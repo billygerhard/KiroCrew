@@ -1202,6 +1202,38 @@ def get_app_backend_port(app_name: str) -> int | None:
         return ap.port if ap and ap.healthy else None
 
 
+def unstopped_backend_port(app_name: str) -> int | None:
+    """The DECLARED fixed port *app_name*'s backend is still listening on, else None.
+
+    Answers the one question :func:`stop_app_backend`'s boolean cannot: it returns
+    ``False`` both for "there was nothing to stop" (never started, already dead,
+    crashed) and for "something is running that I did not stop" (never adopted at
+    boot, or adopted with no usable PIDs). Those need opposite handling — the first
+    is a clean teardown, the second means third-party code is still executing —
+    so the caller observes the port instead of reading the flag.
+
+    Only a manifest-declared FIXED port is checkable. With ``port: auto`` the port
+    existed only in the tracking entry ``stop_app_backend`` just dropped, so there
+    is nothing left to probe; ``None`` there means "cannot tell", not "stopped".
+    Only ``backend.entryPoint`` apps are considered: an app whose backend is a
+    loopback ``mcpServers`` URL is a process the gateway never spawned and does not
+    own, so a listener on it is not an unstopped child.
+    """
+    try:
+        manifest = get_app_manifest(app_name)
+        if manifest is None or not manifest.backend.entryPoint:
+            return None
+        port_str = str(manifest.backend.port)
+        if not port_str or port_str == "auto":
+            return None
+        port = int(port_str)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (_MIN_PORT <= port <= _MAX_PORT):
+        return None
+    return port if _port_is_listening(port) else None
+
+
 # ---------------------------------------------------------------------------
 # Health checking
 # ---------------------------------------------------------------------------
