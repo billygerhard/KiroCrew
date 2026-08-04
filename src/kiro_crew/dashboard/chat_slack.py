@@ -17,13 +17,23 @@ from kiro_crew.dashboard.chat_backfill import (
     session_deep_link,
 )
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
+    expire_slack_options,
+    remember_slack_options,
+)
 from kiro_crew.dashboard.state import DashboardState, _log_task_exception
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.slack.channel_resolver import _CACHE_FILENAME, ChannelNameResolver
-from kiro_crew.slack.format import render_for_slack
+from kiro_crew.slack.format import (
+    build_options_blocks,
+    build_options_selected_blocks,
+    extract_options,
+    render_for_slack,
+)
+from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
 from kiro_crew.sync_bridge import handoff_to_slack
 
 logger = logging.getLogger(__name__)
@@ -98,6 +108,22 @@ async def drain_slack_backfill(
     client = state.slack_client
     if client is None:
         return
+    # Baseline for detecting that the conversation moved on while we work. Taken
+    # BEFORE the selection await, not after: selection reads the on-disk
+    # transcript and can take a while, so a turn that completes during it would
+    # be invisible to a baseline captured afterwards -- leaving a superseded
+    # control clickable. Compared against after the posting loops.
+    #
+    # ``total_messages``, not ``len(slot.messages)``: the message list is capped
+    # at _MAX_SLOT_MESSAGES and trimmed from the front on append, so a slot
+    # sitting at the cap grows and trims in the same step and its LENGTH never
+    # changes. A turn completing mid-drain would then be undetectable on the one
+    # slot busy enough to make the race likely. total_messages is a lifetime
+    # counter and survives trimming.
+    started_running = slot.running
+    started_total = slot.total_messages
+    session_key = effective_session_key(slot)
+
     # Offloaded: selection reads the on-disk transcript when the opening turn is
     # off-window, and read_messages_chained parses every tab_id sibling file (and
     # globs the sessions dir to rebuild a stale index). On the loop thread that
@@ -117,11 +143,55 @@ async def drain_slack_backfill(
             logger.debug("slack backfill: post failed", exc_info=True)
             return False
 
+    async def _post_options(choices: list[str], *, interactive: bool) -> str | None:
+        """Post a replayed OPTIONS tag as a control instead of literal text.
+
+        The body and the control are separate Slack messages, so this composes
+        with the body pipeline above rather than replacing it -- the body keeps
+        its table-safe conversion and full-length redaction, and the choices ride
+        in a Block Kit message of their own.
+
+        *interactive* only for the newest reply. Every earlier one asked a
+        question this replay has already moved past, so it renders struck through
+        and cannot be answered.
+
+        Returns the ts of the control recorded as LIVE, so the caller can spend
+        exactly that one later without touching controls another turn recorded in
+        the same slot. ``None`` when nothing live was recorded.
+        """
+        blocks = (
+            build_options_blocks(choices)
+            if interactive
+            else build_options_selected_blocks(choices, [])
+        )
+        try:
+            ts = await client.post_blocks(channel, blocks, OPTIONS_FALLBACK_TEXT, thread_ts)
+        except Exception:
+            logger.debug("slack backfill: options control post failed", exc_info=True)
+            return None
+        if interactive and ts:
+            remember_slack_options(
+                state,
+                session_key,
+                PostedOptions(
+                    channel=channel,
+                    ts=ts,
+                    choices=tuple(choices),
+                    blocks=tuple(blocks),
+                ),
+            )
+            return ts
+        return None
+
     for row in selection.first_turn:
         icon = _USER_ICON if row.get("role") == "user" else _AGENT_ICON
-        for part in _format_backfill_parts(backfill_content(row), icon):
+        content, choices = _split_backfill_options(row)
+        for part in _format_backfill_parts(content, icon):
             if not await _post(part):
                 return
+        if choices:
+            # The opening turn is superseded by definition — spent, never live.
+            await _post_options(choices, interactive=False)
 
     if selection.skipped_turns and selection.recent:
         summary = gap_summary(selection.skipped_turns)
@@ -136,11 +206,67 @@ async def drain_slack_backfill(
         marker = f"_… {summary} — <{link}|open in the dashboard>_" if link else f"_… {summary}_"
         await _post(marker)
 
-    for row in selection.recent_rows:
+    newest = len(selection.recent_rows) - 1
+    live_ts: str | None = None
+    for idx, row in enumerate(selection.recent_rows):
         icon = _USER_ICON if row.get("role") == "user" else _AGENT_ICON
-        for part in _format_backfill_parts(backfill_content(row), icon):
+        content, choices = _split_backfill_options(row)
+        for part in _format_backfill_parts(content, icon):
             if not await _post(part):
                 return
+        if choices:
+            posted_ts = await _post_options(choices, interactive=idx == newest)
+            if posted_ts:
+                live_ts = posted_ts
+
+    # Did the conversation move past the replayed question while we were
+    # draining? A turn that was running at any point, or a transcript that grew,
+    # means the newest reply we just rendered as a LIVE control is already
+    # superseded — and that turn's own expiry ran before our record existed, so
+    # nothing else will spend it. Expire it here rather than leaving live buttons
+    # for an answer the conversation no longer wants.
+    #
+    # ``started_running or slot.running``, not a before/after comparison: a turn
+    # that is already in flight when the drain begins and is STILL in flight when
+    # it ends (a long cron or injected turn) leaves the flag identical at both
+    # ends and may not have appended a row yet, so both a `!=` on running and the
+    # total_messages check see nothing. The agent is mid-reply the whole time,
+    # which is exactly when the replayed question is most certainly stale.
+    #
+    # Narrowed to OUR ts, never a session-wide drain: the very turn that makes
+    # the replayed question stale can finish mid-drain and record its OWN fresh
+    # control in this slot, and spending the whole slot would strike that newer
+    # question through — silencing the one the conversation is now waiting on.
+    # No live control of ours means there is nothing here to spend.
+    if live_ts and (started_running or slot.running or slot.total_messages != started_total):
+        try:
+            await expire_slack_options(state, session_key, ts=live_ts)
+        except Exception:
+            logger.debug(
+                "slack backfill: could not expire a control superseded mid-drain",
+                exc_info=True,
+            )
+
+
+def _split_backfill_options(row: dict[str, Any]) -> tuple[str, list[str]]:
+    """Split a replayed row into body text and OPTIONS choices.
+
+    Only AGENT-authored rows are parsed. A person's own message can legitimately
+    contain the OPTIONS syntax — quoting it, or discussing it — and lifting the
+    tag out of their words would render choices they never offered, so a user row
+    is returned verbatim with no choices.
+
+    No redaction happens here on purpose. ``build_options_blocks`` runs every
+    choice through ``redact_for_display``, which canonicalises the form Slack
+    actually shows (ANSI, emphasis and backtick splits, link markup) before
+    scanning — strictly stronger than redacting the raw bytes here, and the body
+    is covered by ``_format_backfill_parts``. Duplicating the ordering in this
+    function is what previously let the two copies drift apart.
+    """
+    content = backfill_content(row)
+    if row.get("role") == "user":
+        return content, []
+    return extract_options(content)
 
 
 def _spawn_slack_backfill(
@@ -242,7 +368,9 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     # resolve through, and releases the thread from any slot that held it
     # before. Hand-assigning the fields here duplicated everything except that
     # index, so a reply in the mirrored thread routed and persisted correctly
-    # while nothing ever told the open tab it had arrived.
+    # while nothing ever told the open tab it had arrived. That same index is
+    # what resolves an OPTIONS click on the control replayed below back to this
+    # conversation -- without it the click would answer into a separate session.
     state.link_slack(slot.key, thread_ts, target_channel)
 
     # Seed the new thread with readable history — only when we created a NEW
@@ -288,18 +416,125 @@ async def api_chat_slot_slack_unlink(request: web.Request) -> web.Response:
     # NAME instead would build "dashboard:slack:<ts>" for a channel-born slot,
     # leaving the real link untouched so mirroring silently resumes next turn.
     session_key = effective_session_key(slot)
-    cleared = state.sessions.clear_slack_link(session_key)
-    # chat_runner copies a dashboard session's link from the bare key onto the
-    # "dashboard:"-prefixed one when a turn runs, so both spellings must go or
-    # the next turn re-inherits the link. A channel key has no such twin.
-    if session_key.startswith("dashboard:"):
-        cleared = state.sessions.clear_slack_link(session_key[len("dashboard:") :]) or cleared
+
+    def _clear_persisted_link() -> bool:
+        """Clear BOTH persisted key spellings for this slot's link.
+
+        chat_runner copies a dashboard session's link from the bare key onto the
+        "dashboard:"-prefixed one when a turn runs, so both spellings must go or
+        the next turn re-inherits the link. A channel key has no such twin.
+        """
+        done = state.sessions.clear_slack_link(session_key)
+        if session_key.startswith("dashboard:"):
+            done = state.sessions.clear_slack_link(session_key[len("dashboard:") :]) or done
+        return done
+
+    cleared = _clear_persisted_link()
 
     prev_channel = slot._slack_channel
     prev_thread_ts = slot._slack_thread_ts
-    slot._slack_linked = False
-    slot._slack_channel = ""
-    slot._slack_thread_ts = ""
+    # Expire FIRST, while the routing is still intact, then clear the link only if
+    # it is still the one we captured. Neither plain ordering is safe on its own:
+    #
+    #   teardown-then-expire  -- between the two the buttons are still live while
+    #     the reverse index is already gone, so a click resolves to nothing and
+    #     starts a BRAND-NEW session carrying a stale answer.
+    #   expire-then-teardown  -- expiry awaits a Slack edit, long enough for
+    #     another tab to relink this slot mid-await; resuming would then clear the
+    #     REPLACEMENT link's in-memory fields while its persisted link survived,
+    #     leaving the two disagreeing.
+    #
+    # Compare-and-clear satisfies both. The click keeps working (and keeps
+    # resolving to THIS slot) for as long as the control is still answerable, and
+    # the teardown is conditional on the link not having moved underneath us.
+    await expire_slack_options(state, session_key)
+
+    # Persistence was cleared at the top, so anything here now was written DURING
+    # the await. Read once: both branches below turn on it.
+    persisted_ts, persisted_chan = state.sessions.get_slack_link(session_key)
+
+    if slot._slack_options_posted:
+        # A returned expiry does NOT prove the control was spent. Records whose
+        # Slack edit failed transiently (429, 5xx, network) stay tracked
+        # deliberately, so the buttons are still live on screen — and tearing the
+        # reverse index down now is precisely the teardown-then-expire order
+        # rejected above: a later click resolves to nothing and starts a
+        # BRAND-NEW session carrying a stale answer. A failed expiry is
+        # teardown-then-NEVER-expire, which is worse.
+        #
+        # So abort. Keeping the thread linked is recoverable and visible — the
+        # caller retries and the next turn's expiry spends the control — whereas
+        # completing the unlink silently corrupts a future conversation. Restore
+        # the persisted link we cleared at the top so persistence agrees with the
+        # in-memory fields, which were never touched; skip that if something else
+        # wrote a link while we awaited, since that writer's value is the live one.
+        if not persisted_ts and (prev_thread_ts or prev_channel):
+            state.sessions.set_slack_link(session_key, prev_thread_ts, prev_channel)
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.slack_unlink",
+            outcome="deferred",
+            source="dashboard",
+            resources=slot.key,
+            error="an OPTIONS control could not be expired; link kept to keep it routable",
+        )
+        # 503, not a 200 that lies: the session IS still linked. The dashboard
+        # already treats a non-2xx here as "session stays linked", so its view
+        # matches the state we just restored without any client change.
+        return web.json_response(
+            {
+                "error": "Slack did not confirm the pending control was retired; still linked",
+                "code": "slack_options_pending",
+            },
+            status=503,
+        )
+
+    if slot._slack_channel == prev_channel and slot._slack_thread_ts == prev_thread_ts:
+        # Equality does NOT prove nothing moved. A relink to the SAME thread can
+        # land during the expiry await and restore the identical channel/ts, which
+        # in memory is byte-for-byte indistinguishable from an untouched link.
+        #
+        # Persistence settles it, and by PRESENCE rather than by value: it was
+        # cleared at the top of this handler, and the only writer is ``link_slack``.
+        # So a persisted link sitting here now was necessarily written DURING the
+        # await -- positive evidence of a relink -- while an empty one is positive
+        # evidence that nothing moved. Comparing the channel/ts alone can only
+        # guess, and guessing either way breaks the other case: assume "relinked"
+        # and an ordinary unlink silently no-ops, assume "nothing moved" and a
+        # successful relink is torn down behind the user's back.
+        if persisted_ts and persisted_ts == prev_thread_ts and persisted_chan == prev_channel:
+            # A relink won the race. Its link is the live one, so leave the slot
+            # fields, persistence and the reverse index exactly as it left them --
+            # they already agree with each other, which is all the teardown was
+            # ever protecting.
+            #
+            # ``cleared`` goes False so this reports as a no-op: the session is
+            # still linked, so claiming ``was_linked`` would tell the UI a teardown
+            # happened, and the courtesy note below would announce "replies here no
+            # longer sync" into the very thread that is still syncing.
+            cleared = False
+            logger.debug(
+                "slack unlink: same-thread relink landed during expiry, "
+                "leaving the replacement intact"
+            )
+        else:
+            # Nothing relinked. Re-clear persistence anyway: it is idempotent
+            # here, and it also drops the "dashboard:"-prefixed twin that a turn
+            # running mid-await could otherwise re-inherit the link from.
+            cleared = _clear_persisted_link() or cleared
+            slot._slack_linked = False
+            slot._slack_channel = ""
+            slot._slack_thread_ts = ""
+            # Drop the thread -> slot reverse index too, or the thread keeps
+            # resolving to this conversation after the link is gone.
+            if prev_thread_ts:
+                state._slack_to_slot.pop(prev_thread_ts, None)
+    else:
+        # A relink landed during the expiry await. Its link is the live one now, so
+        # leave every field and the reverse index exactly as the relink left them.
+        logger.debug(
+            "slack unlink: link changed during expiry, leaving the replacement intact"
+        )
 
     # Best-effort courtesy note so a Slack watcher knows why the thread went
     # quiet. Same redaction path as the link endpoint; failure is non-fatal.

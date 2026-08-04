@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog  # noqa: F401
     from kiro_crew.messaging.transport import MessagingTransport  # noqa: F401
     from kiro_crew.power import SleepInhibitor  # noqa: F401
+    from kiro_crew.slack.outbound import PostedOptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -825,6 +826,7 @@ class _ChatSlot:
         "_slack_linked",
         "_slack_channel",
         "_slack_thread_ts",
+        "_slack_options_posted",
         "folder_id",
         "_folder_changed",
         "_folder_suggested",
@@ -981,6 +983,18 @@ class _ChatSlot:
         self._slack_linked: bool = False  # True when linked to a Slack thread
         self._slack_channel: str = ""
         self._slack_thread_ts: str = ""
+        # The live OPTIONS control most recently posted into this session's
+        # Slack thread, kept so the next turn can strike it through once the
+        # conversation moves past the question it asked. In-memory only: a
+        # gateway restart drops it, which leaves the pre-existing behaviour
+        # (the control stays live) rather than causing a new failure.
+        # EVERY control still outstanding for this conversation, not just the
+        # newest. One turn can post more than one OPTIONS message, and a single
+        # slot is also reachable from more than one posting path — if a newer
+        # record replaced the older one, the older control stayed clickable with
+        # nothing tracking it, so a click on it would answer a superseded
+        # question. Expiry drains the whole tuple.
+        self._slack_options_posted: tuple[PostedOptions, ...] = ()
         self.folder_id: str = ""  # project folder assignment
         self._folder_changed: bool = False  # re-inject [FOLDER] breadcrumb next turn after move
         # One-shot claim for the post-titling folder suggestion (see
