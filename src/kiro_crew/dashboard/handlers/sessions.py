@@ -979,12 +979,12 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
 
-    from kiro_crew.dashboard.chat_utils import effective_session_key
+    from kiro_crew.dashboard.chat_utils import slot_history_key
     from kiro_crew.history import _safe_key
 
     protected: set[str] = set()
     for slot in state._slots.values():
-        hk = effective_session_key(slot)
+        hk = slot_history_key(slot)
         protected.add(hk)
         # ``list_sessions`` reports filename stems, so protect the stem too.
         # ``_safe_key`` is the function that produced the filename: a
@@ -992,6 +992,12 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
         # ``discord:kirocrew:direct:123`` mapped to a stem that does not exist,
         # so the open session would fall outside ``protected`` and this bulk
         # delete would remove a live conversation's transcript.
+        #
+        # Keyed on the TRANSCRIPT, not the session: an UNBOUND channel tab runs
+        # under ``dashboard:<stem>`` but its conversation lives in the channel
+        # transcript, so protecting the session key added a pair of names that
+        # match no file while leaving the real one unprotected — the exact loss
+        # the paragraph above exists to prevent.
         protected.add(_safe_key(hk))
 
     sessions = state.conversation_log.list_sessions()

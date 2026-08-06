@@ -17,7 +17,7 @@ from kiro_crew.dashboard.chat_backfill import (
     session_deep_link,
 )
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.state import DashboardState, _log_task_exception
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact_and_truncate
@@ -400,6 +400,7 @@ async def api_chat_slot_handoff(request: web.Request) -> web.Response:
         title=slot.title if slot._titled else "",
         channel=channel,
         sessions=state.sessions,
+        transcript_key=slot_history_key(slot),
     )
     if not thread_ts:
         return web.json_response({"error": "handoff failed"}, status=500)

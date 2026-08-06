@@ -21,7 +21,7 @@ from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     _redact_meta_for_role,
     _sync_dashboard_slots,
-    effective_session_key,
+    slot_history_key,
     slot_transcript_key,
 )
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot, _normalize_slot_key
@@ -474,6 +474,13 @@ def _rehydrate_slot_from_history(
             # Skipped, the slot would answer from a dashboard-only session and the
             # channel thread would stop seeing its replies.
             slot.linked_session_key = str(meta["linked_session_key"])
+        if is_channel_session_key(history_key):
+            # This slot was built FROM an existing channel transcript, so it is a
+            # channel tab regardless of whether the session map could still name
+            # its session. Recording that here is what lets slot_history_key keep
+            # its reads and writes on that one file without inferring provenance
+            # from the slot name's shape.
+            slot.channel_origin = True
         # Restore the persisted tab_id so cross-restart fork chaining survives.
         # get_or_create_slot (called by our caller) assigns a fresh random uuid to
         # slot._tab_id; if we don't overwrite it here, the next _flush_dirty_slots
@@ -1400,7 +1407,7 @@ def _save_slot_to_history(
         and not rewrite
     ):
         return
-    history_key = effective_session_key(slot)
+    history_key = slot_history_key(slot)
     try:
         # Hold the SAME per-session cross-process lock that ``append`` /
         # ``append_off_loop`` / rotate / rewrite / metadata mutations take, across
@@ -1576,7 +1583,7 @@ def _save_slot_to_history(
                     )
 
             _preserve_mtime: float | None = None
-            if closed and slot.linked_session_key:
+            if closed and (slot.linked_session_key or is_channel_session_key(history_key)):
                 # This slot shares its transcript with a channel, and the
                 # reconciler decides whether a close still stands by comparing
                 # the file's mtime against ``closed_at``: activity newer than the
@@ -1585,6 +1592,16 @@ def _save_slot_to_history(
                 # past ``closed_at`` and make the close outrun itself — the tab
                 # would reopen on the next pass. Restore the pre-close mtime so
                 # only a genuine channel append can outrun the close.
+                #
+                # Gated on the TRANSCRIPT, not on ``linked_session_key``: an
+                # UNBOUND channel tab (the session map could not resolve its
+                # stem) writes this very same shared file, so testing the binding
+                # left exactly that tab unprotected — its close bumped the
+                # channel file's mtime and ``_close_stands`` then rejected the
+                # close, resurfacing the tab on the next reconcile. Keeping the
+                # ``linked_session_key`` arm makes this strictly additive for
+                # cron- and workflow-linked slots, whose keys are not channel
+                # keys but which also share a transcript.
                 try:
                     _preserve_mtime = path.stat().st_mtime
                 except OSError:
