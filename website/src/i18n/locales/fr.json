@@ -5038,6 +5038,7 @@
     },
     "terminalCompletion": {
       "path_completions": "Complétions de chemin",
+      "command_completions": "Complétions de commande",
       "use_this_folder": "utiliser ce dossier",
       "dir_truncated": "{{dir}} (tronqué)"
     },

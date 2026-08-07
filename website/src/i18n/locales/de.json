@@ -4977,6 +4977,7 @@
     },
     "terminalCompletion": {
       "path_completions": "Pfadvervollständigungen",
+      "command_completions": "Befehlsvervollständigungen",
       "use_this_folder": "diesen Ordner verwenden",
       "dir_truncated": "{{dir}} (gekürzt)"
     },

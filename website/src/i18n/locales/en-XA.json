@@ -4737,7 +4737,8 @@
     "terminalCompletion": {
       "path_completions": "[Þàţĥ çøɱþĺèţìøñş ··············]",
       "use_this_folder": "[ùşè ţĥìş ƒøĺðèŕ ··············]",
-      "dir_truncated": "[{{dir}} (ţŕùñçàţèð) ···········]"
+      "dir_truncated": "[{{dir}} (ţŕùñçàţèð) ···········]",
+      "command_completions": "[Çøɱɱàñð çøɱþĺèţìøñş ·················]"
     },
     "themeEditor": {
       "cancel": "[Çàñçèĺ ·········]",
