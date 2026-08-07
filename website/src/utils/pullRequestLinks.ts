@@ -226,6 +226,21 @@ function linksInMessage(
   return [...found.values()]
 }
 
+/** Parse ONE url into a source link, or null when it is not a pull request /
+ *  merge request / issue on a permitted host.
+ *
+ *  Exposed for callers that hold a url but no transcript — the sidebar chips,
+ *  whose links the BACKEND scanned out of the slot's messages. Going through the
+ *  same parser as the transcript extractor means such a caller gets the identical
+ *  canonical shape (canonicalised url, provider, number, repo, kind) instead of a
+ *  second, drifting hand-rolled one. */
+export function parseSourceLinkUrl(
+  url: string,
+  gitlabHosts: readonly string[] = [],
+): PullRequestLink | null {
+  return parseCandidate(url, gitlabHostSet(gitlabHosts))
+}
+
 function roleCount(found: Map<string, AttributedLink>, role: MentionRole): number {
   let n = 0
   for (const link of found.values()) if (link.mentionedBy === role) n += 1

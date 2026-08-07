@@ -8,6 +8,7 @@ import {
   loadSeenPullRequestLinks,
   loadSourceSelections,
   MAX_PULL_REQUEST_SOURCES,
+  parseSourceLinkUrl,
   persistSeenPullRequestLinks,
   PullRequestLinkIndex,
   recordNewPullRequestLinks,
@@ -307,6 +308,50 @@ describe('extractPullRequestLinks', () => {
     localStorage.setItem('mc-pr-source-seen-v1', JSON.stringify({ slot: ['not-an-array'] }))
     expect(loadSeenPullRequestLinks()).toEqual(new Map())
     localStorage.clear()
+  })
+})
+
+/* ── parseSourceLinkUrl ────────────────────────────────────────────────────
+ * The one-url entry point, for callers holding a url but no transcript: the
+ * sidebar chips, whose links the BACKEND scanned. Its job is to hand back the
+ * SAME canonical shape the transcript extractor produces, so a revealed chip and
+ * a scanned link are interchangeable in the panel's list. */
+describe('parseSourceLinkUrl', () => {
+  it('returns the same canonical shape the extractor produces', () => {
+    const url = 'https://github.com/acme/widgets/pull/12'
+    expect(parseSourceLinkUrl(url)).toEqual(extractPullRequestLinks(messages(url))[0])
+  })
+
+  it('classifies kind from the url, for both providers', () => {
+    expect(parseSourceLinkUrl('https://github.com/acme/widgets/pull/12'))
+      .toMatchObject({ provider: 'github', number: 12, repo: 'widgets', kind: 'change' })
+    expect(parseSourceLinkUrl('https://github.com/acme/widgets/issues/9'))
+      .toMatchObject({ provider: 'github', number: 9, repo: 'widgets', kind: 'issue' })
+    expect(parseSourceLinkUrl('https://gitlab.com/acme/service/-/merge_requests/4'))
+      .toMatchObject({ provider: 'gitlab', number: 4, repo: 'service', kind: 'change' })
+    expect(parseSourceLinkUrl('https://gitlab.com/acme/service/-/issues/8'))
+      .toMatchObject({ provider: 'gitlab', number: 8, repo: 'service', kind: 'issue' })
+  })
+
+  it('canonicalises the url, dropping query, fragment and www', () => {
+    expect(parseSourceLinkUrl('https://www.github.com/acme/widgets/pull/12?tab=files#diff-1')?.url)
+      .toBe('https://github.com/acme/widgets/pull/12')
+  })
+
+  it('rejects anything that is not a permitted pull request / issue url', () => {
+    // Attribution does NOT apply here — this parses one url, it does not decide
+    // whose mention it was — but the host allowlist still does.
+    expect(parseSourceLinkUrl('https://github.com/acme/widgets')).toBeNull()
+    expect(parseSourceLinkUrl('https://github.com.evil.example/acme/widgets/pull/12')).toBeNull()
+    expect(parseSourceLinkUrl('javascript:alert(1)//github.com/a/b/pull/1')).toBeNull()
+    expect(parseSourceLinkUrl('not a url')).toBeNull()
+  })
+
+  it('accepts a self-managed GitLab host only when it is allowlisted', () => {
+    const mr = 'https://gitlab.acme.internal/team/api/-/merge_requests/7'
+    expect(parseSourceLinkUrl(mr)).toBeNull()
+    expect(parseSourceLinkUrl(mr, ['gitlab.acme.internal']))
+      .toMatchObject({ provider: 'gitlab', number: 7, repo: 'api', kind: 'change' })
   })
 })
 
