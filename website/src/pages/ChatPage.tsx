@@ -100,7 +100,8 @@ import { pickSearchScrollBehavior, scrollCurrentMatchIntoView, pollRowSettled, g
 import QueueStack, { SubagentDeliveryProgress, isSystemDelivery, isNonInteractiveQueued } from '../components/QueueStack'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { TipCard, useTipTrigger } from '../components/TipCard'
-import { useVoiceInput, voiceInputSupported } from '../hooks/useVoiceInput'
+import { voiceInputSupported } from '../hooks/useVoiceInput'
+import { useVoiceSession } from '../providers/VoiceSessionProvider'
 import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
 import type { TurnStats } from './chat/AssistantMessage'
@@ -1389,7 +1390,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     queryKey: ['sttConfig'],
     queryFn: () => api.sttConfig() as Promise<{ streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string }>,
   })
-  const sttStreaming = !!sttCfg?.streaming
   const sttEnabled = !!sttCfg?.enabled
   // The backend probes for the provider's binary and reports `available`.
   // Default true so a not-yet-loaded config doesn't flash the modal; the
@@ -1520,42 +1520,53 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     frozenInputRef.current = null
     frozenCaretRef.current = null
   }, [saveDrafts, spliceDictation])
-  const voice = useVoiceInput(
-    applyVoiceText,
-    {
-      streaming: sttStreaming,
-      sessionId: activeSlot,
-      onPartial: useCallback((text: string, sessionId: string | null) => {
-        // Streaming partials only fire while the originating slot is on screen
-        // (switching slots stops the stream), so a partial attributed to any
-        // other slot is a late straggler — drop it rather than smear a
-        // half-word into the wrong session.
-        if (sessionId && sessionId !== activeSlotRef.current) return
-        if (sttDisarmedRef.current) return
-        // Snapshot the pre-dictation text AND caret on the first partial
-        // (before setInput, so the updater stays pure — no ref mutation inside a
-        // function React may invoke twice) so every later partial and the final
-        // insert at the same spot, replacing the growing hypothesis.
-        if (frozenInputRef.current === null) {
-          frozenInputRef.current = inputRef.current
-          frozenCaretRef.current = voiceCaretRef.current
-        }
-        const spliced = spliceDictation(frozenInputRef.current ?? '', text)
-        if (spliced.value !== inputRef.current) {
-          setInput(spliced.value)
-          voicePendingCaretRef.current = spliced.caret
-        }
-      }, [spliceDictation]),
-      // Semantic endpointing (stt.endpointing) judged the utterance complete:
-      // auto-submit. The composer already holds the streamed transcript via
-      // onPartial, and send() reads inputRef.current + stops the live capture
-      // itself (its recording+streaming branch), so this is the same path as
-      // pressing Enter mid-dictation — just triggered by the backend verdict.
-      onEndpoint: useCallback(() => {
-        if (sttDisarmedRef.current) return
-        sendRef.current?.()
-      }, []),
+  // Live streaming hypothesis handler for the on-screen composer. Registered as
+  // the voice sink's onPartial below.
+  const voiceOnPartial = useCallback((text: string, sessionId: string | null) => {
+    // Streaming partials only fire while the originating slot is on screen
+    // (switching slots stops the stream), so a partial attributed to any
+    // other slot is a late straggler — drop it rather than smear a
+    // half-word into the wrong session.
+    if (sessionId && sessionId !== activeSlotRef.current) return
+    if (sttDisarmedRef.current) return
+    // Snapshot the pre-dictation text AND caret on the first partial
+    // (before setInput, so the updater stays pure — no ref mutation inside a
+    // function React may invoke twice) so every later partial and the final
+    // insert at the same spot, replacing the growing hypothesis.
+    if (frozenInputRef.current === null) {
+      frozenInputRef.current = inputRef.current
+      frozenCaretRef.current = voiceCaretRef.current
     }
+    const spliced = spliceDictation(frozenInputRef.current ?? '', text)
+    if (spliced.value !== inputRef.current) {
+      setInput(spliced.value)
+      voicePendingCaretRef.current = spliced.caret
+    }
+  }, [spliceDictation])
+  // Semantic endpointing (stt.endpointing) judged the utterance complete:
+  // auto-submit. The composer already holds the streamed transcript via
+  // voiceOnPartial, and send() reads inputRef.current + stops the live capture
+  // itself (its recording+streaming branch), so this is the same path as
+  // pressing Enter mid-dictation — just triggered by the backend verdict.
+  const voiceOnEndpoint = useCallback(() => {
+    if (sttDisarmedRef.current) return
+    sendRef.current?.()
+  }, [])
+  // The voice SESSION lives in VoiceSessionProvider ABOVE the router, so a route
+  // change (chat -> schedule/artifacts) no longer unmounts it and orphans an
+  // in-flight transcription. ChatPage remains the owner of the LIVE composer
+  // behaviour and registers it as the session's sink while mounted; when
+  // ChatPage is unmounted the provider routes a finished batch transcript to the
+  // originating slot's persisted draft instead of discarding it.
+  const { registerVoiceSink, ...voice } = useVoiceSession()
+  // useLayoutEffect (not useEffect): register the sink synchronously on (re)mount,
+  // before paint and before passive effects run — so if a batch transcript
+  // completes during a remount (user returns to /chat just as STT finishes) it
+  // routes to the live composer sink rather than slipping through to the draft
+  // fallback and being clobbered by a later mount effect.
+  useLayoutEffect(
+    () => registerVoiceSink({ onText: applyVoiceText, onPartial: voiceOnPartial, onEndpoint: voiceOnEndpoint }),
+    [registerVoiceSink, applyVoiceText, voiceOnPartial, voiceOnEndpoint],
   )
   // Keep a ref to the latest `voice` so effects that intentionally omit
   // `voice` from their deps always invoke the current instance — otherwise
@@ -1563,6 +1574,36 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // changes (e.g. when `sttStreaming` flips).
   const voiceRef = useRef(voice)
   useEffect(() => { voiceRef.current = voice }, [voice])
+  // The voice SESSION lives above the router and deliberately survives a route
+  // change (so an in-flight TRANSCRIPTION is no longer orphaned). But the
+  // recording meter and the stop/cancel controls live in this subtree and
+  // unmount with it — so if the mic is still HOT when the chat surface goes
+  // away (nav to Schedule/Artifacts), stop it here rather than leave an
+  // invisible, uncontrollable capture running off-route. Stopping a batch
+  // capture still transcribes, and the result lands in the originating slot's
+  // draft via the provider's sink-less fallback — the bug we fixed was the
+  // orphaned transcription, not a need for off-route capture. Empty deps: this
+  // cleanup runs only on true unmount, never on a sink re-register.
+  useEffect(() => () => {
+    const v = voiceRef.current
+    if (v.recording) {
+      // Stop a hot mic on unmount — its meter/stop control leave with ChatPage.
+      // Batch: toggle() -> stop -> onstop transcribes -> text lands in the draft.
+      // Streaming: cancel() instead — the hypothesis was already spliced into the
+      // composer and saved to the draft, so draining a streaming final here would
+      // DUPLICATE it if the user navigates back quickly.
+      if (v.streamEnabled) v.cancel()
+      else v.toggle()
+      return
+    }
+    // Not recording yet, but a getUserMedia may still be in flight (pending
+    // startup): cancel it so a delayed acquisition can't turn the mic hot AFTER
+    // we've already navigated away. Guard on !transcribing so an in-flight
+    // transcription — the very case this change protects — is never aborted
+    // (cancel() only drops pre-transcription audio / invalidates a pending
+    // acquire; it does not abort an already-issued sttTranscribe request).
+    if (!v.transcribing) v.cancel()
+  }, [])
   // Same reason as voiceRef: send() deliberately keeps a minimal dep array (with
   // an exhaustive-deps suppression), so reading `sttStreaming` directly there
   // would close over the value from the render that created that send().
