@@ -455,6 +455,12 @@ class Backend:
     # is swallowed in _route_backend_line. Initialized to creation time so a
     # cold-start backend isn't immediately considered stale.
     _last_ping_response_mono: float = 0.0
+    # Frame-forwarding progress: updated on every forwarded request (touch())
+    # and every routed response (_route_backend_line). Used by the orphan
+    # detector in _heartbeat_once to identify backends with attached stubs
+    # that have gone completely silent — the Windows zombie case where a dead
+    # named pipe leaves refcount > 0 but no frames flow.
+    _last_frame_mono: float = 0.0
     # Track request ids already warned as slow-but-responsive to avoid log spam.
     _warned_slow_ids: set = field(default_factory=set)
     # Best-effort latency-metric emits, fired off the stdout-pump hot path so a
@@ -545,7 +551,9 @@ class Backend:
         """Mark the backend as freshly used. Called by the routing layer
         on every forwarded request so the idle-sweep (Milestone 2) can tell
         real traffic from accumulated stragglers."""
-        self.last_used_at = now if now is not None else time.monotonic()
+        t = now if now is not None else time.monotonic()
+        self.last_used_at = t
+        self._last_frame_mono = t
 
     async def attach_stub(self, stub_uuid: str) -> "asyncio.Queue[bytes]":
         """Register ``stub_uuid`` as an active consumer of this backend.
@@ -1043,6 +1051,7 @@ class Backend:
                     self.pid, msg_id,
                 )
                 return
+            self._last_frame_mono = time.monotonic()
             if pending.t_start_ms:
                 # Fire-and-forget: awaiting the emit here (even with its file
                 # I/O offloaded to a thread) yields the shared stdout pump,
@@ -1606,7 +1615,11 @@ class Backend:
           exceeds :data:`HEARTBEAT_TIMEOUT_SECS`, AND (2) no ping response has
           arrived within :data:`PING_STALE_SECS` (backend unresponsive). OR the
           hard ceiling :data:`HARD_WEDGE_CEILING_SECS` is exceeded regardless
-          of ping freshness. Shared backends (kirocrew-core) host long tools
+          of ping freshness. OR stubs are attached but NO frames have been
+          forwarded in either direction for :data:`HARD_WEDGE_CEILING_SECS`
+          (orphan detection — catches the Windows zombie case where a dead
+          named pipe leaves refcount > 0 but _pending_requests empty).
+          Shared backends (kirocrew-core) host long tools
           like ``wait`` (60-1800s) and ``spawn_sub_agents``; recycling them on
           request age alone kills healthy-but-slow backends.
         * ``"alive"``  -- everything else. A best-effort JSON-RPC ``ping`` is
@@ -1625,6 +1638,42 @@ class Backend:
         # 2. No consumers -- leave idle backends to the idle-sweep.
         if self.refcount == 0:
             return "idle"
+
+        # 2b. Orphan detection: stubs attached but no frames forwarded for the
+        # hard-ceiling duration AND the backend is not answering pings.
+        # On Windows a dead named pipe delivers no SIGPIPE, so the gateway
+        # never calls detach_stub — refcount stays > 0 with empty
+        # _pending_requests indefinitely.  The existing wedge-detection (step 3)
+        # is gated on _pending_requests being non-empty, so this orphan state
+        # is invisible to it.
+        #
+        # Two conditions required (frame silence alone is NOT sufficient):
+        #   1. No frames forwarded for HARD_WEDGE_CEILING_SECS (35 min).
+        #   2. Last ping response is stale (> PING_STALE_SECS).
+        #
+        # Why both: a healthy idle backend (user walked away for 35 min) still
+        # answers pings — its MCP read-loop services heartbeat requests
+        # regardless of tool activity.  A zombie backend (stdin pipe broken on
+        # Windows) may accept ping WRITES (the gateway->backend pipe direction
+        # stays open) but the pong never arrives because the backend is hung in
+        # its own readuntil().  So ping-response staleness is the discriminator
+        # between "idle but alive" and "orphaned zombie".
+        if not self._pending_requests:
+            frame_ref = self._last_frame_mono or self.created_at
+            silence = now - frame_ref
+            ping_age = now - self._last_ping_response_mono
+            if silence >= HARD_WEDGE_CEILING_SECS and ping_age >= PING_STALE_SECS:
+                self._dead_reason = (
+                    f"orphan: refcount={self.refcount} but no frames for "
+                    f"{silence:.0f}s >= {HARD_WEDGE_CEILING_SECS:.0f}s ceiling "
+                    f"AND ping stale {ping_age:.0f}s >= {PING_STALE_SECS:.0f}s"
+                )
+                logger.warning(
+                    "backend pid=%s pool=%s %s; recycling",
+                    self.pid, self.pool_key.human_readable(), self._dead_reason,
+                )
+                await self._broadcast_backend_gone(self._dead_reason)
+                return "wedged"
 
         # 3. Wedge detection: two-condition rule + hard ceiling.
         oldest_age = 0.0
@@ -1972,6 +2021,7 @@ async def spawn_backend(
         last_used_at=now,
     )
     backend._last_ping_response_mono = now  # cold-start: not insta-stale
+    backend._last_frame_mono = now  # cold-start: not insta-orphaned
     backend._stderr_task = stderr_task
     return backend
 
