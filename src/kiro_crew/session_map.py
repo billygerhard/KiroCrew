@@ -212,18 +212,20 @@ class SessionMap:
         if entry.get("provider") == "claude_code":
             return sid
         sessions_dir = _kiro_sessions_dir()
-        if sid and (sessions_dir / f"{sid}.json").exists():
+        if sid:
+            # Liveness follows the transcript: kiro-cli writes <sid>.jsonl at
+            # session start but creates <sid>.json only later (delays of hours
+            # observed), so probing .json here misclassified live sessions as
+            # dead and destroyed their mappings.
             jsonl = sessions_dir / f"{sid}.jsonl"
             try:
                 jsonl_size = jsonl.stat().st_size
             except FileNotFoundError:
-                jsonl_size = 0
-            if jsonl_size < 10:
+                jsonl_size = -1
+            if jsonl_size >= 10:
+                return sid
+            if jsonl_size >= 0:
                 logger.info("Session %s has empty JSONL — pruning stale entry for %s", sid, key)
-                self._remove_entry(matched_key)
-                return None
-            return sid
-        if sid:
             self._remove_entry(matched_key)
         return None
 
@@ -292,7 +294,7 @@ class SessionMap:
             for k, entry in self._data.items()
             if entry.get("provider") != "claude_code"
             and (
-                (entry.get("sid") and not (sessions_dir / f"{entry['sid']}.json").exists())
+                (entry.get("sid") and not (sessions_dir / f"{entry['sid']}.jsonl").exists())
                 or (
                     not entry.get("sid")
                     and not entry.get("slack_thread_ts")

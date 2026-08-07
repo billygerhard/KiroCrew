@@ -269,9 +269,13 @@ triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
 
 **Lifecycle:**
-- `get_or_create()`: looks up mapping → if found and `.json` file exists,
-  sets `resume_session_id` on the ACP client and skips warm pool. After
-  `ensure_ready()`, saves the new `session_key → session_id` mapping.
+- `get_or_create()`: looks up mapping → the lookup treats the session as live
+  when its `.jsonl` transcript exists (kiro-cli writes the `.json` metadata
+  file only later, sometimes hours after session start), sets
+  `resume_session_id` on the ACP client and skips warm pool. The provider's
+  resume attempt separately requires the `.json` session file and falls back
+  to `session/new` when it is absent. After `ensure_ready()`, saves the new
+  `session_key → session_id` mapping.
 - `reset()`: does NOT delete mapping — the kiro-cli session file persists
   on disk. Next `get_or_create` will try `session/load`.
 - `remove()`: deletes mapping — explicit tab delete, no resume expected.
