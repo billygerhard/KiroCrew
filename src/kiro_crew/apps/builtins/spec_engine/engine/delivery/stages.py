@@ -166,64 +166,53 @@ def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcom
     """
     wrapped, child_env, cleanup = sandbox.sandboxed_spawn_argv(list(argv))
     try:
-        return _spawn_and_wait(wrapped, argv, cwd=cwd, timeout_s=timeout_s, env=child_env)
-    finally:
-        # The chokepoint hands back a temp launcher / sandbox profile and makes
-        # unlinking it the caller's job. A stage runs once per command per run,
-        # so dropping it would leak a file per command until the stale sweep.
-        if cleanup:
-            Path(cleanup).unlink(missing_ok=True)
-
-
-def _spawn_and_wait(
-    wrapped: list[str],
-    argv: Sequence[str],
-    *,
-    cwd: Path,
-    timeout_s: int,
-    env: dict[str, str],
-) -> CommandOutcome:
-    """Spawn an already-wrapped argv and collect its bounded output."""
-    started: subprocess.Popen[str]
-    try:
-        # Both isolation flags are passed explicitly rather than unpacked from a
-        # dict, which keeps the Popen overload resolvable for the type checker.
-        # start_new_session is a no-op on Windows and the creation flag is a
-        # no-op on POSIX; together they make the child's tree killable.
-        started = subprocess.Popen(
-            wrapped,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-            preexec_fn=sandbox.resource_limit_preexec(),
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-        )
-    except (OSError, ValueError) as exc:
-        return CommandOutcome(exit_code=None, start_error=f"cannot run {argv[0]!r}: {exc}")
-    try:
-        stdout, stderr = started.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+        started: subprocess.Popen[str]
         try:
-            stdout, stderr = started.communicate(timeout=_DRAIN_TIMEOUT_S)
+            # Both isolation flags are passed explicitly rather than unpacked
+            # from a dict, which keeps the Popen overload resolvable for the
+            # type checker. start_new_session is a no-op on Windows and the
+            # creation flag is a no-op on POSIX; together they make the child's
+            # tree killable.
+            started = subprocess.Popen(
+                wrapped,
+                cwd=str(cwd),
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                preexec_fn=sandbox.resource_limit_preexec(),
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            )
+        except (OSError, ValueError) as exc:
+            return CommandOutcome(exit_code=None, start_error=f"cannot run {argv[0]!r}: {exc}")
+        try:
+            stdout, stderr = started.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            stdout, stderr = "", ""
+            platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+            try:
+                stdout, stderr = started.communicate(timeout=_DRAIN_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            return CommandOutcome(
+                exit_code=None,
+                stdout=_cap(stdout),
+                stderr=_cap(stderr),
+                timed_out=True,
+            )
         return CommandOutcome(
-            exit_code=None,
+            exit_code=started.returncode,
             stdout=_cap(stdout),
             stderr=_cap(stderr),
-            timed_out=True,
         )
-    return CommandOutcome(
-        exit_code=started.returncode,
-        stdout=_cap(stdout),
-        stderr=_cap(stderr),
-    )
+    finally:
+        # The chokepoint hands back a temp launcher / sandbox profile and makes
+        # unlinking it the caller's job. A stage runs one command per pipeline
+        # step, so dropping it leaks a file per command until the stale sweep.
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
 
 
 class StageExecutor:
