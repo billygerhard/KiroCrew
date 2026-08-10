@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 53 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 56 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -102,6 +102,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Run context substitution including base branch so gates can compare against base; gate name, severity, exit status and captured output audited and displayed on the run; bundled presets for tests, coverage thresholds, lint and type checks; no gates configured is recorded, not an error
     - _Requirements: 13.23, 29.1, 29.2, 29.3, 29.4, 29.5, 29.6, 29.7, 29.8_
 
+  - [ ] 7.7 Prerequisite checks and safe failure
+    - Read-only, zero-token per-project preflight: programs required by configured commands resolve, provider transports reach, base branch exists, protected set valid, notification channel resolves, budget ceiling present for each enabled level above authoring
+    - Unmet prerequisite for a run's level refuses the run with the specific gap; unmet prerequisite for a watch source stops its dispatch and reports rather than dispatching runs that cannot finish; blocked runs and dispatches audited
+    - _Requirements: 32.1, 32.3, 32.4, 32.5, 32.6_
+
 - [ ] 8. Watchers and dispatch
   - [ ] 8.1 Command-based watch sources and zero-token polling
     - Sources defined as poll command plus field mapping (identifier, title, body, state, address, classification, submitter); disabled by default with per-source enablement
@@ -169,6 +174,10 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 12.3 Configuration surface, cost display, and kill switch
     - Config UI for autonomy, workflow commands, watch sources, role assignments, notification channels; every setting shows effective value and origin; per-run credit consumption on queue entries and detail views; kill-switch control
     - _Requirements: 12.4, 12.5, 24.6_
+  - [ ] 12.5 Prerequisites and preset surfaces
+    - Per-project prerequisite panel stating each unmet check and the action that resolves it; per-stage display of whether commands come from the selected preset or a project override
+    - _Requirements: 32.2, 33.6_
+
   - [ ] 12.4 Replace the Spec Builder builtin
     - New app replaces spec-builder as the single spec surface; specs created by the prior app remain valid artifacts
     - _Requirements: 12.6_
@@ -180,6 +189,10 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 13.2 Bundled presets
     - GitHub/GitLab watch source presets, git-with-PR and local-only workflow presets, quality-first and budget cost profiles, bundled screening guidance
     - _Requirements: 10.8, 13.10, 15.4_
+  - [ ] 13.4 Preset library and organization overrides
+    - Named bundled Workflow_Presets (git + pull request, git + merge request, local-only) and matching public watch sources, treated as read-only; project selects a preset and overrides individual stage commands; user-defined named presets selectable identically; no preset for a non-public review or tracking system ships
+    - _Requirements: 33.1, 33.2, 33.3, 33.4, 33.5_
+
   - [ ] 13.3 Provider_Interface and public build posture
     - Pluggable requirements analysis, model catalog, review policy, and watch sources with bundled local defaults; enhanced providers surface degraded status without changing the tool surface
     - No internal dependencies in the default build; all spec processing local; telemetry off by default and content-free when enabled
@@ -188,8 +201,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 - [ ] 14. Setup assistant
   - [ ] 14.1 Agent-assisted setup flow
     - Inspect KiroCrew memory, steering files, docs, and CI/build configs to infer workflow, watch sources, and tooling; present each inference with evidence; ask conversationally for what cannot be inferred; operate from project files alone when memory is absent
-    - Write through the validated config path on approval; ask (never infer) the Cost_Profile; per-level confirmation for execution, delivery, and integration
-    - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 15.7_
+    - Write through the validated config path on approval; ask (never infer) the Cost_Profile; per-level confirmation for execution, delivery, and integration; offer applicable Workflow_Presets and run the prerequisite checks, reporting each unmet check with its resolving action
+    - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7, 15.7_
 
 - [ ] 15. Headless run driver and notifications
   - [ ] 15.1 Session seeder
@@ -244,10 +257,10 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   {"id": 0, "tasks": ["1.1", "1.2", "2.1", "2.2", "3.1"]},
   {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
   {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
-  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "8.3", "9.1", "15.2", "17.3"]},
+  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "7.7", "8.3", "9.1", "15.2", "17.3"]},
   {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5"]},
-  {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3"]},
-  {"id": 6, "tasks": ["12.2", "12.3", "14.1", "16.1"]},
+  {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3", "13.4"]},
+  {"id": 6, "tasks": ["12.2", "12.3", "12.5", "14.1", "16.1"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}
 ]}
 ```

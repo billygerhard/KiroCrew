@@ -25,6 +25,8 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Prerequisite_Check**: A read-only check that a configured project can actually run: required programs resolve, provider transports reach, the base branch exists, the protected set is valid, notifications resolve, and an autonomous level has a budget ceiling.
+- **Workflow_Preset**: A named, bundled or user-defined Delivery_Workflow or watch-source definition that a project selects and may override per stage or per field.
 - **Capability_Provider**: The implementation bound to a delegable capability, resolved from configuration to one of three transports: builtin (the app's own implementation), mcp (an MCP server invoked as a child process), or command (a program invoked with structured input and output).
 - **Delegable_Capability**: A capability whose implementation may be provided externally: analysis, document authoring, review verdicts, task implementation, supplementary validation rules, watch sources, and model catalogs.
 - **Engine_Floor**: The capabilities that are never delegable and always execute in the engine: native-format validation, phase gate enforcement, Autonomy_Policy resolution, budget enforcement, the dispatch claim ledger, and the audit log.
@@ -229,6 +231,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. WHERE prior KiroCrew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
 5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI.
 6. THE Setup_Assistant SHALL propose the authoring level as the Autonomy_Policy floor, and SHALL NOT enable the execution, delivery, or integration levels without explicit user confirmation of each level being enabled.
+7. WHEN the interactive setup runs, THE Setup_Assistant SHALL offer the applicable Workflow_Presets, SHALL run the Prerequisite_Checks for the proposed configuration, and SHALL report each unmet prerequisite with the action that resolves it.
 ### Requirement 15: Per-project cost profiles for models and effort
 
 **User Story:** As a user who pays differently in different contexts, I want model, effort, and concurrency defaults bundled into selectable per-project profiles, so that a work project can maximize quality while a personal project strictly minimizes spend.
@@ -451,3 +454,28 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 6. THE builtin model catalog provider SHALL resolve the available models from the host.
 7. THE Spec_App SHALL ship no supplementary validation rules, and native-format validation in the Engine_Floor SHALL be the validation baseline.
 8. THE Spec_Builder_UI SHALL identify each capability's bound provider as builtin or external, and SHALL identify each builtin as deterministic or model-backed.
+### Requirement 32: Prerequisite checks and safe failure
+
+**User Story:** As a user configuring autonomy, I want to see what my project still needs before anything runs, so that a misconfiguration is reported up front instead of failing halfway through an unattended run.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL define a Prerequisite_Check set per project covering the programs required by configured commands, reachability of configured Capability_Provider transports, existence of the configured base branch, validity of the protected branch set, resolvability of the notification channel, and presence of a budget ceiling for each enabled autonomy level above authoring.
+2. THE Spec_Builder_UI SHALL display each project's Prerequisite_Check results, and for every unmet check SHALL state what is missing and the action that resolves it.
+3. IF a Prerequisite_Check required by a run's autonomy level is unmet, THEN THE Spec_App SHALL NOT start the run at that level and SHALL report the unmet prerequisite instead.
+4. WHILE a Prerequisite_Check for a watch source is unmet, THE Watcher_Dispatcher SHALL stop dispatching for that source and SHALL report the unmet prerequisite rather than dispatching runs that cannot complete.
+5. THE Prerequisite_Checks SHALL be read-only and SHALL consume zero model credits.
+6. WHEN an unmet Prerequisite_Check prevents a run or a dispatch, THE Spec_Engine SHALL record it in the audit log.
+
+### Requirement 33: Workflow presets and organization overrides
+
+**User Story:** As a user whose organization uses its own review system, I want to start from a bundled preset and override only the stages that differ, so that I do not have to define a whole workflow to fit my tooling.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL bundle named Workflow_Presets for a git repository with pull requests, a git repository with merge requests, and a local-only build, and SHALL bundle watch-source presets for the same public hosts.
+2. THE Spec_App SHALL NOT bundle presets for non-public review or tracking systems.
+3. THE configuration SHALL allow a project to select a Workflow_Preset and to override individual stage commands, so that an organization's own review system can replace a stage without redefining the workflow.
+4. THE configuration SHALL allow user-defined named Workflow_Presets that are selectable in the same way as bundled presets.
+5. THE Spec_App SHALL treat bundled presets as read-only, and selection and overrides SHALL live in project configuration.
+6. THE Spec_Builder_UI SHALL display, for each stage, whether its commands come from the selected preset or from a project override.
