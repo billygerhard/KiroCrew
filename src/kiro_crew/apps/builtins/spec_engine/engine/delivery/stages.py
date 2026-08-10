@@ -164,7 +164,26 @@ def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcom
     a kernel-enforced ceiling is what keeps a runaway child from taking the host
     down with it.
     """
-    wrapped, child_env, _profile = sandbox.sandboxed_spawn_argv(list(argv))
+    wrapped, child_env, cleanup = sandbox.sandboxed_spawn_argv(list(argv))
+    try:
+        return _spawn_and_wait(wrapped, argv, cwd=cwd, timeout_s=timeout_s, env=child_env)
+    finally:
+        # The chokepoint hands back a temp launcher / sandbox profile and makes
+        # unlinking it the caller's job. A stage runs once per command per run,
+        # so dropping it would leak a file per command until the stale sweep.
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
+
+
+def _spawn_and_wait(
+    wrapped: list[str],
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_s: int,
+    env: dict[str, str],
+) -> CommandOutcome:
+    """Spawn an already-wrapped argv and collect its bounded output."""
     started: subprocess.Popen[str]
     try:
         # Both isolation flags are passed explicitly rather than unpacked from a
@@ -174,7 +193,7 @@ def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcom
         started = subprocess.Popen(
             wrapped,
             cwd=str(cwd),
-            env=child_env,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
