@@ -6,28 +6,28 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 
 ## Tasks
 
-- [ ] 1. Core gateway enablers (prerequisite PR to kiro_crew)
-  - [ ] 1.1 Extend approval grants to app-seeded sessions
+- [x] 1. Core gateway enablers (prerequisite PR to kiro_crew)
+  - [x] 1.1 Extend approval grants to app-seeded sessions
     - Generalize the cron `approval_mode` grant shape so an app manifest declares a wanted posture, configuration grants it, and the gateway applies it to sessions the app seeds
     - Refuse or halt a run whose applied posture does not match the grant; no runtime path can elevate a session's own posture
     - _Requirements: 7.1, 7.2, 7.4_
-  - [ ] 1.2 Builtin MCP vending regression test
+  - [x] 1.2 Builtin MCP vending regression test
     - Regression test proving a builtin-declared MCP server and skill reach a Host_Agent session's tool surface; fix the stale contrary comment in the Spec Builder backend
     - Registration failure completes install but reports a not-ready state with the reason
     - _Requirements: 4.3, 4.4_
 
-- [ ] 2. Engine foundations
-  - [ ] 2.1 Config module with bundled defaults and effective-value resolution
+- [x] 2. Engine foundations
+  - [x] 2.1 Config module with bundled defaults and effective-value resolution
     - Schema for app/project/source config; bundled default values for every numeric limit; absent optional settings resolve to defaults without failing
     - Effective-value API returning value plus origin (bundled default vs explicit); single validated write path for all config surfaces
     - _Requirements: 24.3, 24.5_
-  - [ ] 2.2 SQLite state store, per-spec locking, and audit log
+  - [x] 2.2 SQLite state store, per-spec locking, and audit log
     - Tables: specs, approvals, runs, claims, workspaces, queue; per-spec lock rows rejecting conflicting concurrent writers with current state
     - Engine state lives entirely outside spec directories; persistence failure fails the operation and never writes state into a spec document; append-only per-spec audit JSONL
     - _Requirements: 2.6, 1.6, 1.7_
 
 - [ ] 3. Validator
-  - [ ] 3.1 Native-format document validator
+  - [x] 3.1 Native-format document validator
     - Implement the native Kiro format rules (sections, EARS shape, numbering, checkbox syntax) returning every violation with file, location, and rule identifier
     - _Requirements: 1.1, 1.2_
   - [ ] 3.2 Task links, requirement coverage, and DAG validation
