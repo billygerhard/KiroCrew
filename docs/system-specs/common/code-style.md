@@ -40,6 +40,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
 | Managed MCP server specs | `agent.py` | `_MANAGED_MCP_SERVERS`: which servers are auto-registered and refreshed while preserving user customizations. |
 | Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`. |
+| Spec engine limits | `apps/builtins/spec_engine/engine/config/settings.py` | The `SETTINGS` registry: every concurrency cap, retry and cycle limit, phase and command timeout, budget ceiling and watch interval, each with its bundled default and the scopes it may be overridden at. A limit that is not in the registry cannot be written or read, so this table is the whole vocabulary. |
 
 Other style rules:
 
