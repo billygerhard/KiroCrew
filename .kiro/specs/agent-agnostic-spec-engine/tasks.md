@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 52 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 53 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -223,6 +223,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Deterministic structural checks: glossary terms used but undefined, unquantified qualifiers, criteria that are not independently testable, requirements with no covering task, overlapping or contradictory criteria within a requirement
     - Emit the shared Analysis_Findings schema with generated clarifying questions (choices, consequences, recommended answer); declare depth as structural; no network, zero model credits
     - _Requirements: 27.1, 27.2, 27.3, 27.4, 27.5_
+  - [ ] 17.5 Builtin provider bindings
+    - Register the engine's own paths as the builtin providers for authoring (seeded turn behind validation and the phase gate), review (seeded verdict turn with review and test-quality criteria), implementation (per-task subagent dispatch), and model catalog (host resolution)
+    - Bind the bundled GitHub/GitLab watch presets, marking a source unhealthy with the missing program name when its command-line dependency is absent; ship no supplementary validation rules; UI identifies each capability's provider as builtin or external and each builtin as deterministic or model-backed
+    - _Requirements: 31.1, 31.2, 31.3, 31.4, 31.5, 31.6, 31.7, 31.8_
+
   - [ ] 17.3 Conformance runner
     - Per-capability conformance runner over bundled fixtures (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared coverage, timeout honoring and repeatability; every builtin provider passes its own suite
     - _Requirements: 26.15, 27.6_
@@ -240,7 +245,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
   {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
   {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "8.3", "9.1", "15.2", "17.3"]},
-  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1"]},
+  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5"]},
   {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3"]},
   {"id": 6, "tasks": ["12.2", "12.3", "14.1", "16.1"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}

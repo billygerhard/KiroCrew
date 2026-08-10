@@ -437,3 +437,17 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 2. IF a task's tests fail the test quality criteria, THEN THE Orchestrator SHALL treat the verdict as requiring changes.
 3. WHERE a mutation probe command is configured as a Quality_Gate, THE Delivery_Pipeline SHALL run it and treat a suite that still passes under mutation as a gate failure.
 4. WHEN a review verdict reports test quality findings, THE Spec_Engine SHALL record them in the run's audit log.
+### Requirement 31: Shipped builtin providers
+
+**User Story:** As a user of a default install, I want to know exactly what each builtin provider does, so that no capability is a stub and I can tell when I would want to bind an external provider.
+
+#### Acceptance Criteria
+
+1. THE builtin analysis provider SHALL be the Local_Analyzer.
+2. THE builtin authoring provider SHALL seed a turn with the Spec_App's authoring guidance and SHALL rely on native-format validation and the phase gate to accept or reject the produced documents.
+3. THE builtin review provider SHALL seed a review turn using the review role's assignment, SHALL apply the review and test quality criteria, and SHALL return a verdict.
+4. THE builtin implementation provider SHALL dispatch a subagent per leaf task with the spec context, wave ordering, and retry policy.
+5. THE builtin watch source providers SHALL be the bundled GitHub and GitLab command presets, and IF a preset's required command-line program is unavailable, THEN THE Watcher_Dispatcher SHALL mark that source unhealthy and report the missing program rather than reporting no items.
+6. THE builtin model catalog provider SHALL resolve the available models from the host.
+7. THE Spec_App SHALL ship no supplementary validation rules, and native-format validation in the Engine_Floor SHALL be the validation baseline.
+8. THE Spec_Builder_UI SHALL identify each capability's bound provider as builtin or external, and SHALL identify each builtin as deterministic or model-backed.
