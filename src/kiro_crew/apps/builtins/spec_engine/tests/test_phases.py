@@ -35,7 +35,6 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     APPROVAL_RECORDED_EVENT,
     APPROVAL_STALED_EVENT,
     CONTENT_HASH_PREFIX,
-    DOCUMENT_PLANS,
     PHASE_ADVANCE_REFUSED_EVENT,
     REASON_ALREADY_FINAL,
     REASON_APPROVAL_MISSING,
@@ -54,6 +53,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     recorded_spec_type,
     sync_staleness,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.spec_types import SpecType
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecLocked, SpecRef, StateStore
 
 from .conftest import spec_dir_snapshot
@@ -138,9 +138,15 @@ def approve_gates(store: StateStore, ref: SpecRef, *gates: str, actor: str = "us
 # --- The document plan -----------------------------------------------------
 
 
-def test_every_spec_type_declares_a_document_plan():
-    """A type with no plan would be a spec the engine cannot gate at all."""
-    assert set(DOCUMENT_PLANS) == {"feature", "bugfix", "quick"}
+def test_the_document_plan_comes_from_the_spec_type_table():
+    """One table of plans in the engine, and this is the phase machine's view.
+
+    A second table here would be a place for the gates to disagree with what
+    validation and authoring apply to the same spec.
+    """
+    for spec_type in SpecType:
+        assert document_plan(spec_type.value) == spec_type.plan.kinds
+
     assert document_plan("quick") == (DocumentKind.REQUIREMENTS, DocumentKind.TASKS)
     assert DocumentKind.DESIGN not in document_plan("quick")
     assert document_plan(None) == ()
@@ -223,14 +229,33 @@ def test_derivation_does_not_register_a_spec_it_has_never_seen(live_store, live_
     assert live_store.list_specs(include_archived=True) == []
 
 
-def test_a_recorded_spec_type_wins_over_the_sidecar(live_store, live_ref):
-    """The store is where this engine records what it created."""
-    assert recorded_spec_type(live_store, live_ref) == "feature"
+def test_the_sidecar_wins_over_a_disagreeing_store_row(live_store, live_ref):
+    """The sidecar records the type; the store's column only mirrors it.
+
+    The IDE or a user can retype a spec by editing the sidecar, leaving the row
+    behind. Reading the row would derive the other type's plan -- the wrong
+    gates, and with them the wrong advancement decision.
+    """
+    assert recorded_spec_type(live_ref) == "feature"
     live_store.register_spec(live_ref, spec_type="quick")
 
-    assert recorded_spec_type(live_store, live_ref) == "quick"
+    assert recorded_spec_type(live_ref) == "feature"
     gates = [gate.gate for gate in derive_phase(live_store, live_ref).gates]
-    assert gates == ["requirements", "tasks"]
+    assert gates == ["requirements", "design", "tasks"]
+
+
+def test_a_store_row_cannot_supply_a_type_the_sidecar_does_not_record(tmp_path, live_store):
+    """A mirror of a type nobody recorded is not a document plan."""
+    project = write_spec(tmp_path / "mirror-only", spec_type=None)
+    ref = SpecRef.of(project, SPEC_NAME)
+    live_store.register_spec(ref, spec_type="feature")
+
+    assert recorded_spec_type(ref) is None
+    assert derive_phase(live_store, ref).is_untyped
+
+    result = advance(live_store, ref, actor="user:ada")
+    assert not result.ok
+    assert result.reason_codes == (REASON_SPEC_TYPE_UNRECORDED,)
 
 
 def test_a_spec_with_no_recorded_type_derives_untyped(tmp_path, live_store):
@@ -299,10 +324,11 @@ def test_approving_a_document_that_fails_validation_is_refused(tmp_path, live_st
     assert live_store.list_approvals(ref) == []
 
 
-def test_approving_a_gate_outside_the_plan_is_refused(live_store, live_ref):
-    live_store.register_spec(live_ref, spec_type="quick")
+def test_approving_a_gate_outside_the_plan_is_refused(tmp_path, live_store):
+    project = write_spec(tmp_path / "quick", spec_type="quick")
+    ref = SpecRef.of(project, SPEC_NAME)
 
-    outcome = approve(live_store, live_ref, "design", actor="user:ada")
+    outcome = approve(live_store, ref, "design", actor="user:ada")
 
     assert not outcome.ok
     assert [reason.code for reason in outcome.reasons] == [REASON_GATE_NOT_IN_PLAN]
@@ -417,6 +443,35 @@ def test_syncing_staleness_is_idempotent(live_project, live_store, live_ref):
 
     assert sync_staleness(live_store, live_ref) == ("requirements",)
     assert sync_staleness(live_store, live_ref) == ()
+
+
+def test_reverting_to_the_approved_bytes_does_not_revive_the_approval(
+    live_project, live_store, live_ref
+):
+    """A recorded staleness outlives an undo of the edit that caused it.
+
+    The approval was given without sight of the intervening edit, so a gate that
+    a well-chosen revert reopens is a gate worth nothing. Note what this pins: the
+    reverted document hashes to exactly what was approved, so comparing hashes
+    alone would call the approval fresh again -- only the persisted flag keeps it
+    stale.
+    """
+    approve_gates(live_store, live_ref, "requirements")
+    path = live_ref.spec_dir / DocumentKind.REQUIREMENTS.filename
+    approved_bytes = path.read_text(encoding="utf-8")
+
+    edit(live_project, DocumentKind.REQUIREMENTS)
+    assert sync_staleness(live_store, live_ref) == ("requirements",)
+
+    path.write_text(approved_bytes, encoding="utf-8")
+
+    approval = live_store.get_approval(live_ref, "requirements")
+    assert approval.doc_hash == content_hash(approved_bytes)
+    assert derive_phase(live_store, live_ref).stale_gates == ("requirements",)
+
+    result = advance(live_store, live_ref, actor="user:ada", gate="requirements")
+    assert not result.ok
+    assert REASON_APPROVAL_STALE in result.reason_codes
 
 
 def test_a_staled_approval_is_recorded_in_the_audit_log(live_project, live_store, live_ref, log):
@@ -554,10 +609,11 @@ def test_advancing_a_spec_with_no_recorded_type_is_refused(tmp_path, live_store)
     assert result.reason_codes == (REASON_SPEC_TYPE_UNRECORDED,)
 
 
-def test_advancing_a_gate_outside_the_plan_is_refused(live_store, live_ref):
-    live_store.register_spec(live_ref, spec_type="quick")
+def test_advancing_a_gate_outside_the_plan_is_refused(tmp_path, live_store):
+    project = write_spec(tmp_path / "quick", spec_type="quick")
+    ref = SpecRef.of(project, SPEC_NAME)
 
-    result = advance(live_store, live_ref, actor="agent", gate="design")
+    result = advance(live_store, ref, actor="agent", gate="design")
 
     assert not result.ok
     assert result.reason_codes == (REASON_GATE_NOT_IN_PLAN,)

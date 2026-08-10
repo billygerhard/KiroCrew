@@ -43,7 +43,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 from .conftest import spec_dir_snapshot
-from .test_phases import EDIT_MARKER, SPEC_NAME, live_document_text
+from .test_phases import EDIT_MARKER, SPEC_NAME, live_document_text, write_spec
 
 #: Examples per property. Each one runs several SQLite transactions and rewrites
 #: documents on disk, so this trades a little coverage for a suite that still
@@ -104,15 +104,11 @@ class TestPhaseGateSoundness:
         self, tmp_path: Path, actions: list[tuple[str, DocumentKind]]
     ) -> None:
         example = tmp_path / uuid.uuid4().hex
-        project = example / "project"
+        project = write_spec(example / "project", spec_type=_SPEC_TYPE)
         spec_dir = project / ".kiro" / "specs" / SPEC_NAME
-        spec_dir.mkdir(parents=True)
         model = _Model()
         for kind in DocumentKind:
-            text = live_document_text(kind)
-            (spec_dir / kind.filename).write_text(text, encoding="utf-8")
-            model.texts[kind] = text
-        (spec_dir / ".config.kiro").write_text("{}", encoding="utf-8")
+            model.texts[kind] = live_document_text(kind)
 
         plan = document_plan(_SPEC_TYPE)
         store = StateStore(root=example / "state")

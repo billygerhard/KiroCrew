@@ -10,6 +10,13 @@ would make the phase a property of who looked last, and the state store says as
 much about its ``phase`` column -- it is a cache of this derivation, never an
 authority.
 
+**The document plan comes from the sidecar, through one table.** Which gates a
+spec has follows from its recorded type, and that type is read from the
+``.config.kiro`` sidecar by :mod:`.spec_types`, whose plans this module does not
+restate. Both the recorded type and the plan it implies are resolved there, so
+the phase machine cannot come to a different answer about the same spec than
+validation or authoring did.
+
 **A refused advancement says why.** :func:`advance` returns every reason it
 refused, and a reason caused by an invalid document carries the validator's own
 rule identifiers. A gate that answers only "no" makes the caller guess, and an
@@ -32,30 +39,20 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from types import MappingProxyType
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Sequence
 
+from . import spec_types
 from .audit import AuditLog
-from .config.schema import SPEC_TYPES
 from .documents import DocumentKind
 from .findings import ValidationReport
 from .native_format import validate_document_text
 from .state import ApprovalRecord, SpecLock, SpecRef, StateStore
 
 logger = logging.getLogger(__name__)
-
-#: The native sidecar, read only as a fallback when the state store holds no
-#: recorded type: a spec authored by the IDE has a sidecar and no state row, and
-#: refusing to derive its phase would make the engine blind to existing work.
-SIDECAR_FILENAME = ".config.kiro"
-
-#: The sidecar key naming the spec's document plan.
-SIDECAR_TYPE_KEY = "specType"
 
 #: Prefix on a stored content hash, so a stored value declares its own algorithm
 #: and a future change can be told apart from the current one rather than
@@ -84,21 +81,6 @@ class Phase(str, Enum):
     def of(cls, kind: DocumentKind) -> "Phase":
         return cls(kind.value)
 
-
-#: The ordered gates of each spec type. ``bugfix`` shares the feature plan's
-#: files because it differs in what the documents say, not in which exist;
-#: ``quick`` drops the design document entirely.
-_DOCUMENT_PLANS: dict[str, tuple[DocumentKind, ...]] = {
-    "feature": (DocumentKind.REQUIREMENTS, DocumentKind.DESIGN, DocumentKind.TASKS),
-    "bugfix": (DocumentKind.REQUIREMENTS, DocumentKind.DESIGN, DocumentKind.TASKS),
-    "quick": (DocumentKind.REQUIREMENTS, DocumentKind.TASKS),
-}
-
-DOCUMENT_PLANS: Mapping[str, tuple[DocumentKind, ...]] = MappingProxyType(_DOCUMENT_PLANS)
-
-_UNPLANNED_TYPES = frozenset(SPEC_TYPES) - frozenset(_DOCUMENT_PLANS)
-if _UNPLANNED_TYPES:  # pragma: no cover - a plan lands with its spec type
-    raise RuntimeError("spec types without a document plan: " + ", ".join(sorted(_UNPLANNED_TYPES)))
 
 # --- Refusal identifiers ---------------------------------------------------
 # Stable, like the validator's rule identifiers: a driver routes on them, the
@@ -143,10 +125,18 @@ def content_hash(text: str) -> str:
 
 
 def document_plan(spec_type: str | None) -> tuple[DocumentKind, ...]:
-    """The ordered gates of *spec_type*, or an empty plan when it has none."""
-    if spec_type is None:
+    """The ordered gates of *spec_type*, or an empty plan when it has none.
+
+    The plans themselves live with the spec types, so there is one table of them
+    in the engine rather than one per module that consults it. This is the phase
+    machine's view of that table: it answers with an empty plan for a type it
+    cannot place, because a caller only asking where a spec sits gets ``UNTYPED``
+    rather than an exception.
+    """
+    parsed = spec_types.SpecType.parse(spec_type)
+    if parsed is None:
         return ()
-    return _DOCUMENT_PLANS.get(spec_type, ())
+    return parsed.plan.kinds
 
 
 def read_document(spec_dir: Path, kind: DocumentKind) -> str | None:
@@ -168,34 +158,24 @@ def read_document(spec_dir: Path, kind: DocumentKind) -> str | None:
     return text if text.strip() else None
 
 
-def recorded_spec_type(store: StateStore, ref: SpecRef) -> str | None:
-    """The spec's recorded type: the state store first, then the native sidecar.
+def recorded_spec_type(ref: SpecRef) -> str | None:
+    """The spec's recorded type, read from the native ``.config.kiro`` sidecar.
 
-    The store wins because it is where this engine records a type it created. The
-    sidecar is the fallback for a spec some other native tool created, which has
-    a plan even though this engine never wrote its row.
+    The sidecar is the record, so it is the only thing consulted here. The state
+    store's ``spec_type`` column is a mirror kept for listing and reporting: when
+    the two disagree -- the IDE or a user retyped the spec, and the row is left
+    over from before -- reading the mirror would derive the wrong document plan,
+    and with it the wrong gates and the wrong advancement decision.
+
+    ``None`` means the spec has no type this engine can act on, which is what
+    turns into a refusal rather than a guessed default. A row in the store does
+    not rescue that: a plan the spec never declared is not a plan.
     """
-    record = store.get_spec(ref)
-    if record is not None and record.spec_type:
-        return record.spec_type
-    return _sidecar_spec_type(ref.spec_dir)
-
-
-def _sidecar_spec_type(spec_dir: Path) -> str | None:
-    path = spec_dir / SIDECAR_FILENAME
     try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        return spec_types.recorded_spec_type(ref.spec_dir).value
+    except spec_types.SpecTypeUnrecorded as exc:
+        logger.debug("no usable spec type for %s: %s", ref.spec_dir, exc.reason)
         return None
-    try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("could not parse the spec sidecar at %s", path)
-        return None
-    if not isinstance(loaded, dict):
-        return None
-    value = loaded.get(SIDECAR_TYPE_KEY)
-    return value if isinstance(value, str) and value else None
 
 
 @dataclass(frozen=True)
@@ -381,7 +361,7 @@ def derive_phase(store: StateStore, ref: SpecRef, *, spec_type: str | None = Non
     whether its documents pass validation is asserted at the gate, by
     :func:`advance`, where a refusal can carry the violations.
     """
-    resolved_type = spec_type if spec_type is not None else recorded_spec_type(store, ref)
+    resolved_type = spec_type if spec_type is not None else recorded_spec_type(ref)
     plan = document_plan(resolved_type)
     if not plan:
         return PhaseState(ref=ref, spec_type=resolved_type, phase=Phase.UNTYPED, gates=())
@@ -412,10 +392,16 @@ def derive_phase(store: StateStore, ref: SpecRef, *, spec_type: str | None = Non
 def _is_stale(approval: ApprovalRecord | None, digest: str | None) -> bool:
     """Whether *approval* still covers the document hashing to *digest*.
 
-    A persisted stale flag is sticky. Reverting a document to the exact bytes
-    that were approved would make the hashes agree again, but the approval was
-    given without sight of the intervening edit, and re-approval is cheap next to
-    a gate that can be reopened by a well-chosen undo.
+    A persisted stale flag is sticky: once :func:`sync_staleness` or
+    :func:`advance` has recorded that a document moved, reverting it to the exact
+    bytes that were approved makes the hashes agree again but does not revive the
+    approval, which was given without sight of the intervening edit. Re-approval
+    is cheap next to a gate that can be reopened by a well-chosen undo.
+
+    Stickiness reaches only as far as what was observed. An edit made and undone
+    with no derivation persisting the flag in between leaves the document hashing
+    to what was approved, and nothing here can tell that apart from a document
+    nobody touched -- hash comparison is the only evidence there is.
     """
     if approval is None:
         return False
