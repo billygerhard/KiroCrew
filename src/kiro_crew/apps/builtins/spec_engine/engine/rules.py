@@ -86,6 +86,52 @@ TASK_PARENT_UNKNOWN = "native.tasks.parent-unknown"
 TASK_REFERENCE_MISSING = "native.tasks.requirements-ref-missing"
 #: An acceptance-criteria reference is not spelled as a native reference.
 TASK_REFERENCE_MALFORMED = "native.tasks.requirements-ref-malformed"
+#: A reference names a requirement that requirements.md does not declare.
+TASK_REFERENCE_REQUIREMENT_UNKNOWN = "native.tasks.requirements-ref-requirement-unknown"
+#: A reference names a criterion the referenced requirement does not declare.
+TASK_REFERENCE_CRITERION_UNKNOWN = "native.tasks.requirements-ref-criterion-unknown"
+
+# --- Coverage of requirements by tasks -------------------------------------
+
+#: No task claims any part of a requirement.
+COVERAGE_REQUIREMENT_UNCOVERED = "native.coverage.requirement-uncovered"
+#: A requirement is worked on, but one of its criteria is claimed by no task.
+COVERAGE_CRITERION_UNCOVERED = "native.coverage.criterion-uncovered"
+
+# --- Dependency graph ------------------------------------------------------
+
+#: The dependency-graph section carries no graph block.
+GRAPH_BLOCK_MISSING = "native.graph.block-missing"
+#: The graph block does not hold readable JSON.
+GRAPH_JSON_MALFORMED = "native.graph.json-malformed"
+#: The graph's top level is not an object declaring a list of waves.
+GRAPH_ROOT_INVALID = "native.graph.root-invalid"
+#: The graph declares no waves.
+GRAPH_WAVES_EMPTY = "native.graph.waves-empty"
+#: A wave entry is not an object carrying an identifier and a list of tasks.
+GRAPH_WAVE_INVALID = "native.graph.wave-invalid"
+#: Wave identifiers are not consecutive integers counting from zero.
+GRAPH_WAVE_ID_NOT_SEQUENTIAL = "native.graph.wave-id-not-sequential"
+#: A wave's task entry is not spelled as a task number.
+GRAPH_TASK_ID_MALFORMED = "native.graph.task-id-malformed"
+#: A wave schedules a task the plan does not declare.
+GRAPH_TASK_UNKNOWN = "native.graph.task-unknown"
+#: A wave schedules a task that only groups other tasks.
+GRAPH_TASK_NOT_LEAF = "native.graph.task-not-leaf"
+#: A task is scheduled in more than one wave.
+GRAPH_TASK_DUPLICATE = "native.graph.task-duplicate"
+#: An unfinished leaf task is scheduled in no wave.
+GRAPH_TASK_UNASSIGNED = "native.graph.task-unassigned"
+#: The declared dependencies are not an object mapping a task to its
+#: prerequisites.
+GRAPH_DEPENDENCIES_INVALID = "native.graph.dependencies-invalid"
+#: A declared dependency names a task the graph does not schedule.
+GRAPH_DEPENDENCY_UNKNOWN = "native.graph.dependency-unknown"
+#: A declared dependency does not sit in an earlier wave than the task needing
+#: it.
+GRAPH_DEPENDENCY_ORDER = "native.graph.dependency-order"
+#: The declared dependencies close a cycle, so no wave order can satisfy them.
+GRAPH_CYCLE = "native.graph.cycle"
 
 
 _DESCRIPTIONS: dict[str, str] = {
@@ -126,6 +172,33 @@ _DESCRIPTIONS: dict[str, str] = {
     TASK_REFERENCE_MALFORMED: (
         "An acceptance-criteria reference reads '_Requirements: <id>, <id>_'."
     ),
+    TASK_REFERENCE_REQUIREMENT_UNKNOWN: (
+        "A referenced requirement must be declared in requirements.md."
+    ),
+    TASK_REFERENCE_CRITERION_UNKNOWN: (
+        "A referenced criterion must be declared under its requirement."
+    ),
+    COVERAGE_REQUIREMENT_UNCOVERED: "Every requirement is claimed by at least one task.",
+    COVERAGE_CRITERION_UNCOVERED: "Every acceptance criterion is claimed by at least one task.",
+    GRAPH_BLOCK_MISSING: "The dependency-graph section holds a fenced JSON block.",
+    GRAPH_JSON_MALFORMED: "The dependency graph is readable JSON.",
+    GRAPH_ROOT_INVALID: "The dependency graph is an object with a 'waves' list.",
+    GRAPH_WAVES_EMPTY: "A dependency graph declares at least one wave.",
+    GRAPH_WAVE_INVALID: (
+        "A wave is an object with an integer 'id' and a non-empty 'tasks' list of strings."
+    ),
+    GRAPH_WAVE_ID_NOT_SEQUENTIAL: "Wave identifiers are consecutive integers counting from zero.",
+    GRAPH_TASK_ID_MALFORMED: "A scheduled task is named by its number, as in '1.2'.",
+    GRAPH_TASK_UNKNOWN: "A scheduled task must be declared in the tasks section.",
+    GRAPH_TASK_NOT_LEAF: "Waves schedule leaf tasks; a parent task is a grouping.",
+    GRAPH_TASK_DUPLICATE: "A task is scheduled in exactly one wave.",
+    GRAPH_TASK_UNASSIGNED: "Every unfinished leaf task is scheduled in exactly one wave.",
+    GRAPH_DEPENDENCIES_INVALID: (
+        "Declared dependencies map a task number to a list of task numbers."
+    ),
+    GRAPH_DEPENDENCY_UNKNOWN: "A dependency must name a task the graph schedules.",
+    GRAPH_DEPENDENCY_ORDER: "A dependency runs in an earlier wave than the task that needs it.",
+    GRAPH_CYCLE: "The dependency graph is acyclic.",
 }
 
 #: Rule identifier to a one-line statement of what the rule requires. Exposed so

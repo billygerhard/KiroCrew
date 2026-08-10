@@ -741,6 +741,8 @@ def test_every_emitted_rule_is_registered():
     that routes on it. Both are made deliberate by having to edit this list.
     """
     assert sorted(rules.ALL_RULES) == [
+        "native.coverage.criterion-uncovered",
+        "native.coverage.requirement-uncovered",
         "native.criterion.if-without-then",
         "native.criterion.keyword-missing",
         "native.criterion.shall-missing",
@@ -748,6 +750,21 @@ def test_every_emitted_rule_is_registered():
         "native.document.title-duplicate",
         "native.document.title-mismatch",
         "native.document.title-missing",
+        "native.graph.block-missing",
+        "native.graph.cycle",
+        "native.graph.dependencies-invalid",
+        "native.graph.dependency-order",
+        "native.graph.dependency-unknown",
+        "native.graph.json-malformed",
+        "native.graph.root-invalid",
+        "native.graph.task-duplicate",
+        "native.graph.task-id-malformed",
+        "native.graph.task-not-leaf",
+        "native.graph.task-unassigned",
+        "native.graph.task-unknown",
+        "native.graph.wave-id-not-sequential",
+        "native.graph.wave-invalid",
+        "native.graph.waves-empty",
         "native.heading.malformed",
         "native.requirements.criteria-empty",
         "native.requirements.criteria-section-missing",
@@ -769,8 +786,10 @@ def test_every_emitted_rule_is_registered():
         "native.tasks.number-duplicate",
         "native.tasks.number-missing",
         "native.tasks.parent-unknown",
+        "native.tasks.requirements-ref-criterion-unknown",
         "native.tasks.requirements-ref-malformed",
         "native.tasks.requirements-ref-missing",
+        "native.tasks.requirements-ref-requirement-unknown",
         "native.tasks.title-missing",
     ]
 

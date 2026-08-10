@@ -40,19 +40,25 @@ from .documents import (
 from .findings import Location, Severity, ValidationReport, Violation, build_report
 
 # --- Lexical shapes --------------------------------------------------------
+#
+# These are the format itself rather than this module's private business, so
+# they are public: :mod:`.structure` parses the same documents for the
+# cross-document checks, and a second definition of what a task item or a
+# criteria reference looks like would let a shape validate here and stay
+# invisible there.
 
 #: A fenced block opener or closer. Up to three leading spaces still fences, per
 #: the markdown the documents are written in.
-_FENCE_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
+FENCE_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 
 #: A well-formed ATX heading: one to six hashes, exactly one space, then text.
-_HEADING_RE = re.compile(r"^(?P<hashes>#{1,6}) (?P<text>\S.*?)\s*$")
+HEADING_RE = re.compile(r"^(?P<hashes>#{1,6}) (?P<text>\S.*?)\s*$")
 
 #: A heading that begins with a level-1..2 requirement heading number.
-_REQUIREMENT_HEADING_RE = re.compile(r"^Requirement +(?P<number>\d+) *:(?P<title>.*)$")
+REQUIREMENT_HEADING_RE = re.compile(r"^Requirement +(?P<number>\d+) *:(?P<title>.*)$")
 
 #: A numbered list item at the left margin, which is how criteria are written.
-_NUMBERED_ITEM_RE = re.compile(r"^(?P<number>\d+)\. +(?P<body>\S.*?)\s*$")
+NUMBERED_ITEM_RE = re.compile(r"^(?P<number>\d+)\. +(?P<body>\S.*?)\s*$")
 
 #: The user story line inside a requirement.
 _USER_STORY_RE = re.compile(r"^\*\*User Story:\*\* *(?P<body>.*?)\s*$")
@@ -79,29 +85,29 @@ _INVARIANT_OPENER = "FOR ALL"
 
 #: A native task item: zero-or-two-space indent, a dash, a single-character
 #: status box, one space, then the item.
-_TASK_ITEM_RE = re.compile(r"^(?P<indent> *)- \[(?P<mark>[ xX\-])\] (?P<rest>.*?)\s*$")
+TASK_ITEM_RE = re.compile(r"^(?P<indent> *)- \[(?P<mark>[ xX\-])\] (?P<rest>.*?)\s*$")
 
 #: Anything close enough to a checkbox to have been meant as one. Matching this
-#: but not :data:`_TASK_ITEM_RE` is what makes a malformed checkbox reportable
+#: but not :data:`TASK_ITEM_RE` is what makes a malformed checkbox reportable
 #: instead of silently invisible.
-_TASK_ITEM_LOOSE_RE = re.compile(
+TASK_ITEM_LOOSE_RE = re.compile(
     r"^(?P<indent>\s*)[-*+][ \t]*\[(?P<mark>[^\]\n]*)\][ \t]*(?P<rest>.*?)\s*$"
 )
 
 #: A task's leading number, with the trailing period optional. Real plans write
 #: the period on parent numbers and omit it on subtask numbers; both are the
 #: same number, so neither spelling is an error.
-_TASK_NUMBER_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)*)\.?(?: +(?P<title>.*))?$")
+TASK_NUMBER_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)*)\.?(?: +(?P<title>.*))?$")
 
 #: The acceptance-criteria reference that closes a leaf task.
-_TASK_REFERENCE_RE = re.compile(r"^ *- *_Requirements: *(?P<ids>[^_]*)_$")
+TASK_REFERENCE_RE = re.compile(r"^ *- *_Requirements: *(?P<ids>[^_]*)_$")
 
 #: How a reference to a single acceptance criterion is spelled.
-_REFERENCE_ID_RE = re.compile(r"^\d+(?:\.\d+)?$")
+REFERENCE_ID_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 #: Case-folded marker used to notice a reference line that is present but not
 #: spelled correctly, so a typo reports as malformed rather than as missing.
-_REFERENCE_MARKER = "_requirements:"
+REFERENCE_MARKER = "_requirements:"
 
 #: Indent widths that denote a native nesting level: a parent task and its leaf.
 _TASK_INDENTS: tuple[int, ...] = (0, 2)
@@ -110,9 +116,9 @@ _INDENT_PER_LEVEL = 2
 #: Deepest task number the format nests to: a parent and its leaf.
 _MAX_TASK_DEPTH = 2
 
-_HEADING_LEVEL_SECTION = 2
-_HEADING_LEVEL_REQUIREMENT = 3
-_HEADING_LEVEL_CRITERIA = 4
+HEADING_LEVEL_SECTION = 2
+HEADING_LEVEL_REQUIREMENT = 3
+HEADING_LEVEL_CRITERIA = 4
 
 #: Location used for a violation about the document as a whole, such as a
 #: section that is absent and therefore has no line of its own.
@@ -200,7 +206,7 @@ def _scan(text: str, collector: _Collector) -> tuple[list[_Line], list[_Heading]
 
     for number, raw in enumerate(text.splitlines(), start=1):
         line = raw.rstrip()
-        fence_match = _FENCE_RE.match(line)
+        fence_match = FENCE_RE.match(line)
         if fence is not None:
             # Only a run of the same character, at least as long as the opener,
             # closes the fence; a shorter or different run is block content.
@@ -214,7 +220,7 @@ def _scan(text: str, collector: _Collector) -> tuple[list[_Line], list[_Heading]
             continue
 
         if line.lstrip().startswith("#") and line.startswith("#"):
-            heading_match = _HEADING_RE.match(line)
+            heading_match = HEADING_RE.match(line)
             if heading_match is None:
                 collector.add(
                     rules.HEADING_MALFORMED,
@@ -296,7 +302,7 @@ def _check_sections(
     """Report on the required level-2 sections and index every section found."""
     found: dict[str, list[_Heading]] = {}
     for heading in headings:
-        if heading.level == _HEADING_LEVEL_SECTION:
+        if heading.level == HEADING_LEVEL_SECTION:
             found.setdefault(heading.normalized, []).append(heading)
 
     for required in REQUIRED_SECTIONS[kind]:
@@ -375,7 +381,7 @@ def _check_criteria(
 ) -> None:
     criteria_headings = [
         h
-        for h in _headings_within(headings, requirement.index, end, _HEADING_LEVEL_CRITERIA)
+        for h in _headings_within(headings, requirement.index, end, HEADING_LEVEL_CRITERIA)
         if h.normalized == normalize_heading(ACCEPTANCE_CRITERIA_HEADING)
     ]
     if not criteria_headings:
@@ -390,7 +396,7 @@ def _check_criteria(
     heading = criteria_headings[0]
     expected = 1
     for line in _body(lines, heading, _span_end(headings, heading, end)):
-        item = _NUMBERED_ITEM_RE.match(line.text)
+        item = NUMBERED_ITEM_RE.match(line.text)
         if item is None:
             continue
         if int(item.group("number")) != expected:
@@ -455,11 +461,11 @@ def _check_requirements_body(
         return
 
     section_end = _span_end(headings, section, len(lines))
-    candidates = _headings_within(headings, section.index, section_end, _HEADING_LEVEL_REQUIREMENT)
+    candidates = _headings_within(headings, section.index, section_end, HEADING_LEVEL_REQUIREMENT)
 
     position = 0
     for heading in candidates:
-        match = _REQUIREMENT_HEADING_RE.match(heading.text)
+        match = REQUIREMENT_HEADING_RE.match(heading.text)
         if match is None:
             collector.add(
                 rules.REQUIREMENT_HEADING_MALFORMED,
@@ -506,9 +512,9 @@ def _parse_task_item(line: _Line, index: int, collector: _Collector) -> tuple[st
     Returns ``None`` when the line carries no usable number, which is reported
     on its own and leaves nothing for the numbering checks to work with.
     """
-    match = _TASK_ITEM_RE.match(line.text)
+    match = TASK_ITEM_RE.match(line.text)
     if match is None:
-        match = _TASK_ITEM_LOOSE_RE.match(line.text)
+        match = TASK_ITEM_LOOSE_RE.match(line.text)
         if match is None:
             return None
         collector.add(
@@ -528,7 +534,7 @@ def _parse_task_item(line: _Line, index: int, collector: _Collector) -> tuple[st
         )
 
     rest = match.group("rest")
-    number_match = _TASK_NUMBER_RE.match(rest)
+    number_match = TASK_NUMBER_RE.match(rest)
     if number_match is None:
         collector.add(
             rules.TASK_NUMBER_MISSING,
@@ -576,10 +582,10 @@ def _has_reference(lines: Sequence[_Line], start: int, end: int, collector: _Col
     """
     present = False
     for line in lines[start:end]:
-        if _REFERENCE_MARKER not in line.text.casefold():
+        if REFERENCE_MARKER not in line.text.casefold():
             continue
         present = True
-        match = _TASK_REFERENCE_RE.match(line.text)
+        match = TASK_REFERENCE_RE.match(line.text)
         if match is None:
             collector.add(
                 rules.TASK_REFERENCE_MALFORMED,
@@ -588,7 +594,7 @@ def _has_reference(lines: Sequence[_Line], start: int, end: int, collector: _Col
             )
             continue
         ids = [token.strip() for token in match.group("ids").split(",")]
-        bad = [token for token in ids if not _REFERENCE_ID_RE.match(token)]
+        bad = [token for token in ids if not REFERENCE_ID_RE.match(token)]
         if bad or not ids:
             collector.add(
                 rules.TASK_REFERENCE_MALFORMED,
@@ -604,7 +610,7 @@ def _task_item_indices(lines: Sequence[_Line], start: int, end: int) -> list[int
     return [
         index
         for index in range(start, end)
-        if _TASK_ITEM_RE.match(lines[index].text) or _TASK_ITEM_LOOSE_RE.match(lines[index].text)
+        if TASK_ITEM_RE.match(lines[index].text) or TASK_ITEM_LOOSE_RE.match(lines[index].text)
     ]
 
 
