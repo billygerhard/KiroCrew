@@ -102,9 +102,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Run context substitution including base branch so gates can compare against base; gate name, severity, exit status and captured output audited and displayed on the run; bundled presets for tests, coverage thresholds, lint and type checks; no gates configured is recorded, not an error
     - _Requirements: 13.23, 29.1, 29.2, 29.3, 29.4, 29.5, 29.6, 29.7, 29.8_
 
-  - [ ] 7.7 Prerequisite checks and safe failure
-    - Read-only, zero-token per-project preflight: programs required by configured commands resolve, provider transports reach, base branch exists, protected set valid, notification channel resolves, budget ceiling present for each enabled level above authoring
-    - Unmet prerequisite for a run's level refuses the run with the specific gap; unmet prerequisite for a watch source stops its dispatch and reports rather than dispatching runs that cannot finish; blocked runs and dispatches audited
+  - [ ] 7.7 Phase-scoped prerequisite checks and safe failure
+    - Read-only, zero-token preflight per project, each check scoped to the phase requiring it: that phase's command programs resolve, the providers it binds reach, base branch exists, protected set valid, notification channel resolves, budget ceiling present per enabled level above authoring
+    - Run gate evaluates every phase the run's autonomy level will reach, including phases executing later in the run, and refuses before the first credit is spent
+    - Watch-source checks cover the programs needed to poll at all; an unavailable program reports unmet and unhealthy, never "no items"
+    - Property test: for a config whose delivery-phase program is absent, no run starts and no model credits are consumed
     - _Requirements: 32.1, 32.3, 32.4, 32.5, 32.6_
 
 - [ ] 8. Watchers and dispatch

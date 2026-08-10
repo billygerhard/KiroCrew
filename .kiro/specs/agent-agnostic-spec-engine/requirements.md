@@ -460,10 +460,10 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 #### Acceptance Criteria
 
-1. THE Spec_App SHALL define a Prerequisite_Check set per project covering the programs required by configured commands, reachability of configured Capability_Provider transports, existence of the configured base branch, validity of the protected branch set, resolvability of the notification channel, and presence of a budget ceiling for each enabled autonomy level above authoring.
-2. THE Spec_Builder_UI SHALL display each project's Prerequisite_Check results, and for every unmet check SHALL state what is missing and the action that resolves it.
-3. IF a Prerequisite_Check required by a run's autonomy level is unmet, THEN THE Spec_App SHALL NOT start the run at that level and SHALL report the unmet prerequisite instead.
-4. WHILE a Prerequisite_Check for a watch source is unmet, THE Watcher_Dispatcher SHALL stop dispatching for that source and SHALL report the unmet prerequisite rather than dispatching runs that cannot complete.
+1. THE Spec_App SHALL define Prerequisite_Checks per project, each scoped to the phase that requires it, covering the programs required by that phase's configured commands, reachability of the Capability_Providers that phase binds, existence of the configured base branch, validity of the protected branch set, resolvability of the notification channel, and presence of a budget ceiling for each enabled autonomy level above authoring.
+2. THE Spec_Builder_UI SHALL display each project's Prerequisite_Check results grouped by phase, and for every unmet check SHALL state what is missing and the action that resolves it.
+3. WHEN a run is about to start, THE Spec_App SHALL evaluate the Prerequisite_Checks for every phase that run's autonomy level will reach, including phases that execute later in the run, and IF any is unmet THEN it SHALL refuse the run before consuming model credits and SHALL report the unmet prerequisite.
+4. THE Prerequisite_Checks for a watch source SHALL cover the programs that source needs in order to poll at all, and IF such a program is unavailable THEN the source SHALL be reported as an unmet prerequisite and as unhealthy, and SHALL NOT be reported as having found no items.
 5. THE Prerequisite_Checks SHALL be read-only and SHALL consume zero model credits.
 6. WHEN an unmet Prerequisite_Check prevents a run or a dispatch, THE Spec_Engine SHALL record it in the audit log.
 
