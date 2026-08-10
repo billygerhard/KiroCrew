@@ -1777,6 +1777,22 @@ def resolve_stdio_command(cfg: dict) -> dict:
     return cfg
 
 
+def _mcp_registration_deferred(server_config: Any, resolved_port: int | None) -> bool:
+    """Whether this declared server is intentionally left unwritten for now.
+
+    An HTTP server with no live backend port has nothing reachable to point at:
+    writing the manifest's illustrative port would put a dead URL in front of
+    every kiro session (see :func:`_register_mcp_servers`). Such a server is
+    PENDING the health-gated :func:`reregister_app_mcp_servers` pass, not failed,
+    so readiness must not count it as missing. stdio servers have no port and are
+    never deferred.
+
+    The one place this rule is expressed, so the skip and the readiness
+    assessment cannot drift into disagreeing about what "not registered" means.
+    """
+    return bool(isinstance(server_config, dict) and server_config.get("url")) and not resolved_port
+
+
 def _register_mcp_servers(
     app_name: str, manifest: AppManifest, live_port: int | None = None
 ) -> list[str]:
@@ -1818,7 +1834,7 @@ def _register_mcp_servers(
             if isinstance(cfg, dict):
                 cfg = _pin_host_cli_command(app_name, cfg)
             is_http = isinstance(cfg, dict) and bool(cfg.get("url"))
-            if is_http and not resolved_port:
+            if _mcp_registration_deferred(cfg, resolved_port):
                 # No live backend → registering the manifest's dead default-port URL would
                 # break every kiro session. Skip it AND scrub any stale entry so a prior
                 # (now-dead) registration can't keep poisoning the provider path.
@@ -1983,6 +1999,30 @@ class RegistrationResult:
     crons: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    #: Resources the manifest DECLARED that registration did not place, in cases
+    #: where nothing raised and so nothing landed in ``errors``.
+    #: ``_register_skills`` and ``_register_mcp_servers`` log a warning and carry
+    #: on when a declared skill directory is absent or a link cannot be made, so
+    #: without this a half-registered app is indistinguishable from a whole one —
+    #: an app whose skill or MCP server never reached a session would still
+    #: report success. Servers deliberately deferred to the health-gated
+    #: re-registration are NOT listed here; they are pending, not missing.
+    unregistered: list[str] = field(default_factory=list)
+
+    @property
+    def not_ready_reasons(self) -> list[str]:
+        """Every reason this app cannot be treated as operational, or empty."""
+        return [*self.errors, *self.unregistered]
+
+    @property
+    def ready(self) -> bool:
+        """Whether every declared resource is in place.
+
+        Installation and enablement still SUCCEED when this is False — the app is
+        installed, just not usable — so callers report the not-ready state and its
+        reasons rather than failing the lifecycle operation.
+        """
+        return not self.not_ready_reasons
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1991,6 +2031,8 @@ class RegistrationResult:
             "crons": self.crons,
             "mcp_servers": self.mcp_servers,
             "errors": self.errors,
+            "ready": self.ready,
+            "not_ready_reasons": self.not_ready_reasons,
         }
 
 
@@ -2060,6 +2102,41 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             if stale:
                 _write_mcp_json_unlocked(data)
                 logger.info("Pruned %d stale app MCP server(s) for %s", len(stale), app_name)
+
+
+def _record_unregistered_resources(
+    app_name: str,
+    manifest: AppManifest,
+    result: RegistrationResult,
+    live_port: int | None = None,
+) -> None:
+    """Record declared skills and MCP servers that registration did not place.
+
+    Registration is best-effort per resource: a missing skill directory or an
+    unlinkable path only logs a warning, so the app comes up looking fine while
+    the agent never sees the resource. Diffing what the manifest declared against
+    what actually registered turns that silence into a reportable not-ready
+    state, and a PARTIAL miss counts — one registered server does not compensate
+    for an unregistered skill.
+    """
+    declared_skills = {_namespace(app_name, Path(p).name) for p in (manifest.skills or [])}
+    missing_skills = declared_skills - set(result.skills)
+    if missing_skills:
+        result.unregistered.append(
+            "skills declared but not registered: " + ", ".join(sorted(missing_skills))
+        )
+
+    resolved_port = _live_port_for(app_name, live_port)
+    declared_servers = {
+        f"{app_name}:{server_name}"
+        for server_name, cfg in (manifest.mcpServers or {}).items()
+        if not _mcp_registration_deferred(cfg, resolved_port)
+    }
+    missing_servers = declared_servers - set(result.mcp_servers)
+    if missing_servers:
+        result.unregistered.append(
+            "MCP servers declared but not registered: " + ", ".join(sorted(missing_servers))
+        )
 
 
 def register_app(app_name: str) -> RegistrationResult:
@@ -2140,6 +2217,8 @@ def register_app(app_name: str) -> RegistrationResult:
     except Exception as exc:
         result.errors.append(f"cron registration failed: {exc}")
 
+    _record_unregistered_resources(app_name, manifest, result)
+
     logger.info(
         "Registered app %s: %d agents, %d skills, %d crons, %d mcp, %d errors",
         app_name,
@@ -2149,6 +2228,15 @@ def register_app(app_name: str) -> RegistrationResult:
         len(result.mcp_servers),
         len(result.errors),
     )
+    if not result.ready:
+        # Registration does NOT fail the install or the enable: the app stays
+        # installed and reports itself not-ready with the reasons, so a user sees
+        # what to fix instead of an app that claims to work.
+        logger.warning(
+            "App %s registered NOT READY: %s",
+            app_name,
+            "; ".join(result.not_ready_reasons),
+        )
     return result
 
 

@@ -2729,11 +2729,13 @@ async def test_detail_refuses_when_the_slot_is_foreign(tmp_path, monkeypatch):
 
 
 def test_seed_prompt_is_self_contained_and_type_aware():
-    """The reported gap: the seed told the agent to "follow the `spec-workflow`
-    skill exactly", but builtin apps are not run through bridges.register_app
-    (that path symlinks from ~/.kiro/crew/apps/<name>/, which a wheel-shipped
-    builtin has no copy of), so the skill is not on the agent's skill path. It
-    also listed all three documents for every spec type, contradicting `quick`."""
+    """The seed must carry its own rules, not defer to the app's skill.
+
+    A builtin's declared skills DO register (resolved against the packaged app
+    root), so the reference would resolve — but the seed must not depend on that,
+    and it must list only the documents the chosen spec type calls for. It once
+    told the agent to "follow the `spec-workflow` skill exactly" and listed all
+    three documents for every spec type, contradicting `quick`."""
     spec_dir = Path("/w/.kiro/specs/thing")
 
     quick = routes._seed_prompt("quick", "thing", spec_dir, "/w", "make it fast")

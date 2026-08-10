@@ -1869,13 +1869,13 @@ _TYPE_GUIDANCE: dict[str, str] = {
 def _seed_prompt(spec_type: str, name: str, spec_dir: Path, working_dir: str, description: str) -> str:
     """The opening turn for a new spec.
 
-    SELF-CONTAINED by necessity: this app ships a ``spec-workflow`` skill in its
-    manifest, but builtin apps are not run through ``bridges.register_app`` (that
-    path symlinks from ``~/.kiro/crew/apps/<name>/``, which a wheel-shipped
-    builtin does not have), so the skill is NOT on the agent's skill path. The
-    old prompt told the agent to "follow the `spec-workflow` skill exactly" --
-    a dangling reference -- and listed all three documents regardless of the spec
-    type the user picked. Everything the agent needs is now stated here.
+    SELF-CONTAINED by choice: everything the agent needs is stated here rather
+    than deferred to the ``spec-workflow`` skill this app's manifest declares.
+    A builtin's declared skills and MCP servers DO reach a session (registration
+    resolves them against the packaged app root), so a skill reference would
+    resolve — but a seed that carries its own rules cannot be silently weakened
+    by a skill that fails to register, and it lets the prompt list only the
+    documents the chosen spec type actually calls for.
     """
     desc = f"\n\nThe user's initial description:\n{description.strip()}" if description.strip() else ""
     files = _TYPE_PLAN.get(spec_type, _TYPE_PLAN["feature"])

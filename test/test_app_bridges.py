@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -1480,6 +1481,7 @@ class TestCronServiceBridge:
             persistent_session=False,
             silent=True,
             enabled=True,
+            approval_mode="",
         )
 
     def test_disabled_cron_registers_paused(self, tmp_path, app_env, monkeypatch):
@@ -1627,7 +1629,93 @@ class TestCronServiceBridge:
             persistent_session=False,
             silent=True,
             enabled=True,
+            approval_mode="",
         )
+
+    def _write_app_manifest(self, tmp_path, app_name, permissions):
+        """Write an installed app.json declaring *permissions*."""
+        app_dir = tmp_path / "kirocrew-home" / "apps" / app_name
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / APP_MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "name": app_name,
+                    "version": "1.0.0",
+                    "displayName": "Test App",
+                    "description": "A test app",
+                    "permissions": permissions,
+                }
+            )
+        )
+
+    def _write_grants(self, tmp_path, grants):
+        (tmp_path / "kirocrew-home" / "app_approval_grants.json").write_text(
+            json.dumps({"version": 1, "grants": grants})
+        )
+
+    def test_registration_applies_the_granted_posture(self, tmp_path, app_env, monkeypatch):
+        """A declared posture the operator granted is applied to the app's crons."""
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.apps.bridges import register_app_crons_with_service
+
+        self._write_app_crons(
+            tmp_path, "test-app", [{"name": "test-app/poll", "every": 60, "message": "go"}]
+        )
+        self._write_app_manifest(tmp_path, "test-app", {"approvalMode": "auto"})
+        self._write_grants(tmp_path, {"test-app": "auto"})
+
+        mock_sdk = MagicMock()
+        mock_sdk.list_jobs.return_value = []
+        mock_sdk.add_job_async = AsyncMock(return_value=MagicMock(id="job-id"))
+
+        with patch("kiro_crew.apps.bridges.CronSDK", return_value=mock_sdk):
+            _run(register_app_crons_with_service("test-app", MagicMock()))
+
+        assert mock_sdk.add_job_async.call_args.kwargs["approval_mode"] == "auto"
+
+    def test_registration_refuses_an_ungranted_declaration(self, tmp_path, app_env, monkeypatch):
+        """A manifest declaration alone grants nothing — configuration decides."""
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.apps.bridges import register_app_crons_with_service
+
+        self._write_app_crons(
+            tmp_path, "test-app", [{"name": "test-app/poll", "every": 60, "message": "go"}]
+        )
+        self._write_app_manifest(tmp_path, "test-app", {"approvalMode": "auto"})
+
+        mock_sdk = MagicMock()
+        mock_sdk.list_jobs.return_value = []
+        mock_sdk.add_job_async = AsyncMock(return_value=MagicMock(id="job-id"))
+
+        with patch("kiro_crew.apps.bridges.CronSDK", return_value=mock_sdk):
+            _run(register_app_crons_with_service("test-app", MagicMock()))
+
+        assert mock_sdk.add_job_async.call_args.kwargs["approval_mode"] == ""
+
+    def test_manifest_cron_env_cannot_carry_the_reserved_control_var(self):
+        """KIROCREW_APPROVAL_MODE never survives a manifest env block."""
+        from kiro_crew.apps.bridges import _cron_defs_from_manifest
+
+        manifest = AppManifest.from_dict(
+            {
+                "name": "test-app",
+                "version": "1.0.0",
+                "displayName": "Test App",
+                "description": "A test app",
+                "crons": [
+                    {
+                        "name": "poll",
+                        "every": 60,
+                        "message": "go",
+                        "env": {"KIROCREW_APPROVAL_MODE": "auto", "KEEP": "1"},
+                    }
+                ],
+            }
+        )
+        defs, _ = _cron_defs_from_manifest("test-app", manifest)
+        assert defs[0]["env"] == {"KEEP": "1"}
 
     def test_rejects_malicious_command(self, tmp_path, app_env, monkeypatch):
         """Commands blocked by _vet_shell_command are skipped with SEL audit."""
@@ -2132,6 +2220,270 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
         # future refactor cannot drop the normalisation while every
         # underscore-free builtin still passes.
         assert any("-" in n for n in checked), f"expected a hyphenated builtin, got {checked}"
+
+
+class TestBuiltinVendedResourcesReachASession:
+    """A builtin's declared MCP server and skill must reach an agent session.
+
+    A session's tool surface is the ``mcpServers`` map in KiroCrew's own agent
+    config (the file kiro-cli loads) plus the skills the loader finds under the
+    data home. Registration populates both from the SHIPPED manifest, and every
+    way it can fail to do so is silent — a declared resource that never lands only
+    logs a warning, so an app with no tools looks identical to a working one.
+
+    These walk the whole chain a builtin actually takes — shipped manifest →
+    discovery snapshot → ``register_app`` → session-visible surface — because
+    each hop has independently dropped resources before, and assert on the real
+    surfaces (the registered server map, the skill loader) rather than on
+    registration's own return value.
+    """
+
+    APP = "vending-probe"
+    SERVER = "probe-engine"
+    SKILL = "probe-discovery"
+
+    def _ship_builtin(self, tmp_path, monkeypatch, *, ship_skill_dir=True):
+        """Create a shipped builtin declaring one stdio MCP server and one skill.
+
+        Returns the shipped package root. ``ship_skill_dir=False`` declares the
+        skill in the manifest but leaves the directory absent — the shape of a
+        packaging mistake, which registration only warns about.
+        """
+        import kiro_crew.apps.execution as execution_mod
+        import kiro_crew.apps.manager as manager_mod
+        from kiro_crew.apps.discovery import discover_builtin_apps
+
+        shipped = tmp_path / "shipped-builtins"
+        app_root = shipped / self.APP.replace("-", "_")
+        app_root.mkdir(parents=True)
+        (app_root / "app.json").write_text(
+            json.dumps(
+                {
+                    "name": self.APP,
+                    "version": "1.0.0",
+                    "displayName": "Vending Probe",
+                    "description": "Declares an MCP server and a skill",
+                    "author": "kirocrew",
+                    "defaultEnabled": True,
+                    # stdio, not HTTP: an HTTP server with no live backend is
+                    # deliberately deferred, which would make this vacuous.
+                    "mcpServers": {self.SERVER: {"command": "probe-engine-bin"}},
+                    "skills": [f"skills/{self.SKILL}"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        if ship_skill_dir:
+            skill_dir = app_root / "skills" / self.SKILL
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                f"name: {self.SKILL}\n"
+                "description: Start spec work through the engine tools.\n"
+                "---\n\n"
+                "Ask the engine tools for the workflow instructions first.\n",
+                encoding="utf-8",
+            )
+
+        # Provenance: builtin status is derived from the immutable package tree,
+        # never from installed metadata.
+        monkeypatch.setattr(execution_mod, "_BUILTINS_DIR", shipped)
+        # Real discovery over the temp tree — this exercises the manifest→snapshot
+        # conversion rather than hand-building the dict it produces.
+        monkeypatch.setattr(
+            manager_mod, "discover_builtin_apps", lambda: discover_builtin_apps(shipped)
+        )
+        monkeypatch.setattr(manager_mod, "_orphaned_builtins_cache", None)
+        return app_root
+
+    def _skill_loader(self, app_env):
+        from kiro_crew.skills import SkillsLoader
+
+        # install_builtins=False: only the app's registered skill should be in
+        # play, so a hit cannot come from the bundled set.
+        return SkillsLoader(
+            skills_path=app_env["home"] / "skills",
+            install_builtins=False,
+        )
+
+    def test_declared_mcp_server_lands_in_the_session_agent_config(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """The server reaches the map kiro-cli reads, under its namespaced name."""
+        from kiro_crew.apps.bridges import register_app, registered_app_mcp_servers
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+        result = register_app(self.APP)
+
+        namespaced = f"{self.APP}:{self.SERVER}"
+        assert result.errors == []
+        assert namespaced in result.mcp_servers
+        # The surface itself, not registration's report of it.
+        on_disk = registered_app_mcp_servers()
+        assert namespaced in on_disk, (
+            f"declared MCP server absent from the session agent config: {sorted(on_disk)}"
+        )
+        assert on_disk[namespaced]["command"] == "probe-engine-bin"
+
+    def test_declared_mcp_server_is_trusted_as_app_own(self, tmp_path, app_env, monkeypatch):
+        """The gate's app-own set must recognise it, or its tools need approval
+        the app was never prompted for."""
+        from kiro_crew.apps.execution import builtin_app_mcp_servers
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+
+        assert f"{self.APP}:{self.SERVER}" in builtin_app_mcp_servers()
+
+    def test_declared_skill_reaches_the_session_skill_catalogue(self, app_env):
+        """A shipped builtin's declared skill must be visible to the skill loader.
+
+        Uses the REAL shipped builtins rather than a fabricated tree: the loader
+        admits a skills-dir symlink only when its target resolves inside the
+        installed ``kiro_crew`` package or the data-home apps dir, so a synthetic
+        builtin under a temp path would be rejected for a reason production never
+        hits — and the containment check is part of what has to hold.
+        """
+        from kiro_crew.apps.bridges import register_app
+        from kiro_crew.apps.discovery import _get_builtins_dir
+        from kiro_crew.apps.manager import get_app, register_builtin_apps
+
+        register_builtin_apps()
+        expected: set[str] = set()
+        # Driven from the SHIPPED manifests, which is what registration reads —
+        # so this measures registration reach and cannot be masked by a snapshot
+        # that dropped the declaration.
+        for app_json in sorted(_get_builtins_dir().glob("*/app.json")):
+            shipped = json.loads(app_json.read_text(encoding="utf-8"))
+            name = shipped.get("name")
+            declared = shipped.get("skills") or []
+            if not name or not declared or get_app(name) is None:
+                continue
+            register_app(name)
+            expected |= {Path(p).name for p in declared}
+
+        assert expected, "no shipped builtin declares a skill — test would be vacuous"
+        listed = {s["key"] for s in self._skill_loader(app_env).list_skills()}
+        # Keys may be flat or namespaced depending on which link the walk kept.
+        found = {name for name in expected if any(k.split("/")[-1] == name for k in listed)}
+        assert found == expected, (
+            f"builtin-declared skills missing from the session catalogue: "
+            f"{sorted(expected - found)}"
+        )
+
+    def test_synthetic_declared_skill_is_linked_into_the_skills_tree(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """Registration links the declared skill under both the namespaced and
+        flat names the skill scanner looks for."""
+        from kiro_crew.apps.bridges import register_app
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+        result = register_app(self.APP)
+
+        assert _namespace(self.APP, self.SKILL) in result.skills
+        skills_root = app_env["home"] / "skills"
+        for link in (skills_root / self.APP / self.SKILL, skills_root / self.SKILL):
+            assert (link / "SKILL.md").is_file(), f"{link} does not lead to the skill"
+
+    def test_snapshot_keeps_the_typed_declarations(self, tmp_path, app_env, monkeypatch):
+        """The persisted snapshot carries mcpServers and skills.
+
+        ``mcpServers`` and ``skills`` are typed AppManifest fields rather than
+        ``extra``, so the manifest→snapshot conversion has to copy them by hand;
+        when it did not, they were absent from every builtin's persisted app.json
+        and from every consumer that reads it.
+        """
+        from kiro_crew.apps.manager import get_app_manifest, register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+
+        manifest = get_app_manifest(self.APP)
+        assert manifest is not None
+        assert self.SERVER in manifest.mcpServers
+        assert f"skills/{self.SKILL}" in manifest.skills
+
+    def test_absent_skill_directory_reports_not_ready_and_names_the_skill(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A declared-but-unshipped skill must not pass as operational.
+
+        Nothing raises on this path — registration logs a warning and carries on —
+        so the miss has to be detected by diffing declarations against what landed.
+        """
+        from kiro_crew.apps.bridges import register_app
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch, ship_skill_dir=False)
+        register_builtin_apps()
+        result = register_app(self.APP)
+
+        assert result.errors == [], "the absent directory is a silent skip, not an error"
+        assert not result.ready
+        reasons = " ".join(result.not_ready_reasons)
+        assert self.SKILL in reasons, f"reason does not name the missing skill: {reasons}"
+        assert result.to_dict()["ready"] is False
+        assert result.to_dict()["not_ready_reasons"] == result.not_ready_reasons
+
+    def test_a_registered_skill_does_not_offset_a_failed_mcp_registration(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """PARTIAL failure is failure: one placed resource is not readiness."""
+        import kiro_crew.apps.bridges as bridges_mod
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("agent config is read-only")
+
+        monkeypatch.setattr(bridges_mod, "_register_mcp_servers", _boom)
+        result = bridges_mod.register_app(self.APP)
+
+        assert _namespace(self.APP, self.SKILL) in result.skills, "skill should still register"
+        assert result.mcp_servers == []
+        assert not result.ready
+        assert any("read-only" in r for r in result.not_ready_reasons)
+
+    def test_fully_registered_builtin_reports_ready(self, tmp_path, app_env, monkeypatch):
+        """The positive case, so the not-ready assertions cannot pass vacuously."""
+        from kiro_crew.apps.bridges import register_app
+        from kiro_crew.apps.manager import register_builtin_apps
+
+        self._ship_builtin(tmp_path, monkeypatch)
+        register_builtin_apps()
+        result = register_app(self.APP)
+
+        assert result.ready, result.not_ready_reasons
+        assert result.not_ready_reasons == []
+
+    def test_install_completes_despite_a_registration_failure(self, tmp_path, app_env):
+        """A third-party install whose skill cannot register still installs.
+
+        The app must end up present and enabled, reporting not-ready with the
+        reason, rather than the install being rolled back.
+        """
+        from kiro_crew.apps.bridges import register_app
+        from kiro_crew.apps.manager import get_app, install_app
+
+        src = _make_app_source(tmp_path, name="broken-skill-app")
+        # Ship the manifest's skill declaration without the directory.
+        shutil.rmtree(src / "skills" / "my-skill")
+        install_result = install_app(src)
+        assert install_result.ok
+
+        result = register_app("broken-skill-app")
+
+        assert get_app("broken-skill-app") is not None, "install was rolled back"
+        assert not result.ready
+        assert any("my-skill" in r for r in result.not_ready_reasons)
 
 
 class TestAppEventBusIsActuallyWired:
