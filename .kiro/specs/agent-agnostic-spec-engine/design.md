@@ -38,7 +38,7 @@ Three layers. Only the middle one owns rules.
 +---------------------------------------------------------------+
 ```
 
-Public/internal split: the app ships with local default providers only. The internal Brazil package `SpecDrivenDevMcp` (immutable name, never renamed) becomes a consumer that wraps the open engine and registers internal providers (KRS requirements analysis, internal model catalog, Amazon review policy). The MCP tool surface is identical in both builds.
+Public/internal split: the app ships with local default providers only. An organization's internal consumer package can wrap the open engine and register enhanced providers (enhanced requirements analysis, private model catalogs, organization-specific review policy). The MCP tool surface is identical in both builds.
 
 ## Components and Interfaces
 
@@ -59,7 +59,7 @@ Public/internal split: the app ships with local default providers only. The inte
 
 ### Engine_MCP_Server (`apps/spec-engine/engine_mcp/`)
 
-Thin stdio JSON-RPC wrapper over the library; every tool call maps 1:1 onto a library call so MCP and library paths produce identical state. Tool surface mirrors the proven kiro-spec set: `get_authoring_prompt`, `get_bugfix_prompt`, `get_orchestrator_prompt` (prompt-as-tool-result carries all workflow knowledge), `validate_spec`, `analyze_requirements` (provider-backed; local default), `task_list`/`task_get`/`task_update`, review verdict tools, subagent orchestration tools, `get_user_input`. Conformant JSON-RPC: `prompts/list` and `resources/list` answer empty sets; unknown methods return -32601. No tool mutates the Autonomy_Policy or the Delivery_Workflow. Guidance that cannot be supplied returns an error, never partial text.
+Thin stdio JSON-RPC wrapper over the library; every tool call maps 1:1 onto a library call so MCP and library paths produce identical state. Tool surface: `get_authoring_prompt`, `get_bugfix_prompt`, `get_orchestrator_prompt` (prompt-as-tool-result carries all workflow knowledge), `validate_spec`, `analyze_requirements` (provider-backed; local default), `task_list`/`task_get`/`task_update`, review verdict tools, subagent orchestration tools, `get_user_input`. Conformant JSON-RPC: `prompts/list` and `resources/list` answer empty sets; unknown methods return -32601. No tool mutates the Autonomy_Policy or the Delivery_Workflow. Guidance that cannot be supplied returns an error, never partial text.
 
 ### Drivers
 
@@ -140,5 +140,5 @@ Frameworks: **pytest** for the engine and MCP wrapper (with **hypothesis** for t
 | Engine state outside spec dirs, keyed by project+spec | Preserves IDE/CLI interop (R1.6); spec dirs stay byte-compatible with native tooling |
 | Watchers and delivery as commands, argv substitution | Zero-token determinism (R17), no plugin code (R13.1), injection rail (R13.6) |
 | Core enablers as a separate prerequisite PR | Approval grants and builtin vending are general-purpose gateway capabilities, reviewable independently of the app |
-| `SpecDrivenDevMcp` wraps the open engine | Brazil package names are immutable; the internal package pins the engine and registers internal providers, keeping one tool surface |
+| Internal consumers wrap the open engine | An organization's internal package can pin the engine and register enhanced providers, keeping one tool surface |
 | Working name `spec-engine`, final name gated on sign-off | App/registry names are one-way doors |
