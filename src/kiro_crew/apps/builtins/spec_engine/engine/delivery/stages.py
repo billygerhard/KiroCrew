@@ -36,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, sandbox
 
 from ..config import DELIVERY_STAGES, ConfigStore, ConfigValidationError, ValueOrigin
 from .templates import CommandTemplate, MissingVariableError, TemplateError
@@ -148,7 +148,23 @@ class CommandRunner(Protocol):
 
 
 def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
-    """Run *argv* in *cwd* with no shell, capturing bounded output."""
+    """Run *argv* in *cwd* with no shell, capturing bounded output.
+
+    The spawn goes through the package's sandbox chokepoint. The program and its
+    literal arguments come from configuration an operator wrote, but the values
+    substituted into them do not: a branch name, an item title, a review body
+    all originate in a tracker anyone may write to. Argv isolation keeps that
+    text from becoming syntax; the sandbox is the second layer, hiding
+    credential trees the workflow has no business reading and handing the child
+    a scrubbed environment. Standard mode is the mode that leaves git-over-SSH
+    and the AWS CLI working, which a delivery stage needs.
+
+    The resource-limit preexec is the third layer: a stage command is a build or
+    a push an operator configured but nobody watches at three in the morning, so
+    a kernel-enforced ceiling is what keeps a runaway child from taking the host
+    down with it.
+    """
+    wrapped, child_env, _profile = sandbox.sandboxed_spawn_argv(list(argv))
     started: subprocess.Popen[str]
     try:
         # Both isolation flags are passed explicitly rather than unpacked from a
@@ -156,13 +172,15 @@ def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcom
         # start_new_session is a no-op on Windows and the creation flag is a
         # no-op on POSIX; together they make the child's tree killable.
         started = subprocess.Popen(
-            list(argv),
+            wrapped,
             cwd=str(cwd),
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
+            preexec_fn=sandbox.resource_limit_preexec(),
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
         )
