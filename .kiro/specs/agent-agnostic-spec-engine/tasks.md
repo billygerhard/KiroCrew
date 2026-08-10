@@ -280,7 +280,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 - [ ] 18. Clean-room provenance gate
   - [ ] 18.1 Provenance checks and audit
     - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
-    - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5_
+    - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5, 28.6_
 
 ## Task Dependency Graph
 

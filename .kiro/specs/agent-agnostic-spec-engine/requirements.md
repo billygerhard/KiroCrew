@@ -90,7 +90,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 1. THE Spec_App SHALL vend a discovery skill whose trigger phrases include natural spec requests such as creating a spec, planning a feature, fixing a bug as a spec, and making a quick plan.
 2. WHEN the discovery skill is triggered, THE discovery skill SHALL direct the Host_Agent to obtain workflow instructions from the Engine_MCP_Server tools before performing any spec operation, rather than embedding format rules in the skill body.
 3. WHEN the Spec_App is installed or enabled, THE Spec_App SHALL register its discovery skill and its Engine_MCP_Server so that both reach Host_Agent sessions, for builtin and installed app paths alike.
-4. IF registration fails, THEN THE Spec_App SHALL complete installation, report a not-ready state with the failure reason, and SHALL NOT present itself as operational.
+4. IF registration of either the discovery skill or the Engine_MCP_Server fails, THEN THE Spec_App SHALL complete installation, report a not-ready state with the failure reason, and SHALL NOT present itself as operational.
 
 ### Requirement 5: Feature, bugfix, and quick spec types
 
@@ -124,7 +124,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 1. WHERE a session is seeded by the Spec_App for a headless run, THE Gateway SHALL apply the tool-approval posture granted to the Spec_App in configuration.
 2. THE Gateway SHALL NOT allow a running agent session to modify or elevate its own tool-approval posture through any tool call.
 3. WHEN a headless run starts, THE Spec_App SHALL record the applied approval posture in the run's audit log.
-4. IF a session's applied approval posture does not match the posture granted in configuration, THEN THE Spec_App SHALL refuse to start the run, or halt it if already started, and record the mismatch in the audit log.
+4. IF a session's applied approval posture does not match the posture granted in configuration, THEN THE Spec_App SHALL refuse to start the run, or halt it if already started, and record the mismatch in the audit log, and IF the refusal or halt cannot be applied THEN THE Spec_App SHALL fail the run rather than allow it to proceed.
 
 ### Requirement 8: Policy-governed execution gate
 
@@ -134,7 +134,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 1. WHERE the Autonomy_Policy reserves execution for human action, THE Review_Gate SHALL start spec execution only from an explicit human action.
 2. WHERE no Autonomy_Policy level is configured for a source and spec type, THE Autonomy_Policy SHALL resolve to human-reserved execution, and WHERE a level is explicitly configured for that source and spec type THE Autonomy_Policy SHALL resolve to the configured level.
-3. WHERE the Autonomy_Policy authorizes autonomous execution for a run's source, spec type, and submitter class, THE Review_Gate SHALL start execution when validation and required gate approvals pass, and SHALL NOT require any further trigger event or human action.
+3. WHERE the Autonomy_Policy authorizes autonomous execution for a run's source, spec type, and submitter class, THE Review_Gate SHALL start execution when validation and required gate approvals pass, SHALL NOT require any further trigger event or human action, and SHALL NOT prevent a human from intervening in the run.
 4. IF execution is requested for a spec whose tasks.md fails validation or whose gates lack required approvals, THEN THE Review_Gate SHALL refuse the request, return the blocking reasons regardless of the Autonomy_Policy, and record the refused request with its initiator in the audit log.
 5. WHEN execution starts, THE Spec_Engine SHALL record the initiator, an explicit human identity or the Autonomy_Policy identifier, with a timestamp in the spec's audit log.
 6. THE Spec_Engine SHALL load the Autonomy_Policy from configuration only, and THE Engine_MCP_Server SHALL NOT expose any tool that modifies the Autonomy_Policy.
@@ -148,7 +148,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 1. WHEN executing a spec, THE Orchestrator SHALL dispatch leaf tasks wave by wave in dependency-graph order, running tasks within a wave in parallel up to a configured concurrency cap.
 2. WHEN resolving the model for a unit of work, THE Orchestrator SHALL determine that work's role, one of design, review, or implement, and resolve the agent, model, and effort from the configuration entry for that role, falling back to the session default agent and model when that role is unconfigured.
-3. WHEN a task implementation completes successfully, THE Orchestrator SHALL obtain a review verdict using the review role's model, and THE Orchestrator SHALL NOT mark a task complete unless that task's review verdict is approval.
+3. WHEN a task implementation completes successfully, THE Orchestrator SHALL obtain a review verdict using the review role's model, and THE Orchestrator SHALL NOT mark a task complete unless that task's review verdict is approval, and WHERE a task implementation does not complete successfully THE Orchestrator SHALL route it to retry or failure handling without obtaining a review verdict.
 4. IF a task does not complete successfully, including implementation failure, a review verdict requiring changes, or an infrastructure failure, THEN THE Orchestrator SHALL retry the task up to the configured retry limit and SHALL mark the task failed after the limit without abandoning independent tasks in the remaining waves.
 5. WHILE execution is in progress, THE Spec_Engine SHALL persist task status after every task state change so that an interrupted execution resumes from the recorded state.
 
@@ -234,7 +234,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 2. WHEN the Setup_Assistant infers a proposed configuration, THE Setup_Assistant SHALL present each inferred setting together with the evidence it was inferred from before applying anything.
 3. IF the Setup_Assistant cannot infer a required setting from the available context, THEN THE Setup_Assistant SHALL ask the user for that setting conversationally.
 4. WHERE prior KiroCrew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
-5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI.
+5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI, and THE Setup_Assistant SHALL NOT write any configuration before the user approves it.
 6. THE Setup_Assistant SHALL propose the authoring level as the Autonomy_Policy floor, and SHALL NOT enable the execution, delivery, or integration levels without explicit user confirmation of each level being enabled.
 7. WHEN the interactive setup runs, THE Setup_Assistant SHALL offer the applicable Workflow_Presets, SHALL run the Doctor against the proposed configuration, and SHALL report each Finding with the action that resolves it.
 ### Requirement 15: Per-project cost profiles for models and effort
@@ -264,7 +264,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 5. THE Spec_App SHALL provide a single kill-switch action that pauses all watchers and halts all autonomous runs after in-flight turns complete.
 6. WHEN a run completes or halts, THE Spec_App SHALL notify the configured notification channel with the run's total credit consumption and record it in the spec's audit log.
 7. THE per-run budget ceiling SHALL be enforced independently of watch-source spending caps, so that a run halts on its own ceiling even when no source cap stopped its dispatch.
-8. WHERE a budget warning threshold is configured, THE Spec_App SHALL notify the configured notification channel when a run's consumption crosses the threshold, without halting the run.
+8. WHERE a budget warning threshold is configured, THE Spec_App SHALL notify the configured notification channel when a run's consumption crosses the threshold, without halting the run, and WHILE a run is halted THE Spec_App SHALL NOT send budget warning notifications for it.
 
 ### Requirement 17: Deterministic execution outside reasoning steps
 
@@ -333,7 +333,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. THE Spec_Builder_UI SHALL provide approve and request-changes actions on each Review_Queue entry, and WHERE a run waits at a human-reserved gate, the approve action SHALL record that gate's approval.
-2. WHEN a reviewer requests changes with comments, THE Spec_Engine SHALL record the comments, return the run to its authoring state, and dispatch a revision turn that receives the reviewer comments as quoted data input.
+2. WHEN a reviewer requests changes with comments, THE Spec_Engine SHALL apply the comment recording, the return to authoring state, and the revision dispatch as a single transition with the reviewer comments as quoted data input, and IF any part fails THEN it SHALL leave the run in its prior state and report the failure.
 3. WHEN a revision turn completes, THE Spec_Engine SHALL validate the revised documents under the same rules as original documents and return the run to the Review_Queue.
 4. IF revision cycles at a single gate exceed the configured limit, THEN THE Spec_App SHALL mark the run as needing human attention and SHALL NOT dispatch further revision turns for that gate.
 
@@ -371,7 +371,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. WHERE intake screening is enabled for a Watched_Item's submitter class, THE Watcher_Dispatcher SHALL screen the item's content for embedded instructions and injection attempts before the run proceeds past intake, using bundled screening guidance.
-2. THE intake screening SHALL default to enabled for every submitter class, and disabling it for a submitter class SHALL require explicit configuration.
+2. THE intake screening SHALL default to enabled for every submitter class, disabling it for a submitter class SHALL require explicit configuration, and THE Spec_App SHALL NOT provide a setting that disables screening for all submitter classes at once.
 3. WHERE intake guidance is configured for a project or source, THE screening SHALL apply that guidance in addition to the bundled screening guidance.
 4. IF screening suspects injection, THEN THE Spec_App SHALL NOT proceed past the authoring level regardless of the Autonomy_Policy, SHALL flag the run and its screening findings in the Review_Queue, and SHALL notify the configured notification channel.
 5. WHEN a reviewer releases a quarantined run, THE Spec_App SHALL treat the release as the human review action and proceed according to the Autonomy_Policy.
@@ -386,7 +386,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 1. THE Spec_Engine SHALL resolve each Delegable_Capability from configuration to a Capability_Provider using one of the transports builtin, mcp, or command, and THE Engine_MCP_Server tool surface SHALL be identical regardless of which providers are bound.
 2. THE Spec_App SHALL ship a builtin Capability_Provider for every Delegable_Capability, and THE Spec_App SHALL NOT require any external provider to function.
 3. THE Spec_Engine SHALL execute every Engine_Floor capability itself, and THE Spec_Engine SHALL NOT accept a Capability_Provider binding for any Engine_Floor capability.
-4. WHERE the mcp transport is configured, THE Spec_Engine SHALL invoke the provider as an MCP server child process using the configured command and environment, and THE Spec_App SHALL NOT bundle, vendor, or embed that provider's implementation.
+4. WHERE the mcp transport is configured, THE Spec_Engine SHALL invoke the provider as an MCP server child process using the configured command and environment.
 5. WHERE the command transport is configured, THE Spec_Engine SHALL invoke the configured program with the capability's structured input and SHALL parse its structured output, so that an external agent or command-line tool can serve a capability.
 6. WHEN THE Spec_Engine invokes a Capability_Provider, THE request SHALL carry the artifact locations, the spec type, and the artifact format version.
 7. WHEN a Capability_Provider returns a response, THE Spec_Engine SHALL validate it against that capability's published schema, and findings SHALL reference the acceptance criteria or tasks they concern.
@@ -420,9 +420,10 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 1. THE Spec_App implementation SHALL be derived only from the publicly documented artifact format, publicly available spec artifacts, and the public host codebase.
 2. THE Spec_App SHALL NOT contain code, schemas, or prompt text copied or adapted from non-public implementations.
-3. THE Spec_App SHALL author all shipped prompt text for this app.
+3. THE Spec_App SHALL author all shipped prompt text for this app, and SHALL NOT copy prompt text from another implementation whether or not that implementation is public.
 4. THE Spec_App SHALL NOT contain endpoints, service names, request headers, or credentials for non-public services.
-5. WHERE enhanced capability is delegated, THE Spec_App SHALL reference the provider by configuration only.
+5. WHERE enhanced capability is delegated, THE Spec_App SHALL reference the provider by configuration only, at every stage including development and testing.
+6. THE Spec_App SHALL NOT bundle, vendor, or embed any non-public provider's implementation, regardless of which transport is configured for it.
 ### Requirement 29: Pre-submit quality gates
 
 **User Story:** As a reviewer, I want quality gates to run before the change is submitted for review, so that analyzer and coverage findings are fixed by the run instead of landing on me.
@@ -445,7 +446,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. WHEN a task's implementation includes tests, THE review verdict SHALL judge those tests against defined criteria, including that assertions derive from the code under test rather than from values the test itself constructed, that the test fails when the covered behavior is wrong, and that error and boundary cases are covered.
-2. IF a task's tests fail the test quality criteria, THEN THE Orchestrator SHALL treat the verdict as requiring changes.
+2. IF a task's tests fail the test quality criteria, THEN THE Orchestrator SHALL treat the verdict as requiring changes, and SHALL NOT make approval available for that task until the tests satisfy the criteria.
 3. WHERE a mutation probe command is configured as a Quality_Gate, THE Delivery_Pipeline SHALL run it and treat a suite that still passes under mutation as a gate failure.
 4. WHEN a review verdict reports test quality findings, THE Spec_Engine SHALL record them in the run's audit log.
 ### Requirement 31: Shipped builtin providers
@@ -460,7 +461,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. THE builtin implementation provider SHALL dispatch a subagent per leaf task with the spec context, wave ordering, and retry policy.
 5. THE builtin watch source providers SHALL be the bundled GitHub and GitLab command presets, and IF a preset's required command-line program is unavailable, THEN THE Watcher_Dispatcher SHALL mark that source unhealthy and report the missing program rather than reporting no items.
 6. THE builtin model catalog provider SHALL resolve the available models from the host.
-7. THE Spec_App SHALL ship no supplementary validation rules, and native-format validation in the Engine_Floor SHALL be the validation baseline.
+7. THE Spec_App SHALL ship no supplementary spec-document validation rules, and native-format validation in the Engine_Floor SHALL be the validation baseline, and this SHALL NOT preclude a provider validating its own request and response payloads against their published schemas.
 8. THE Spec_Builder_UI SHALL identify each capability's bound provider as builtin or external, and SHALL identify each builtin as deterministic or model-backed.
 ### Requirement 32: Prerequisite checks and safe failure
 
@@ -485,7 +486,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 2. THE Spec_App SHALL NOT bundle presets for non-public review or tracking systems.
 3. THE configuration SHALL allow a project to select a Workflow_Preset and to override individual stage commands, so that an organization's own review system can replace a stage without redefining the workflow.
 4. THE configuration SHALL allow user-defined named Workflow_Presets that are selectable in the same way as bundled presets.
-5. THE Spec_App SHALL treat bundled presets as read-only, and selection and overrides SHALL live in project configuration.
+5. THE Spec_App SHALL treat bundled presets as read-only, SHALL allow a bundled preset to be copied into an editable user-defined preset, SHALL allow a user-defined preset to be edited after creation, and selection and overrides SHALL live in project configuration.
 6. THE Spec_Builder_UI SHALL display, for each stage, whether its commands come from the selected preset or from a project override.
 ### Requirement 34: Doctor diagnostic
 
