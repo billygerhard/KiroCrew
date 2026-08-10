@@ -1,0 +1,202 @@
+"""Capability providers: what the app delegates, and what it never will.
+
+The app is a host. Analysis, document authoring, review verdicts, task
+implementation, supplementary validation rules, watch sources, and the model
+catalog are all **delegable**: each resolves from configuration to one of three
+transports — ``builtin`` (in-process, ships with the app), ``mcp`` (an MCP server
+invoked as a child process), or ``command`` (a program handed structured input
+whose structured output is parsed back) — and every one of them ships a working
+builtin, so nothing is ever absent or answers "not configured".
+
+The **engine floor** is the other half of the same design, and the half that
+makes the first half safe. Native-format validation, the phase gates, autonomy
+resolution, budget enforcement, the claim ledger, and the audit log always
+execute in the engine and cannot be bound at all. Without that line, delegation
+would quietly undo rules-as-code: whoever configured the most permissive provider
+would decide what the engine guarantees. So a configuration naming an
+engine-floor capability is an error rather than an ignored key, and a
+supplementary validation provider may only *add* findings — never suppress,
+downgrade, or override an engine finding or a gate.
+
+Everything else in this package follows from those two sentences:
+
+* :mod:`.contracts` — the request, response, and result types every transport
+  shares, plus :class:`~.contracts.Untrusted`, which is how "provider output is
+  data, never instructions" becomes something the type checker holds.
+* :mod:`.schemas` — the published, versioned request and response schema per
+  capability, and the validator that runs on every response before a finding is
+  recorded.
+* :mod:`.transports` — the two external transports, each spawning its child
+  through the package's sandbox chokepoint under one wall-clock deadline.
+* :mod:`.providers` — the builtin every capability answers from.
+* :mod:`.registry` — the one resolution and invocation path, where the engine
+  floor is enforced, an unusable provider degrades to the builtin instead of
+  blocking the run, declared cost reaches the budget, and provider identity,
+  transport, coverage, and degraded status reach the audit log.
+* :mod:`.supplementary` — the additive-only seam for supplementary validation.
+
+No provider implementation is bundled here beyond the app's own builtins. An
+external provider is named by configuration — a command and an environment — and
+its code lives wherever its author put it, which is what keeps the app complete
+on its own and free of anything it did not write.
+"""
+
+from __future__ import annotations
+
+from .contracts import (
+    ARTIFACT_KINDS,
+    FINDING_BINDING_INVALID,
+    FINDING_ENGINE_FLOOR_BINDING,
+    FINDING_PROVIDER_TIMEOUT,
+    FINDING_PROVIDER_UNAVAILABLE,
+    FINDING_RESPONSE_INVALID,
+    FINDING_SEVERITIES,
+    MAX_DISPLAY_CHARS,
+    NATIVE_FORMAT_VERSION,
+    TRANSPORT_BUILTIN,
+    TRANSPORT_COMMAND,
+    TRANSPORT_MCP,
+    ArtifactRef,
+    CapabilityError,
+    CapabilityRequest,
+    CapabilityResponse,
+    CapabilityResult,
+    ClarifyingQuestion,
+    Coverage,
+    Degradation,
+    EngineFloorViolation,
+    FindingSeverity,
+    ProviderFinding,
+    ProviderIdentity,
+    ProviderKind,
+    ProviderNature,
+    SkippedItem,
+    UnknownCapability,
+    Untrusted,
+    require_delegable,
+)
+from .providers import (
+    BuiltinProvider,
+    DeclaredSkipProvider,
+    builtin_identity,
+    default_builtins,
+)
+from .registry import (
+    AUDIT_EVENT_CAPABILITY,
+    CAPABILITY_TIMEOUT_SETTING,
+    AuditSink,
+    Binding,
+    CapabilityRegistry,
+    CostSink,
+    RecordingCostSink,
+    builtin_binding,
+    external_identity,
+    resolve_bindings,
+)
+from .schemas import (
+    CURRENT_SCHEMA_VERSION,
+    REQUEST,
+    RESPONSE,
+    PayloadSchema,
+    SchemaError,
+    SchemaViolation,
+    published_schemas,
+    published_versions,
+    schema_for,
+    validate_response,
+)
+from .supplementary import (
+    DisplayEntry,
+    EntryOrigin,
+    SupplementaryFinding,
+    SupplementedReport,
+    blocking_rules,
+    engine_severities,
+    supplement,
+)
+from .transports import (
+    MAX_OUTPUT_CHARS,
+    MCP_PROTOCOL_VERSION,
+    MCP_TOOL_PREFIX,
+    CapabilityTransport,
+    ChildOutcome,
+    ChildRunner,
+    CommandProviderTransport,
+    McpProviderTransport,
+    TransportFailure,
+    run_provider_child,
+)
+
+__all__ = [
+    "ARTIFACT_KINDS",
+    "AUDIT_EVENT_CAPABILITY",
+    "CAPABILITY_TIMEOUT_SETTING",
+    "CURRENT_SCHEMA_VERSION",
+    "FINDING_BINDING_INVALID",
+    "FINDING_ENGINE_FLOOR_BINDING",
+    "FINDING_PROVIDER_TIMEOUT",
+    "FINDING_PROVIDER_UNAVAILABLE",
+    "FINDING_RESPONSE_INVALID",
+    "FINDING_SEVERITIES",
+    "MAX_DISPLAY_CHARS",
+    "MAX_OUTPUT_CHARS",
+    "MCP_PROTOCOL_VERSION",
+    "MCP_TOOL_PREFIX",
+    "NATIVE_FORMAT_VERSION",
+    "REQUEST",
+    "RESPONSE",
+    "TRANSPORT_BUILTIN",
+    "TRANSPORT_COMMAND",
+    "TRANSPORT_MCP",
+    "ArtifactRef",
+    "AuditSink",
+    "Binding",
+    "BuiltinProvider",
+    "CapabilityError",
+    "CapabilityRegistry",
+    "CapabilityRequest",
+    "CapabilityResponse",
+    "CapabilityResult",
+    "CapabilityTransport",
+    "ChildOutcome",
+    "ChildRunner",
+    "ClarifyingQuestion",
+    "CommandProviderTransport",
+    "CostSink",
+    "Coverage",
+    "DeclaredSkipProvider",
+    "Degradation",
+    "DisplayEntry",
+    "EngineFloorViolation",
+    "EntryOrigin",
+    "FindingSeverity",
+    "McpProviderTransport",
+    "PayloadSchema",
+    "ProviderFinding",
+    "ProviderIdentity",
+    "ProviderKind",
+    "ProviderNature",
+    "RecordingCostSink",
+    "SchemaError",
+    "SchemaViolation",
+    "SkippedItem",
+    "SupplementaryFinding",
+    "SupplementedReport",
+    "TransportFailure",
+    "UnknownCapability",
+    "Untrusted",
+    "blocking_rules",
+    "builtin_binding",
+    "builtin_identity",
+    "default_builtins",
+    "engine_severities",
+    "external_identity",
+    "published_schemas",
+    "published_versions",
+    "require_delegable",
+    "resolve_bindings",
+    "run_provider_child",
+    "schema_for",
+    "supplement",
+    "validate_response",
+]
