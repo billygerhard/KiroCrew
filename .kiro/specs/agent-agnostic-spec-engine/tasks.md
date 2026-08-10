@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, the doctor, setup assistant, and the verification suites. 19 parent tasks, 59 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, the doctor, setup assistant, and the verification suites. 19 parent tasks, 60 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -131,6 +131,12 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Screen dispatched items with bundled guidance plus configured intake guidance on the review role's model; enabled by default per submitter class with explicit opt-out
     - Suspected injection quarantines at authoring level regardless of policy, flags findings in the Review_Queue, and notifies; reviewer release is the human gate; verdicts audited and cost attributed to the run
     - _Requirements: 25.1, 25.2, 25.3, 25.4, 25.5, 25.6, 25.7_
+
+  - [ ] 8.7 Tracker housekeeping writeback
+    - Named lifecycle events (claimed, awaiting review, delivery submitted, completed, failed or needs-human, refused) mapped to configured commands under the delivery stage-command rules; comment, label, state, assign, and link-artifact operations; bundled presets for the public hosts, per-event override for an organization's tracker, no non-public preset
+    - Disabled by default, enabled per event per source through configuration only with no tool able to enable it; at-most-once per run per event recorded in the ledger so a repeated poll, retry, or resumed run does not repeat a delivered writeback
+    - Failure recorded and surfaced without failing the run; content composed only from declared templates and engine values, never model-composed text or verbatim item body; zero model credits
+    - _Requirements: 36.1, 36.2, 36.3, 36.4, 36.5, 36.6, 36.7, 36.8, 10.10_
 
 - [ ] 9. Orchestrator
   - [ ] 9.1 Wave loop and task persistence
@@ -278,7 +284,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
   {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
   {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "7.7", "8.3", "9.1", "15.2", "17.3"]},
-  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5", "17.6"]},
+  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "8.7", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5", "17.6"]},
   {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3", "13.4", "19.1"]},
   {"id": 6, "tasks": ["12.2", "12.3", "12.5", "14.1", "16.1", "19.2"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}

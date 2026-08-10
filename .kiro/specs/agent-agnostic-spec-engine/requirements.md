@@ -25,6 +25,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Item_Lifecycle_Event**: A named point in a run's life at which the app may write back to the tracker that supplied the item: claimed, awaiting review, delivery submitted, completed, failed or needs-human, and refused.
 - **Analysis_Depth**: The declared thoroughness of an analysis result: structural (deterministic checks), semantic (model-reasoned over the documents), or extended (a provider declaring coverage beyond semantic).
 - **Doctor**: The single read-only diagnostic operation that aggregates prerequisite, health, provider, configuration, and budget state into a list of Findings, and is reachable from every surface.
 - **Finding**: One diagnosed problem carrying a stable identifier, a severity, the phase or surface it affects, what is wrong, and the action that resolves it.
@@ -165,7 +166,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 7. THE Watcher_Dispatcher SHALL enforce the concurrency cap per project in addition to the global cap, and SHALL start queued Watched_Items in arrival order as capacity frees.
 8. THE Spec_App SHALL bundle command-based watch source presets for GitHub and GitLab issues, and THE Spec_Engine SHALL accept additional watch sources registered through the Provider_Interface.
 9. THE Watcher_Dispatcher SHALL derive Watched_Item lifecycle transitions, including reopened and cancelled, by comparing successive poll results.
-10. WHERE item feedback commands are configured for a source, THE Watcher_Dispatcher SHALL post dispatch and completion updates back to the Watched_Item using those commands with the run context variables.
+10. WHERE item feedback commands are configured for a source, THE Watcher_Dispatcher SHALL write back to the Watched_Item at the Item_Lifecycle_Events using those commands with the run context variables.
 11. WHERE a watch source's items are publicly submittable, THE Spec_App SHALL warn the user when the execution, delivery, or integration autonomy levels are enabled for that source, and SHALL record the user's acknowledgment in the audit log.
 12. WHERE an item's classification has no configured spec-type mapping and the source configures no default spec type, THE Watcher_Dispatcher SHALL NOT dispatch the item and SHALL record it as unmapped.
 
@@ -513,3 +514,17 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 6. WHEN a dispatched analysis turn returns, THE Spec_Engine SHALL validate its output against the Analysis_Findings schema before recording, and IF validation fails THEN it SHALL fail the job and SHALL NOT record partial findings.
 7. FOR ALL depths and transports, findings SHALL be recorded in the single Analysis_Findings schema so a spec's analysis history is comparable across providers.
 8. THE Spec_Engine SHALL attribute a dispatched analysis turn's spend to the run's budget, and the dispatch SHALL be subject to the budget ceiling and the kill switch.
+### Requirement 36: Tracker housekeeping writeback
+
+**User Story:** As a user whose team works from an issue board, I want the app to keep the item up to date as the run progresses, so that the board reflects reality without me copying status across by hand.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL define the Item_Lifecycle_Events at which writeback may occur, and FOR ALL events SHALL support the operations comment, set label, set state, assign, and link the delivery artifact.
+2. FOR ALL Item_Lifecycle_Events, THE Spec_App SHALL map the event to zero or more configured commands executed under the same rules as Delivery_Workflow stage commands, substituting engine-supplied values as literal argument elements, and IF a referenced variable has no value THEN it SHALL fail that event before execution.
+3. THE Spec_App SHALL bundle writeback presets for the public hosts it already bundles watch sources for, SHALL NOT bundle a preset for a non-public tracker, and SHALL allow an organization's tracker to be served by a user-defined preset or per-event override.
+4. THE writeback SHALL be disabled by default, SHALL be enabled per event per source through configuration only, and no Engine_MCP_Server tool SHALL enable or modify it.
+5. FOR ALL Item_Lifecycle_Events, THE Spec_Engine SHALL deliver a writeback at most once per run per event and SHALL record delivery in the ledger, so that a repeated poll, a retry, or a resumed run does not repeat a delivered writeback.
+6. IF a writeback command fails, THEN THE Spec_Engine SHALL record the failure and surface it, and SHALL NOT fail the run.
+7. THE writeback content SHALL be composed only from declared templates and engine-supplied values, and SHALL NOT include model-composed free text or verbatim Watched_Item body content, so that content submitted to a watched source cannot be amplified back into a shared system.
+8. THE writeback SHALL consume zero model credits.
