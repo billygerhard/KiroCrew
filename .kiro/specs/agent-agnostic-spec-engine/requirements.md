@@ -25,6 +25,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Analysis_Depth**: The declared thoroughness of an analysis result: structural (deterministic checks), semantic (model-reasoned over the documents), or extended (a provider declaring coverage beyond semantic).
 - **Doctor**: The single read-only diagnostic operation that aggregates prerequisite, health, provider, configuration, and budget state into a list of Findings, and is reachable from every surface.
 - **Finding**: One diagnosed problem carrying a stable identifier, a severity, the phase or surface it affects, what is wrong, and the action that resolves it.
 - **Prerequisite_Check**: A read-only check that a configured project can actually run: required programs resolve, provider transports reach, the base branch exists, the protected set is valid, notifications resolve, and an autonomous level has a budget ceiling.
@@ -448,7 +449,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 #### Acceptance Criteria
 
-1. THE builtin analysis provider SHALL be the Local_Analyzer.
+1. THE builtin analysis providers SHALL be the Local_Analyzer at structural depth and the model-backed analysis builtin at semantic depth, selectable by configuration.
 2. THE builtin authoring provider SHALL seed a turn with the Spec_App's authoring guidance and SHALL rely on native-format validation and the phase gate to accept or reject the produced documents.
 3. THE builtin review provider SHALL seed a review turn using the review role's assignment, SHALL apply the review and test quality criteria, and SHALL return a verdict.
 4. THE builtin implementation provider SHALL dispatch a subagent per leaf task with the spec context, wave ordering, and retry policy.
@@ -498,3 +499,17 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 9. THE Spec_Engine SHALL record the last known result per Finding identifier, and WHEN a check that previously passed is evaluated as failing, THE Doctor SHALL report it as a regression distinguished from a check that has never passed, including when it last passed.
 10. WHEN a Finding is reported as a regression, THE Spec_App SHALL notify through the configured channel, and SHALL NOT notify for an unchanged Finding.
 11. WHERE a Workflow_Preset or configuration declares a minimum version for a required program, THE Prerequisite_Check SHALL verify the resolved program's version against it rather than verifying presence alone.
+### Requirement 35: Capability tool parity and the analysis depth ladder
+
+**User Story:** As a user without any external provider, I want every capability tool present and working at the best depth available to me, so that binding a provider changes how deep the analysis goes rather than which tools exist.
+
+#### Acceptance Criteria
+
+1. FOR ALL Delegable_Capabilities, THE Spec_App SHALL ship a working builtin, and no tool in the Engine_MCP_Server surface SHALL be absent, stubbed, or answer with a not-configured error when no external provider is bound.
+2. THE Spec_App SHALL ship a model-backed analysis builtin that performs semantic analysis by dispatching an agent turn with an authored analysis prompt, using the agent, model, and effort configured for the analysis role, and SHALL NOT require a network service.
+3. FOR ALL analysis transports, THE tool shape SHALL be an asynchronous job comprising a submit operation that returns a job identifier and a poll operation that returns status, progress, and the findings on completion.
+4. THE Spec_Engine SHALL apply a configured total wall-clock deadline to every analysis job, and IF the deadline elapses THEN it SHALL fail the job reporting elapsed time and partial progress, and SHALL NOT hold a call open indefinitely.
+5. FOR ALL analysis results, THE Spec_Engine SHALL record the Analysis_Depth and the provider identity that produced them, and SHALL NOT report absence of findings at one depth as correctness at a greater depth.
+6. WHEN a dispatched analysis turn returns, THE Spec_Engine SHALL validate its output against the Analysis_Findings schema before recording, and IF validation fails THEN it SHALL fail the job and SHALL NOT record partial findings.
+7. FOR ALL depths and transports, findings SHALL be recorded in the single Analysis_Findings schema so a spec's analysis history is comparable across providers.
+8. THE Spec_Engine SHALL attribute a dispatched analysis turn's spend to the run's budget, and the dispatch SHALL be subject to the budget ceiling and the kill switch.

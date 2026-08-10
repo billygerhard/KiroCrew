@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, the doctor, setup assistant, and the verification suites. 19 parent tasks, 58 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, the doctor, setup assistant, and the verification suites. 19 parent tasks, 59 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -259,6 +259,12 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Equivalence test: the tool and the UI path return identical Findings for the same state
     - _Requirements: 34.3, 32.2_
 
+  - [ ] 17.6 Semantic builtin and the async analysis job shape
+    - Model-backed analysis builtin dispatching an agent turn with an authored analysis prompt at the agent, model, and effort configured for the analysis role, no network service; submit/poll job shape shared by every transport; configured total wall-clock deadline failing the job with elapsed time and partial progress
+    - Dispatched turn output schema-validated before recording, invalid output fails the job with nothing partial recorded; spend attributed to the run's budget and subject to the ceiling and kill switch; every result records depth and provider identity; one findings schema across depths and transports
+    - Every capability answers from a working builtin: no absent, stubbed, or not-configured tool in the surface
+    - _Requirements: 35.1, 35.2, 35.3, 35.4, 35.5, 35.6, 35.7, 35.8_
+
 - [ ] 18. Clean-room provenance gate
   - [ ] 18.1 Provenance checks and audit
     - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
@@ -272,7 +278,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
   {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
   {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "7.7", "8.3", "9.1", "15.2", "17.3"]},
-  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5"]},
+  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5", "17.6"]},
   {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3", "13.4", "19.1"]},
   {"id": 6, "tasks": ["12.2", "12.3", "12.5", "14.1", "16.1", "19.2"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}
