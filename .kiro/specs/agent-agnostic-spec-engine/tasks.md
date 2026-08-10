@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 56 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, the doctor, setup assistant, and the verification suites. 19 parent tasks, 58 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -176,9 +176,9 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 12.3 Configuration surface, cost display, and kill switch
     - Config UI for autonomy, workflow commands, watch sources, role assignments, notification channels; every setting shows effective value and origin; per-run credit consumption on queue entries and detail views; kill-switch control
     - _Requirements: 12.4, 12.5, 24.6_
-  - [ ] 12.5 Prerequisites and preset surfaces
-    - Per-project prerequisite panel stating each unmet check and the action that resolves it; per-stage display of whether commands come from the selected preset or a project override
-    - _Requirements: 32.2, 33.6_
+  - [ ] 12.5 Preset origin display
+    - Per-stage display of whether commands come from the selected preset or a project override
+    - _Requirements: 33.6_
 
   - [ ] 12.4 Replace the Spec Builder builtin
     - New app replaces spec-builder as the single spec surface; specs created by the prior app remain valid artifacts
@@ -247,6 +247,18 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Per-capability conformance runner over bundled fixtures (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared coverage, timeout honoring and repeatability; every builtin provider passes its own suite
     - _Requirements: 26.15, 27.6_
 
+- [ ] 19. Doctor
+  - [ ] 19.1 Finding vocabulary and aggregation
+    - Stable Finding identifiers with severity, affected phase or surface, cause, and resolving action; aggregate phase prerequisites, source health, provider reachability and degradation, config validation, budget and kill-switch state, blocked runs, and skill/MCP registration reach
+    - A check that cannot complete becomes a Finding and the remaining Findings still return; provider, command, and watched-item text carried as untrusted data, never executed; no operation modifies config, Autonomy_Policy, or Delivery_Workflow
+    - Engine refusals, blocked dispatches, and degraded marks quote the same Finding identifier
+    - Last known result recorded per identifier; a previously-passing check that now fails reports as a regression with when it last passed, notifies once, and stays quiet while unchanged; declared minimum program versions verified rather than presence alone
+    - _Requirements: 34.1, 34.2, 34.4, 34.5, 34.6, 34.7, 34.8, 34.9, 34.10, 34.11_
+  - [ ] 19.2 Doctor surfaces and surface equivalence
+    - Doctor exposed as an Engine_MCP_Server tool and as the UI panel from the one engine operation; prerequisite Findings grouped by phase
+    - Equivalence test: the tool and the UI path return identical Findings for the same state
+    - _Requirements: 34.3, 32.2_
+
 - [ ] 18. Clean-room provenance gate
   - [ ] 18.1 Provenance checks and audit
     - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
@@ -261,8 +273,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
   {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "7.7", "8.3", "9.1", "15.2", "17.3"]},
   {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1", "17.5"]},
-  {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3", "13.4"]},
-  {"id": 6, "tasks": ["12.2", "12.3", "12.5", "14.1", "16.1"]},
+  {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3", "13.4", "19.1"]},
+  {"id": 6, "tasks": ["12.2", "12.3", "12.5", "14.1", "16.1", "19.2"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}
 ]}
 ```

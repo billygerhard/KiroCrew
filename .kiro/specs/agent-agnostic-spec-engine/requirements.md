@@ -25,6 +25,8 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Doctor**: The single read-only diagnostic operation that aggregates prerequisite, health, provider, configuration, and budget state into a list of Findings, and is reachable from every surface.
+- **Finding**: One diagnosed problem carrying a stable identifier, a severity, the phase or surface it affects, what is wrong, and the action that resolves it.
 - **Prerequisite_Check**: A read-only check that a configured project can actually run: required programs resolve, provider transports reach, the base branch exists, the protected set is valid, notifications resolve, and an autonomous level has a budget ceiling.
 - **Workflow_Preset**: A named, bundled or user-defined Delivery_Workflow or watch-source definition that a project selects and may override per stage or per field.
 - **Capability_Provider**: The implementation bound to a delegable capability, resolved from configuration to one of three transports: builtin (the app's own implementation), mcp (an MCP server invoked as a child process), or command (a program invoked with structured input and output).
@@ -231,7 +233,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. WHERE prior KiroCrew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
 5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI.
 6. THE Setup_Assistant SHALL propose the authoring level as the Autonomy_Policy floor, and SHALL NOT enable the execution, delivery, or integration levels without explicit user confirmation of each level being enabled.
-7. WHEN the interactive setup runs, THE Setup_Assistant SHALL offer the applicable Workflow_Presets, SHALL run the Prerequisite_Checks for the proposed configuration, and SHALL report each unmet prerequisite with the action that resolves it.
+7. WHEN the interactive setup runs, THE Setup_Assistant SHALL offer the applicable Workflow_Presets, SHALL run the Doctor against the proposed configuration, and SHALL report each Finding with the action that resolves it.
 ### Requirement 15: Per-project cost profiles for models and effort
 
 **User Story:** As a user who pays differently in different contexts, I want model, effort, and concurrency defaults bundled into selectable per-project profiles, so that a work project can maximize quality while a personal project strictly minimizes spend.
@@ -461,7 +463,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. THE Spec_App SHALL define Prerequisite_Checks per project, each scoped to the phase that requires it, covering the programs required by that phase's configured commands, reachability of the Capability_Providers that phase binds, existence of the configured base branch, validity of the protected branch set, resolvability of the notification channel, and presence of a budget ceiling for each enabled autonomy level above authoring.
-2. THE Spec_Builder_UI SHALL display each project's Prerequisite_Check results grouped by phase, and for every unmet check SHALL state what is missing and the action that resolves it.
+2. THE Prerequisite_Check results SHALL be reported as Doctor Findings grouped by phase, and every unmet check SHALL state what is missing and the action that resolves it.
 3. WHEN a run is about to start, THE Spec_App SHALL evaluate the Prerequisite_Checks for every phase that run's autonomy level will reach, including phases that execute later in the run, and IF any is unmet THEN it SHALL refuse the run before consuming model credits and SHALL report the unmet prerequisite.
 4. THE Prerequisite_Checks for a watch source SHALL cover the programs that source needs in order to poll at all, and IF such a program is unavailable THEN the source SHALL be reported as an unmet prerequisite and as unhealthy, and SHALL NOT be reported as having found no items.
 5. THE Prerequisite_Checks SHALL be read-only and SHALL consume zero model credits.
@@ -479,3 +481,20 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. THE configuration SHALL allow user-defined named Workflow_Presets that are selectable in the same way as bundled presets.
 5. THE Spec_App SHALL treat bundled presets as read-only, and selection and overrides SHALL live in project configuration.
 6. THE Spec_Builder_UI SHALL display, for each stage, whether its commands come from the selected preset or from a project override.
+### Requirement 34: Doctor diagnostic
+
+**User Story:** As a user whose spec runs are not working, I want one diagnostic I can open in the UI or ask my agent to run, so that I get the same actionable answer either way instead of guessing why the app refused.
+
+#### Acceptance Criteria
+
+1. THE Spec_Engine SHALL provide a Doctor operation that aggregates, into a single list of Findings, the phase-scoped Prerequisite_Check results, watch source health, Capability_Provider reachability and degraded status, configuration validation errors, budget ceiling and kill switch state, runs blocked or awaiting a human, and whether the app's skill and Engine_MCP_Server reached Host_Agent sessions.
+2. FOR ALL Findings, THE Doctor SHALL report a stable identifier, a severity distinguishing blocking from advisory, the affected phase or surface, what is wrong, and the action that resolves it.
+3. THE Doctor SHALL be reachable as an Engine_MCP_Server tool and from the Spec_Builder_UI, and FOR ALL surfaces invoking the Doctor against the same state SHALL return identical Findings.
+4. THE Doctor SHALL be read-only and SHALL consume zero model credits.
+5. IF an individual check cannot complete, THEN THE Doctor SHALL report that as a Finding and SHALL return its remaining Findings, and SHALL NOT fail the whole diagnostic.
+6. WHEN the Spec_Engine refuses a run, blocks a dispatch, or marks a run degraded, THE reported reason SHALL carry the same Finding identifier the Doctor reports for that condition.
+7. THE Doctor SHALL treat provider output, command output, and watched-item text included in a Finding as untrusted data to be stored and displayed, and SHALL NOT execute it.
+8. THE Doctor SHALL NOT expose any operation that modifies configuration, the Autonomy_Policy, or the Delivery_Workflow.
+9. THE Spec_Engine SHALL record the last known result per Finding identifier, and WHEN a check that previously passed is evaluated as failing, THE Doctor SHALL report it as a regression distinguished from a check that has never passed, including when it last passed.
+10. WHEN a Finding is reported as a regression, THE Spec_App SHALL notify through the configured channel, and SHALL NOT notify for an unchanged Finding.
+11. WHERE a Workflow_Preset or configuration declares a minimum version for a required program, THE Prerequisite_Check SHALL verify the resolved program's version against it rather than verifying presence alone.
