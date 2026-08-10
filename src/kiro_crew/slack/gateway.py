@@ -45,6 +45,7 @@ import kiro_crew
 import kiro_crew.crash_guard as crash_guard
 from kiro_crew import beacon, platform_compat, shutdown_event
 from kiro_crew.acp.client import AcpError, AcpProcessDied
+from kiro_crew.apps.approval_grants import posture_extra_env
 from kiro_crew.autonudge import (
     AutoNudgeService,
     NudgeLoop,
@@ -2367,12 +2368,12 @@ class GatewayOrchestrator:
                 re-injected here when the job's VALIDATED ``approval_mode`` is
                 "auto". Otherwise an app manifest could set it directly in
                 ``job.env`` and have an interactive cron's spawn_run subagents
-                silently auto-approved -- an authorization bypass.
+                silently auto-approved -- an authorization bypass. The strip and
+                the single re-injection point live in
+                ``apps.approval_grants.posture_extra_env`` so every seeding path
+                (cron, app-seeded run) shares one owner for the reserved var.
                 """
-                env = {k: v for k, v in (job.env or {}).items() if k != "KIROCREW_APPROVAL_MODE"}
-                if job.approval_mode == "auto":
-                    env["KIROCREW_APPROVAL_MODE"] = "auto"
-                return env or None
+                return posture_extra_env(job.approval_mode, job.env)
 
             async def _acquire_with_model_fallback(
                 key: str, agent_id: str | None

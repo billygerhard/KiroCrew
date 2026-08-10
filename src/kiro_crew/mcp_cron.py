@@ -812,6 +812,35 @@ def _audit_fire_time_decision(job_id: str, scope: str, outcome: str, reason: str
         logger.debug("fire-time governance audit emit failed", exc_info=True)
 
 
+def _vet_approval_posture_grant(job: CronJob) -> str | None:
+    """Refuse an app-owned job whose stored approval posture exceeds its grant.
+
+    The posture is resolved once, when the app's crons are registered, from the
+    app's manifest declaration intersected with the operator's grant. Re-checking
+    it at fire time is what makes the grant a ceiling rather than a one-time
+    default: a job row edited on disk, an update call that carried its own value,
+    or a grant REVOKED after the job was scheduled all leave a stored posture the
+    operator no longer authorizes, and an unattended run must refuse rather than
+    execute auto-approved. User-authored jobs are untouched — they carry a human
+    creator, not an app owner, and their posture is the author's own choice.
+
+    Returns a redacted ``"Error: ..."`` deny reason, or ``None`` when the job may
+    run.
+    """
+    # Deferred import: the app platform package pulls in the bridges -> cron_sdk
+    # chain, which reaches back into this module (same cycle the bridges vetting
+    # imports avoid).
+    from kiro_crew.apps.approval_grants import app_from_owner, posture_exceeds_grant
+
+    app = app_from_owner(job.created_by or "")
+    if not app:
+        return None
+    reason = posture_exceeds_grant(app, job.approval_mode or "")
+    if not reason:
+        return None
+    return f"Error: cron blocked: {redact(reason)}"
+
+
 def vet_job_at_fire_time(job: CronJob) -> str | None:
     """Re-run the governance gates for an already-scheduled cron job at FIRE time.
 
@@ -824,6 +853,9 @@ def vet_job_at_fire_time(job: CronJob) -> str | None:
     - all kinds: the ``capabilities.cron`` on/off gate
       (:func:`_vet_cron_capability_governance`), keyed ``cron:<job.id>`` so the
       SEL deny trail names the blocked job;
+    - app-owned jobs: the app's approval-posture GRANT ceiling
+      (:func:`_vet_approval_posture_grant`), so a stored posture that was raised
+      after the grant was resolved refuses the run instead of running elevated;
     - ``command`` jobs: the governance ``commands`` ceiling over the command
       body (:func:`_vet_command_governance`);
     - ``script`` jobs: the script BODY re-scan (:func:`_vet_script_file`) on the
@@ -847,6 +879,10 @@ def vet_job_at_fire_time(job: CronJob) -> str | None:
         _audit_fire_time_decision(job.id, "capabilities.cron", "denied", reason)
         return reason
     _audit_fire_time_decision(job.id, "capabilities.cron", "allowed")
+    reason = _vet_approval_posture_grant(job)
+    if reason:
+        _audit_fire_time_decision(job.id, "app_approval.posture", "denied", reason)
+        return reason
     if job.command:
         reason = _vet_command_governance(job.command)
         if reason:

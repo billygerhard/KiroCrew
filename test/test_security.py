@@ -2845,6 +2845,31 @@ class TestIsSensitivePath:
         assert is_sensitive_path(f"{home}/.kiro/crew/app_admission.json") is True
         assert is_sensitive_path("~/.kirocrew/app_admission.json") is True
 
+    def test_app_approval_grants(self) -> None:
+        # Keystone invariant: app_approval_grants.json is what turns an app's
+        # DECLARED wish for an unattended tool-approval posture into an applied
+        # one (apps/approval_grants.py). An agent that could write it could grant
+        # its own app auto-approval for every tool call in the sessions that app
+        # seeds, and one that could read it would learn which apps already run
+        # unattended — so it is read/write blocked via the shared gate.
+        home = str(Path.home())
+        assert is_sensitive_path("~/.kiro/crew/app_approval_grants.json") is True
+        assert is_sensitive_path(f"{home}/.kiro/crew/app_approval_grants.json") is True
+        assert is_sensitive_path("~/.kirocrew/app_approval_grants.json") is True
+
+    def test_app_approval_grants_shell_write_forms(self) -> None:
+        # The keystone floor also arms the bash matchers, so a redirect or a tee
+        # into the grant file is refused the way it is for the other trust roots.
+        assert (
+            is_sensitive_bash_command("echo '{}' > ~/.kiro/crew/app_approval_grants.json")
+            is not None
+        )
+        assert (
+            is_sensitive_bash_command("echo '{}' | tee ~/.kiro/crew/app_approval_grants.json")
+            is not None
+        )
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/app_approval_grants.json") is not None
+
     def test_token_signing_key(self) -> None:
         # token_signing.key (dashboard/token_secret.py) signs every
         # dashboard access + refresh token. An agent that could fs_read it could

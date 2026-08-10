@@ -52,6 +52,7 @@ import asyncio
 import logging
 from typing import Any, Callable, TypeVar
 
+from kiro_crew.apps.approval_grants import clamp_posture, sanitize_app_env
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.sel import sel
 
@@ -203,12 +204,18 @@ class CronSDK:
         persistent_session: bool,
         silent: bool,
         enabled: bool,
+        approval_mode: str = "",
     ) -> dict[str, Any]:
         """Build the kwargs common to the sync/async ``CronService.add_job``.
 
         Threads every field so the job is persisted FULLY-FORMED and owner-tagged
         in ONE locked build+persist (no follow-up unlocked ``_save()`` that could
         race a concurrent create).
+
+        ``approval_mode`` is CLAMPED to what the operator granted this app, and
+        ``env`` has the reserved approval control var stripped: an app may ask for
+        an unattended posture but only configuration confers it, and neither an
+        SDK argument nor a manifest env block may confer it instead.
         """
         return dict(
             name=name,
@@ -219,10 +226,11 @@ class CronSDK:
             command=command or "",
             script=script or "",
             agent_sequence=agent_sequence or None,
-            env=env or None,
+            env=sanitize_app_env(env) or None,
             persistent_session=persistent_session,
             silent=silent,
             enabled=enabled,
+            approval_mode=clamp_posture(self._app_name, approval_mode),
             created_by=self._owner_prefix,
         )
 
@@ -243,11 +251,16 @@ class CronSDK:
         persistent_session: bool = True,
         silent: bool = False,
         enabled: bool = True,
+        approval_mode: str = "",
     ) -> Any:
         """Create a cron job owned by this app. **Synchronous** (preserves the
         published SDK contract). See :meth:`add_job_async` for the loop-native
         variant. Raises ``CronSyncOnLoopError`` if called on a running event loop
         (use :meth:`add_job_async` there). Returns the created CronJob object.
+
+        ``approval_mode`` REQUESTS a tool-approval posture for the job's session;
+        it is granted only by the operator's app grant and otherwise falls back to
+        the default hook-based posture.
         """
         self._vet_command_script(name, command, script)
         job = _run_sync_mutator(
@@ -258,7 +271,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled,
+                enabled=enabled, approval_mode=approval_mode,
             ),
         )
         self._audit_add(job)
@@ -279,6 +292,7 @@ class CronSDK:
         persistent_session: bool = True,
         silent: bool = False,
         enabled: bool = True,
+        approval_mode: str = "",
     ) -> Any:
         """Event-loop-native :meth:`add_job`: routes through
         ``CronService.add_job_async`` (bounded store-lock spin offloaded to a
@@ -292,7 +306,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled,
+                enabled=enabled, approval_mode=approval_mode,
             ),
         )
         self._audit_add(job)
@@ -358,6 +372,7 @@ class CronSDK:
         Returns the updated CronJob or None.
         """
         self._assert_owned(job_id, "cron_update_job")
+        kwargs = self._clamp_update_kwargs(kwargs)
         result = _run_sync_mutator(
             self._cron.update_job, job_id, _api="update_job", **kwargs
         )
@@ -368,9 +383,28 @@ class CronSDK:
         """Event-loop-native :meth:`update_job` (routes through
         ``CronService.update_job_async``)."""
         self._assert_owned(job_id, "cron_update_job")
+        kwargs = self._clamp_update_kwargs(kwargs)
         result = await self._cron.update_job_async(job_id, **kwargs)
         self._audit_update(job_id)
         return result
+
+    def _clamp_update_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Re-apply the grant to a caller-supplied update payload.
+
+        Update is the same authorization decision as create, so it gets the same
+        treatment: an ``approval_mode`` the operator did not grant this app is
+        narrowed to the default posture, and the reserved approval control var is
+        stripped from any ``env``. Without this, an app could create an
+        interactive job and then raise its own posture with one update call.
+        """
+        if not kwargs:
+            return kwargs
+        out = dict(kwargs)
+        if "approval_mode" in out:
+            out["approval_mode"] = clamp_posture(self._app_name, str(out["approval_mode"] or ""))
+        if out.get("env") is not None:
+            out["env"] = sanitize_app_env(out["env"])
+        return out
 
     def _audit_update(self, job_id: str) -> None:
         sel().log_api_access(

@@ -4136,6 +4136,9 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 #                                 (owner-only dir OUTSIDE the log's directory);
 #                                 the bare leaf covers pre-migration installs
 #   app_admission.json            App Kit admission ceiling (apps/admission.py)
+#   app_approval_grants.json      per-app tool-approval grants — the file that
+#                                 decides which apps may seed auto-approved
+#                                 sessions (apps/approval_grants.py)
 #   security_policy.json          governance ceiling (KEYSTONE, governance.py)
 #   profiles                      per-surface governance profiles
 #   admission_policy.json         signed-plugin admission trust root
@@ -4208,6 +4211,16 @@ _CREW_SECRET_LEAVES: list[str] = [
     "trust",
     "security_events.jsonl",
     "app_admission.json",
+    # Per-app tool-approval grants (apps/approval_grants.py). Same class of
+    # control as ``app_admission.json`` directly above and as
+    # ``ops_mission_control_policy.json`` below: the file is what turns an app's
+    # DECLARED wish for an unattended posture into an applied one, so an agent
+    # that could WRITE it could grant its own app auto-approval for every tool
+    # call in the sessions that app seeds — the elevation the grant exists to
+    # prevent — and one that could READ it would learn which apps already run
+    # unattended and aim there. The loader opens it directly, not through this
+    # gate, so grant resolution is unaffected; the operator edits it out-of-band.
+    "app_approval_grants.json",
     "security_policy.json",
     "profiles",
     "admission_policy.json",

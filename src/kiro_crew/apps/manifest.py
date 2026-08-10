@@ -373,6 +373,13 @@ class Permissions:
     #: Declared rather than implicit so "which apps can start an agent" is
     #: auditable from the manifest instead of from an app's import graph.
     spawn: bool = False
+    #: Tool-approval posture the app WANTS for the sessions it seeds:
+    #: ``""`` (hook-based, the default) or ``"auto"`` (auto-approve). This is a
+    #: REQUEST, not a grant — the operator's ``app_approval_grants.json`` decides
+    #: whether it applies, and the effective posture is the intersection of the
+    #: two (``apps.approval_grants.effective_posture``). Declaring it here is what
+    #: makes an app's unattended intent auditable from the manifest.
+    approvalMode: str = ""  # noqa: N815
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -392,6 +399,8 @@ class Permissions:
             d["cron"] = True
         if self.spawn:
             d["spawn"] = True
+        if self.approvalMode:
+            d["approvalMode"] = self.approvalMode
         return d
 
     @classmethod
@@ -416,6 +425,9 @@ class Permissions:
             memory=str(data.get("memory", "")),
             cron=data.get("cron") is True,
             spawn=data.get("spawn") is True,
+            # Same grant-direction coercion: only the literal "auto" asks for the
+            # permissive posture, so a malformed value requests nothing.
+            approvalMode=("auto" if data.get("approvalMode") == "auto" else ""),
         )
 
 

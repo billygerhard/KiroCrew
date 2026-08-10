@@ -48,6 +48,7 @@ class MockCronJob:
     persistent_session: bool = True
     silent: bool = False
     enabled: bool = True
+    approval_mode: str = ""
     user_paused: bool = False
     every_secs: int | None = None
     cron_expr: str | None = None

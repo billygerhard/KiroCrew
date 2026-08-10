@@ -210,7 +210,8 @@ they go live without waiting for a Gateway restart.
     "cron": true,
     "memory": "app-scoped",
     "network": false,
-    "spawn": false
+    "spawn": false,
+    "approvalMode": ""
   }
 }
 ```
@@ -225,6 +226,7 @@ they go live without waiting for a Gateway restart.
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
+| `permissions.approvalMode` | string | Tool-approval posture the app WANTS for the sessions it seeds: `""` (hook-based) or `"auto"`. A request, not a grant |
 
 #### `permissions.spawn` — Background Agents
 
@@ -242,6 +244,42 @@ the platform does not rate-limit spawns per app today.
 
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 `SpawnError`.
+
+#### `permissions.approvalMode` — Unattended Tool Approval
+
+An app doing unattended work needs the sessions it seeds to call tools without a
+human to answer the approval prompt. This field DECLARES the posture the app
+wants; it grants nothing on its own. The operator grants it by name in
+`~/.kiro/crew/app_approval_grants.json`, a keystone file the agent can neither
+read nor write:
+
+```json
+{"version": 1, "grants": {"my-app": "auto"}}
+```
+
+The applied posture is the intersection — `"auto"` only when the app declared it
+AND the operator granted it; anything else resolves to the default hook-based
+posture. The grant is a ceiling, not an assignment: an app that never declared a
+posture does not receive one because it was granted.
+
+What this buys, and what it forbids:
+
+- Cron jobs an app declares are registered with the effective posture, resolved
+  at registration so a grant added later takes effect and a revoked one cannot be
+  served from a stale file.
+- `ctx.cron.add_job(approval_mode=...)` and `update_job(approval_mode=...)` are
+  CLAMPED to the grant, so an app cannot select or raise its own posture through
+  an SDK argument.
+- `KIROCREW_APPROVAL_MODE` is a reserved control variable, stripped from every
+  app-controlled `env` map and re-injected only for a granted posture — an app
+  cannot smuggle the posture through its own manifest env block.
+- The posture is re-checked at fire time against the grant. A stored posture that
+  exceeds it — an edited job row, a revoked grant — refuses the run rather than
+  executing auto-approved.
+
+API: `apps/approval_grants.py` — `session_posture`, `verify_session_posture`,
+`effective_posture`, `clamp_posture`, `posture_exceeds_grant`,
+`posture_extra_env`.
 
 > **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [app-sandbox-roadmap.md](../request-for-change/rfc-app-sandbox-isolation.md).
 

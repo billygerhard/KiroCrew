@@ -24,6 +24,11 @@ from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.approval_grants import (
+    effective_posture,
+    sanitize_app_env,
+    wanted_posture,
+)
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
     app_execution_denied,
@@ -1265,7 +1270,10 @@ def _cron_defs_from_manifest(
                 "script": cron.script,
                 "app": app_name,
                 "agent_sequence": cron.agent_sequence,
-                "env": cron.env,
+                # The reserved approval control var never survives a manifest env
+                # block: the posture comes from the operator's grant at
+                # registration time, not from anything the app can author.
+                "env": sanitize_app_env(cron.env),
                 "persistent_session": cron.persistent_session,
                 "silent": cron.silent,
                 "enabled": cron.enabled,
@@ -1316,6 +1324,13 @@ def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
         return []
 
 
+def _declared_permissions(manifest: AppManifest | None) -> dict[str, Any]:
+    """The manifest's ``permissions`` block as a dict, or ``{}`` when absent."""
+    if manifest is None:
+        return {}
+    return manifest.permissions.to_dict()
+
+
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
     """Promote admitted app cron definitions into the running CronService.
 
@@ -1353,6 +1368,12 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
 
     sdk = CronSDK(app_name, cron_service)
     existing_names = {j.name for j in sdk.list_jobs()}
+
+    # The posture is resolved HERE, at registration, rather than baked into the
+    # persisted definitions: a grant added later then takes effect on the next
+    # enable, and a revoked grant cannot be served from a stale file. The app's
+    # manifest supplies only the WANTED posture; the operator's grant decides.
+    posture = effective_posture(app_name, wanted_posture(_declared_permissions(manifest)))
 
     # circular import: mcp_cron → security → ... → hooks_integration → bridges
     from kiro_crew.mcp_cron import _vet_script_file, _vet_shell_command
@@ -1427,6 +1448,7 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 persistent_session=d.get("persistent_session", False),
                 silent=bool(d.get("silent", False)),
                 enabled=bool(d.get("enabled", True)),
+                approval_mode=posture,
             )
             newly_registered.append(name)
             sel().log_api_access(
