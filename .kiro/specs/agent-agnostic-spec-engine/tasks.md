@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 16 parent tasks, 45 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 49 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -197,18 +197,37 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Fixture git repository with a local bare remote exercising isolate through teardown offline; seeded fake metering ledger exercising budget halt; deterministic stages verified to make zero model invocations
     - _Requirements: 13.16, 16.3, 6.4, 17.1, 17.2_
 
+- [ ] 17. Analysis
+  - [ ] 17.1 Analysis contract, schemas, and provider resolution
+    - Publish versioned request and Analysis_Findings JSON Schemas; resolve the Analysis_Provider from config (local in-process, or an MCP stdio child from configured command/env/timeout) behind one engine call with an identical tool surface either way
+    - Validate every response against the schema; key findings to acceptance criteria; surface declared skipped coverage; attribute declared cost to the run's budget; treat finding text as untrusted data
+    - Unavailable, timed-out, or schema-invalid provider falls back to the local analyzer with a degraded marker and reason, never blocking authoring; analyzer identity, coverage, and degraded status audited
+    - _Requirements: 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 26.8, 26.9, 26.10, 24.7_
+  - [ ] 17.2 Bundled local analyzer
+    - Deterministic structural checks: glossary terms used but undefined, unquantified qualifiers, criteria that are not independently testable, requirements with no covering task, overlapping or contradictory criteria within a requirement
+    - Emit the shared Analysis_Findings schema with generated clarifying questions (choices, consequences, recommended answer); declare depth as structural; no network, zero model credits
+    - _Requirements: 27.1, 27.2, 27.3, 27.4, 27.5_
+  - [ ] 17.3 Conformance runner
+    - `verify-analyzer` runner over fixture documents (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared skips, timeout honoring, and repeatability; the local analyzer passes it
+    - _Requirements: 26.11, 27.6_
+
+- [ ] 18. Clean-room provenance gate
+  - [ ] 18.1 Provenance checks and audit
+    - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
+    - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5_
+
 ## Task Dependency Graph
 
 ```json
 {"waves": [
   {"id": 0, "tasks": ["1.1", "1.2", "2.1", "2.2", "3.1"]},
-  {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1"]},
-  {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2"]},
-  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "8.3", "9.1", "15.2"]},
+  {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
+  {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2"]},
+  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "8.3", "9.1", "15.2", "17.3"]},
   {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "10.1", "11.1", "15.1"]},
   {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3"]},
   {"id": 6, "tasks": ["12.2", "12.3", "14.1", "16.1"]},
-  {"id": 7, "tasks": ["12.4", "16.2"]}
+  {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}
 ]}
 ```
 

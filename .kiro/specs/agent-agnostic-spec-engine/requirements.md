@@ -24,7 +24,10 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Setup_Assistant**: An agent-driven interactive setup flow that inspects existing project context, such as KiroCrew memory, Kiro steering files, and project documentation, to infer and propose the Spec_App configuration.
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
-- **Provider_Interface**: The extension point through which enhanced analysis capabilities (requirements analysis, model catalogs, review policy, additional watch sources) plug into the Spec_Engine without changing its tool surface.
+- **Analysis_Provider**: The component that analyzes a requirements document and returns Analysis_Findings. Resolved from configuration to either the bundled Local_Analyzer or an external analyzer invoked as an MCP server command.
+- **Local_Analyzer**: The bundled Analysis_Provider that runs structural and lexical checks locally with no network access.
+- **Analysis_Findings**: The structured analysis result: per finding a kind, severity, referenced acceptance criteria, message, and an optional clarifying question with choices, consequences, and a recommended answer; plus declared coverage and optional cost.
+- **Provider_Interface**: The extension point through which pluggable capabilities, including analysis, model catalogs, review policy, and additional watch sources, plug into the Spec_Engine without changing its tool surface.
 
 ## Requirements
 
@@ -257,7 +260,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. THE Spec_App SHALL execute watch polling, document validation, phase derivation, gate enforcement, delivery stage commands, and notifications without model invocation.
-2. THE Spec_App SHALL restrict model invocations to document authoring, task implementation, review verdicts, fix-task generation, intake screening, and interactive setup inference.
+2. THE Spec_App SHALL restrict model invocations to document authoring, task implementation, review verdicts, fix-task generation, intake screening, delegated analysis, and interactive setup inference.
 3. WHILE no new Watched_Item is detected, THE Watcher_Dispatcher SHALL consume zero model credits.
 4. FOR ALL spec runs, the credit consumption attributed to validation, phase derivation, and delivery command execution SHALL be zero.
 ### Requirement 18: Run lifecycle and review queue
@@ -344,6 +347,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. WHERE no notification channel is configured, THE Spec_App SHALL deliver notifications to the host gateway's default dashboard channel.
 5. FOR ALL optional configuration settings, an absent setting resolves to a defined default and never causes a failure or a blocked operation by absence alone.
 6. THE Spec_Builder_UI configuration surface SHALL display the effective value of every setting together with its origin, bundled default or explicit configuration.
+7. WHERE no Analysis_Provider is configured, THE Spec_Engine SHALL resolve analysis to the Local_Analyzer.
 ### Requirement 25: Intake injection screening
 
 **User Story:** As an operator wiring untrusted issue intake to autonomous runs, I want each watched item screened for prompt-injection attempts before autonomy applies, so that a crafted issue is quarantined for my review instead of steering an unattended agent.
@@ -357,3 +361,45 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 5. WHEN a reviewer releases a quarantined run, THE Spec_App SHALL treat the release as the human review action and proceed according to the Autonomy_Policy.
 6. THE screening invocation SHALL resolve its model through the review role of the selected Cost_Profile, and its credit consumption SHALL attribute to the run's budget.
 7. WHEN screening completes, THE Spec_Engine SHALL record the screening verdict and findings in the run's audit log.
+### Requirement 26: Pluggable analysis provider contract
+
+**User Story:** As a user in different environments, I want requirements analysis delegated to a provider I name in configuration, so that an enhanced analyzer can be attached where it is available while every install still gets analysis.
+
+#### Acceptance Criteria
+
+1. THE Spec_Engine SHALL resolve the Analysis_Provider from configuration to either the Local_Analyzer or an external analyzer, and THE Spec_Engine SHALL expose the same analysis tool regardless of which is resolved.
+2. WHERE an external Analysis_Provider is configured, THE Spec_Engine SHALL invoke it as an MCP server child process using the configured command and environment, and THE Spec_App SHALL NOT bundle, vendor, or embed that provider's implementation.
+3. WHEN THE Spec_Engine requests analysis, THE request SHALL carry the requirements document location, the spec type, and the artifact format version.
+4. WHEN an Analysis_Provider returns a response, THE Spec_Engine SHALL validate it against the published Analysis_Findings schema, and every finding SHALL reference the acceptance criteria it concerns.
+5. THE Analysis_Provider SHALL declare which requirements it analyzed and which it skipped, and THE Spec_App SHALL surface skipped requirements to the user.
+6. IF the configured Analysis_Provider is unavailable, exceeds its configured timeout, or returns a response that fails schema validation, THEN THE Spec_Engine SHALL fall back to the Local_Analyzer, mark the run's analysis degraded with the reason, and SHALL NOT block authoring.
+7. WHERE a response declares a cost, THE Spec_App SHALL attribute that cost to the run's budget.
+8. THE Spec_Engine SHALL treat all Analysis_Findings text as untrusted data, stored and displayed but never executed or interpreted as instructions.
+9. WHEN analysis completes, THE Spec_Engine SHALL record the analyzer identity, declared coverage, and degraded status in the run's audit log, and THE Spec_Builder_UI SHALL display which provider answered.
+10. THE Spec_App SHALL publish the analysis request and Analysis_Findings schemas as versioned artifacts in the repository.
+11. THE Spec_App SHALL provide a conformance runner that verifies a candidate Analysis_Provider against bundled fixture documents, checking schema validity, detection of planted defects, declared coverage of skipped sections, timeout honoring, and repeatability.
+
+### Requirement 27: Bundled local analyzer
+
+**User Story:** As a user of a default install, I want mechanical analysis without any external provider, so that spec quality comes from executable checks rather than from prompt wording alone.
+
+#### Acceptance Criteria
+
+1. THE Local_Analyzer SHALL run deterministic checks over the Spec_Artifacts, including glossary terms used but not defined, unquantified qualifiers, acceptance criteria that are not independently testable, requirements not covered by any task, and criteria within a requirement whose conditions overlap or contradict.
+2. THE Local_Analyzer SHALL emit results in the Analysis_Findings schema used by external providers.
+3. WHERE a finding admits a human decision, THE Local_Analyzer SHALL generate a clarifying question with choices, consequences, and a recommended answer.
+4. THE Local_Analyzer SHALL declare its analysis depth as structural, and SHALL NOT report absence of findings as proof of correctness.
+5. THE Local_Analyzer SHALL operate with no network access and SHALL consume zero model credits.
+6. THE Local_Analyzer SHALL pass the conformance runner.
+
+### Requirement 28: Clean-room implementation provenance
+
+**User Story:** As a maintainer preparing this for an open repository, I want the implementation derived only from public surfaces, so that the app carries no provenance question.
+
+#### Acceptance Criteria
+
+1. THE Spec_App implementation SHALL be derived only from the publicly documented artifact format, publicly available spec artifacts, and the public host codebase.
+2. THE Spec_App SHALL NOT contain code, schemas, or prompt text copied or adapted from non-public implementations.
+3. THE Spec_App SHALL author all shipped prompt text for this app.
+4. THE Spec_App SHALL NOT contain endpoints, service names, request headers, or credentials for non-public services.
+5. WHERE enhanced capability is delegated, THE Spec_App SHALL reference the provider by configuration only.
