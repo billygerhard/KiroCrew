@@ -24,7 +24,11 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Setup_Assistant**: An agent-driven interactive setup flow that inspects existing project context, such as KiroCrew memory, Kiro steering files, and project documentation, to infer and propose the Spec_App configuration.
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
-- **Analysis_Provider**: The component that analyzes a requirements document and returns Analysis_Findings. Resolved from configuration to either the bundled Local_Analyzer or an external analyzer invoked as an MCP server command.
+- **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Capability_Provider**: The implementation bound to a delegable capability, resolved from configuration to one of three transports: builtin (the app's own implementation), mcp (an MCP server invoked as a child process), or command (a program invoked with structured input and output).
+- **Delegable_Capability**: A capability whose implementation may be provided externally: analysis, document authoring, review verdicts, task implementation, supplementary validation rules, watch sources, and model catalogs.
+- **Engine_Floor**: The capabilities that are never delegable and always execute in the engine: native-format validation, phase gate enforcement, Autonomy_Policy resolution, budget enforcement, the dispatch claim ledger, and the audit log.
+- **Analysis_Provider**: The Capability_Provider bound to analysis. Returns Analysis_Findings.
 - **Local_Analyzer**: The bundled Analysis_Provider that runs structural and lexical checks locally with no network access.
 - **Analysis_Findings**: The structured analysis result: per finding a kind, severity, referenced acceptance criteria, message, and an optional clarifying question with choices, consequences, and a recommended answer; plus declared coverage and optional cost.
 - **Provider_Interface**: The extension point through which pluggable capabilities, including analysis, model catalogs, review policy, and additional watch sources, plug into the Spec_Engine without changing its tool surface.
@@ -167,7 +171,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 #### Acceptance Criteria
 
 1. THE Spec_App SHALL build and operate with no internal-only dependencies in its default configuration.
-2. THE Spec_Engine SHALL define a Provider_Interface for pluggable capabilities, including requirements analysis, model catalogs, review policy, and watch sources, with a bundled default provider for each.
+2. THE Spec_Engine SHALL define the Capability_Provider interface for every Delegable_Capability, with a bundled builtin provider for each.
 3. WHERE an enhanced provider is registered, THE Spec_Engine SHALL route the corresponding operations to that provider without changing the Engine_MCP_Server tool surface.
 4. THE Spec_Engine SHALL perform all spec content processing on the local machine and SHALL NOT transmit spec content to remote services.
 5. THE Spec_App SHALL NOT transmit telemetry by default, and WHERE telemetry is explicitly enabled it SHALL carry only anonymous operational counts and never spec content.
@@ -212,6 +216,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 20. WHERE no protected branch set is configured for a project, THE Spec_App SHALL treat the project's base branch as protected.
 21. IF autonomous integration is enabled for a project with no verify stage configured, THEN THE Spec_App SHALL warn the user at configuration time and record the warning in the audit log.
 22. WHERE a run is interactive, THE Delivery_Pipeline SHALL be startable by explicit user action and SHALL apply the same stages, variables, and rules as autonomous delivery.
+23. THE Delivery_Workflow SHALL define the order in which its configured stages run, and THE Delivery_Pipeline SHALL support verify stages configured to run before the submit stage, after it, or both.
 ### Requirement 14: Agent-assisted interactive setup
 
 **User Story:** As a new user, I want an agent-guided setup that learns my project and delivery workflow from context that already exists, so that my configuration is generated and explained instead of hand-written.
@@ -347,7 +352,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. WHERE no notification channel is configured, THE Spec_App SHALL deliver notifications to the host gateway's default dashboard channel.
 5. FOR ALL optional configuration settings, an absent setting resolves to a defined default and never causes a failure or a blocked operation by absence alone.
 6. THE Spec_Builder_UI configuration surface SHALL display the effective value of every setting together with its origin, bundled default or explicit configuration.
-7. WHERE no Analysis_Provider is configured, THE Spec_Engine SHALL resolve analysis to the Local_Analyzer.
+7. WHERE no Capability_Provider is configured for a Delegable_Capability, THE Spec_Engine SHALL resolve that capability to its builtin provider.
 ### Requirement 25: Intake injection screening
 
 **User Story:** As an operator wiring untrusted issue intake to autonomous runs, I want each watched item screened for prompt-injection attempts before autonomy applies, so that a crafted issue is quarantined for my review instead of steering an unattended agent.
@@ -361,23 +366,27 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 5. WHEN a reviewer releases a quarantined run, THE Spec_App SHALL treat the release as the human review action and proceed according to the Autonomy_Policy.
 6. THE screening invocation SHALL resolve its model through the review role of the selected Cost_Profile, and its credit consumption SHALL attribute to the run's budget.
 7. WHEN screening completes, THE Spec_Engine SHALL record the screening verdict and findings in the run's audit log.
-### Requirement 26: Pluggable analysis provider contract
+### Requirement 26: Pluggable capability providers
 
-**User Story:** As a user in different environments, I want requirements analysis delegated to a provider I name in configuration, so that an enhanced analyzer can be attached where it is available while every install still gets analysis.
+**User Story:** As a user with my own tooling, I want every delegable capability bound to a provider I choose, so that the app hosts my analyzer, reviewer, or coding agent while still guaranteeing the rules the engine enforces.
 
 #### Acceptance Criteria
 
-1. THE Spec_Engine SHALL resolve the Analysis_Provider from configuration to either the Local_Analyzer or an external analyzer, and THE Spec_Engine SHALL expose the same analysis tool regardless of which is resolved.
-2. WHERE an external Analysis_Provider is configured, THE Spec_Engine SHALL invoke it as an MCP server child process using the configured command and environment, and THE Spec_App SHALL NOT bundle, vendor, or embed that provider's implementation.
-3. WHEN THE Spec_Engine requests analysis, THE request SHALL carry the requirements document location, the spec type, and the artifact format version.
-4. WHEN an Analysis_Provider returns a response, THE Spec_Engine SHALL validate it against the published Analysis_Findings schema, and every finding SHALL reference the acceptance criteria it concerns.
-5. THE Analysis_Provider SHALL declare which requirements it analyzed and which it skipped, and THE Spec_App SHALL surface skipped requirements to the user.
-6. IF the configured Analysis_Provider is unavailable, exceeds its configured timeout, or returns a response that fails schema validation, THEN THE Spec_Engine SHALL fall back to the Local_Analyzer, mark the run's analysis degraded with the reason, and SHALL NOT block authoring.
-7. WHERE a response declares a cost, THE Spec_App SHALL attribute that cost to the run's budget.
-8. THE Spec_Engine SHALL treat all Analysis_Findings text as untrusted data, stored and displayed but never executed or interpreted as instructions.
-9. WHEN analysis completes, THE Spec_Engine SHALL record the analyzer identity, declared coverage, and degraded status in the run's audit log, and THE Spec_Builder_UI SHALL display which provider answered.
-10. THE Spec_App SHALL publish the analysis request and Analysis_Findings schemas as versioned artifacts in the repository.
-11. THE Spec_App SHALL provide a conformance runner that verifies a candidate Analysis_Provider against bundled fixture documents, checking schema validity, detection of planted defects, declared coverage of skipped sections, timeout honoring, and repeatability.
+1. THE Spec_Engine SHALL resolve each Delegable_Capability from configuration to a Capability_Provider using one of the transports builtin, mcp, or command, and THE Engine_MCP_Server tool surface SHALL be identical regardless of which providers are bound.
+2. THE Spec_App SHALL ship a builtin Capability_Provider for every Delegable_Capability, and THE Spec_App SHALL NOT require any external provider to function.
+3. THE Spec_Engine SHALL execute every Engine_Floor capability itself, and THE Spec_Engine SHALL NOT accept a Capability_Provider binding for any Engine_Floor capability.
+4. WHERE the mcp transport is configured, THE Spec_Engine SHALL invoke the provider as an MCP server child process using the configured command and environment, and THE Spec_App SHALL NOT bundle, vendor, or embed that provider's implementation.
+5. WHERE the command transport is configured, THE Spec_Engine SHALL invoke the configured program with the capability's structured input and SHALL parse its structured output, so that an external agent or command-line tool can serve a capability.
+6. WHEN THE Spec_Engine invokes a Capability_Provider, THE request SHALL carry the artifact locations, the spec type, and the artifact format version.
+7. WHEN a Capability_Provider returns a response, THE Spec_Engine SHALL validate it against that capability's published schema, and findings SHALL reference the acceptance criteria or tasks they concern.
+8. THE Capability_Provider SHALL declare what it processed and what it skipped, and THE Spec_App SHALL surface skipped items to the user.
+9. IF a Capability_Provider is unavailable, exceeds its configured timeout, or returns a response that fails schema validation, THEN THE Spec_Engine SHALL fall back to the builtin provider for that capability, mark the run degraded with the reason, and SHALL NOT block the run.
+10. WHERE a response declares a cost, THE Spec_App SHALL attribute that cost to the run's budget.
+11. THE Spec_Engine SHALL treat all Capability_Provider output as untrusted data, stored and displayed but never executed or interpreted as instructions.
+12. WHERE a supplementary validation provider is bound, THE Spec_Engine SHALL add its findings to the engine's own findings, and THE Spec_Engine SHALL NOT allow a provider to suppress, downgrade, or override an engine finding or gate.
+13. WHEN a capability completes, THE Spec_Engine SHALL record the provider identity, transport, declared coverage, and degraded status in the run's audit log, and THE Spec_Builder_UI SHALL display which provider served each capability.
+14. THE Spec_App SHALL publish a versioned request and response schema for every Delegable_Capability.
+15. THE Spec_App SHALL provide a conformance runner that verifies a candidate Capability_Provider for a named capability against bundled fixtures, checking schema validity, detection of planted defects where applicable, declared coverage, timeout honoring, and repeatability.
 
 ### Requirement 27: Bundled local analyzer
 
@@ -403,3 +412,28 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 3. THE Spec_App SHALL author all shipped prompt text for this app.
 4. THE Spec_App SHALL NOT contain endpoints, service names, request headers, or credentials for non-public services.
 5. WHERE enhanced capability is delegated, THE Spec_App SHALL reference the provider by configuration only.
+### Requirement 29: Pre-submit quality gates
+
+**User Story:** As a reviewer, I want quality gates to run before the change is submitted for review, so that analyzer and coverage findings are fixed by the run instead of landing on me.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL read Quality_Gates as verify-stage commands, each declared with a severity of blocking or advisory.
+2. WHERE Quality_Gates are configured to run before the submit stage, THE Delivery_Pipeline SHALL run them before producing the review artifact.
+3. IF a blocking Quality_Gate fails, THEN THE Delivery_Pipeline SHALL dispatch fix tasks up to the configured retry limit and SHALL NOT run the submit stage until it passes or the limit is reached.
+4. IF an advisory Quality_Gate fails, THEN THE Delivery_Pipeline SHALL record the outcome and surface it on the run without stopping the run.
+5. WHEN a Quality_Gate runs, THE Delivery_Pipeline SHALL substitute the run context variables, including the base branch, so that a gate can compare the change against its base.
+6. WHEN a Quality_Gate produces output, THE Spec_Engine SHALL record the gate name, severity, exit status, and captured output in the run's audit log, and THE Spec_Builder_UI SHALL display each gate's outcome on the run.
+7. THE Spec_App SHALL bundle editable Quality_Gate presets for test execution, coverage thresholds, linting, and type checking.
+8. WHERE no Quality_Gates are configured, THE Delivery_Pipeline SHALL proceed without them and SHALL record that no gates ran.
+
+### Requirement 30: Test quality verification
+
+**User Story:** As an engineer relying on an autonomous run's tests, I want test quality judged explicitly, so that a green suite means the tests would actually catch a regression.
+
+#### Acceptance Criteria
+
+1. WHEN a task's implementation includes tests, THE review verdict SHALL judge those tests against defined criteria, including that assertions derive from the code under test rather than from values the test itself constructed, that the test fails when the covered behavior is wrong, and that error and boundary cases are covered.
+2. IF a task's tests fail the test quality criteria, THEN THE Orchestrator SHALL treat the verdict as requiring changes.
+3. WHERE a mutation probe command is configured as a Quality_Gate, THE Delivery_Pipeline SHALL run it and treat a suite that still passes under mutation as a gate failure.
+4. WHEN a review verdict reports test quality findings, THE Spec_Engine SHALL record them in the run's audit log.

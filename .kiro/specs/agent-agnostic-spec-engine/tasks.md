@@ -2,7 +2,7 @@
 
 ## Overview
 
-Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 49 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
+Ships the spec-engine app in dependency order: gateway enablers and engine foundations first, then the validator, phase machine, autonomy and run lifecycle, budget, delivery, watchers, and orchestrator, then the MCP surface, feedback loops, UI absorption, packaging, setup assistant, and the verification suites. 18 parent tasks, 52 leaves, 8 waves; wave membership follows real code dependencies (state store and config before everything stateful; engine modules before the MCP wrapper and drivers; UI and packaging after the surfaces they expose).
 
 ## Tasks
 
@@ -97,6 +97,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Explicit user action starts the same pipeline with identical stages, variables, and rules; completion or failure notifies with every executed stage's outcome
     - _Requirements: 13.22, 13.13_
 
+  - [ ] 7.6 Quality gates and stage ordering
+    - Workflow-declared stage order with verify-class gates runnable before submit, after it, or both; each gate carries severity (blocking stops the flow and dispatches fix tasks, advisory records and surfaces without stopping)
+    - Run context substitution including base branch so gates can compare against base; gate name, severity, exit status and captured output audited and displayed on the run; bundled presets for tests, coverage thresholds, lint and type checks; no gates configured is recorded, not an error
+    - _Requirements: 13.23, 29.1, 29.2, 29.3, 29.4, 29.5, 29.6, 29.7, 29.8_
+
 - [ ] 8. Watchers and dispatch
   - [ ] 8.1 Command-based watch sources and zero-token polling
     - Sources defined as poll command plus field mapping (identifier, title, body, state, address, classification, submitter); disabled by default with per-source enablement
@@ -131,6 +136,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 9.3 Review verdicts and retry policy
     - Successful implementations get a review verdict on the review role's model; no completion without approval; any unsuccessful completion (implementation, review rejection, infrastructure) retries to the limit then fails without abandoning independent tasks
     - _Requirements: 9.3, 9.4_
+
+  - [ ] 9.4 Test quality criteria in the review gate
+    - Review verdicts judge tests explicitly: assertions derive from the code under test rather than test-constructed values, the test fails when the covered behavior is wrong, error and boundary cases covered; failing the criteria yields changes-required
+    - Optional mutation-probe gate: a suite that still passes under mutation is a gate failure; test quality findings recorded in the audit log
+    - _Requirements: 30.1, 30.2, 30.3, 30.4_
 
 - [ ] 10. Engine MCP server
   - [ ] 10.1 Tool surface and JSON-RPC conformance
@@ -198,18 +208,24 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 13.16, 16.3, 6.4, 17.1, 17.2_
 
 - [ ] 17. Analysis
-  - [ ] 17.1 Analysis contract, schemas, and provider resolution
+  - [ ] 17.1 Capability provider registry, schemas, and transports
+    - Resolve every Delegable_Capability from config to builtin, mcp, or command transport behind one invocation path; identical tool surface regardless; builtin provider shipped for each; Engine_Floor capabilities refuse any binding
+    - Per-capability versioned request/response schemas; schema-validated responses; declared coverage surfaced; cost attributed to the run budget; provider output treated as untrusted data; provider identity, transport, coverage and degraded status audited and displayed
+    - Unavailable, timed-out or schema-invalid provider falls back to builtin with a degraded marker and reason, never blocking the run; supplementary validation providers may only add findings, never suppress or downgrade engine findings or gates
+    - _Requirements: 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 26.8, 26.9, 26.10, 26.11, 26.12, 26.13, 26.14, 24.7, 11.2_
+  - [ ] 17.4 Analysis capability wiring
     - Publish versioned request and Analysis_Findings JSON Schemas; resolve the Analysis_Provider from config (local in-process, or an MCP stdio child from configured command/env/timeout) behind one engine call with an identical tool surface either way
     - Validate every response against the schema; key findings to acceptance criteria; surface declared skipped coverage; attribute declared cost to the run's budget; treat finding text as untrusted data
     - Unavailable, timed-out, or schema-invalid provider falls back to the local analyzer with a degraded marker and reason, never blocking authoring; analyzer identity, coverage, and degraded status audited
-    - _Requirements: 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 26.8, 26.9, 26.10, 24.7_
+    - Bind the analysis capability through the registry: request carries document location, spec type and format version; findings keyed to acceptance criteria route into the Review_Queue
+    - _Requirements: 26.6, 26.7, 26.8_
   - [ ] 17.2 Bundled local analyzer
     - Deterministic structural checks: glossary terms used but undefined, unquantified qualifiers, criteria that are not independently testable, requirements with no covering task, overlapping or contradictory criteria within a requirement
     - Emit the shared Analysis_Findings schema with generated clarifying questions (choices, consequences, recommended answer); declare depth as structural; no network, zero model credits
     - _Requirements: 27.1, 27.2, 27.3, 27.4, 27.5_
   - [ ] 17.3 Conformance runner
-    - `verify-analyzer` runner over fixture documents (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared skips, timeout honoring, and repeatability; the local analyzer passes it
-    - _Requirements: 26.11, 27.6_
+    - Per-capability conformance runner over bundled fixtures (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared coverage, timeout honoring and repeatability; every builtin provider passes its own suite
+    - _Requirements: 26.15, 27.6_
 
 - [ ] 18. Clean-room provenance gate
   - [ ] 18.1 Provenance checks and audit
@@ -222,9 +238,9 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 {"waves": [
   {"id": 0, "tasks": ["1.1", "1.2", "2.1", "2.2", "3.1"]},
   {"id": 1, "tasks": ["3.2", "4.1", "4.2", "5.1", "7.1", "8.1", "17.1"]},
-  {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2"]},
-  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "8.3", "9.1", "15.2", "17.3"]},
-  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "10.1", "11.1", "15.1"]},
+  {"id": 2, "tasks": ["4.3", "5.2", "6.1", "7.2", "7.3", "8.2", "9.2", "17.2", "17.4"]},
+  {"id": 3, "tasks": ["5.3", "5.4", "6.2", "7.4", "7.5", "7.6", "8.3", "9.1", "15.2", "17.3"]},
+  {"id": 4, "tasks": ["8.4", "8.5", "8.6", "9.3", "9.4", "10.1", "11.1", "15.1"]},
   {"id": 5, "tasks": ["10.2", "11.2", "12.1", "13.1", "13.2", "13.3"]},
   {"id": 6, "tasks": ["12.2", "12.3", "14.1", "16.1"]},
   {"id": 7, "tasks": ["12.4", "16.2", "18.1"]}
