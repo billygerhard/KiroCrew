@@ -1,0 +1,359 @@
+# Requirements Document
+
+## Introduction
+
+KiroCrew replicates the full Kiro spec-driven development process (requirements -> design -> tasks -> execution) as an open, agent-agnostic system. Today the process is fragmented: the Kiro IDE owns one implementation, the Spec Builder app embeds its rules as prompt text in its own backend (reachable only through its embedded chat), and a separately hosted MCP server carries a third copy. This feature extracts the rules into a single Spec_Engine (rules as code), exposes it to any agent through an MCP tool surface that carries its own instructions, and packages the whole thing as a KiroCrew app in the public repository. The result supports both interactive authoring ("Spec this out" in any chat) and headless authoring (a watcher fires a spec run when an issue arrives), with a policy-governed review gate before execution (human review by default, configurable up to full autonomy per source), an optional autonomous delivery pipeline that carries results through the project's own delivery workflow, whether that is a pull request with CI, an internal code review, or plain local builds, and orchestrated execution that routes design/review work to a smart model and implementation work to a cheaper one.
+
+## Glossary
+
+- **Spec_Artifacts**: The on-disk contract for a spec: `requirements.md`, `design.md`, `tasks.md`, and the `.config.kiro` sidecar under `<project>/.kiro/specs/<name>/`.
+- **Spec_Engine**: The library that implements spec rules as code: document validation, phase state machine, dependency-graph analysis, approval recording, and task status persistence. The single source of truth for spec discipline.
+- **Engine_MCP_Server**: The MCP wrapper over the Spec_Engine that exposes its operations as tools to any agent.
+- **Spec_App**: The KiroCrew app that packages the Spec_Engine, the Engine_MCP_Server, the discovery skill, and the Spec_Builder_UI for installation.
+- **Host_Agent**: Any agent session (default agent, subagent, cron, third-party agent) that consumes the Engine_MCP_Server tools. Requires no spec-specific configuration.
+- **Gateway**: The KiroCrew gateway process that hosts agent sessions and owns tool-approval decisions.
+- **Review_Gate**: The structural boundary between spec authoring and spec execution. Execution starts only through this gate, governed by the Autonomy_Policy.
+- **Autonomy_Policy**: Per-source, per-spec-type, and optionally per-submitter-class configuration that sets how far a triggered run proceeds without human action: authoring only, through execution, through delivery, or through integration. Loaded from configuration only.
+- **Delivery_Pipeline**: The post-execution flow of a run, executing the stages of the configured Delivery_Workflow: isolate, submit, verify, publish, and teardown. Available to autonomous and interactive runs alike.
+- **Delivery_Workflow**: A pure-configuration mapping of each delivery stage to the project's own terminal commands, for example git branching with a pull-request command and CI, an internal code-review command, or local-only build and test commands. Defined entirely in configuration with no plugin code.
+- **Integration_Target**: The protected destination where changes become part of the project, such as a protected branch like mainline or the primary working copy of a non-version-controlled project.
+- **Orchestrator**: The execution component that dispatches leaf tasks in dependency-graph waves and routes each role (design, review, implement) to its configured model.
+- **Watcher_Dispatcher**: The headless trigger component that observes external sources (issue trackers) and starts headless spec runs for newly detected items.
+- **Watched_Item**: A newly detected external item (for example a GitHub issue) that the Watcher_Dispatcher may turn into a headless spec run.
+- **Spec_Builder_UI**: The dashboard application surface for browsing specs, reviewing documents, approving phases, and starting execution. A driver of the Spec_Engine, not an engine.
+- **Setup_Assistant**: An agent-driven interactive setup flow that inspects existing project context, such as KiroCrew memory, Kiro steering files, and project documentation, to infer and propose the Spec_App configuration.
+- **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
+- **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
+- **Provider_Interface**: The extension point through which enhanced analysis capabilities (requirements analysis, model catalogs, review policy, additional watch sources) plug into the Spec_Engine without changing its tool surface.
+
+## Requirements
+
+### Requirement 1: Rules-as-code validation engine
+
+**User Story:** As a developer, I want spec rules implemented as code in a shared engine, so that every agent and UI enforces the same discipline instead of each reimplementing rules as prompt text.
+
+#### Acceptance Criteria
+
+1. WHEN a spec document is submitted for validation, THE Spec_Engine SHALL validate it against the native Kiro spec format, including required sections, EARS acceptance-criterion shape, sequential requirement numbering, task checkbox syntax, and dependency-graph JSON structure.
+2. IF a document fails validation, THEN THE Spec_Engine SHALL return every violation with its file, location, and rule identifier.
+3. WHEN tasks.md is validated, THE Spec_Engine SHALL verify that every leaf task references at least one acceptance criterion that exists in requirements.md.
+4. WHEN tasks.md is validated, alone or as part of a full spec validation, THE Spec_Engine SHALL report every requirement that is not covered by at least one task.
+5. WHEN a dependency graph is validated, THE Spec_Engine SHALL verify that the graph is acyclic, that every incomplete leaf task appears in exactly one wave, and that wave identifiers are sequential integers starting from zero.
+6. THE Spec_Engine SHALL store engine-managed run state outside the native spec documents, and every spec directory SHALL remain consumable by the Kiro IDE and CLI.
+7. IF engine-managed run state cannot be persisted outside the native spec documents, THEN THE Spec_Engine SHALL fail the operation and report the reason, and SHALL NOT write that state into a spec document.
+
+### Requirement 2: Enforced phase advancement
+
+**User Story:** As a spec owner, I want phase advancement enforced by the engine, so that an agent cannot self-promote a spec to ready-to-build by writing all documents at once.
+
+#### Acceptance Criteria
+
+1. WHEN the phase of a spec is requested, THE Spec_Engine SHALL derive it from the Spec_Artifacts present on disk combined with recorded approval state, as a read-only computation that never advances the phase as a side effect.
+2. IF advancement to the next phase is requested while the current phase's document fails validation, THEN THE Spec_Engine SHALL refuse the advancement and return the validation errors.
+3. IF advancement to the next phase is requested while the current phase lacks a recorded approval, THEN THE Spec_Engine SHALL refuse the advancement and identify the missing approval.
+4. WHEN a phase approval is recorded, THE Spec_Engine SHALL persist the approver identity and timestamp with the approval.
+5. IF a spec document is modified while a recorded approval exists for its phase, THEN THE Spec_Engine SHALL mark that recorded approval stale and require re-approval before any subsequent advancement, and WHERE no approval was recorded for that phase THE Spec_Engine SHALL leave approval state unchanged.
+6. THE Spec_Engine SHALL serialize state-changing operations per spec, and IF a second session attempts a conflicting state change on the same spec, THEN THE Spec_Engine SHALL reject it and return the spec's current state.
+
+### Requirement 3: Agent-agnostic MCP tool surface
+
+**User Story:** As a user of any coding agent, I want the spec workflow exposed as MCP tools that carry their own instructions, so that a stock agent with no spec knowledge can author and run specs.
+
+#### Acceptance Criteria
+
+1. THE Engine_MCP_Server SHALL expose Spec_Engine operations as MCP tools, including authoring guidance, document validation, phase advancement, approval recording, task listing and status updates, review verdicts, and orchestration guidance.
+2. WHEN a Host_Agent calls an authoring-guidance tool, THE Engine_MCP_Server SHALL return the complete authoring instructions for the requested flow as the tool result, including document formats, phase flow, and approval gates.
+3. WHEN a Host_Agent with only the Engine_MCP_Server registered performs the spec workflow, THE Engine_MCP_Server SHALL supply all spec-specific knowledge required, without agent-side prompt or configuration changes, and THE Engine_MCP_Server SHALL NOT require that a Host_Agent lack other spec-related tools.
+4. FOR ALL spec state operations, invoking an operation through the MCP tool surface and invoking the same operation through the Spec_Engine library interface SHALL produce identical resulting state.
+5. IF the Engine_MCP_Server cannot supply the authoring guidance for a requested flow, THEN THE Engine_MCP_Server SHALL return an error and SHALL NOT return partial guidance.
+
+### Requirement 4: Plain-prompt discovery in any chat
+
+**User Story:** As a user, I want to say "Spec this out" or "Create a spec" in any chat, so that spec work starts without selecting a special agent or opening a UI.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL vend a discovery skill whose trigger phrases include natural spec requests such as creating a spec, planning a feature, fixing a bug as a spec, and making a quick plan.
+2. WHEN the discovery skill is triggered, THE discovery skill SHALL direct the Host_Agent to obtain workflow instructions from the Engine_MCP_Server tools before performing any spec operation, rather than embedding format rules in the skill body.
+3. WHEN the Spec_App is installed or enabled, THE Spec_App SHALL register its discovery skill and its Engine_MCP_Server so that both reach Host_Agent sessions, for builtin and installed app paths alike.
+4. IF registration fails, THEN THE Spec_App SHALL complete installation, report a not-ready state with the failure reason, and SHALL NOT present itself as operational.
+
+### Requirement 5: Feature, bugfix, and quick spec types
+
+**User Story:** As a user, I want feature, bugfix, and quick-plan flows, so that the process weight matches the work.
+
+#### Acceptance Criteria
+
+1. THE Spec_Engine SHALL support three spec types: feature (requirements, design, tasks), bugfix (bug analysis, fix design, tasks), and quick (requirements and tasks only).
+2. WHEN a spec is created, THE Spec_Engine SHALL record the spec type in the spec's `.config.kiro` sidecar and derive the required document set from that recorded type.
+3. WHEN a spec is validated or advanced, THE Spec_Engine SHALL apply the document plan of the recorded spec type.
+4. IF the spec type cannot be recorded when a spec is created, THEN THE Spec_Engine SHALL fail the creation, leave no partial spec directory behind, and refuse validation and advancement for any spec with no recorded spec type.
+
+### Requirement 6: One workflow, interactive and headless
+
+**User Story:** As a user, I want the same spec process to run interactively in chat or headless from a trigger, so that autonomy does not fork the workflow.
+
+#### Acceptance Criteria
+
+1. WHERE a spec run is interactive, THE Spec_Engine SHALL record phase approvals only from explicit user approval actions.
+2. WHERE a spec run is headless, THE Spec_Engine SHALL record gate approvals from the Autonomy_Policy for every gate the policy covers, and THE Spec_Engine SHALL require human action for every gate the policy does not cover.
+3. WHEN a headless run reaches a gate that the Autonomy_Policy reserves for human action, THE Spec_App SHALL notify the configured notification channel that the run is waiting for review.
+4. FOR ALL completed spec runs, artifacts produced by interactive runs and artifacts produced by headless runs SHALL satisfy the same Spec_Engine validation rules.
+5. THE Spec_App SHALL deliver notifications through the host gateway's notification channels, and THE Spec_App SHALL read the channel selection from project configuration.
+
+### Requirement 7: Unattended tool approval for headless runs
+
+**User Story:** As an operator, I want unattended spec runs to call tools without stalling on approval prompts, so that headless authoring completes without a human watching.
+
+#### Acceptance Criteria
+
+1. WHERE a session is seeded by the Spec_App for a headless run, THE Gateway SHALL apply the tool-approval posture granted to the Spec_App in configuration.
+2. THE Gateway SHALL NOT allow a running agent session to modify or elevate its own tool-approval posture through any tool call.
+3. WHEN a headless run starts, THE Spec_App SHALL record the applied approval posture in the run's audit log.
+4. IF a session's applied approval posture does not match the posture granted in configuration, THEN THE Spec_App SHALL refuse to start the run, or halt it if already started, and record the mismatch in the audit log.
+
+### Requirement 8: Policy-governed execution gate
+
+**User Story:** As a spec owner, I want the execution gate driven by a policy I configure, so that I choose per source and spec type between human review and full autonomy.
+
+#### Acceptance Criteria
+
+1. WHERE the Autonomy_Policy reserves execution for human action, THE Review_Gate SHALL start spec execution only from an explicit human action.
+2. WHERE no Autonomy_Policy level is configured for a source and spec type, THE Autonomy_Policy SHALL resolve to human-reserved execution, and WHERE a level is explicitly configured for that source and spec type THE Autonomy_Policy SHALL resolve to the configured level.
+3. WHERE the Autonomy_Policy authorizes autonomous execution for a run's source, spec type, and submitter class, THE Review_Gate SHALL start execution when validation and required gate approvals pass, and SHALL NOT require any further trigger event or human action.
+4. IF execution is requested for a spec whose tasks.md fails validation or whose gates lack required approvals, THEN THE Review_Gate SHALL refuse the request, return the blocking reasons regardless of the Autonomy_Policy, and record the refused request with its initiator in the audit log.
+5. WHEN execution starts, THE Spec_Engine SHALL record the initiator, an explicit human identity or the Autonomy_Policy identifier, with a timestamp in the spec's audit log.
+6. THE Spec_Engine SHALL load the Autonomy_Policy from configuration only, and THE Engine_MCP_Server SHALL NOT expose any tool that modifies the Autonomy_Policy.
+7. THE Spec_Engine SHALL treat the Autonomy_Policy levels as strictly ordered, authoring, then execution, then delivery, then integration, and an enabled level SHALL imply every lower level.
+
+### Requirement 9: Wave-based orchestration with role-based model routing
+
+**User Story:** As a cost-conscious user, I want a smart model to design and review while a cheaper model implements, so that spec execution is affordable at scale.
+
+#### Acceptance Criteria
+
+1. WHEN executing a spec, THE Orchestrator SHALL dispatch leaf tasks wave by wave in dependency-graph order, running tasks within a wave in parallel up to a configured concurrency cap.
+2. WHEN resolving the model for a unit of work, THE Orchestrator SHALL determine that work's role, one of design, review, or implement, and resolve the agent, model, and effort from the configuration entry for that role, falling back to the session default agent and model when that role is unconfigured.
+3. WHEN a task implementation completes successfully, THE Orchestrator SHALL obtain a review verdict using the review role's model, and THE Orchestrator SHALL NOT mark a task complete unless that task's review verdict is approval.
+4. IF a task does not complete successfully, including implementation failure, a review verdict requiring changes, or an infrastructure failure, THEN THE Orchestrator SHALL retry the task up to the configured retry limit and SHALL mark the task failed after the limit without abandoning independent tasks in the remaining waves.
+5. WHILE execution is in progress, THE Spec_Engine SHALL persist task status after every task state change so that an interrupted execution resumes from the recorded state.
+
+### Requirement 10: Watcher-triggered headless dispatch
+
+**User Story:** As a team, I want new bug issues to trigger headless bugfix specs and feature requests to trigger headless plans, so that spec authoring starts before an engineer looks at the item.
+
+#### Acceptance Criteria
+
+1. WHERE watcher dispatch is enabled for a source, THE Watcher_Dispatcher SHALL start a headless spec run for each newly detected Watched_Item, mapping the item's classification to a spec type according to configuration.
+2. THE Watcher_Dispatcher SHALL be disabled by default and SHALL require explicit per-source enablement.
+3. WHEN a Watched_Item is selected for dispatch, THE Watcher_Dispatcher SHALL atomically claim the item in a persistent ledger before starting the run, and THE Watcher_Dispatcher SHALL NOT dispatch an already-claimed item.
+4. WHILE the number of active headless runs is at the configured concurrency cap, THE Watcher_Dispatcher SHALL queue further Watched_Items instead of starting new runs.
+5. WHEN a Watched_Item is passed to a headless run, THE Watcher_Dispatcher SHALL provide the item content as quoted data input to the run, and THE Watcher_Dispatcher SHALL delegate all execution and delivery decisions to the Autonomy_Policy.
+6. THE Watcher_Dispatcher SHALL support watch sources defined in configuration as a poll command with a field mapping that yields each item's identifier, title, body, state, address, classification, and submitter, and THE Spec_App SHALL NOT require plugin code to define a command-based watch source.
+7. THE Watcher_Dispatcher SHALL enforce the concurrency cap per project in addition to the global cap, and SHALL start queued Watched_Items in arrival order as capacity frees.
+8. THE Spec_App SHALL bundle command-based watch source presets for GitHub and GitLab issues, and THE Spec_Engine SHALL accept additional watch sources registered through the Provider_Interface.
+9. THE Watcher_Dispatcher SHALL derive Watched_Item lifecycle transitions, including reopened and cancelled, by comparing successive poll results.
+10. WHERE item feedback commands are configured for a source, THE Watcher_Dispatcher SHALL post dispatch and completion updates back to the Watched_Item using those commands with the run context variables.
+11. WHERE a watch source's items are publicly submittable, THE Spec_App SHALL warn the user when the execution, delivery, or integration autonomy levels are enabled for that source, and SHALL record the user's acknowledgment in the audit log.
+12. WHERE an item's classification has no configured spec-type mapping and the source configures no default spec type, THE Watcher_Dispatcher SHALL NOT dispatch the item and SHALL record it as unmapped.
+
+### Requirement 11: Public app with pluggable providers
+
+**User Story:** As a maintainer, I want the app published in the public KiroCrew repository with proprietary capabilities pluggable, so that public consumers get a working engine while internal builds add enhanced analysis.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL build and operate with no internal-only dependencies in its default configuration.
+2. THE Spec_Engine SHALL define a Provider_Interface for pluggable capabilities, including requirements analysis, model catalogs, review policy, and watch sources, with a bundled default provider for each.
+3. WHERE an enhanced provider is registered, THE Spec_Engine SHALL route the corresponding operations to that provider without changing the Engine_MCP_Server tool surface.
+4. THE Spec_Engine SHALL perform all spec content processing on the local machine and SHALL NOT transmit spec content to remote services.
+5. THE Spec_App SHALL NOT transmit telemetry by default, and WHERE telemetry is explicitly enabled it SHALL carry only anonymous operational counts and never spec content.
+
+### Requirement 12: Spec Builder UI as a driver of the engine
+
+**User Story:** As a dashboard user, I want the Spec Builder UI to drive the shared engine, so that the UI and agents cannot diverge on spec rules.
+
+#### Acceptance Criteria
+
+1. THE Spec_Builder_UI SHALL obtain spec state, validation results, and phase transitions from the Spec_Engine, and THE Spec_Builder_UI SHALL NOT implement independent spec rules.
+2. WHEN a spec is modified through any driver, THE Spec_Builder_UI SHALL display the updated spec state on its next refresh, and WHERE a refresh fails THE Spec_Builder_UI SHALL retain the last known state with a visible staleness indicator.
+3. THE Spec_Builder_UI SHALL provide the human review surface for the Review_Gate, including document review, phase approval, and starting execution.
+4. THE Spec_Builder_UI SHALL provide a configuration surface for the Autonomy_Policy, the Delivery_Workflow stage commands, watch sources, model role assignments, and notification channels.
+5. THE Spec_Builder_UI SHALL display each run's credit consumption, resolved from the per-turn metering ledger, on the run's Review_Queue entry and run detail view.
+6. THE Spec_App SHALL replace the existing Spec Builder builtin as the single spec surface, and specs created by the prior app SHALL remain valid Spec_Artifacts.
+### Requirement 13: Autonomous delivery through configured commands
+
+**User Story:** As a user, I want to define my delivery workflow as configuration that maps each stage to my own terminal commands, so that any workflow works, pull requests, internal code reviews, or plain local builds, without writing plugin code.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL read the Delivery_Workflow from configuration that maps each of the stages isolate, submit, verify, publish, and teardown to terminal commands, and THE Spec_App SHALL NOT require plugin code to define a delivery workflow.
+2. WHERE a stage has no configured commands, THE Delivery_Pipeline SHALL skip that stage.
+3. WHEN a stage command runs, THE Delivery_Pipeline SHALL substitute run context variables into the configured command, including the spec name, the spec type, the workspace path, the base branch, the generated branch name, the triggering Watched_Item identifier and URL, and a review title and review summary derived from the spec documents.
+4. WHERE the configuration defines custom project variables, THE Delivery_Pipeline SHALL substitute those variables into stage commands alongside the run context variables.
+5. IF a stage command references a variable that has no value for the current run, THEN THE Delivery_Pipeline SHALL fail the stage before executing the command and report the missing variable.
+6. THE Delivery_Pipeline SHALL pass substituted variable values to commands as literal argument values without shell interpretation of the values.
+7. WHERE the Autonomy_Policy authorizes delivery for a run, THE Delivery_Pipeline SHALL run the isolate stage before task execution begins, producing an isolated workspace such as a feature branch, a git worktree, or a separate working copy.
+8. IF a verify stage command exits with a failure status, THEN THE Delivery_Pipeline SHALL dispatch fix tasks up to the configured retry limit before marking the delivery failed.
+9. WHERE a publish stage is configured, THE Delivery_Pipeline SHALL run it only after every configured verify stage has passed.
+10. THE Spec_App SHALL bundle editable Delivery_Workflow presets, including a git-with-pull-request workflow and a local-only build-and-test workflow.
+11. WHERE autonomous integration is not enabled for the project, THE Delivery_Pipeline SHALL NOT integrate changes into the project's Integration_Target, and integration SHALL require explicit human action. WHERE the project configuration explicitly enables autonomous integration, THE Delivery_Pipeline SHALL integrate changes into the Integration_Target after every configured verify stage has passed.
+12. THE Spec_App SHALL accept Delivery_Workflow configuration changes only through its configuration surfaces, and THE Engine_MCP_Server SHALL NOT expose any tool that modifies the Delivery_Workflow.
+13. WHEN the Delivery_Pipeline completes or fails, THE Spec_App SHALL notify the configured notification channel with the outcome of every executed stage.
+14. WHEN a delivery stage executes, THE Spec_Engine SHALL record the stage, the commands run, the initiator, and the outcome in the spec's audit log.
+15. FOR ALL concurrently active runs, each run operates in its own isolated workspace and no two runs share a working tree.
+16. WHERE a project uses the bundled git workflow preset, THE isolate stage SHALL create a dedicated git worktree on a new branch cut from the refreshed base branch, so that concurrent runs share one repository without interfering.
+17. THE Spec_App SHALL read the set of protected integration branches from configuration, and THE Delivery_Pipeline SHALL permit publish stage commands to push to non-protected environment branches, such as a development branch that feeds a test pipeline.
+18. WHEN a publish stage command completes, THE Delivery_Pipeline SHALL capture the command output and include deployment addresses from that output in the run's notification, the Review_Queue entry, and the audit log.
+19. WHEN a spec is archived, THE Delivery_Pipeline SHALL run the configured teardown stage commands to remove the run's dedicated deployments.
+20. WHERE no protected branch set is configured for a project, THE Spec_App SHALL treat the project's base branch as protected.
+21. IF autonomous integration is enabled for a project with no verify stage configured, THEN THE Spec_App SHALL warn the user at configuration time and record the warning in the audit log.
+22. WHERE a run is interactive, THE Delivery_Pipeline SHALL be startable by explicit user action and SHALL apply the same stages, variables, and rules as autonomous delivery.
+### Requirement 14: Agent-assisted interactive setup
+
+**User Story:** As a new user, I want an agent-guided setup that learns my project and delivery workflow from context that already exists, so that my configuration is generated and explained instead of hand-written.
+
+#### Acceptance Criteria
+
+1. WHEN a user starts the interactive setup, THE Setup_Assistant SHALL inspect the available project context, including KiroCrew memory, Kiro steering files, project documentation, and CI or build configuration files, to infer the project's delivery workflow, watch sources, and tooling.
+2. WHEN the Setup_Assistant infers a proposed configuration, THE Setup_Assistant SHALL present each inferred setting together with the evidence it was inferred from before applying anything.
+3. IF the Setup_Assistant cannot infer a required setting from the available context, THEN THE Setup_Assistant SHALL ask the user for that setting conversationally.
+4. WHERE prior KiroCrew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
+5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI.
+6. THE Setup_Assistant SHALL propose the authoring level as the Autonomy_Policy floor, and SHALL NOT enable the execution, delivery, or integration levels without explicit user confirmation of each level being enabled.
+### Requirement 15: Per-project cost profiles for models and effort
+
+**User Story:** As a user who pays differently in different contexts, I want model, effort, and concurrency defaults bundled into selectable per-project profiles, so that a work project can maximize quality while a personal project strictly minimizes spend.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL define Cost_Profiles that assign an optional Host_Agent, a model, and a reasoning effort to each of the roles design, review, implement, and setup, together with a subagent concurrency cap and a default per-run budget ceiling.
+2. WHERE a role has no assigned Host_Agent, THE Orchestrator SHALL seed that role's sessions with the session default agent.
+3. WHEN a Cost_Profile assigns a Host_Agent to a role, THE Spec_App SHALL verify at configuration time that the assigned agent's tool surface includes the Engine_MCP_Server tools, and SHALL warn the user when it does not.
+4. THE Spec_App SHALL bundle editable Cost_Profile presets, including a quality-first profile and a budget profile, and SHALL accept user-defined profiles.
+5. WHERE a project has a selected Cost_Profile, THE Orchestrator SHALL resolve every agent, model, and effort decision for that project's runs from the selected profile, and WHERE a project has no selected Cost_Profile THE Orchestrator SHALL resolve from the session default agent and model and report that no profile is selected.
+6. WHEN the Orchestrator dispatches a subagent, THE Orchestrator SHALL apply the run's Cost_Profile role assignment, including any assigned Host_Agent, to the subagent session.
+7. WHEN the interactive setup runs, THE Setup_Assistant SHALL ask the user to choose a Cost_Profile rather than inferring one from project context.
+
+### Requirement 16: Budget enforcement and kill switch
+
+**User Story:** As a paying user, I want hard spend limits and a single stop control, so that autonomous activity can never run away with my money.
+
+#### Acceptance Criteria
+
+1. WHEN a session belonging to a spec run starts, THE Spec_Engine SHALL stamp the run identifier onto the session so that per-turn metering records are attributable to the run.
+2. THE Spec_App SHALL compute a run's credit consumption from the per-turn metering ledger across all sessions belonging to the run, including authoring, orchestrator, and subagent sessions.
+3. IF a run's attributed credit consumption reaches its budget ceiling, THEN THE Orchestrator SHALL halt further dispatch after in-flight turns complete, mark the run as halted for budget, and notify the configured notification channel with the consumed amount.
+4. WHERE a spending cap is configured for a watch source, THE Watcher_Dispatcher SHALL stop dispatching new runs for that source once the cap is reached within the configured period.
+5. THE Spec_App SHALL provide a single kill-switch action that pauses all watchers and halts all autonomous runs after in-flight turns complete.
+6. WHEN a run completes or halts, THE Spec_App SHALL notify the configured notification channel with the run's total credit consumption and record it in the spec's audit log.
+7. THE per-run budget ceiling SHALL be enforced independently of watch-source spending caps, so that a run halts on its own ceiling even when no source cap stopped its dispatch.
+8. WHERE a budget warning threshold is configured, THE Spec_App SHALL notify the configured notification channel when a run's consumption crosses the threshold, without halting the run.
+
+### Requirement 17: Deterministic execution outside reasoning steps
+
+**User Story:** As a cost-conscious user, I want every deterministic part of the pipeline to run without model calls, so that idle watching and mechanical stages cost zero.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL execute watch polling, document validation, phase derivation, gate enforcement, delivery stage commands, and notifications without model invocation.
+2. THE Spec_App SHALL restrict model invocations to document authoring, task implementation, review verdicts, fix-task generation, intake screening, and interactive setup inference.
+3. WHILE no new Watched_Item is detected, THE Watcher_Dispatcher SHALL consume zero model credits.
+4. FOR ALL spec runs, the credit consumption attributed to validation, phase derivation, and delivery command execution SHALL be zero.
+### Requirement 18: Run lifecycle and review queue
+
+**User Story:** As a reviewer, I want every run to carry a defined lifecycle state and to find everything waiting on me in one queue, so that autonomous authoring stays manageable at any volume.
+
+#### Acceptance Criteria
+
+1. THE Spec_Engine SHALL track every run through defined states, including queued, authoring, awaiting review, executing, delivering, done, failed, halted for budget, cancelled, and stalled.
+2. WHEN a run exceeds the configured timeout for its current phase, THE Spec_Engine SHALL mark the run stalled and notify the configured notification channel.
+3. WHEN a stalled or interrupted run is resumed, THE Spec_Engine SHALL continue from the last persisted state, at task granularity during execution and at phase granularity during authoring, rather than restarting the run.
+4. THE Spec_Engine SHALL expose the Review_Queue so that any driver can render it.
+5. THE Spec_Builder_UI SHALL render the Review_Queue grouped by run state, and headless runs SHALL occupy ordinary agent sessions that appear in the dashboard session list.
+6. THE Spec_Engine SHALL NOT archive or expire a spec based on elapsed time.
+7. THE Spec_App SHALL archive a spec only on explicit user action or on cancellation of its triggering Watched_Item, an archived spec SHALL remain archived until explicitly unarchived, and archival SHALL be reversible.
+
+### Requirement 19: Watch source to project mapping
+
+**User Story:** As a user watching multiple sources, I want each source explicitly mapped to a project, so that a dispatched spec always lands in the right place with the right workflow and cost profile.
+
+#### Acceptance Criteria
+
+1. THE Watcher_Dispatcher SHALL read, for each watch source, a configured target project, base branch, and classification-to-spec-type mapping.
+2. WHEN dispatching a Watched_Item, THE Watcher_Dispatcher SHALL create the spec in the source's target project and resolve the Delivery_Workflow and Cost_Profile from that project's configuration.
+3. IF a watch source has no target project configured, THEN THE Watcher_Dispatcher SHALL NOT dispatch for that source and SHALL report the missing configuration.
+4. THE Watcher_Dispatcher SHALL determine each Watched_Item's submitter class from configuration, using a configured maintainer list or the source's author-association field, and WHERE the submitter class cannot be determined THE Watcher_Dispatcher SHALL assign the least-trusted class.
+5. WHERE the classification-to-spec-type mapping or the Autonomy_Policy is configured per submitter class, THE Watcher_Dispatcher SHALL resolve the spec type and the autonomy level using both the item's classification and its submitter class.
+6. WHERE a project or watch source configures intake guidance for a spec type, such as a project-specific debugging playbook for bugfix runs, THE Watcher_Dispatcher SHALL include that guidance in the headless run's input, separated from the Watched_Item's quoted data, and intake guidance SHALL be writable only through the configuration surfaces.
+7. WHEN a headless run is seeded, THE Spec_App SHALL run it in the target project's working tree so that the project's native Kiro steering files apply to the run.
+
+### Requirement 20: Workspace stewardship
+
+**User Story:** As a user whose work lives on branches, I want disposable workspace materializations cleaned up while branches and commits persist indefinitely, so that disk does not leak and work is never lost.
+
+#### Acceptance Criteria
+
+1. THE Spec_App SHALL record every isolated workspace and every per-run deployment it creates in a workspace ledger with the run identifier and location.
+2. WHEN a run reaches a terminal state, THE Delivery_Pipeline SHALL remove disposable workspace materializations, such as git worktrees and temporary working copies, and SHALL preserve all branches and commits.
+3. THE Spec_App SHALL NOT delete branches or commits created by a run.
+4. WHEN a spec is archived, THE Spec_App SHALL clean up the spec's ledger-recorded workspace materializations.
+5. THE Spec_Builder_UI SHALL provide a manual cleanup action for ledger-recorded workspaces.
+
+### Requirement 21: Watched item lifecycle and re-dispatch
+
+**User Story:** As a user, I want the triggering item's lifecycle to drive the spec's lifecycle, so that reopened issues re-run, cancelled issues stop work, and duplicates never double-dispatch.
+
+#### Acceptance Criteria
+
+1. THE Watcher_Dispatcher SHALL key dispatch claims on the Watched_Item identifier together with its lifecycle generation, so that a reopened item is dispatchable as a new run while an in-flight item is not.
+2. IF a Watched_Item is cancelled while its run is in flight, THEN THE Spec_App SHALL cancel the run after in-flight turns complete, archive the spec, and record the cascade in the audit log.
+3. WHILE a run is in flight, THE Spec_App SHALL ignore edits to the triggering Watched_Item and SHALL record that the edits occurred in the audit log.
+4. THE Spec_Builder_UI SHALL provide a manual re-dispatch action that overrides the claim ledger for a selected Watched_Item.
+### Requirement 22: Spec review feedback loop
+
+**User Story:** As a reviewer, I want to approve or request changes on an authored spec from the review surface, so that headless authoring incorporates my feedback without me editing documents by hand.
+
+#### Acceptance Criteria
+
+1. THE Spec_Builder_UI SHALL provide approve and request-changes actions on each Review_Queue entry, and WHERE a run waits at a human-reserved gate, the approve action SHALL record that gate's approval.
+2. WHEN a reviewer requests changes with comments, THE Spec_Engine SHALL record the comments, return the run to its authoring state, and dispatch a revision turn that receives the reviewer comments as quoted data input.
+3. WHEN a revision turn completes, THE Spec_Engine SHALL validate the revised documents under the same rules as original documents and return the run to the Review_Queue.
+4. IF revision cycles at a single gate exceed the configured limit, THEN THE Spec_App SHALL mark the run as needing human attention and SHALL NOT dispatch further revision turns for that gate.
+
+### Requirement 23: Delivery review feedback loop
+
+**User Story:** As a reviewer, I want my comments on the submitted review artifact to drive fix tasks automatically, so that the loop from issue to integrated fix closes without me writing code.
+
+#### Acceptance Criteria
+
+1. WHERE review-feedback watching is enabled for a project, THE Spec_App SHALL poll the run's review artifact for new reviewer comments using configured commands, following the same command-based pattern as watch sources.
+2. THE review-feedback watching SHALL be disabled by default and SHALL require explicit per-project enablement.
+3. WHEN new reviewer comments are detected on a run's review artifact, THE Spec_App SHALL dispatch fix tasks that receive the comments as quoted data input, and THE Delivery_Pipeline SHALL carry the resulting revision through the same stages as the original delivery.
+4. THE Spec_App SHALL bound feedback cycles by the configured retry limit and the run's budget ceiling, and IF either bound is reached, THEN THE Spec_App SHALL mark the run as needing human attention and notify the configured notification channel.
+5. WHILE no new reviewer comments are detected, THE review-feedback polling SHALL consume zero model credits.
+### Requirement 24: Safe zero-configuration defaults
+
+**User Story:** As a user who installs the app and configures nothing, I want every absent setting to resolve to a safe, useful default, so that the app works out of the box and never surprises me with spend or autonomy.
+
+#### Acceptance Criteria
+
+1. WHERE no Delivery_Workflow is configured for a project, THE Spec_Engine SHALL support authoring and execution in the project's working tree, matching Kiro IDE behavior, and THE Autonomy_Policy SHALL NOT resolve above the execution level for that project.
+2. WHERE no Cost_Profile is selected and no per-run budget ceiling is configured, THE Spec_App SHALL apply a bundled default budget ceiling to every headless run, and a headless run SHALL NOT execute without a budget ceiling.
+3. THE Spec_App SHALL ship bundled default values for every numeric limit, including the task retry limit, the revision cycle limit, phase timeouts, watch poll intervals, and the global and per-project concurrency caps, and each SHALL be overridable in configuration.
+4. WHERE no notification channel is configured, THE Spec_App SHALL deliver notifications to the host gateway's default dashboard channel.
+5. FOR ALL optional configuration settings, an absent setting resolves to a defined default and never causes a failure or a blocked operation by absence alone.
+6. THE Spec_Builder_UI configuration surface SHALL display the effective value of every setting together with its origin, bundled default or explicit configuration.
+### Requirement 25: Intake injection screening
+
+**User Story:** As an operator wiring untrusted issue intake to autonomous runs, I want each watched item screened for prompt-injection attempts before autonomy applies, so that a crafted issue is quarantined for my review instead of steering an unattended agent.
+
+#### Acceptance Criteria
+
+1. WHERE intake screening is enabled for a Watched_Item's submitter class, THE Watcher_Dispatcher SHALL screen the item's content for embedded instructions and injection attempts before the run proceeds past intake, using bundled screening guidance.
+2. THE intake screening SHALL default to enabled for every submitter class, and disabling it for a submitter class SHALL require explicit configuration.
+3. WHERE intake guidance is configured for a project or source, THE screening SHALL apply that guidance in addition to the bundled screening guidance.
+4. IF screening suspects injection, THEN THE Spec_App SHALL NOT proceed past the authoring level regardless of the Autonomy_Policy, SHALL flag the run and its screening findings in the Review_Queue, and SHALL notify the configured notification channel.
+5. WHEN a reviewer releases a quarantined run, THE Spec_App SHALL treat the release as the human review action and proceed according to the Autonomy_Policy.
+6. THE screening invocation SHALL resolve its model through the review role of the selected Cost_Profile, and its credit consumption SHALL attribute to the run's budget.
+7. WHEN screening completes, THE Spec_Engine SHALL record the screening verdict and findings in the run's audit log.
