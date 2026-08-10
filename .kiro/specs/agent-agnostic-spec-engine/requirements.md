@@ -25,6 +25,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
+- **Content_Element**: One authored piece of external text the app consumes or echoes: a watched item's body, a comment on that item, or a comment on a review artifact. Each carries its own author and its own submitter class.
 - **Item_Lifecycle_Event**: A named point in a run's life at which the app may write back to the tracker that supplied the item: claimed, awaiting review, delivery submitted, completed, failed or needs-human, and refused.
 - **Analysis_Depth**: The declared thoroughness of an analysis result: structural (deterministic checks), semantic (model-reasoned over the documents), or extended (a provider declaring coverage beyond semantic).
 - **Doctor**: The single read-only diagnostic operation that aggregates prerequisite, health, provider, configuration, and budget state into a list of Findings, and is reachable from every surface.
@@ -347,6 +348,9 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 3. WHEN new reviewer comments are detected on a run's review artifact, THE Spec_App SHALL dispatch fix tasks that receive the comments as quoted data input, and THE Delivery_Pipeline SHALL carry the resulting revision through the same stages as the original delivery.
 4. THE Spec_App SHALL bound feedback cycles by the configured retry limit and the run's budget ceiling, and IF either bound is reached, THEN THE Spec_App SHALL mark the run as needing human attention and notify the configured notification channel.
 5. WHILE no new reviewer comments are detected, THE review-feedback polling SHALL consume zero model credits.
+6. WHEN a reviewer comment is detected, THE Spec_App SHALL derive that comment's submitter class from its own author, and SHALL dispatch fix tasks only WHERE that class is configured as permitted to drive feedback dispatch for the project.
+7. IF a reviewer comment's submitter class is not permitted to drive feedback dispatch, THEN THE Spec_App SHALL NOT dispatch fix tasks from it, SHALL surface it in the Review_Queue for human release, and SHALL NOT consume model credits on it.
+8. THE reviewer comments that drive feedback dispatch SHALL be screened for embedded instructions on the same terms as watched item intake.
 ### Requirement 24: Safe zero-configuration defaults
 
 **User Story:** As a user who installs the app and configures nothing, I want every absent setting to resolve to a safe, useful default, so that the app works out of the box and never surprises me with spend or autonomy.
@@ -526,5 +530,17 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 4. THE writeback SHALL be disabled by default, SHALL be enabled per event per source through configuration only, and no Engine_MCP_Server tool SHALL enable or modify it.
 5. FOR ALL Item_Lifecycle_Events, THE Spec_Engine SHALL deliver a writeback at most once per run per event and SHALL record delivery in the ledger, so that a repeated poll, a retry, or a resumed run does not repeat a delivered writeback.
 6. IF a writeback command fails, THEN THE Spec_Engine SHALL record the failure and surface it, and SHALL NOT fail the run.
-7. THE writeback content SHALL be composed only from declared templates and engine-supplied values, and SHALL NOT include model-composed free text or verbatim Watched_Item body content, so that content submitted to a watched source cannot be amplified back into a shared system.
+7. THE writeback content SHALL be composed only from declared templates and engine-supplied values, SHALL NOT include model-composed free text, and SHALL include text from a Content_Element only WHERE that element's submitter class is configured as permitted for echo and never for the least-trusted class, so that content submitted to a watched source cannot be amplified back into a shared system.
 8. THE writeback SHALL consume zero model credits.
+### Requirement 37: Content authorship and trust derivation
+
+**User Story:** As an operator whose repository accepts public comments, I want each piece of external text trusted according to who wrote that specific text, so that commenting on a maintainer's issue does not borrow the maintainer's trust.
+
+#### Acceptance Criteria
+
+1. FOR ALL Content_Elements the Spec_App consumes or echoes, THE Spec_Engine SHALL derive the submitter class from that element's own author.
+2. THE Spec_Engine SHALL NOT inherit a Content_Element's submitter class from its item, its review artifact, or another element, and WHERE an element's author cannot be determined THE Spec_Engine SHALL assign the least-trusted class.
+3. WHEN a Content_Element changes after its submitter class was derived, THE Spec_Engine SHALL re-derive the class and re-apply every decision gated on it before using the changed content.
+4. THE intake screening SHALL apply to each consumed Content_Element according to that element's own submitter class, rather than only to the item at intake.
+5. FOR ALL decisions gated on submitter class, THE Spec_Engine SHALL record the class, the element's author, and the content revision relied upon in the run's audit log.
+6. THE Spec_Engine SHALL resolve the trust configuration for Content_Elements from configuration only, and no Engine_MCP_Server tool SHALL modify it.
