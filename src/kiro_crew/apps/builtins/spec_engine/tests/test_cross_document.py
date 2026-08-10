@@ -478,11 +478,29 @@ def test_validating_a_spec_orders_the_whole_report_by_file_and_line(tmp_path):
     assert list(report) == sorted(report, key=lambda v: v.sort_key)
 
 
-def test_a_spec_missing_a_document_reports_no_cross_document_findings(tmp_path):
+def test_a_spec_with_no_requirements_document_skips_the_link_and_coverage_checks(tmp_path):
     """Which documents a spec owes is a property of its type, decided elsewhere."""
-    spec = _write_spec(tmp_path)
+    spec = _write_spec(
+        tmp_path, tasks=_replace(TASKS, "_Requirements: 2.1_", "_Requirements: 9.9_")
+    )
     (spec / "requirements.md").unlink()
     assert validate_spec(spec).rule_ids == ()
+
+
+def test_a_spec_with_no_requirements_document_still_validates_its_graph(tmp_path):
+    """A spec type owing no requirements document still hands over a schedule.
+
+    The graph reads tasks.md alone, so gating it on the other document would
+    leave such a spec's schedule permanently unchecked.
+    """
+    tasks = _graph([{"id": 0, "tasks": ["1.1", "2.1"]}, {"id": 5, "tasks": ["2.2", "2.1", "9.9"]}])
+    spec = _write_spec(tmp_path, tasks=tasks)
+    (spec / "requirements.md").unlink()
+    assert set(validate_spec(spec).rule_ids) == {
+        rules.GRAPH_WAVE_ID_NOT_SEQUENTIAL,
+        rules.GRAPH_TASK_DUPLICATE,
+        rules.GRAPH_TASK_UNKNOWN,
+    }
 
 
 def test_validating_a_spec_reports_full_paths_by_default(tmp_path):

@@ -1,6 +1,8 @@
-"""Checks that no single document can answer on its own.
+"""Checks the format rules, reading a document line by line, cannot answer.
 
-Three claims live between the documents rather than inside one of them.
+Three claims sit above that level. Two span the pair of documents; the third
+spans the whole of tasks.md and needs no second document, which is why it is
+gated on tasks.md alone.
 
 A task's criteria references must resolve. The format rules confirm a leaf task
 carries a reference and that the reference is spelled correctly; only
@@ -14,7 +16,9 @@ because the omission is the same omission either way.
 The dependency graph must be schedulable. It is data the orchestrator executes,
 so it is validated as data -- readable JSON with the expected shape -- and as a
 plan: consecutive waves counting from zero, every unfinished leaf scheduled
-exactly once, and no cycle among declared dependencies.
+exactly once, and no cycle among declared dependencies. This one reads tasks.md
+only, so it runs for a spec that owes no requirements document at all: the
+orchestrator executes that spec's graph the same way.
 
 Severities separate work that is missing from work that is merely unaccounted
 for. A requirement with no task at all blocks a gate; one covered requirement
@@ -599,8 +603,11 @@ def validate_spec(spec_dir: Path | str, *, relative: bool = False) -> Validation
 
     Documents that are absent are skipped rather than reported: which documents
     a spec owes depends on its recorded spec type, which is not a property of
-    the documents on disk. Cross-document checks need both requirements.md and
-    tasks.md, so they run only when both are present.
+    the documents on disk. Each check is then gated on the documents it actually
+    reads: links and coverage need requirements.md as well as tasks.md, while the
+    dependency graph is validated whenever tasks.md is present, because a spec
+    type owing no requirements document still hands its graph to the
+    orchestrator.
 
     ``relative`` reports each violation against the bare filename instead of the
     full path, for a caller rendering a report next to the spec itself.
@@ -621,13 +628,15 @@ def validate_spec(spec_dir: Path | str, *, relative: bool = False) -> Validation
 
     requirements_path = present.get(DocumentKind.REQUIREMENTS)
     tasks_path = present.get(DocumentKind.TASKS)
-    if requirements_path is not None and tasks_path is not None:
-        violations.extend(
-            check_cross_document(
-                parse_requirements(requirements_path.read_text(encoding="utf-8")),
-                parse_tasks(tasks_path.read_text(encoding="utf-8")),
-                requirements_file=name(DocumentKind.REQUIREMENTS),
-                tasks_file=name(DocumentKind.TASKS),
+    if tasks_path is not None:
+        plan = parse_tasks(tasks_path.read_text(encoding="utf-8"))
+        if requirements_path is not None:
+            index = parse_requirements(requirements_path.read_text(encoding="utf-8"))
+            violations.extend(check_task_links(index, plan, tasks_file=name(DocumentKind.TASKS)))
+            violations.extend(
+                check_requirement_coverage(
+                    index, plan, requirements_file=name(DocumentKind.REQUIREMENTS)
+                )
             )
-        )
+        violations.extend(check_dependency_graph(plan, tasks_file=name(DocumentKind.TASKS)))
     return build_report(violations)
