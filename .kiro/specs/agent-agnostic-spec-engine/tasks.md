@@ -73,7 +73,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 37.1, 37.2, 37.3, 37.4, 37.5, 37.6_
 
 - [ ] 6. Budget enforcement and kill switch
-  - [ ] 6.1 Run stamping, ledger attribution, and ceilings
+  - [x] 6.1 Run stamping, ledger attribution, and ceilings
     - Stamp run identifier on every session; sum per-turn metering ledger records across all run sessions (authoring, orchestrator, subagents)
     - Halt dispatch after in-flight turns at the ceiling with amount in the notification; per-run ceiling independent of source caps; bundled default ceiling so headless runs never execute unbounded; optional warning threshold notifies without halting
     - _Requirements: 16.1, 16.2, 16.3, 16.7, 16.8, 24.2_
@@ -149,7 +149,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Wire the pieces earlier waves built as libraries but left unconstructed outside their tests: pass a workspace broker into the delivery pipeline so the shared-working-tree refusal actually runs, and resolve each dispatch's role through the role resolver. Reviews of tasks 7.3 and 9.2 found both inert in production; a library nothing constructs is an enforcement that never fires
     - Hold one spec lock across a batch of task-status writes rather than one per write. The store refuses a conflicting writer instead of waiting, so two tasks reporting at once get one refusal, and a status that is refused and then dropped makes a resumed run pay again for finished work
     - _Requirements: 9.1, 9.5_
-  - [ ] 9.2 Role resolution and cost profiles
+  - [x] 9.2 Role resolution and cost profiles
     - Determine each work unit's role and resolve agent, model, and effort from the selected Cost_Profile; session default agent/model fallback with a report when unset
     - Config-time verification that an assigned agent's tool surface includes the engine tools; subagents inherit the run's role assignments
     - _Requirements: 9.2, 15.1, 15.2, 15.3, 15.5, 15.6_
