@@ -5,20 +5,26 @@ already passed the schema, so nothing here refuses a write; each advisory names 
 combination that is legal, saved, and worth telling the operator about before
 they walk away from it.
 
-One advisory exists so far, and it is the reason the module does: **unattended
-integration armed with nothing verifying the change.** Autonomous integration
-writes to a destination a mistake cannot be taken back from, and a project with
-no verify stage has told the engine nothing that could stop a bad change from
-getting there. Both halves are individually reasonable — a local-only workflow
-legitimately configures no verify stage, and auto-integration is a deliberate
-opt-in — so neither is an error, and the combination is not something to discover
-from a merged commit at three in the morning.
+Two advisories live here, and they share one reason to exist: the moment the
+document is written is the last moment a human is present, and both conditions
+otherwise surface hours later in an unattended run with nobody reading its output.
 
-The warning is raised **where the setting is written**, not where it would fire.
-Delivery runs hours later, in an unattended run, with nobody reading its output;
-configuration time is the moment a human is present, looking at this exact
-switch, and able to add a verify stage instead. That is also why the advisory
-carries the dotted path of the declaration rather than a prose description of it.
+**Unattended integration armed with nothing verifying the change.** Autonomous
+integration writes to a destination a mistake cannot be taken back from, and a
+project with no verify stage has told the engine nothing that could stop a bad
+change from getting there. Both halves are individually reasonable — a local-only
+workflow legitimately configures no verify stage, and auto-integration is a
+deliberate opt-in — so neither is an error, and the combination is not something to
+discover from a merged commit at three in the morning.
+
+**A role's assigned agent that cannot reach the engine's tools.** A profile that
+routes review to a specific agent is making a quality decision, and an agent whose
+tool allowlist filters the engine's MCP server cannot record a verdict at all. The
+run would fail mid-flight, at the point the assignment was supposed to improve.
+
+The warning is raised **where the setting is written**, not where it would fire,
+and it carries the dotted path of the declaration rather than a prose description
+of it, so an operator lands on the exact key to change.
 
 Recording is left to the caller through :data:`WarningRecorder`. The audit log is
 per-spec and a configuration edit is per-project, so binding the two here would
@@ -31,7 +37,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from .agent_surface import ENGINE_MCP_SERVER, AgentSurfaceLookup, disk_lookup
 from .effective import resolve
+from .profiles import FIELD_AGENT, profiles
 from .schema import SECTION_PROJECTS, SECTION_WORKFLOW
 from .settings import SETTINGS
 
@@ -40,6 +48,12 @@ from .settings import SETTINGS
 #: audit entry all quote the same one, so an operator correlates them by name
 #: rather than by matching prose.
 AUTO_INTEGRATE_WITHOUT_VERIFY = "delivery.auto_integrate_without_verify"
+
+#: An assigned agent exists but its tool allowlist filters the engine's tools.
+AGENT_MISSING_ENGINE_TOOLS = "cost_profiles.agent_missing_engine_tools"
+
+#: An assigned agent has no configuration this host can find.
+AGENT_NOT_INSTALLED = "cost_profiles.agent_not_installed"
 
 #: Audit event name for a recorded configuration warning.
 CONFIG_WARNING_EVENT = "config.warning"
@@ -79,16 +93,25 @@ class ConfigWarning:
 WarningRecorder = Callable[[ConfigWarning], None]
 
 
-def document_warnings(doc: Mapping[str, Any]) -> tuple[ConfigWarning, ...]:
-    """Return every advisory the merged document earns, in document order.
+def document_warnings(
+    doc: Mapping[str, Any],
+    *,
+    agents: AgentSurfaceLookup | None = None,
+) -> tuple[ConfigWarning, ...]:
+    """Return every advisory the merged document earns.
 
-    Evaluated per project, plus once app-wide when no project is configured yet.
-    A project is the unit that has a workflow, so an app-wide switch with three
-    projects under it is three separate situations: two may verify and one may
-    not, and reporting that as one app-wide warning would name a location the
-    operator cannot act on.
+    The auto-integration advisory is evaluated per project, plus once app-wide
+    when no project is configured yet. A project is the unit that has a workflow,
+    so an app-wide switch with three projects under it is three separate
+    situations: two may verify and one may not, and reporting that as one app-wide
+    warning would name a location the operator cannot act on.
+
+    *agents* resolves an assigned agent's tool surface; it defaults to reading the
+    agent directories the document implies. A caller that already knows the
+    surfaces passes its own and touches no disk.
     """
     warnings: list[ConfigWarning] = []
+    warnings.extend(_assigned_agent_warnings(doc, agents))
     projects = doc.get(SECTION_PROJECTS)
     names = tuple(projects) if isinstance(projects, Mapping) else ()
     if not names:
@@ -111,6 +134,65 @@ def record_config_warnings(
     if recorder is not None:
         for warning in warnings:
             recorder(warning)
+    return tuple(warnings)
+
+
+def _assigned_agent_warnings(
+    doc: Mapping[str, Any],
+    agents: AgentSurfaceLookup | None,
+) -> tuple[ConfigWarning, ...]:
+    """Advisories for every Host_Agent a cost profile assigns to a role.
+
+    One lookup per distinct agent name, not per assignment: a profile that routes
+    three roles to the same agent has one thing wrong with it, and three warnings
+    naming one agent read as three problems.
+    """
+    parsed = profiles(doc)
+    assignments = [
+        assignment
+        for profile in parsed.values()
+        for assignment in profile.assignments.values()
+        if assignment.assigns_agent
+    ]
+    if not assignments:
+        return ()
+    lookup = agents if agents is not None else disk_lookup(doc)
+    surfaces: dict[str, bool] = {}
+    warnings: list[ConfigWarning] = []
+    for assignment in assignments:
+        agent = assignment.agent
+        path = f"{assignment.declared_at}.{FIELD_AGENT}"
+        if agent in surfaces:
+            continue
+        surface = lookup(agent)
+        surfaces[agent] = surface.grants(ENGINE_MCP_SERVER)
+        if surfaces[agent]:
+            continue
+        if not surface.found:
+            warnings.append(
+                ConfigWarning(
+                    code=AGENT_NOT_INSTALLED,
+                    path=path,
+                    message=(
+                        f"role {assignment.role!r} is assigned to agent {agent!r}, which has "
+                        "no configuration on this host, so a session for that role cannot "
+                        "start; install the agent or remove the assignment"
+                    ),
+                )
+            )
+            continue
+        warnings.append(
+            ConfigWarning(
+                code=AGENT_MISSING_ENGINE_TOOLS,
+                path=path,
+                message=(
+                    f"role {assignment.role!r} is assigned to agent {agent!r}, whose tool "
+                    f"allowlist does not include the spec engine tools (@{ENGINE_MCP_SERVER}), "
+                    "so that role's session cannot drive the run; grant the server in the "
+                    "agent's tools or assign a different agent"
+                ),
+            )
+        )
     return tuple(warnings)
 
 

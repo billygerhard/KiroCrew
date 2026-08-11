@@ -9,10 +9,16 @@ returns both, and every surface renders what it was given rather than inferring
 someone has explicitly pinned a value that happens to equal the default).
 
 Precedence is narrowest-first: a per-source value beats a per-project value,
-which beats the app-wide value, which beats the bundled default. A layer that
-holds no value for the setting is skipped rather than treated as an explicit
-override, which is what makes an absent optional setting resolve rather than
-fail.
+which beats a value pinned by the profile that project selected, which beats the
+app-wide value, which beats the bundled default. A layer that holds no value for
+the setting is skipped rather than treated as an explicit override, which is what
+makes an absent optional setting resolve rather than fail.
+
+The profile layer sits where it does because selecting a profile is a per-project
+act: it is a narrower declaration than the app-wide value it overrides, and a
+wider one than a value pinned on the project itself. So a project that picks the
+budget profile runs under that profile's ceiling, and a project that also pins its
+own ceiling keeps the one it pinned.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
+from .profiles import profile_pin
 from .schema import ConfigError, ConfigValidationError, stored_value
 from .settings import SCOPE_PRECEDENCE, SETTINGS, Scope, Setting
 
@@ -30,6 +37,7 @@ class ValueOrigin(str, Enum):
 
     BUNDLED_DEFAULT = "bundled_default"
     APP_CONFIG = "app_config"
+    COST_PROFILE = "cost_profile"
     PROJECT_CONFIG = "project_config"
     SOURCE_CONFIG = "source_config"
 
@@ -72,6 +80,12 @@ def resolve(
     the very work the operator meant to bound.
     """
     for scope in SCOPE_PRECEDENCE:
+        # The selected profile is consulted immediately above the app layer, so a
+        # project's own declaration still wins over the profile it picked.
+        if scope is Scope.APP:
+            pinned = _profile_value(doc, setting, project)
+            if pinned is not None:
+                return pinned
         if not setting.allows(scope):
             continue
         if scope is Scope.PROJECT and project is None:
@@ -87,6 +101,20 @@ def resolve(
             raise ConfigValidationError([ConfigError(path, str(exc))]) from exc
         return EffectiveValue(setting.key, value, _ORIGIN_FOR_SCOPE[scope], path)
     return EffectiveValue(setting.key, setting.default, ValueOrigin.BUNDLED_DEFAULT)
+
+
+def _profile_value(
+    doc: Mapping[str, Any], setting: Setting, project: str | None
+) -> EffectiveValue | None:
+    """Resolve *setting* from the profile *project* selected, if it pins it."""
+    present, raw, path = profile_pin(doc, setting.key, project)
+    if not present:
+        return None
+    try:
+        value = setting.coerce(raw)
+    except ValueError as exc:
+        raise ConfigValidationError([ConfigError(path, str(exc))]) from exc
+    return EffectiveValue(setting.key, value, ValueOrigin.COST_PROFILE, path)
 
 
 def resolve_all(

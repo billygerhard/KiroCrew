@@ -15,6 +15,8 @@ registry, the schema, the resolver, and the store is an implementation detail.
 from __future__ import annotations
 
 from .advisories import (
+    AGENT_MISSING_ENGINE_TOOLS,
+    AGENT_NOT_INSTALLED,
     AUTO_INTEGRATE_SETTING,
     AUTO_INTEGRATE_WITHOUT_VERIFY,
     CONFIG_WARNING_EVENT,
@@ -23,7 +25,25 @@ from .advisories import (
     document_warnings,
     record_config_warnings,
 )
+from .agent_surface import (
+    ENGINE_MCP_SERVER,
+    AgentSurfaceLookup,
+    AgentToolSurface,
+    DiskAgentSurfaces,
+    agent_directories,
+    disk_lookup,
+)
 from .effective import EffectiveValue, ValueOrigin, resolve, resolve_all
+from .profiles import (
+    PROJECT_PROFILE_FIELD,
+    CostProfile,
+    RoleAssignment,
+    profile,
+    profile_pin,
+    profiles,
+    selected_profile,
+    selected_profile_name,
+)
 from .schema import (
     AUTONOMY_LEVELS,
     CONFIG_ONLY_PATHS,
@@ -35,6 +55,8 @@ from .schema import (
     GATE_SEVERITIES,
     ITEM_LIFECYCLE_EVENTS,
     LEAST_TRUSTED_CLASS,
+    PROFILE_SETTING_GROUPS,
+    PROFILE_SETTING_KEYS,
     PROJECT_FIELDS,
     ROLES,
     SECTIONS,
@@ -63,6 +85,8 @@ from .store import (
 )
 
 __all__ = [
+    "AGENT_MISSING_ENGINE_TOOLS",
+    "AGENT_NOT_INSTALLED",
     "APP_NAME",
     "AUTO_INTEGRATE_SETTING",
     "AUTO_INTEGRATE_WITHOUT_VERIFY",
@@ -75,11 +99,15 @@ __all__ = [
     "DELEGABLE_CAPABILITIES",
     "DELIVERY_STAGES",
     "ENGINE_FLOOR_CAPABILITIES",
+    "ENGINE_MCP_SERVER",
     "GATE_POSITIONS",
     "GATE_SEVERITIES",
     "ITEM_LIFECYCLE_EVENTS",
     "LEAST_TRUSTED_CLASS",
+    "PROFILE_SETTING_GROUPS",
+    "PROFILE_SETTING_KEYS",
     "PROJECT_FIELDS",
+    "PROJECT_PROFILE_FIELD",
     "ROLES",
     "SECTIONS",
     "SETTINGS",
@@ -90,6 +118,8 @@ __all__ = [
     "TRANSPORTS",
     "VERSION_KEY",
     "WILDCARD_KEY",
+    "AgentSurfaceLookup",
+    "AgentToolSurface",
     "ConfigError",
     "ConfigLoadError",
     "ConfigStore",
@@ -97,19 +127,29 @@ __all__ = [
     "ConfigWarning",
     "ConfigWriteRefused",
     "ConfigWriteSurface",
+    "CostProfile",
+    "DiskAgentSurfaces",
     "EffectiveValue",
+    "RoleAssignment",
     "Scope",
     "Setting",
     "ValueOrigin",
     "WarningRecorder",
+    "agent_directories",
     "config_only_paths",
     "default_of",
     "default_root",
+    "disk_lookup",
     "document_warnings",
     "lookup",
+    "profile",
+    "profile_pin",
+    "profiles",
     "record_config_warnings",
     "resolve",
     "resolve_all",
+    "selected_profile",
+    "selected_profile_name",
     "settings_in_scope",
     "validate_config_document",
 ]

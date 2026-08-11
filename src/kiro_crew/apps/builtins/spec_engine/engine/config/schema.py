@@ -115,6 +115,14 @@ PROFILE_SETTING_KEYS: tuple[str, ...] = (
     "budget.run_ceiling_credits",
 )
 
+#: Setting groups a profile object may carry, derived from the keys above so the
+#: two cannot disagree about which containers are accepted. A group outside this
+#: set is still accepted as a container and refused leaf by leaf, so an operator
+#: who pins the wrong setting is told which setting rather than which section.
+PROFILE_SETTING_GROUPS: frozenset[str] = frozenset(
+    key.split(".", 1)[0] for key in PROFILE_SETTING_KEYS
+)
+
 #: Points at which the app may write back to the tracker that supplied an item.
 ITEM_LIFECYCLE_EVENTS: tuple[str, ...] = (
     "claimed",
@@ -387,7 +395,11 @@ def _check_cost_profiles(errors: list[ConfigError], value: Any, path: str) -> No
             errors.append(ConfigError(entry_path, "expected an object"))
             continue
         for key in profile:
-            if key != "roles":
+            if key == "roles":
+                continue
+            if key in SETTING_GROUPS:
+                _check_profile_settings(errors, key, profile[key], f"{entry_path}.{key}")
+            else:
                 errors.append(ConfigError(f"{entry_path}.{key}", "unknown profile field"))
         roles = profile.get("roles")
         if not isinstance(roles, Mapping):
@@ -411,6 +423,34 @@ def _check_cost_profiles(errors: list[ConfigError], value: Any, path: str) -> No
                 errors.append(ConfigError(f"{role_path}.agent", "expected a string"))
             if "effort" in assignment and assignment["effort"] not in EFFORT_LEVELS:
                 errors.append(ConfigError(f"{role_path}.effort", _one_of_message(EFFORT_LEVELS)))
+
+
+def _check_profile_settings(errors: list[ConfigError], group: str, value: Any, path: str) -> None:
+    """Validate the settings a profile pins beside its role assignments.
+
+    Only the keys in :data:`PROFILE_SETTING_KEYS` may be pinned, and each one is
+    coerced by its own registry entry. A profile that could pin any setting would
+    become a second, undocumented configuration layer for limits the rest of the
+    app resolves elsewhere.
+    """
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object of settings"))
+        return
+    for leaf, raw in value.items():
+        leaf_path = f"{path}.{leaf}"
+        key = f"{group}.{leaf}"
+        if key not in PROFILE_SETTING_KEYS:
+            errors.append(
+                ConfigError(
+                    leaf_path,
+                    "a cost profile may pin only: " + ", ".join(PROFILE_SETTING_KEYS),
+                )
+            )
+            continue
+        try:
+            SETTINGS[key].coerce(raw)
+        except ValueError as exc:
+            errors.append(ConfigError(leaf_path, str(exc)))
 
 
 def _check_workflow(errors: list[ConfigError], value: Any, path: str) -> None:
