@@ -54,7 +54,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Resolve per (source, spec type, submitter class); unconfigured resolves to authoring-only human-reserved execution; configured resolves exactly to the configured level
     - Strictly ordered levels with lower levels implied; loaded from configuration only
     - _Requirements: 8.2, 8.6, 8.7_
-  - [ ] 5.2 Run state machine, timeouts, and resume
+  - [x] 5.2 Run state machine, timeouts, and resume
     - States: queued, authoring, awaiting review, executing, delivering, done, failed, halted for budget, cancelled, stalled; per-phase timeouts mark stalled and notify
     - Resume from persisted state at task granularity in execution and phase granularity in authoring
     - _Requirements: 18.1, 18.2, 18.3_
@@ -87,7 +87,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Read Delivery_Workflow stage-to-commands config; unconfigured stages skip; tokenize templates once and substitute variables as single literal argv elements via subprocess (no shell interpretation)
     - Run context plus custom project variables; valueless referenced variable fails the stage before execution; zero-config projects run authoring/execution in the working tree with autonomy capped at execution
     - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 24.1_
-  - [ ] 7.2 Stage flow, verify loop, and integration floor
+  - [x] 7.2 Stage flow, verify loop, and integration floor
     - Isolate before execution for delivery-authorized runs; verify failure dispatches fix tasks up to the retry limit; publish only after all verify stages pass
     - Publish output captured with deployment addresses surfaced; protected branch set from config defaulting to the base branch; integration requires human action unless autonomous integration explicitly enabled; no-verify auto-integration warns at config time
     - _Requirements: 13.7, 13.8, 13.9, 13.11, 13.17, 13.18, 13.20, 13.21_
@@ -119,7 +119,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Sources defined as poll command plus field mapping (identifier, title, body, state, address, classification, submitter); disabled by default with per-source enablement
     - Poll tick runs from a script cron with zero model invocations while idle
     - _Requirements: 10.2, 10.6, 17.3_
-  - [ ] 8.2 Poll diffing, lifecycle generations, and atomic claims
+  - [x] 8.2 Poll diffing, lifecycle generations, and atomic claims
     - Diff successive poll snapshots to derive new items and transitions (reopened, cancelled); claims keyed on (item identifier, lifecycle generation) with a SQLite unique constraint for exactly-once dispatch
     - _Requirements: 10.3, 10.9, 21.1_
   - [ ] 8.3 Dispatcher routing, caps, and run seeding
