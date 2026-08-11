@@ -17,7 +17,7 @@
     "6.2": "queued",
     "7.1": "completed",
     "7.2": "completed",
-    "7.3": "queued",
+    "7.3": "completed",
     "7.4": "queued",
     "7.5": "queued",
     "8.1": "in_progress",
@@ -199,6 +199,11 @@
     {
       "ts": "2026-08-11T12:45:50",
       "taskId": "5.2",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-11T13:07:39",
+      "taskId": "7.3",
       "status": "completed"
     }
   ]

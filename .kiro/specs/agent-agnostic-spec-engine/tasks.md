@@ -91,7 +91,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Isolate before execution for delivery-authorized runs; verify failure dispatches fix tasks up to the retry limit; publish only after all verify stages pass
     - Publish output captured with deployment addresses surfaced; protected branch set from config defaulting to the base branch; integration requires human action unless autonomous integration explicitly enabled; no-verify auto-integration warns at config time
     - _Requirements: 13.7, 13.8, 13.9, 13.11, 13.17, 13.18, 13.20, 13.21_
-  - [ ] 7.3 Worktree isolation for concurrent runs
+  - [x] 7.3 Worktree isolation for concurrent runs
     - Git preset isolate creates a dedicated worktree on a new branch from the refreshed base; no two active runs share a working tree
     - _Requirements: 13.15, 13.16_
   - [ ] 7.4 Teardown and workspace stewardship
@@ -146,6 +146,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 - [ ] 9. Orchestrator
   - [ ] 9.1 Wave loop and task persistence
     - Dispatch leaf tasks wave by wave with in-wave parallelism up to the concurrency cap; persist task status after every state change for resume
+    - Wire the pieces earlier waves built as libraries but left unconstructed outside their tests: pass a workspace broker into the delivery pipeline so the shared-working-tree refusal actually runs, and resolve each dispatch's role through the role resolver. Reviews of tasks 7.3 and 9.2 found both inert in production; a library nothing constructs is an enforcement that never fires
+    - Hold one spec lock across a batch of task-status writes rather than one per write. The store refuses a conflicting writer instead of waiting, so two tasks reporting at once get one refusal, and a status that is refused and then dropped makes a resumed run pay again for finished work
     - _Requirements: 9.1, 9.5_
   - [ ] 9.2 Role resolution and cost profiles
     - Determine each work unit's role and resolve agent, model, and effort from the selected Cost_Profile; session default agent/model fallback with a report when unset
