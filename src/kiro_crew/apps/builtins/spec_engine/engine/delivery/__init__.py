@@ -15,10 +15,48 @@ The module boundaries follow the trust boundary:
   configuration layer, and answers whether a project configured a workflow at
   all — the zero-configuration case that caps autonomy at execution.
 * :mod:`.stages` validates a whole stage, then executes it.
+* :mod:`.integration` holds the integration floor: the protected branch set, the
+  workflow ceiling on autonomy, and the two independent gates an unattended merge
+  must both pass.
+* :mod:`.flow` orders the stages — isolate before execution, publish only after
+  verification, fix rounds bounded by the retry limit.
 """
 
 from __future__ import annotations
 
+from .flow import (
+    DELIVERY_FLOW_STAGES,
+    EVENT_FIX_DISPATCH,
+    EVENT_INTEGRATION,
+    EVENT_PUBLISHED,
+    EVENT_STAGE,
+    MAX_ADDRESS_CHARS,
+    MAX_DEPLOYMENT_ADDRESSES,
+    PUBLISH_STAGE,
+    SUBMIT_STAGE,
+    VERIFY_RETRY_LIMIT_SETTING,
+    VERIFY_STAGE,
+    AuditRecorder,
+    DeliveryOutcome,
+    DeliveryPipeline,
+    DeliveryRun,
+    FixDispatch,
+    FixTaskDispatcher,
+    VerifyAttempt,
+)
+from .integration import (
+    PROTECTED_BRANCHES_FIELD,
+    REASON_LADDER,
+    REASON_NO_TARGET,
+    REASON_POSTURE,
+    REASON_VERIFY,
+    DeliveryAuthority,
+    IntegrationDecision,
+    ProtectedBranches,
+    evaluate_integration,
+    resolve_authority,
+    resolve_protected_branches,
+)
 from .stages import (
     MAX_CAPTURED_CHARS,
     STAGE_TIMEOUT_SETTING,
@@ -52,22 +90,47 @@ from .workflow import (
 )
 
 __all__ = [
+    "DELIVERY_FLOW_STAGES",
+    "EVENT_FIX_DISPATCH",
+    "EVENT_INTEGRATION",
+    "EVENT_PUBLISHED",
+    "EVENT_STAGE",
     "ISOLATE_STAGE",
+    "MAX_ADDRESS_CHARS",
     "MAX_CAPTURED_CHARS",
+    "MAX_DEPLOYMENT_ADDRESSES",
+    "PROTECTED_BRANCHES_FIELD",
+    "PUBLISH_STAGE",
+    "REASON_LADDER",
+    "REASON_NO_TARGET",
+    "REASON_POSTURE",
+    "REASON_VERIFY",
     "RUN_CONTEXT_VARIABLES",
     "STAGES_KEY",
     "STAGE_TIMEOUT_SETTING",
+    "SUBMIT_STAGE",
     "TRUNCATION_NOTICE",
     "VARIABLES_KEY",
     "VARIABLE_NAME_PATTERN",
+    "VERIFY_RETRY_LIMIT_SETTING",
+    "VERIFY_STAGE",
     "ZERO_CONFIG_AUTONOMY_CEILING",
     "ArgumentTemplate",
+    "AuditRecorder",
     "CommandOutcome",
     "CommandResult",
     "CommandRunner",
     "CommandTemplate",
+    "DeliveryAuthority",
+    "DeliveryOutcome",
+    "DeliveryPipeline",
+    "DeliveryRun",
     "DeliveryWorkflow",
+    "FixDispatch",
+    "FixTaskDispatcher",
+    "IntegrationDecision",
     "MissingVariableError",
+    "ProtectedBranches",
     "RunContext",
     "StageCommands",
     "StageExecutor",
@@ -76,8 +139,12 @@ __all__ = [
     "TemplateError",
     "VariableError",
     "VariableRef",
+    "VerifyAttempt",
     "build_variables",
     "cap_autonomy",
+    "evaluate_integration",
     "has_value",
+    "resolve_authority",
+    "resolve_protected_branches",
     "run_argv",
 ]

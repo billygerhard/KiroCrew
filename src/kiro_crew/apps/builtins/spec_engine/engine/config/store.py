@@ -39,6 +39,7 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
 
+from .advisories import ConfigWarning, WarningRecorder, document_warnings, record_config_warnings
 from .effective import EffectiveValue, resolve, resolve_all
 from .schema import (
     CURRENT_VERSION,
@@ -162,6 +163,19 @@ class ConfigStore:
         """
         return validate_config_document(self.document())
 
+    def advisories(
+        self,
+        *,
+        recorder: WarningRecorder | None = None,
+    ) -> tuple[ConfigWarning, ...]:
+        """Return advisories for the persisted document: valid but dangerous setups.
+
+        Separate from :meth:`validate` because the two call for different
+        handling: a validation error means the document is not usable, while an
+        advisory means it is usable and somebody should know what they armed.
+        """
+        return record_config_warnings(document_warnings(self.document()), recorder)
+
     def effective(
         self,
         key: str,
@@ -191,6 +205,7 @@ class ConfigStore:
         patch: Mapping[str, Any],
         *,
         surface: ConfigWriteSurface,
+        warn: WarningRecorder | None = None,
     ) -> dict[str, Any]:
         """Merge *patch* into the document, validate, and persist it.
 
@@ -198,6 +213,12 @@ class ConfigStore:
         have to resend every other. A ``None`` value removes its key, which is
         how a setting is returned to its bundled default — distinct from writing
         the default's current value, which would pin it.
+
+        *warn* receives each advisory the persisted document earns. Advisories
+        are raised here because this is the moment a human is present and looking
+        at the setting: a document that arms unattended integration with nothing
+        verifying it is valid, saved, and worth saying out loud before the run
+        that acts on it starts hours later with nobody watching.
 
         Returns the persisted document. Raises ``ConfigWriteRefused`` when the
         surface may not write a path in the patch, and ``ConfigValidationError``
@@ -232,6 +253,10 @@ class ConfigStore:
             surface.name,
             len(patch),
         )
+        for warning in record_config_warnings(document_warnings(merged), warn):
+            logger.warning(
+                "spec engine configuration advisory %s at %s", warning.code, warning.path
+            )
         return merged
 
 

@@ -14,6 +14,15 @@ registry, the schema, the resolver, and the store is an implementation detail.
 
 from __future__ import annotations
 
+from .advisories import (
+    AUTO_INTEGRATE_SETTING,
+    AUTO_INTEGRATE_WITHOUT_VERIFY,
+    CONFIG_WARNING_EVENT,
+    ConfigWarning,
+    WarningRecorder,
+    document_warnings,
+    record_config_warnings,
+)
 from .effective import EffectiveValue, ValueOrigin, resolve, resolve_all
 from .schema import (
     AUTONOMY_LEVELS,
@@ -55,9 +64,12 @@ from .store import (
 
 __all__ = [
     "APP_NAME",
+    "AUTO_INTEGRATE_SETTING",
+    "AUTO_INTEGRATE_WITHOUT_VERIFY",
     "AUTONOMY_LEVELS",
     "CONFIG_FILENAME",
     "CONFIG_ONLY_PATHS",
+    "CONFIG_WARNING_EVENT",
     "CURRENT_VERSION",
     "DASHBOARD_SURFACE",
     "DELEGABLE_CAPABILITIES",
@@ -82,16 +94,20 @@ __all__ = [
     "ConfigLoadError",
     "ConfigStore",
     "ConfigValidationError",
+    "ConfigWarning",
     "ConfigWriteRefused",
     "ConfigWriteSurface",
     "EffectiveValue",
     "Scope",
     "Setting",
     "ValueOrigin",
+    "WarningRecorder",
     "config_only_paths",
     "default_of",
     "default_root",
+    "document_warnings",
     "lookup",
+    "record_config_warnings",
     "resolve",
     "resolve_all",
     "settings_in_scope",
