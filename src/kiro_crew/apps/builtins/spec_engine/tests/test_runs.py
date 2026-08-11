@@ -13,6 +13,7 @@ one.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.runs import (
     TaskStatus,
     UnknownRun,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import SpecLocked, SpecRef, StateStore
 
 from .conftest import NATIVE_SPEC_FILES, spec_dir_snapshot
 
@@ -532,6 +533,127 @@ class TestTaskProgress:
         machine.create(ref, run_id="run-1")
         machine._store.update_run("run-1", detail={runs.DETAIL_TASKS: {"1": "finished-ish"}})
         assert runs.task_statuses(machine.get("run-1")) == {}
+
+
+class TestConcurrentWriters:
+    """Two writers contending for one run, which the store supports by design.
+
+    The danger is not a torn write — the store serializes those — but a decision
+    made against a state that stopped being true before it was acted on. A
+    legality check performed outside the lock lets both writers pass, and the one
+    that takes the lock second commits a move from a state the run has left.
+    """
+
+    def test_only_one_of_two_racing_terminal_writers_wins(
+        self, machine: RunMachine, store: StateStore, ref: SpecRef, config: ConfigStore
+    ) -> None:
+        machine.create(ref, run_id="run-1")
+        machine.transition(ref, "run-1", RunState.EXECUTING)
+        # A second machine over the same database, which is how a sweep, the
+        # dashboard, and an orchestrator actually reach one run.
+        other = RunMachine(store, config)
+        ready = threading.Barrier(2)
+        outcomes: list[tuple[str, str]] = []
+        results_lock = threading.Lock()
+
+        def attempt(owner: RunMachine, to_state: RunState) -> None:
+            ready.wait()
+            try:
+                owner.transition(ref, "run-1", to_state, initiator=to_state.value)
+                result = ("won", to_state.value)
+            except (IllegalTransition, RunError, SpecLocked) as refused:
+                # Either refusal is correct and both are loud: the table refused
+                # the move, or the lock refused the writer. What must not happen
+                # is a second commit against a state the run has already left.
+                result = ("refused", type(refused).__name__)
+            with results_lock:
+                outcomes.append(result)
+
+        threads = [
+            threading.Thread(target=attempt, args=(machine, RunState.CANCELLED)),
+            threading.Thread(target=attempt, args=(other, RunState.DONE)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        won = [outcome for outcome in outcomes if outcome[0] == "won"]
+        assert len(won) == 1, f"both writers committed a terminal move: {outcomes}"
+        # Whichever won, the run holds that state and no later writer moved it.
+        assert machine.state_of("run-1") is RunState[won[0][1].upper()]
+        assert machine.state_of("run-1") in TERMINAL_STATES
+
+    def test_a_contended_task_status_is_applied_or_refused_never_lost(
+        self, machine: RunMachine, store: StateStore, ref: SpecRef, config: ConfigStore
+    ) -> None:
+        """The status map is rewritten whole, so a read outside the lock loses it.
+
+        The lock rejects rather than waits, so the honest contract is not that
+        both writers succeed — it is that a writer is either applied or told it
+        was refused. A refusal is recoverable because the caller still holds the
+        fact; a lost update is not, because the run resumes and pays again for
+        work it had already completed and forgotten.
+
+        A caller that needs both writes to land passes one lock across them,
+        which is what the lock parameter is for.
+        """
+        machine.create(ref, run_id="run-1")
+        machine.transition(ref, "run-1", RunState.EXECUTING)
+        other = RunMachine(store, config)
+        ready = threading.Barrier(2)
+        applied: list[str] = []
+        refused: list[str] = []
+        unexpected: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def report(owner: RunMachine, task: str) -> None:
+            ready.wait()
+            try:
+                owner.record_task_status(ref, "run-1", task, TaskStatus.COMPLETE)
+                outcome, bucket = task, applied
+            except SpecLocked:
+                outcome, bucket = task, refused
+            except BaseException as error:  # noqa: BLE001 - re-raised on the main thread
+                with results_lock:
+                    unexpected.append(error)
+                return
+            with results_lock:
+                bucket.append(outcome)
+
+        threads = [
+            threading.Thread(target=report, args=(machine, "1")),
+            threading.Thread(target=report, args=(other, "2")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not unexpected, f"a writer failed in an unplanned way: {unexpected}"
+        assert applied, "both writers were refused; no progress was made at all"
+        statuses = runs.task_statuses(machine.get("run-1"))
+        # Every writer told it succeeded is in the map. This is the assertion the
+        # unlocked read-modify-write violates: it reported success and dropped it.
+        for task in applied:
+            assert task in statuses, f"{task} reported success but was lost: {statuses}"
+        assert set(applied) | set(refused) == {"1", "2"}
+
+    def test_serialising_two_task_writes_under_one_lock_keeps_both(
+        self, machine: RunMachine, ref: SpecRef, store: StateStore
+    ) -> None:
+        # The pattern a caller uses when it needs several statuses to land: hold
+        # the lock once and record under it, so neither write is refused.
+        machine.create(ref, run_id="run-1")
+        machine.transition(ref, "run-1", RunState.EXECUTING)
+
+        with store.lock(ref, owner="orchestrator") as held:
+            machine.record_task_status(ref, "run-1", "1", TaskStatus.COMPLETE, lock=held)
+            machine.record_task_status(ref, "run-1", "2", TaskStatus.COMPLETE, lock=held)
+
+        statuses = runs.task_statuses(machine.get("run-1"))
+        assert set(statuses) == {"1", "2"}
+        assert all(status is TaskStatus.COMPLETE for status in statuses.values())
 
 
 class TestResume:

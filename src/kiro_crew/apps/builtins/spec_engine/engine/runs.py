@@ -207,6 +207,13 @@ TRANSITIONS: Mapping[RunState, frozenset[RunState]] = {
     ),
     RunState.STALLED: frozenset(
         {
+            # QUEUED is unreachable in practice and kept deliberately: a resume
+            # returns a parked run to the state it parked from, and QUEUED has no
+            # timeout, so nothing can stall out of it. Listing every resumable
+            # state rather than the subset that can currently stall means adding
+            # a timeout to a phase does not also require remembering to widen
+            # this set, which is the kind of omission that turns a resumable park
+            # into a stranded run.
             RunState.QUEUED,
             RunState.AUTHORING,
             RunState.AWAITING_REVIEW,
@@ -579,10 +586,38 @@ class RunMachine:
         leaves the row exactly as it was: the failure this guards against is a
         state that was applied and then reported as illegal, which is
         unrecoverable because nothing recorded what the previous state had been.
+
+        The read and the check happen INSIDE the lock, with the write, because
+        the store is shared across threads and processes. Checking first and
+        locking second lets two writers validate against the same state and both
+        pass: the loser then takes the lock the winner has released and commits a
+        move whose from-state no longer exists. A cancel followed by a ``done``
+        writer that had already read ``executing`` would move a terminal run,
+        which is the one thing this module promises cannot happen.
         """
-        record = self.get(run_id)
-        from_state = run_state_of(record)
-        if not is_legal(from_state, to_state):
+        refusal: tuple[RunState, RunState] | None = None
+        with self._held(ref, lock, owner=initiator or run_id):
+            record = self.get(run_id)
+            from_state = run_state_of(record)
+            if not is_legal(from_state, to_state):
+                refusal = (from_state, to_state)
+            else:
+                payload: dict[str, Any] = dict(detail or {})
+                payload[DETAIL_PHASE_ENTERED] = self._now_iso()
+                # Where a park resumes to is recorded when the park happens,
+                # because that is the only moment the previous state is still
+                # known. Leaving a park clears it, so a stale value cannot send a
+                # later resume somewhere the run never was.
+                payload[DETAIL_PARKED_FROM] = (
+                    from_state.value if to_state in PARKED_STATES else ""
+                )
+                updated = self._store.update_run(run_id, state=to_state.value, detail=payload)
+
+        # Audit outside the lock: the decision is already durable either way, and
+        # holding the lock across a second file write would make every writer
+        # wait on the audit log rather than on the state it actually contends for.
+        if refusal is not None:
+            from_state, to_state = refusal
             self._append_audit(
                 ref,
                 RUN_TRANSITION_REFUSED_EVENT,
@@ -596,16 +631,6 @@ class RunMachine:
                 },
             )
             raise IllegalTransition(run_id, from_state, to_state)
-
-        payload: dict[str, Any] = dict(detail or {})
-        payload[DETAIL_PHASE_ENTERED] = self._now_iso()
-        # Where a park resumes to is recorded when the park happens, because that
-        # is the only moment the previous state is still known. Leaving a park
-        # clears it, so a stale value cannot send a later resume somewhere the
-        # run never was.
-        payload[DETAIL_PARKED_FROM] = from_state.value if to_state in PARKED_STATES else ""
-        with self._held(ref, lock, owner=initiator or run_id):
-            updated = self._store.update_run(run_id, state=to_state.value, detail=payload)
         self._append_audit(
             ref,
             RUN_TRANSITIONED_EVENT,
@@ -778,18 +803,26 @@ class RunMachine:
         Refused for a finished run. Recording progress against a run that is
         done, failed, or cancelled would rewrite a history that has already been
         reported.
+
+        The check and the read-modify-write both happen inside the lock. The
+        status map is rewritten whole, so doing the read outside would lose an
+        update: two tasks in the same wave reporting at once would each write a
+        map built before the other's, and whichever committed second would erase
+        the first. The terminal check has to be under the same lock for the same
+        reason a transition's does — otherwise a run that finished between the
+        check and the write still accepts progress against itself.
         """
         if not task.strip():
             raise ValueError("a task status needs a task number")
-        record = self.get(run_id)
-        state = run_state_of(record)
-        if state in TERMINAL_STATES:
-            raise RunError(
-                f"run {run_id} is {state.value}; task status cannot be recorded against it"
-            )
-        statuses = {number: value.value for number, value in task_statuses(record).items()}
-        statuses[task] = status.value
         with self._held(ref, lock, owner=run_id):
+            record = self.get(run_id)
+            state = run_state_of(record)
+            if state in TERMINAL_STATES:
+                raise RunError(
+                    f"run {run_id} is {state.value}; task status cannot be recorded against it"
+                )
+            statuses = {number: value.value for number, value in task_statuses(record).items()}
+            statuses[task] = status.value
             return self._store.update_run(run_id, detail={DETAIL_TASKS: statuses})
 
     def completed_tasks(self, ref: SpecRef, run_id: str) -> tuple[str, ...]:
@@ -954,6 +987,19 @@ class RunMachine:
         initiator: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        """Append one run event, letting a failure to record it surface.
+
+        Deliberately unlike :meth:`_notify`, which swallows. A notification is a
+        courtesy and its loss costs someone a message; the audit log is the
+        record of what the engine did to a repository unattended, and a run whose
+        state moved with no trace of the move is the thing an operator later
+        cannot reconstruct.
+
+        The cost is that a transition which persisted and then failed to audit is
+        reported to its caller as an error. That is the safe direction: the state
+        is already durable and correct, and a caller that retries is refused as an
+        illegal self-transition rather than doubling anything.
+        """
         if self._audit is None:
             return
         self._audit.append(ref, event, run=run, initiator=initiator, detail=detail)
