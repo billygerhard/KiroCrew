@@ -104,7 +104,16 @@ LEAST_TRUSTED_CLASS = SUBMITTER_CLASSES[-1]
 SPEC_TYPES: tuple[str, ...] = ("feature", "bugfix", "quick")
 
 #: Work roles a cost profile may assign a model and effort to.
-ROLES: tuple[str, ...] = ("design", "review", "implement", "analysis")
+ROLES: tuple[str, ...] = ("design", "review", "implement", "analysis", "setup")
+
+#: Settings a cost profile may pin beside its role assignments: the tasks it
+#: dispatches at once and the credits one of its runs may spend. Both are
+#: ordinary settings, so the registry keeps ownership of their types and bounds
+#: and a profile cannot invent a limit the rest of the app does not understand.
+PROFILE_SETTING_KEYS: tuple[str, ...] = (
+    "concurrency.wave_max_tasks",
+    "budget.run_ceiling_credits",
+)
 
 #: Points at which the app may write back to the tracker that supplied an item.
 ITEM_LIFECYCLE_EVENTS: tuple[str, ...] = (

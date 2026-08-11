@@ -1,9 +1,10 @@
 """SQLite state store for the spec engine.
 
 Everything the engine remembers about a spec — the spec registry, phase
-approvals, runs, the at-most-once claim ledger, the workspace ledger, and the
-arrival-ordered dispatch queue — lives in one SQLite database under the app's
-data directory. None of it lives in a spec directory.
+approvals, runs, the at-most-once claim ledger, the watched-item lifecycle
+snapshot, the workspace ledger, and the arrival-ordered dispatch queue — lives in
+one SQLite database under the app's data directory. None of it lives in a spec
+directory.
 
 That separation is the whole point of this module. ``<project>/.kiro/specs/<name>/``
 is a contract shared with the Kiro IDE and CLI: it holds the native documents
@@ -154,6 +155,30 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         run_id     TEXT,
         claimed_ts TEXT NOT NULL,
         PRIMARY KEY (kind, scope, subject, generation)
+    )
+    """,
+    # The lifecycle snapshot every poll is compared against: one row per item a
+    # source has ever reported, holding the generation that item is currently on.
+    #
+    # A row outlives the item being closed, and outlives the source stopping to
+    # report it at all, which is why nothing here is ever deleted by a poll. The
+    # generation is part of the dispatch claim key, so forgetting a closed item
+    # would restart it at the first generation — whose claim is already held —
+    # and its reopen would then be silently dropped instead of dispatched.
+    #
+    # `is_open` is the lifecycle authority, not `item_state`. The state text is
+    # whatever the tracker printed, kept for display and diagnosis; an item the
+    # source stopped reporting has no state text at all.
+    """
+    CREATE TABLE IF NOT EXISTS watch_items (
+        source        TEXT NOT NULL,
+        item_id       TEXT NOT NULL,
+        generation    INTEGER NOT NULL DEFAULT 1,
+        item_state    TEXT NOT NULL DEFAULT '',
+        is_open       INTEGER NOT NULL DEFAULT 1,
+        first_seen_ts TEXT NOT NULL,
+        observed_ts   TEXT NOT NULL,
+        PRIMARY KEY (source, item_id)
     )
     """,
     """
@@ -351,6 +376,40 @@ class ClaimRecord:
 
 
 @dataclass(frozen=True)
+class WatchObservation:
+    """What one poll observed about one item, ready to be recorded.
+
+    Separate from :class:`WatchItemRecord` because a caller decides an item's
+    lifecycle position and the store decides the timestamps: a diff that
+    invented its own ``first_seen_ts`` could overwrite the real one.
+    """
+
+    item_id: str
+    generation: int
+    item_state: str = ""
+    is_open: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.item_id.strip():
+            raise ValueError("an observation must name the item it observed")
+        if self.generation < 1:
+            raise ValueError("a lifecycle generation starts at one and only rises")
+
+
+@dataclass(frozen=True)
+class WatchItemRecord:
+    """One item's recorded lifecycle position, as the last poll left it."""
+
+    source: str
+    item_id: str
+    generation: int
+    item_state: str
+    is_open: bool
+    first_seen_ts: str
+    observed_ts: str
+
+
+@dataclass(frozen=True)
 class WorkspaceRecord:
     workspace_id: int
     run_id: str
@@ -437,6 +496,18 @@ def _claim_record(row: sqlite3.Row) -> ClaimRecord:
         generation=row["generation"],
         run_id=row["run_id"],
         claimed_ts=row["claimed_ts"],
+    )
+
+
+def _watch_item_record(row: sqlite3.Row) -> WatchItemRecord:
+    return WatchItemRecord(
+        source=row["source"],
+        item_id=row["item_id"],
+        generation=int(row["generation"]),
+        item_state=row["item_state"],
+        is_open=bool(row["is_open"]),
+        first_seen_ts=row["first_seen_ts"],
+        observed_ts=row["observed_ts"],
     )
 
 
@@ -1060,6 +1131,60 @@ class StateStore:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._query(f"SELECT * FROM claims{where} ORDER BY claimed_ts, subject", params)
         return [_claim_record(row) for row in rows]
+
+    # ------------------------------------------------- watched-item snapshot
+
+    def record_watch_items(self, source: str, observations: Sequence[WatchObservation]) -> None:
+        """Record what one poll observed, as one transaction.
+
+        The whole snapshot lands or none of it does. A half-applied snapshot
+        would be a snapshot no poll ever saw, and the next diff would derive its
+        transitions by comparing against it — inventing reopens and
+        cancellations out of an interrupted write.
+
+        Items the *observations* do not mention are left as they are. A poll that
+        stopped reporting an item says so by observing it closed, never by
+        omitting it, because an omission is also what a narrowed poll filter
+        looks like.
+        """
+        if not source.strip():
+            raise ValueError("a watched-item observation must name its source")
+        if not observations:
+            return
+        now = utc_now_iso()
+        with self._write() as conn:
+            for observation in observations:
+                conn.execute(
+                    "INSERT INTO watch_items (source, item_id, generation, item_state, "
+                    "is_open, first_seen_ts, observed_ts) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (source, item_id) DO UPDATE SET "
+                    "generation = excluded.generation, item_state = excluded.item_state, "
+                    "is_open = excluded.is_open, observed_ts = excluded.observed_ts",
+                    (
+                        source,
+                        observation.item_id,
+                        observation.generation,
+                        observation.item_state,
+                        1 if observation.is_open else 0,
+                        now,
+                        now,
+                    ),
+                )
+
+    def get_watch_item(self, source: str, item_id: str) -> WatchItemRecord | None:
+        row = self._query_one(
+            "SELECT * FROM watch_items WHERE source = ? AND item_id = ?", (source, item_id)
+        )
+        return _watch_item_record(row) if row is not None else None
+
+    def list_watch_items(self, source: str) -> list[WatchItemRecord]:
+        """Every item *source* has ever reported, in identifier order.
+
+        Identifier order rather than observation order so a diff derived from
+        this snapshot reports its transitions the same way twice.
+        """
+        rows = self._query("SELECT * FROM watch_items WHERE source = ? ORDER BY item_id", (source,))
+        return [_watch_item_record(row) for row in rows]
 
     # -------------------------------------------------------------- workspaces
 
