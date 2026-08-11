@@ -190,13 +190,136 @@ class CandidateTree:
         Warnings keep the order they were produced in: they are emitted by the
         walk itself, which is already deterministic, and their sequence carries
         the reading order a user follows.
+
+        Raises:
+            ValueError: if a candidate path is not inside ``root``.
         """
 
-        return cls(
-            root=root,
-            candidates=tuple(sorted(candidates, key=lambda candidate: candidate.path)),
-            warnings=tuple(warnings),
-        )
+        ordered = tuple(sorted(candidates, key=lambda candidate: candidate.path))
+        for candidate in ordered:
+            # Containment is the invariant every later stage relies on: a
+            # candidate path becomes a folder's ``project_dir``, so one that
+            # escaped the root would scope a chat outside what the user pointed
+            # at. The walker cannot produce one (it only joins child names onto
+            # the root), but declaration parsing resolves paths a file supplied,
+            # so the guard sits at the single point every tree is built through.
+            if not _is_within(candidate.path, root):
+                raise ValueError(f"candidate path {candidate.path!r} is outside scan root {root!r}")
+        return cls(root=root, candidates=ordered, warnings=tuple(warnings))
+
+
+def _is_within(path: str, root: str) -> bool:
+    """Return whether ``path`` names a strict descendant of ``root``.
+
+    A prefix comparison, not a ``commonpath`` call: both arguments are already
+    normalized absolute paths, and ``commonpath`` raises on paths from different
+    Windows drives — which is a legitimate "outside the root" answer, not an
+    error. The separator is re-appended so ``/srv/app2`` does not read as being
+    inside ``/srv/app``.
+    """
+
+    prefix = root.rstrip(os.sep) + os.sep
+    return path.startswith(prefix) and path != prefix
+
+
+@dataclass(frozen=True)
+class _DirContents:
+    """One directory's listing, reduced to the two things the walk needs."""
+
+    # Sub-directories worth descending into: real directories only (never a
+    # symlink), never a pruned name, and never ``.kiro`` — see :func:`_read_dir`.
+    subdirs: tuple[str, ...]
+    # Detection signals the directory carries itself, in a fixed order so two
+    # scans of an unchanged directory produce an equal candidate.
+    signals: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _Frame:
+    """A directory queued for classification, with the context of its ancestors."""
+
+    path: str
+    # Distance below the scan root; the root itself is 0 and is never a candidate
+    # (the scaffold step creates the root's folder from the scan root directly).
+    depth: int
+    # Nearest ancestor that is itself a candidate; ``None`` means the scan root.
+    parent_path: str | None
+    # Whether any ancestor was detected as a package. This is what splits the
+    # boundary rule from the nested rule: the same manifest means "this is the
+    # package the user pointed at" outside a package and "this may be an
+    # implementation detail of the package above" inside one.
+    inside_package: bool
+
+
+def _read_dir(directory: str, manifests: frozenset[str]) -> _DirContents:
+    """Read ``directory`` once, returning what to descend into and what it signals.
+
+    Raises:
+        OSError: if the directory cannot be listed. The caller turns that into a
+            warning and keeps scanning; one unreadable directory must not cost
+            the user the packages found elsewhere.
+    """
+
+    subdirs: list[str] = []
+    has_git = False
+    has_kiro = False
+    found_manifests: list[str] = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            name = entry.name
+            # ``follow_symlinks=False`` is the whole of the no-symlink rule: a
+            # symlinked directory fails this test, so it never enters ``subdirs``
+            # and is never walked. Its target is therefore never read, whether it
+            # points inside the root, outside it, or back at an ancestor.
+            if entry.is_dir(follow_symlinks=False):
+                if name == GIT_DIR:
+                    has_git = True
+                    continue
+                if name == KIRO_DIR:
+                    # A signal, not a container: Kiro's own directory holds
+                    # steering and specs, so descending into it could only
+                    # manufacture candidates out of the tool's own files.
+                    has_kiro = True
+                    continue
+                # Prune before classify: a pruned name never reaches the
+                # classifier because it never reaches the stack, so a vendored
+                # manifest under a dependency directory cannot become a
+                # candidate however well it matches.
+                if is_pruned(name):
+                    continue
+                subdirs.append(name)
+            elif name in manifests:
+                # Anything that is not a real directory and carries a manifest
+                # name counts, including a symlinked manifest: only the name is
+                # read, never the target, so containment is unaffected.
+                found_manifests.append(name)
+
+    signals: list[str] = []
+    if has_git:
+        signals.append(SIGNAL_GIT)
+    if has_kiro:
+        signals.append(SIGNAL_KIRO)
+    signals.extend(manifest_signal(name) for name in sorted(found_manifests))
+    # Sorted rather than in ``scandir`` order: directory iteration order is not
+    # guaranteed, and the traversal order fixes the order warnings are reported
+    # in (candidate order comes from :meth:`CandidateTree.build`).
+    return _DirContents(subdirs=tuple(sorted(subdirs)), signals=tuple(signals))
+
+
+def _tier_for(signals: Sequence[str], *, inside_package: bool) -> Tier:
+    """Return the tier for a directory carrying ``signals``.
+
+    ``.git`` and ``.kiro`` are unambiguous at any depth — a nested repository is
+    its own package, and a directory the user has already used with Kiro is one
+    they have already treated as a project root. A manifest is the ambiguous
+    case, and position decides it: outside any package it names the package
+    itself, inside one it may just as easily name a build fixture, so it is
+    offered unticked.
+    """
+
+    if SIGNAL_GIT in signals or SIGNAL_KIRO in signals:
+        return Tier.AUTO
+    return Tier.OFFERED if inside_package else Tier.AUTO
 
 
 def scan(
@@ -220,4 +343,64 @@ def scan(
         error.
     """
 
-    raise NotImplementedError("the walker lands with the traversal implementation")
+    # Not ``resolve()``: the recorded paths stay the ones the caller named, so a
+    # root reached through a symlinked parent yields folders whose ``project_dir``
+    # matches what the user typed. Containment holds regardless, because every
+    # deeper path is this string with child names joined onto it.
+    root_path = os.path.abspath(os.fspath(root))
+    manifests = recognized_manifests(extra_signals)
+
+    candidates: list[Candidate] = []
+    warnings: list[str] = []
+    stack = [_Frame(path=root_path, depth=0, parent_path=None, inside_package=False)]
+
+    while stack:
+        frame = stack.pop()
+        try:
+            contents = _read_dir(frame.path, manifests)
+        except OSError as exc:
+            # A subtree we cannot list is a partial result, not a failed scan.
+            warnings.append(f"skipped unreadable directory {frame.path}: {exc.strerror or exc}")
+            continue
+
+        parent_path = frame.parent_path
+        # The root's own signals count even though the root is never a candidate:
+        # pointing at a monorepo whose top level holds a manifest means every
+        # package below it is nested inside that package, which is the case
+        # Requirement 2's "shown unticked" tier exists for. Requirement 1's
+        # boundary tier is for the other shape — a root that is just a directory
+        # holding unrelated repositories.
+        inside_package = frame.inside_package or bool(contents.signals)
+        if frame.depth > 0 and contents.signals:
+            candidates.append(
+                Candidate(
+                    path=frame.path,
+                    name=os.path.basename(frame.path),
+                    parent_path=frame.parent_path,
+                    tier=_tier_for(contents.signals, inside_package=frame.inside_package),
+                    signals=contents.signals,
+                )
+            )
+            # Children hang off this candidate, not off whatever is above it.
+            parent_path = frame.path
+
+        # A directory at exactly the cap is still classified — it is within the
+        # depth the caller allowed — but its children are one step too deep.
+        if frame.depth >= depth_cap:
+            continue
+
+        # Reversed, because a stack pops last-in first: pushing in reverse walks
+        # children alphabetically. Candidate order does not depend on this, but
+        # warning order does, and a scan that reports its problems in a different
+        # sequence each run is not reproducible.
+        for name in reversed(contents.subdirs):
+            stack.append(
+                _Frame(
+                    path=os.path.join(frame.path, name),
+                    depth=frame.depth + 1,
+                    parent_path=parent_path,
+                    inside_package=inside_package,
+                )
+            )
+
+    return CandidateTree.build(root_path, candidates, warnings)

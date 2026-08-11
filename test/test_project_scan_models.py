@@ -245,6 +245,9 @@ class TestIsPruned:
 
 
 class TestScanSignature:
-    def test_walker_is_not_implemented_yet(self, tmp_path: Path) -> None:
-        with pytest.raises(NotImplementedError):
-            scan(tmp_path, extra_signals=("BUILD.bazel",), depth_cap=2)
+    def test_scan_returns_an_empty_tree_for_an_empty_root(self, tmp_path: Path) -> None:
+        # Signature smoke test only — traversal and classification behavior lives
+        # in the walker's own suite.
+        tree = scan(tmp_path, extra_signals=("BUILD.bazel",), depth_cap=2)
+
+        assert tree == CandidateTree(root=str(tmp_path))
