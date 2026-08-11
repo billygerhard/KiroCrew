@@ -140,6 +140,37 @@ class TestConfigOnlyObjects:
     def test_ordinary_settings_are_not_restricted(self):
         assert config_only_paths({"limits": {"task_retry_limit": 1}}) == ()
 
+    def test_the_integration_switch_is_restricted_at_both_scopes(self):
+        # It is one setting rather than a whole section, but it co-gates
+        # unattended integration alongside the autonomy ladder, and integration
+        # is the stage a mistake cannot undo. A ladder no tool can widen buys
+        # little if the other gate on the same action stays freely writable.
+        assert config_only_paths({"delivery": {"auto_integrate": True}}) == (
+            "delivery.auto_integrate",
+        )
+        assert config_only_paths(
+            {"projects": {"acme": {"delivery": {"auto_integrate": True}}}}
+        ) == ("projects.acme.delivery.auto_integrate",)
+
+    def test_other_delivery_settings_stay_ordinary(self):
+        # Only the integration switch is fenced; fencing the whole section would
+        # make routine delivery settings need an operator-confirmed surface.
+        assert config_only_paths({"delivery": {"base_branch": "main"}}) == ()
+
+    @pytest.mark.parametrize(
+        "patch",
+        [
+            {"delivery": {"auto_integrate": True}},
+            {"projects": {"acme": {"path": "/w", "delivery": {"auto_integrate": True}}}},
+        ],
+    )
+    def test_an_unconfirmed_surface_cannot_arm_unattended_integration(
+        self, store: ConfigStore, patch: dict
+    ):
+        with pytest.raises(ConfigWriteRefused):
+            store.write(patch, surface=UNCONFIRMED_SURFACE)
+        assert not store.path.exists()
+
     @pytest.mark.parametrize(
         "patch",
         [

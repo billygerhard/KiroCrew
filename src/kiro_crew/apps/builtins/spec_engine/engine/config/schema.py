@@ -152,6 +152,13 @@ CONFIG_ONLY_PATHS: tuple[str, ...] = (
     SECTION_WORKFLOW,
     SECTION_CAPABILITIES,
     f"{SECTION_PROJECTS}.*.{SECTION_WORKFLOW}",
+    # Not a whole section, but the same kind of thing as one. This switch
+    # co-gates unattended integration into a protected destination alongside
+    # the autonomy ladder, and integration is the one stage a mistake cannot
+    # undo. A ladder that no tool can widen is worth little if the second gate
+    # on the same action stays writable from a surface no operator confirmed.
+    "delivery.auto_integrate",
+    f"{SECTION_PROJECTS}.*.delivery.auto_integrate",
 )
 
 
