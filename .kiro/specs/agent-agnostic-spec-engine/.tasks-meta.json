@@ -5,22 +5,22 @@
     "2.1": "completed",
     "2.2": "completed",
     "3.1": "completed",
-    "3.2": "queued",
-    "4.1": "queued",
-    "4.2": "queued",
+    "3.2": "completed",
+    "4.1": "completed",
+    "4.2": "completed",
     "4.3": "queued",
-    "5.1": "queued",
+    "5.1": "completed",
     "5.2": "queued",
     "5.3": "queued",
     "5.4": "queued",
     "6.1": "queued",
     "6.2": "queued",
-    "7.1": "queued",
+    "7.1": "completed",
     "7.2": "queued",
     "7.3": "queued",
     "7.4": "queued",
     "7.5": "queued",
-    "8.1": "queued",
+    "8.1": "in_progress",
     "8.2": "queued",
     "8.3": "queued",
     "8.4": "queued",
@@ -52,7 +52,7 @@
     "9.4": "queued",
     "12.5": "queued",
     "13.4": "queued",
-    "17.1": "queued",
+    "17.1": "in_progress",
     "17.4": "queued",
     "17.2": "queued",
     "17.5": "queued",
@@ -124,6 +124,66 @@
     {
       "ts": "2026-08-10T10:45:16",
       "taskId": "3.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-10T11:20:32",
+      "taskId": "3.2",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:20:35",
+      "taskId": "4.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:20:39",
+      "taskId": "4.2",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:20:42",
+      "taskId": "5.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:20:45",
+      "taskId": "7.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:52:57",
+      "taskId": "8.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T11:53:00",
+      "taskId": "17.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-10T12:35:07",
+      "taskId": "3.2",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-10T12:35:11",
+      "taskId": "4.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-10T12:35:15",
+      "taskId": "4.2",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-10T12:35:18",
+      "taskId": "5.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-10T12:35:22",
+      "taskId": "7.1",
       "status": "completed"
     }
   ]

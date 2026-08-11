@@ -26,21 +26,21 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Engine state lives entirely outside spec directories; persistence failure fails the operation and never writes state into a spec document; append-only per-spec audit JSONL
     - _Requirements: 2.6, 1.6, 1.7_
 
-- [ ] 3. Validator
+- [x] 3. Validator
   - [x] 3.1 Native-format document validator
     - Implement the native Kiro format rules (sections, EARS shape, numbering, checkbox syntax) returning every violation with file, location, and rule identifier
     - _Requirements: 1.1, 1.2_
-  - [ ] 3.2 Task links, requirement coverage, and DAG validation
+  - [x] 3.2 Task links, requirement coverage, and DAG validation
     - Resolve every leaf-task criterion reference against requirements.md; report uncovered requirements in tasks-only and full-spec validation
     - Waves DAG checks: acyclic, every incomplete leaf in exactly one wave, sequential wave ids
     - _Requirements: 1.3, 1.4, 1.5_
 
 - [ ] 4. Spec lifecycle and phase machine
-  - [ ] 4.1 Spec creation and spec types
+  - [x] 4.1 Spec creation and spec types
     - Create spec directories with `.config.kiro` recording the spec type; derive the document plan (feature/bugfix/quick) from the recorded type
     - Unrecordable type fails creation atomically, leaving no partial directory; no validation or advancement without a recorded type
     - _Requirements: 5.1, 5.2, 5.3, 5.4_
-  - [ ] 4.2 Phase derivation, advancement gates, and approval staleness
+  - [x] 4.2 Phase derivation, advancement gates, and approval staleness
     - Read-only phase derivation from artifacts plus approval state; advancement refused on validation failure or missing approval with reasons returned
     - Approvals persist approver identity and timestamp; post-approval document edits (content hash) stale exactly the affected approvals
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
@@ -50,7 +50,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 6.1, 6.2, 6.4_
 
 - [ ] 5. Autonomy policy and run lifecycle
-  - [ ] 5.1 Autonomy_Policy resolution
+  - [x] 5.1 Autonomy_Policy resolution
     - Resolve per (source, spec type, submitter class); unconfigured resolves to authoring-only human-reserved execution; configured resolves exactly to the configured level
     - Strictly ordered levels with lower levels implied; loaded from configuration only
     - _Requirements: 8.2, 8.6, 8.7_
@@ -83,7 +83,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 16.4, 16.5, 16.6_
 
 - [ ] 7. Delivery pipeline
-  - [ ] 7.1 Stage executor with argv substitution
+  - [x] 7.1 Stage executor with argv substitution
     - Read Delivery_Workflow stage-to-commands config; unconfigured stages skip; tokenize templates once and substitute variables as single literal argv elements via subprocess (no shell interpretation)
     - Run context plus custom project variables; valueless referenced variable fails the stage before execution; zero-config projects run authoring/execution in the working tree with autonomy capped at execution
     - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 24.1_
