@@ -34,6 +34,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     ISOLATE_STAGE,
     MAX_DEPLOYMENT_ADDRESSES,
     PUBLISH_STAGE,
+    REASON_DELIVERY_FAILED,
     REASON_LADDER,
     REASON_POSTURE,
     REASON_VERIFY,
@@ -552,6 +553,31 @@ class TestIntegrationInTheFlow:
         assert run.integration is not None
         assert not run.integration.permitted
         assert REASON_VERIFY in run.integration.reasons
+
+    def test_a_publish_that_deployed_and_then_failed_does_not_permit_integration(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The dangerous shape: verification passed, both configuration gates are
+        # open, and a protected target is named, so every configured gate holds
+        # while the run itself broke partway through publishing. A caller reading
+        # only `permitted` would integrate a half-deployed change.
+        store.write(workflow_document(auto_integrate=True), surface=DASHBOARD_SURFACE)
+        pipeline = build_pipeline(
+            store,
+            level=AutonomyLevel.INTEGRATION,
+            runner=ScriptedRunner(exits={PUBLISH_PROGRAM: [1]}),
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert run.verified
+        assert run.integration is not None
+        assert run.integration.ladder_permits
+        assert run.integration.auto_integrate
+        assert not run.integration.delivered
+        assert not run.integration.permitted
+        assert run.integration.reasons == (REASON_DELIVERY_FAILED,)
 
     def test_the_publish_target_outside_the_protected_set_is_not_an_integration(
         self, store: ConfigStore, workspace: Path

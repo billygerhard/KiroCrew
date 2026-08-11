@@ -48,6 +48,7 @@ from .flow import (
 )
 from .integration import (
     PROTECTED_BRANCHES_FIELD,
+    REASON_DELIVERY_FAILED,
     REASON_LADDER,
     REASON_NO_TARGET,
     REASON_POSTURE,
@@ -122,6 +123,7 @@ __all__ = [
     "MAX_SLUG_CHARS",
     "PROTECTED_BRANCHES_FIELD",
     "PUBLISH_STAGE",
+    "REASON_DELIVERY_FAILED",
     "REASON_LADDER",
     "REASON_NO_TARGET",
     "REASON_POSTURE",

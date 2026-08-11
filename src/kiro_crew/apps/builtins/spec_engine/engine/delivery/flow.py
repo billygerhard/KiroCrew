@@ -399,7 +399,11 @@ class DeliveryPipeline:
 
     def _with_integration(self, run: DeliveryRun, context: RunContext) -> DeliveryRun:
         """Attach the integration decision for this run's target."""
-        decision = self._authority.integration(verified=run.verified, target=context.base_branch)
+        decision = self._authority.integration(
+            verified=run.verified,
+            target=context.base_branch,
+            delivered=run.outcome is not DeliveryOutcome.FAILED,
+        )
         self._record(
             EVENT_INTEGRATION,
             {
@@ -409,6 +413,7 @@ class DeliveryPipeline:
                 "ladder_permits": decision.ladder_permits,
                 "auto_integrate": decision.auto_integrate,
                 "verified": decision.verified,
+                "delivered": decision.delivered,
                 "reasons": list(decision.reasons),
             },
         )
@@ -446,9 +451,12 @@ class DeliveryPipeline:
             reason=cause.reason or f"the {cause.stage} stage {cause.outcome.value}",
             not_reached=tuple(remaining),
         )
-        # The integration decision is attached to a failed delivery too. A run
-        # that failed verification is exactly the run whose record must say that
-        # integration was not authorized, rather than leaving the question open.
+        # The integration decision is attached to a failed delivery too, so the
+        # record answers the question rather than leaving it open. The failure
+        # itself is one of the gates: a publish that deployed part of a change
+        # and then exited non-zero passes every configured gate, so were the
+        # outcome not evaluated this record would say integration was permitted
+        # on a run that broke halfway through.
         return self._with_integration(run, context)
 
     def _run_stage(self, stage: str, context: RunContext) -> StageResult:

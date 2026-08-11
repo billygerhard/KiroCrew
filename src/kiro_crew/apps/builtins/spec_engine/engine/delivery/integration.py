@@ -55,6 +55,7 @@ REASON_LADDER = "autonomy_ladder"
 REASON_POSTURE = "auto_integrate_off"
 REASON_VERIFY = "verify_incomplete"
 REASON_NO_TARGET = "no_integration_target"
+REASON_DELIVERY_FAILED = "delivery_failed"
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,8 @@ class IntegrationDecision:
     verified: bool
     target: str
     target_protected: bool
+    #: Whether the delivery this decision belongs to actually succeeded.
+    delivered: bool = True
     reasons: tuple[str, ...] = ()
     #: Where the posture switch was read from, for a configuration surface.
     auto_integrate_declared_at: str = ""
@@ -144,6 +147,7 @@ def evaluate_integration(
     verified: bool,
     protected: ProtectedBranches,
     target: str,
+    delivered: bool = True,
     auto_integrate_declared_at: str = "",
 ) -> IntegrationDecision:
     """Decide whether the pipeline may integrate into *target* without a human.
@@ -151,6 +155,14 @@ def evaluate_integration(
     Every gate is evaluated rather than short-circuited, so a run blocked by two
     things reports two things: an operator who flips the posture switch on a run
     the ladder also refused would otherwise be told the same "refused" twice.
+
+    *delivered* is the outcome of the delivery this decision belongs to, and it
+    is a gate rather than context. The configuration gates answer "may this run
+    integrate"; they cannot answer "did this run produce something worth
+    integrating". A publish that deployed half a change and exited non-zero
+    satisfies every configured gate, so without this a failed delivery would
+    carry a permitted decision and a caller reading only ``permitted`` would
+    integrate it.
     """
     ladder = decision.permits(AutonomyLevel.INTEGRATION)
     reasons: list[str] = []
@@ -162,6 +174,8 @@ def evaluate_integration(
         reasons.append(REASON_VERIFY)
     if not target.strip():
         reasons.append(REASON_NO_TARGET)
+    if not delivered:
+        reasons.append(REASON_DELIVERY_FAILED)
     return IntegrationDecision(
         permitted=not reasons,
         ladder_permits=ladder,
@@ -169,6 +183,7 @@ def evaluate_integration(
         verified=verified,
         target=target,
         target_protected=protected.protects(target),
+        delivered=delivered,
         reasons=tuple(reasons),
         auto_integrate_declared_at=auto_integrate_declared_at,
     )
@@ -211,7 +226,9 @@ class DeliveryAuthority:
         """
         return self.permits(AutonomyLevel.DELIVERY)
 
-    def integration(self, *, verified: bool, target: str) -> IntegrationDecision:
+    def integration(
+        self, *, verified: bool, target: str, delivered: bool = True
+    ) -> IntegrationDecision:
         """Evaluate the integration gates for this run against *target*."""
         return evaluate_integration(
             decision=_capped_decision(self.decision, self.level),
@@ -219,6 +236,7 @@ class DeliveryAuthority:
             verified=verified,
             protected=self.protected,
             target=target,
+            delivered=delivered,
             auto_integrate_declared_at=self.auto_integrate_declared_at,
         )
 
