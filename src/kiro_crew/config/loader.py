@@ -172,6 +172,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "mcp",
         "taskrunner",
         "orchestrator",
+        "scaffold",
         "watchdog",
         "messaging",
         "cron_history",
@@ -1990,6 +1991,41 @@ class OrchestratorConfig:
             "Stage Timeout", "Max seconds per stage before auto-run stops. Default 30 min."
         ),
     )
+
+
+# Depth the project scanner descends below a scan root before it stops. Owned
+# here because it is a user-configurable limit; the scanner takes it as an
+# argument rather than reading config itself.
+DEFAULT_SCAFFOLD_DEPTH_CAP = 5
+
+
+@dataclass
+class ScaffoldConfig:
+    extra_manifest_signals: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Extra Manifest Signals",
+            "Additional manifest filenames that mark a directory as a package "
+            "when scanning a project, on top of the built-in set "
+            "(package.json, pyproject.toml, Cargo.toml, go.mod, pom.xml, "
+            "build.gradle, build.gradle.kts). Bare filenames, not paths.",
+        ),
+    )
+    depth_cap: int = field(
+        default=DEFAULT_SCAFFOLD_DEPTH_CAP,
+        metadata=_meta(
+            "Scan Depth Cap",
+            "How many directory levels below the scan root the project scanner "
+            "descends. Bounds the scan on large trees.",
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # A cap below 1 would scan nothing at all, which reads as "the scanner
+        # is broken" rather than "the cap is wrong" — fail safe to 1 level.
+        if self.depth_cap < 1:
+            logger.warning("scaffold.depth_cap %d < 1, using 1", self.depth_cap)
+            self.depth_cap = 1
 
 
 @dataclass
@@ -6340,6 +6376,10 @@ class KiroCrewConfig:
         default_factory=CronHistoryConfig,
         metadata=_meta("Cron History", "Cron execution history storage limits."),
     )
+    scaffold: ScaffoldConfig = field(
+        default_factory=ScaffoldConfig,
+        metadata=_meta("Scaffold", "Project scanning limits for folder scaffolding."),
+    )
     memory: MemoryConfig = field(
         default_factory=MemoryConfig,
         metadata=_meta("Memory", "Memory and embedding configuration."),
@@ -6731,6 +6771,9 @@ class KiroCrewConfig:
         cron_history_data = data.get("cron_history", {})
         if not isinstance(cron_history_data, dict):
             cron_history_data = {}
+        scaffold_data = data.get("scaffold", {})
+        if not isinstance(scaffold_data, dict):
+            scaffold_data = {}
         memory_data = data.get("memory", {})
         if not isinstance(memory_data, dict):
             memory_data = {}
@@ -7060,6 +7103,17 @@ class KiroCrewConfig:
                 ),
                 cron_max_index_records=_safe_int(
                     cron_history_data.get("cron_max_index_records", 2000), 2000
+                ),
+            ),
+            scaffold=ScaffoldConfig(
+                extra_manifest_signals=[
+                    s
+                    for s in _safe_list(scaffold_data.get("extra_manifest_signals"))
+                    if isinstance(s, str)
+                ],
+                depth_cap=_safe_int(
+                    scaffold_data.get("depth_cap", DEFAULT_SCAFFOLD_DEPTH_CAP),
+                    DEFAULT_SCAFFOLD_DEPTH_CAP,
                 ),
             ),
             messaging=MessagingConfig(
@@ -7826,6 +7880,7 @@ class KiroCrewConfig:
             "watchdog": asdict(self.watchdog),
             "messaging": asdict(self.messaging),
             "cron_history": asdict(self.cron_history),
+            "scaffold": asdict(self.scaffold),
             "knowledge": asdict(self.knowledge),
             "heartbeat": asdict(self.heartbeat),
             "skills": asdict(self.skills),

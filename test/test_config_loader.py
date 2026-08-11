@@ -30,6 +30,7 @@ from kiro_crew.config.loader import (
     MemoryConfig,
     MemoryStoreConfig,
     ResolvedBindings,
+    ScaffoldConfig,
     SessionConfig,
     SlackConfig,
     SttConfig,
@@ -3760,6 +3761,85 @@ class TestOrchestratorWatchdogThemeAreParsed:
         )
         assert cfg.watchdog.check_after_secs == 60.0
         assert cfg.orchestrator.stage_timeout_seconds == 1800
+
+
+class TestScaffoldConfig:
+    """The scaffold.* keys read by the project scanner: an extra-manifest
+    allowlist that lets a user teach the scanner a build system it does not
+    know, and the depth cap that bounds a scan. Both are hand-editable, so a
+    malformed value must degrade to the default rather than reach the scanner.
+    """
+
+    def test_defaults_when_section_absent(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.scaffold.extra_manifest_signals == []
+        assert cfg.scaffold.depth_cap == 5
+
+    def test_dataclass_defaults(self) -> None:
+        assert ScaffoldConfig().extra_manifest_signals == []
+        assert ScaffoldConfig().depth_cap == 5
+
+    def test_defaults_when_section_empty(self) -> None:
+        cfg = _load_from_dict({"scaffold": {}})
+        assert cfg.scaffold.extra_manifest_signals == []
+        assert cfg.scaffold.depth_cap == 5
+
+    def test_valid_overrides_are_parsed(self) -> None:
+        cfg = _load_from_dict(
+            {"scaffold": {"extra_manifest_signals": ["BUILD", "meson.build"], "depth_cap": 8}}
+        )
+        assert cfg.scaffold.extra_manifest_signals == ["BUILD", "meson.build"]
+        assert cfg.scaffold.depth_cap == 8
+
+    def test_non_list_signals_fall_back_to_empty(self) -> None:
+        # A bare string would char-split into single-letter "manifests" and make
+        # every directory a package, so it must degrade to the default instead.
+        cfg = _load_from_dict({"scaffold": {"extra_manifest_signals": "BUILD"}})
+        assert cfg.scaffold.extra_manifest_signals == []
+
+    def test_non_string_signal_entries_are_dropped(self) -> None:
+        cfg = _load_from_dict(
+            {"scaffold": {"extra_manifest_signals": ["BUILD", 7, None, {"a": 1}, "meson.build"]}}
+        )
+        assert cfg.scaffold.extra_manifest_signals == ["BUILD", "meson.build"]
+
+    def test_non_numeric_depth_cap_falls_back(self) -> None:
+        cfg = _load_from_dict({"scaffold": {"depth_cap": "junk"}})
+        assert cfg.scaffold.depth_cap == 5
+
+    def test_boolean_depth_cap_falls_back(self) -> None:
+        # bool is an int subclass; the loader rejects it everywhere else too.
+        cfg = _load_from_dict({"scaffold": {"depth_cap": True}})
+        assert cfg.scaffold.depth_cap == 5
+
+    def test_numeric_string_depth_cap_is_coerced(self) -> None:
+        # Matches every other int knob: older writers stored numbers as strings.
+        cfg = _load_from_dict({"scaffold": {"depth_cap": "7"}})
+        assert cfg.scaffold.depth_cap == 7
+
+    def test_integral_float_depth_cap_is_coerced(self) -> None:
+        cfg = _load_from_dict({"scaffold": {"depth_cap": 4.0}})
+        assert cfg.scaffold.depth_cap == 4
+
+    def test_fractional_float_depth_cap_falls_back(self) -> None:
+        cfg = _load_from_dict({"scaffold": {"depth_cap": 4.5}})
+        assert cfg.scaffold.depth_cap == 5
+
+    @pytest.mark.parametrize("bad", [0, -1, -100])
+    def test_depth_cap_below_one_clamps_to_one(self, bad: int) -> None:
+        cfg = _load_from_dict({"scaffold": {"depth_cap": bad}})
+        assert cfg.scaffold.depth_cap == 1
+        assert ScaffoldConfig(depth_cap=bad).depth_cap == 1
+
+    def test_non_dict_section_falls_back_to_defaults(self) -> None:
+        cfg = _load_from_dict({"scaffold": ["not", "a", "dict"]})
+        assert cfg.scaffold.extra_manifest_signals == []
+        assert cfg.scaffold.depth_cap == 5
+
+    def test_round_trips_through_to_dict(self) -> None:
+        cfg = _load_from_dict({"scaffold": {"extra_manifest_signals": ["BUILD"], "depth_cap": 3}})
+        section = cfg.to_dict()["scaffold"]
+        assert section == {"extra_manifest_signals": ["BUILD"], "depth_cap": 3}
 
 
 class TestMalformedConfigNeverBricksLoad:
