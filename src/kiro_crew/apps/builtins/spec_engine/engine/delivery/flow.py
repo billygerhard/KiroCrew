@@ -41,8 +41,9 @@ from enum import Enum
 from typing import Any, Callable, Protocol, Sequence
 
 from ..autonomy import AutonomyLevel
-from ..config import ConfigStore
+from ..config import ConfigStore, ConfigValidationError
 from .integration import DeliveryAuthority, IntegrationDecision
+from .isolation import WorkspaceBroker, isolated_context
 from .stages import CommandRunner, StageExecutor, StageOutcome, StageResult
 from .variables import RunContext
 from .workflow import ISOLATE_STAGE, DeliveryWorkflow
@@ -206,6 +207,7 @@ class DeliveryPipeline:
         executor: StageExecutor | None = None,
         fix_dispatcher: FixTaskDispatcher | None = None,
         audit: AuditRecorder | None = None,
+        isolation: WorkspaceBroker | None = None,
     ) -> None:
         self._store = store
         self._project = project
@@ -215,6 +217,7 @@ class DeliveryPipeline:
         )
         self._fix_dispatcher = fix_dispatcher
         self._audit = audit
+        self._isolation = isolation
 
     @property
     def workflow(self) -> DeliveryWorkflow:
@@ -226,13 +229,19 @@ class DeliveryPipeline:
 
     # --- isolation ---------------------------------------------------------
 
-    def isolate(self, context: RunContext) -> StageResult:
+    def isolate(self, context: RunContext, *, run_id: str = "") -> StageResult:
         """Run the isolate stage, before any task executes.
 
         Called by the run driver ahead of execution rather than at delivery time.
         A run that is not delivery-authorized gets a skip with the reason on it,
         because "no isolated workspace" is the correct outcome there and a caller
         must be able to tell it apart from a failed isolation.
+
+        With a workspace broker wired, the run's own working tree is claimed
+        before the stage spawns anything and released again if nothing was
+        created. The claim is what makes a second run asking for the same tree a
+        refusal instead of two runs editing one checkout; the broker's module
+        explains why that has to happen before the command rather than after it.
         """
         if not self._authority.isolates_before_execution:
             result = StageResult(
@@ -245,9 +254,37 @@ class DeliveryPipeline:
             )
             self._record_stage(result)
             return result
-        result = self._executor.run(ISOLATE_STAGE, context)
+        if self._isolation is None or not self._isolates():
+            # No broker, or a workflow with nothing to materialize a workspace:
+            # claiming a path here would hold it against later runs for a tree
+            # that never appears.
+            result = self._executor.run(ISOLATE_STAGE, context)
+            self._record_stage(result)
+            return result
+        claim = self._isolation.claim(run_id=run_id, context=context)
+        if not claim.granted:
+            result = StageResult(
+                stage=ISOLATE_STAGE,
+                outcome=StageOutcome.REFUSED,
+                reason=claim.reason,
+            )
+            self._record_stage(result)
+            return result
+        result = self._executor.run(ISOLATE_STAGE, isolated_context(context, claim))
+        if not result.executed or not result.ok:
+            self._isolation.release(claim)
         self._record_stage(result)
         return result
+
+    def _isolates(self) -> bool:
+        """Whether the workflow has isolate commands, tolerating a bad one."""
+        try:
+            return self.workflow.isolates
+        except ConfigValidationError:
+            # An unusable isolate declaration is the executor's refusal to
+            # report, with the configuration path on it. Claiming first would
+            # add a released row to the ledger and change nothing else.
+            return False
 
     # --- the flow ----------------------------------------------------------
 

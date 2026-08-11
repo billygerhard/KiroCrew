@@ -18,6 +18,8 @@ The module boundaries follow the trust boundary:
 * :mod:`.integration` holds the integration floor: the protected branch set, the
   workflow ceiling on autonomy, and the two independent gates an unattended merge
   must both pass.
+* :mod:`.isolation` gives each run a working tree of its own and refuses to hand
+  one tree to two runs.
 * :mod:`.flow` orders the stages — isolate before execution, publish only after
   verification, fix rounds bounded by the retry limit.
 """
@@ -57,6 +59,21 @@ from .integration import (
     resolve_authority,
     resolve_protected_branches,
 )
+from .isolation import (
+    BRANCH_PREFIX,
+    GIT_ISOLATE_COMMANDS,
+    ISOLATED_PATH_VARIABLE,
+    MAX_SLUG_CHARS,
+    WORKTREE_KIND,
+    WorkspaceBroker,
+    WorkspaceClaim,
+    WorkspaceLedger,
+    WorkspacePlan,
+    git_isolate_commands,
+    isolated_context,
+    plan_workspace,
+    slugify,
+)
 from .stages import (
     MAX_CAPTURED_CHARS,
     STAGE_TIMEOUT_SETTING,
@@ -90,15 +107,19 @@ from .workflow import (
 )
 
 __all__ = [
+    "BRANCH_PREFIX",
     "DELIVERY_FLOW_STAGES",
     "EVENT_FIX_DISPATCH",
     "EVENT_INTEGRATION",
     "EVENT_PUBLISHED",
     "EVENT_STAGE",
+    "GIT_ISOLATE_COMMANDS",
+    "ISOLATED_PATH_VARIABLE",
     "ISOLATE_STAGE",
     "MAX_ADDRESS_CHARS",
     "MAX_CAPTURED_CHARS",
     "MAX_DEPLOYMENT_ADDRESSES",
+    "MAX_SLUG_CHARS",
     "PROTECTED_BRANCHES_FIELD",
     "PUBLISH_STAGE",
     "REASON_LADDER",
@@ -114,6 +135,7 @@ __all__ = [
     "VARIABLE_NAME_PATTERN",
     "VERIFY_RETRY_LIMIT_SETTING",
     "VERIFY_STAGE",
+    "WORKTREE_KIND",
     "ZERO_CONFIG_AUTONOMY_CEILING",
     "ArgumentTemplate",
     "AuditRecorder",
@@ -140,11 +162,19 @@ __all__ = [
     "VariableError",
     "VariableRef",
     "VerifyAttempt",
+    "WorkspaceBroker",
+    "WorkspaceClaim",
+    "WorkspaceLedger",
+    "WorkspacePlan",
     "build_variables",
     "cap_autonomy",
     "evaluate_integration",
+    "git_isolate_commands",
     "has_value",
+    "isolated_context",
+    "plan_workspace",
     "resolve_authority",
     "resolve_protected_branches",
     "run_argv",
+    "slugify",
 ]

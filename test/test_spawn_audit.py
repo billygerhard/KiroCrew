@@ -322,6 +322,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # a repo that holds a real binary blob to prove host-side `git` decodes its output
         # leniently (D-142) — a strict decode killed the watcher on any repo with a PNG.
         "apps/builtins/auto_improvement/tests/test_pr_watchers.py::_repo_with_binary",
+        # Same basis: a fixed `git init/clone/commit/push/worktree` argv against a
+        # pytest tmp_path, building the repository the spec engine's worktree-isolation
+        # tests run against. The claim under test is that git itself refuses to check one
+        # branch out in two working trees, so the setup has to be real git; the argv is
+        # literal and the cwd is a tmp_path, and the isolate stage under test runs
+        # through the sandboxed stage executor rather than this helper.
+        "apps/builtins/spec_engine/tests/test_delivery_isolation.py::_git",
         # Same basis: a fixed `git init` + `git diff no-such-branch..HEAD` against a
         # tmp_path, asserting that a failed diff really does exit non-zero with empty
         # stdout — the premise the direct-push credential gate's guard rests on.

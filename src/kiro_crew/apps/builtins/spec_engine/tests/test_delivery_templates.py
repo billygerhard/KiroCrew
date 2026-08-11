@@ -162,6 +162,7 @@ class TestVariableAssembly:
             spec_name="s",
             spec_type="feature",
             workspace_path="/w",
+            isolated_path="/w-run",
             base_branch="main",
             branch_name="topic",
             item_id="7",

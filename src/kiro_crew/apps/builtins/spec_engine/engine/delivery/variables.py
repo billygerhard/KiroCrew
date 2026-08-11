@@ -29,6 +29,7 @@ RUN_CONTEXT_VARIABLES: tuple[str, ...] = (
     "spec_name",
     "spec_type",
     "workspace_path",
+    "isolated_path",
     "base_branch",
     "branch_name",
     "item_id",
@@ -57,6 +58,12 @@ class RunContext:
     spec_name: str
     spec_type: str
     workspace_path: str
+    #: Workspace the isolate stage creates for this run, empty until one is
+    #: planned. Kept apart from ``workspace_path``, which stays the tree the
+    #: stage commands run *in*: a worktree is added by the repository that will
+    #: hold it, and a run with no isolated workspace must not silently render a
+    #: command against the project's own tree.
+    isolated_path: str = ""
     base_branch: str = ""
     branch_name: str = ""
     item_id: str = ""
@@ -70,6 +77,7 @@ class RunContext:
             "spec_name": self.spec_name,
             "spec_type": self.spec_type,
             "workspace_path": self.workspace_path,
+            "isolated_path": self.isolated_path,
             "base_branch": self.base_branch,
             "branch_name": self.branch_name,
             "item_id": self.item_id,
