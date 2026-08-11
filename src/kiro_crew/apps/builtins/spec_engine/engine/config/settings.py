@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from math import isfinite
 from typing import Any
 
 
@@ -95,7 +96,16 @@ class Setting:
         if self.kind is float:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError("expected a number")
-            return self._bounded(float(value))
+            widened = float(value)
+            # Infinity and NaN survive every bound: a minimum rejects neither
+            # infinity (which exceeds it) nor NaN (whose comparisons are all
+            # false). A hand-edited Infinity would then read as a configured
+            # ceiling, and a budget ceiling that is a number no spend can reach
+            # is the absence of a ceiling wearing one's clothes. Refused here,
+            # where the operator who typed it is the one who hears about it.
+            if not isfinite(widened):
+                raise ValueError("expected a finite number")
+            return self._bounded(widened)
         if not isinstance(value, str):
             raise ValueError("expected a string")
         if self.choices and value not in self.choices:

@@ -462,6 +462,64 @@ class TestHaltAtTheCeiling:
         assert decision.outcome is DispatchOutcome.HALTED
         assert halting.halted
 
+    def test_the_unbounded_refusal_uses_a_lock_the_caller_already_holds(
+        self,
+        store: StateStore,
+        ref: SpecRef,
+        accounting: RunAccounting,
+        machine: RunMachine,
+        ledger_path: Path,
+    ) -> None:
+        # The counterpart of the halt case, and the gap that let a dropped lock
+        # survive: the refusal parks the run too, so it needs the caller's handle
+        # for the same reason. Without it the park is rejected by the dispatcher
+        # that asked for it and the run is left in the state this refusal replaces.
+        make_run(store, ref)
+        unbounded = guard(
+            store, ref, accounting, machine, ceiling=float("inf"), headless=True
+        )
+        with store.lock(ref, owner="dispatcher") as held:
+            decision = unbounded.authorize_dispatch(lock=held)
+        assert decision.outcome is DispatchOutcome.UNBOUNDED
+        parked = store.get_run(RUN)
+        assert parked is not None
+        assert parked.state == RunState.HALTED_BUDGET.value
+        assert unbounded.halted
+
+    def test_an_unattended_run_with_no_ceiling_cannot_open_a_turn(
+        self,
+        store: StateStore,
+        ref: SpecRef,
+        accounting: RunAccounting,
+        machine: RunMachine,
+    ) -> None:
+        # The backstop for a caller that never asked. Refused on the facts, so it
+        # holds even when no park has been recorded — the park is what tells an
+        # operator, not what makes the stop true.
+        make_run(store, ref)
+        unbounded = guard(
+            store, ref, accounting, machine, ceiling=float("inf"), headless=True
+        )
+        with pytest.raises(BudgetHalted):
+            unbounded.open_turn()
+        assert unbounded.in_flight == 0
+
+    def test_an_attended_run_with_no_ceiling_may_still_work(
+        self,
+        store: StateStore,
+        ref: SpecRef,
+        accounting: RunAccounting,
+        machine: RunMachine,
+    ) -> None:
+        # The refusal is about being unattended, not about the ceiling alone: a
+        # person watching their own run is the thing that replaces the ceiling.
+        make_run(store, ref)
+        attended = guard(
+            store, ref, accounting, machine, ceiling=float("inf"), headless=False
+        )
+        attended.open_turn()
+        assert attended.in_flight == 1
+
     def test_a_spec_another_writer_holds_leaves_the_park_for_the_next_check(
         self,
         store: StateStore,

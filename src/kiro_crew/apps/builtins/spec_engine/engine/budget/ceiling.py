@@ -332,7 +332,7 @@ class BudgetGuard:
         spend = self.spend()
         self._cache_cost(spend)
         if self._headless and not self._budget.bounded:
-            return self._refuse_unbounded(spend)
+            return self._refuse_unbounded(spend, lock)
         if self.halted:
             return DispatchDecision(
                 outcome=DispatchOutcome.HALTED,
@@ -351,7 +351,20 @@ class BudgetGuard:
         Refuses once the run is halted. The check in :meth:`authorize_dispatch` is
         where a well-behaved caller stops; this is what makes the stop hold for
         one that does not.
+
+        Unboundedness is refused on the facts rather than on the parked state. It
+        is knowable without reading anything -- this run is unattended and no
+        finite ceiling is in force -- whereas the halted flag only becomes true
+        after a park that persisted. Depending on the park meant any failure to
+        record it left an unattended run with nothing to stop it, which is the
+        single outcome this class exists to prevent, so the cheaper test is also
+        the correct one.
         """
+        if self._headless and not self._budget.bounded:
+            raise BudgetHalted(
+                f"run {self._run_id} may not dispatch a turn: it is unattended and no "
+                "budget ceiling is in force"
+            )
         if self.halted:
             raise BudgetHalted(
                 f"run {self._run_id} is halted for budget; no further turns may be dispatched"
@@ -431,7 +444,7 @@ class BudgetGuard:
             return False
         return True
 
-    def _refuse_unbounded(self, spend: RunSpend) -> DispatchDecision:
+    def _refuse_unbounded(self, spend: RunSpend, lock: SpecLock | None = None) -> DispatchDecision:
         message = (
             f"run {self._run_id} will not execute headless: no budget ceiling is in force, "
             "and an unattended run without a ceiling has nothing to stop it"
@@ -440,7 +453,13 @@ class BudgetGuard:
         # Parked rather than left queued: the run is real, it cannot proceed, and
         # parking it is what lets an operator who configures a ceiling resume the
         # work instead of finding a run that sat still with no state saying why.
-        self._park(message, spend, None)
+        #
+        # The caller's lock is forwarded for the same reason the halt path
+        # forwards it. Dropping it here made the park conflict with the very
+        # dispatcher that asked: the store's lock is not re-entrant, so the park
+        # was rejected by its own caller, the rejection was swallowed, and the run
+        # stayed queued -- the one state this refusal exists to replace.
+        self._park(message, spend, lock)
         if self._state.claim(NOTIFY_CLAIM_KIND, self._run_id, NOTIFY_UNBOUNDED):
             self._deliver(message, detail)
             self._record(AUDIT_EVENT_REFUSED, detail)

@@ -49,6 +49,18 @@ class TestBundledDefaults:
             # that the validated write path would reject.
             assert setting.coerce(setting.default) == setting.default, key
 
+    def test_a_non_finite_number_is_not_a_configured_value(self):
+        # A ceiling of Infinity passes every bound while meaning the opposite of
+        # a bound, and NaN passes because none of its comparisons are true. Both
+        # are refused at coercion, where the person who hand-edited the file is
+        # still the one being told.
+        numeric = [key for key, setting in SETTINGS.items() if setting.kind is float]
+        assert numeric, "expected at least one float setting to guard"
+        for key in numeric:
+            for hostile in (float("inf"), float("-inf"), float("nan")):
+                with pytest.raises(ValueError):
+                    SETTINGS[key].coerce(hostile)
+
     def test_absent_settings_resolve_to_defaults_without_a_config_file(self, store: ConfigStore):
         assert not store.path.exists()
         resolved = store.effective_settings()
