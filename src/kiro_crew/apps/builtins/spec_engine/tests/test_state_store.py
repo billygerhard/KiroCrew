@@ -296,6 +296,42 @@ class TestClaimLedger:
 
 
 class TestWorkspaceLedger:
+    def test_only_one_of_many_dispatchers_takes_the_same_queue_entry(
+        self, store: StateStore, ref: SpecRef
+    ) -> None:
+        """The queue's own stated contract, which every other queue test is too
+        sequential to observe.
+
+        Selecting and marking share one transaction precisely so two dispatchers
+        cannot both take one entry. Run in sequence the select always sees the
+        previous mark, so splitting the two apart changes nothing a sequential
+        test can see -- while under real contention it hands the same work to two
+        dispatchers. The claim ledger and the spec lock both got a contention test
+        of this shape; the queue did not.
+        """
+        store.enqueue(source="github", project=ref.project, item_id="42")
+        dispatchers = 8
+        ready = threading.Barrier(dispatchers)
+        taken: list[int] = []
+        taken_lock = threading.Lock()
+
+        def dequeue() -> None:
+            ready.wait()
+            entry = store.next_queued()
+            if entry is not None:
+                with taken_lock:
+                    taken.append(entry.seq)
+
+        threads = [threading.Thread(target=dequeue) for _ in range(dispatchers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(taken) == 1, f"the same entry went to several dispatchers: {taken}"
+
+
+class TestWorkspaceLedgerRecords:
     def test_recorded_workspaces_are_findable_by_run(self, store: StateStore) -> None:
         worktree = store.record_workspace("run-1", kind="worktree", location="/tmp/wt")
         store.record_workspace(

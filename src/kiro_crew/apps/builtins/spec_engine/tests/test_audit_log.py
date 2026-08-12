@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -81,6 +82,32 @@ class TestAppend:
 
 
 class TestAppendOnly:
+    def test_the_log_is_opened_for_appending_and_never_for_writing(
+        self, log: AuditLog, ref: SpecRef, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Append-only is a property of the write, not of the bytes it produced.
+
+        Comparing content before and after shows the earlier entries survived this
+        append, which a read-modify-rewrite would also satisfy exactly -- and would
+        destroy the whole log on a crash halfway through. What makes the guarantee
+        real is that the descriptor cannot reach earlier bytes at all, so that is
+        what this observes.
+        """
+        opened: list[int] = []
+        real_open = os.open
+
+        def record_flags(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+            opened.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", record_flags)
+        log.append(ref, "spec.created")
+
+        assert opened, "the append did not open the log through os.open"
+        for flags in opened:
+            assert flags & os.O_APPEND, "the log was opened without O_APPEND"
+            assert not flags & os.O_TRUNC, "the log was opened truncating"
+
     def test_later_appends_never_rewrite_earlier_lines(self, log: AuditLog, ref: SpecRef) -> None:
         log.append(ref, "spec.created")
         first = log.path_for(ref).read_text(encoding="utf-8")

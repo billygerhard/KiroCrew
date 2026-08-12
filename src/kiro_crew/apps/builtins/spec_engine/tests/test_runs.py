@@ -37,7 +37,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.runs import (
     TaskStatus,
     UnknownRun,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecLocked, SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    SpecLocked,
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 
 from .conftest import NATIVE_SPEC_FILES, spec_dir_snapshot
 
@@ -583,6 +588,38 @@ class TestConcurrentWriters:
         # Whichever won, the run holds that state and no later writer moved it.
         assert machine.state_of("run-1") is RunState[won[0][1].upper()]
         assert machine.state_of("run-1") in TERMINAL_STATES
+
+    def test_an_unwritable_audit_log_surfaces_but_the_state_move_still_stands(
+        self, machine: RunMachine, store: StateStore, ref: SpecRef, audit: AuditLog
+    ) -> None:
+        """The other half of the asymmetry the module documents.
+
+        A notification failure is swallowed, because losing a message costs
+        someone a message. An audit failure is allowed to surface, because a run
+        whose state moved with no record of the move is what an operator later
+        cannot reconstruct. Only the swallowing half was pinned, so suppressing
+        the audit error passed everything.
+
+        The state write is already durable when the audit is attempted, and that
+        ordering is the reason surfacing is safe: the caller sees an error, the row
+        is correct, and a retry is refused as an illegal self-transition rather
+        than doubling anything.
+        """
+        machine.create(ref, run_id="run-1")
+        # A file where the log's per-project directory belongs, so mkdir cannot
+        # succeed and the append fails for a reason unrelated to the run.
+        blocker = audit.path_for(ref).parent
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        for stale in list(blocker.iterdir()) if blocker.is_dir() else []:
+            stale.unlink()
+        if blocker.is_dir():
+            blocker.rmdir()
+        blocker.write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(StatePersistenceError):
+            machine.transition(ref, "run-1", RunState.AUTHORING)
+
+        assert machine.state_of("run-1") is RunState.AUTHORING
 
     def test_a_contended_task_status_is_applied_or_refused_never_lost(
         self, machine: RunMachine, store: StateStore, ref: SpecRef, config: ConfigStore
