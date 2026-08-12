@@ -213,13 +213,16 @@ class Worker:
             self.contexts.append(context)
             self.events.append(("start", task))
         try:
+            # Observed on arrival, before any gate: what the loop recorded before
+            # it dispatched this task is a fact about the dispatch batch, and
+            # reading it after a gate would race the first task to settle.
+            if self._during is not None:
+                self._during(task)
             if self._cap_gate is not None:
                 self._cap_gate.arrived(live)
                 self._cap_gate.hold()
             if self._barrier is not None:
                 self._barrier.wait()
-            if self._during is not None:
-                self._during(task)
         finally:
             with self._lock:
                 self._live -= 1
@@ -578,11 +581,12 @@ class TestOneLockPerBatch:
     def test_a_waves_leaves_are_marked_in_progress_under_one_acquisition(
         self, harness: Harness
     ) -> None:
-        """Read from inside the wave, where the dispatch batch is observable.
+        """Read on arrival, where the dispatch batch is observable.
 
         A wave of three with a cap of three is one dispatch batch, so by the time
-        any of its tasks is running all three are recorded and exactly one lock
-        was taken to record them.
+        any of its tasks starts all three are recorded and exactly one lock was
+        taken to record them. The barrier keeps the tasks alive until all three
+        have looked, so the count is not raced by the first task to settle.
         """
         write_tasks(harness.ref.spec_dir, [["1.1", "1.2", "1.3"]])
         set_cap(harness, 3)

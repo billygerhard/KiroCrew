@@ -585,7 +585,7 @@ class WaveRunner:
                         # is never incremented from two workers at once.
                         self._guard.open_turn()
                         running[
-                            pool.submit(self._invoke, task=task, dispatch=dispatch, context=context)
+                            pool.submit(self._worker, task=task, dispatch=dispatch, context=context)
                         ] = task
                     self._record(
                         WAVE_DISPATCHED_EVENT,
@@ -604,7 +604,7 @@ class WaveRunner:
                 for future in done:
                     task = running.pop(future)
                     self._guard.settle_turn()
-                    result = _result_of(future)
+                    result = self._result_of(future, task)
                     results[task] = result
                     settled[task] = TaskStatus.COMPLETE if result.ok else TaskStatus.FAILED
                 # Everything that finished together is written under one lock, so
@@ -632,15 +632,18 @@ class WaveRunner:
             halt,
         )
 
-    def _invoke(self, *, task: str, dispatch: Dispatch, context: RunContext) -> TaskResult:
-        """Call the worker, turning a raised failure into a recorded one.
+    def _result_of(self, future: Future[TaskResult], task: str) -> TaskResult:
+        """The worker's verdict, or the failure it raised instead of returning one.
 
-        A worker that raises is an infrastructure failure, and one leaf's
-        infrastructure failure must not take the independent leaves running
-        beside it with it.
+        A worker that raises is an infrastructure failure of one leaf, and one
+        leaf's infrastructure failure must not take the independent leaves running
+        beside it with it — nor leave the run with a dispatched task that has no
+        recorded outcome, which is what a resumed run would pay for again. This is
+        the only place a raised worker is turned into a status, so there is one
+        answer to what a raising task costs rather than two that can drift.
         """
         try:
-            return self._worker(task=task, dispatch=dispatch, context=context)
+            return future.result()
         except Exception as exc:  # a worker's failure is this task's failure
             logger.warning("task %s of run %s raised: %s", task, self._run_id, exc)
             return TaskResult(ok=False, reason=f"the task dispatch raised: {exc}")
@@ -765,14 +768,6 @@ class WaveRunner:
             initiator=ORCHESTRATOR_INITIATOR,
             detail=detail,
         )
-
-
-def _result_of(future: Future[TaskResult]) -> TaskResult:
-    """The worker's result, or the failure that reached the future instead."""
-    try:
-        return future.result()
-    except Exception as exc:  # pragma: no cover - _invoke catches the worker's own
-        return TaskResult(ok=False, reason=f"the task dispatch raised: {exc}")
 
 
 def _audit_recorder(log: AuditLog, ref: SpecRef, run_id: str) -> AuditRecorder:
