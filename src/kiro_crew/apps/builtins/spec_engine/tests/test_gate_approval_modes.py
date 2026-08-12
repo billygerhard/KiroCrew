@@ -866,6 +866,23 @@ class TestExecutionAudit:
         with pytest.raises(StatePersistenceError):
             request_execution(store, ref, decision=decision, audit=log)
 
+    def test_a_refusal_persists_the_drift_it_discovered(self, store, ref, project_tree, log):
+        """The rows a review queue reads must agree with the decision the gate took.
+
+        Derivation compares hashes live, so the refusal itself does not depend on
+        this; what depends on it is every surface that reads the approval rows
+        instead of the documents.
+        """
+        decision = decision_for("integration")
+        settle_plan(store, ref, decision=decision)
+        edit(project_tree, DocumentKind.REQUIREMENTS)
+
+        assert not request_execution(store, ref, decision=decision, audit=log).ok
+
+        stored = store.get_approval(ref, "requirements")
+        assert stored is not None and stored.stale
+        assert store.get_approval(ref, "tasks").stale is False
+
     def test_the_gate_writes_nothing_into_the_spec_directory(self, store, ref, log):
         decision = decision_for("execution")
         settle_plan(store, ref, decision=decision)
