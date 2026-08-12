@@ -186,6 +186,54 @@ class TestSpendSumsEverySession:
         assert spend.records == 4
         assert set(spend.metered_sessions) == set(spend.sessions)
 
+    def test_a_dashboard_started_runs_own_session_is_counted(
+        self, accounting: RunAccounting, ledger_path: Path, run: str
+    ) -> None:
+        """The join across the two spellings of one session, exercised end to end.
+
+        The dashboard stamps ``dashboard:chat-N-TS`` and the metering rows are
+        filed under the bare ``chat-N-TS``, so the sum only finds them because both
+        sides are normalized. Asserting the normalizer's algebra does not exercise
+        that: every other key in these tests normalizes to itself, so the join
+        matches identically with the normalization deleted.
+
+        This is the authoring session of every dashboard-started run, which is
+        usually its largest, and an unmetered stamped session is legal -- so the
+        miss reports nothing and the ceiling simply fires late or not at all.
+        """
+        slot = "chat-7-1785905004"
+        seed_shard(ledger_path, date.today(), [turn(slot, 2.5, turns=3)])
+        accounting.stamp(run, f"dashboard:{slot}")
+
+        spend = accounting.spend(run)
+
+        assert spend.metered_credits == pytest.approx(2.5)
+        assert spend.turns == 3
+
+    def test_a_turn_in_yesterdays_shard_still_counts(
+        self, store: StateStore, accounting: RunAccounting, ledger_path: Path, run: str
+    ) -> None:
+        """The reason the scan reaches one day further back than the run's date.
+
+        Shards are named for the local day and run timestamps are UTC, so a run
+        created just after UTC midnight in a western offset writes its first turns
+        into what is still yesterday locally. Without the grace those credits are
+        below the scan bound and vanish from the sum, and the ceiling then
+        authorizes spend the run has already made.
+
+        Every other test seeds shards on or after the run's own date, where the
+        grace is not load-bearing -- so dropping it changes nothing they can see.
+        """
+        started = datetime.now(timezone.utc)
+        backdate_run(store, run, started)
+        yesterday = date.fromordinal(started.date().toordinal() - 1)
+        seed_shard(ledger_path, yesterday, [turn("authoring-1", 1.25)])
+        accounting.stamp(run, "authoring-1")
+
+        spend = accounting.spend(run)
+
+        assert spend.metered_credits == pytest.approx(1.25)
+
     def test_another_runs_turns_are_not_counted(
         self,
         accounting: RunAccounting,
