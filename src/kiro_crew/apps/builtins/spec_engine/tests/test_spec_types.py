@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from kiro_crew.apps.builtins.spec_engine.engine import spec_types
 from kiro_crew.apps.builtins.spec_engine.engine.config import SPEC_TYPES
 from kiro_crew.apps.builtins.spec_engine.engine.documents import DocumentKind
 from kiro_crew.apps.builtins.spec_engine.engine.spec_types import (
@@ -231,6 +233,28 @@ class TestWritingTheSidecar:
     def test_writing_leaves_no_temporary_file_behind(self, bare_spec_dir: Path) -> None:
         write_sidecar(bare_spec_dir, "feature")
         assert [path.name for path in bare_spec_dir.iterdir()] == [SIDECAR_FILENAME]
+
+    def test_a_failed_replace_leaves_no_temporary_file_behind(
+        self, bare_spec_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cleanup is only load-bearing when the replace fails.
+
+        On the success path the replace consumes the temporary file, so the
+        cleanup is a no-op and its absence is invisible. A full or read-only
+        filesystem is when it matters, and a leftover temp file breaks the one
+        directory contract shared with the IDE: only the native documents and
+        the sidecar live here.
+        """
+
+        def failing_replace(source: Any, destination: Any) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(spec_types.os, "replace", failing_replace)
+
+        with pytest.raises(OSError):
+            write_sidecar(bare_spec_dir, "feature")
+
+        assert list(bare_spec_dir.iterdir()) == []
 
     def test_an_unreadable_sidecar_is_repaired_by_recording_a_type(
         self, bare_spec_dir: Path

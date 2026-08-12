@@ -32,6 +32,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     EVENT_PUBLISHED,
     EVENT_STAGE,
     ISOLATE_STAGE,
+    MAX_ADDRESS_CHARS,
     MAX_DEPLOYMENT_ADDRESSES,
     PUBLISH_STAGE,
     REASON_DELIVERY_FAILED,
@@ -489,6 +490,26 @@ class TestPublishOutput:
         addresses = pipeline.deliver(context(workspace)).deployment_addresses
 
         assert len(addresses) == MAX_DEPLOYMENT_ADDRESSES
+
+    def test_an_overlong_address_is_dropped_rather_than_carried(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """The bound is on length as well as count.
+
+        Publish output is a provider's stdout, so its shape is the provider's
+        choice. One absurd address would otherwise ride into the notification,
+        the queue entry, and the audit record, all of which a human reads.
+        """
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        absurd = "https://example.test/" + "p" * (MAX_ADDRESS_CHARS + 1)
+        keep = "https://example.test/real"
+        pipeline = build_pipeline(
+            store, runner=ScriptedRunner(stdout={PUBLISH_PROGRAM: f"{absurd}\n{keep}\n"})
+        )
+
+        addresses = pipeline.deliver(context(workspace)).deployment_addresses
+
+        assert addresses == (keep,)
 
     def test_output_without_an_address_reports_none(
         self, store: ConfigStore, workspace: Path
