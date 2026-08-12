@@ -39,6 +39,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     StageExecutor,
     StageOutcome,
     cap_autonomy,
+    has_value,
 )
 
 #: Every shell construct that would matter if a shell were involved, plus a
@@ -219,6 +220,24 @@ class TestSubstitutionAtTheProcessBoundary:
 
 
 class TestValuelessVariables:
+    def test_each_layer_of_blank_is_absent_holds_on_its_own(self, workspace: Path) -> None:
+        """Two layers enforce this, and either alone is a no-op end to end.
+
+        That makes the depth invisible: removing one layer passes the whole suite
+        while halving a fail-closed defence, so a later simplification takes it
+        out for free. Each layer's own contract is asserted here so the depth is
+        deliberate rather than incidental.
+        """
+        # Layer 1 -- a blank context field never becomes a variable at all.
+        values = context(workspace, item_url="").to_variables()
+        assert "item_url" not in values
+        assert values["workspace_path"]
+
+        # Layer 2 -- and a blank that reached the map anyway is still not a value.
+        assert has_value({"real": "x"}, "real") is True
+        assert has_value({"blank": "   "}, "blank") is False
+        assert has_value({}, "missing") is False
+
     def test_stage_refuses_before_any_process_starts(
         self, store: ConfigStore, workspace: Path, recorder: Path
     ) -> None:

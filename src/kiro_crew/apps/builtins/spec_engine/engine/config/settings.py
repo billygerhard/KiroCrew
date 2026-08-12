@@ -174,7 +174,11 @@ _REGISTRY: tuple[Setting, ...] = (
         kind=int,
         scopes=_APP_PROJECT,
         minimum=0,
-        summary="Fix-task rounds dispatched for failing verify stages before delivery fails.",
+        summary=(
+            "Fix-task rounds dispatched for failing verify stages before delivery fails. "
+            "Applied per verification point, so a workflow with both pre-submit gates and "
+            "a post-submit check can spend this many rounds at each."
+        ),
     ),
     # --- timeouts ----------------------------------------------------------
     Setting(

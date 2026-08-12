@@ -174,6 +174,11 @@ class DispatchRefusal(str, Enum):
     #: The spend gate refused the source: its cap is reached, or everything is
     #: stopped. Claims are untaken, so the items remain candidates.
     GATED = "gated"
+    #: Creating the run or handing it to the starter raised. Recorded against the
+    #: one item rather than allowed to escape, because the rest of the batch is
+    #: already claimed and snapshotted and would otherwise read as unchanged for
+    #: good.
+    START_FAILED = "start_failed"
 
 
 class ClassEvidence(str, Enum):
@@ -702,16 +707,40 @@ def dispatch_source(
         if not room.admits(started):
             dispositions.append(_enqueue(state, route, change, klass, room))
             continue
-        disposition = _dispatch_one(
-            state,
-            route,
-            change=change,
-            spec_type=spec_type,
-            spec_type_declared_at=declared_at,
-            klass=klass,
-            policy=policy,
-            start=start,
-        )
+        try:
+            disposition = _dispatch_one(
+                state,
+                route,
+                change=change,
+                spec_type=spec_type,
+                spec_type_declared_at=declared_at,
+                klass=klass,
+                policy=policy,
+                start=start,
+            )
+        except Exception as exc:  # a starter or a run write can fail for its own reasons
+            # Every candidate in this batch is already claimed and snapshotted, so
+            # letting one item's fault escape would leave the rest reading as
+            # unchanged on every later poll -- the same permanent loss the
+            # refuse-before-claim ordering exists to prevent, reached through a
+            # different door. Record the fault against the item it belongs to and
+            # keep going; the claims of items this loop never reaches are released
+            # below so they are offered again.
+            detail = (
+                f"dispatching item {change.identifier!r} from watch source "
+                f"{outcome.source!r} raised {type(exc).__name__}: {exc}"
+            )
+            logger.exception("%s", detail)
+            dispositions.append(
+                ItemDisposition(
+                    identifier=change.identifier,
+                    generation=change.generation,
+                    outcome=ItemOutcome.REFUSED,
+                    refusal=DispatchRefusal.START_FAILED,
+                    detail=detail,
+                )
+            )
+            continue
         dispositions.append(disposition)
         if disposition.outcome is ItemOutcome.DISPATCHED:
             started += 1

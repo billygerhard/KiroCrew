@@ -405,6 +405,36 @@ class TestVerifyRetryLoop:
         assert run.verify_attempts[0].fix == FixDispatch(dispatched=True, tasks=("fix-0",))
         assert run.verify_attempts[-1].ok
 
+    def test_each_verification_point_gets_its_own_retry_budget(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """The limit is per verification point, which doubles the worst case.
+
+        A pre-submit gate and a post-submit check gate different things -- the
+        review artifact and the publish -- so a run that spent its rounds fixing
+        analyzers still needs rounds for the CI that runs on the artifact. The
+        consequence is that the unattended worst case is two budgets, not one,
+        and nothing distinguished the two semantics: making the budget shared
+        across the delivery left every test passing.
+        """
+        configure(
+            store,
+            gate("lint", LINT_PROGRAM),
+            limits={"verify_retry_limit": 1},
+        )
+        # The gate fails then recovers, so the pre-submit point spends one round.
+        # The post-submit check then fails, and must still get a full round of its
+        # own rather than finding the budget already spent.
+        runner = ScriptedRunner(exits={LINT_PROGRAM: [1, 0], VERIFY_PROGRAM: [1, 0]})
+        dispatch = dispatcher()
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatch)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED, run.reason
+        # One round at each point, not one shared between them.
+        assert rounds_of(dispatch) == [0, 0]
+
     def test_fix_rounds_stop_at_the_configured_retry_limit(
         self, store: ConfigStore, workspace: Path
     ) -> None:
@@ -1106,6 +1136,30 @@ class TestGateVariables:
         assert refused.result.outcome is StageOutcome.REFUSED
         assert refused.result.missing_variables == ("item_url",)
         assert refused.exit_status is None
+
+    def test_a_refused_gate_asks_for_no_fixes_at_all(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """A refusal is about the configuration, so no fix task can change it.
+
+        Nothing ran, so the refusal says nothing about the code and the same
+        configuration refuses identically on every remaining round. Spending the
+        retry budget on model-backed fix dispatches would burn real credits on an
+        unattended path to rediscover a config error the first round already
+        named.
+        """
+        configure(store, gate("lint", LINT_PROGRAM, arguments=["--item", "{item_url}"]))
+        runner = ScriptedRunner()
+        dispatch = dispatcher()
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatch)
+
+        run = pipeline.deliver(context(workspace, item_url=""))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert runner.calls == []
+        rounds = run.gate("lint")
+        assert len(rounds) == 1, "a refusal must not be retried"
+        assert dispatch.rounds == []
 
 
 class TestGateRecording:

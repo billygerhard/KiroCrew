@@ -121,6 +121,54 @@ class Starter:
         return [seed.item.identifier for seed in self.seeds]
 
 
+class RaisingStarter(Starter):
+    """Fails on one identifier, records the rest, so a batch can be observed."""
+
+    def __init__(self, fails_on: str) -> None:
+        super().__init__()
+        self._fails_on = fails_on
+
+    def __call__(self, seed: RunSeed) -> None:
+        if seed.item.identifier == self._fails_on:
+            raise RuntimeError("the session could not be started")
+        super().__call__(seed)
+
+
+class TestAFaultMidBatch:
+    def test_one_items_fault_does_not_strand_the_rest_of_the_batch(self, tmp_path: Path) -> None:
+        """Every candidate is claimed and snapshotted before the loop runs.
+
+        So a fault escaping the loop would leave the unreached items reading as
+        unchanged on every later poll, and they would never be offered again --
+        the same permanent loss the refuse-before-claim ordering exists to
+        prevent, arriving through a different door. The fault belongs to the one
+        item that caused it.
+        """
+        store, config, _tree = _build(tmp_path)
+        identifiers = ["1", "2", "3", "4", "5"]
+
+        report = dispatch_source(
+            store,
+            config,
+            polled(*[item(number) for number in identifiers]),
+            gate=AllowAll(),
+            start=RaisingStarter("2"),
+        )
+
+        started = [d.identifier for d in report.dispatched]
+        refused = {d.identifier: d for d in report.refused}
+        queued = [d.identifier for d in report.queued]
+
+        # The fault belongs to item 2 alone, and it did not take the batch with it.
+        assert set(refused) == {"2"}
+        assert refused["2"].refusal is DispatchRefusal.START_FAILED
+        assert "could not be started" in refused["2"].detail
+        assert started, "the batch continued past the fault"
+        assert "2" not in started
+        # Every candidate is accounted for, so none is silently lost.
+        assert len(started) + len(queued) + len(refused) == len(identifiers)
+
+
 @pytest.fixture()
 def starter() -> Starter:
     return Starter()

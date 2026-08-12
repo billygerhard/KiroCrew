@@ -958,6 +958,31 @@ class DeliveryPipeline:
                     )
                 )
                 return tuple(rounds)
+            refused = [
+                failure
+                for failure in current.blocking_failures
+                if failure.outcome is StageOutcome.REFUSED
+            ]
+            if len(refused) == len(current.blocking_failures):
+                # A refusal happened before anything ran, so it says nothing about
+                # the code and no fix task can change it: the same configuration
+                # would refuse identically on every remaining round. Asking for
+                # fixes anyway spends real credits on an unattended path to
+                # rediscover a config error, which is the same reasoning that
+                # already stops this loop when a dispatcher creates nothing.
+                rounds.append(
+                    replace(
+                        current,
+                        fix=FixDispatch(
+                            dispatched=False,
+                            reason=(
+                                "the blocking check refused before executing, so the "
+                                f"configuration it names must change: {refused[0].reason}"
+                            ),
+                        ),
+                    )
+                )
+                return tuple(rounds)
             dispatch = self._dispatch_fixes(attempt=attempt, stage=current.blocking_failures[0])
             rounds.append(replace(current, fix=dispatch))
             if not dispatch.dispatched:
