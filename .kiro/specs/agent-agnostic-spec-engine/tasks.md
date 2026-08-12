@@ -159,6 +159,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 9.2, 15.1, 15.2, 15.3, 15.5, 15.6_
   - [ ] 9.3 Review verdicts and retry policy
     - Successful implementations get a review verdict on the review role's model; no completion without approval; any unsuccessful completion (implementation, review rejection, infrastructure) retries to the limit then fails without abandoning independent tasks
+    - Call the two seams task 7.4 built and could not reach from its own files. `WaveRunner.finish` is where a run becomes terminal, so it is where the workspace janitor's `retire_run` belongs — without it every completed run leaves its checkout on disk for good. And `DeliveryRun.deployment_addresses` is produced but `record_deployment` is never called, so the ledger has no row for a live environment the engine created. Both are one call each; both are inert today
+    - Give the delivery pipeline a notifier, which is NOT the one-argument wiring it looks like: the engine has two `Notifier` protocols and they are not interchangeable. The budget one takes `notify(channel=..., message=..., detail=...)`, while the delivery one takes `send(...)` and deliberately holds no channel because configuration resolves the destination inside the notifier. Passing the orchestrator's budget notifier to the pipeline is a type error. Converge the two protocols on the delivery shape, or resolve a delivery notifier separately in the factory — until then an autonomous delivery records that it had no notifier and tells nobody its outcome
     - _Requirements: 9.3, 9.4_
 
   - [ ] 9.4 Test quality criteria in the review gate
