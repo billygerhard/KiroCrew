@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterator, Mapping
 
 from . import phases
+from .delivery.teardown import TeardownReport, WorkspaceJanitor
 from .runs import (
     TERMINAL_STATES,
     RunMachine,
@@ -233,6 +234,10 @@ class ArchiveResult:
     item_id: str | None = None
     #: Runs cancelled as part of the archival, when the triggering item was.
     cancelled_runs: tuple[str, ...] = ()
+    #: What teardown did with each run's ledger-recorded workspaces. Carried on
+    #: the result rather than only logged: a surface that offers archival is the
+    #: surface that has to say a deployment was left standing.
+    teardown: tuple[TeardownReport, ...] = ()
 
     @property
     def ref(self) -> SpecRef:
@@ -248,6 +253,7 @@ class ArchiveResult:
             "actor": self.actor,
             "item_id": self.item_id,
             "cancelled_runs": list(self.cancelled_runs),
+            "teardown": [report.to_json_object() for report in self.teardown],
         }
 
 
@@ -280,9 +286,18 @@ class ReviewQueue:
     its own idea of what a legal move is.
     """
 
-    def __init__(self, machine: RunMachine) -> None:
+    def __init__(self, machine: RunMachine, *, janitor: WorkspaceJanitor | None = None) -> None:
         self._machine = machine
         self._store = machine.store
+        # A janitor is always present. Archiving is the moment the ledger's
+        # disposable rows are supposed to close out, and a cleanup that only
+        # happens when a driver remembered to pass something is a cleanup that
+        # does not happen: every surface would have to opt in, and the one that
+        # forgot would leak a worktree per archived spec with nothing saying so.
+        # The default carries no disposable root and no teardown-command runner,
+        # so it removes what git owns and *reports* the rest rather than deleting
+        # a path on a guess.
+        self._janitor = janitor if janitor is not None else WorkspaceJanitor(machine.store)
 
     # ------------------------------------------------------------------ queue
 
@@ -379,6 +394,13 @@ class ReviewQueue:
                 actor=actor,
                 item_id=item_id,
             )
+        # After the archival write, never interleaved with it: teardown spawns
+        # the workflow's own commands and removes directories, so it takes as
+        # long as those commands take. Running it once the spec is already
+        # archived means nothing is going to start work in the trees being
+        # removed, and a slow command cannot delay the state change a person is
+        # waiting on.
+        teardown = self._teardown_runs(ref)
         self._machine.append_audit(
             ref,
             SPEC_ARCHIVED_EVENT,
@@ -387,9 +409,34 @@ class ReviewQueue:
                 "cause": resolved.value,
                 "item_id": item_id,
                 "changed": result.changed,
+                "teardown": [report.to_json_object() for report in teardown],
             },
         )
-        return result
+        return replace(result, teardown=teardown)
+
+    def _teardown_runs(self, ref: SpecRef) -> tuple[TeardownReport, ...]:
+        """Tear down every run of *ref*, one run at a time.
+
+        Per run identifier rather than per spec, because that is the key the
+        ledger is written with: a query keyed on anything broader would reach the
+        workspace of a run belonging to another spec, and the run whose tree got
+        removed underneath it would fail in the middle of work it had already
+        reported as progressing.
+
+        Terminal runs are included. Their disposable materializations are exactly
+        what is left to remove, and a run that already finished is the common
+        case at archive.
+
+        A teardown that cannot finish does not stop the archival. Archiving is a
+        person's decision about a spec, and refusing to honour it because a
+        deployment command exited non-zero would leave the spec live and the
+        person without a way to put it down; the report and the audit entry carry
+        what was kept, and the manual cleanup action is how it is retried.
+        """
+        reports: list[TeardownReport] = []
+        for record in self._store.list_runs(ref=ref):
+            reports.append(self._janitor.archive_run(record.run_id))
+        return tuple(reports)
 
     def _resolved_cause(
         self,
@@ -494,6 +541,7 @@ class ReviewQueue:
             actor=result.actor,
             item_id=result.item_id,
             cancelled_runs=cancelled,
+            teardown=result.teardown,
         )
 
     def _cancel_runs_for_item(
@@ -537,9 +585,7 @@ class ReviewQueue:
             # this block unlocked. The archival cascade's atomicity is exactly
             # what that would void.
             if lock.ref != ref:
-                raise StatePersistenceError(
-                    f"lock is held for {lock.ref.key}, not {ref.key}"
-                )
+                raise StatePersistenceError(f"lock is held for {lock.ref.key}, not {ref.key}")
             self._store.verify_lock(lock)
             yield lock
             return

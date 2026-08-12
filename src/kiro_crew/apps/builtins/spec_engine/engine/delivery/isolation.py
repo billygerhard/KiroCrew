@@ -55,6 +55,19 @@ logger = logging.getLogger(__name__)
 #: checkout from a deployment recorded against the same run.
 WORKTREE_KIND = "worktree"
 
+#: Ledger ``kind`` for a working copy the engine materialized outside git — a
+#: workflow that copies the tree rather than adding a worktree. Removed by
+#: deleting the directory, so it is tracked apart from a checkout git owns.
+TEMP_COPY_KIND = "temp_copy"
+
+#: Ledger ``kind`` for somewhere a run's publish stage put the change. Not a
+#: materialization the engine can delete: it is removed by the workflow's own
+#: teardown commands at archive, which is why it is recorded as non-disposable.
+DEPLOYMENT_KIND = "deployment"
+
+#: The kinds the engine may remove itself, in the ledger's own vocabulary.
+DISPOSABLE_KINDS: frozenset[str] = frozenset({WORKTREE_KIND, TEMP_COPY_KIND})
+
 #: Run context variable naming the workspace the isolate stage must create.
 ISOLATED_PATH_VARIABLE = "isolated_path"
 
@@ -238,6 +251,40 @@ class WorkspaceBroker:
             disposable=True,
         )
         return WorkspaceClaim(granted=True, plan=plan, workspace_id=record.workspace_id)
+
+    def record_deployment(
+        self,
+        run_id: str,
+        *,
+        address: str,
+        location: str | Path = "",
+    ) -> WorkspaceRecord:
+        """Record somewhere a run's publish stage put the change.
+
+        The ledger holds deployments beside working trees because both are things
+        one run created that outlive the command that created them, and archive
+        has to find every one of them from the run identifier alone. They are not
+        the same to *remove*, though: a checkout is a directory the engine can
+        delete, while a deployed environment is removed by the workflow's own
+        teardown commands. So a deployment is recorded as non-disposable, which
+        is what keeps the terminal-state sweep from treating an address as a path
+        and trying to delete it.
+        """
+        run = run_id.strip()
+        if not run:
+            raise ValueError("recording a deployment needs a run identifier")
+        target = address.strip()
+        if not target:
+            raise ValueError("recording a deployment needs the address it was published to")
+        return self._ledger.record_workspace(
+            run,
+            kind=DEPLOYMENT_KIND,
+            # An address with no separate location is its own location: a
+            # deployment is identified by where it is reachable.
+            location=str(location) or target,
+            address=target,
+            disposable=False,
+        )
 
     def release(self, claim: WorkspaceClaim) -> bool:
         """Drop a claim whose workspace was never created.
