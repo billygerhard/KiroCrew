@@ -553,8 +553,30 @@ class TestHonesty:
             glossary=["Spec_Engine"],
         )
         outcome = analyze(Corpus(requirements=text, tasks=_tasks(["1.1"])))
+        skipped = {item.item for item in outcome.coverage.skipped}
         for kind in analyzer.ALL_KINDS:
-            assert f"{analyzer.CHECK_PREFIX}{kind}" in outcome.coverage.processed
+            entry = f"{analyzer.CHECK_PREFIX}{kind}"
+            assert entry in outcome.coverage.processed
+            # Listed as both ran and did-not-run is as uninformative as absent
+            # from both, and only the absent case is covered elsewhere.
+            assert entry not in skipped
+
+    def test_a_dirty_pass_declares_its_blind_spots_too(self) -> None:
+        """Findings are not a substitute for declaring what was not examined.
+
+        A pass that reports defects and no blind spots reads as an exhaustive
+        list, so the reader takes the absence of any other finding as evidence.
+        That is the same wrong conclusion the clean-pass case guards against,
+        reached from the other direction.
+        """
+        text = _requirements(["THE Undefined_Thing SHALL be fast."])
+        outcome = analyze(Corpus(requirements=text, tasks=_tasks(["1.1"])))
+
+        assert outcome.findings, "the corpus is meant to trip checks"
+        declared = {item.item for item in outcome.coverage.skipped}
+        for item, _reason in analyzer.STRUCTURAL_BLIND_SPOTS:
+            assert f"{analyzer.BLIND_SPOT_PREFIX}{item}" in declared
+        assert not outcome.coverage.complete
 
     def test_every_check_is_either_processed_or_skipped_never_neither(self) -> None:
         # Silence from a check that ran is evidence; silence from one that did

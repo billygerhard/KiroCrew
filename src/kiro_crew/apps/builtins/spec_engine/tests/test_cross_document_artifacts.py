@@ -419,18 +419,30 @@ def test_a_cycle_in_the_declared_dependencies_is_always_found(leaf_count, pair):
     numbers = _leaf_numbers(leaf_count)
     waves = _chunks(numbers, 2)
     assume(len(waves) > 1)
-    first = pair.draw(st.sampled_from(numbers))
-    second = pair.draw(st.sampled_from([n for n in numbers if n != first]))
+    # A loop of any length the graph can hold, not only a mutual pair: a
+    # detector that scans for self-loops and reciprocal edges satisfies a
+    # generator that only ever builds two-node loops, and "any closed loop" is
+    # the claim being made.
+    loop = pair.draw(
+        st.lists(
+            st.sampled_from(numbers),
+            min_size=2,
+            max_size=len(numbers),
+            unique=True,
+        )
+    )
+    dependencies = {node: [loop[(index + 1) % len(loop)]] for index, node in enumerate(loop)}
 
     tasks = _tasks_document(
         [(False, ["1.1"])] * leaf_count,
         waves=waves,
-        dependencies={first: [second], second: [first]},
+        dependencies=dependencies,
     )
     found = check_dependency_graph(parse_tasks(tasks), tasks_file="tasks.md")
     cycles = [v for v in found if v.rule == rules.GRAPH_CYCLE]
     assert len(cycles) == 1
-    assert first in cycles[0].message and second in cycles[0].message
+    for node in loop:
+        assert node in cycles[0].message
 
 
 # --- Totality --------------------------------------------------------------
