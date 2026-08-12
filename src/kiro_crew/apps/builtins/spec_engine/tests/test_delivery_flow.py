@@ -591,6 +591,36 @@ class TestIntegrationInTheFlow:
         assert run.outcome is DeliveryOutcome.PASSED
         assert not decision.target_protected
 
+    def test_a_protected_target_is_recorded_as_protected(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """The direction nothing asserted, on the stage the module calls irreversible.
+
+        Protection gates nothing on its own -- a blank target is refused by its own
+        check -- so the classification exists to be *recorded*: it is what says
+        afterwards whether the branch a change landed on was one other people build
+        on. Only the negative direction was ever asserted, and a constant False
+        satisfies that, so every protected merge could be recorded as unprotected
+        with the whole set resolution reduced to a boolean nobody read.
+        """
+        store.write(workflow_document(auto_integrate=True), surface=DASHBOARD_SURFACE)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store,
+            level=AutonomyLevel.INTEGRATION,
+            audit=lambda event, detail: recorded.append((event, detail)),
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.integration is not None
+        # The run's base branch is the protected set's fallback, so this target is
+        # exactly the case that fallback exists for.
+        assert run.integration.target_protected is True
+        details = [detail for event, detail in recorded if event == EVENT_INTEGRATION]
+        assert details, "the integration decision was never audited"
+        assert details[-1]["target_protected"] is True
+
 
 class TestRefusedDelivery:
     def test_a_run_without_delivery_authority_runs_no_stage(
