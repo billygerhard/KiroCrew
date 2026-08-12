@@ -7,6 +7,25 @@ number of fix rounds rather than either an immediate failure or an endless loop.
 A quality gate adds a second axis to the same question: which side of submit it
 runs on, and what its failure costs.
 
+Two further families of claim live here because they are properties of the same
+one entry point:
+
+* **An explicit human request runs the same pipeline.** "Identical stages,
+  variables, and rules" is not something a test can assume, so it is compared:
+  the same workflow is driven through both entry points and what executed is set
+  side by side — the argv lists with their substituted values, the stage results,
+  the gate set with its severities and positions. An interactive delivery that
+  quietly skipped a gate or resolved one variable differently would satisfy any
+  test that only asserted the interactive path succeeded. What a requester may
+  not be is also tested: an identity out of the engine's reserved namespace, in
+  either spelling the engine itself emits.
+* **Completion and failure both notify.** A notifier that only fired on success
+  passes a success-only test, so the failing direction is asserted too, and both
+  are asserted to carry every executed stage's outcome. Routing goes through the
+  real notifier against a fake host bus, because the claim is that configuration
+  decides the destination — a caller's channel is a request — and a fake notifier
+  would only prove this module calls something.
+
 Commands are answered by a scripted runner instead of real processes. What
 happens at the process boundary — a hostile value arriving as one inert
 argument — is the stage executor's claim and is tested against real spawns
@@ -42,13 +61,16 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     EVENT_GATE,
     EVENT_GATES,
     EVENT_INTEGRATION,
+    EVENT_OUTCOME,
     EVENT_PUBLISHED,
+    EVENT_REQUESTED,
     EVENT_STAGE,
     ISOLATE_STAGE,
     MAX_ADDRESS_CHARS,
     MAX_DEPLOYMENT_ADDRESSES,
     MAX_GATE_OUTPUT_CHARS,
     NO_GATES_REASON,
+    NO_NOTIFIER_REASON,
     PUBLISH_STAGE,
     QUALITY_GATE_PRESETS,
     REASON_DELIVERY_FAILED,
@@ -57,6 +79,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     REASON_VERIFY,
     SUBMIT_STAGE,
     TRUNCATION_NOTICE,
+    UNNAMED_REQUESTER_REASON,
     VERIFY_STAGE,
     CommandOutcome,
     DeliveryOutcome,
@@ -70,6 +93,21 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     load_quality_gates,
     resolve_authority,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.notify import (
+    DASHBOARD_CHANNEL,
+    REASON_MISMATCH,
+    REASON_UNDECLARED,
+    REVIEW_CHANNEL,
+    HostNotifier,
+    bus_channel,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.phases import (
+    INITIATOR_POLICY,
+    INITIATOR_USER,
+    POLICY_ACTOR_SCHEME,
+    policy_actor,
+)
+from kiro_crew.notifications.bus import NotificationPayload, NotificationValidationError
 
 PROJECT = "acme"
 SOURCE = "tracker"
@@ -219,6 +257,37 @@ def decision_at(level: AutonomyLevel) -> AutonomyDecision:
     )
 
 
+class FakeBus:
+    """The host notification bus, reduced to what routing pushes into it.
+
+    Real routing runs against this rather than a fake notifier: the claim being
+    tested is that configuration picks the channel, which a fake notifier would
+    answer by construction.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.pushed: list[NotificationPayload] = []
+        self.registered: dict[str, str] = {}
+        self._fail = fail
+
+    def is_registered(self, channel: str) -> bool:
+        return channel in self.registered
+
+    def register_channel(self, channel: str, default_priority: str = "default") -> None:
+        self.registered[channel] = default_priority
+
+    def push(self, payload: NotificationPayload) -> dict[str, Any]:
+        if self._fail:
+            raise NotificationValidationError("bus said no")
+        self.pushed.append(payload)
+        return {"channel": payload.channel}
+
+    @property
+    def only(self) -> NotificationPayload:
+        assert len(self.pushed) == 1, f"expected one notice, got {len(self.pushed)}"
+        return self.pushed[0]
+
+
 def build_pipeline(
     store: ConfigStore,
     *,
@@ -226,6 +295,8 @@ def build_pipeline(
     runner: ScriptedRunner | None = None,
     fix_dispatcher: Any = None,
     audit: Any = None,
+    bus: FakeBus | None = None,
+    channel: str = "",
 ) -> DeliveryPipeline:
     authority = resolve_authority(
         store, decision=decision_at(level), project=PROJECT, base_branch=BASE
@@ -237,7 +308,16 @@ def build_pipeline(
         runner=runner or ScriptedRunner(),
         fix_dispatcher=fix_dispatcher,
         audit=audit,
+        notifier=(
+            HostNotifier(store, project=PROJECT, bus=bus, limiter=None) if bus is not None else None
+        ),
+        channel=channel,
     )
+
+
+def executed(run: DeliveryRun) -> list[tuple[str, str]]:
+    """Every stage that actually spawned a command, with how it ended."""
+    return [(result.stage, result.outcome.value) for result in run.executed_stages()]
 
 
 def dispatcher(dispatched: bool = True) -> Any:
@@ -778,7 +858,9 @@ class TestAuditRecording:
         events = [event for event, _ in recorded]
         assert events.count(EVENT_STAGE) == 3
         assert EVENT_PUBLISHED in events
-        assert events[-1] == EVENT_INTEGRATION
+        # The integration decision comes after everything the flow did, and the
+        # outcome record closes the delivery behind it.
+        assert events[-2:] == [EVENT_INTEGRATION, EVENT_OUTCOME]
         published = next(detail for event, detail in recorded if event == EVENT_PUBLISHED)
         assert published["addresses"] == ["https://example.test/a"]
 
@@ -1351,3 +1433,668 @@ class TestGateConfiguration:
 
     def test_a_document_with_no_gate_section_reads_as_none(self) -> None:
         assert load_quality_gates({}) == ()
+
+
+class TestInteractiveDeliveryRunsTheSamePipeline:
+    """Identical is compared, not assumed.
+
+    Every test here drives one configuration through both entry points and sets
+    what executed side by side. A test that only asserted the interactive path
+    reached ``PASSED`` would be satisfied by an interactive path that skipped
+    every gate, substituted a different base branch, or ran publish before verify.
+    """
+
+    def workflow_with_a_custom_variable(self) -> dict[str, Any]:
+        """A workflow whose commands reference the whole variable surface.
+
+        The custom project variable is the part that matters: a second resolution
+        path that assembled only the run context would still render every stage,
+        and only a command that names a project's own variable would notice.
+        """
+        return {
+            ISOLATE_STAGE: [[ISOLATE_PROGRAM, "{branch_name}", "--from", "{base_branch}"]],
+            SUBMIT_STAGE: [[SUBMIT_PROGRAM, "--title", "{review_title}", "--env", "{deploy_env}"]],
+            VERIFY_STAGE: [[VERIFY_PROGRAM, "--base", "{base_branch}"]],
+            PUBLISH_STAGE: [[PUBLISH_PROGRAM, "--branch", "development", "--to", "{deploy_env}"]],
+        }
+
+    def configured(self, store: ConfigStore) -> None:
+        document = workflow_document(stages=self.workflow_with_a_custom_variable())
+        document["projects"][PROJECT]["variables"] = {"deploy_env": "staging"}
+        document[SECTION_QUALITY_GATES] = [
+            gate("lint", LINT_PROGRAM, arguments=("--base", "{base_branch}")),
+            gate("coverage", COVERAGE_PROGRAM, severity=GATE_SEVERITY_ADVISORY),
+            gate("ci", CI_PROGRAM, position=GATE_POSITION_POST_SUBMIT),
+        ]
+        store.write(document, surface=DASHBOARD_SURFACE)
+
+    def both_ways(
+        self,
+        store: ConfigStore,
+        workspace: Path,
+        *,
+        exits: Mapping[str, Sequence[int]] | None = None,
+    ) -> tuple[tuple[DeliveryRun, ScriptedRunner], tuple[DeliveryRun, ScriptedRunner]]:
+        """Deliver the same run autonomously and interactively.
+
+        The autonomous pipeline is authorized at the delivery rung; the
+        interactive one is capped at execution, which is where a default install
+        sits. So the comparison is between a policy-driven delivery and a human
+        asking for one on a run the policy would never have delivered.
+
+        Neither is isolated here, because isolation is not one of the pipeline's
+        flow stages: it is the run's earlier decision, taken before any request
+        exists, and the test below records that boundary rather than hiding it
+        inside this comparison.
+        """
+        autonomous_runner = ScriptedRunner(exits=exits)
+        autonomous_run = build_pipeline(
+            store, level=AutonomyLevel.DELIVERY, runner=autonomous_runner
+        ).deliver(context(workspace))
+
+        interactive_runner = ScriptedRunner(exits=exits)
+        interactive_run = build_pipeline(
+            store, level=AutonomyLevel.EXECUTION, runner=interactive_runner
+        ).deliver(context(workspace), requester="dana")
+
+        return (autonomous_run, autonomous_runner), (interactive_run, interactive_runner)
+
+    def test_the_same_commands_run_with_the_same_substituted_values(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        self.configured(store)
+
+        (_, autonomous), (_, interactive) = self.both_ways(store, workspace)
+
+        # Whole argv lists, in order: the programs, the literal arguments, and
+        # every substituted value. Comparing only the program names would pass
+        # against a path that resolved the base branch or a project variable
+        # differently.
+        assert interactive.calls == autonomous.calls
+        assert "staging" in [argument for argv in interactive.calls for argument in argv]
+
+    def test_the_same_stages_run_and_end_the_same_way(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        self.configured(store)
+
+        (autonomous, _), (interactive, _) = self.both_ways(store, workspace)
+
+        assert executed(interactive) == executed(autonomous)
+        assert executed(interactive) == [
+            (SUBMIT_STAGE, StageOutcome.PASSED.value),
+            (VERIFY_STAGE, StageOutcome.PASSED.value),
+            (PUBLISH_STAGE, StageOutcome.PASSED.value),
+        ]
+
+    def test_isolation_stays_the_runs_earlier_decision_rather_than_the_requests(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """The one thing a request does not retroactively change.
+
+        Isolation happens before the first task is implemented, hours before
+        anybody asks for a delivery, and the autonomy ladder decides it then. A
+        run capped at execution therefore worked in the project's own tree — the
+        IDE's behaviour — and a delivery requested later runs from that tree. The
+        difference is asserted here rather than left for the comparison above to
+        paper over, because "identical" is a claim about the delivery pipeline's
+        stages and this stage is not one of them.
+        """
+        self.configured(store)
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, runner=runner)
+
+        isolation = pipeline.isolate(context(workspace), run_id="run-human")
+        run = pipeline.deliver(context(workspace), requester="dana")
+
+        assert isolation.outcome is StageOutcome.SKIPPED
+        assert "not authorized for delivery" in isolation.reason
+        assert runner.ran(ISOLATE_PROGRAM) == 0
+        # Every flow stage still ran, in the project tree the run has been using.
+        assert executed(run) == [
+            (SUBMIT_STAGE, StageOutcome.PASSED.value),
+            (VERIFY_STAGE, StageOutcome.PASSED.value),
+            (PUBLISH_STAGE, StageOutcome.PASSED.value),
+        ]
+
+    def test_the_same_gates_run_at_the_same_positions_with_the_same_severities(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        self.configured(store)
+
+        (autonomous, _), (interactive, _) = self.both_ways(store, workspace)
+
+        signature = [
+            (run.gate, run.severity, run.position, run.result.outcome.value)
+            for run in interactive.gate_runs()
+        ]
+        assert signature == [
+            (run.gate, run.severity, run.position, run.result.outcome.value)
+            for run in autonomous.gate_runs()
+        ]
+        assert interactive.declared_gates == autonomous.declared_gates == ("lint", "coverage", "ci")
+        assert [entry[:3] for entry in signature] == [
+            ("lint", GATE_SEVERITY_BLOCKING, GATE_POSITION_PRE_SUBMIT),
+            ("coverage", GATE_SEVERITY_ADVISORY, GATE_POSITION_PRE_SUBMIT),
+            ("ci", GATE_SEVERITY_BLOCKING, GATE_POSITION_POST_SUBMIT),
+        ]
+
+    def test_a_blocking_gate_stops_a_human_request_exactly_as_it_stops_the_policy(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The direction that matters. A human asked for this delivery, and the
+        # gate still refuses to raise the review artifact: an interactive path
+        # that trusted the person watching would pass every test above.
+        self.configured(store)
+
+        (autonomous, autonomous_runner), (interactive, interactive_runner) = self.both_ways(
+            store, workspace, exits={LINT_PROGRAM: [1]}
+        )
+
+        assert interactive.outcome is autonomous.outcome is DeliveryOutcome.FAILED
+        assert interactive_runner.ran(SUBMIT_PROGRAM) == 0
+        assert interactive_runner.calls == autonomous_runner.calls
+        assert interactive.not_reached == autonomous.not_reached == DELIVERY_FLOW_STAGES
+
+    def test_the_verify_retry_ceiling_is_the_same_for_a_human_request(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # A retry limit that a human request could exceed would be an unbounded
+        # spend authorized by a click.
+        self.configured(store)
+        store.write({"limits": {"verify_retry_limit": 1}}, surface=DASHBOARD_SURFACE)
+        autonomous_dispatch = dispatcher()
+        interactive_dispatch = dispatcher()
+        autonomous = build_pipeline(
+            store,
+            level=AutonomyLevel.DELIVERY,
+            runner=ScriptedRunner(exits={CI_PROGRAM: [1]}),
+            fix_dispatcher=autonomous_dispatch,
+        ).deliver(context(workspace))
+        interactive = build_pipeline(
+            store,
+            level=AutonomyLevel.EXECUTION,
+            runner=ScriptedRunner(exits={CI_PROGRAM: [1]}),
+            fix_dispatcher=interactive_dispatch,
+        ).deliver(context(workspace), requester="dana")
+
+        assert rounds_of(interactive_dispatch) == rounds_of(autonomous_dispatch) == [0]
+        assert interactive.outcome is autonomous.outcome is DeliveryOutcome.FAILED
+
+    def test_a_valueless_variable_refuses_a_human_request_before_anything_runs(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The substitution rule is not relaxed for somebody who asked: an empty
+        # value would make a push a different command with the same exit code.
+        store.write(
+            workflow_document(stages={SUBMIT_STAGE: [[SUBMIT_PROGRAM, "--item", "{item_url}"]]}),
+            surface=DASHBOARD_SURFACE,
+        )
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, runner=runner)
+
+        run = pipeline.deliver(context(workspace), requester="dana")
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert runner.calls == []
+        submit = run.stage(SUBMIT_STAGE)
+        assert submit is not None and submit.missing_variables == ("item_url",)
+
+    def test_a_human_request_does_not_arm_unattended_integration(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # Starting a delivery is not consent to a merge. The posture switch is a
+        # property of the destination, and nobody flipped it here.
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION)
+
+        run = pipeline.deliver(context(workspace), requester="dana")
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert run.integration is not None
+        assert not run.integration.permitted
+        assert REASON_POSTURE in run.integration.reasons
+
+    def test_a_project_with_no_delivery_workflow_has_nothing_for_a_request_to_start(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The zero-configuration floor is not about who asked: with no configured
+        # stages there is nothing to isolate, submit, or verify, and a pipeline of
+        # skips reporting PASSED would claim work nobody did.
+        store.write({"projects": {PROJECT: {"path": "/tmp/acme"}}}, surface=DASHBOARD_SURFACE)
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, runner=runner)
+
+        run = pipeline.deliver(context(workspace), requester="dana")
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+        assert "no configured delivery workflow" in run.reason
+        assert runner.calls == []
+
+    def test_the_requester_is_recorded_as_the_initiator(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store,
+            level=AutonomyLevel.EXECUTION,
+            audit=lambda event, detail: recorded.append((event, detail)),
+        )
+
+        run = pipeline.deliver(context(workspace), requester="dana")
+
+        assert run.initiator == "dana"
+        assert run.initiator_kind == INITIATOR_USER
+        assert run.interactive
+        request = next(detail for event, detail in recorded if event == EVENT_REQUESTED)
+        assert request == {
+            "initiator_kind": INITIATOR_USER,
+            "accepted": True,
+            "autonomy_level": AutonomyLevel.EXECUTION.value,
+            "policy_declared_at": f"sources.{SOURCE}.{AUTONOMY_FIELD}.maintainer.feature",
+            "requester": "dana",
+        }
+
+    def test_an_autonomous_delivery_is_credited_to_the_policy(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        pipeline = build_pipeline(store, level=AutonomyLevel.DELIVERY)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.initiator == ""
+        assert run.initiator_kind == INITIATOR_POLICY
+        assert not run.interactive
+
+
+class TestARequesterTheEngineCouldHaveMinted:
+    """A caller-supplied identity out of the reserved namespace is not a person.
+
+    Both spellings are tested because the engine emits both: the approver form
+    when the policy approves a gate, and a parenthesised form on a refusal,
+    written that way so it cannot be read as an approval. A guard keyed to the
+    approver spelling alone hands a refusal's own initiator back as a human
+    action — which is the hole this closes rather than a hypothetical one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _workflow(self, store: ConfigStore) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+
+    def approver_spelling(self) -> str:
+        return policy_actor(decision_at(AutonomyLevel.DELIVERY))
+
+    def refusal_spelling(self) -> str:
+        declared = f"sources.{SOURCE}.{AUTONOMY_FIELD}.maintainer.feature"
+        return f"{POLICY_ACTOR_SCHEME}({declared})"
+
+    @pytest.mark.parametrize("spelling", ["approver_spelling", "refusal_spelling"])
+    def test_a_reserved_identity_cannot_start_a_human_reserved_delivery(
+        self, store: ConfigStore, workspace: Path, spelling: str
+    ) -> None:
+        requester = getattr(self, spelling)()
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, runner=runner)
+
+        run = pipeline.deliver(context(workspace), requester=requester)
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+        assert "reserved identity" in run.reason
+        assert runner.calls == []
+        assert run.not_reached == DELIVERY_FLOW_STAGES
+
+    def test_the_bare_scheme_is_refused_too(self, store: ConfigStore, workspace: Path) -> None:
+        # Not a spelling the engine emits, but it is inside the namespace, and a
+        # guard that admitted it would be keyed to punctuation rather than to the
+        # namespace it exists to reserve.
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION)
+
+        run = pipeline.deliver(context(workspace), requester=POLICY_ACTOR_SCHEME)
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+
+    def test_a_refused_identity_is_not_recorded_as_an_initiator(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # A trail scan for what started a delivery must not turn up a request
+        # that started nothing, while the forged claim stays visible.
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store,
+            level=AutonomyLevel.EXECUTION,
+            audit=lambda event, detail: recorded.append((event, detail)),
+        )
+        claimed = self.refusal_spelling()
+
+        run = pipeline.deliver(context(workspace), requester=claimed)
+
+        assert run.initiator == ""
+        request = next(detail for event, detail in recorded if event == EVENT_REQUESTED)
+        assert request["accepted"] is False
+        assert request["claimed_requester"] == claimed
+        assert "requester" not in request
+
+    def test_a_request_naming_nobody_is_refused(self, store: ConfigStore, workspace: Path) -> None:
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, runner=runner)
+
+        run = pipeline.deliver(context(workspace), requester="   ")
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+        assert run.reason == UNNAMED_REQUESTER_REASON
+        assert runner.calls == []
+
+    def test_an_ordinary_name_that_merely_mentions_the_scheme_is_still_refused(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The namespace is reserved by prefix, which is the whole of what the
+        # engine can check: a name it cannot distinguish from one it mints is one
+        # it must not accept.
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION)
+
+        run = pipeline.deliver(context(workspace), requester=f"{POLICY_ACTOR_SCHEME}-impersonator")
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+
+    def test_a_refused_request_notifies_nobody(self, store: ConfigStore, workspace: Path) -> None:
+        # Nothing ran and the caller has the answer in hand, so there is no
+        # notice to send and no notice recorded.
+        bus = FakeBus()
+        pipeline = build_pipeline(store, level=AutonomyLevel.EXECUTION, bus=bus)
+
+        run = pipeline.deliver(context(workspace), requester=self.approver_spelling())
+
+        assert run.notice is None
+        assert bus.pushed == []
+
+
+class TestCompletionAndFailureNotify:
+    def test_a_completed_delivery_notifies_with_every_executed_stage(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+        pipeline = build_pipeline(store, bus=bus)
+        pipeline.isolate(context(workspace), run_id="run-1")
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.notice is not None and run.notice.delivered
+        assert run.notice.stage_outcomes == (
+            (ISOLATE_STAGE, StageOutcome.PASSED.value),
+            (SUBMIT_STAGE, StageOutcome.PASSED.value),
+            (VERIFY_STAGE, StageOutcome.PASSED.value),
+            (PUBLISH_STAGE, StageOutcome.PASSED.value),
+        )
+        body = bus.only.body
+        for stage in (ISOLATE_STAGE, SUBMIT_STAGE, VERIFY_STAGE, PUBLISH_STAGE):
+            assert f"- {stage}: {StageOutcome.PASSED.value}" in body
+
+    def test_a_failed_delivery_notifies_too(self, store: ConfigStore, workspace: Path) -> None:
+        """The direction a success-only notifier passes every other test on.
+
+        A run that failed unattended is the one an operator is waiting to hear
+        about, so the notice must carry what ran, how it ended, and what was
+        never reached.
+        """
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+        pipeline = build_pipeline(
+            store, runner=ScriptedRunner(exits={VERIFY_PROGRAM: [1]}), bus=bus
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert run.notice is not None and run.notice.delivered
+        assert run.notice.stage_outcomes == (
+            (SUBMIT_STAGE, StageOutcome.PASSED.value),
+            (VERIFY_STAGE, StageOutcome.FAILED.value),
+        )
+        assert run.notice.not_reached == (PUBLISH_STAGE,)
+        payload = bus.only
+        assert DeliveryOutcome.FAILED.value in payload.title
+        assert f"- {VERIFY_STAGE}: {StageOutcome.FAILED.value}" in payload.body
+        assert f"Stages not reached: {PUBLISH_STAGE}" in payload.body
+
+    def test_an_interactive_delivery_notifies_on_the_same_terms(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        autonomous_bus = FakeBus()
+        interactive_bus = FakeBus()
+        build_pipeline(store, level=AutonomyLevel.DELIVERY, bus=autonomous_bus).deliver(
+            context(workspace)
+        )
+        build_pipeline(store, level=AutonomyLevel.EXECUTION, bus=interactive_bus).deliver(
+            context(workspace), requester="dana"
+        )
+
+        assert interactive_bus.only.body == autonomous_bus.only.body
+        assert interactive_bus.only.title == autonomous_bus.only.title
+        assert interactive_bus.only.channel == autonomous_bus.only.channel
+
+    def test_every_gate_reaches_the_notice_with_its_severity(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(
+            store,
+            gate("lint", LINT_PROGRAM),
+            gate("coverage", COVERAGE_PROGRAM, severity=GATE_SEVERITY_ADVISORY),
+        )
+        bus = FakeBus()
+        pipeline = build_pipeline(
+            store, runner=ScriptedRunner(exits={COVERAGE_PROGRAM: [1]}), bus=bus
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.gate_outcomes == (
+            ("lint", GATE_SEVERITY_BLOCKING, StageOutcome.PASSED.value),
+            ("coverage", GATE_SEVERITY_ADVISORY, StageOutcome.FAILED.value),
+        )
+        body = bus.only.body
+        assert f"- coverage ({GATE_SEVERITY_ADVISORY}): {StageOutcome.FAILED.value}" in body
+
+    def test_a_delivery_with_no_gates_says_so_rather_than_saying_nothing(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        build_pipeline(store, bus=bus).deliver(context(workspace))
+
+        assert NO_GATES_REASON in bus.only.body
+
+    def test_the_publish_addresses_reach_the_notice(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+        pipeline = build_pipeline(
+            store,
+            runner=ScriptedRunner(
+                stdout={PUBLISH_PROGRAM: "deployed to https://acme.test/run-1\n"}
+            ),
+            bus=bus,
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.addresses == ("https://acme.test/run-1",)
+        assert "https://acme.test/run-1" in bus.only.body
+
+    def test_a_failure_cause_from_a_command_is_carried_fenced(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # A stage's failure reason can be the first line of a command's stderr,
+        # so it is content the engine did not author. Interpolated into a body a
+        # surface renders as markdown, a crafted line would forge structure the
+        # engine never wrote.
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+        pipeline = build_pipeline(
+            store, runner=ScriptedRunner(exits={VERIFY_PROGRAM: [1]}), bus=bus
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.notice is not None and run.notice.quoted == run.reason
+        body = bus.only.body
+        assert "```" in body
+        assert body.index("```") > body.index(f"- {VERIFY_STAGE}")
+
+    def test_the_notice_carries_the_stage_outcomes_as_detail(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        build_pipeline(store, bus=bus).deliver(context(workspace))
+
+        meta = bus.only.meta
+        assert meta["spec_outcome"] == DeliveryOutcome.PASSED.value
+        assert meta["spec_stages"] == (
+            f"{SUBMIT_STAGE}={StageOutcome.PASSED.value}, "
+            f"{VERIFY_STAGE}={StageOutcome.PASSED.value}, "
+            f"{PUBLISH_STAGE}={StageOutcome.PASSED.value}"
+        )
+
+    def test_the_outcome_and_the_notice_are_audited(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        bus = FakeBus()
+        pipeline = build_pipeline(
+            store, bus=bus, audit=lambda event, detail: recorded.append((event, detail))
+        )
+
+        pipeline.deliver(context(workspace), requester="dana")
+
+        outcome = next(detail for event, detail in recorded if event == EVENT_OUTCOME)
+        assert outcome["outcome"] == DeliveryOutcome.PASSED.value
+        assert outcome["notified"] is True
+        assert outcome["channel"] == bus_channel(DASHBOARD_CHANNEL)
+        assert outcome["initiator_kind"] == INITIATOR_USER
+
+
+class TestNotificationRoutingIsConfigurations:
+    def test_the_project_channel_decides_where_the_notice_lands(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        document = workflow_document()
+        document["projects"][PROJECT]["notify"] = {"channel": REVIEW_CHANNEL}
+        store.write(document, surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        run = build_pipeline(store, bus=bus).deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.channel == bus_channel(REVIEW_CHANNEL)
+        assert bus.only.channel == bus_channel(REVIEW_CHANNEL)
+
+    def test_an_unconfigured_channel_lands_on_the_dashboard(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        run = build_pipeline(store, bus=bus).deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.channel == bus_channel(DASHBOARD_CHANNEL)
+        assert not run.notice.route_reason
+
+    def test_a_channel_named_by_the_caller_is_a_request_not_the_answer(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # Configuration owns the destination. A caller holding a stale or
+        # hand-edited channel must not steer a notice somewhere the project did
+        # not choose.
+        document = workflow_document()
+        document["projects"][PROJECT]["notify"] = {"channel": REVIEW_CHANNEL}
+        store.write(document, surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        run = build_pipeline(store, bus=bus, channel=DASHBOARD_CHANNEL).deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.channel == bus_channel(REVIEW_CHANNEL)
+        assert run.notice.route_reason == REASON_MISMATCH
+
+    def test_the_route_keeps_its_own_substitution_reason(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # A project that named a channel this app does not declare falls back and
+        # says why. That reason names the document an operator has to edit, so a
+        # caller mismatch must not overwrite it — the caller read the same
+        # unusable value, and reporting the caller would send them hunting.
+        document = workflow_document()
+        document["projects"][PROJECT]["notify"] = {"channel": "no-such-channel"}
+        store.write(document, surface=DASHBOARD_SURFACE)
+        bus = FakeBus()
+
+        run = build_pipeline(store, bus=bus, channel="no-such-channel").deliver(context(workspace))
+
+        assert run.notice is not None
+        assert run.notice.route_reason == REASON_UNDECLARED
+        assert run.notice.channel == bus_channel(DASHBOARD_CHANNEL)
+
+
+class TestAnUndeliveredNoticeChangesNothing:
+    def test_a_failing_bus_leaves_the_delivery_outcome_alone(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # Run state is primary and the notice is best-effort: a channel outage
+        # must not turn a delivered change into a failed one.
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, runner=runner, bus=FakeBus(fail=True))
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert runner.programs == [SUBMIT_PROGRAM, VERIFY_PROGRAM, PUBLISH_PROGRAM]
+        assert run.notice is not None
+        assert not run.notice.delivered
+        assert "bus said no" in run.notice.error
+
+    def test_an_undelivered_notice_is_recorded_rather_than_lost(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store,
+            bus=FakeBus(fail=True),
+            audit=lambda event, detail: recorded.append((event, detail)),
+        )
+
+        pipeline.deliver(context(workspace))
+
+        outcome = next(detail for event, detail in recorded if event == EVENT_OUTCOME)
+        assert outcome["notified"] is False
+        assert outcome["error"]
+
+    def test_a_pipeline_with_no_notifier_records_the_absence(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # An inert notifier seam is the failure this records: without it, a
+        # delivery that told nobody is indistinguishable from one that did.
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store, audit=lambda event, detail: recorded.append((event, detail))
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert run.notice is not None and run.notice.error == NO_NOTIFIER_REASON
+        outcome = next(detail for event, detail in recorded if event == EVENT_OUTCOME)
+        assert outcome["error"] == NO_NOTIFIER_REASON

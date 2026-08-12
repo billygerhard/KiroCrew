@@ -67,6 +67,47 @@ status, and captured output of every gate reach the audit record and the run, so
 a failure is diagnosable without re-running anything. That output is written by
 a program the engine does not control, so what is recorded is bounded before it
 is stored anywhere a human reads it.
+
+**An explicit human request starts this pipeline, not a second one.** Interactive
+delivery is the same :meth:`DeliveryPipeline.deliver` call with a *requester*
+named on it. There is deliberately no separate interactive path: a second
+entry point would be a second place for the stage order, the variable set, the
+gate list and the retry ceiling to be decided, and the two would drift in the
+direction that is never noticed — the interactive one skipping a check because a
+human was watching, which is precisely when nobody re-reads the audit trail. So
+the requester decides *who may start* the flow and changes nothing about what the
+flow does.
+
+What the requester does change is the authorization question. The autonomy ladder
+says how far the engine may go *unasked*; it was never a monopoly on asking, and
+the execution gate already answers it this way. A named person may therefore
+start delivery at any resolved level — otherwise a default install, whose
+unconfigured policy resolves to authoring, could never deliver interactively at
+all. Two floors still hold, because neither is about who asked: a project with no
+configured delivery workflow has described no way to isolate, submit, or verify,
+so there is nothing for a request to start; and integration remains gated on its
+own posture switch, so starting a delivery is not consent to an unattended merge.
+
+**A requester the engine could have minted is not a human.** The reserved
+autonomy-policy identity namespace is engine-issued, in more than one spelling —
+a refusal's initiator is rewritten to a parenthesised form specifically so it
+cannot be mistaken for an approval. Handing either spelling back as a requester
+would launder policy authority into "an explicit human action", so the whole
+namespace is refused rather than the one approver spelling.
+
+**Completion and failure both notify, with every executed stage's outcome.** One
+notice at the end of the flow, for the run that passed and for the run that
+failed, listing each stage the pipeline ran and how it ended, each gate with its
+severity, the stages never reached, and any deployment address the publish
+printed. A notifier that only fired on success would leave the case an operator
+actually needs told — the unattended run that stopped — as the silent one.
+
+Routing is the notify package's, not this module's: configuration owns the
+destination, so a channel named here is a request that may be declined, and the
+route's own substitution reason is carried out untouched because it is the only
+thing an operator can act on. Delivery of the notice is best-effort and the run
+state is primary: a notice that cannot be handed over is recorded as undelivered
+and never changes what the delivery did.
 """
 
 from __future__ import annotations
@@ -89,6 +130,8 @@ from ..config.schema import (
     GATE_SEVERITY_BLOCKING,
     SECTION_QUALITY_GATES,
 )
+from ..notify import Delivery
+from ..phases import INITIATOR_POLICY, INITIATOR_USER, is_reserved_actor
 from .integration import DeliveryAuthority, IntegrationDecision
 from .isolation import WorkspaceBroker, isolated_context
 from .stages import (
@@ -185,6 +228,15 @@ EVENT_FIX_DISPATCH = "delivery.fix_dispatch"
 EVENT_PUBLISHED = "delivery.published"
 EVENT_INTEGRATION = "delivery.integration"
 
+#: One per delivery attempt, naming who asked for it and whether the request
+#: stood. Recorded for a refusal too: a caller presenting an identity only the
+#: engine may mint is the event most worth having written down.
+EVENT_REQUESTED = "delivery.requested"
+
+#: One per delivery that entered the flow: its outcome, every stage's outcome,
+#: and what became of the notification.
+EVENT_OUTCOME = "delivery.outcome"
+
 #: One per gate execution: which gate, at which position, in which round, how it
 #: ended, and what it printed.
 EVENT_GATE = "delivery.gate"
@@ -196,6 +248,39 @@ EVENT_GATES = "delivery.gates"
 
 #: Reason recorded with :data:`EVENT_GATES` when a project configured no gates.
 NO_GATES_REASON = "no quality gates are configured, so the flow ran without them"
+
+#: Recorded when a delivery ended with no notifier wired to the pipeline. The
+#: absence is written down rather than passed over: the completion notice is the
+#: only thing that tells an operator an unattended delivery stopped, so a
+#: pipeline nobody gave a notifier to must be visible in the trail as such.
+NO_NOTIFIER_REASON = "no notifier is wired to this pipeline"
+
+#: Refusal for a delivery request that names nobody. An interactive start is an
+#: explicit human action, and an action attributable to no one is not one.
+UNNAMED_REQUESTER_REASON = (
+    "an interactive delivery names the person who asked for it, and this request names nobody"
+)
+
+
+class Notifier(Protocol):
+    """Where a delivery's completion notice goes. ``HostNotifier`` satisfies it.
+
+    Narrow on purpose, and deliberately not a channel: this module decides *that*
+    an operator must be told and what the notice says. Which channel it lands on
+    is configuration's answer, resolved inside the notifier.
+    """
+
+    def send(
+        self,
+        title: str,
+        body: str = "",
+        *,
+        quoted: str = "",
+        channel: str = "",
+        priority: str | None = None,
+        group_key: str = "",
+        detail: Mapping[str, Any] | None = None,
+    ) -> Delivery: ...
 
 
 @dataclass(frozen=True)
@@ -521,6 +606,63 @@ _RoundT = TypeVar("_RoundT", VerifyAttempt, GateRound)
 
 
 @dataclass(frozen=True)
+class DeliveryNotice:
+    """The completion-or-failure notice for one delivery, and what became of it.
+
+    Carried on the run rather than only sent, because "did anybody get told" is
+    part of what happened: delivery of a notice is best-effort while the run state
+    is primary, so an undelivered notice must leave a record instead of leaving
+    silence.
+
+    The stage list is every stage the pipeline produced a result for, in the order
+    they ran, including the ones that skipped — a submit that skipped and a submit
+    that passed are different things to read, and an omitted entry says neither.
+    """
+
+    outcome: DeliveryOutcome
+    title: str
+    body: str
+    #: Text the engine did not author. A stage's failure reason can be the first
+    #: line of a command's stderr, so it travels fenced rather than interpolated
+    #: into prose a surface renders as markdown.
+    quoted: str = ""
+    #: ``(stage, outcome)`` per stage result, in the order the stages ran.
+    stage_outcomes: tuple[tuple[str, str], ...] = ()
+    #: ``(gate, severity, outcome)`` per gate execution, in the order they ran.
+    gate_outcomes: tuple[tuple[str, str, str], ...] = ()
+    not_reached: tuple[str, ...] = ()
+    addresses: tuple[str, ...] = ()
+    notified: bool = False
+    #: Host bus channel the notice reached, empty when it reached none.
+    channel: str = ""
+    #: Why the route replaced the configured channel, taken from the route. Read
+    #: through rather than restated: the router's reason names the document an
+    #: operator has to edit, and a reason written here would send them elsewhere.
+    route_reason: str = ""
+    #: Why the notice was not delivered, when it was not.
+    error: str = ""
+
+    @property
+    def delivered(self) -> bool:
+        return self.notified and not self.error
+
+    def detail(self) -> dict[str, Any]:
+        """The notice as bounded detail for the note's meta map and the audit log."""
+        detail: dict[str, Any] = {"outcome": self.outcome.value}
+        if self.stage_outcomes:
+            detail["stages"] = ", ".join(f"{stage}={how}" for stage, how in self.stage_outcomes)
+        if self.gate_outcomes:
+            detail["gates"] = ", ".join(
+                f"{gate}({severity})={how}" for gate, severity, how in self.gate_outcomes
+            )
+        if self.not_reached:
+            detail["not_reached"] = ", ".join(self.not_reached)
+        if self.addresses:
+            detail["addresses"] = ", ".join(self.addresses)
+        return detail
+
+
+@dataclass(frozen=True)
 class DeliveryRun:
     """Everything one pass through the pipeline did."""
 
@@ -539,10 +681,32 @@ class DeliveryRun:
     #: Names of every gate configured for this delivery, in declaration order.
     #: Empty is a recorded answer rather than missing information.
     declared_gates: tuple[str, ...] = ()
+    #: The person whose explicit action started this delivery, empty when the
+    #: Autonomy_Policy's own authority did. Never carries a refused identity: a
+    #: trail scan for what started a delivery must not turn up a request that
+    #: started nothing.
+    initiator: str = ""
+    #: Whether a person or the policy is credited with starting this delivery.
+    initiator_kind: str = ""
+    #: The completion notice, absent only for a request refused before the flow.
+    notice: DeliveryNotice | None = None
 
     @property
     def ok(self) -> bool:
         return self.outcome is DeliveryOutcome.PASSED
+
+    @property
+    def interactive(self) -> bool:
+        """Whether an explicit human action started this delivery."""
+        return self.initiator_kind == INITIATOR_USER
+
+    def stage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        """Every stage result this delivery produced, with how it ended."""
+        return tuple((result.stage, result.outcome.value) for result in self.stages)
+
+    def gate_outcomes(self) -> tuple[tuple[str, str, str], ...]:
+        """Every gate execution: its name, its severity, and how it ended."""
+        return tuple((run.gate, run.severity, run.result.outcome.value) for run in self.gate_runs())
 
     @property
     def gates_configured(self) -> bool:
@@ -628,6 +792,8 @@ class DeliveryPipeline:
         fix_dispatcher: FixTaskDispatcher | None = None,
         audit: AuditRecorder | None = None,
         isolation: WorkspaceBroker | None = None,
+        notifier: Notifier | None = None,
+        channel: str = "",
     ) -> None:
         self._store = store
         self._project = project
@@ -638,6 +804,9 @@ class DeliveryPipeline:
         self._fix_dispatcher = fix_dispatcher
         self._audit = audit
         self._isolation = isolation
+        self._notifier = notifier
+        self._channel = channel
+        self._isolated: StageResult | None = None
 
     @property
     def workflow(self) -> DeliveryWorkflow:
@@ -662,7 +831,17 @@ class DeliveryPipeline:
         created. The claim is what makes a second run asking for the same tree a
         refusal instead of two runs editing one checkout; the broker's module
         explains why that has to happen before the command rather than after it.
+
+        The result is held on the pipeline so the delivery notice can report it.
+        Isolation runs hours before delivery, and a notice that listed only the
+        stages of the final pass would omit the stage that made the workspace the
+        others ran in.
         """
+        result = self._isolate(context, run_id=run_id)
+        self._isolated = result
+        return result
+
+    def _isolate(self, context: RunContext, *, run_id: str) -> StageResult:
         if not self._authority.isolates_before_execution:
             result = StageResult(
                 stage=ISOLATE_STAGE,
@@ -708,27 +887,94 @@ class DeliveryPipeline:
 
     # --- the flow ----------------------------------------------------------
 
-    def deliver(self, context: RunContext) -> DeliveryRun:
+    def deliver(self, context: RunContext, *, requester: str | None = None) -> DeliveryRun:
         """Run the gates, submit, verification, and publish for one run.
 
         Returns rather than raises for every stage-level problem, so a caller
         reports what ran alongside what did not instead of losing the earlier
         stages to an exception from a later one.
+
+        *requester* names the person whose explicit action started this delivery,
+        and naming one is the whole of what an interactive delivery is: the same
+        stages, the same variables, the same gates, the same retry ceiling. It
+        changes only who may start the flow — a named person may, at any resolved
+        autonomy level, because the ladder governs what the engine does unasked
+        rather than who may ask. It does not lift the two floors that are not
+        about who asked: a project with no configured delivery workflow has
+        nothing to start, and integration keeps its own posture gate.
+
+        An identity from the engine's reserved namespace is not a person, in any
+        of its spellings, and is refused: accepting one would let policy authority
+        re-enter as an explicit human action.
+
+        With no *requester* the Autonomy_Policy has to carry the authority itself,
+        which is the autonomous path and unchanged.
         """
-        if not self._authority.permits(AutonomyLevel.DELIVERY):
+        refusal = self._authorization_refusal(requester)
+        kind = INITIATOR_USER if requester is not None else INITIATOR_POLICY
+        self._record(EVENT_REQUESTED, self._request_detail(requester, refusal))
+        if refusal:
+            # Nothing ran, so there is nothing to notify about and no side effect
+            # left the host. A human who asked has this answer in their hand; an
+            # unattended run that the policy does not authorize is waiting at a
+            # gate the run lifecycle already reports.
             return DeliveryRun(
                 outcome=DeliveryOutcome.REFUSED,
-                reason=(
-                    "the autonomy policy does not authorize delivery for this run"
-                    + (
-                        "; the project has no configured delivery workflow"
-                        if not self._authority.workflow_configured
-                        else ""
-                    )
-                ),
+                reason=refusal,
                 not_reached=DELIVERY_FLOW_STAGES,
+                initiator_kind=kind,
             )
+        run = replace(
+            self._flow(context),
+            initiator=requester or "",
+            initiator_kind=kind,
+        )
+        return self._notified(run, context)
 
+    def _authorization_refusal(self, requester: str | None) -> str:
+        """Why this delivery may not start, or the empty string when it may."""
+        if requester is not None:
+            claim = _requester_refusal(requester)
+            if claim:
+                return claim
+            if not self._authority.workflow_configured:
+                return (
+                    "the project has no configured delivery workflow, so an explicit "
+                    "request has no stages to start"
+                )
+            return ""
+        if self._authority.permits(AutonomyLevel.DELIVERY):
+            return ""
+        return "the autonomy policy does not authorize delivery for this run" + (
+            "; the project has no configured delivery workflow"
+            if not self._authority.workflow_configured
+            else ""
+        )
+
+    def _request_detail(self, requester: str | None, refusal: str) -> dict[str, Any]:
+        """Audit fields naming who asked for this delivery and how it was judged."""
+        decision = self._authority.decision
+        detail: dict[str, Any] = {
+            "initiator_kind": INITIATOR_USER if requester is not None else INITIATOR_POLICY,
+            "accepted": not refusal,
+            "autonomy_level": self._authority.level.value,
+            "policy_declared_at": decision.declared_at or None,
+        }
+        if requester is not None:
+            # A refused identity is recorded under a key of its own rather than as
+            # the initiator, so the forged claim stays visible while a search for
+            # what started a delivery cannot match it.
+            detail["requester" if not refusal else "claimed_requester"] = requester
+        if refusal:
+            detail["reason"] = refusal
+        return detail
+
+    def _flow(self, context: RunContext) -> DeliveryRun:
+        """The stage flow itself, once the request is authorized."""
+        # The isolate result leads the stage list when this pipeline ran one. It
+        # is the stage the rest of the flow depended on, so a record of what the
+        # delivery did that started at submit would be missing its foundation.
+        isolated: tuple[StageResult, ...] = (self._isolated,) if self._isolated is not None else ()
         try:
             gates = self.gates()
         except ConfigValidationError as exc:
@@ -738,13 +984,14 @@ class DeliveryPipeline:
             self._record(EVENT_GATES, {"configured": [], "error": str(exc)})
             return DeliveryRun(
                 outcome=DeliveryOutcome.REFUSED,
+                stages=isolated,
                 reason=f"the configured quality gates cannot be read: {exc}",
                 not_reached=DELIVERY_FLOW_STAGES,
             )
         declared = tuple(gate.name for gate in gates)
         self._record_gate_configuration(gates)
 
-        stages: list[StageResult] = []
+        stages: list[StageResult] = list(isolated)
         attempts: list[VerifyAttempt] = []
         remaining = list(DELIVERY_FLOW_STAGES)
 
@@ -1010,6 +1257,78 @@ class DeliveryPipeline:
         )
         return dispatch
 
+    # --- the completion notice ---------------------------------------------
+
+    def _notified(self, run: DeliveryRun, context: RunContext) -> DeliveryRun:
+        """Notify the outcome of every executed stage, and record what happened.
+
+        One exit for both outcomes. A notifier reached only on the way out of a
+        successful delivery would leave the unattended failure — the case an
+        operator is actually waiting to hear about — as the silent one, and no
+        test of the passing path would say so.
+
+        Delivery of the notice is best-effort and the run is primary: a channel
+        that cannot be reached loses the message, never the delivery's outcome.
+        The exception is therefore swallowed here and recorded, which is also why
+        the notice is carried on the run — an undelivered notice leaves a record
+        rather than leaving silence.
+        """
+        notice = self._compose_notice(run, context)
+        if self._notifier is None:
+            notice = replace(notice, error=NO_NOTIFIER_REASON)
+            logger.warning(
+                "delivery for spec %r finished as %s with no notifier wired",
+                context.spec_name,
+                run.outcome.value,
+            )
+        else:
+            try:
+                delivered = self._notifier.send(
+                    notice.title,
+                    notice.body,
+                    quoted=notice.quoted,
+                    # A request, not the answer: the notifier resolves the
+                    # project's configured channel and may decline this one.
+                    channel=self._channel,
+                    group_key=context.spec_name,
+                    detail=notice.detail(),
+                )
+            except Exception as exc:
+                notice = replace(notice, error=str(exc))
+                logger.warning(
+                    "delivery notice for spec %r was not delivered: %s", context.spec_name, exc
+                )
+            else:
+                notice = replace(
+                    notice,
+                    notified=True,
+                    channel=delivered.channel,
+                    # Read through from the route rather than restated. The
+                    # router's reason names the configuration an operator must
+                    # edit; a reason written here would send them hunting a
+                    # caller instead.
+                    route_reason=delivered.route.reason,
+                )
+        self._record(EVENT_OUTCOME, _outcome_detail(run, notice))
+        return replace(run, notice=notice)
+
+    def _compose_notice(self, run: DeliveryRun, context: RunContext) -> DeliveryNotice:
+        """Build the notice for *run*: what ran, how it ended, and where it went."""
+        stage_outcomes = run.stage_outcomes()
+        gate_outcomes = run.gate_outcomes()
+        return DeliveryNotice(
+            outcome=run.outcome,
+            title=f"Spec delivery {run.outcome.value}: {context.spec_name}",
+            body=_notice_body(run, context, stage_outcomes, gate_outcomes),
+            # The cause can be the first line of a command's stderr, so it is
+            # fenced by the notifier rather than interpolated into the body.
+            quoted=run.reason,
+            stage_outcomes=stage_outcomes,
+            gate_outcomes=gate_outcomes,
+            not_reached=run.not_reached,
+            addresses=run.deployment_addresses,
+        )
+
     # --- results -----------------------------------------------------------
 
     def _with_integration(self, run: DeliveryRun, context: RunContext) -> DeliveryRun:
@@ -1127,6 +1446,80 @@ class DeliveryPipeline:
         if self._audit is None:
             return
         self._audit(event, detail)
+
+
+def _requester_refusal(requester: str) -> str:
+    """Why *requester* is not an explicit human action, or "" when it is.
+
+    Two refusals, and the second is the one that matters. A blank name is an
+    action attributable to nobody, which an interactive start cannot be.
+
+    A name inside the engine's reserved identity namespace is refused whatever its
+    punctuation, because the engine mints more than one spelling of it: the
+    approver form when the policy approves a gate, and a parenthesised form on a
+    refusal, written that way precisely so it cannot be read as an approval. A
+    guard keyed to the approver spelling alone would hand that refusal's own
+    initiator straight back as a human requester — turning authority the policy
+    was denied into an explicit human action attributed to a person.
+    """
+    if not requester.strip():
+        return UNNAMED_REQUESTER_REASON
+    if is_reserved_actor(requester):
+        return (
+            f"{requester!r} claims the Autonomy_Policy's reserved identity as a human "
+            "requester; delivery starts from a named person or from the policy's own "
+            "authority, never from one wearing the other's identity"
+        )
+    return ""
+
+
+def _outcome_detail(run: DeliveryRun, notice: DeliveryNotice) -> dict[str, Any]:
+    """Audit fields for one finished delivery, including the notice's fate."""
+    detail = notice.detail()
+    detail["initiator_kind"] = run.initiator_kind
+    detail["notified"] = notice.notified
+    detail["channel"] = notice.channel
+    if notice.route_reason:
+        detail["route_reason"] = notice.route_reason
+    if notice.error:
+        detail["error"] = notice.error
+    if run.reason:
+        detail["reason"] = run.reason
+    return detail
+
+
+def _notice_body(
+    run: DeliveryRun,
+    context: RunContext,
+    stage_outcomes: Sequence[tuple[str, str]],
+    gate_outcomes: Sequence[tuple[str, str, str]],
+) -> str:
+    """The notice's prose: every stage's outcome, every gate's, and what was not run.
+
+    Engine-authored throughout. The stage and gate names come from the schema's
+    stage list and an operator's own gate declarations, and the outcomes are enum
+    values — nothing a command printed reaches this text, which is why the failure
+    cause travels separately as fenced content.
+
+    Addresses come last so that a publish which printed many of them is what gets
+    clipped by the notifier's body cap, rather than the stage list a reader needs.
+    """
+    lines = [f"Delivery for the {context.spec_name!r} spec finished as {run.outcome.value}."]
+    if stage_outcomes:
+        lines += ["", "Stages:"]
+        lines += [f"- {stage}: {how}" for stage, how in stage_outcomes]
+    if run.not_reached:
+        lines += ["", f"Stages not reached: {', '.join(run.not_reached)}"]
+    lines.append("")
+    if gate_outcomes:
+        lines.append("Quality gates:")
+        lines += [f"- {gate} ({severity}): {how}" for gate, severity, how in gate_outcomes]
+    else:
+        lines.append(f"Quality gates: {NO_GATES_REASON}")
+    if run.deployment_addresses:
+        lines += ["", "Deployment addresses:"]
+        lines += [f"- {address}" for address in run.deployment_addresses]
+    return "\n".join(lines)
 
 
 def _gate_output(result: StageResult) -> str:
