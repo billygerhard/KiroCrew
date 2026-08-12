@@ -48,6 +48,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.notify import (
     known_channel,
     quote_untrusted,
     resolve_channel,
+    resolve_requested,
     safe_detail,
     safe_line,
 )
@@ -231,6 +232,25 @@ class TestUndeclaredChannels:
         HostNotifier(config, project=PROJECT, bus=bus).send("stalled")
         assert bus.registrations == [f"{APP_NAME}.{DASHBOARD_CHANNEL}"]
         assert [payload.channel for payload in bus.pushed] == [f"{APP_NAME}.{DASHBOARD_CHANNEL}"]
+
+    def test_the_undeclared_reason_survives_the_path_a_notice_actually_takes(
+        self, config: ConfigStore
+    ) -> None:
+        """The reason is the only thing an operator can act on, so it must reach them.
+
+        Delivery resolves through the caller-aware path, and a caller reads the
+        same configured value the router just rejected -- so the two differ for
+        the router's own reason. Reporting a caller mismatch there names engine
+        code the operator cannot change, and hides the one-line fix in their own
+        document.
+        """
+        with_project(config, channel="system.approval")
+
+        route = resolve_requested(config, "system.approval", project=PROJECT)
+
+        assert route.channel_id == DASHBOARD_CHANNEL
+        assert route.reason == REASON_UNDECLARED
+        assert route.requested == "system.approval"
 
     def test_an_unreadable_configuration_still_yields_a_route(self, config: ConfigStore) -> None:
         config.path.parent.mkdir(parents=True, exist_ok=True)

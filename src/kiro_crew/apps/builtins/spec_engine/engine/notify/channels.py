@@ -167,6 +167,13 @@ def resolve_requested(
     route = resolve_channel(store, project=project)
     if not requested or requested == route.channel_id:
         return route
+    if route.substituted:
+        # Configuration already failed and the route says why. The caller read
+        # that same configured value, so it differs from the substituted channel
+        # for the router's own reason, not the caller's -- and replacing the
+        # reason here would tell an operator to hunt a caller when the fix is one
+        # line in their own document.
+        return route
     logger.warning(
         "notification channel %r named by the caller is not the route for this project (%r)",
         requested,

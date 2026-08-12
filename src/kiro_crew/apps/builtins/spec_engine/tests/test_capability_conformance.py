@@ -538,6 +538,23 @@ class TestPlantedDefectDetection:
 
         report = RUNNER.run(SkippingStub(), CAPABILITY)
         assert report.passed, report.report_text()
+        # Honest, but not the same event as detecting. A one-bit verdict that
+        # cannot tell "conformed by working" from "conformed by declining
+        # everything" is the runner reporting the opposite of the truth.
+        assert report.declined_detections > 0
+        assert "declined" in report.summary()
+
+    def test_a_candidate_that_detects_is_not_reported_as_declining(self) -> None:
+        """The qualifier has to be absent when it is not earned.
+
+        Otherwise it is decoration rather than a signal, and a caller that reads
+        it to decide whether detection happened learns nothing.
+        """
+        report = verify_builtin(LocalAnalyzer(), CAPABILITY)
+
+        assert report.passed, report.report_text()
+        assert report.declined_detections == 0
+        assert "declined" not in report.summary()
 
     def test_detection_cannot_be_asked_of_a_fixture_with_nothing_planted(self) -> None:
         # A suite that asked for detection against a clean fixture would pass

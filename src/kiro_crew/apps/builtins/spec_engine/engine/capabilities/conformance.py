@@ -190,6 +190,12 @@ class CheckResult:
     #: registry keeps provider prose out of a degradation reason: this string is
     #: printed, logged, and pasted into an issue.
     detail: str
+    #: How many planted defects this check passed by accepting a declared skip
+    #: rather than a finding. Carried structurally rather than left in the detail
+    #: prose because the verdict has to be able to say so: a report that reads
+    #: "conforms" about a provider that examined nothing is the one outcome this
+    #: runner exists to prevent.
+    excused: int = 0
 
     def __str__(self) -> str:
         mark = "pass" if self.passed else "FAIL"
@@ -261,11 +267,27 @@ class ConformanceReport:
     def passed(self) -> bool:
         return not self.failures and not self.gaps
 
+    @property
+    def declined_detections(self) -> int:
+        """Planted defects the candidate was excused from, having declined them.
+
+        A provider that says it did not look is not lying, so declining is an
+        honest answer and does not fail the suite. But it is not the same event as
+        finding the defect, and a caller that requires detection has to be able
+        to tell the two apart without parsing prose.
+        """
+        return sum(result.excused for result in self.results)
+
     def summary(self) -> str:
         """One line naming the verdict and what produced it."""
         verdict = "conforms" if self.passed else "does not conform"
+        declined = self.declined_detections
+        # Named in the verdict line, not just the per-check detail, because that
+        # line is what a reader takes away: "conforms" about a candidate that
+        # examined nothing is worse than no report at all.
+        qualifier = f" (declined {declined} planted defect(s))" if declined else ""
         return (
-            f"{self.candidate} {verdict} for capability {self.capability}: "
+            f"{self.candidate} {verdict}{qualifier} for capability {self.capability}: "
             f"{len(self.results) - len(self.failures)}/{len(self.results)} checks passed "
             f"over {len(self.executed_fixtures)} fixtures, {len(self.gaps)} gaps"
         )
@@ -605,7 +627,11 @@ class ConformanceRunner:
         if excused:
             parts.append(f"declared skipped rather than examined for {len(excused)}")
         return CheckResult(
-            CHECK_PLANTED_DEFECT, fixture.name, True, ", ".join(parts) + " planted defect(s)"
+            CHECK_PLANTED_DEFECT,
+            fixture.name,
+            True,
+            ", ".join(parts) + " planted defect(s)",
+            excused=len(excused),
         )
 
     def _repeatability_result(
