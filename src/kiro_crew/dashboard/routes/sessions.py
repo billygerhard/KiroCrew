@@ -38,6 +38,7 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/chat/folders", chat.api_chat_folders)
     app.router.add_post("/api/chat/folders", chat.api_chat_folder_create)
     app.router.add_post("/api/chat/folders/scan", chat.api_chat_folders_scan)
+    app.router.add_post("/api/chat/folders/scaffold", chat.api_chat_folders_scaffold)
     app.router.add_patch("/api/chat/folders/{id}", chat.api_chat_folder_update)
     app.router.add_delete("/api/chat/folders/{id}", chat.api_chat_folder_delete)
     app.router.add_patch("/api/chat/slots/{slot}/folder", chat.api_chat_slot_folder)

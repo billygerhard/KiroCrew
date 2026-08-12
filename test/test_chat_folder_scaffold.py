@@ -1,28 +1,40 @@
 """Tests for the folder-scaffold endpoints.
 
-The scan endpoint is a preview, so what is pinned here is mostly what it does
+The scan endpoint is a preview, so what is pinned there is mostly what it does
 NOT do: it creates no folder, it refuses exactly the roots manual folder
 creation refuses, and it never offers to re-create a folder the user already
-has. The scanner's own detection rules are covered by the engine suites; the
-layouts below are the smallest ones that exercise an endpoint concern.
+has. The scaffold endpoint is the half that writes, so what is pinned here is
+that it writes only what the server itself just offered, nests what it creates
+the way the preview showed it, and never removes anything — including the
+folders a failed creation leaves behind. The scanner's own detection rules are
+covered by the engine suites; the layouts below are the smallest ones that
+exercise an endpoint concern.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from kiro_crew.dashboard.chat_folder_scaffold import (
+    MAX_REPORTED_UNKNOWN,
     STATUS_EMPTY,
     STATUS_OK,
+    api_chat_folders_scaffold,
     api_chat_folders_scan,
 )
+from kiro_crew.dashboard.chat_folders import FolderCreateError, create_folder_record
 
 
 def _make_scaffold_app(state: Any) -> web.Application:
@@ -31,6 +43,7 @@ def _make_scaffold_app(state: Any) -> web.Application:
     app = web.Application()
     app["state"] = state
     app.router.add_post("/api/chat/folders/scan", api_chat_folders_scan)
+    app.router.add_post("/api/chat/folders/scaffold", api_chat_folders_scaffold)
     return app
 
 
@@ -84,9 +97,40 @@ def _nested(root: Path) -> Path:
     return root
 
 
+def _deep(root: Path) -> Path:
+    """Three candidate levels: a repository, a manifest inside it, a ``.kiro``.
+
+    The middle candidate is OFFERED, so a default selection leaves it out — which
+    is the layout the nearest-created-ancestor parenting rule needs.
+    """
+
+    root.mkdir()
+    (root / "repo" / ".git").mkdir(parents=True)
+    (root / "repo" / "mid").mkdir()
+    (root / "repo" / "mid" / "pyproject.toml").write_text("", encoding="utf-8")
+    (root / "repo" / "mid" / "leaf" / ".kiro").mkdir(parents=True)
+    return root
+
+
 async def _scan(client: TestClient, root: Any) -> tuple[int, dict[str, Any]]:
     resp = await client.post("/api/chat/folders/scan", json={"root": str(root)})
     return resp.status, await resp.json()
+
+
+async def _scaffold(
+    client: TestClient, root: Any, selected: Any = ()
+) -> tuple[int, dict[str, Any]]:
+    resp = await client.post(
+        "/api/chat/folders/scaffold",
+        json={"root": str(root), "selected": [str(path) for path in selected]},
+    )
+    return resp.status, await resp.json()
+
+
+def _by_project_dir(state: Any) -> dict[str, dict[str, Any]]:
+    """Folders keyed by the project directory they were created on."""
+
+    return {f["project_dir"]: f for f in state._folders}
 
 
 class TestScanPreview:
@@ -437,6 +481,516 @@ class _StubConfig:
         return self._cfg
 
 
+class TestScaffoldCreation:
+    @pytest.mark.asyncio
+    async def test_root_folder_is_created_for_the_scan_root(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """The scan root always gets a folder — it is what the rest nests under."""
+
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root)
+
+        assert status == 200
+        assert [entry["path"] for entry in body["created"]] == [str(root)]
+        folder = _by_project_dir(state)[str(root)]
+        assert folder["name"] == "work"
+        assert folder["parent_id"] == ""
+        assert body["root_folder_id"] == folder["id"]
+
+    @pytest.mark.asyncio
+    async def test_selected_candidates_become_folders_under_the_root(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "web"])
+
+        assert status == 200
+        assert body["failed"] == []
+        folders = _by_project_dir(state)
+        assert sorted(folders) == sorted([str(root), str(root / "api"), str(root / "web")])
+        root_id = folders[str(root)]["id"]
+        assert folders[str(root / "api")]["parent_id"] == root_id
+        assert folders[str(root / "web")]["parent_id"] == root_id
+        # A folder's project_dir is what makes a chat opened in it scope-correct,
+        # so it is the candidate's own path, not the root's.
+        assert folders[str(root / "api")]["project_dir"] == str(root / "api")
+        assert folders[str(root / "api")]["name"] == "api"
+
+    @pytest.mark.asyncio
+    async def test_unselected_candidate_gets_no_folder(self, state: Any, tmp_path: Path) -> None:
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api"])
+
+        assert status == 200
+        assert sorted(_by_project_dir(state)) == sorted([str(root), str(root / "api")])
+        assert [entry["path"] for entry in body["created"]] == [str(root), str(root / "api")]
+
+    @pytest.mark.asyncio
+    async def test_empty_selection_creates_only_the_root_folder(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """ "Just the root, none of the packages" is a real answer, not a no-op."""
+
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [])
+
+        assert status == 200
+        assert list(_by_project_dir(state)) == [str(root)]
+        assert body["skipped_existing"] == []
+
+    @pytest.mark.asyncio
+    async def test_children_are_created_after_their_parent(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """Every folder names a parent that already exists when it is created."""
+
+        root = _deep(tmp_path / "work")
+        selected = [root / "repo", root / "repo" / "mid", root / "repo" / "mid" / "leaf"]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, selected)
+
+        assert status == 200
+        assert body["failed"] == []
+        folders = _by_project_dir(state)
+        assert folders[str(root / "repo")]["parent_id"] == folders[str(root)]["id"]
+        assert folders[str(root / "repo" / "mid")]["parent_id"] == folders[str(root / "repo")]["id"]
+        assert (
+            folders[str(root / "repo" / "mid" / "leaf")]["parent_id"]
+            == folders[str(root / "repo" / "mid")]["id"]
+        )
+        # Creation order, not just the final links: a parent appearing after its
+        # child would mean the child named an id that did not exist yet.
+        order = [entry["path"] for entry in body["created"]]
+        assert order == [str(root)] + [str(path) for path in selected]
+
+    @pytest.mark.asyncio
+    async def test_skipped_middle_candidate_reparents_to_nearest_created_ancestor(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """A partial selection nests as deeply as it can rather than flattening."""
+
+        root = _deep(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, _ = await _scaffold(
+                client, root, [root / "repo", root / "repo" / "mid" / "leaf"]
+            )
+
+        assert status == 200
+        folders = _by_project_dir(state)
+        assert str(root / "repo" / "mid") not in folders
+        assert (
+            folders[str(root / "repo" / "mid" / "leaf")]["parent_id"]
+            == folders[str(root / "repo")]["id"]
+        )
+
+
+class TestScaffoldSelectionRederivation:
+    @pytest.mark.asyncio
+    async def test_path_the_scan_does_not_offer_is_rejected(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """A selection is only ever a pick from what this server just found."""
+
+        root = _sibling_repos(tmp_path / "work")
+        # A real directory inside the root, but one the scanner offers no
+        # candidate for: no signal, so no folder may be created on it.
+        (root / "notes").mkdir()
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "notes"])
+
+        assert status == 400
+        assert body["code"] == "folder_scaffold_selection_stale"
+        assert body["unknown"] == [str(root / "notes")]
+        # Refused wholesale: the selection the user confirmed no longer describes
+        # the tree, so none of it is acted on.
+        assert state._folders == []
+
+    @pytest.mark.asyncio
+    async def test_path_outside_the_scan_root_is_rejected(self, state: Any, tmp_path: Path) -> None:
+        """The one that matters: a forged path cannot smuggle in a folder."""
+
+        root = _sibling_repos(tmp_path / "work")
+        elsewhere = tmp_path / "elsewhere"
+        (elsewhere / ".git").mkdir(parents=True)
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [elsewhere])
+
+        assert status == 400
+        assert body["code"] == "folder_scaffold_selection_stale"
+        assert state._folders == []
+
+    @pytest.mark.asyncio
+    async def test_a_stale_scan_no_longer_naming_a_candidate_is_rejected(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """The preview's own paths go stale when the tree changes under it."""
+
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            _, preview = await _scan(client, root)
+            assert [c["path"] for c in preview["candidates"]] == [
+                str(root / "api"),
+                str(root / "web"),
+            ]
+            # The package the user saw is gone by the time they confirm.
+            (root / "api" / ".git").rmdir()
+            status, body = await _scaffold(client, root, [c["path"] for c in preview["candidates"]])
+
+        assert status == 400
+        assert body["unknown"] == [str(root / "api")]
+
+    @pytest.mark.asyncio
+    async def test_reported_unknown_paths_are_capped(self, state: Any, tmp_path: Path) -> None:
+        """The rejected list is caller-controlled, so the response cannot grow with it."""
+
+        root = _sibling_repos(tmp_path / "work")
+        forged = [str(root / f"ghost{index}") for index in range(MAX_REPORTED_UNKNOWN + 10)]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, forged)
+
+        assert status == 400
+        assert len(body["unknown"]) == MAX_REPORTED_UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_selected_must_be_a_list_of_strings(self, state: Any, tmp_path: Path) -> None:
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            for selected in ("everything", {"path": 1}, [1, 2], [None]):
+                resp = await client.post(
+                    "/api/chat/folders/scaffold",
+                    json={"root": str(root), "selected": selected},
+                )
+                assert resp.status == 400
+                assert (await resp.json())["code"] == "folder_scaffold_selection_invalid"
+        assert state._folders == []
+
+    @pytest.mark.asyncio
+    async def test_null_selection_is_an_empty_selection(self, state: Any, tmp_path: Path) -> None:
+        """A surface with nothing ticked may send null; it means the root only."""
+
+        root = _sibling_repos(tmp_path / "work")
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/folders/scaffold", json={"root": str(root), "selected": None}
+            )
+            assert resp.status == 200
+        assert list(_by_project_dir(state)) == [str(root)]
+
+    @pytest.mark.asyncio
+    async def test_root_is_validated_exactly_as_the_scan_validates_it(self, state: Any) -> None:
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, "relative/path")
+
+        assert status == 400
+        assert body["error"] == "project_dir must be an absolute path"
+        assert body["code"] == "folder_scan_root_invalid"
+
+    @pytest.mark.asyncio
+    async def test_sensitive_root_rejected(self, state: Any) -> None:
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, "~/.ssh")
+
+        assert status == 400
+        assert body["error"] == "project_dir refers to a sensitive path"
+        assert state._folders == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_rejected(self, state: Any) -> None:
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/folders/scaffold",
+                data="{not json",
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "invalid_json"
+
+
+class TestScaffoldReconcile:
+    @pytest.mark.asyncio
+    async def test_existing_candidate_is_skipped_not_duplicated(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        root = _sibling_repos(tmp_path / "work")
+        state._folders = [
+            {
+                "id": "f-api",
+                "name": "api",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(root / "api"),
+            }
+        ]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "web"])
+
+        assert status == 200
+        assert body["skipped_existing"] == [str(root / "api")]
+        assert [entry["path"] for entry in body["created"]] == [str(root), str(root / "web")]
+        assert [f["id"] for f in state._folders if f["project_dir"] == str(root / "api")] == [
+            "f-api"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_existing_root_is_skipped_and_still_the_parent(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        """A re-scan of an already-scaffolded root files new packages under it."""
+
+        root = _sibling_repos(tmp_path / "work")
+        state._folders = [
+            {"id": "f-root", "name": "work", "order": 0, "parent_id": "", "project_dir": str(root)}
+        ]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "web"])
+
+        assert status == 200
+        assert body["skipped_existing"] == [str(root)]
+        assert body["root_folder_id"] == "f-root"
+        assert _by_project_dir(state)[str(root / "web")]["parent_id"] == "f-root"
+
+    @pytest.mark.asyncio
+    async def test_children_of_an_existing_folder_are_parented_to_it(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        root = _deep(tmp_path / "work")
+        state._folders = [
+            {
+                "id": "f-repo",
+                "name": "repo",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(root / "repo"),
+            }
+        ]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, _ = await _scaffold(client, root, [root / "repo", root / "repo" / "mid"])
+
+        assert status == 200
+        assert _by_project_dir(state)[str(root / "repo" / "mid")]["parent_id"] == "f-repo"
+
+    @pytest.mark.asyncio
+    async def test_rerunning_the_same_scaffold_creates_nothing(
+        self, state: Any, tmp_path: Path
+    ) -> None:
+        root = _sibling_repos(tmp_path / "work")
+        selected = [root / "api", root / "web"]
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            await _scaffold(client, root, selected)
+            after_first = copy.deepcopy(state._folders)
+            status, body = await _scaffold(client, root, selected)
+
+        assert status == 200
+        assert body["created"] == []
+        assert sorted(body["skipped_existing"]) == sorted(
+            [str(root)] + [str(path) for path in selected]
+        )
+        assert state._folders == after_first
+
+
+class TestScaffoldPartialFailure:
+    @pytest.mark.asyncio
+    async def test_one_refused_folder_costs_only_that_folder(
+        self, state: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What was created stays created: no rollback deletion on partial failure."""
+
+        root = _sibling_repos(tmp_path / "work")
+
+        async def _refuse_web(state_arg: Any, **kwargs: Any) -> dict[str, Any]:
+            if kwargs.get("project_dir") == str(root / "web"):
+                raise FolderCreateError("folder store is full", "folder_store_full")
+            return await create_folder_record(state_arg, **kwargs)
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_folder_scaffold.create_folder_record", _refuse_web
+        )
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "web"])
+
+        assert status == 200
+        assert [entry["path"] for entry in body["created"]] == [str(root), str(root / "api")]
+        assert body["failed"] == [
+            {
+                "path": str(root / "web"),
+                "error": "folder store is full",
+                "code": "folder_store_full",
+            }
+        ]
+        # The successful half survives — deleting it could delete a folder that
+        # already holds conversations.
+        assert sorted(_by_project_dir(state)) == sorted([str(root), str(root / "api")])
+
+    @pytest.mark.asyncio
+    async def test_a_store_write_failure_is_reported_not_raised(
+        self, state: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = _sibling_repos(tmp_path / "work")
+
+        async def _fail_web(state_arg: Any, **kwargs: Any) -> dict[str, Any]:
+            if kwargs.get("project_dir") == str(root / "web"):
+                raise OSError("No space left on device")
+            return await create_folder_record(state_arg, **kwargs)
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_folder_scaffold.create_folder_record", _fail_web
+        )
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "web"])
+
+        assert status == 200
+        assert body["failed"][0]["path"] == str(root / "web")
+        assert body["failed"][0]["code"] == "folder_create_failed"
+
+    @pytest.mark.asyncio
+    async def test_root_failure_stops_before_creating_children(
+        self, state: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a root folder the selection would land as unrelated top-level folders."""
+
+        root = _sibling_repos(tmp_path / "work")
+
+        async def _refuse(state_arg: Any, **kwargs: Any) -> dict[str, Any]:
+            raise FolderCreateError("name required")
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_folder_scaffold.create_folder_record", _refuse
+        )
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scaffold(client, root, [root / "api", root / "web"])
+
+        assert status == 200
+        assert body["created"] == []
+        assert [entry["path"] for entry in body["failed"]] == [str(root)]
+        assert body["root_folder_id"] == ""
+        assert state._folders == []
+
+
+# Filesystem work plus an aiohttp server per example is far past Hypothesis'
+# default per-example deadline. The shared profile already lifts it; restating it
+# keeps this property correct if that profile is ever narrowed, while leaving
+# ``max_examples`` to the profile.
+_P7_SETTINGS = settings(deadline=None, suppress_health_check=[HealthCheck.too_slow])
+
+
+def _additive_layout(base: Path) -> tuple[Path, list[str]]:
+    """A tree with candidates at three levels, plus the paths it offers.
+
+    Fixed rather than generated: the property below quantifies over *selections*
+    and over which folders already exist, and the scanner's own answer for random
+    trees is what the engine property suite covers.
+    """
+
+    root = base / "work"
+    (root / "api" / ".git").mkdir(parents=True)
+    (root / "web" / ".git").mkdir(parents=True)
+    (root / "web" / "pkg").mkdir()
+    (root / "web" / "pkg" / "package.json").write_text("{}", encoding="utf-8")
+    (root / "web" / "pkg" / "inner" / ".kiro").mkdir(parents=True)
+    return root, [
+        str(root / "api"),
+        str(root / "web"),
+        str(root / "web" / "pkg"),
+        str(root / "web" / "pkg" / "inner"),
+    ]
+
+
+_CANDIDATE_COUNT = 4
+_FLAGS = st.lists(st.booleans(), min_size=_CANDIDATE_COUNT, max_size=_CANDIDATE_COUNT)
+
+
+def _preexisting_folder(index: int, project_dir: str) -> dict[str, Any]:
+    """A folder already in the store, carrying a value nothing may rewrite."""
+
+    return {
+        "id": f"pre{index}",
+        "name": f"kept-{index}",
+        "order": index,
+        "collapsed": True,
+        "hidden": False,
+        "parent_id": "",
+        "project_dir": project_dir,
+        "default_agent": "",
+        # Not a field the scaffold path writes; present so a settings-preserving
+        # assertion has something to be about beyond the fields it does write.
+        "color": "#22c55e",
+    }
+
+
+class TestAdditiveScaffold:
+    """Property 7: scaffolding only ever adds.
+
+    Whatever the selection and whatever is already in the store, a scaffold call
+    leaves every folder that existed before it byte-identical, and the folders it
+    adds are exactly the selected candidates that had none. This is the property
+    that makes re-scanning a growing project safe: the user's existing setup —
+    names, colors, placements, the conversations filed under them — is not
+    something a re-run may rewrite.
+    """
+
+    @_P7_SETTINGS
+    @given(selection=_FLAGS, preexisting=_FLAGS, root_exists=st.booleans())
+    def test_scaffolding_only_adds_folders(
+        self,
+        tmp_path_factory: pytest.TempPathFactory,
+        selection: list[bool],
+        preexisting: list[bool],
+        root_exists: bool,
+    ) -> None:
+        # Per-example directories: Hypothesis creates a fixture once per test, not
+        # once per example, so the area is session-scoped and isolation comes from
+        # a fresh sub-directory here.
+        base = tmp_path_factory.mktemp("additive")
+        home = base / "home"
+        home.mkdir()
+        root, offered = _additive_layout(base)
+        selected = [path for path, ticked in zip(offered, selection) if ticked]
+        already = [path for path, ticked in zip(offered, preexisting) if ticked]
+        if root_exists:
+            already = [str(root)] + already
+        before = [
+            _preexisting_folder(index, project_dir) for index, project_dir in enumerate(already)
+        ]
+
+        with mock.patch("kiro_crew.dashboard.state.config_dir", lambda: home):
+            state = _make_state(base)
+            state._folders = copy.deepcopy(before)
+            body = asyncio.run(self._scaffold_once(state, root, selected))
+            after = copy.deepcopy(state._folders)
+            # Additive twice over: a second identical run is a no-op, which is
+            # what a user re-scanning an unchanged project must get.
+            repeat = asyncio.run(self._scaffold_once(state, root, selected))
+
+        by_id = {folder["id"]: folder for folder in after}
+        for folder in before:
+            # Byte-identical, not merely present: no rename, no re-placement, no
+            # settings change.
+            assert by_id.get(folder["id"]) == folder
+
+        expected_new = ({str(root)} | set(selected)) - set(already)
+        assert body["failed"] == []
+        assert {entry["path"] for entry in body["created"]} == expected_new
+        offered_again = {str(root)} | set(selected)
+        assert sorted(body["skipped_existing"]) == sorted(set(already) & offered_again)
+        assert {folder["project_dir"] for folder in after} == set(already) | expected_new
+        # Nothing dangling: every parent named by a created folder resolves.
+        ids = set(by_id)
+        assert all(folder["parent_id"] in ids or not folder["parent_id"] for folder in after)
+        assert repeat["created"] == []
+        assert state._folders == after
+
+    @staticmethod
+    async def _scaffold_once(state: Any, root: Path, selected: list[str]) -> dict[str, Any]:
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            _, body = await _scaffold(client, root, selected)
+            return body
+
+
 class TestRouteRegistration:
     """The handler must be reachable in the running dashboard, not just in
     the private apps these tests build. Registration lives inline in
@@ -450,6 +1004,11 @@ class TestRouteRegistration:
 
         assert chat.api_chat_folders_scan is api_chat_folders_scan
 
+    def test_facade_reexports_the_scaffold_handler(self) -> None:
+        from kiro_crew.dashboard import chat
+
+        assert chat.api_chat_folders_scaffold is api_chat_folders_scaffold
+
     def test_start_dashboard_registers_the_scan_route(self) -> None:
         import inspect
 
@@ -459,3 +1018,13 @@ class TestRouteRegistration:
         assert (
             'add_post("/api/chat/folders/scan", chat.api_chat_folders_scan)' in source
         ), "POST /api/chat/folders/scan is not registered in start_dashboard"
+
+    def test_start_dashboard_registers_the_scaffold_route(self) -> None:
+        import inspect
+
+        from kiro_crew.dashboard.server import start_dashboard
+
+        source = inspect.getsource(start_dashboard)
+        assert (
+            'add_post("/api/chat/folders/scaffold", chat.api_chat_folders_scaffold)' in source
+        ), "POST /api/chat/folders/scaffold is not registered in start_dashboard"

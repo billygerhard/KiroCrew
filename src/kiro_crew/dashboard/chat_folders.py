@@ -384,36 +384,85 @@ def _is_descendant(folders: list[dict], *, ancestor_id: str, folder_id: str) -> 
     return False
 
 
-async def api_chat_folder_create(request: web.Request) -> web.Response:
-    """POST /api/chat/folders — create a project folder."""
-    state: DashboardState = request.app["state"]
-    if (refusal := _refuse_unattributable_caller(state, request)) is not None:
-        return refusal
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    name = (body.get("name") or "").strip()[:100]
+class FolderCreateError(ValueError):
+    """A folder could not be created because the request was refused.
+
+    Carries the two halves of the folder API's 400 body: ``str(exc)`` is the
+    advisory prose a surface renders, ``code`` the machine-readable id it
+    branches on (empty for the refusals the folder API answers without one).
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class FolderOwnershipError(FolderCreateError):
+    """Refused because an app tried to nest under a folder it does not own.
+
+    Split from :class:`FolderCreateError` because the folder API answers it
+    differently (403 plus a denied SEL entry, not a plain 400), and the
+    response shape belongs to the caller — so the caller must be able to tell
+    this refusal apart without string-matching the message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "cannot create a folder inside one this app does not own",
+            "folder_not_owned",
+        )
+
+
+async def create_folder_record(
+    state: DashboardState,
+    *,
+    name: str,
+    parent_id: str = "",
+    project_dir: str = "",
+    default_agent: str = "",
+    color: str = "",
+    request_app: str = "",
+) -> dict[str, Any]:
+    """Validate one folder and append it to the store under the folders lock.
+
+    The single create path. Callers that build folders for the user — the folder
+    API below, project scaffolding — go through here, so none of them can end up
+    with weaker path validation, a dangling ``parent_id``, weaker app-ownership
+    isolation, or an unserialized store write than the others get. What stays
+    with the caller is what differs between them: the response shape, the audit
+    entry, and when to push a slots update (once per folder for a single create,
+    once for a whole scaffold).
+
+    ``request_app`` is the calling app's identity (empty when a person is
+    calling): it is stamped as ``owner_app`` and gates nesting under folders
+    other apps own. Never taken from a request body — a caller that could name
+    its own owner could name someone else's (see ``_folder_owner_app``).
+
+    Returns:
+        The created folder, exactly as it was appended to the store.
+
+    Raises:
+        FolderCreateError: if the folder was refused (unusable name, missing
+            parent, unusable ``project_dir``, unknown color).
+        FolderOwnershipError: if an app tried to nest under a folder it does
+            not own.
+    """
+
+    name = name.strip()[:100]
     if not name:
-        return web.json_response({"error": "name required"}, status=400)
-    parent_id = str(body.get("parent_id") or "")
+        raise FolderCreateError("name required")
     if parent_id and not any(f["id"] == parent_id for f in state._folders):
-        return web.json_response({"error": "parent folder not found"}, status=400)
-    project_dir = str(body.get("project_dir") or "").strip()
-    project_dir, err = _validate_project_dir(project_dir)
+        raise FolderCreateError("parent folder not found")
+    project_dir, err = _validate_project_dir(project_dir.strip())
     if err:
-        return web.json_response({"error": err}, status=400)
-    default_agent = str(body.get("default_agent") or "").strip()
-    color = str(body.get("color") or "").strip().lower()
+        raise FolderCreateError(err)
+    color = color.strip().lower()
     if color and not _is_valid_folder_color(color):
         # `code` is the contract, `error` is advisory prose (RFC 9457 3.1.3) —
         # the dashboard renders `error` verbatim into a localized UI, so a new
         # error response without an id is untranslatable by construction.
-        return web.json_response(
-            {"error": "color must be one of the folder palette values", "code": "color_invalid"},
-            status=400,
-        )
-    folder = {
+        raise FolderCreateError("color must be one of the folder palette values", "color_invalid")
+    folder: dict[str, Any] = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
         "order": len(state._folders),
@@ -425,11 +474,6 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     }
     if color:
         folder["color"] = color
-    # Never from the body: a caller that could name its own owner could name
-    # someone else's. Written only when an app is calling, so the person's rows
-    # keep the shape they have on disk today and "absent means the person"
-    # stays the one representation (see _folder_owner_app).
-    request_app = _effective_request_app(state, request)
     if request_app:
         folder["owner_app"] = request_app
 
@@ -455,23 +499,49 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     create_err = await state.mutate_folders(_append)
     if create_err == "parent_not_found":
         # The parent was deleted while this request waited for the lock.
-        return web.json_response(
-            {"error": "parent folder not found", "code": "folder_parent_not_found"},
-            status=400,
-        )
+        raise FolderCreateError("parent folder not found", "folder_parent_not_found")
     if create_err == "forbidden_parent":
+        raise FolderOwnershipError()
+    return folder
+
+
+async def api_chat_folder_create(request: web.Request) -> web.Response:
+    """POST /api/chat/folders — create a project folder."""
+    state: DashboardState = request.app["state"]
+    if (refusal := _refuse_unattributable_caller(state, request)) is not None:
+        return refusal
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    # Never from the body: a caller that could name its own owner could name
+    # someone else's. Written only when an app is calling, so the person's rows
+    # keep the shape they have on disk today and "absent means the person"
+    # stays the one representation (see _folder_owner_app).
+    request_app = _effective_request_app(state, request)
+    parent_id = str(body.get("parent_id") or "")
+    try:
+        folder = await create_folder_record(
+            state,
+            name=str(body.get("name") or ""),
+            parent_id=parent_id,
+            project_dir=str(body.get("project_dir") or ""),
+            default_agent=str(body.get("default_agent") or "").strip(),
+            color=str(body.get("color") or ""),
+            request_app=request_app,
+        )
+    except FolderOwnershipError as exc:
         sel().log_api_access(
             caller=request_app, operation="chat.folder_create",
             outcome="denied", source="app_isolation", resources=f"parent={parent_id}",
             error="app cannot create inside a folder it does not own",
         )
-        return web.json_response(
-            {
-                "error": "cannot create a folder inside one this app does not own",
-                "code": "folder_not_owned",
-            },
-            status=403,
-        )
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except FolderCreateError as exc:
+        payload: dict[str, Any] = {"error": str(exc)}
+        if exc.code:
+            payload["code"] = exc.code
+        return web.json_response(payload, status=400)
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
