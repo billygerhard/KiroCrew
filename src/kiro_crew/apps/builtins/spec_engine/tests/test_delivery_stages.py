@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
@@ -670,3 +672,72 @@ class TestCommandsSuppliedByTheCaller:
         # executor with one is a caller bug rather than a stage outcome.
         with pytest.raises(ValueError):
             StageExecutor(store).run_commands("verify", context(workspace), [])
+
+
+#: Values a public tracker can supply, biased toward the characters that would
+#: matter if a shell were ever involved. Handwritten examples only cover the ones
+#: somebody thought of.
+_GATE_VALUES = st.text(
+    alphabet=st.sampled_from(list("abc 12;|&`$()'\"{}[]<>\\\n\t*?~#!")),
+    min_size=1,
+    max_size=24,
+).filter(lambda value: value.strip() != "")
+
+
+class CapturingRunner:
+    """A runner that records the argv it was handed and reports success."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
+        self.calls.append(tuple(argv))
+        return CommandOutcome(exit_code=0)
+
+
+class TestCallerSuppliedCommandsUnderAnyValue:
+    """Substitution safety for the command path a quality gate takes.
+
+    The stage path has this property already, and gates reach the executor by a
+    different door. Pinning it here is what keeps the two from diverging into one
+    door that renders values and one that interpolates them.
+    """
+
+    @settings(max_examples=150, deadline=None)
+    @given(value=_GATE_VALUES)
+    def test_any_value_occupies_exactly_one_argument_of_a_gate_command(
+        self, tmp_path_factory: pytest.TempPathFactory, value: str
+    ) -> None:
+        root = tmp_path_factory.mktemp("gate-values")
+        workspace = root / "workspace"
+        workspace.mkdir()
+        store = ConfigStore(root / "state")
+        runner = CapturingRunner()
+        commands = [CommandTemplate.parse(["check", "--title", "{review_title}", "--tail"])]
+
+        result = StageExecutor(store, runner=runner).run_commands(
+            "verify", context(workspace, review_title=value), commands
+        )
+
+        assert result.outcome is StageOutcome.PASSED
+        assert runner.calls == [("check", "--title", value, "--tail")]
+
+    @settings(max_examples=25, deadline=None)
+    @given(blank=st.sampled_from(["", " ", "\t", "\n", "   "]))
+    def test_a_blank_value_spawns_nothing_from_a_gate_command(
+        self, tmp_path_factory: pytest.TempPathFactory, blank: str
+    ) -> None:
+        root = tmp_path_factory.mktemp("gate-blank")
+        workspace = root / "workspace"
+        workspace.mkdir()
+        store = ConfigStore(root / "state")
+        runner = CapturingRunner()
+        commands = [CommandTemplate.parse(["check", "--against", "{base_branch}"])]
+
+        result = StageExecutor(store, runner=runner).run_commands(
+            "verify", context(workspace, base_branch=blank), commands
+        )
+
+        assert result.outcome is StageOutcome.REFUSED
+        assert result.missing_variables == ("base_branch",)
+        assert runner.calls == []
