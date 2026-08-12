@@ -4,6 +4,8 @@ The claims under test are orderings rather than outcomes. Publish must not be
 reached while verification is failing; isolation must happen for a run that will
 deliver and not for one that will not; a failing verify stage must buy a bounded
 number of fix rounds rather than either an immediate failure or an endless loop.
+A quality gate adds a second axis to the same question: which side of submit it
+runs on, and what its failure costs.
 
 Commands are answered by a scripted runner instead of real processes. What
 happens at the process boundary — a hostile value arriving as one inert
@@ -14,6 +16,7 @@ and a scripted runner records exactly that.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -25,21 +28,35 @@ from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
     AutonomyLevel,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
+from kiro_crew.apps.builtins.spec_engine.engine.config.schema import (
+    GATE_POSITION_BOTH,
+    GATE_POSITION_POST_SUBMIT,
+    GATE_POSITION_PRE_SUBMIT,
+    GATE_SEVERITY_ADVISORY,
+    GATE_SEVERITY_BLOCKING,
+    SECTION_QUALITY_GATES,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     DELIVERY_FLOW_STAGES,
     EVENT_FIX_DISPATCH,
+    EVENT_GATE,
+    EVENT_GATES,
     EVENT_INTEGRATION,
     EVENT_PUBLISHED,
     EVENT_STAGE,
     ISOLATE_STAGE,
     MAX_ADDRESS_CHARS,
     MAX_DEPLOYMENT_ADDRESSES,
+    MAX_GATE_OUTPUT_CHARS,
+    NO_GATES_REASON,
     PUBLISH_STAGE,
+    QUALITY_GATE_PRESETS,
     REASON_DELIVERY_FAILED,
     REASON_LADDER,
     REASON_POSTURE,
     REASON_VERIFY,
     SUBMIT_STAGE,
+    TRUNCATION_NOTICE,
     VERIFY_STAGE,
     CommandOutcome,
     DeliveryOutcome,
@@ -49,6 +66,8 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     RunContext,
     StageOutcome,
     StageResult,
+    gate_presets,
+    load_quality_gates,
     resolve_authority,
 )
 
@@ -60,6 +79,10 @@ ISOLATE_PROGRAM = "make-worktree"
 SUBMIT_PROGRAM = "raise-review"
 VERIFY_PROGRAM = "run-checks"
 PUBLISH_PROGRAM = "deploy"
+
+LINT_PROGRAM = "run-lint"
+COVERAGE_PROGRAM = "run-coverage"
+CI_PROGRAM = "run-ci"
 
 
 class ScriptedRunner:
@@ -151,6 +174,39 @@ def workflow_document(
     if auto_integrate is not None:
         entry["delivery"] = {"auto_integrate": auto_integrate}
     return {"projects": {PROJECT: entry}}
+
+
+def gate(
+    name: str,
+    program: str,
+    *,
+    position: str = GATE_POSITION_PRE_SUBMIT,
+    severity: str = GATE_SEVERITY_BLOCKING,
+    arguments: Sequence[str] = (),
+) -> dict[str, Any]:
+    """One quality gate declaration, as a configuration surface would write it."""
+    return {
+        "name": name,
+        "position": position,
+        "severity": severity,
+        "commands": [[program, *arguments]],
+    }
+
+
+def configure(
+    store: ConfigStore,
+    *gates: Mapping[str, Any],
+    stages: dict[str, Any] | None = None,
+    auto_integrate: bool | None = None,
+    limits: dict[str, Any] | None = None,
+) -> None:
+    """Persist a workflow plus *gates* through the validated write path."""
+    document: dict[str, Any] = dict(workflow_document(stages=stages, auto_integrate=auto_integrate))
+    if gates:
+        document[SECTION_QUALITY_GATES] = [dict(entry) for entry in gates]
+    if limits is not None:
+        document["limits"] = limits
+    store.write(document, surface=DASHBOARD_SURFACE)
 
 
 def decision_at(level: AutonomyLevel) -> AutonomyDecision:
@@ -761,3 +817,483 @@ class TestRunReporting:
 
         assert not run.verified
         assert not run.verification_executed
+
+
+class TestGatePositions:
+    """Which side of submit a gate runs on is declared, not fixed.
+
+    The pipeline has one verify stage in its stage list, so a gate list that
+    always ran at the same point would satisfy every "the gate ran" assertion
+    while making the declaration decorative. These tests pin the position against
+    the submit command, which is the boundary the position is named after.
+    """
+
+    def test_a_pre_submit_gate_runs_before_the_review_artifact_is_raised(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("lint", LINT_PROGRAM))
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert runner.programs == [LINT_PROGRAM, SUBMIT_PROGRAM, VERIFY_PROGRAM, PUBLISH_PROGRAM]
+        assert [entry.position for entry in run.gate("lint")] == [GATE_POSITION_PRE_SUBMIT]
+
+    def test_a_post_submit_gate_runs_on_the_raised_artifact(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("ci", CI_PROGRAM, position=GATE_POSITION_POST_SUBMIT))
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert runner.programs == [SUBMIT_PROGRAM, VERIFY_PROGRAM, CI_PROGRAM, PUBLISH_PROGRAM]
+        assert [entry.position for entry in run.gate("ci")] == [GATE_POSITION_POST_SUBMIT]
+
+    def test_one_gate_declared_at_both_positions_runs_on_both_sides_of_submit(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """The case a two-valued position cannot express.
+
+        An analyzer worth running before a human sees the change is usually worth
+        re-running on the artifact CI built. Declaring that as two gates would put
+        one check in the record under two names with two severities to keep in
+        step, so the position itself carries it — and a pipeline that resolved
+        ``both`` to either single side would still pass every one-sided test.
+        """
+        configure(store, gate("checks", LINT_PROGRAM, position=GATE_POSITION_BOTH))
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert runner.programs == [
+            LINT_PROGRAM,
+            SUBMIT_PROGRAM,
+            VERIFY_PROGRAM,
+            LINT_PROGRAM,
+            PUBLISH_PROGRAM,
+        ]
+        assert [entry.position for entry in run.gate("checks")] == [
+            GATE_POSITION_PRE_SUBMIT,
+            GATE_POSITION_POST_SUBMIT,
+        ]
+
+    def test_gates_at_one_position_run_in_declared_order(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("lint", LINT_PROGRAM), gate("coverage", COVERAGE_PROGRAM))
+        runner = ScriptedRunner()
+
+        build_pipeline(store, runner=runner).deliver(context(workspace))
+
+        assert runner.programs.index(LINT_PROGRAM) < runner.programs.index(COVERAGE_PROGRAM)
+
+    def test_a_workflow_declaring_its_verify_work_only_as_gates_still_verified(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # No verify stage at all: the gates are the verification, and a run that
+        # published after them has not published something unchecked.
+        configure(
+            store,
+            gate("lint", LINT_PROGRAM),
+            stages={
+                SUBMIT_STAGE: [[SUBMIT_PROGRAM, "--title", "{review_title}"]],
+                PUBLISH_STAGE: [[PUBLISH_PROGRAM]],
+            },
+        )
+        run = build_pipeline(store, runner=ScriptedRunner()).deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert run.verified
+        assert run.verification_executed
+
+
+class TestGateSeverity:
+    """Blocking and advisory failures must cost different things.
+
+    A gate that stopped the flow on every failure passes any blocking-only test,
+    and one that stopped on nothing passes any advisory-only test, so each of
+    these asserts what the *other* severity does in the same delivery.
+    """
+
+    def test_a_blocking_failure_stops_the_flow_and_dispatches_fix_tasks(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("lint", LINT_PROGRAM), limits={"verify_retry_limit": 1})
+        runner = ScriptedRunner(exits={LINT_PROGRAM: [1]})
+        dispatch = dispatcher()
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatch)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert runner.ran(SUBMIT_PROGRAM) == 0
+        assert run.not_reached == DELIVERY_FLOW_STAGES
+        assert rounds_of(dispatch) == [0]
+        assert [entry.gate for entry in run.blocking_failures()] == ["lint", "lint"]
+
+    def test_an_advisory_failure_is_recorded_and_surfaced_without_stopping(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("coverage", COVERAGE_PROGRAM, severity=GATE_SEVERITY_ADVISORY))
+        runner = ScriptedRunner(exits={COVERAGE_PROGRAM: [1]})
+        dispatch = dispatcher()
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatch)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert runner.programs == [
+            COVERAGE_PROGRAM,
+            SUBMIT_PROGRAM,
+            VERIFY_PROGRAM,
+            PUBLISH_PROGRAM,
+        ]
+        assert rounds_of(dispatch) == []
+        surfaced = run.advisory_failures()
+        assert [entry.gate for entry in surfaced] == ["coverage"]
+        assert surfaced[0].exit_status == 1
+        assert run.blocking_failures() == ()
+
+    def test_an_advisory_and_a_blocking_failure_in_one_round_do_different_things(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """Both directions of the severity axis, in one delivery.
+
+        The advisory gate fails first and the blocking gate after it still runs,
+        so the advisory failure stopped nothing; the flow never reaches submit, so
+        the blocking failure stopped everything. Collapsing the two severities in
+        either direction changes exactly one of those two assertions.
+        """
+        configure(
+            store,
+            gate("coverage", COVERAGE_PROGRAM, severity=GATE_SEVERITY_ADVISORY),
+            gate("lint", LINT_PROGRAM),
+        )
+        runner = ScriptedRunner(exits={COVERAGE_PROGRAM: [1], LINT_PROGRAM: [2]})
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert runner.programs == [COVERAGE_PROGRAM, LINT_PROGRAM]
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert [entry.gate for entry in run.advisory_failures()] == ["coverage"]
+        assert [entry.gate for entry in run.blocking_failures()] == ["lint"]
+
+    def test_the_whole_round_runs_so_one_fix_dispatch_answers_every_finding(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # A blocking failure stops the flow, not its siblings: stopping the round
+        # would make each finding spend one round of a bounded limit to reveal
+        # the next.
+        configure(store, gate("lint", LINT_PROGRAM), gate("coverage", COVERAGE_PROGRAM))
+        runner = ScriptedRunner(exits={LINT_PROGRAM: [1], COVERAGE_PROGRAM: [1]})
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatcher(False))
+
+        run = pipeline.deliver(context(workspace))
+
+        assert runner.programs == [LINT_PROGRAM, COVERAGE_PROGRAM]
+        assert len(run.blocking_failures()) == 2
+
+    def test_blocking_gate_rounds_stop_at_the_configured_retry_limit(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("lint", LINT_PROGRAM), limits={"verify_retry_limit": 2})
+        runner = ScriptedRunner(exits={LINT_PROGRAM: [1]})
+        dispatch = dispatcher()
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatch)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert runner.ran(LINT_PROGRAM) == 3
+        assert rounds_of(dispatch) == [0, 1]
+        assert [round_.attempt for round_ in run.gate_rounds] == [0, 1, 2]
+        assert "retry limit" in run.gate_rounds[-1].fix.reason  # type: ignore[union-attr]
+
+    def test_a_gate_that_passes_after_a_fix_round_lets_the_flow_continue(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("lint", LINT_PROGRAM))
+        runner = ScriptedRunner(exits={LINT_PROGRAM: [1, 0]})
+        pipeline = build_pipeline(store, runner=runner, fix_dispatcher=dispatcher())
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert runner.ran(LINT_PROGRAM) == 2
+        assert runner.programs.index(SUBMIT_PROGRAM) > max(
+            index for index, name in enumerate(runner.programs) if name == LINT_PROGRAM
+        )
+
+    def test_a_failing_post_submit_blocking_gate_keeps_publish_out_of_reach(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(
+            store,
+            gate("ci", CI_PROGRAM, position=GATE_POSITION_POST_SUBMIT),
+            limits={"verify_retry_limit": 0},
+        )
+        runner = ScriptedRunner(exits={CI_PROGRAM: [1]})
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert runner.ran(PUBLISH_PROGRAM) == 0
+        assert PUBLISH_STAGE in run.not_reached
+        assert not run.verified
+
+    def test_a_failing_advisory_gate_does_not_withhold_verification(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The verify stage passed and only an advisory gate failed, so the change
+        # is verified and integration is not held back by a ratio.
+        configure(
+            store,
+            gate(
+                "coverage",
+                COVERAGE_PROGRAM,
+                position=GATE_POSITION_POST_SUBMIT,
+                severity=GATE_SEVERITY_ADVISORY,
+            ),
+        )
+        runner = ScriptedRunner(exits={COVERAGE_PROGRAM: [1]})
+
+        run = build_pipeline(store, runner=runner).deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert run.verified
+        assert run.integration is not None
+        assert REASON_VERIFY not in run.integration.reasons
+
+
+class TestGateVariables:
+    def test_a_gate_is_substituted_the_run_context_including_its_base_branch(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # The whole point of the base branch reaching a gate: a coverage delta or
+        # a changed-files lint compares the change against what it started from.
+        configure(
+            store,
+            gate("coverage", COVERAGE_PROGRAM, arguments=["--against", "{base_branch}"]),
+        )
+        runner = ScriptedRunner()
+
+        build_pipeline(store, runner=runner).deliver(context(workspace))
+
+        assert (COVERAGE_PROGRAM, "--against", BASE) in runner.calls
+
+    def test_a_gate_referencing_a_valueless_variable_refuses_before_executing(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # Fail closed: an empty substitution would leave a gate command that runs,
+        # exits zero, and checked something other than what was configured.
+        configure(store, gate("lint", LINT_PROGRAM, arguments=["--item", "{item_url}"]))
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(store, runner=runner)
+
+        run = pipeline.deliver(context(workspace, item_url=""))
+
+        assert runner.calls == []
+        assert run.outcome is DeliveryOutcome.FAILED
+        refused = run.gate("lint")[0]
+        assert refused.result.outcome is StageOutcome.REFUSED
+        assert refused.result.missing_variables == ("item_url",)
+        assert refused.exit_status is None
+
+
+class TestGateRecording:
+    def test_each_gate_execution_records_name_severity_exit_status_and_output(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(store, gate("coverage", COVERAGE_PROGRAM, severity=GATE_SEVERITY_ADVISORY))
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store,
+            runner=ScriptedRunner(
+                exits={COVERAGE_PROGRAM: [3]},
+                stdout={COVERAGE_PROGRAM: "coverage 71% (was 74%)\n"},
+                stderr={COVERAGE_PROGRAM: "below the threshold\n"},
+            ),
+            audit=lambda event, detail: recorded.append((event, detail)),
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        gates = [detail for event, detail in recorded if event == EVENT_GATE]
+        assert len(gates) == 1
+        assert gates[0]["gate"] == "coverage"
+        assert gates[0]["severity"] == GATE_SEVERITY_ADVISORY
+        assert gates[0]["position"] == GATE_POSITION_PRE_SUBMIT
+        assert gates[0]["exit_status"] == 3
+        assert gates[0]["blocked"] is False
+        assert "coverage 71%" in gates[0]["output"]
+        assert "below the threshold" in gates[0]["output"]
+        # The same text the audit record holds is on the run, for a driver to
+        # display without reading the log back.
+        assert run.gate("coverage")[0].output == gates[0]["output"]
+
+    def test_gate_output_is_bounded_before_it_is_recorded(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """Gate output is written by a program the engine does not control.
+
+        It flows into the notification, the queue entry, and the audit record, so
+        the bound is what keeps a chatty analyzer from deciding how large those
+        get.
+        """
+        configure(store, gate("lint", LINT_PROGRAM, severity=GATE_SEVERITY_ADVISORY))
+        flood = "x" * (MAX_GATE_OUTPUT_CHARS * 3)
+        pipeline = build_pipeline(
+            store, runner=ScriptedRunner(exits={LINT_PROGRAM: [1]}, stdout={LINT_PROGRAM: flood})
+        )
+
+        run = pipeline.deliver(context(workspace))
+        output = run.gate("lint")[0].output
+
+        assert len(output) < len(flood)
+        assert output.startswith("x" * MAX_GATE_OUTPUT_CHARS)
+        assert output.endswith(TRUNCATION_NOTICE)
+
+    def test_the_configured_gates_are_recorded_with_the_side_they_run_on(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        configure(
+            store,
+            gate("lint", LINT_PROGRAM),
+            gate("ci", CI_PROGRAM, position=GATE_POSITION_POST_SUBMIT),
+            gate("checks", COVERAGE_PROGRAM, position=GATE_POSITION_BOTH),
+        )
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store, audit=lambda event, detail: recorded.append((event, detail))
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        configuration = next(detail for event, detail in recorded if event == EVENT_GATES)
+        assert configuration["configured"] == ["lint", "ci", "checks"]
+        assert configuration["pre_submit"] == ["lint", "checks"]
+        assert configuration["post_submit"] == ["ci", "checks"]
+        assert run.declared_gates == ("lint", "ci", "checks")
+
+    def test_no_gates_configured_is_recorded_rather_than_silent(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """ "No gate ran" and "no gate was configured" must not read alike.
+
+        Recording nothing would leave the two indistinguishable afterwards, which
+        is exactly the question asked when someone wants to know what checked a
+        change.
+        """
+        configure(store)
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        pipeline = build_pipeline(
+            store, audit=lambda event, detail: recorded.append((event, detail))
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        configuration = next(detail for event, detail in recorded if event == EVENT_GATES)
+        assert configuration["configured"] == []
+        assert configuration["reason"] == NO_GATES_REASON
+        assert run.outcome is DeliveryOutcome.PASSED
+        assert not run.gates_configured
+        assert run.gate_runs() == ()
+        assert EVENT_GATE not in [event for event, _ in recorded]
+
+    def test_a_gate_that_cannot_be_read_refuses_instead_of_resolving_to_none(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        """A document edited around the write path must not disable the gates.
+
+        Resolving an unparseable gate list to "no gates configured" would make
+        one bad character the way to turn every check off while the delivery still
+        reports success.
+        """
+        configure(store, gate("lint", LINT_PROGRAM))
+        document = json.loads(store.path.read_text(encoding="utf-8"))
+        document[SECTION_QUALITY_GATES][0]["severity"] = "whenever"
+        store.path.write_text(json.dumps(document), encoding="utf-8")
+        recorded: list[tuple[str, dict[str, Any]]] = []
+        runner = ScriptedRunner()
+        pipeline = build_pipeline(
+            store, runner=runner, audit=lambda event, detail: recorded.append((event, detail))
+        )
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.REFUSED
+        assert runner.calls == []
+        assert f"{SECTION_QUALITY_GATES}[0].severity" in run.reason
+        configuration = next(detail for event, detail in recorded if event == EVENT_GATES)
+        assert configuration["error"]
+
+
+class TestGateConfiguration:
+    def test_the_bundled_presets_cover_tests_coverage_lint_and_type_checks(self) -> None:
+        assert set(QUALITY_GATE_PRESETS) == {"tests", "coverage", "lint", "types"}
+
+    def test_a_preset_is_valid_configuration_and_loads_back_as_a_gate(
+        self, store: ConfigStore
+    ) -> None:
+        # Editable means it goes through the ordinary write path and comes back
+        # as an ordinary gate, not that it is a special kind of binding.
+        store.write(
+            {SECTION_QUALITY_GATES: gate_presets()},
+            surface=DASHBOARD_SURFACE,
+        )
+
+        loaded = load_quality_gates(store.document())
+
+        assert [entry.name for entry in loaded] == ["tests", "coverage", "lint", "types"]
+        severities = {entry.name: entry.severity for entry in loaded}
+        assert severities["tests"] == GATE_SEVERITY_BLOCKING
+        # A coverage threshold dips on an honest refactor, so it reports rather
+        # than abandoning finished work.
+        assert severities["coverage"] == GATE_SEVERITY_ADVISORY
+
+    def test_the_coverage_preset_compares_against_the_run_base_branch(self) -> None:
+        coverage = gate_presets("coverage")[0]
+        arguments = [argument for argv in coverage["commands"] for argument in argv]
+
+        assert any("{base_branch}" in argument for argument in arguments)
+
+    def test_editing_a_preset_does_not_change_what_the_next_project_is_offered(self) -> None:
+        first = gate_presets("tests")[0]
+        first["severity"] = GATE_SEVERITY_ADVISORY
+        first["commands"][0].append("--only-fast")
+
+        second = gate_presets("tests")[0]
+
+        assert second["severity"] == GATE_SEVERITY_BLOCKING
+        assert second["commands"] == [["make", "test"]]
+
+    def test_an_unknown_preset_name_is_refused(self) -> None:
+        with pytest.raises(KeyError):
+            gate_presets("no-such-preset")
+
+    def test_gates_are_read_in_declaration_order(self, store: ConfigStore) -> None:
+        store.write(
+            {
+                SECTION_QUALITY_GATES: [
+                    gate("second", COVERAGE_PROGRAM),
+                    gate("first", LINT_PROGRAM),
+                ]
+            },
+            surface=DASHBOARD_SURFACE,
+        )
+
+        assert [entry.name for entry in load_quality_gates(store.document())] == [
+            "second",
+            "first",
+        ]
+
+    def test_a_document_with_no_gate_section_reads_as_none(self) -> None:
+        assert load_quality_gates({}) == ()

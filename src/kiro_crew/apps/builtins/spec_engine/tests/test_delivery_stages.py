@@ -31,6 +31,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     TRUNCATION_NOTICE,
     ZERO_CONFIG_AUTONOMY_CEILING,
     CommandOutcome,
+    CommandTemplate,
     DeliveryWorkflow,
     RunContext,
     StageExecutor,
@@ -573,3 +574,99 @@ class TestZeroConfiguration:
     def test_unknown_level_is_refused(self) -> None:
         with pytest.raises(ValueError):
             cap_autonomy("root", workflow_configured=True)
+
+
+class TestCommandsSuppliedByTheCaller:
+    """Quality gates are command lists no workflow stage declared.
+
+    They run through the executor's command path rather than a second executor
+    precisely so the guarantees are the same ones, and these tests assert that
+    against real processes: the value is inert, the variable set is the run's,
+    and a valueless reference refuses before anything spawns.
+    """
+
+    def test_caller_supplied_commands_substitute_the_same_run_context(
+        self, store: ConfigStore, workspace: Path, recorder: Path
+    ) -> None:
+        target = workspace / "argv.json"
+        commands = [
+            CommandTemplate.parse(
+                [sys.executable, str(recorder), str(target), "--against", "{base_branch}"]
+            )
+        ]
+
+        result = StageExecutor(store).run_commands(
+            "verify", context(workspace, base_branch="main"), commands
+        )
+
+        assert result.outcome is StageOutcome.PASSED
+        assert recorded_argv(target) == ["--against", "main"]
+
+    def test_a_hostile_value_is_as_inert_in_a_gate_as_in_a_stage(
+        self, store: ConfigStore, workspace: Path, recorder: Path
+    ) -> None:
+        target = workspace / "argv.json"
+        commands = [
+            CommandTemplate.parse(
+                [sys.executable, str(recorder), str(target), "--title", "{review_title}"]
+            )
+        ]
+
+        result = StageExecutor(store).run_commands(
+            "verify", context(workspace, review_title=HOSTILE_TITLE), commands
+        )
+
+        assert result.outcome is StageOutcome.PASSED
+        assert recorded_argv(target) == ["--title", HOSTILE_TITLE]
+        for artefact in PAYLOAD_ARTEFACTS:
+            assert not (workspace / artefact).exists()
+
+    def test_a_valueless_reference_refuses_before_any_process_starts(
+        self, store: ConfigStore, workspace: Path, recorder: Path
+    ) -> None:
+        target = workspace / "argv.json"
+        commands = [
+            CommandTemplate.parse([sys.executable, str(recorder), str(target)]),
+            CommandTemplate.parse([sys.executable, str(recorder), str(target), "{item_url}"]),
+        ]
+
+        result = StageExecutor(store).run_commands("verify", context(workspace), commands)
+
+        assert result.outcome is StageOutcome.REFUSED
+        assert result.missing_variables == ("item_url",)
+        # The first command was runnable and still did not run: a gate that
+        # performed half its checks and then refused would report a partial
+        # result as a refusal.
+        assert not target.exists()
+
+    def test_the_variables_used_are_recorded_for_caller_supplied_commands(
+        self, store: ConfigStore, workspace: Path, recorder: Path
+    ) -> None:
+        target = workspace / "argv.json"
+        commands = [
+            CommandTemplate.parse(
+                [sys.executable, str(recorder), str(target), "{base_branch}", "{spec_name}"]
+            )
+        ]
+
+        result = StageExecutor(store).run_commands(
+            "verify", context(workspace, base_branch="main"), commands
+        )
+
+        assert result.variables_used == ("base_branch", "spec_name")
+
+    def test_an_unknown_stage_name_is_a_programming_error(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        commands = [CommandTemplate.parse(["true"])]
+
+        with pytest.raises(ValueError):
+            StageExecutor(store).run_commands("deploy-everything", context(workspace), commands)
+
+    def test_no_commands_at_all_is_a_programming_error(
+        self, store: ConfigStore, workspace: Path
+    ) -> None:
+        # An empty gate is refused by the configuration schema, so reaching the
+        # executor with one is a caller bug rather than a stage outcome.
+        with pytest.raises(ValueError):
+            StageExecutor(store).run_commands("verify", context(workspace), [])
