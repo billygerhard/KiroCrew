@@ -82,12 +82,25 @@ TRANSPORTS: tuple[str, ...] = ("builtin", "mcp", "command")
 #: it, or both.
 DELIVERY_STAGES: tuple[str, ...] = ("isolate", "submit", "verify", "publish", "teardown")
 
-#: Where a quality gate runs relative to raising the review artifact.
-GATE_POSITIONS: tuple[str, ...] = ("pre_submit", "post_submit")
+#: Where a quality gate runs relative to raising the review artifact. ``both``
+#: exists because a gate position is not a property of the check: an analyzer
+#: worth running before a human sees the change is usually worth re-running on
+#: the artifact, and expressing that as two gates would put one check in the
+#: audit record under two names with two independently editable severities.
+GATE_POSITION_PRE_SUBMIT = "pre_submit"
+GATE_POSITION_POST_SUBMIT = "post_submit"
+GATE_POSITION_BOTH = "both"
+GATE_POSITIONS: tuple[str, ...] = (
+    GATE_POSITION_PRE_SUBMIT,
+    GATE_POSITION_POST_SUBMIT,
+    GATE_POSITION_BOTH,
+)
 
 #: A blocking gate stops the flow and dispatches fix tasks; an advisory gate is
 #: recorded and surfaced without stopping the run.
-GATE_SEVERITIES: tuple[str, ...] = ("blocking", "advisory")
+GATE_SEVERITY_BLOCKING = "blocking"
+GATE_SEVERITY_ADVISORY = "advisory"
+GATE_SEVERITIES: tuple[str, ...] = (GATE_SEVERITY_BLOCKING, GATE_SEVERITY_ADVISORY)
 
 #: The autonomy ladder, least to most autonomous. Strictly ordered, and an
 #: enabled level implies every level below it.

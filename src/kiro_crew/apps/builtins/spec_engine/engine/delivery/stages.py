@@ -257,7 +257,36 @@ class StageExecutor:
                 outcome=StageOutcome.SKIPPED,
                 reason="no commands configured for this stage",
             )
+        return self.run_commands(
+            stage,
+            context,
+            configured.commands,
+            origin=configured.origin,
+            declared_at=configured.declared_at,
+        )
 
+    def run_commands(
+        self,
+        stage: str,
+        context: RunContext,
+        commands: Sequence[CommandTemplate],
+        *,
+        origin: ValueOrigin | None = None,
+        declared_at: str = "",
+    ) -> StageResult:
+        """Run *commands* as *stage* for the run described by *context*.
+
+        The stage's commands are one argument rather than resolved here, because
+        a quality gate is a verify-stage command list that a workflow stage did
+        not declare. Running it through this method rather than a second executor
+        is what makes a gate obey the same rules as a stage: the whole list is
+        validated before the first spawn, the same variable set is substituted,
+        and a valueless reference refuses without executing anything.
+        """
+        if stage not in DELIVERY_STAGES:
+            raise ValueError(f"unknown delivery stage: {stage!r}")
+        if not commands:
+            raise ValueError(f"no commands to run for the {stage!r} stage")
         try:
             values = build_variables(context, self._workflow.project_variables())
         except (ConfigValidationError, VariableError) as exc:
@@ -265,11 +294,11 @@ class StageExecutor:
                 stage=stage,
                 outcome=StageOutcome.REFUSED,
                 reason=str(exc),
-                origin=configured.origin,
-                declared_at=configured.declared_at,
+                origin=origin,
+                declared_at=declared_at,
             )
 
-        missing = _missing_across(configured.commands, values)
+        missing = _missing_across(commands, values)
         if missing:
             # Reported before anything spawns: an empty substitution would turn a
             # push, a comment, or a deploy into a different command with the same
@@ -279,8 +308,8 @@ class StageExecutor:
                 outcome=StageOutcome.REFUSED,
                 reason="a command references variables that have no value for this run",
                 missing_variables=missing,
-                origin=configured.origin,
-                declared_at=configured.declared_at,
+                origin=origin,
+                declared_at=declared_at,
             )
 
         workspace = Path(context.workspace_path) if context.workspace_path.strip() else None
@@ -289,19 +318,19 @@ class StageExecutor:
                 stage=stage,
                 outcome=StageOutcome.REFUSED,
                 reason=f"the run's workspace is not a directory: {context.workspace_path!r}",
-                origin=configured.origin,
-                declared_at=configured.declared_at,
+                origin=origin,
+                declared_at=declared_at,
             )
 
         try:
-            rendered = [command.render(values) for command in configured.commands]
+            rendered = [command.render(values) for command in commands]
         except (MissingVariableError, TemplateError) as exc:  # pragma: no cover - guarded above
             return StageResult(
                 stage=stage,
                 outcome=StageOutcome.REFUSED,
                 reason=str(exc),
-                origin=configured.origin,
-                declared_at=configured.declared_at,
+                origin=origin,
+                declared_at=declared_at,
             )
 
         timeout_s = int(self._store.effective(STAGE_TIMEOUT_SETTING, project=self._project).value)
@@ -322,9 +351,9 @@ class StageExecutor:
             outcome=outcome,
             commands=tuple(results),
             reason=reason,
-            origin=configured.origin,
-            declared_at=configured.declared_at,
-            variables_used=configured.variables,
+            origin=origin,
+            declared_at=declared_at,
+            variables_used=_variables_across(commands),
         )
 
     def _execute(self, argv: tuple[str, ...], *, cwd: Path, timeout_s: int) -> CommandResult:
@@ -365,6 +394,15 @@ def _missing_across(
     seen: dict[str, None] = {}
     for command in commands:
         for name in command.missing(values):
+            seen.setdefault(name, None)
+    return tuple(seen)
+
+
+def _variables_across(commands: Sequence[CommandTemplate]) -> tuple[str, ...]:
+    """Every variable referenced across *commands*, in first-appearance order."""
+    seen: dict[str, None] = {}
+    for command in commands:
+        for name in command.variables:
             seen.setdefault(name, None)
     return tuple(seen)
 
