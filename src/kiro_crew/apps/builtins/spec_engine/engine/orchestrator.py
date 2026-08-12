@@ -481,6 +481,10 @@ class WaveRunner:
     def execute(self, context: RunContext) -> ExecutionReport:
         """Isolate, then dispatch every wave in order.
 
+        Does not end the run: :meth:`finish` is what moves it into a final state
+        and reports what it consumed, and the two are separate so a delivery pass
+        can sit between them. :meth:`run` is the whole sequence.
+
         Returns rather than raises for a refusal or a failure, so the report says
         what ran alongside what did not. A persistence failure is the exception:
         the recorded status is what a resumed run reads, so a status that could

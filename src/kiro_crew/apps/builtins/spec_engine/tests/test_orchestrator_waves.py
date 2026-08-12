@@ -796,6 +796,51 @@ class TestTheCompletionReporterIsWired:
         assert report.completion.report.consumed_credits == pytest.approx(3.0)
         assert harness.machine.state_of(RUN) is RunState.FAILED
 
+    def test_a_run_cancelled_under_the_loop_keeps_the_state_it_ended_in(
+        self, harness: Harness
+    ) -> None:
+        """A finished run's history is not rewritten by a late writer.
+
+        Cancellation is terminal, so the completion reports what the run cost and
+        names cancelled — it does not move the run to done or failed on the way.
+        """
+        harness.start_run()
+        harness.spend(0.5)
+        machine = harness.machine
+        runner = runner_for(harness, Worker())
+        execution = runner.execute(context_for(harness))
+        machine.transition(harness.ref, RUN, RunState.CANCELLED)
+
+        report = runner.finish(execution)
+
+        assert report.completion is not None
+        assert report.completion.final_state is RunState.CANCELLED
+        assert report.completion.transitioned is False
+        assert report.completion.report is not None
+        assert report.completion.report.consumed_credits == pytest.approx(0.5)
+        assert machine.state_of(RUN) is RunState.CANCELLED
+
+    def test_a_run_that_never_started_is_not_declared_finished(self, harness: Harness) -> None:
+        """Queued is not a state a run finishes from, so nothing is reported.
+
+        A run whose leaves were all already checked off has nothing to dispatch,
+        but it also never started: moving it to done is not in the lifecycle
+        table, and reporting a completion for it would spend the once-per-run
+        notice on a run that has not run.
+        """
+        write_tasks(harness.ref.spec_dir, [["1.1"]], complete=["1.1"])
+        harness.machine.create(harness.ref, run_id=RUN)
+
+        report = runner_for(harness, Worker()).run(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.COMPLETED
+        assert report.completion is not None
+        assert report.completion.report is None
+        assert report.completion.transitioned is False
+        assert "cannot move from queued" in report.completion.reason
+        assert harness.machine.state_of(RUN) is RunState.QUEUED
+        assert harness.notifier.messages() == ()
+
 
 class TestTheBudgetStopsDispatch:
     def test_reaching_the_ceiling_mid_wave_stops_the_leaves_that_had_not_started(
