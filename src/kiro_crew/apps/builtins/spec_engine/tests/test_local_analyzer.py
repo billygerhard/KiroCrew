@@ -90,6 +90,23 @@ _FORBIDDEN_NAMES: tuple[str, ...] = (
 )
 
 
+def _relative_targets(base: Path, module: str, names: list[ast.alias]) -> list[Path]:
+    """Files a relative import could name, as either a module or a package.
+
+    Both spellings are returned rather than resolved, because ``from .x import y``
+    is a module import when ``x.py`` exists and a package one when ``x/`` does;
+    the caller keeps whichever is a file, so a wrong guess costs nothing.
+    """
+    head = base
+    for part in (part for part in module.split(".") if part):
+        head = head / part
+    targets = [head.with_suffix(".py"), head / "__init__.py"]
+    for alias in names:
+        targets.append(head / f"{alias.name}.py")
+        targets.append(head / alias.name / "__init__.py")
+    return targets
+
+
 def _header(title: str) -> str:
     return f"# {title}\n\n"
 
@@ -701,19 +718,64 @@ class TestCostAndReach:
         # The structural half of the claim. A cost field reading zero is what a
         # provider that called out anyway would also report, so the assertion
         # that carries weight is that the code has no way to call out.
-        source = Path(analyzer.__file__).read_text(encoding="utf-8")
-        imported: set[str] = set()
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module or "")
-                imported.update(f"{node.module or ''}.{alias.name}" for alias in node.names)
-        for name in imported:
+        #
+        # Walked transitively across the engine's own modules, not just this
+        # file's own import list. The analyzer reaches the requirements index and
+        # the coverage check by design, so a forbidden import added to either of
+        # those is reachable from here -- and a direct-only audit would pass while
+        # the property it exists to protect had already been broken. The runtime
+        # trap below does not cover the gap either: it catches a socket, and a
+        # dependency that grew a child process or a model dispatch opens no socket
+        # in this process at all.
+        audited, imported = self._engine_import_closure(analyzer.__file__)
+        # The closure is the assertion's own subject, so an empty or single-module
+        # walk would make everything below vacuous.
+        assert len(audited) > 1, "the closure walk found no engine dependencies to audit"
+        for name, origin in sorted(imported):
             head = name.lstrip(".").split(".")[0]
-            assert head not in _FORBIDDEN_IMPORTS, f"{name} could reach outside the process"
+            assert head not in _FORBIDDEN_IMPORTS, (
+                f"{name} in {origin} could reach outside the process"
+            )
             parts = {part for part in name.lstrip(".").split(".") if part}
-            assert not parts & set(_FORBIDDEN_NAMES), f"{name} could reach a model or a session"
+            assert not parts & set(_FORBIDDEN_NAMES), (
+                f"{name} in {origin} could reach a model or a session"
+            )
+
+    @staticmethod
+    def _engine_import_closure(entry: str) -> tuple[set[Path], set[tuple[str, str]]]:
+        """Every engine module reachable from *entry*, and the imports they make.
+
+        Relative imports are resolved against the package directory and followed;
+        absolute imports are recorded and not followed, because the point is to
+        audit the code this app ships rather than the standard library.
+        """
+        root = Path(entry).resolve().parent
+        pending = [Path(entry).resolve()]
+        audited: set[Path] = set()
+        imported: set[tuple[str, str]] = set()
+        while pending:
+            current = pending.pop()
+            if current in audited or not current.is_file():
+                continue
+            audited.add(current)
+            tree = ast.parse(current.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported.add((alias.name, current.name))
+                elif isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    imported.add((module, current.name))
+                    for alias in node.names:
+                        imported.add((f"{module}.{alias.name}", current.name))
+                    if node.level:
+                        base = current.parent
+                        for _ in range(node.level - 1):
+                            base = base.parent
+                        for candidate in _relative_targets(base, module, node.names):
+                            if root in candidate.parents or candidate.parent == root:
+                                pending.append(candidate)
+        return audited, imported
 
     def test_a_full_pass_makes_no_network_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The runtime half. Every socket constructor becomes a trap, so a call

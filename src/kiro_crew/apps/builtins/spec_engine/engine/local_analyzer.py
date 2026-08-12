@@ -1063,7 +1063,9 @@ def analyze(corpus: Corpus) -> Outcome:
         findings.extend(check_qualifiers(texts))
         findings.extend(check_testability(texts))
     if index is not None and plan is not None:
-        findings.extend(check_coverage(index, plan, requirements_file=DocumentKind.TASKS.filename))
+        findings.extend(
+            check_coverage(index, plan, requirements_file=DocumentKind.REQUIREMENTS.filename)
+        )
     if index is not None:
         findings.extend(check_criteria_collisions(index, texts))
 
