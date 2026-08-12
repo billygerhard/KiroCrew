@@ -20,8 +20,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import HealthCheck, given
+from hypothesis import settings as hyp_settings
+from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine.budget import (
+    BudgetHalted,
     CapOutcome,
     DispatchOutcome,
     KillSwitch,
@@ -31,6 +35,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.budget import (
     SourceCap,
     SourceCaps,
     caps_for,
+    engage_kill_switch,
     format_credits,
     guard_for,
     resolve_source_cap,
@@ -53,6 +58,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     advance_watch,
 )
 
+from .conftest import make_spec_dir
 from .test_budget_ledger import backdate_run, seed_shard, turn
 
 CAPPED = "capped-source"
@@ -508,3 +514,147 @@ class TestTheGateFactory:
         # A switch resolved from anywhere else would be a stop these runs could
         # not see.
         assert gate.kill_switch.root == store.root
+
+
+#: Credit amounts a run can consume, as quarter-credit steps: exactly
+#: representable in binary, so a sum over them is the same number however it is
+#: accumulated. The property is about the cap rule, and amounts whose total
+#: depends on the summation algorithm would test that instead.
+_CREDITS = st.integers(min_value=0, max_value=160).map(lambda steps: steps / 4)
+
+#: Spend per source, as a list of run totals. Empty is a case: a source that has
+#: started nothing is under every cap.
+_RUN_SPEND = st.lists(_CREDITS, min_size=0, max_size=6)
+
+#: Cap amounts, on the same grid and never zero: a cap of zero is not a limit and
+#: the config schema refuses it.
+_LIMITS = st.integers(min_value=2, max_value=240).map(lambda steps: steps / 4)
+
+_SETTINGS = hyp_settings(
+    max_examples=40,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+
+
+class TestCapProperties:
+    """FOR ALL spend arrangements, a cap refuses exactly the source that reached it."""
+
+    @_SETTINGS
+    @given(
+        capped_spend=_RUN_SPEND,
+        other_spend=_RUN_SPEND,
+        limit=_LIMITS,
+        at_boundary=st.booleans(),
+    )
+    def test_a_source_dispatches_exactly_while_its_own_spend_is_under_its_own_cap(
+        self,
+        tmp_path_factory: Any,
+        capped_spend: list[float],
+        other_spend: list[float],
+        limit: float,
+        at_boundary: bool,
+    ) -> None:
+        # Some examples set the cap to exactly what the source consumed, so the
+        # boundary is generated rather than hoped for: without it the property holds
+        # just as well for a cap that refuses only *above* its number, which is one
+        # dispatch too many.
+        if at_boundary and sum(capped_spend) > 0:
+            limit = sum(capped_spend)
+        root = Path(tmp_path_factory.mktemp("caps"))
+        project = root / "project"
+        project.mkdir(parents=True, exist_ok=True)
+        make_spec_dir(project, "example")
+        ref = SpecRef.of(project, "example")
+        store = StateStore(root=root / "state")
+        config = ConfigStore(root / "config")
+        ledger_path = root / "tokens"
+        accounting = RunAccounting(store, ledger=MeteringLedger(ledger_path))
+        gate = SourceCaps(
+            store, config, accounting=accounting, kill_switch=KillSwitch(root / "switch")
+        )
+        # The capped source carries a cap; its neighbour carries a large one, so a
+        # control that stopped every source once one filled up is visible.
+        configure_caps(
+            config,
+            capped_source={"credits": limit, "period_days": 30},
+            other_source={"credits": 1000.0, "period_days": 30},
+        )
+        for index, amount in enumerate(capped_spend):
+            run_costing(store, ref, accounting, ledger_path, f"cap-{index}", CAPPED, amount)
+        for index, amount in enumerate(other_spend):
+            run_costing(store, ref, accounting, ledger_path, f"other-{index}", OTHER, amount)
+
+        decision = gate.authorize_dispatch(CAPPED)
+        neighbour = gate.authorize_dispatch(OTHER)
+
+        assert decision.allowed is (sum(capped_spend) < limit)
+        assert decision.consumed_credits == pytest.approx(sum(capped_spend))
+        # The neighbour's answer depends on its own spend and nothing else.
+        assert neighbour.allowed is (sum(other_spend) < 1000.0)
+
+    @_SETTINGS
+    @given(
+        states=st.lists(st.sampled_from(list(RunState)), min_size=1, max_size=6),
+        spend=_RUN_SPEND,
+    )
+    def test_no_run_may_open_a_turn_once_the_switch_is_engaged(
+        self,
+        tmp_path_factory: Any,
+        states: list[RunState],
+        spend: list[float],
+    ) -> None:
+        root = Path(tmp_path_factory.mktemp("stop"))
+        project = root / "project"
+        project.mkdir(parents=True, exist_ok=True)
+        make_spec_dir(project, "example")
+        ref = SpecRef.of(project, "example")
+        store = StateStore(root=root / "state")
+        config = ConfigStore(root / "config")
+        ledger_path = root / "tokens"
+        accounting = RunAccounting(store, ledger=MeteringLedger(ledger_path))
+        switch = KillSwitch(root / "switch")
+        for index, state in enumerate(states):
+            store.create_run(f"run-{index}", ref, state=state.value, source=CAPPED)
+        for index, amount in enumerate(spend):
+            accounting.stamp("run-0", f"run-0-session-{index}")
+        if spend:
+            seed_shard(
+                ledger_path,
+                date.today(),
+                [turn(f"run-0-session-{i}", amount) for i, amount in enumerate(spend)],
+            )
+
+        engage_kill_switch(
+            state=store,
+            config=config,
+            initiator="operator-1",
+            switch=switch,
+            accounting=accounting,
+        )
+
+        # Whatever states the runs were in, and whatever they had spent, not one of
+        # them may open another turn.
+        for index in range(len(states)):
+            guard = guard_for(
+                f"run-{index}",
+                ref,
+                state=store,
+                config=config,
+                accounting=accounting,
+                kill_switch=switch,
+            )
+            with pytest.raises(BudgetHalted):
+                guard.open_turn()
+        # And no source may claim new work while it is engaged.
+        assert gate_refuses_every_source(store, config, accounting, switch)
+
+
+def gate_refuses_every_source(
+    store: StateStore,
+    config: ConfigStore,
+    accounting: RunAccounting,
+    switch: KillSwitch,
+) -> bool:
+    gate = SourceCaps(store, config, accounting=accounting, kill_switch=switch)
+    return not any(gate.dispatch_allowed(source) for source in (CAPPED, OTHER, "never-configured"))
