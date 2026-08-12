@@ -80,9 +80,7 @@ _UNDISPLAYABLE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066
 #: The same set plus the whitespace controls prose is allowed to keep. A finding
 #: kind or a criterion identifier has no line breaks in it, so any that arrive
 #: are either a mistake or an attempt to make one audit line look like several.
-_UNPRINTABLE_IN_IDENTIFIER = re.compile(
-    r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]"
-)
+_UNPRINTABLE_IN_IDENTIFIER = re.compile(r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
 
 #: Cap on one displayed provider string. Provider output is unbounded input; a
 #: surface rendering it needs a ceiling that is not set by the provider.
@@ -443,6 +441,28 @@ class CapabilityResponse:
 
     def findings_for(self, severity: FindingSeverity) -> tuple[ProviderFinding, ...]:
         return tuple(finding for finding in self.findings if finding.severity is severity)
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return the JSON object a provider would send for this response.
+
+        The engine's own builtins never serialize — they hand back this object
+        directly — so this exists to hold them to the same published contract an
+        external provider is held to, over the same representation. Rendering it
+        here rather than at each caller is what keeps the bytes the schema
+        validates identical to the bytes a conformance report judges.
+        """
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "capability": self.capability,
+            "provider": {"name": self.provider_name},
+            "coverage": self.coverage.to_json_object(),
+            "findings": [finding.to_json_object() for finding in self.findings],
+            "cost": {"credits": self.cost_credits},
+            "result": dict(self.result),
+        }
+        if self.provider_version:
+            payload["provider"]["version"] = self.provider_version
+        return payload
 
 
 @dataclass(frozen=True)

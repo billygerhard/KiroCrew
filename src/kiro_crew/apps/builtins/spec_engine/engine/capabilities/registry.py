@@ -632,18 +632,7 @@ def _schema_reason(binding: Binding, errors: tuple[SchemaError, ...]) -> str:
 
 def _payload_from_response(response: CapabilityResponse) -> dict[str, Any]:
     """Render a builtin's response as the wire payload its schema describes."""
-    payload: dict[str, Any] = {
-        "schema_version": response.schema_version,
-        "capability": response.capability,
-        "provider": {"name": response.provider_name},
-        "coverage": response.coverage.to_json_object(),
-        "findings": [finding.to_json_object() for finding in response.findings],
-        "cost": {"credits": response.cost_credits},
-        "result": dict(response.result),
-    }
-    if response.provider_version:
-        payload["provider"]["version"] = response.provider_version
-    return payload
+    return response.to_wire()
 
 
 def _response_from_payload(capability: str, payload: Mapping[str, Any]) -> CapabilityResponse:
