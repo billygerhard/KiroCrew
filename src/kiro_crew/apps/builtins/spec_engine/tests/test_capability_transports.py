@@ -15,13 +15,15 @@ names, whichever transport carries it.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import pytest
 
-from kiro_crew import sandbox
+from kiro_crew import platform_compat, sandbox
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
     FINDING_PROVIDER_TIMEOUT,
     FINDING_PROVIDER_UNAVAILABLE,
@@ -106,6 +108,22 @@ def mcp_provider(tmp_path: Path) -> list[str]:
     return [sys.executable, str(script)]
 
 
+def _still_running(pid: int) -> bool:
+    """Whether *pid* still exists, without signalling it.
+
+    Signal 0 performs the permission and existence checks and delivers nothing.
+    A permission error means the pid is live and owned by someone else, which for
+    this purpose is still alive.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class TestChildSpawn:
     def test_the_request_reaches_the_child_on_standard_input(self, tmp_path: Path) -> None:
         recorder = tmp_path / "seen.json"
@@ -155,6 +173,42 @@ class TestChildSpawn:
         )
         assert outcome.timed_out
         assert outcome.exit_code is None
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX, reason="process groups are the POSIX mechanism"
+    )
+    def test_a_timed_out_child_takes_its_grandchild_with_it(self, tmp_path: Path) -> None:
+        """The claim the timeout path rests on, and the only one that leaks if false.
+
+        ``timed_out`` is set by the timeout branch whether or not the kill landed,
+        and the exit code is that branch's default, so the sibling assertions above
+        would hold for a kill that did nothing. What they cannot see is a surviving
+        process, which is why the child here starts one of its own: killing the
+        direct child alone leaves a grandchild holding the pipes, and a watcher
+        polling a hanging provider would accumulate one of those per timeout.
+        """
+        marker = tmp_path / "pids"
+        spawner = (
+            "import os, subprocess, sys, time\n"
+            "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(marker)!r}, 'w').write(f'{{os.getpid()}} {{kid.pid}}')\n"
+            "time.sleep(30)\n"
+        )
+
+        outcome = run_provider_child([sys.executable, "-c", spawner], stdin_text="", timeout_s=3)
+
+        assert outcome.timed_out
+        assert marker.is_file(), "the child never got far enough to start a grandchild"
+        pids = [int(entry) for entry in marker.read_text(encoding="utf-8").split()]
+        assert len(pids) == 2
+        # Polled rather than slept on: reaping is asynchronous, so a fixed pause
+        # would either be a slow test or a racy one.
+        deadline = time.monotonic() + 10.0
+        alive = [pid for pid in pids if _still_running(pid)]
+        while alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+            alive = [pid for pid in pids if _still_running(pid)]
+        assert not alive, f"processes survived the timeout: {alive}"
 
     def test_a_missing_program_fails_without_raising(self) -> None:
         outcome = run_provider_child(

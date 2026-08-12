@@ -10,12 +10,15 @@ nothing about the thing that could go wrong.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     DASHBOARD_SURFACE,
     DELIVERY_STAGES,
@@ -90,6 +93,17 @@ def configure(store: ConfigStore, document: dict[str, Any]) -> None:
 
 def recorded_argv(target: Path) -> list[str]:
     return list(json.loads(target.read_text(encoding="utf-8")))
+
+
+def _still_running(pid: int) -> bool:
+    """Whether *pid* still exists, without signalling it."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class TestUnconfiguredStages:
@@ -357,6 +371,49 @@ class TestExecutionOutcomes:
         assert result.outcome is StageOutcome.TIMED_OUT
         assert not result.ok
         assert "timeout" in result.reason
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX, reason="process groups are the POSIX mechanism"
+    )
+    def test_a_timed_out_stage_leaves_no_process_behind(
+        self, store: ConfigStore, workspace: Path, tmp_path: Path
+    ) -> None:
+        """The outcome enum says the stage timed out; it cannot say the work stopped.
+
+        Stage commands are whatever an operator configured -- a build, a push, a
+        deploy -- so one that outlives its timeout is not an idle process. It can
+        still be holding a worktree lock or writing to the tree the next stage is
+        about to read, and the enum above would look identical.
+        """
+        marker = tmp_path / "pids"
+        # No braces anywhere in this script: the executor substitutes {name}
+        # patterns and would refuse the stage for an unresolvable variable before
+        # running anything, which is the substitution guard doing its job.
+        spawner = (
+            "import os, subprocess, sys, time\n"
+            "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            "open(" + repr(str(marker)) + ", 'w').write(str(os.getpid()) + ' ' + str(kid.pid))\n"
+            "time.sleep(30)\n"
+        )
+        configure(
+            store,
+            {
+                "timeouts": {"stage_command_s": 3},
+                "workflow": {"stages": {"verify": [[sys.executable, "-c", spawner]]}},
+            },
+        )
+
+        result = StageExecutor(store).run("verify", context(workspace))
+
+        assert result.outcome is StageOutcome.TIMED_OUT
+        assert marker.is_file(), "the stage never got far enough to start a child"
+        pids = [int(entry) for entry in marker.read_text(encoding="utf-8").split()]
+        deadline = time.monotonic() + 10.0
+        alive = [pid for pid in pids if _still_running(pid)]
+        while alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+            alive = [pid for pid in pids if _still_running(pid)]
+        assert not alive, f"stage processes survived the timeout: {alive}"
 
     def test_captured_output_is_capped(self, store: ConfigStore, workspace: Path) -> None:
         oversized = MAX_CAPTURED_CHARS * 2
