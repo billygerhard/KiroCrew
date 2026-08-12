@@ -935,16 +935,24 @@ class StateStore:
         rows = self._query("SELECT * FROM approvals WHERE spec_key = ? ORDER BY gate", (ref.key,))
         return [_approval_record(row) for row in rows]
 
-    def set_approval_stale(self, ref: SpecRef, gate: str, stale: bool = True) -> bool:
+    def mark_approval_stale(self, ref: SpecRef, gate: str) -> bool:
         """Mark one gate's approval stale. False means no approval was recorded.
 
         A gate that was never approved is left untouched, so an edit cannot
         invent approval state for a gate nobody approved.
+
+        Staling is one-way and there is deliberately no primitive to undo it. An
+        approval goes stale because its document changed after a human approved
+        it, and the only honest way back is a fresh approval of what the document
+        says now. A clearing primitive would be the shortest path to an approval
+        that appears live for bytes nobody agreed to -- and after a revert to the
+        approved bytes, the flag is the sole surviving evidence that the document
+        moved at all.
         """
         with self._write() as conn:
             cursor = conn.execute(
-                "UPDATE approvals SET stale = ? WHERE spec_key = ? AND gate = ?",
-                (1 if stale else 0, ref.key, gate),
+                "UPDATE approvals SET stale = 1 WHERE spec_key = ? AND gate = ?",
+                (ref.key, gate),
             )
             return cursor.rowcount == 1
 

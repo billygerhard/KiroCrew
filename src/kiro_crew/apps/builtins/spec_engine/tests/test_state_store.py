@@ -156,7 +156,7 @@ class TestApprovals:
         self, store: StateStore, ref: SpecRef
     ) -> None:
         store.record_approval(ref, gate="design", actor="user:ada", doc_hash="hash-1")
-        store.set_approval_stale(ref, "design")
+        store.mark_approval_stale(ref, "design")
         assert store.get_approval(ref, "design").stale is True  # type: ignore[union-attr]
         store.record_approval(ref, gate="design", actor="policy:autonomy", doc_hash="hash-2")
         refreshed = store.get_approval(ref, "design")
@@ -170,7 +170,7 @@ class TestApprovals:
     def test_staling_a_gate_that_was_never_approved_changes_nothing(
         self, store: StateStore, ref: SpecRef
     ) -> None:
-        assert store.set_approval_stale(ref, "design") is False
+        assert store.mark_approval_stale(ref, "design") is False
         assert store.get_approval(ref, "design") is None
 
     def test_approvals_list_in_gate_order(self, store: StateStore, ref: SpecRef) -> None:

@@ -258,8 +258,30 @@ class TestMalformedAndUnknownInput:
             resolve(policy_for("delivery"))  # type: ignore[arg-type]
         assert raised.value.errors[0].path.endswith(AUTONOMY_FIELD)
 
-    def test_class_entry_that_is_not_an_object_falls_through_to_wildcards(self):
+    def test_class_entry_that_is_not_an_object_is_named_rather_than_skipped(self):
         grid = {"member": "delivery", WILDCARD_KEY: {WILDCARD_KEY: "execution"}}
+        with pytest.raises(ConfigValidationError) as caught:
+            resolve(policy_for(grid))
+        # The report names the row, because "your policy is malformed" sends an
+        # operator through a grid, and the path sends them to a line.
+        assert any("member" in error.path for error in caught.value.errors)
+
+    def test_a_malformed_specific_row_cannot_be_answered_by_a_broader_one(self):
+        # The direction that makes this a defect rather than a nuisance: the
+        # operator restricted an untrusted class, mistyped the row, and the
+        # wildcard beneath it permits more than they wrote. Falling through would
+        # read that mistake as permission to integrate.
+        grid = {
+            "external": "authoring",
+            WILDCARD_KEY: {WILDCARD_KEY: "integration"},
+        }
+        with pytest.raises(ConfigValidationError):
+            resolve(policy_for(grid), submitter_class="external")
+
+    def test_an_absent_class_row_still_falls_through(self):
+        # The legitimate case the raise must not swallow: no rule written here,
+        # so a broader cell answers.
+        grid = {WILDCARD_KEY: {WILDCARD_KEY: "execution"}}
         assert resolve(policy_for(grid)).level is AutonomyLevel.EXECUTION
 
     def test_sources_section_that_is_not_an_object_resolves_to_the_default(self):

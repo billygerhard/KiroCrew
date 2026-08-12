@@ -123,7 +123,7 @@ class TestSpecDirectoryPurity:
         elif operation == "approve":
             store.record_approval(ref, gate=value, actor=f"user:{value}", doc_hash=value)
         elif operation == "stale":
-            store.set_approval_stale(ref, value)
+            store.mark_approval_stale(ref, value)
         elif operation == "run":
             run_id = f"run-{index}"
             store.create_run(run_id, ref, state="queued", source=value)

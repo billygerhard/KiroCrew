@@ -203,8 +203,28 @@ class AutonomyPolicy:
 
         grid, base_path = self._grid(source)
         for class_key, type_key in _candidates(klass, spec_type):
-            by_type = grid.get(class_key)
-            if not isinstance(by_type, Mapping) or type_key not in by_type:
+            if class_key not in grid:
+                continue
+            by_type = grid[class_key]
+            if not isinstance(by_type, Mapping):
+                # An absent row and a malformed one are not the same question.
+                # Absent means the operator did not write a rule here, so a
+                # broader cell should answer. Malformed means they DID write one
+                # and it cannot be read -- and because the specific row is the
+                # restrictive one under class-first precedence, skipping it hands
+                # the decision to a wildcard that may permit more. A misplaced
+                # indent under a class name would then raise this run's authority
+                # instead of lowering it, which is the one direction a
+                # configuration mistake must never move.
+                raise ConfigValidationError(
+                    [
+                        ConfigError(
+                            f"{base_path}.{class_key}",
+                            "expected an object keyed by spec type",
+                        )
+                    ]
+                )
+            if type_key not in by_type:
                 continue
             path = f"{base_path}.{class_key}.{type_key}"
             return AutonomyDecision(

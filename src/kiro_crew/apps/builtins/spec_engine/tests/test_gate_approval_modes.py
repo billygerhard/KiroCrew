@@ -224,6 +224,29 @@ class TestInteractiveRuns:
         refused = [event for event in log.read(ref) if event.event == APPROVAL_REFUSED_EVENT]
         assert len(refused) == 1
 
+    def test_the_policy_cannot_approve_without_a_declared_mode(self, store, ref, log):
+        """An absent mode is not evidence of an unattended run.
+
+        The policy would cover this gate and carries the decision that authorizes
+        it, so the only thing missing is the run kind. Accepting it recorded a
+        policy approval whose audit trail could not say which kind of run made it,
+        which is the one thing that trail exists to distinguish.
+        """
+        decision = decision_for("integration")
+
+        outcome = approve(
+            store,
+            ref,
+            "requirements",
+            actor=policy_actor(decision),
+            decision=decision,
+            audit=log,
+        )
+
+        assert not outcome.ok
+        assert outcome.reason_codes == (REASON_HUMAN_REQUIRED,)
+        assert store.list_approvals(ref) == []
+
     def test_a_user_cannot_borrow_the_policy_identity(self, store, ref):
         """The reserved scheme is refused from the interactive path in both roles."""
         outcome = approve_interactive(

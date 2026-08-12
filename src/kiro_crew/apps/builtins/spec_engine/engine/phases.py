@@ -482,7 +482,7 @@ def sync_staleness(
         approval = gate.approval
         if approval is None or approval.stale or not gate.stale:
             continue
-        if store.set_approval_stale(ref, gate.gate):
+        if store.mark_approval_stale(ref, gate.gate):
             changed.append(gate.gate)
     if audit is not None:
         for gate_name in changed:
@@ -845,17 +845,29 @@ def _policy_actor_refusal(
     """Why the policy may not approve *gate* as *actor*, or ``None`` when it may.
 
     Three ways this refuses, and each closes a route by which an approval could be
-    credited to a policy that never authorized it: the run is interactive, where a
-    present user is the only approver; no decision was supplied, so there is
-    nothing to check the claim against; or the decision does not reach this gate,
-    either because it names another declaration or because its level does not
-    cover the gate.
+    credited to a policy that never authorized it: the run is not affirmatively
+    headless, where a present user is the only approver; no decision was supplied,
+    so there is nothing to check the claim against; or the decision does not reach
+    this gate, either because it names another declaration or because its level
+    does not cover the gate.
+
+    The mode test is positive rather than "not interactive" on purpose. An absent
+    mode is not evidence of an unattended run, but treating it as one recorded a
+    policy approval whose audit detail could not say which kind of run produced
+    it -- and the mode is how a reader of that trail later distinguishes a policy
+    that was allowed to act from one that was asked to.
     """
-    if mode is RunMode.INTERACTIVE:
+    if mode is not RunMode.HEADLESS:
         return Reason(
             code=REASON_HUMAN_REQUIRED,
             gate=gate,
             message=(
+                "The Autonomy_Policy approves only in a run declared headless; "
+                "this run did not declare one, so its approvals come from an "
+                "explicit user action."
+            )
+            if mode is None
+            else (
                 "This run is interactive, so its approvals come from an explicit "
                 "user action; the Autonomy_Policy is not an approver here."
             ),
