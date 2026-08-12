@@ -620,9 +620,7 @@ class RunMachine:
                 # because that is the only moment the previous state is still
                 # known. Leaving a park clears it, so a stale value cannot send a
                 # later resume somewhere the run never was.
-                payload[DETAIL_PARKED_FROM] = (
-                    from_state.value if to_state in PARKED_STATES else ""
-                )
+                payload[DETAIL_PARKED_FROM] = from_state.value if to_state in PARKED_STATES else ""
                 updated = self._store.update_run(run_id, state=to_state.value, detail=payload)
 
         # Audit outside the lock: the decision is already durable either way, and

@@ -25,7 +25,6 @@ from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.phases import content_hash
 from kiro_crew.apps.builtins.spec_engine.engine.review_queue import (
-    HUMAN_RESERVED_STATES,
     ArchivalRefused,
     ArchiveCause,
     QueueEntry,
@@ -155,15 +154,17 @@ class TestQueueProjection:
 
         held = set(queue.snapshot().run_ids)
 
-        # Every state is exercised, so this pins the membership rule in both
-        # directions: a state that should not queue appearing here is as much a
-        # failure as one that should and does not.
-        assert held == {f"run-{state.value}" for state in HUMAN_RESERVED_STATES}
+        # Spelled out rather than derived from HUMAN_RESERVED_STATES: an expected
+        # set built from the mapping under test moves with it, so widening the
+        # mapping to a state the engine drives itself would satisfy the assertion
+        # instead of failing it. Every state is parked, so this pins membership in
+        # both directions.
+        assert held == {"run-awaiting_review", "run-halted_budget", "run-stalled"}
 
     def test_each_entry_says_what_the_person_has_to_do(
         self, machine: RunMachine, queue: ReviewQueue, ref: SpecRef
     ) -> None:
-        for state in HUMAN_RESERVED_STATES:
+        for state in RunState:
             park(machine, ref, f"run-{state.value}", state)
 
         waiting = {entry.run_id: entry.waiting_on for entry in queue.snapshot()}
@@ -445,8 +446,7 @@ class TestReversible:
         recorded = [
             (event.event, event.initiator)
             for event in audit.read(ref)
-            if event.event
-            in (review_queue.SPEC_ARCHIVED_EVENT, review_queue.SPEC_UNARCHIVED_EVENT)
+            if event.event in (review_queue.SPEC_ARCHIVED_EVENT, review_queue.SPEC_UNARCHIVED_EVENT)
         ]
         assert recorded == [
             (review_queue.SPEC_ARCHIVED_EVENT, "user:someone"),

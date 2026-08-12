@@ -24,7 +24,6 @@ from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.review_queue import (
-    HUMAN_RESERVED_STATES,
     ArchivalRefused,
     ReviewQueue,
 )
@@ -41,6 +40,11 @@ from .conftest import make_spec_dir
 #: Each example drives several SQLite transactions against a real store, so keep
 #: the count modest rather than trading suite time for breadth.
 MAX_EXAMPLES = 50
+
+#: The states a run waits on a person in, named here rather than read from the
+#: engine's mapping: a property whose expectation is computed from the mapping it
+#: is checking moves with the mapping and stops being a check.
+WAITING_STATES = frozenset({RunState.AWAITING_REVIEW, RunState.HALTED_BUDGET, RunState.STALLED})
 
 #: The item the generated runs are attributed to, so a cancellation cascade in a
 #: sequence has something to match on.
@@ -132,7 +136,7 @@ def test_queue_membership_and_archival_hold_over_any_operation_sequence(
         # else: no transition, sweep, clock advance, or refused cause may move it.
         assert queue.is_archived(ref) is archived
         state = machine.state_of("run-1")
-        expected = state in HUMAN_RESERVED_STATES and not archived
+        expected = state in WAITING_STATES and not archived
         assert queue.holds("run-1") is expected
         # The projection agrees with itself: an entry exists exactly when the
         # membership rule says one should, and carries that state.
