@@ -435,3 +435,27 @@ class _StubConfig:
 
     def load(self) -> Any:
         return self._cfg
+
+
+class TestRouteRegistration:
+    """The handler must be reachable in the running dashboard, not just in
+    the private apps these tests build. Registration lives inline in
+    ``start_dashboard`` (no standalone route factory to invoke), so this
+    guard inspects that function's source the same way the repo's YAML
+    guard inspects call sites -- it fails if the ``add_post`` line for the
+    scan route is ever dropped."""
+
+    def test_facade_reexports_the_scan_handler(self) -> None:
+        from kiro_crew.dashboard import chat
+
+        assert chat.api_chat_folders_scan is api_chat_folders_scan
+
+    def test_start_dashboard_registers_the_scan_route(self) -> None:
+        import inspect
+
+        from kiro_crew.dashboard.server import start_dashboard
+
+        source = inspect.getsource(start_dashboard)
+        assert (
+            'add_post("/api/chat/folders/scan", chat.api_chat_folders_scan)' in source
+        ), "POST /api/chat/folders/scan is not registered in start_dashboard"
