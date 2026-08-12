@@ -293,9 +293,10 @@ class TestHaltAtTheCeiling:
             store, ref, accounting, machine, ceiling=5.0, notifier=notifier
         ).authorize_dispatch()
         message = notifier.messages()[0]
-        # "Budget exceeded" with no number tells an operator nothing actionable.
-        assert format_credits(6.0) in message
-        assert format_credits(5.0) in message
+        # "Budget exceeded" with no number tells an operator nothing actionable,
+        # and two numbers in the wrong order are worse than none: asserting the
+        # phrase rather than each number separately is what pins which is which.
+        assert f"consuming {format_credits(6.0)} of {format_credits(5.0)} credits" in message
         assert message == outcome.message
         detail = notifier.sent[0]["detail"]
         assert detail["consumed_credits"] == pytest.approx(6.0)
@@ -621,8 +622,7 @@ class TestWarningThreshold:
         assert record is not None
         assert record.state == RunState.EXECUTING.value
         message = notifier.messages()[0]
-        assert format_credits(4.5) in message
-        assert format_credits(5.0) in message
+        assert f"consumed {format_credits(4.5)} of {format_credits(5.0)}" in message
 
     def test_the_warning_is_sent_once_not_on_every_dispatch(
         self,

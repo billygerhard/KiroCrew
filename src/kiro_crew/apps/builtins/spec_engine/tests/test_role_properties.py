@@ -22,6 +22,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.roles import (
     RoleSource,
     SessionDefault,
     WorkKind,
+    model_supports_effort,
     role_for,
 )
 
@@ -73,7 +74,22 @@ def test_every_role_resolves_and_every_substitution_is_reported(
             # An assignment the profile made is used, not adjusted.
             assert resolved.model == assigned_model
             assert resolved.source is RoleSource.COST_PROFILE
-            assert resolved.agent == (assignment or {}).get("agent", "") or SESSION.agent
+            # The parentheses are load-bearing: without them the `or` binds
+            # after the `==`, the comparison is discarded, and a truthy session
+            # agent makes the whole assert unfailable.
+            assert resolved.agent == ((assignment or {}).get("agent", "") or SESSION.agent)
+            # The generator samples effort-capable and effort-incapable models
+            # on purpose, so the drop rule is what that sampling is for. Keying
+            # this off the model's capability rather than off the resolution's
+            # own dropped_effort is deliberate: a bug that moves both output
+            # fields together satisfies any assertion phrased in terms of them.
+            assigned_effort = (assignment or {}).get("effort", "")
+            if assigned_effort and not model_supports_effort(assigned_model):
+                assert not resolved.effort
+                assert resolved.dropped_effort == assigned_effort
+            else:
+                assert resolved.effort == assigned_effort
+                assert not resolved.dropped_effort
         else:
             # Anything else fell back, and saying so is the requirement.
             assert resolved.model == SESSION.model

@@ -579,6 +579,32 @@ class TestCostAttribution:
         registry_with(store, transport, cost_sink=sink).invoke(request_for(run="run-9"))
         assert sink.total_for("run-9") == 0.0
 
+    def test_an_invalid_response_is_not_billed_for_the_cost_it_declares(
+        self, store: ConfigStore
+    ) -> None:
+        """A refused response is refused whole, cost included.
+
+        The transport-failure case cannot reach this: no payload exists, so
+        nothing could be read out of one. Here the payload is present, fails the
+        schema, and still names a price. Billing it would let a provider that
+        answers invalidly on purpose charge for every degraded call, which is a
+        cheaper attack than answering well.
+        """
+        bind(store, "analysis", transport=TRANSPORT_COMMAND, command=["greedy-analyzer"])
+        expensive = response_payload("analysis", cost={"credits": 99.0})
+        expensive.pop("coverage")
+        transport = StubTransport(payload=expensive)
+        sink = RecordingCostSink()
+
+        result = registry_with(store, transport, cost_sink=sink).invoke(request_for(run="run-10"))
+
+        assert result.degraded
+        assert result.degradation is not None
+        assert result.degradation.finding_id == FINDING_RESPONSE_INVALID
+        assert result.cost_credits == pytest.approx(0.0)
+        assert sink.attributed == []
+        assert sink.total_for("run-10") == 0.0
+
 
 class TestAuditRecord:
     def test_a_completed_call_records_provider_transport_coverage_and_degradation(
