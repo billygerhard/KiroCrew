@@ -636,6 +636,41 @@ class TestAuditRecord:
         assert detail["findings"] == 1
         assert "provider prose" not in repr(detail)
 
+    def test_the_short_provider_fields_are_sanitized_where_they_are_transcribed(
+        self, store: ConfigStore
+    ) -> None:
+        # Findings are counted rather than transcribed, but coverage is copied
+        # through, so the identifier-shaped fields the wrapper does not carry are
+        # the ones that actually reach a reader. Control characters are the payload
+        # that matters here: they are how provider text rewrites the line around it
+        # in a terminal reading the log.
+        bind(store, "analysis", transport=TRANSPORT_COMMAND, command=["analyzer"])
+        transport = StubTransport(
+            payload=response_payload(
+                "analysis",
+                coverage={
+                    "processed": ["13.1\r\x1b[2Kforged line"],
+                    "skipped": [{"item": "26.1\x00", "reason": "unreadable"}],
+                },
+            )
+        )
+
+        result = registry_with(store, transport).invoke(request_for())
+        rendered = result.coverage.to_json_object()
+
+        # Assert on the values, not on repr() of them: repr escapes control
+        # characters into printable sequences, so a check against repr passes
+        # whether or not the sanitizing happened.
+        processed = rendered["processed"]
+        skipped_items = [entry["item"] for entry in rendered["skipped"]]
+        for text in [*processed, *skipped_items]:
+            assert "\x1b" not in text
+            assert "\x00" not in text
+            assert "\r" not in text
+        # The identifiers themselves survive -- sanitizing is not redaction.
+        assert any("13.1" in text for text in processed)
+        assert any("26.1" in text for text in skipped_items)
+
 
 class TestBuiltinReplacement:
     def test_a_registered_builtin_takes_over_from_the_shipped_default(

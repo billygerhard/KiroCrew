@@ -277,6 +277,16 @@ class TestTypeAlgebra:
         assert Num().check(False, "f")
         assert Bool().check(1, "f")
 
+    def test_a_non_finite_number_is_refused_because_bounds_cannot_refuse_it(self) -> None:
+        # json.loads accepts these and JSON Schema cannot express them, so
+        # published and enforced would disagree. Bounds are no defence: infinity
+        # satisfies any minimum, and NaN satisfies every comparison by failing
+        # all of them. A declared cost of infinity passes a "greater than zero"
+        # spend guard and poisons every total it is added to.
+        for hostile in (float("inf"), float("-inf"), float("nan")):
+            assert Num().check(hostile, "f")
+            assert Num(minimum=0.0).check(hostile, "f")
+
     def test_numeric_bounds_are_enforced_and_published(self) -> None:
         spec = Int(minimum=1, maximum=3)
         assert spec.check(0, "f")

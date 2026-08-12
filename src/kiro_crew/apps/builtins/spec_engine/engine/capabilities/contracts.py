@@ -8,13 +8,22 @@ than which calls exist.
 
 Three types here carry more weight than their size suggests.
 
-:class:`Untrusted` wraps every string a provider authored. It has no ``__str__``,
+:class:`Untrusted` wraps the prose a provider authored. It has no ``__str__``,
 so provider text cannot slip into an f-string, a log line, or a command template
 by looking like a ``str``; a caller that wants the characters asks for them with
 :meth:`Untrusted.for_display`, which is a display path and nothing else. The
 guarantee the engine owes is that provider output is data — stored, shown, never
 executed or read as instructions — and a wrapper type is how that becomes a
 property the type checker holds rather than a habit each call site remembers.
+
+The wrapper is not universal, and the exception is deliberate. A handful of
+provider fields are short and identifier-shaped — a finding's kind, a criterion
+identifier in a coverage list — and the engine compares and routes on them, so
+wrapping them would put a display call on the matching path. Those stay plain
+strings and are put through :func:`sanitized` where they enter an audit record or
+a label. The property is that no provider-authored text reaches a human
+unsanitized; where that happens differs by field, and a field that is not wrapped
+is not therefore trusted.
 
 :class:`Coverage` makes partial work visible. A provider that examined the
 requirements and skipped the design has not analyzed the spec, and a response
@@ -67,6 +76,13 @@ FINDING_ENGINE_FLOOR_BINDING = "capability.engine_floor_binding"
 #: misrepresent itself once rendered: one can rewrite a terminal line, the other
 #: can reverse the reading order of what follows it.
 _UNDISPLAYABLE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
+
+#: The same set plus the whitespace controls prose is allowed to keep. A finding
+#: kind or a criterion identifier has no line breaks in it, so any that arrive
+#: are either a mistake or an attempt to make one audit line look like several.
+_UNPRINTABLE_IN_IDENTIFIER = re.compile(
+    r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]"
+)
 
 #: Cap on one displayed provider string. Provider output is unbounded input; a
 #: surface rendering it needs a ceiling that is not set by the provider.
@@ -143,6 +159,31 @@ class Untrusted:
 
     def __repr__(self) -> str:  # pragma: no cover - display only
         return f"Untrusted({self.for_display(limit=64)!r})"
+
+
+def sanitized(text: str, *, limit: int = MAX_DISPLAY_CHARS) -> str:
+    """Render provider-authored text that is not carried in :class:`Untrusted`.
+
+    A few provider fields are short and identifier-shaped -- a finding's kind, a
+    criterion identifier in a coverage list -- and are compared and routed on as
+    plain strings rather than wrapped, because wrapping a value the engine
+    matches against would put ``for_display`` on the matching path.
+
+    The schema constrains them to non-empty strings and nothing more, so their
+    contents are still whatever a provider sent. They pass through this on the
+    way into an audit record or a label, which is the same treatment
+    :meth:`Untrusted.for_display` gives, so being unwrapped changes where the
+    sanitizing happens and not whether it happens.
+
+    Stricter than the prose path in one respect: line breaks and tabs go too.
+    :meth:`Untrusted.for_display` keeps them because prose legitimately contains
+    them, but an identifier does not, and a carriage return is how a value
+    overwrites the line printed before it in a terminal reading the log.
+    """
+    cleaned = _UNPRINTABLE_IN_IDENTIFIER.sub("", text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + DISPLAY_TRUNCATION_NOTICE
 
 
 class FindingSeverity(str, Enum):
@@ -310,7 +351,7 @@ class SkippedItem:
     reason: Untrusted
 
     def to_json_object(self) -> dict[str, Any]:
-        return {"item": self.item, "reason": self.reason.for_display()}
+        return {"item": sanitized(self.item), "reason": self.reason.for_display()}
 
 
 @dataclass(frozen=True)
@@ -327,7 +368,7 @@ class Coverage:
 
     def to_json_object(self) -> dict[str, Any]:
         return {
-            "processed": list(self.processed),
+            "processed": [sanitized(entry) for entry in self.processed],
             "skipped": [item.to_json_object() for item in self.skipped],
         }
 
@@ -370,7 +411,7 @@ class ProviderFinding:
 
     def to_json_object(self) -> dict[str, Any]:
         record: dict[str, Any] = {
-            "kind": self.kind,
+            "kind": sanitized(self.kind),
             "severity": self.severity.value,
             "message": self.message.for_display(),
             "refs": list(self.refs),

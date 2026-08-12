@@ -161,6 +161,15 @@ def run_provider_child(
     except (OSError, ValueError) as exc:
         _remove_launcher(cleanup)
         return ChildOutcome(start_error=f"cannot run {argv[0]!r}: {exc}")
+    except BaseException:
+        # Everything else the spawn can raise, which is not nothing: a failing
+        # resource-limit preexec surfaces as SubprocessError rather than OSError,
+        # and an interrupt arriving mid-spawn is not an error at all. Both left
+        # the launcher script on disk, and the caller that would have removed it
+        # is the one being unwound. Re-raised unchanged -- this is about the file,
+        # not about swallowing the failure.
+        _remove_launcher(cleanup)
+        raise
     try:
         try:
             stdout, stderr = started.communicate(input=stdin_text, timeout=timeout_s)

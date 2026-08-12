@@ -27,6 +27,7 @@ fields whose meaning changed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..config import DELEGABLE_CAPABILITIES
@@ -148,7 +149,15 @@ class Int(TypeSpec):
 
 @dataclass(frozen=True)
 class Num(TypeSpec):
-    """A number. An int is accepted and widened, since JSON has one numeric type."""
+    """A number. An int is accepted and widened, since JSON has one numeric type.
+
+    Finite, and that is part of the contract rather than a detail. ``json.loads``
+    accepts ``NaN`` and ``Infinity``, JSON Schema has no way to express them, and
+    bounds cannot reject them -- infinity satisfies any minimum, and NaN satisfies
+    every comparison by failing all of them. Left alone, the schema published to
+    providers would be stricter than the one enforced, which is the drift this
+    module exists to prevent.
+    """
 
     minimum: float | None = None
     maximum: float | None = None
@@ -156,7 +165,10 @@ class Num(TypeSpec):
     def check(self, value: Any, path: str) -> list[SchemaError]:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return [SchemaError(path, "expected a number")]
-        return _bounds(float(value), self.minimum, self.maximum, path)
+        widened = float(value)
+        if not isfinite(widened):
+            return [SchemaError(path, "expected a finite number")]
+        return _bounds(widened, self.minimum, self.maximum, path)
 
     def json_schema(self) -> dict[str, Any]:
         return _with_bounds({"type": "number"}, self.minimum, self.maximum)
