@@ -19,10 +19,20 @@ who never looked.
 Autonomy buys no leniency. The same invalid document is refused with the same
 reasons and the same rule identifiers whether a user or a fully-autonomous policy
 asked, because both go through one approval path and its validation.
+
+The execution gate is the same claim at the point where it costs the most. A
+policy that permits everything is refused on exactly the reasons a policy that
+permits nothing is refused on, because the gate asks whether the spec is
+executable before it asks who may start it, and the first question never sees the
+policy. Both outcomes are audited with the initiator -- a person's identity or the
+policy's declaration -- and a refusal never records the policy's reserved approver
+identity, which would make the trail claim an authorization that never happened.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -31,7 +41,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine import rules
-from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
+from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditEvent, AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
     AUTONOMY_FIELD,
     AutonomyDecision,
@@ -45,10 +55,17 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     APPROVAL_REFUSED_EVENT,
     APPROVER_POLICY,
     APPROVER_USER,
+    EXECUTION_GATE,
+    EXECUTION_REFUSED_EVENT,
+    EXECUTION_STARTED_EVENT,
+    INITIATOR_POLICY,
+    INITIATOR_USER,
     POLICY_ACTOR_SCHEME,
     REASON_APPROVAL_MISSING,
+    REASON_APPROVAL_STALE,
     REASON_DOCUMENT_INVALID,
     REASON_HUMAN_REQUIRED,
+    REASON_TASKS_PLAN_INVALID,
     Phase,
     RunMode,
     advance,
@@ -60,14 +77,22 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     gate_is_policy_covered,
     is_policy_actor,
     policy_actor,
+    policy_authorizes_execution,
     policy_declaration,
     policy_level_for_gate,
+    request_execution,
     sync_staleness,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    LockLost,
+    SpecLocked,
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 
 from .conftest import make_spec_dir, spec_dir_snapshot
-from .test_phases import SPEC_NAME, write_spec
+from .test_phases import SPEC_NAME, approve_gates, edit, write_spec
 
 SOURCE = "tracker"
 USER = "user:ada"
@@ -105,9 +130,59 @@ def log(tmp_path: Path) -> AuditLog:
 
 
 @pytest.fixture()
-def ref(tmp_path: Path) -> SpecRef:
+def project_tree(tmp_path: Path) -> Path:
+    """A project holding one spec whose three documents are real and format-clean."""
+    return write_spec(tmp_path / "workspace")
+
+
+@pytest.fixture()
+def ref(project_tree: Path) -> SpecRef:
     """A spec whose three documents are real and format-clean."""
-    return SpecRef.of(write_spec(tmp_path / "workspace"), SPEC_NAME)
+    return SpecRef.of(project_tree, SPEC_NAME)
+
+
+def settle_plan(
+    store: StateStore,
+    ref: SpecRef,
+    *,
+    decision: AutonomyDecision | None = None,
+    user: str = USER,
+) -> None:
+    """Approve every document gate, leaving authority as the only open question."""
+    for gate in DOCUMENT_GATES:
+        outcome = (
+            approve_by_policy(store, ref, gate, decision=decision)
+            if decision is not None
+            else approve(store, ref, gate, actor=user)
+        )
+        assert outcome.ok, [str(reason) for reason in outcome.reasons]
+
+
+def mutate_tasks(project: Path, transform, *, name: str = SPEC_NAME) -> None:
+    """Rewrite tasks.md through *transform*, leaving the other documents alone."""
+    path = project / ".kiro" / "specs" / name / DocumentKind.TASKS.filename
+    path.write_text(transform(path.read_text(encoding="utf-8")), encoding="utf-8")
+
+
+def break_task_reference(text: str) -> str:
+    """Point one leaf's criteria reference at a requirement that does not exist.
+
+    Format-neutral on purpose: tasks.md still satisfies every native rule, so the
+    defect is only visible by reading requirements.md as well.
+    """
+    mutated, count = re.subn(r"_Requirements: [^_]*_", "_Requirements: 99.1_", text, count=1)
+    assert count == 1, "tasks.md carries no criteria reference to break"
+    return mutated
+
+
+def cycle_the_graph(text: str) -> str:
+    """Give the waves graph a two-task dependency cycle, leaving the format valid."""
+    block = re.search(r"```json\n(.*?)\n```", text, re.S)
+    assert block is not None, "tasks.md carries no dependency graph block"
+    graph = json.loads(block.group(1))
+    first, second = graph["waves"][0]["tasks"][:2]
+    graph["dependencies"] = {first: [second], second: [first]}
+    return text[: block.start(1)] + json.dumps(graph) + text[block.end(1) :]
 
 
 # --- Gate coverage ---------------------------------------------------------
@@ -425,6 +500,480 @@ class TestValidationParity:
         approve_by_policy(store, ref, "tasks", decision=decision_for(None))
 
         assert spec_dir_snapshot(spec_dir) == before
+
+
+# --- The execution gate ----------------------------------------------------
+
+
+def started_events(log: AuditLog, ref: SpecRef) -> list[AuditEvent]:
+    return [event for event in log.read(ref) if event.event == EXECUTION_STARTED_EVENT]
+
+
+def refused_events(log: AuditLog, ref: SpecRef) -> list[AuditEvent]:
+    return [event for event in log.read(ref) if event.event == EXECUTION_REFUSED_EVENT]
+
+
+def initiator_of(event: AuditEvent) -> str:
+    """The event's recorded initiator, asserted present.
+
+    An audited outcome with no initiator is the defect the assertion is here to
+    catch: the trail would say execution was refused or started and not by whom.
+    """
+    assert event.initiator is not None
+    return event.initiator
+
+
+class TestExecutionAuthority:
+    """Who may start execution, once the spec itself is executable."""
+
+    def test_a_human_reserved_run_waits_for_an_explicit_human_action(self, store, ref, log):
+        """An unconfigured source reserves execution, so nobody asking means nobody starts."""
+        decision = decision_for(None)
+        settle_plan(store, ref)
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert not outcome.ok
+        assert outcome.reason_codes == (REASON_HUMAN_REQUIRED,)
+        assert outcome.reasons[0].gate == EXECUTION_GATE
+        assert outcome.human_reserved
+        assert outcome.started_ts is None
+        assert not started_events(log, ref)
+
+    def test_a_configured_authoring_level_also_reserves_execution(self, store, ref, log):
+        """Presence means exactly what it says; nothing rounds up to the next rung."""
+        settle_plan(store, ref)
+
+        outcome = request_execution(store, ref, decision=decision_for("authoring"), audit=log)
+
+        assert not outcome.ok
+        assert outcome.reason_codes == (REASON_HUMAN_REQUIRED,)
+        assert not started_events(log, ref)
+
+    def test_an_explicit_human_action_starts_a_human_reserved_run(self, store, ref, log):
+        settle_plan(store, ref)
+
+        outcome = request_execution(store, ref, decision=decision_for(None), user=USER, audit=log)
+
+        assert outcome.ok, [str(reason) for reason in outcome.reasons]
+        assert outcome.human_reserved
+        assert outcome.initiator == USER
+        assert outcome.initiator_kind == INITIATOR_USER
+        assert not outcome.by_policy
+
+    def test_an_authorized_policy_starts_with_no_further_trigger(self, store, ref, log):
+        """One call is the whole gate: no second request, no trigger event, no human."""
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert outcome.ok, [str(reason) for reason in outcome.reasons]
+        assert outcome.by_policy
+        assert not outcome.human_reserved
+        assert outcome.initiator == policy_actor(decision)
+        assert outcome.initiator_kind == INITIATOR_POLICY
+        assert derive_phase(store, ref).phase is Phase.READY
+
+    def test_every_level_from_execution_upward_starts_unattended(self, store, log, tmp_path):
+        for level in ("execution", "delivery", "integration"):
+            project = write_spec(tmp_path / f"level-{level}")
+            spec = SpecRef.of(project, SPEC_NAME)
+            decision = decision_for(level)
+            settle_plan(store, spec, decision=decision)
+
+            outcome = request_execution(store, spec, decision=decision, audit=log)
+
+            assert outcome.ok, [str(reason) for reason in outcome.reasons]
+            assert outcome.by_policy
+
+    def test_a_human_may_start_a_run_the_policy_already_authorizes(self, store, ref, log):
+        """Authority to proceed unasked is not a monopoly on asking."""
+        decision = decision_for("integration")
+        settle_plan(store, ref, decision=decision)
+
+        outcome = request_execution(store, ref, decision=decision, user=USER, audit=log)
+
+        assert outcome.ok
+        assert outcome.initiator == USER
+        assert not outcome.by_policy
+        assert [event.initiator for event in started_events(log, ref)] == [USER]
+
+    def test_a_permissive_but_undeclared_decision_cannot_start_execution(self, store, ref, log):
+        """A level with no declaration behind it is the unconfigured default's shape.
+
+        Nothing in configuration produces this today. It is what a resolver whose
+        unconfigured default moved up the ladder would produce, and the gate has to
+        refuse it: an install that configured nothing must never execute unattended,
+        so authority asks for a declaration and not only for a rung.
+        """
+        undeclared = AutonomyDecision(
+            level=AutonomyLevel.INTEGRATION,
+            source=SOURCE,
+            spec_type="feature",
+            submitter_class="member",
+        )
+        settle_plan(store, ref)
+
+        assert undeclared.permits(AutonomyLevel.EXECUTION)
+        assert not policy_authorizes_execution(undeclared)
+
+        outcome = request_execution(store, ref, decision=undeclared, audit=log)
+
+        assert not outcome.ok
+        assert outcome.reason_codes == (REASON_HUMAN_REQUIRED,)
+        assert not started_events(log, ref)
+
+    def test_a_forged_human_initiator_is_refused_where_the_policy_would_have_started(
+        self, store, ref, log
+    ):
+        """The reserved scheme is engine-issued, so no person can be wearing one."""
+        decision = decision_for("integration")
+        settle_plan(store, ref, decision=decision)
+
+        outcome = request_execution(
+            store, ref, decision=decision, user=policy_actor(decision), audit=log
+        )
+
+        assert not outcome.ok
+        assert outcome.reason_codes == (REASON_HUMAN_REQUIRED,)
+        assert not started_events(log, ref)
+        assert not is_policy_actor(outcome.initiator)
+
+    def test_an_empty_initiator_is_a_driver_bug(self, store, ref, log):
+        """Either a request names a human or it names none; blank is neither."""
+        settle_plan(store, ref)
+
+        for blank in ("", "   "):
+            with pytest.raises(ValueError):
+                request_execution(store, ref, decision=decision_for(None), user=blank, audit=log)
+        assert not started_events(log, ref)
+
+
+class TestExecutionRefusesRegardlessOfPolicy:
+    """The load-bearing direction: the most permissive policy is refused the same.
+
+    Each test here configures integration -- every rung the ladder has -- and then
+    breaks something about the spec. The permissive path is exactly where a
+    wildcard fallthrough would hide, so it is the path under test rather than the
+    restrictive one.
+    """
+
+    def test_a_missing_approval_refuses_under_a_policy_that_permits_everything(
+        self, store, ref, log
+    ):
+        decision = decision_for("integration")
+        approve_gates(store, ref, "requirements", "design")  # tasks left unapproved
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert not outcome.ok
+        assert REASON_APPROVAL_MISSING in outcome.reason_codes
+        assert not outcome.human_reserved  # the policy is permissive; the gate still refused
+        assert not started_events(log, ref)
+
+    def test_a_stale_approval_refuses_under_a_policy_that_permits_everything(
+        self, store, ref, project_tree, log
+    ):
+        decision = decision_for("integration")
+        settle_plan(store, ref, decision=decision)
+        edit(project_tree, DocumentKind.REQUIREMENTS)
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert not outcome.ok
+        assert REASON_APPROVAL_STALE in outcome.reason_codes
+        assert not started_events(log, ref)
+
+    def test_an_invalid_document_refuses_under_a_policy_that_permits_everything(
+        self, store, project, log
+    ):
+        """conftest's project holds title-only documents: real files, invalid format."""
+        spec = SpecRef.of(project, "example")
+
+        outcome = request_execution(store, spec, decision=decision_for("integration"), audit=log)
+
+        assert not outcome.ok
+        assert REASON_DOCUMENT_INVALID in outcome.reason_codes
+        assert rules.SECTION_MISSING in outcome.rule_ids
+        assert outcome.report is not None and not outcome.report.ok
+        assert not started_events(log, spec)
+
+    def test_an_unresolvable_criteria_reference_refuses_execution(
+        self, store, ref, project_tree, log
+    ):
+        """tasks.md is format-clean, so only reading requirements.md finds this."""
+        decision = decision_for("integration")
+        mutate_tasks(project_tree, break_task_reference)
+        settle_plan(store, ref, decision=decision)
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert not outcome.ok
+        assert REASON_TASKS_PLAN_INVALID in outcome.reason_codes
+        assert rules.TASK_REFERENCE_REQUIREMENT_UNKNOWN in outcome.rule_ids
+        assert not started_events(log, ref)
+
+    def test_a_cyclic_dependency_graph_refuses_execution(self, store, ref, project_tree, log):
+        """The orchestrator dispatches this graph wave by wave; a cycle has no order."""
+        decision = decision_for("integration")
+        mutate_tasks(project_tree, cycle_the_graph)
+        settle_plan(store, ref, decision=decision)
+
+        outcome = request_execution(store, ref, decision=decision, audit=log)
+
+        assert not outcome.ok
+        assert REASON_TASKS_PLAN_INVALID in outcome.reason_codes
+        assert rules.GRAPH_CYCLE in outcome.rule_ids
+        assert not started_events(log, ref)
+
+    def test_an_explicit_human_action_cannot_override_a_blocked_spec(self, store, ref, log):
+        """A person asking is authority to start, never permission to skip the plan."""
+        approve_gates(store, ref, "requirements")
+
+        outcome = request_execution(
+            store, ref, decision=decision_for("integration"), user=USER, audit=log
+        )
+
+        assert not outcome.ok
+        assert REASON_APPROVAL_MISSING in outcome.reason_codes
+        assert not started_events(log, ref)
+
+    def test_the_reasons_a_spec_is_unexecutable_do_not_depend_on_the_policy(
+        self, store, ref, log, tmp_path
+    ):
+        """Same broken spec, every rung: one identical list of blocking reasons."""
+        approve_gates(store, ref, "requirements", "design")
+        seen = set()
+
+        for level in (None, *AUTONOMY_LEVELS):
+            outcome = request_execution(store, ref, decision=decision_for(level), audit=log)
+            seen.add(tuple(code for code in outcome.reason_codes if code != REASON_HUMAN_REQUIRED))
+
+        assert seen == {(REASON_APPROVAL_MISSING,)}
+
+
+class TestExecutionAudit:
+    """Both outcomes are recorded, and the initiator is what makes them readable."""
+
+    def test_a_started_execution_records_its_initiator_and_timestamp(self, store, ref, log):
+        settle_plan(store, ref)
+
+        outcome = request_execution(store, ref, decision=decision_for(None), user=USER, audit=log)
+
+        events = started_events(log, ref)
+        assert len(events) == 1
+        assert events[0].initiator == USER
+        assert events[0].ts == outcome.started_ts
+        assert events[0].ts.endswith("+00:00")
+        assert events[0].detail is not None
+        assert events[0].detail["initiator_kind"] == INITIATOR_USER
+        assert events[0].detail["human_reserved"] is True
+        assert events[0].detail["autonomy_level"] == AutonomyLevel.AUTHORING.value
+
+    def test_an_autonomous_start_records_the_declaration_that_authorized_it(self, store, ref, log):
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        request_execution(store, ref, decision=decision, audit=log)
+
+        event = started_events(log, ref)[0]
+        assert event.initiator == policy_actor(decision)
+        assert is_policy_actor(event.initiator)
+        assert policy_declaration(event.initiator) == decision.declared_at
+        assert event.detail is not None
+        assert event.detail["initiator_kind"] == INITIATOR_POLICY
+        assert event.detail["policy_declared_at"] == decision.declared_at
+        assert event.detail["human_reserved"] is False
+
+    def test_a_refused_request_records_its_initiator_and_reasons(self, store, ref, log):
+        approve_gates(store, ref, "requirements")
+
+        request_execution(store, ref, decision=decision_for(None), user=USER, audit=log)
+
+        events = refused_events(log, ref)
+        assert len(events) == 1
+        assert events[0].initiator == USER
+        assert events[0].detail is not None
+        assert events[0].detail["gate"] == EXECUTION_GATE
+        codes = [reason["code"] for reason in events[0].detail["reasons"]]
+        assert REASON_APPROVAL_MISSING in codes
+
+    @pytest.mark.parametrize(
+        "level, blocked",
+        [
+            (None, False),
+            ("authoring", False),
+            ("integration", True),
+        ],
+    )
+    def test_a_refusal_never_records_the_policys_approver_identity(
+        self, store, log, tmp_path, level, blocked
+    ):
+        """Every way a request is refused, in the one field a reader scans.
+
+        ``scheme:path`` means the policy authorized something. A refusal wearing it
+        would make an operator auditing what autonomy let through find a gate the
+        policy never opened -- including the case that matters most, a policy that
+        *did* authorize execution whose spec was refused on validation.
+        """
+        project = write_spec(tmp_path / f"refusal-{level}-{blocked}")
+        spec = SpecRef.of(project, SPEC_NAME)
+        decision = decision_for(level)
+        if not blocked:
+            settle_plan(store, spec, user="user:grace")
+
+        outcome = request_execution(store, spec, decision=decision, audit=log)
+
+        assert not outcome.ok
+        event = refused_events(log, spec)[0]
+        assert not is_policy_actor(initiator_of(event))
+        assert not is_policy_actor(outcome.initiator)
+        assert event.initiator == outcome.initiator
+        assert event.detail is not None
+        # The declaration stays legible even though the scheme is not borrowed.
+        assert event.detail["policy_declared_at"] == (decision.declared_at or None)
+
+    def test_a_forged_initiator_is_not_recorded_as_an_approver(self, store, ref, log):
+        decision = decision_for("integration")
+        settle_plan(store, ref, decision=decision)
+
+        request_execution(store, ref, decision=decision, user=policy_actor(decision), audit=log)
+
+        event = refused_events(log, ref)[0]
+        assert not is_policy_actor(initiator_of(event))
+
+    def test_a_refused_policy_approval_is_not_recorded_as_an_approver(self, store, ref, log):
+        """The same rule on the approval path: a configured level too low to approve."""
+        outcome = approve_by_policy(store, ref, "requirements", decision=decision_for("authoring"))
+        assert not outcome.ok
+
+        approve_by_policy(store, ref, "requirements", decision=decision_for("authoring"), audit=log)
+
+        refused = [event for event in log.read(ref) if event.event == APPROVAL_REFUSED_EVENT]
+        assert refused and not any(is_policy_actor(initiator_of(e)) for e in refused)
+
+    def test_an_audit_failure_fails_the_request(self, store, ref, log, monkeypatch):
+        """An execution nobody could record must not begin: the append is the record."""
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        def unwritable(*args, **kwargs):
+            raise StatePersistenceError("audit log is unwritable")
+
+        monkeypatch.setattr(log, "append", unwritable)
+
+        with pytest.raises(StatePersistenceError):
+            request_execution(store, ref, decision=decision, audit=log)
+
+    def test_the_gate_writes_nothing_into_the_spec_directory(self, store, ref, log):
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+        before = spec_dir_snapshot(ref.spec_dir)
+
+        request_execution(store, ref, decision=decision, audit=log)
+        request_execution(store, ref, decision=decision_for(None), audit=log)
+
+        assert spec_dir_snapshot(ref.spec_dir) == before
+
+
+class TestExecutionSerialisation:
+    """Two drivers must not both start one spec."""
+
+    def test_a_second_writer_is_rejected_while_the_spec_is_locked(self, store, ref, log):
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        with store.lock(ref, owner="other-session"):
+            with pytest.raises(SpecLocked):
+                request_execution(store, ref, decision=decision, audit=log)
+
+        assert not started_events(log, ref)
+
+    def test_a_request_may_reuse_a_lock_its_caller_already_holds(self, store, ref, log):
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        with store.lock(ref, owner="driver") as handle:
+            outcome = request_execution(store, ref, decision=decision, audit=log, lock=handle)
+
+        assert outcome.ok, [str(reason) for reason in outcome.reasons]
+
+    def test_a_lock_taken_over_mid_request_records_no_start(self, store, ref, log, monkeypatch):
+        """Acquisition is not the whole guarantee.
+
+        The lock can expire underneath the validation the gate just ran and be
+        taken over by a second writer. Only the re-verification before the audit
+        append stands between that and two recorded starts for one spec.
+        """
+        decision = decision_for("execution")
+        settle_plan(store, ref, decision=decision)
+
+        def taken_over(handle):
+            raise LockLost(SPEC_NAME)
+
+        monkeypatch.setattr(store, "verify_lock", taken_over)
+
+        with pytest.raises(LockLost):
+            request_execution(store, ref, decision=decision, audit=log)
+
+        assert not started_events(log, ref)
+
+
+# --- Property: authority and executability are independent -----------------
+
+
+@settings(
+    max_examples=MAX_EXAMPLES,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    level=st.one_of(st.none(), st.sampled_from(AUTONOMY_LEVELS)),
+    approved=st.integers(min_value=0, max_value=len(DOCUMENT_GATES)),
+    by_human=st.booleans(),
+)
+def test_execution_starts_exactly_when_the_plan_is_settled_and_someone_may_start(
+    tmp_path: Path, level: str | None, approved: int, by_human: bool
+) -> None:
+    """The gate is the conjunction of two independent facts, over the whole grid.
+
+    Executable comes from the spec: every document gate approved. Authorized comes
+    from the request: a human asked, or a configured level reaches the execution
+    rung. Neither substitutes for the other, and the expectation here is computed
+    from the two facts rather than from the gate's own code -- so a permissive
+    policy that started an unapproved spec, or a settled spec that refused a
+    person, both fail this.
+    """
+    slug = f"{level}-{approved}-{by_human}"
+    project = write_spec(tmp_path / f"grid-{slug}")
+    ref = SpecRef.of(project, SPEC_NAME)
+    store = StateStore(root=tmp_path / f"state-{slug}")
+    log = AuditLog(root=tmp_path / f"state-{slug}")
+    try:
+        decision = decision_for(level)
+        for gate in DOCUMENT_GATES[:approved]:
+            assert approve(store, ref, gate, actor=USER).ok
+
+        outcome = request_execution(
+            store, ref, decision=decision, user=USER if by_human else None, audit=log
+        )
+
+        settled = approved == len(DOCUMENT_GATES)
+        authorized = by_human or (
+            level is not None and AutonomyLevel(level).permits(AutonomyLevel.EXECUTION)
+        )
+        assert outcome.ok is (settled and authorized)
+        assert bool(started_events(log, ref)) is outcome.ok
+        if not settled:
+            # Refused for the spec's own state, whatever the policy permitted.
+            assert REASON_APPROVAL_MISSING in outcome.reason_codes
+        if not authorized:
+            assert REASON_HUMAN_REQUIRED in outcome.reason_codes
+        if not outcome.ok:
+            assert not is_policy_actor(initiator_of(refused_events(log, ref)[0]))
+    finally:
+        store.close()
 
 
 # --- Property: attribution follows the ladder ------------------------------

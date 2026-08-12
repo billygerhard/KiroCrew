@@ -47,6 +47,20 @@ someone who never looked is worse evidence than no approval at all.
 What autonomy does *not* buy is a softer gate. Every approval, whoever it is
 attributed to, goes through :func:`approve` and its validation, so an unattended
 run cannot approve a document an interactive run would have been refused.
+
+**Starting execution asks two questions, and never collapses them into one.**
+:func:`request_execution` first asks whether the spec is executable at all --
+every document written, valid, approved, and a tasks plan that resolves across
+documents -- and asks it without consulting the policy, because the policy has
+nothing to say about it. Only then does it ask who may start: a human always may,
+and the policy may exactly when it names a declaration reaching the execution
+rung. Collapsing the two would mean the most permissive configuration takes the
+shortest path through the gate, which is the one configuration where a mistake
+costs the most.
+
+Both answers are recorded with their initiator, and a refusal never records the
+policy's reserved approver identity: that identity means the policy authorized
+something, and nothing refused was authorized.
 """
 
 from __future__ import annotations
@@ -59,13 +73,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from . import spec_types
+from . import cross_document, spec_types, structure
 from .audit import AuditLog
 from .autonomy import AutonomyDecision, AutonomyLevel
 from .documents import DocumentKind
-from .findings import ValidationReport
+from .findings import Severity, ValidationReport, Violation, build_report
 from .native_format import validate_document_text
-from .state import ApprovalRecord, SpecLock, SpecRef, StateStore
+from .state import ApprovalRecord, SpecLock, SpecRef, StateStore, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +147,12 @@ REASON_ALREADY_FINAL = "phase.already-final"
 #: The gate needs an explicit human action: either the Autonomy_Policy does not
 #: cover it, or the run is interactive and the policy is not an approver there.
 REASON_HUMAN_REQUIRED = "phase.human-required"
+#: tasks.md is a valid document on its own, but its plan does not hold together
+#: across documents: a criterion reference resolving nowhere, a requirement no
+#: task covers, or a waves graph the orchestrator cannot dispatch. Separate from
+#: ``REASON_DOCUMENT_INVALID`` because repairing it means looking at more than the
+#: one file.
+REASON_TASKS_PLAN_INVALID = "phase.tasks-plan-invalid"
 
 # --- Audit event names -----------------------------------------------------
 
@@ -141,6 +161,8 @@ APPROVAL_REFUSED_EVENT = "spec.gate.approval-refused"
 APPROVAL_STALED_EVENT = "spec.gate.approval-staled"
 PHASE_ADVANCED_EVENT = "spec.phase.advanced"
 PHASE_ADVANCE_REFUSED_EVENT = "spec.phase.advance-refused"
+EXECUTION_STARTED_EVENT = "spec.execution.started"
+EXECUTION_REFUSED_EVENT = "spec.execution.refused"
 
 
 def content_hash(text: str) -> str:
@@ -687,6 +709,22 @@ def approver_kind(actor: str) -> str:
     return APPROVER_POLICY if is_policy_actor(actor) else APPROVER_USER
 
 
+def _refused_initiator(initiator: str) -> str:
+    """The initiator to audit against a refusal, with the reserved scheme stripped.
+
+    ``scheme:path`` means the Autonomy_Policy authorized this, and nothing
+    refused was authorized -- so an operator scanning the trail for what the
+    policy let through must not find a refusal among the results, whichever way
+    the refusal arose: the policy asked and had no authority, a request it did
+    authorize was refused on validation, or a caller claimed its identity
+    outright. The parenthesised form keeps the declaration readable while being
+    unmistakably not an approver identity.
+    """
+    if not is_policy_actor(initiator):
+        return initiator
+    return f"{POLICY_ACTOR_SCHEME}({policy_declaration(initiator)})"
+
+
 # --- Approval --------------------------------------------------------------
 
 
@@ -1073,7 +1111,15 @@ def _refuse_approval(
             "reasons": [reason.to_json_object() for reason in reasons],
         }
         detail.update(_context_detail(mode, actor))
-        audit.append(ref, APPROVAL_REFUSED_EVENT, initiator=actor, detail=detail)
+        # The claim stays legible through the detail's policy declaration; the
+        # initiator field is the one a reader scans, and a refusal must not appear
+        # in it as an approver.
+        audit.append(
+            ref,
+            APPROVAL_REFUSED_EVENT,
+            initiator=_refused_initiator(actor),
+            detail=detail,
+        )
     return ApprovalOutcome(ok=False, gate=gate, reasons=reasons, report=report)
 
 
@@ -1246,6 +1292,328 @@ def _refuse_advance(
         from_phase=state.phase,
         to_phase=None,
         gate=gate,
+        reasons=reasons,
+        report=report,
+    )
+
+
+# --- The execution gate ----------------------------------------------------
+
+
+#: Name carried on an execution refusal's reasons and audit detail. Not a
+#: document gate: nothing is approved here. This gate reads the document plan's
+#: gates and adds no approval of its own.
+EXECUTION_GATE = "execution"
+
+#: What a started execution is attributed to. The same two words as the approver
+#: kinds, because it is the same distinction -- a person or the policy -- asked
+#: about a different act.
+INITIATOR_USER = APPROVER_USER
+INITIATOR_POLICY = APPROVER_POLICY
+
+#: Refusals about a document itself rather than about the plan it belongs to. A
+#: spec carrying one of these is refused on that alone, and its tasks plan is left
+#: unparsed: consequences of an absent or malformed document are not separate
+#: defects, and reporting them as such sends a caller looking for two problems.
+_DOCUMENT_DEFECT_CODES = frozenset(
+    {REASON_SPEC_TYPE_UNRECORDED, REASON_DOCUMENT_MISSING, REASON_DOCUMENT_INVALID}
+)
+
+
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """The execution gate's answer for one request.
+
+    ``initiator`` is the identity that was audited, so a caller can echo exactly
+    what the trail says rather than reconstructing it. On a refusal that is never
+    the policy's reserved approver identity.
+    """
+
+    ok: bool
+    phase: Phase
+    #: Whether starting this execution required an explicit human action, which is
+    #: the case for every policy short of a configured execution rung.
+    human_reserved: bool
+    initiator: str
+    initiator_kind: str
+    started_ts: str | None = None
+    reasons: tuple[Reason, ...] = ()
+    report: ValidationReport | None = None
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        return tuple(reason.code for reason in self.reasons)
+
+    @property
+    def rule_ids(self) -> tuple[str, ...]:
+        """Validator rule identifiers across every reason, in order, deduplicated."""
+        seen: dict[str, None] = {}
+        for reason in self.reasons:
+            for rule in reason.rule_ids:
+                seen.setdefault(rule, None)
+        return tuple(seen)
+
+    @property
+    def by_policy(self) -> bool:
+        """Whether the Autonomy_Policy started this execution with nobody asking."""
+        return self.ok and self.initiator_kind == INITIATOR_POLICY
+
+    def to_json_object(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "phase": self.phase.value,
+            "human_reserved": self.human_reserved,
+            "initiator": self.initiator,
+            "initiator_kind": self.initiator_kind,
+            "started_ts": self.started_ts,
+            "reasons": [reason.to_json_object() for reason in self.reasons],
+        }
+
+
+def policy_authorizes_execution(decision: AutonomyDecision) -> bool:
+    """Whether *decision* starts execution with no human action at all.
+
+    Both halves are load-bearing, and the second is the one worth explaining. A
+    level must reach the execution rung, and the decision must come from a
+    configuration declaration -- because an unconfigured triple still resolves to
+    a level, and a resolver whose default ever moved up the ladder would hand
+    unattended execution to every source nobody configured. Requiring a
+    declaration means such a change refuses instead of silently widening
+    authority, which is the direction a mistake here must never move.
+    """
+    return decision.is_configured and decision.permits(AutonomyLevel.EXECUTION)
+
+
+def tasks_plan_violations(state: PhaseState) -> tuple[Violation, ...]:
+    """Cross-document defects in *state*'s tasks plan; native format is not re-checked.
+
+    Execution dispatches the waves graph in tasks.md and reviews each leaf against
+    the criteria it references, so a plan whose graph has a cycle or whose
+    references resolve nowhere cannot be executed even though both documents are
+    individually well-formed. That is a defect the document gates cannot see, and
+    the reason it is asserted here rather than at every advancement is that
+    execution is the first operation that has to act on the plan.
+
+    Nothing is returned when either document is unwritten: an absent document is
+    refused by its own gate.
+    """
+    tasks = state.gate_named(DocumentKind.TASKS.value)
+    requirements = state.gate_named(DocumentKind.REQUIREMENTS.value)
+    if tasks is None or requirements is None or not (tasks.present and requirements.present):
+        return ()
+    tasks_text = read_document(tasks.path.parent, tasks.kind)
+    requirements_text = read_document(requirements.path.parent, requirements.kind)
+    if tasks_text is None or requirements_text is None:  # pragma: no cover - present has text
+        return ()
+    return cross_document.check_cross_document(
+        structure.parse_requirements(requirements_text),
+        structure.parse_tasks(tasks_text),
+        requirements_file=str(requirements.path),
+        tasks_file=str(tasks.path),
+    )
+
+
+def execution_blocking_reasons(
+    state: PhaseState,
+) -> tuple[tuple[Reason, ...], ValidationReport | None]:
+    """Every reason *state* cannot begin execution, whatever any policy allows.
+
+    Read-only, and policy-free by construction: this function takes no decision
+    and cannot consult one, so no configuration can shorten the list it returns.
+    Execution needs the whole document plan settled -- every document written,
+    valid, and carrying a live approval -- plus a tasks plan that resolves against
+    the requirements it claims to cover.
+    """
+    reasons, report = blocking_reasons(state, state.gates)
+    if any(reason.code in _DOCUMENT_DEFECT_CODES for reason in reasons):
+        return reasons, report
+    violations = tasks_plan_violations(state)
+    errors = tuple(v for v in violations if v.severity is Severity.ERROR)
+    if not errors:
+        return reasons, report
+    plan_report = build_report(violations)
+    reason = Reason(
+        code=REASON_TASKS_PLAN_INVALID,
+        gate=DocumentKind.TASKS.value,
+        message=(
+            f"{DocumentKind.TASKS.filename} does not resolve against the rest of "
+            f"the spec: {len(errors)} error{'s' if len(errors) != 1 else ''} "
+            "spanning documents."
+        ),
+        rule_ids=tuple(dict.fromkeys(violation.rule for violation in errors)),
+    )
+    return reasons + (reason,), report if report is not None else plan_report
+
+
+def _execution_authority_refusal(decision: AutonomyDecision, user: str | None) -> Reason | None:
+    """Why *user* or *decision* may not start execution, or ``None`` when they may.
+
+    A named person may always start execution, at any level: a policy that
+    authorizes autonomy grants the engine permission to proceed unasked, never a
+    monopoly on asking, and a human must not be shut out of their own run.
+
+    With nobody asking, the policy has to carry the authority itself. Anything
+    short of a configured execution rung is human-reserved and waits -- which is
+    also the answer for a source nobody configured, so a forgotten source parks
+    its run on a reviewer rather than executing on its own.
+    """
+    if user is not None:
+        if is_policy_actor(user):
+            # A person cannot hold the reserved scheme: it is engine-issued, so a
+            # request presenting one is a forged human action rather than a human
+            # one, and it must not satisfy "an explicit human action".
+            return Reason(
+                code=REASON_HUMAN_REQUIRED,
+                gate=EXECUTION_GATE,
+                message=(
+                    f"{user!r} claims the Autonomy_Policy's reserved identity as a "
+                    "human initiator; execution starts from a named person or from "
+                    "the policy's own authority, never from one wearing the other's "
+                    "identity."
+                ),
+            )
+        return None
+    if policy_authorizes_execution(decision):
+        return None
+    where = decision.declared_at or "nothing configured for this run"
+    return Reason(
+        code=REASON_HUMAN_REQUIRED,
+        gate=EXECUTION_GATE,
+        message=(
+            f"The Autonomy_Policy resolves to {decision.level.value!r} ({where}), "
+            f"which does not authorize {AutonomyLevel.EXECUTION.value!r}, so "
+            "starting execution needs an explicit human action."
+        ),
+    )
+
+
+def _execution_initiator(decision: AutonomyDecision, user: str | None) -> tuple[str, str]:
+    """The initiator and its kind for a request made by *user* or by the policy."""
+    if user is not None:
+        return user, INITIATOR_USER
+    if policy_authorizes_execution(decision):
+        return policy_actor(decision), INITIATOR_POLICY
+    return _unauthorized_policy_initiator(decision), INITIATOR_POLICY
+
+
+def _execution_detail(
+    state: PhaseState,
+    decision: AutonomyDecision,
+    kind: str,
+) -> dict[str, Any]:
+    """Audit fields describing the policy a request was judged against."""
+    return {
+        "gate": EXECUTION_GATE,
+        "phase": state.phase.value,
+        "initiator_kind": kind,
+        "autonomy_level": decision.level.value,
+        "policy_declared_at": decision.declared_at or None,
+        "human_reserved": not policy_authorizes_execution(decision),
+    }
+
+
+def request_execution(
+    store: StateStore,
+    ref: SpecRef,
+    *,
+    decision: AutonomyDecision,
+    audit: AuditLog,
+    user: str | None = None,
+    spec_type: str | None = None,
+    lock: SpecLock | None = None,
+) -> ExecutionOutcome:
+    """Decide whether execution may start for *ref*, and record the answer.
+
+    Two questions, asked in this order and never collapsed into one:
+
+    * **Is the spec executable?** Every document in the plan written, valid and
+      carrying a live approval, and a tasks plan that resolves across documents.
+      This is asked first and answered without consulting *decision* at all,
+      because the policy has nothing to say about it: no configuration makes an
+      unapproved gate approved or a cyclic graph dispatchable. So a policy that
+      permits everything is refused here on exactly the reasons a policy that
+      permits nothing is refused on.
+    * **Who may start it?** *user* names an explicit human action and always may.
+      With no user, only a policy reaching a configured execution rung may, and
+      the run is otherwise human-reserved.
+
+    A run the policy authorizes needs nothing further: no second call, no trigger
+    event, no human. This one call is the whole gate, and it answers ``ok`` the
+    moment the plan is settled.
+
+    Both answers are audited with their initiator. That record is the only trace
+    the gate leaves -- a start writes no state here, since the run state machine
+    owns run state, and a refusal writes nothing anywhere -- which is why *audit*
+    is required rather than optional, and why an append that cannot land raises
+    instead of letting an unrecorded execution begin.
+    """
+    if user is not None and not user.strip():
+        raise ValueError("an execution request either names a human initiator or names none")
+    authority = _execution_authority_refusal(decision, user)
+    initiator, kind = _execution_initiator(decision, user)
+    with _held(store, ref, lock, owner=initiator) as handle:
+        # Persist drift first, so the rows a queue reads agree with the decision
+        # taken here rather than only with the next derivation.
+        sync_staleness(store, ref, spec_type=spec_type, audit=audit)
+        state = derive_phase(store, ref, spec_type=spec_type)
+        reasons, report = execution_blocking_reasons(state)
+        if authority is not None:
+            reasons = reasons + (authority,)
+        if reasons:
+            return _refuse_execution(
+                ref,
+                state,
+                reasons,
+                decision=decision,
+                initiator=initiator,
+                kind=kind,
+                audit=audit,
+                report=report,
+            )
+        # The audit entry IS the record that execution started, so it is written
+        # under the lock the decision was taken under: a lock lost to a second
+        # writer must not leave two recorded starts for one spec.
+        store.verify_lock(handle)
+        started_ts = utc_now_iso()
+        audit.append(
+            ref,
+            EXECUTION_STARTED_EVENT,
+            initiator=initiator,
+            ts=started_ts,
+            detail=_execution_detail(state, decision, kind),
+        )
+    return ExecutionOutcome(
+        ok=True,
+        phase=state.phase,
+        human_reserved=not policy_authorizes_execution(decision),
+        initiator=initiator,
+        initiator_kind=kind,
+        started_ts=started_ts,
+        report=report,
+    )
+
+
+def _refuse_execution(
+    ref: SpecRef,
+    state: PhaseState,
+    reasons: tuple[Reason, ...],
+    *,
+    decision: AutonomyDecision,
+    initiator: str,
+    kind: str,
+    audit: AuditLog,
+    report: ValidationReport | None,
+) -> ExecutionOutcome:
+    recorded = _refused_initiator(initiator)
+    detail = _execution_detail(state, decision, kind)
+    detail["reasons"] = [reason.to_json_object() for reason in reasons]
+    audit.append(ref, EXECUTION_REFUSED_EVENT, initiator=recorded, detail=detail)
+    return ExecutionOutcome(
+        ok=False,
+        phase=state.phase,
+        human_reserved=not policy_authorizes_execution(decision),
+        initiator=recorded,
+        initiator_kind=kind,
         reasons=reasons,
         report=report,
     )
