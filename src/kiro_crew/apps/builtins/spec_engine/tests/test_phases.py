@@ -54,7 +54,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     sync_staleness,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.spec_types import SpecType
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecLocked, SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    LockLost,
+    SpecLocked,
+    SpecRef,
+    StateStore,
+)
 
 from .conftest import spec_dir_snapshot
 
@@ -659,6 +664,46 @@ def test_an_operation_may_reuse_a_lock_it_already_holds(live_store, live_ref):
 
     assert outcome.ok
     assert result.ok
+
+
+def test_a_lock_taken_over_mid_approval_does_not_persist_the_approval(
+    live_store, live_ref, monkeypatch
+):
+    """Acquisition is not the whole guarantee.
+
+    The lock can expire underneath a slow check and be taken over by a second
+    writer. Acquisition already succeeded by then, so only the re-verification
+    before the write stands between that and an approval that silently
+    supersedes the writer who now owns the lock.
+    """
+
+    def taken_over(handle):
+        raise LockLost(SPEC_NAME)
+
+    monkeypatch.setattr(live_store, "verify_lock", taken_over)
+
+    with pytest.raises(LockLost):
+        approve(live_store, live_ref, "requirements", actor="user:ada")
+
+    assert live_store.list_approvals(live_ref) == []
+
+
+def test_a_lock_taken_over_mid_advance_does_not_record_the_phase(
+    live_store, live_ref, monkeypatch
+):
+    """The same window exists in advance, before the phase is recorded."""
+    approve(live_store, live_ref, "requirements", actor="user:ada")
+    before = live_store.get_spec(live_ref)
+
+    def taken_over(handle):
+        raise LockLost(SPEC_NAME)
+
+    monkeypatch.setattr(live_store, "verify_lock", taken_over)
+
+    with pytest.raises(LockLost):
+        advance(live_store, live_ref, actor="agent", gate="requirements")
+
+    assert live_store.get_spec(live_ref) == before
 
 
 def test_an_operation_needs_an_actor(live_store, live_ref):

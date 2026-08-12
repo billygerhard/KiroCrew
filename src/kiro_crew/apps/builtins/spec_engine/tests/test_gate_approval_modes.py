@@ -306,6 +306,10 @@ class TestHeadlessRuns:
         assert len(refused) == 1
         assert refused[0].detail is not None
         assert refused[0].detail["mode"] == RunMode.HEADLESS.value
+        # The refusal must not borrow the approver scheme. It approved nothing,
+        # so a reader scanning the trail for policy approvals must not find this
+        # event among them.
+        assert not is_policy_actor(refused[0].initiator)
 
     def test_an_uncovered_gate_leaves_advancement_refused(self, store, ref):
         """Nothing recorded is what keeps the run stopped, not a second check."""
