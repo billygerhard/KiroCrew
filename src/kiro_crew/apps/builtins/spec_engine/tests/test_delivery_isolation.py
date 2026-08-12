@@ -237,13 +237,11 @@ def branches_of(repo: Fixture) -> set[str]:
 
 def commit_exists(repo: Fixture, sha: str) -> bool:
     """Whether *sha* is still an object in the project repository."""
-    completed = subprocess.run(
-        ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
-        cwd=str(repo.work),
-        capture_output=True,
-        text=True,
-    )
-    return completed.returncode == 0
+    try:
+        _git("cat-file", "-e", f"{sha}^{{commit}}", cwd=repo.work)
+    except subprocess.CalledProcessError:
+        return False
+    return True
 
 
 #: Git verbs that move or destroy a ref, an object, or a working-tree edit.
@@ -760,13 +758,16 @@ class TestTeardownReachesOneRunOnly:
         second = isolate_run(repo, RUN_B)
         second_branch = branch_of(second)
         second_sha = commit_in(second, "sibling")
-        (second / "uncommitted.txt").write_text("in progress\n", encoding="utf-8")
+        # Deliberately clean. A tree with uncommitted edits is one git refuses to
+        # remove without force, so a sibling left dirty would survive a teardown
+        # keyed at every run and this test would pass on the wrong mechanism.
+        assert _git("status", "--porcelain", cwd=second) == ""
 
         janitor_for(repo).retire_run(RUN_A)
 
         assert not first.exists()
         assert second.is_dir()
-        assert (second / "uncommitted.txt").read_text(encoding="utf-8") == "in progress\n"
+        assert (second / "sibling.txt").read_text(encoding="utf-8") == "sibling\n"
         assert branch_of(second) == second_branch
         assert head_of(second) == second_sha
         # And the sibling's ledger row is still active, so it still holds its
