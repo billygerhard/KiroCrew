@@ -61,6 +61,8 @@ from kiro_crew.notifications.bus import (
     NotificationValidationError,
 )
 
+from .conftest import NATIVE_SPEC_FILES, spec_dir_snapshot
+
 PROJECT = "acme"
 
 
@@ -558,3 +560,18 @@ class TestTheRunLifecycleSeam:
         notice = self.stalled(store, config, ref, FakeBus(fail=True))
         assert notice.notified is False
         assert "bus said no" in notice.error
+
+    def test_notifying_writes_nothing_into_the_spec_directory(
+        self, store: StateStore, config: ConfigStore, ref: SpecRef, project: Path, bus: FakeBus
+    ) -> None:
+        # The spec directory holds the native documents and the sidecar, and
+        # nothing else: the IDE and the CLI read the same trees, so a note,
+        # a channel record, or a delivery receipt left there is a foreign file
+        # in someone else's contract.
+        spec_dir = project / ".kiro" / "specs" / "example"
+        before = spec_dir_snapshot(spec_dir)
+        with_project(config, channel=REVIEW_CHANNEL)
+        self.stalled(store, config, ref, bus)
+        assert bus.pushed, "the notice went out, so this is not a vacuous snapshot"
+        assert spec_dir_snapshot(spec_dir) == before
+        assert set(before) == set(NATIVE_SPEC_FILES)
