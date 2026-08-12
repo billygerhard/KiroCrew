@@ -590,6 +590,63 @@ class TestPersistenceFailure:
         assert spec_dir_snapshot(ref.spec_dir) == before
         assert set(before) == set(NATIVE_SPEC_FILES)
 
+    def test_a_commit_that_fails_is_not_reported_as_a_successful_claim(
+        self, store: StateStore, ref: SpecRef, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A claim's answer is computed before the commit that makes it true.
+
+        ``claim`` returns ``cursor.rowcount == 1`` from inside the write block, so
+        the value is decided while the insert is still uncommitted and only the
+        commit failure propagating out of the transaction stops it being returned.
+        That makes this the narrowest path in the store: a swallowed commit error
+        hands back "you hold this claim" for a row that never landed, and the next
+        poll claims the same key again -- so the exactly-once guarantee fails
+        through the persistence one rather than through anything in the ledger.
+        """
+        real = store._conn()
+
+        class _UncommittableConnection:
+            """Accepts the work and refuses only to make it durable."""
+
+            def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
+                if statement.strip().upper().startswith("COMMIT"):
+                    raise sqlite_error("disk I/O error")
+                return real.execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_conn", lambda: _UncommittableConnection())
+
+        with pytest.raises(StatePersistenceError):
+            store.claim_dispatch("github", "42")
+
+        # The claim must still be available: if the failed attempt were reported
+        # as held, this second call would return False and the item would never
+        # dispatch at all.
+        monkeypatch.undo()
+        assert store.claim_dispatch("github", "42") is True
+
+    def test_a_statement_that_fails_mid_transaction_leaves_nothing_behind(
+        self, store: StateStore, ref: SpecRef, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other half of the write path: the transaction opened, so the failure
+        # is a partial write to undo rather than a store that was never usable.
+        real = store._conn()
+        store.register_spec(ref, spec_type="feature")
+
+        class _FailsAfterBegin:
+            def execute(self, statement: str, *args: Any, **kwargs: Any) -> Any:
+                head = statement.strip().upper()
+                if head.startswith(("INSERT", "UPDATE", "DELETE")):
+                    raise sqlite_error("database or disk is full")
+                return real.execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_conn", lambda: _FailsAfterBegin())
+
+        with pytest.raises(StatePersistenceError):
+            store.create_run("run-1", ref, state="queued")
+
+        monkeypatch.undo()
+        assert store.get_run("run-1") is None
+
     def test_a_failing_read_is_reported_rather_than_answered_with_a_guess(
         self, store: StateStore, ref: SpecRef, monkeypatch: pytest.MonkeyPatch
     ) -> None:
