@@ -130,6 +130,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 10.1, 10.4, 10.5, 10.7, 10.12, 19.1, 19.2, 19.3, 19.4, 19.5, 19.6, 19.7_
   - [ ] 8.4 Item feedback and lifecycle cascade
     - Configured feedback commands post dispatch and completion updates to the item; mid-flight cancellation cancels the run, archives the spec, and audits the cascade; mid-run item edits ignored and audited
+    - Release the dispatch claim for the two refusals that keep one today, because both contradict the rule the rest of the module follows: a refusal must leave the backlog intact so that fixing the configuration is all it takes. An unmapped classification keeps its claim, so adding one mapping recovers nothing until an operator releases every accumulated item by hand, and the ledger row already provides the once-per-generation reporting the claim was there for. A spec-name collision keeps its claim with no ledger row at all, so the item is not even enumerable — record it under its own claim kind, or make the name collision-free, and note that the slug folds punctuation and truncates at 40 characters so distinct identifiers can converge on custom sources where the identifier is untrusted text
     - _Requirements: 10.10, 21.2, 21.3_
   - [ ] 8.5 Public-source autonomy warning
     - Enabling execution-or-higher autonomy on a publicly submittable source warns and records the acknowledgment

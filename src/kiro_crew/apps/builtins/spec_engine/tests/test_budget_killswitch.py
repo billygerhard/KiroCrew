@@ -24,6 +24,7 @@ import pytest
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.budget import (
     AUDIT_EVENT_STOPPED,
+    DETAIL_KILL_SWITCH,
     KILL_SWITCH_FILENAME,
     KILL_SWITCH_INITIATOR,
     STOPPABLE_STATES,
@@ -518,6 +519,38 @@ class TestOneActionStopsEveryRun:
             # a turn even though its state column still says executing.
             with pytest.raises(BudgetHalted):
                 guard.open_turn()
+
+    def test_the_parked_row_says_an_operator_stopped_it_not_a_ceiling(
+        self,
+        store: StateStore,
+        ref: SpecRef,
+        config: ConfigStore,
+        accounting: RunAccounting,
+        ledger_path: Path,
+        switch: KillSwitch,
+    ) -> None:
+        """The run state is shared with a ceiling halt, so the row must say which.
+
+        Reusing HALTED_BUDGET is right -- the states are enumerated and none of
+        them means an operator stopped this -- but without the cause on the row a
+        surface shows "halted for budget" beside a total well under its ceiling,
+        and only the audit log disagrees.
+        """
+        make_run(store, ref, "run-1")
+        spend_credits(accounting, ledger_path, "run-1", 1.0)
+
+        engage_kill_switch(
+            state=store,
+            config=config,
+            initiator=OPERATOR,
+            switch=switch,
+            accounting=accounting,
+        )
+
+        record = store.get_run("run-1")
+        assert record is not None
+        assert record.state == RunState.HALTED_BUDGET.value
+        assert record.detail.get(DETAIL_KILL_SWITCH) is True
 
     def test_a_stop_whose_park_was_refused_still_notifies_and_records(
         self,

@@ -153,6 +153,11 @@ def poll_tick(
     was thrown and poll the one added to configuration afterwards.
     """
     resolved = store if store is not None else ConfigStore()
+    # This flag must be the same file the budget guards read: they resolve it from
+    # their state store's root, and this resolves it from the default root, which
+    # is the same path only because nothing constructs a store elsewhere. A
+    # configurable state root has to thread through here too, or the tick would
+    # keep polling from a flag nobody engages while every guard is stopped.
     switch = kill_switch if kill_switch is not None else KillSwitch()
     state = switch.read()
     if state.engaged:

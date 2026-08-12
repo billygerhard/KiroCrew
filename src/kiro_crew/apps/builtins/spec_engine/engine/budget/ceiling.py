@@ -75,6 +75,10 @@ AUDIT_EVENT_HALTED = "budget.halted"
 AUDIT_EVENT_WARNING = "budget.warning"
 AUDIT_EVENT_REFUSED = "budget.refused"
 AUDIT_EVENT_STOPPED = "budget.kill_switch"
+#: Marks a halt an operator caused rather than a ceiling. Carried on the run row's
+#: detail as well as the audit record, because the run state is shared with a
+#: ceiling halt and a reader of the row alone could not otherwise tell them apart.
+DETAIL_KILL_SWITCH = "kill_switch"
 AUDIT_EVENT_COMPLETED = "budget.completed"
 
 #: Claim coordinates for a one-shot notification. Scope is the run and subject the
@@ -469,7 +473,7 @@ class BudgetGuard:
     ) -> DispatchDecision:
         message = self._stop_message(spend, reason)
         detail = self._detail(spend)
-        detail["kill_switch"] = True
+        detail[DETAIL_KILL_SWITCH] = True
         if reason:
             detail["kill_switch_reason"] = reason
         parked = self.halted or self._park(
@@ -591,6 +595,13 @@ class BudgetGuard:
                 detail={
                     DETAIL_CONSUMED_CREDITS: spend.total_credits,
                     DETAIL_CEILING_CREDITS: self._budget.ceiling_credits,
+                    # The state is shared with a ceiling halt, deliberately: the
+                    # run states are enumerated and none of them means "an
+                    # operator stopped this". So the cause travels in the detail,
+                    # or a surface reading the row shows "halted for budget"
+                    # beside a total well under its ceiling and only the audit log
+                    # says why.
+                    **({DETAIL_KILL_SWITCH: True} if initiator == KILL_SWITCH_INITIATOR else {}),
                 },
                 lock=lock,
             )

@@ -59,9 +59,12 @@ class HaltedRun:
     run_id: str
     ref: SpecRef
     consumed_credits: float
-    #: Whether the run reached the parked state. False when another writer held
-    #: the spec or the run could not be moved; neither changes the fact that no
-    #: further turn may open, which the flag decides.
+    #: Whether the run is IN the parked state now, which is not the same as this
+    #: call having moved it: a run already halted for budget when the switch was
+    #: thrown short-circuits the park and still reads true here. False when
+    #: another writer held the spec or the run could not be moved; neither changes
+    #: the fact that no further turn may open, which the flag decides. The audit
+    #: record's own ``parked`` detail is the one that says whether a row moved.
     parked: bool
     message: str = ""
 
