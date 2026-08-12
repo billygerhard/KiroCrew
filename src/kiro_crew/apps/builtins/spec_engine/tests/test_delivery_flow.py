@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
     AUTONOMY_FIELD,
@@ -1707,6 +1709,69 @@ class TestInteractiveDeliveryRunsTheSamePipeline:
         assert run.initiator == ""
         assert run.initiator_kind == INITIATOR_POLICY
         assert not run.interactive
+
+    @settings(max_examples=120, deadline=None)
+    @given(
+        positions=st.lists(
+            st.sampled_from(
+                (GATE_POSITION_PRE_SUBMIT, GATE_POSITION_POST_SUBMIT, GATE_POSITION_BOTH)
+            ),
+            min_size=1,
+            max_size=3,
+        ),
+        severities=st.lists(
+            st.sampled_from((GATE_SEVERITY_BLOCKING, GATE_SEVERITY_ADVISORY)),
+            min_size=1,
+            max_size=3,
+        ),
+        failing=st.sets(
+            st.sampled_from(
+                (SUBMIT_PROGRAM, VERIFY_PROGRAM, PUBLISH_PROGRAM, LINT_PROGRAM, CI_PROGRAM)
+            ),
+            max_size=2,
+        ),
+    )
+    def test_the_two_entry_points_execute_the_same_commands_whatever_is_configured(
+        self,
+        tmp_path_factory: pytest.TempPathFactory,
+        positions: list[str],
+        severities: list[str],
+        failing: set[str],
+    ) -> None:
+        """The equivalence generalized past the configurations a fixture happens to pick.
+
+        A divergence that appeared only for a gate declared at both positions, or
+        only once a specific stage failed, would slip past example-based tests
+        while being exactly the shape a second code path produces. Comparing the
+        argv sequence and the outcome across generated configurations is what
+        makes "the same pipeline" a property rather than an anecdote.
+        """
+        root = tmp_path_factory.mktemp("both-ways")
+        workspace = root / "workspace"
+        workspace.mkdir()
+        store = ConfigStore(root / "state")
+        gates = [
+            gate(f"gate-{index}", program, position=position, severity=severity)
+            for index, (program, position, severity) in enumerate(
+                zip((LINT_PROGRAM, COVERAGE_PROGRAM, CI_PROGRAM), positions, severities)
+            )
+        ]
+        configure(store, *gates)
+        exits = {program: [1] for program in failing}
+
+        autonomous_runner = ScriptedRunner(exits=exits)
+        autonomous = build_pipeline(
+            store, level=AutonomyLevel.DELIVERY, runner=autonomous_runner
+        ).deliver(context(workspace))
+        interactive_runner = ScriptedRunner(exits=exits)
+        interactive = build_pipeline(
+            store, level=AutonomyLevel.EXECUTION, runner=interactive_runner
+        ).deliver(context(workspace), requester="dana")
+
+        assert interactive_runner.calls == autonomous_runner.calls
+        assert interactive.outcome is autonomous.outcome
+        assert interactive.stage_outcomes() == autonomous.stage_outcomes()
+        assert interactive.gate_outcomes() == autonomous.gate_outcomes()
 
 
 class TestARequesterTheEngineCouldHaveMinted:
