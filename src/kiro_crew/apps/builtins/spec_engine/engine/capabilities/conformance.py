@@ -538,7 +538,15 @@ class ConformanceRunner:
                 "so the response cannot distinguish nothing-wrong from nothing-examined"
             )
         skipped_items = {item for item, _ in skipped}
-        overlap = sorted(set(processed) & skipped_items)
+        # Both sides are compared on their last namespace segment, because the
+        # skip check already reads tokens that way. Comparing raw here instead
+        # would let a provider namespace one list and not the other, so a
+        # document could be declared processed AND excused from its defect --
+        # each check answering correctly about a different spelling of one name.
+        processed_names = {_coverage_name(token) for token in processed}
+        overlap = sorted(
+            token for token in skipped_items if _coverage_name(token) in processed_names
+        )
         if overlap:
             named = ", ".join(sanitized(item, limit=64) for item in overlap[:5])
             problems.append(f"declares both processed and skipped for: {named}")
@@ -713,17 +721,20 @@ def _coverage_of(payload: Any) -> tuple[tuple[str, ...], tuple[tuple[str, str], 
     return processed, tuple(skipped)
 
 
-def _declares_skipped(skipped_items: Iterable[str], artifact: str) -> bool:
-    """Whether a coverage token names *artifact* as skipped.
+def _coverage_name(token: str) -> str:
+    """The artifact a coverage token names, ignoring any namespace qualifier.
 
-    The last namespace segment is what is compared, so a provider is free to
-    qualify its tokens: ``requirements`` and ``document:requirements`` both say
-    the requirements document went unexamined.
+    A provider may qualify its tokens, so ``requirements`` and
+    ``document:requirements`` name the same document. Every comparison between
+    coverage lists goes through this, so no two checks can disagree about
+    whether two spellings are one artifact.
     """
-    for token in skipped_items:
-        if token == artifact or token.rsplit(COVERAGE_NAMESPACE, 1)[-1] == artifact:
-            return True
-    return False
+    return token.rsplit(COVERAGE_NAMESPACE, 1)[-1]
+
+
+def _declares_skipped(skipped_items: Iterable[str], artifact: str) -> bool:
+    """Whether a coverage token names *artifact* as skipped."""
+    return any(_coverage_name(token) == artifact for token in skipped_items)
 
 
 def _finding_references(payload: Any, refs: Sequence[str]) -> bool:

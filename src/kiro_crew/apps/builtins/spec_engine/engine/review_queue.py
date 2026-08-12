@@ -46,7 +46,7 @@ from .runs import (
     phase_entered_ts,
     run_state_of,
 )
-from .state import RunRecord, SpecLock, SpecRecord, SpecRef
+from .state import RunRecord, SpecLock, SpecRecord, SpecRef, StatePersistenceError
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +532,14 @@ class ReviewQueue:
         already has rather than deadlocking against itself.
         """
         if lock is not None:
+            # verify_lock checks the row for the handle's OWN ref, so a valid
+            # handle for a different spec would pass it and leave every write in
+            # this block unlocked. The archival cascade's atomicity is exactly
+            # what that would void.
+            if lock.ref != ref:
+                raise StatePersistenceError(
+                    f"lock is held for {lock.ref.key}, not {ref.key}"
+                )
             self._store.verify_lock(lock)
             yield lock
             return

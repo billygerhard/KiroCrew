@@ -202,6 +202,25 @@ class ContradictoryCoverageStub:
 
 
 @dataclass
+class MismatchedSpellingCoverageStub:
+    """Wrong in one way: the same document, spelled two ways across the lists.
+
+    Claiming a document processed while skipping it under a bare spelling is the
+    contradiction that buys the most: the coverage check sees no overlap, and the
+    detection check sees a declared skip and excuses the missing finding. Each
+    check answers correctly about a different spelling of one name.
+    """
+
+    name: str = "mismatched-spelling-coverage-stub"
+
+    def respond(self, request: CapabilityRequest) -> Any:
+        return valid_payload(
+            processed=["document:requirements", "document:design", "document:tasks"],
+            skipped=[{"item": "requirements", "reason": "declined"}],
+        )
+
+
+@dataclass
 class UnexplainedSkipStub:
     """Wrong in one way: skips a document without saying why.
 
@@ -546,6 +565,19 @@ class TestDeclaredCoverage:
         report = RUNNER.run(ContradictoryCoverageStub(), CAPABILITY)
         assert failed_checks(report) == {CHECK_DECLARED_COVERAGE}
         assert "both processed and skipped" in report.failures[0].detail
+
+    def test_the_contradiction_is_caught_however_the_two_lists_are_spelled(self) -> None:
+        """One name in two spellings is still one document.
+
+        Comparing the lists raw while the detection check reads the last
+        namespace segment lets a provider claim a document processed and be
+        excused from finding its defect at the same time -- and it reports as
+        conforming, which is the one outcome this runner exists to prevent.
+        """
+        report = RUNNER.run(MismatchedSpellingCoverageStub(), CAPABILITY)
+
+        assert not report.passed
+        assert CHECK_DECLARED_COVERAGE in failed_checks(report)
 
     def test_a_skip_without_a_reason_fails(self) -> None:
         report = RUNNER.run(UnexplainedSkipStub(), CAPABILITY)

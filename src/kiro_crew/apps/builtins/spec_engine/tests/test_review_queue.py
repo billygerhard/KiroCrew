@@ -38,7 +38,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.runs import (
     StallNotice,
     TaskStatus,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecLocked, SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    SpecLocked,
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 
 from .conftest import make_spec_dir
 
@@ -335,6 +340,31 @@ class TestNoTimeBasedArchival:
 
 
 class TestArchivedStaysArchived:
+    def test_a_lock_held_for_another_spec_is_refused_rather_than_accepted(
+        self,
+        store: StateStore,
+        queue: ReviewQueue,
+        ref: SpecRef,
+        tmp_path: Path,
+    ) -> None:
+        """A valid handle is not the same as a handle for THIS spec.
+
+        The store validates a handle against the row for the handle's own ref, so
+        a caller holding a genuine lock on a different spec would pass that check
+        and then write here with nothing held. The cascade that cancels runs and
+        archives in one block is only atomic because the lock covers it, and a
+        foreign handle turns that into no guarantee at all.
+        """
+        other_project = tmp_path / "elsewhere"
+        make_spec_dir(other_project, "example")
+        other = SpecRef.of(other_project, "example")
+
+        with store.lock(other, owner="user:someone") as foreign:
+            with pytest.raises(StatePersistenceError):
+                queue.archive(ref, actor="user:someone", lock=foreign)
+
+        assert queue.is_archived(ref) is False
+
     def test_no_operation_but_an_explicit_unarchive_brings_a_spec_back(
         self,
         machine: RunMachine,

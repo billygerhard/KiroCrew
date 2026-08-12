@@ -48,7 +48,14 @@ from . import phases, structure
 from .audit import AuditLog
 from .config import ConfigStore
 from .documents import DocumentKind
-from .state import RunRecord, SpecLock, SpecLocked, SpecRef, StateStore
+from .state import (
+    RunRecord,
+    SpecLock,
+    SpecLocked,
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -982,6 +989,13 @@ class RunMachine:
         by itself.
         """
         if lock is not None:
+            # verify_lock checks the row for the handle's OWN ref, so a valid
+            # handle for a different spec would pass it and leave the writes in
+            # this block unlocked.
+            if lock.ref != ref:
+                raise StatePersistenceError(
+                    f"lock is held for {lock.ref.key}, not {ref.key}"
+                )
             self._store.verify_lock(lock)
             yield lock
             return

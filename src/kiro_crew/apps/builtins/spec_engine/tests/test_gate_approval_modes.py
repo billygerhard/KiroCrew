@@ -834,6 +834,35 @@ class TestExecutionAudit:
         # The declaration stays legible even though the scheme is not borrowed.
         assert event.detail["policy_declared_at"] == (decision.declared_at or None)
 
+    def test_a_refusals_own_initiator_is_not_a_human_action_handed_back(
+        self, store, log, tmp_path
+    ):
+        """The identity the engine minted cannot be replayed as a person.
+
+        A refusal is rewritten out of the approver spelling so it is not mistaken
+        for an approval, which leaves the engine emitting a second spelling of a
+        reserved name. A guard keyed to the approval spelling alone hands that
+        straight back: the trail says who was refused, a caller echoes it, and a
+        run the policy reserves for a person starts attributed to one. The scheme
+        is a namespace, so both directions have to treat it as one.
+        """
+        project = write_spec(tmp_path / "replayed-refusal")
+        spec = SpecRef.of(project, SPEC_NAME)
+        # Authoring-level autonomy: execution stays human-reserved, and the plan
+        # is settled so nothing else can be what refuses the replay.
+        decision = decision_for("authoring")
+        settle_plan(store, spec, user="user:grace")
+
+        refused = request_execution(store, spec, decision=decision, audit=log)
+        assert not refused.ok
+
+        replayed = request_execution(
+            store, spec, decision=decision, user=refused.initiator, audit=log
+        )
+
+        assert not replayed.ok
+        assert REASON_HUMAN_REQUIRED in replayed.reason_codes
+
     def test_a_forged_initiator_is_not_recorded_as_an_approver(self, store, ref, log):
         decision = decision_for("integration")
         settle_plan(store, ref, decision=decision)

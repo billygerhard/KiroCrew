@@ -697,6 +697,21 @@ def is_policy_actor(actor: str) -> bool:
     return actor.startswith(POLICY_ACTOR_SCHEME + ":")
 
 
+def is_reserved_actor(actor: str) -> bool:
+    """Whether *actor* claims the engine's reserved identity namespace, any spelling.
+
+    Two different questions hang off this scheme and they need different tests.
+    Reading the trail asks whether the policy authorized something, which is the
+    exact approver spelling and nothing else. Accepting an identity from a caller
+    asks whether the string trespasses on a namespace only the engine may mint —
+    and there the punctuation must not matter, because the engine emits more than
+    one form. A refusal is rewritten to the parenthesised form precisely so it is
+    not mistaken for an approval, and a guard keyed to the approval spelling would
+    hand that refusal straight back as an explicit human action.
+    """
+    return actor.startswith(POLICY_ACTOR_SCHEME)
+
+
 def policy_declaration(actor: str) -> str | None:
     """The config path behind a policy approver, or ``None`` for a person."""
     if not is_policy_actor(actor):
@@ -761,7 +776,7 @@ def approve(
     """
     if not actor:
         raise ValueError("an approval needs an actor")
-    if is_policy_actor(actor):
+    if is_reserved_actor(actor):
         refusal = _policy_actor_refusal(gate, actor, mode=mode, decision=decision)
         if refusal is not None:
             return _refuse_approval(ref, gate, (refusal,), actor=actor, mode=mode, audit=audit)
@@ -1155,6 +1170,13 @@ def advance(
     """
     if not actor:
         raise ValueError("an advancement needs an actor")
+    if is_reserved_actor(actor):
+        # Advancement holds no AutonomyDecision, so it has nothing to check a
+        # policy claim against and can never legitimately record one. Writing the
+        # actor through unexamined would put an identity in the trail that no
+        # declaration authorized, which is what a reader scanning for the policy's
+        # own work would then find and believe.
+        raise ValueError("an advancement cannot be attributed to the autonomy policy")
     with _held(store, ref, lock, owner=actor) as handle:
         # Persist drift first, so the rows a queue reads agree with the decision
         # taken here rather than only with the next derivation.
@@ -1458,7 +1480,7 @@ def _execution_authority_refusal(decision: AutonomyDecision, user: str | None) -
     its run on a reviewer rather than executing on its own.
     """
     if user is not None:
-        if is_policy_actor(user):
+        if is_reserved_actor(user):
             # A person cannot hold the reserved scheme: it is engine-issued, so a
             # request presenting one is a forged human action rather than a human
             # one, and it must not satisfy "an explicit human action".

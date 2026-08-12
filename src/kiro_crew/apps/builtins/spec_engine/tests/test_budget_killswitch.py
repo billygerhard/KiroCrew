@@ -519,6 +519,52 @@ class TestOneActionStopsEveryRun:
             with pytest.raises(BudgetHalted):
                 guard.open_turn()
 
+    def test_a_stop_whose_park_was_refused_still_notifies_and_records(
+        self,
+        store: StateStore,
+        ref: SpecRef,
+        config: ConfigStore,
+        accounting: RunAccounting,
+        ledger_path: Path,
+        switch: KillSwitch,
+        tmp_path: Path,
+    ) -> None:
+        """The case the design calls expected is the case an operator needs told.
+
+        A park refused by another writer leaves the run stopped with its state
+        column still reading as running. That is precisely when someone has to be
+        told, and told what it cost, so the report cannot hang off the bookkeeping
+        the same module says may fail.
+        """
+        make_run(store, ref, "run-1")
+        spend_credits(accounting, ledger_path, "run-1", 3.0)
+        notifier = RecordingNotifier()
+        log = AuditLog(tmp_path / "audit")
+
+        with store.lock(ref, owner="somebody-else"):
+            guard = guard_for(
+                "run-1",
+                ref,
+                state=store,
+                config=config,
+                accounting=accounting,
+                kill_switch=switch,
+                notifier=notifier,
+                audit=log,
+            )
+            switch.engage(initiator=OPERATOR)
+            decision = guard.authorize_dispatch()
+
+        assert decision.outcome is DispatchOutcome.STOPPED
+        assert notifier.messages(), "a stop nobody is told about is the failure"
+        assert format_credits(3.0) in notifier.messages()[0]
+        recorded = [event for event in log.read(ref) if event.event == AUDIT_EVENT_STOPPED]
+        assert len(recorded) == 1
+        assert recorded[0].detail is not None
+        assert recorded[0].detail["kill_switch"] is True
+        # The row's fate is what is conditional, and the record says which way.
+        assert recorded[0].detail["parked"] is False
+
     def test_engaging_twice_notifies_once_per_run(
         self,
         store: StateStore,

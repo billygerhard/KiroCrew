@@ -475,7 +475,14 @@ class BudgetGuard:
         parked = self.halted or self._park(
             message, spend, lock, initiator=KILL_SWITCH_INITIATOR
         )
-        if parked and self._state.claim(NOTIFY_CLAIM_KIND, self._run_id, NOTIFY_STOPPED):
+        # The flag is the stop, so it is already durable here whether or not the
+        # row moved. A park refused by another writer is expected and survivable,
+        # and it is the case an operator most needs told: the run is stopped while
+        # its state column still reads as running. Gating the notice on the park
+        # would drop the report exactly there, so only the row's fate is
+        # conditional and the record says which way it went.
+        detail["parked"] = parked
+        if self._state.claim(NOTIFY_CLAIM_KIND, self._run_id, NOTIFY_STOPPED):
             self._deliver(message, detail)
             self._record(AUDIT_EVENT_STOPPED, detail, cost=spend.total_credits)
         logger.warning("%s", message)

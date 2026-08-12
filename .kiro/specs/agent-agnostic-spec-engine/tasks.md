@@ -58,11 +58,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - States: queued, authoring, awaiting review, executing, delivering, done, failed, halted for budget, cancelled, stalled; per-phase timeouts mark stalled and notify
     - Resume from persisted state at task granularity in execution and phase granularity in authoring
     - _Requirements: 18.1, 18.2, 18.3_
-  - [ ] 5.3 Review_Queue and archival rules
+  - [x] 5.3 Review_Queue and archival rules
     - Engine-exposed queue of runs at human-reserved gates, renderable by any driver; no time-based archival or expiry
     - Archive only on explicit user action or triggering-item cancellation; archived stays archived until explicitly unarchived; reversible
     - _Requirements: 18.4, 18.6, 18.7_
-  - [ ] 5.4 Execution gate
+  - [x] 5.4 Execution gate
     - Human-reserved execution starts only from explicit human action; authorized autonomy starts on gate satisfaction with no further trigger
     - Failed validation or missing approvals refuse regardless of policy; refused requests and started executions audited with initiator
     - _Requirements: 8.1, 8.3, 8.4, 8.5_
@@ -72,12 +72,12 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - A changed element re-derives its class and re-applies every gated decision before the new content is used; intake screening applies per element by its own class; class, author, and content revision recorded for every gated decision; trust configuration is config-only with no tool able to modify it
     - _Requirements: 37.1, 37.2, 37.3, 37.4, 37.5, 37.6_
 
-- [ ] 6. Budget enforcement and kill switch
+- [x] 6. Budget enforcement and kill switch
   - [x] 6.1 Run stamping, ledger attribution, and ceilings
     - Stamp run identifier on every session; sum per-turn metering ledger records across all run sessions (authoring, orchestrator, subagents)
     - Halt dispatch after in-flight turns at the ceiling with amount in the notification; per-run ceiling independent of source caps; bundled default ceiling so headless runs never execute unbounded; optional warning threshold notifies without halting
     - _Requirements: 16.1, 16.2, 16.3, 16.7, 16.8, 24.2_
-  - [ ] 6.2 Source spending caps and kill switch
+  - [x] 6.2 Source spending caps and kill switch
     - Per-source spending caps stop new dispatches within the configured period; single kill-switch action pauses all watchers and halts autonomous runs after in-flight turns
     - Completion and halt notifications carry total credit consumption and land in the audit log
     - _Requirements: 16.4, 16.5, 16.6_
@@ -126,6 +126,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Route via source config: target project, base branch, classification-to-spec-type and autonomy per submitter class; submitter class from maintainer list or author-association, least-trusted when undetermined
     - Global and per-project caps with arrival-order queueing; unmapped classification without a default is recorded, not dispatched; no target project refuses dispatch; item content passed as quoted data; intake guidance injected separately; runs seeded in the project working tree so native steering applies
     - Consume what the tick and the lifecycle diff already produce. Tasks 8.1 and 8.2 built polling and the claim-keyed diff but no production caller, so a tick's items currently go nowhere; this is the consumer, and the "no target project refuses dispatch" property named above belongs here rather than to the poll
+    - Construct the per-source spend gate 6.2 added and pass it in: a dispatch path without it is uncapped, because the parameter currently defaults to no enforcement. Budget enforcement is Engine_Floor and never delegable, so make the gate a required argument as part of wiring it — a seam that defaults to off delegates the ceiling to whoever writes the caller, and the test certifying that the ungated path "behaves as it did" retires with it
     - _Requirements: 10.1, 10.4, 10.5, 10.7, 10.12, 19.1, 19.2, 19.3, 19.4, 19.5, 19.6, 19.7_
   - [ ] 8.4 Item feedback and lifecycle cascade
     - Configured feedback commands post dispatch and completion updates to the item; mid-flight cancellation cancels the run, archives the spec, and audits the cascade; mid-run item edits ignored and audited
@@ -148,6 +149,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 9.1 Wave loop and task persistence
     - Dispatch leaf tasks wave by wave with in-wave parallelism up to the concurrency cap; persist task status after every state change for resume
     - Wire the pieces earlier waves built as libraries but left unconstructed outside their tests: pass a workspace broker into the delivery pipeline so the shared-working-tree refusal actually runs, and resolve each dispatch's role through the role resolver. Reviews of tasks 7.3 and 9.2 found both inert in production; a library nothing constructs is an enforcement that never fires
+    - Also call the completion reporter 6.2 added. It attributes a run's total consumption to the notification and the audit record, and run completion lives here rather than in the budget module, so nothing invokes it yet
     - Hold one spec lock across a batch of task-status writes rather than one per write. The store refuses a conflicting writer instead of waiting, so two tasks reporting at once get one refusal, and a status that is refused and then dropped makes a resumed run pay again for finished work
     - _Requirements: 9.1, 9.5_
   - [x] 9.2 Role resolution and cost profiles
@@ -230,7 +232,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 15.1 Session seeder
     - Seed ordinary agent sessions with the granted approval posture applied and the run identifier stamped; posture recorded in the audit log; runs appear in the dashboard session list; human-reserved gates notify that the run waits for review
     - _Requirements: 7.3, 6.3_
-  - [ ] 15.2 Notification routing
+  - [x] 15.2 Notification routing
     - Deliver through the host gateway's channels with selection from project config; default to the gateway dashboard channel when unconfigured
     - _Requirements: 6.5, 24.4_
 
@@ -263,7 +265,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Bind the bundled GitHub/GitLab watch presets, marking a source unhealthy with the missing program name when its command-line dependency is absent; ship no supplementary validation rules; UI identifies each capability's provider as builtin or external and each builtin as deterministic or model-backed
     - _Requirements: 31.1, 31.2, 31.3, 31.4, 31.5, 31.6, 31.7, 31.8_
 
-  - [ ] 17.3 Conformance runner
+  - [x] 17.3 Conformance runner
     - Per-capability conformance runner over bundled fixtures (planted ambiguity, contradictory criteria, coverage hole, oversized document, malformed response) asserting schema validity, planted-defect detection, declared coverage, timeout honoring and repeatability; every builtin provider passes its own suite
     - _Requirements: 26.15, 27.6_
 
