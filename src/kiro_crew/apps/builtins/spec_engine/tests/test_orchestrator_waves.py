@@ -927,6 +927,24 @@ class TestTheBudgetStopsDispatch:
         assert "resumable" in report.completion.reason
         assert not any("ended as" in message for message in harness.notifier.messages())
 
+    def test_the_factory_carries_the_unattended_posture_to_the_guard(
+        self, harness: Harness
+    ) -> None:
+        """The one argument on this path that nothing else checks.
+
+        Every enforcement here is reachable only because the factory passes it
+        on, and this is the argument whose omission is invisible: configuration
+        cannot express an unbounded ceiling, so the refusal it feeds is
+        unreachable through the factory today and becomes reachable the moment a
+        real unattended caller exists. Asserting the posture arrived is what
+        keeps the passthrough from being decoration.
+        """
+        harness.start_run()
+        runner = runner_for(harness, Worker(), headless=True)
+
+        assert runner.guard.headless is True
+        assert runner_for(harness, Worker()).guard.headless is False
+
     def test_an_unattended_run_with_no_ceiling_dispatches_nothing(self, harness: Harness) -> None:
         """Engine_Floor: a headless run with no finite ceiling never executes.
 

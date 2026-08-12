@@ -460,12 +460,35 @@ class TestSubmitterClass:
         configure(config, {"sources": {SOURCE: {"maintainers": ["Trusted-Dev"]}}})
         route = load_route(config, SOURCE)
 
-        # Folded on both sides: a tracker that prints "@trusted_dev" and a list
-        # that says "Trusted-Dev" are the same person.
-        resolved = submitter_class_of(route, item("7", submitter="@trusted_dev"))
+        # Case and a single leading "@" are the whole leniency: a tracker that
+        # prints "@Trusted-Dev" and a list that says "Trusted-Dev" are one person.
+        resolved = submitter_class_of(route, item("7", submitter="@trusted-dev"))
 
         assert resolved.name == "maintainer"
         assert resolved.evidence is ClassEvidence.MAINTAINER_LIST
+
+    @pytest.mark.parametrize(
+        "submitter",
+        ["trusted_dev", "trusted dev", "trusted--dev", "trus@ted-dev", "trusted-dev-x"],
+    )
+    def test_a_name_that_merely_resembles_a_maintainer_is_not_one(
+        self, config: ConfigStore, submitter: str
+    ) -> None:
+        """The submitter is mapped item text, so this comparison is attacker-facing.
+
+        Folding separators would make distinct accounts equal -- an underscore is
+        a legal username character on some hosts, so a stranger registering the
+        underscore spelling of a maintainer's handle would inherit the maintainer
+        autonomy level, up to and including integration. The list is operator
+        config, written once, so it can be matched exactly.
+        """
+        configure(config, {"sources": {SOURCE: {"maintainers": ["Trusted-Dev"]}}})
+        route = load_route(config, SOURCE)
+
+        resolved = submitter_class_of(route, item("7", submitter=submitter))
+
+        assert resolved.name != "maintainer"
+        assert resolved.evidence is not ClassEvidence.MAINTAINER_LIST
 
     @pytest.mark.parametrize(
         ("association", "expected"),

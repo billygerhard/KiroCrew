@@ -102,7 +102,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Explicit user action starts the same pipeline with identical stages, variables, and rules; completion or failure notifies with every executed stage's outcome
     - _Requirements: 13.22, 13.13_
 
-  - [ ] 7.6 Quality gates and stage ordering
+  - [x] 7.6 Quality gates and stage ordering
     - Workflow-declared stage order with verify-class gates runnable before submit, after it, or both; each gate carries severity (blocking stops the flow and dispatches fix tasks, advisory records and surfaces without stopping)
     - Run context substitution including base branch so gates can compare against base; gate name, severity, exit status and captured output audited and displayed on the run; bundled presets for tests, coverage thresholds, lint and type checks; no gates configured is recorded, not an error
     - _Requirements: 13.23, 29.1, 29.2, 29.3, 29.4, 29.5, 29.6, 29.7, 29.8_
@@ -122,7 +122,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [x] 8.2 Poll diffing, lifecycle generations, and atomic claims
     - Diff successive poll snapshots to derive new items and transitions (reopened, cancelled); claims keyed on (item identifier, lifecycle generation) with a SQLite unique constraint for exactly-once dispatch
     - _Requirements: 10.3, 10.9, 21.1_
-  - [ ] 8.3 Dispatcher routing, caps, and run seeding
+  - [x] 8.3 Dispatcher routing, caps, and run seeding
     - Route via source config: target project, base branch, classification-to-spec-type and autonomy per submitter class; submitter class from maintainer list or author-association, least-trusted when undetermined
     - Global and per-project caps with arrival-order queueing; unmapped classification without a default is recorded, not dispatched; no target project refuses dispatch; item content passed as quoted data; intake guidance injected separately; runs seeded in the project working tree so native steering applies
     - Consume what the tick and the lifecycle diff already produce. Tasks 8.1 and 8.2 built polling and the claim-keyed diff but no production caller, so a tick's items currently go nowhere; this is the consumer, and the "no target project refuses dispatch" property named above belongs here rather than to the poll
@@ -146,7 +146,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 36.1, 36.2, 36.3, 36.4, 36.5, 36.6, 36.7, 36.8, 10.10, 37.1_
 
 - [ ] 9. Orchestrator
-  - [ ] 9.1 Wave loop and task persistence
+  - [x] 9.1 Wave loop and task persistence
     - Dispatch leaf tasks wave by wave with in-wave parallelism up to the concurrency cap; persist task status after every state change for resume
     - Wire the pieces earlier waves built as libraries but left unconstructed outside their tests: pass a workspace broker into the delivery pipeline so the shared-working-tree refusal actually runs, and resolve each dispatch's role through the role resolver. Reviews of tasks 7.3 and 9.2 found both inert in production; a library nothing constructs is an enforcement that never fires
     - Also call the completion reporter 6.2 added. It attributes a run's total consumption to the notification and the audit record, and run completion lives here rather than in the budget module, so nothing invokes it yet
@@ -211,6 +211,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 13.1 Manifest, discovery skill, and registration
     - app.json declaring the MCP server and skill; trigger phrases for natural spec requests; skill directs agents to obtain instructions from the tools before any spec operation
     - Register the watcher's script cron and install its shim. Task 8.1 built the tick and proved it costs nothing, but nothing installs or schedules it, so an unregistered watcher polls no source at all — a review found the same inert shape in three separate tasks, which is why the wiring is named here rather than assumed
+    - Reach the orchestrator through `orchestrator_for` rather than assembling a wave runner by hand. Task 9.1 made that factory the single construction point for the workspace broker, the role resolver and the completion reporter, so a surface that builds its own runner silently drops all three — the inertness moved up one level rather than away, and this is the task that closes it
     - _Requirements: 4.1, 4.2, 4.3_
   - [ ] 13.2 Bundled presets
     - GitHub/GitLab watch source presets, git-with-PR and local-only workflow presets, quality-first and budget cost profiles, bundled screening guidance

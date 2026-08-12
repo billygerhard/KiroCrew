@@ -184,6 +184,14 @@ CONFIG_ONLY_PATHS: tuple[str, ...] = (
     SECTION_WORKFLOW,
     SECTION_CAPABILITIES,
     f"{SECTION_PROJECTS}.*.{SECTION_WORKFLOW}",
+    # The second place in this document that holds argv the delivery pipeline
+    # executes, on the run's workspace with the run's substituted variables. The
+    # workflow above is fenced for exactly that reason, and leaving gates open
+    # would not be a gap beside the fence but a way through it: a command refused
+    # at a workflow stage is accepted as a gate and runs on the next delivery.
+    # Declared advisory it would run and stop nothing, so the run still reports
+    # passed.
+    SECTION_QUALITY_GATES,
     # Intake guidance is text the engine puts in a headless run's seed beside the
     # watched item, so a tool that could write it could write the run's own
     # instructions. The source-level copy is already covered by the whole

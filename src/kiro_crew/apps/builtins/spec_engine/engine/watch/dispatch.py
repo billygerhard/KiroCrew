@@ -549,7 +549,7 @@ def load_route(config: ConfigStore, source: str) -> SourceRoute:
         base_branch=_text(entry.get(BASE_BRANCH_FIELD))
         or _text(project_entry.get(BASE_BRANCH_FIELD)),
         spec_types=_mapping(entry.get(SPEC_TYPES_FIELD)),
-        maintainers=frozenset(_folded(name) for name in _text_list(entry.get(MAINTAINERS_FIELD))),
+        maintainers=frozenset(_identity(name) for name in _text_list(entry.get(MAINTAINERS_FIELD))),
         intake=_intake(entry.get(INTAKE_FIELD), project_entry.get(INTAKE_FIELD)),
     )
 
@@ -564,7 +564,7 @@ def submitter_class_of(route: SourceRoute, item: WatchedItem) -> SubmitterClass:
     knows nothing about, and treating an unknown author as trusted is the one
     error a stranger could exploit on purpose.
     """
-    submitter = _folded(item.submitter)
+    submitter = _identity(item.submitter)
     if submitter and submitter in route.maintainers:
         return SubmitterClass(
             name="maintainer",
@@ -1078,11 +1078,32 @@ def _longest_backtick_run(text: str) -> int:
 
 
 def _folded(text: str) -> str:
-    """Fold a name or an association for comparison against a fixed vocabulary."""
+    """Fold an association for comparison against a fixed vocabulary.
+
+    Deliberately lossy: the vocabulary is a closed set of engine-known spellings,
+    so ``FIRST_TIME_CONTRIBUTOR``, ``first-time contributor`` and
+    ``First Time Contributor`` should all land on the same entry.
+    """
     folded = text.strip().casefold().replace("@", "")
     for separator in ("_", "-"):
         folded = folded.replace(separator, " ")
     return " ".join(folded.split())
+
+
+def _identity(text: str) -> str:
+    """Fold a name for comparison against the operator's maintainer list.
+
+    This is an identity match, not a vocabulary lookup, so it must not be lossy
+    in the permissive direction. Folding separators here would make two genuinely
+    different accounts equal -- an underscore is a legal username character on
+    some hosts, so a maintainer ``alice-smith`` and a stranger's ``alice_smith``
+    would collide, and the resolved class picks the autonomy level. The operator
+    writes the list once, so it can be spelled exactly; the one leniency kept is a
+    single leading ``@``, because a tracker that prints ``@name`` and a list that
+    says ``name`` do mean the same person.
+    """
+    stripped = text.strip().casefold()
+    return stripped[1:] if stripped.startswith("@") else stripped
 
 
 def _entry(document: Mapping[str, Any], section: str, name: str) -> Mapping[str, Any]:
