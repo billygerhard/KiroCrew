@@ -238,9 +238,15 @@ class StallLike(Protocol):
     Structural rather than an import of the run lifecycle's dataclass: routing
     needs a channel, a line of text, and an identifier to group by, and naming
     only those keeps a notifier usable by anything that produces a notice.
+
+    ``channel`` is a read-only property because the notice it describes is a
+    frozen dataclass. Declared as a plain attribute the protocol would demand a
+    settable one, and the notifier would then not satisfy the seam it exists to
+    fill — a mismatch the type checker catches and no test would.
     """
 
-    channel: str
+    @property
+    def channel(self) -> str: ...
 
     def message(self) -> str: ...
 

@@ -20,11 +20,13 @@ Four claims, in the order a regression would hurt:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from kiro_crew.apps.builtins.spec_engine.engine.budget import Notifier as BudgetNotifier
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.config.effective import ValueOrigin
 from kiro_crew.apps.builtins.spec_engine.engine.config.store import APP_NAME
@@ -49,6 +51,9 @@ from kiro_crew.apps.builtins.spec_engine.engine.notify import (
     safe_detail,
     safe_line,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.runs import Notifier as RunNotifier
+from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine, RunState
+from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 from kiro_crew.notifications.bus import (
     PRIORITIES,
     NotificationBus,
@@ -57,6 +62,19 @@ from kiro_crew.notifications.bus import (
 )
 
 PROJECT = "acme"
+
+
+class FakeClock:
+    """A clock the test advances, so a phase timeout fires without a sleep."""
+
+    def __init__(self) -> None:
+        self._now = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now = self._now + timedelta(seconds=seconds)
 
 
 class FakeBus:
@@ -350,6 +368,15 @@ class TestDeliveryThroughTheHost:
 class TestNotifierSeams:
     """The two shapes the engine already calls a notifier with."""
 
+    def test_the_notifier_fits_both_engine_notifier_seams(self, config: ConfigStore) -> None:
+        # Checked by the type checker rather than at runtime: a notifier whose
+        # signature drifts from a seam it claims to fill still passes every
+        # behavioural test in this file, because those call it directly.
+        notifier = HostNotifier(config)
+        run_seam: RunNotifier = notifier
+        budget_seam: BudgetNotifier = notifier
+        assert run_seam is budget_seam is notifier
+
     def test_the_budget_shape_delivers_with_the_message_as_title_and_body(
         self, config: ConfigStore, bus: FakeBus
     ) -> None:
@@ -472,3 +499,62 @@ class TestUntrustedText:
 
     def test_safe_line_collapses_runs_of_whitespace(self) -> None:
         assert safe_line("  a\t\t b \n c ") == "a b c"
+
+
+class TestTheRunLifecycleSeam:
+    """The notifier is a drop-in for the seam the run lifecycle already calls.
+
+    A structural protocol that does not actually match the notice the engine
+    produces is worth nothing, so this drives a real stall through a real run
+    machine rather than asserting against a hand-built notice.
+    """
+
+    def stalled(
+        self,
+        store: StateStore,
+        config: ConfigStore,
+        ref: SpecRef,
+        bus: FakeBus,
+    ) -> Any:
+        clock = FakeClock()
+        machine = RunMachine(
+            store,
+            config,
+            project=PROJECT,
+            notifier=HostNotifier(config, project=PROJECT, bus=bus),
+            clock=clock,
+        )
+        machine.create(ref, run_id="run-9")
+        machine.transition(ref, "run-9", RunState.AUTHORING)
+        timeout = machine.phase_timeout_s(RunState.AUTHORING)
+        assert timeout is not None
+        clock.advance(timeout + 1)
+        (notice,) = machine.sweep_stalled()
+        return notice
+
+    def test_a_real_stall_reaches_the_configured_channel(
+        self, store: StateStore, config: ConfigStore, ref: SpecRef, bus: FakeBus
+    ) -> None:
+        with_project(config, channel=REVIEW_CHANNEL)
+        notice = self.stalled(store, config, ref, bus)
+        assert notice.notified is True
+        (payload,) = bus.pushed
+        assert payload.channel == f"{APP_NAME}.{REVIEW_CHANNEL}"
+        assert payload.group_key == "run-9"
+        assert "run-9" in payload.body
+
+    def test_a_project_with_no_channel_configured_reaches_the_dashboard(
+        self, store: StateStore, config: ConfigStore, ref: SpecRef, bus: FakeBus
+    ) -> None:
+        with_project(config)
+        notice = self.stalled(store, config, ref, bus)
+        assert notice.notified is True
+        assert bus.pushed[0].channel == f"{APP_NAME}.{DASHBOARD_CHANNEL}"
+
+    def test_an_undelivered_stall_leaves_the_run_stalled_and_recorded(
+        self, store: StateStore, config: ConfigStore, ref: SpecRef
+    ) -> None:
+        with_project(config)
+        notice = self.stalled(store, config, ref, FakeBus(fail=True))
+        assert notice.notified is False
+        assert "bus said no" in notice.error
