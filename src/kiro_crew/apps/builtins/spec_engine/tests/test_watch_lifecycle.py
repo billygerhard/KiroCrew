@@ -35,6 +35,7 @@ from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine.state import (
     CLAIM_DISPATCH,
+    StatePersistenceError,
     StateStore,
     WatchObservation,
 )
@@ -548,6 +549,61 @@ class TestClaims:
 
 
 # --- the invariants that make a wrong generation unconstructable -----------
+
+
+class TestCrashBetweenTheTwoWrites:
+    """The ordering ``advance_watch`` argues for, which only a fault can observe.
+
+    Its two writes are separate transactions, so which one goes first decides what
+    an interrupted tick leaves behind. Claiming first leaves a claim for work that
+    never started: a missed dispatch, and the claim row is the trace that makes it
+    recoverable. Recording first leaves the snapshot advanced with nothing in the
+    ledger, so the next poll sees an unchanged item and the work is never
+    dispatched and never known about. Both orders satisfy every assertion that
+    only inspects a completed advance, which is why these inject the fault.
+    """
+
+    def test_a_failed_snapshot_write_still_leaves_the_claim(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = snapshot(store)
+
+        def refuse(*_args: object, **_kwargs: object) -> None:
+            raise StatePersistenceError("disk full")
+
+        monkeypatch.setattr(store, "record_watch_items", refuse)
+
+        with pytest.raises(StatePersistenceError):
+            advance_watch(store, polled(item("1")))
+
+        monkeypatch.undo()
+        # The claim landed before the snapshot attempt, so the interrupted tick is
+        # visible and releasable. A second claim for the same generation is
+        # therefore refused. Swapping the two writes makes this return True.
+        held = store.claim_dispatch(SOURCE, "1", generation=generation_key(FIRST_GENERATION))
+        assert held is False
+        assert snapshot(store) == before
+
+    def test_a_failed_claim_leaves_the_snapshot_untouched(
+        self, store: StateStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        before = snapshot(store)
+        real_claim = store.claim
+
+        def refuse(kind: str, *args: object, **kwargs: object) -> bool:
+            if kind == CLAIM_DISPATCH:
+                raise StatePersistenceError("disk full")
+            return bool(real_claim(kind, *args, **kwargs))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "claim", refuse)
+
+        with pytest.raises(StatePersistenceError):
+            advance_watch(store, polled(item("1")))
+
+        monkeypatch.undo()
+        # Nothing was recorded, so the next poll still sees the item as new and
+        # the work is not silently lost.
+        assert snapshot(store) == before
 
 
 class TestInvariants:
