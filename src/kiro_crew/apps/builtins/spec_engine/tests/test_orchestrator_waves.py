@@ -847,6 +847,40 @@ class TestTheCompletionReporterIsWired:
 
 
 class TestTheBudgetStopsDispatch:
+    def test_dispatched_turns_are_in_flight_while_they_run_and_settled_after(
+        self, harness: Harness
+    ) -> None:
+        """The in-flight count is what "halted, still draining" is read from.
+
+        A ceiling reached with turns outstanding stops new dispatch and lets those
+        turns finish, and a surface can only say so if the count reflects what is
+        actually running. Counted on the loop's own thread, so two workers never
+        increment it at once.
+        """
+        write_tasks(harness.ref.spec_dir, [["1.1", "1.2"]])
+        set_cap(harness, 2)
+        harness.start_run()
+        gate = CapGate(2)
+        worker = Worker(cap_gate=gate)
+        runner = runner_for(harness, worker)
+        observed: list[int] = []
+
+        def observe() -> None:
+            try:
+                gate.reached.wait(GATE_TIMEOUT_S)
+                observed.append(runner.guard.in_flight)
+            finally:
+                gate.release.set()
+
+        watcher = threading.Thread(target=observe, daemon=True)
+        watcher.start()
+        report = runner.execute(context_for(harness))
+        watcher.join(GATE_TIMEOUT_S)
+
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert observed == [2]
+        assert runner.guard.in_flight == 0
+
     def test_reaching_the_ceiling_mid_wave_stops_the_leaves_that_had_not_started(
         self, harness: Harness
     ) -> None:

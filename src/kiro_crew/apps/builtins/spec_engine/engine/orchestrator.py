@@ -462,6 +462,17 @@ class WaveRunner:
         return self._plan
 
     @property
+    def guard(self) -> BudgetGuard:
+        """The run's budget guard.
+
+        Exposed because a worker that creates a session has to stamp it onto the
+        run: consumption from a session nobody stamped is spend the ceiling cannot
+        see, and the worker is the only party that knows the session key it was
+        given.
+        """
+        return self._guard
+
+    @property
     def pipeline(self) -> DeliveryPipeline:
         """The delivery pipeline this run isolates through.
 
