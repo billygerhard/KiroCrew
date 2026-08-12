@@ -104,9 +104,14 @@ IMPLEMENT_MODEL = "implement-model"
 REVIEW_MODEL = "review-model"
 SESSION_MODEL = "session-model"
 
-#: Barrier waits are bounded so a loop that dispatches fewer tasks than the cap
-#: fails the test instead of hanging it.
+#: Barrier and gate waits are bounded so a loop that dispatches fewer tasks than
+#: the cap fails the test instead of hanging it.
 GATE_TIMEOUT_S = 10.0
+
+#: How long the cap observer waits for a task beyond the cap to appear. Only the
+#: broken case ends this wait early, so a generous window costs one pause per
+#: parametrized case and never a false failure.
+EXCEED_WINDOW_S = 0.75
 
 
 class CountingStore(StateStore):
@@ -128,13 +133,55 @@ class CountingStore(StateStore):
         return lock
 
 
+class CapGate:
+    """Holds every dispatched task live until the test has observed the overlap.
+
+    A plain barrier cannot answer this question. A barrier of *cap* parties
+    releases in groups of *cap*, so it serialises the arrivals into exactly the
+    shape the cap would have produced anyway and the observed peak comes out at
+    the cap whether the loop honoured it or not. Here every task blocks until an
+    observer has looked, so the number of live tasks is the loop's answer rather
+    than the gate's.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.reached = threading.Event()
+        self.exceeded = threading.Event()
+        self.release = threading.Event()
+        self.observed: list[int] = []
+
+    def arrived(self, live: int) -> None:
+        if live >= self.cap:
+            self.reached.set()
+        if live > self.cap:
+            self.exceeded.set()
+
+    def hold(self) -> None:
+        if not self.release.wait(GATE_TIMEOUT_S):
+            raise AssertionError("a dispatched task was never released by the observer")
+
+    def observe(self, worker: "Worker") -> None:
+        """Record how many tasks were live once the cap was reached."""
+        try:
+            if self.reached.wait(GATE_TIMEOUT_S):
+                # Bounded and one-directional: it returns at once when more than
+                # the cap is live and times out when the cap holds, so the
+                # correct case waits and the broken case is caught immediately.
+                self.exceeded.wait(EXCEED_WINDOW_S)
+            self.observed.append(worker.live)
+        finally:
+            self.release.set()
+
+
 class Worker:
     """A task worker that records what it was handed and how much overlapped."""
 
     def __init__(
         self,
         *,
-        gate: threading.Barrier | None = None,
+        barrier: threading.Barrier | None = None,
+        cap_gate: CapGate | None = None,
         fail: Iterable[str] = (),
         during: Callable[[str], None] | None = None,
     ) -> None:
@@ -145,21 +192,32 @@ class Worker:
         self.peak = 0
         self._live = 0
         self._lock = threading.Lock()
-        self._gate = gate
+        self._barrier = barrier
+        self._cap_gate = cap_gate
         self._fail = set(fail)
         self._during = during
+
+    @property
+    def live(self) -> int:
+        """Tasks inside the worker right now."""
+        with self._lock:
+            return self._live
 
     def __call__(self, *, task: str, dispatch: Dispatch, context: RunContext) -> TaskResult:
         with self._lock:
             self._live += 1
+            live = self._live
             self.peak = max(self.peak, self._live)
             self.dispatched.append(task)
             self.routed[task] = dispatch
             self.contexts.append(context)
             self.events.append(("start", task))
         try:
-            if self._gate is not None:
-                self._gate.wait()
+            if self._cap_gate is not None:
+                self._cap_gate.arrived(live)
+                self._cap_gate.hold()
+            if self._barrier is not None:
+                self._barrier.wait()
             if self._during is not None:
                 self._during(task)
         finally:
@@ -379,27 +437,31 @@ class TestWavesRunInOrder:
 
 class TestInWaveParallelism:
     @pytest.mark.parametrize("cap", [1, 2, 3])
-    def test_the_configured_cap_is_both_the_floor_and_the_ceiling(
+    def test_exactly_the_configured_number_of_leaves_are_live_at_once(
         self, harness: Harness, cap: int
     ) -> None:
-        """Twice *cap* leaves in one wave, dispatched *cap* at a time.
+        """Twice *cap* leaves in one wave, and the live count is read mid-wave.
 
-        Both directions are asserted, because each alone passes for the wrong
-        reason: a barrier of *cap* parties proves at least that many overlap (a
-        serial loop deadlocks on it and the wait times out), and the observed peak
-        proves no more than that many do (a loop ignoring the cap would exceed
-        it). The leaf count is a multiple of the cap so every group of arrivals
-        fills the barrier.
+        Both directions matter and one assertion covers both: the count observed
+        while the wave is running is *equal* to the cap, so a serial loop (fewer
+        live) and a loop that ignored the cap (more live) each fail. Every
+        dispatched task is held until the observer has looked, so the number is
+        the loop's answer and not an artefact of how the tasks were paced.
         """
         leaves = [f"1.{index}" for index in range(1, cap * 2 + 1)]
         write_tasks(harness.ref.spec_dir, [leaves])
         set_cap(harness, cap)
         harness.start_run()
-        worker = Worker(gate=threading.Barrier(cap, timeout=GATE_TIMEOUT_S))
+        gate = CapGate(cap)
+        worker = Worker(cap_gate=gate)
+        observer = threading.Thread(target=gate.observe, args=(worker,), daemon=True)
+        observer.start()
 
         report = runner_for(harness, worker).execute(context_for(harness))
+        observer.join(GATE_TIMEOUT_S)
 
         assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert gate.observed == [cap]
         assert worker.peak == cap
         assert sorted(worker.dispatched) == sorted(leaves)
 
@@ -483,35 +545,84 @@ class TestTaskStatusIsPersisted:
 
 
 class TestOneLockPerBatch:
-    def test_statuses_that_settle_together_are_written_under_one_lock(
-        self, harness: Harness
-    ) -> None:
-        """Three leaves finishing at once cost one acquisition, not three.
+    def test_a_batch_of_statuses_costs_one_lock_acquisition(self, harness: Harness) -> None:
+        """Three statuses, one acquisition, and all three landed.
 
         The store refuses a conflicting writer instead of waiting, so an
         acquisition per write is an acquisition per write that can be refused —
         and a refused status that is then dropped makes a resumed run pay again
-        for work that finished. One acquisition for the batch is also what makes
-        the batch atomic against any other writer of the spec.
+        for work that finished. The write count is asserted beside the lock count,
+        because "few locks" is only correct if every status still landed: passing
+        the handle down is what makes the writes work at all, since the lock is
+        not re-entrant and a nested acquisition is refused by its own caller.
+        """
+        harness.start_run()
+        runner = runner_for(harness, Worker())
+        harness.state.acquisitions.clear()
+
+        runner.record_statuses(
+            {
+                "1.1": TaskStatus.COMPLETE,
+                "1.2": TaskStatus.FAILED,
+                "2.1": TaskStatus.IN_PROGRESS,
+            }
+        )
+
+        assert harness.state.acquisitions == [RUN]
+        assert harness.detail_statuses() == {
+            "1.1": TaskStatus.COMPLETE,
+            "1.2": TaskStatus.FAILED,
+            "2.1": TaskStatus.IN_PROGRESS,
+        }
+
+    def test_a_waves_leaves_are_marked_in_progress_under_one_acquisition(
+        self, harness: Harness
+    ) -> None:
+        """Read from inside the wave, where the dispatch batch is observable.
+
+        A wave of three with a cap of three is one dispatch batch, so by the time
+        any of its tasks is running all three are recorded and exactly one lock
+        was taken to record them.
         """
         write_tasks(harness.ref.spec_dir, [["1.1", "1.2", "1.3"]])
         set_cap(harness, 3)
         harness.start_run()
-        worker = Worker(gate=threading.Barrier(3, timeout=GATE_TIMEOUT_S))
+        seen: list[tuple[int, dict[str, TaskStatus]]] = []
 
+        def observe(task: str) -> None:
+            seen.append((len(harness.state.acquisitions), harness.detail_statuses()))
+
+        worker = Worker(barrier=threading.Barrier(3, timeout=GATE_TIMEOUT_S), during=observe)
         harness.state.acquisitions.clear()
         report = runner_for(harness, worker).execute(context_for(harness))
 
         assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
-        # One batch marked in progress, one batch settled: two acquisitions for
-        # six status writes. The write count is asserted too, because "few locks"
-        # is only correct if every status still landed.
-        assert harness.state.acquisitions == [RUN, RUN]
-        assert harness.detail_statuses() == {
-            "1.1": TaskStatus.COMPLETE,
-            "1.2": TaskStatus.COMPLETE,
-            "1.3": TaskStatus.COMPLETE,
-        }
+        in_progress = {task: TaskStatus.IN_PROGRESS for task in ("1.1", "1.2", "1.3")}
+        assert seen == [(1, in_progress)] * 3
+
+    def test_no_spec_lock_is_held_while_a_task_runs(self, harness: Harness) -> None:
+        """The lock serialises writers of one spec; a task can take minutes.
+
+        Held across a dispatch, it would block the stall sweep, a cancellation,
+        and every other run of the same spec for as long as the model turn takes.
+        """
+        write_tasks(harness.ref.spec_dir, [["1.1"]])
+        harness.start_run()
+        acquired: list[bool] = []
+
+        def probe(task: str) -> None:
+            try:
+                lock = harness.state.acquire_lock(harness.ref, owner="observer")
+            except SpecLocked:
+                acquired.append(False)
+                return
+            acquired.append(True)
+            harness.state.release_lock(lock)
+
+        report = runner_for(harness, Worker(during=probe)).execute(context_for(harness))
+
+        assert acquired == [True]
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
 
 
 class TestTheWorkspaceBrokerIsWired:

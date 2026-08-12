@@ -573,7 +573,7 @@ class WaveRunner:
                     # One lock for the whole batch. Marking each task in turn
                     # would take and drop the lock per task, which is the
                     # contention this batching exists to remove.
-                    self._persist({task: TaskStatus.IN_PROGRESS for task in batch})
+                    self.record_statuses({task: TaskStatus.IN_PROGRESS for task in batch})
                     for task in batch:
                         dispatch = self._plan.dispatch(WorkKind.TASK_IMPLEMENTATION, subagent=True)
                         routed[task] = dispatch
@@ -606,7 +606,7 @@ class WaveRunner:
                 # Everything that finished together is written under one lock, so
                 # simultaneous completions coalesce into one writer instead of
                 # one of them being refused and dropped.
-                self._persist(settled)
+                self.record_statuses(settled)
                 for task, status in settled.items():
                     dispatch = routed[task]
                     attempt = TaskAttempt(
@@ -726,8 +726,21 @@ class WaveRunner:
         setting = self._config.effective(WAVE_CONCURRENCY_SETTING, project=self._project)
         return max(1, int(setting.value))
 
-    def _persist(self, statuses: Mapping[str, TaskStatus]) -> None:
-        """Write a batch of task statuses under one held spec lock."""
+    def record_statuses(self, statuses: Mapping[str, TaskStatus]) -> None:
+        """Write a batch of task statuses under one held spec lock.
+
+        Public because the batching is the contract rather than an
+        implementation detail: anything layered on this loop that reports several
+        tasks at once has to write them the same way. One acquisition per batch
+        rather than one per status, and the handle is passed to each write rather
+        than re-acquired -- the store's lock is not re-entrant, so a nested
+        acquisition is refused by its own caller, and a status that is refused and
+        then dropped is finished work a resumed run pays for twice.
+
+        No lock is held while a task is running. The lock serialises writers of
+        one spec, and holding it across a model turn would block every other
+        writer for as long as the turn takes.
+        """
         if not statuses:
             return
         with self._machine.store.lock(self._ref, owner=self._run_id) as handle:
