@@ -312,6 +312,32 @@ class TestNoTwoActiveRunsShareAWorkingTree:
         assert RUN_A in result.reason
         assert result.commands == ()
 
+    def test_a_branch_a_released_run_held_is_free_for_another_run(self, repo: Fixture) -> None:
+        """Releasing a claim has to hand the branch back, not retire it.
+
+        A tracker-dispatched run carries the branch its review artifact expects,
+        so the same name legitimately arrives again after the first attempt let
+        it go. Holding it against a run that no longer exists would strand that
+        branch for good, and the only thing separating the two cases is that a
+        released claim is excluded from the conflict scan.
+        """
+        configure_git_preset(repo)
+        broker = broker_for(repo)
+        shared = "review/example-17"
+        # A base the remote lacks: the stage fails and releases the claim, which
+        # is the realistic way a branch is held and then handed back.
+        first = build_pipeline(repo, broker=broker).isolate(
+            context(repo, branch_name=shared, base_branch="no-such-base"), run_id=RUN_A
+        )
+        assert not first.ok
+        assert broker.workspace_for(RUN_A) is None
+
+        result = build_pipeline(repo, broker=broker).isolate(
+            context(repo, branch_name=shared), run_id=RUN_B
+        )
+
+        assert result.outcome is StageOutcome.PASSED, result.reason
+
     def test_git_refuses_the_shared_branch_when_no_broker_asked_first(self, repo: Fixture) -> None:
         """The backstop under the engine's own check.
 
