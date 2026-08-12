@@ -40,6 +40,7 @@ from typing import Any, Sequence
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
+from ..budget.switch import KillSwitch
 from ..config import ConfigStore
 from ..delivery.stages import CommandRunner
 from .items import WatchedItem
@@ -96,6 +97,10 @@ class TickReport:
     """Every source's outcome for one tick."""
 
     outcomes: tuple[PollOutcome, ...]
+    #: Set when the kill switch was engaged, in which case nothing was polled.
+    #: The reason travels with the report because a tick that returns no outcomes
+    #: is otherwise indistinguishable from one with no sources configured.
+    paused: str = ""
 
     @property
     def polled(self) -> tuple[PollOutcome, ...]:
@@ -124,6 +129,8 @@ class TickReport:
 
     def summary(self) -> str:
         """A human-readable line per source."""
+        if self.paused:
+            return self.paused
         return "\n".join(outcome.describe() for outcome in self.outcomes)
 
 
@@ -132,14 +139,25 @@ def poll_tick(
     *,
     sources: Sequence[str] | None = None,
     runner: CommandRunner | None = None,
+    kill_switch: KillSwitch | None = None,
 ) -> TickReport:
     """Run one poll tick over *sources*, or every enabled source.
 
     Reads the enabled set from configuration on every tick rather than trusting
     the caller: the scheduler holds a job per source, and a job that outlived its
     source's enablement must not be the thing that decides whether to poll.
+
+    The kill switch is read here, before anything is selected, which is what makes
+    one operator action pause *every* watcher. Checking it per source, or handing a
+    list of jobs to pause, would pause the watchers that were known when the switch
+    was thrown and poll the one added to configuration afterwards.
     """
     resolved = store if store is not None else ConfigStore()
+    switch = kill_switch if kill_switch is not None else KillSwitch()
+    state = switch.read()
+    if state.engaged:
+        logger.warning("watch tick skipped: %s", state.describe())
+        return TickReport(outcomes=(), paused=state.describe())
     if sources is None:
         selected = tuple(source.name for source in load_sources(resolved, enabled_only=True))
     else:

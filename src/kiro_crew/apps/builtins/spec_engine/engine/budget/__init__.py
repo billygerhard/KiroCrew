@@ -1,9 +1,9 @@
-"""Budget enforcement: run attribution and the per-run ceiling.
+"""Budget enforcement: run attribution, the per-run ceiling, caps, and the stop.
 
 Import from this package rather than its modules; the split between attribution
 and enforcement is an implementation detail.
 
-    from ...engine.budget import guard_for
+    from ...engine.budget import caps_for, engage_kill_switch, guard_for
 
     guard = guard_for(run_id, ref, state=state, config=config, headless=True)
     guard.stamp_session(session_key)      # every session the run creates
@@ -11,23 +11,53 @@ and enforcement is an implementation detail.
     if not decision.allowed:
         return decision.message           # carries the consumed amount
 
-The ceiling is per run and independent of any watch-source spending cap: a run
-halts on its own ceiling whether or not a cap ever stopped its dispatch.
+    gate = caps_for(state, config)        # per-source cap + the kill switch
+    if not gate.dispatch_allowed(source):
+        return                            # no new run for that source
+
+    engage_kill_switch(state=state, config=config, initiator="operator")
+
+Three controls, deliberately independent:
+
+* the **ceiling** is per run — a run halts on its own number whether or not a cap
+  ever stopped its dispatch;
+* a **cap** is per source and per period — it stops new dispatches for one source
+  while every other source keeps going;
+* the **kill switch** is one flag every one of those paths reads per attempt, so a
+  single operator action reaches work that did not exist when it was thrown.
 """
 
 from __future__ import annotations
 
+from .caps import (
+    CAP_CREDITS_KEY,
+    CAP_PERIOD_DAYS_KEY,
+    SOURCES_SECTION,
+    SPEND_CAP_FIELD,
+    CapDecision,
+    CapOutcome,
+    SourceCap,
+    SourceCaps,
+    SourceSpend,
+    caps_for,
+    resolve_source_cap,
+)
 from .ceiling import (
+    AUDIT_EVENT_COMPLETED,
     AUDIT_EVENT_HALTED,
     AUDIT_EVENT_REFUSED,
+    AUDIT_EVENT_STOPPED,
     AUDIT_EVENT_WARNING,
     CEILING_SETTING,
     CHANNEL_SETTING,
     DETAIL_CEILING_CREDITS,
     DETAIL_CONSUMED_CREDITS,
     HALT_INITIATOR,
+    KILL_SWITCH_INITIATOR,
     NOTIFY_CLAIM_KIND,
+    NOTIFY_COMPLETED,
     NOTIFY_HALTED,
+    NOTIFY_STOPPED,
     NOTIFY_UNBOUNDED,
     NOTIFY_WARNING,
     RUN_STATE_HALTED_BUDGET,
@@ -36,6 +66,7 @@ from .ceiling import (
     Budget,
     BudgetGuard,
     BudgetHalted,
+    CompletionReport,
     DispatchDecision,
     DispatchOutcome,
     Notifier,
@@ -43,6 +74,14 @@ from .ceiling import (
     format_credits,
     guard_for,
     resolve_budget,
+)
+from .killswitch import (
+    STOPPABLE_STATES,
+    HaltedRun,
+    KillSwitchReport,
+    engage_kill_switch,
+    release_kill_switch,
+    stoppable_runs,
 )
 from .ledger import (
     DECLARED_CALLS_KEY,
@@ -64,11 +103,20 @@ from .ledger import (
     ledger_dir,
     normalize_session_key,
 )
+from .switch import (
+    KILL_SWITCH_FILENAME,
+    KillSwitch,
+    KillSwitchState,
+)
 
 __all__ = [
+    "AUDIT_EVENT_COMPLETED",
     "AUDIT_EVENT_HALTED",
     "AUDIT_EVENT_REFUSED",
+    "AUDIT_EVENT_STOPPED",
     "AUDIT_EVENT_WARNING",
+    "CAP_CREDITS_KEY",
+    "CAP_PERIOD_DAYS_KEY",
     "CEILING_SETTING",
     "CHANNEL_SETTING",
     "DECLARED_CALLS_KEY",
@@ -79,22 +127,36 @@ __all__ = [
     "FIELD_SLOT",
     "FIELD_TURNS",
     "HALT_INITIATOR",
+    "KILL_SWITCH_FILENAME",
+    "KILL_SWITCH_INITIATOR",
     "LEDGER_SUBPATH",
     "NOTIFY_CLAIM_KIND",
+    "NOTIFY_COMPLETED",
     "NOTIFY_HALTED",
+    "NOTIFY_STOPPED",
     "NOTIFY_UNBOUNDED",
     "NOTIFY_WARNING",
     "RUN_STATE_HALTED_BUDGET",
     "SESSION_CLAIM_KIND",
     "SESSION_CLAIM_SCOPE",
     "SHARD_SUFFIX",
+    "SOURCES_SECTION",
+    "SPEND_CAP_FIELD",
+    "STOPPABLE_STATES",
     "WARN_FRACTION_SETTING",
     "AuditSink",
     "Budget",
     "BudgetGuard",
     "BudgetHalted",
+    "CapDecision",
+    "CapOutcome",
+    "CompletionReport",
     "DispatchDecision",
     "DispatchOutcome",
+    "HaltedRun",
+    "KillSwitch",
+    "KillSwitchReport",
+    "KillSwitchState",
     "LedgerTotal",
     "MeteringLedger",
     "Notifier",
@@ -104,9 +166,17 @@ __all__ = [
     "RunSessions",
     "RunSpend",
     "SessionAttributionConflict",
+    "SourceCap",
+    "SourceCaps",
+    "SourceSpend",
+    "caps_for",
+    "engage_kill_switch",
     "format_credits",
     "guard_for",
     "ledger_dir",
     "normalize_session_key",
+    "release_kill_switch",
     "resolve_budget",
+    "resolve_source_cap",
+    "stoppable_runs",
 ]

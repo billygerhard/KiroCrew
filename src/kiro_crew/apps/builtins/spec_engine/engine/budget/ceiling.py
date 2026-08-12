@@ -40,6 +40,7 @@ from ..config import ConfigStore, ValueOrigin
 from ..runs import IllegalTransition, RunMachine, RunState, run_state_of
 from ..state import SpecLock, SpecLocked, SpecRef, StateStore
 from .ledger import MeteringLedger, RunAccounting, RunSpend
+from .switch import KillSwitch
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,11 @@ RUN_STATE_HALTED_BUDGET = RunState.HALTED_BUDGET
 #: Initiator recorded against a halt: the ceiling acted, not a person.
 HALT_INITIATOR = "budget"
 
+#: Initiator recorded against a halt the kill switch caused. A person threw that
+#: switch, and a run parked by it is distinguishable in the audit log from one the
+#: arithmetic stopped.
+KILL_SWITCH_INITIATOR = "kill-switch"
+
 #: Run-detail keys this module writes when it parks a run, namespaced because the
 #: detail object is shared with every other writer of the run row.
 DETAIL_CONSUMED_CREDITS = "budget_consumed_credits"
@@ -68,6 +74,8 @@ DETAIL_CEILING_CREDITS = "budget_ceiling_credits"
 AUDIT_EVENT_HALTED = "budget.halted"
 AUDIT_EVENT_WARNING = "budget.warning"
 AUDIT_EVENT_REFUSED = "budget.refused"
+AUDIT_EVENT_STOPPED = "budget.kill_switch"
+AUDIT_EVENT_COMPLETED = "budget.completed"
 
 #: Claim coordinates for a one-shot notification. Scope is the run and subject the
 #: notification kind, so a resumed run that re-reads a total already past the
@@ -77,6 +85,8 @@ NOTIFY_CLAIM_KIND = "notify"
 NOTIFY_HALTED = "budget_halted"
 NOTIFY_WARNING = "budget_warning"
 NOTIFY_UNBOUNDED = "budget_unbounded"
+NOTIFY_STOPPED = "budget_kill_switch"
+NOTIFY_COMPLETED = "budget_completed"
 
 
 class BudgetHalted(Exception):
@@ -190,6 +200,8 @@ class DispatchOutcome(Enum):
     HALTED = "halted"
     #: A headless run with no ceiling in force. It never starts.
     UNBOUNDED = "unbounded"
+    #: The kill switch is engaged. Nothing new dispatches for any run.
+    STOPPED = "stopped"
 
 
 @dataclass(frozen=True)
@@ -221,15 +233,43 @@ class DispatchDecision:
     @property
     def draining(self) -> bool:
         """Halted with turns still settling: dispatch has stopped, spend has not."""
-        return self.outcome is DispatchOutcome.HALTED and self.in_flight > 0
+        return self.outcome in (DispatchOutcome.HALTED, DispatchOutcome.STOPPED) and (
+            self.in_flight > 0
+        )
+
+
+@dataclass(frozen=True)
+class CompletionReport:
+    """What a finished run consumed, as reported to an operator and the audit log.
+
+    Not a :class:`DispatchDecision`: a completed run is not asking whether it may
+    dispatch, and answering that question here would invite a caller to treat the
+    report as an authorization.
+    """
+
+    run_id: str
+    spend: RunSpend
+    #: The state the run ended in, ``None`` when its row is gone.
+    final_state: RunState | None
+    message: str
+    #: Whether this call was the one that sent the notification. False for a
+    #: second caller: the claim makes the message once per run.
+    notified: bool = False
+
+    @property
+    def consumed_credits(self) -> float:
+        """The run's total consumption, across every session it created."""
+        return self.spend.total_credits
 
 
 class BudgetGuard:
-    """Enforces one run's ceiling.
+    """Enforces one run's spend controls: its ceiling, and the global stop.
 
     Per run rather than per engine, because the ceiling, the spec it audits
     against, and the halt state are all properties of a single run. The
-    accounting it reads is shared, so several guards see the same totals.
+    accounting it reads is shared, so several guards see the same totals, and the
+    kill switch it reads is global, so one operator action reaches every guard —
+    including one built for a run that did not exist when the switch was thrown.
 
     The halt itself is applied through the run lifecycle machine rather than
     written here. That machine owns the transition table, the resume point a
@@ -250,6 +290,7 @@ class BudgetGuard:
         audit: AuditSink | None = None,
         channel: str = "",
         headless: bool = False,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         if state.get_run(run_id) is None:
             raise KeyError(f"unknown run: {run_id!r}")
@@ -263,6 +304,10 @@ class BudgetGuard:
         self._audit = audit
         self._channel = channel
         self._headless = headless
+        # Defaulted from the state store's own root, so a guard's switch and its
+        # run state always live in the same place: a switch resolved from
+        # elsewhere would be a stop this run could not see.
+        self._kill_switch = kill_switch if kill_switch is not None else KillSwitch(state.root)
         self._in_flight = 0
 
     @property
@@ -289,9 +334,18 @@ class BudgetGuard:
         return record is not None and run_state_of(record) is RunState.HALTED_BUDGET
 
     @property
+    def stopped(self) -> bool:
+        """Whether the kill switch is engaged. Read per call, never cached.
+
+        Cached, this would answer for the moment the guard was built, and a guard
+        outlives an operator's decision to stop everything.
+        """
+        return self._kill_switch.engaged
+
+    @property
     def draining(self) -> bool:
         """Halted with turns still in flight. They finish; nothing new is sent."""
-        return self.halted and self._in_flight > 0
+        return (self.halted or self.stopped) and self._in_flight > 0
 
     # --- attribution -------------------------------------------------------
 
@@ -331,6 +385,11 @@ class BudgetGuard:
         """
         spend = self.spend()
         self._cache_cost(spend)
+        if self.stopped:
+            # Ahead of every other check, including the halted one: the operator's
+            # stop is the answer they expect to read, and it is the only refusal
+            # here that is about the whole engine rather than about this run.
+            return self._stop(spend, lock)
         if self._headless and not self._budget.bounded:
             return self._refuse_unbounded(spend, lock)
         if self.halted:
@@ -348,18 +407,22 @@ class BudgetGuard:
     def open_turn(self) -> None:
         """Record a turn as dispatched.
 
-        Refuses once the run is halted. The check in :meth:`authorize_dispatch` is
-        where a well-behaved caller stops; this is what makes the stop hold for
-        one that does not.
+        Refuses once the kill switch is engaged or the run is halted. The check in
+        :meth:`authorize_dispatch` is where a well-behaved caller stops; this is
+        what makes the stop hold for one that does not.
 
-        Unboundedness is refused on the facts rather than on the parked state. It
-        is knowable without reading anything -- this run is unattended and no
-        finite ceiling is in force -- whereas the halted flag only becomes true
-        after a park that persisted. Depending on the park meant any failure to
-        record it left an unattended run with nothing to stop it, which is the
-        single outcome this class exists to prevent, so the cheaper test is also
-        the correct one.
+        The kill switch and unboundedness are both refused on the facts rather
+        than on the parked state. Each is knowable without reading the run row —
+        an operator has stopped the engine, or this run is unattended with no
+        finite ceiling — whereas the halted flag only becomes true after a park
+        that persisted. Depending on the park meant any failure to record it left
+        an unattended run with nothing to stop it, which is the single outcome
+        this class exists to prevent, so the cheaper test is also the correct one.
         """
+        if self.stopped:
+            raise BudgetHalted(
+                f"run {self._run_id} may not dispatch a turn: the kill switch is engaged"
+            )
         if self._headless and not self._budget.bounded:
             raise BudgetHalted(
                 f"run {self._run_id} may not dispatch a turn: it is unattended and no "
@@ -374,12 +437,90 @@ class BudgetGuard:
     def settle_turn(self) -> None:
         """Record a dispatched turn as finished.
 
-        Allowed while halted, and that is the point: the turns that were already
-        in flight when the ceiling was reached are the ones the halt deliberately
-        lets finish.
+        Allowed while halted or stopped, and that is the point: the turns that
+        were already in flight when the ceiling was reached, or when the kill
+        switch was thrown, are the ones the stop deliberately lets finish.
         """
         if self._in_flight > 0:
             self._in_flight -= 1
+
+    # --- the global stop ---------------------------------------------------
+
+    def halt_for_kill_switch(
+        self, *, reason: str = "", lock: SpecLock | None = None
+    ) -> DispatchDecision:
+        """Park this run because the kill switch was thrown, and say what it cost.
+
+        Called by the engine-wide stop for each run it walks. Parking is what makes
+        a surface able to explain why the work stopped; the flag is what actually
+        stops it, so a park this cannot apply — a terminal run, a spec another
+        writer holds — leaves the run stopped all the same.
+
+        *lock* is forwarded to the park for the same reason the ceiling forwards
+        it: the store's lock is not re-entrant, and an operator action taken from
+        inside a locked operation must not be rejected by its own caller.
+        """
+        spend = self.spend()
+        self._cache_cost(spend)
+        return self._stop(spend, lock, reason=reason)
+
+    def _stop(
+        self, spend: RunSpend, lock: SpecLock | None = None, *, reason: str = ""
+    ) -> DispatchDecision:
+        message = self._stop_message(spend, reason)
+        detail = self._detail(spend)
+        detail["kill_switch"] = True
+        if reason:
+            detail["kill_switch_reason"] = reason
+        parked = self.halted or self._park(
+            message, spend, lock, initiator=KILL_SWITCH_INITIATOR
+        )
+        if parked and self._state.claim(NOTIFY_CLAIM_KIND, self._run_id, NOTIFY_STOPPED):
+            self._deliver(message, detail)
+            self._record(AUDIT_EVENT_STOPPED, detail, cost=spend.total_credits)
+        logger.warning("%s", message)
+        return DispatchDecision(
+            outcome=DispatchOutcome.STOPPED,
+            spend=spend,
+            ceiling_credits=self._budget.ceiling_credits,
+            message=message,
+            in_flight=self._in_flight,
+        )
+
+    # --- completion --------------------------------------------------------
+
+    def report_completion(self) -> CompletionReport:
+        """Notify and audit what the run consumed, now that it has stopped running.
+
+        The counterpart to the halt: a run that finished normally cost money too,
+        and an operator told the amount only when something went wrong cannot tell
+        an expensive success from a cheap one. The amount is the run's total across
+        every session it created, the same sum the ceiling compares.
+
+        Claimed once per run, so a resumed run, a retried caller, or two surfaces
+        both noticing the same completion send one message rather than three. The
+        cached total is written before the message, so a channel that is
+        unreachable loses the notification rather than the number.
+        """
+        spend = self.spend()
+        self._cache_cost(spend)
+        record = self._state.get_run(self._run_id)
+        state = run_state_of(record) if record is not None else None
+        message = self._completion_message(spend, state)
+        detail = self._detail(spend)
+        detail["final_state"] = state.value if state is not None else ""
+        notified = self._state.claim(NOTIFY_CLAIM_KIND, self._run_id, NOTIFY_COMPLETED)
+        if notified:
+            self._deliver(message, detail)
+            self._record(AUDIT_EVENT_COMPLETED, detail, cost=spend.total_credits)
+        logger.info("%s", message)
+        return CompletionReport(
+            run_id=self._run_id,
+            spend=spend,
+            final_state=state,
+            message=message,
+            notified=notified,
+        )
 
     # --- outcomes ----------------------------------------------------------
 
@@ -413,7 +554,14 @@ class BudgetGuard:
             in_flight=self._in_flight,
         )
 
-    def _park(self, reason: str, spend: RunSpend, lock: SpecLock | None) -> bool:
+    def _park(
+        self,
+        reason: str,
+        spend: RunSpend,
+        lock: SpecLock | None,
+        *,
+        initiator: str = HALT_INITIATOR,
+    ) -> bool:
         """Move the run into the halted state through the lifecycle machine.
 
         Returns whether the run is now parked. Two failures are survivable and
@@ -431,7 +579,7 @@ class BudgetGuard:
                 self._ref,
                 self._run_id,
                 RunState.HALTED_BUDGET,
-                initiator=HALT_INITIATOR,
+                initiator=initiator,
                 reason=reason,
                 detail={
                     DETAIL_CONSUMED_CREDITS: spend.total_credits,
@@ -440,7 +588,7 @@ class BudgetGuard:
                 lock=lock,
             )
         except (IllegalTransition, SpecLocked) as exc:
-            logger.warning("run %s could not be parked at its ceiling: %s", self._run_id, exc)
+            logger.warning("run %s could not be parked: %s", self._run_id, exc)
             return False
         return True
 
@@ -504,6 +652,26 @@ class BudgetGuard:
             f"{format_credits(self._budget.ceiling_credits)} credits"
         )
 
+    def _stop_message(self, spend: RunSpend, reason: str = "") -> str:
+        """The kill-switch halt message.
+
+        Carries the consumed amount and not the ceiling: the run did not reach its
+        ceiling, and printing a limit it never hit beside a total it did would
+        invite the reader to conclude the arithmetic stopped it.
+        """
+        because = f" ({reason})" if reason else ""
+        return (
+            f"run {self._run_id} halted by the kill switch{because} after consuming "
+            f"{format_credits(spend.total_credits)} credits"
+        )
+
+    def _completion_message(self, spend: RunSpend, state: RunState | None) -> str:
+        ended = state.value if state is not None else "gone"
+        return (
+            f"run {self._run_id} ended as {ended} after consuming "
+            f"{format_credits(spend.total_credits)} credits"
+        )
+
     def _detail(self, spend: RunSpend) -> dict[str, Any]:
         return {
             "run": self._run_id,
@@ -563,6 +731,7 @@ def guard_for(
     headless: bool = False,
     ledger: MeteringLedger | None = None,
     machine: RunMachine | None = None,
+    kill_switch: KillSwitch | None = None,
 ) -> BudgetGuard:
     """Build a guard with the ceiling and channel configuration puts in force."""
     if accounting is None:
@@ -580,4 +749,5 @@ def guard_for(
         audit=audit,
         channel=str(config.effective(CHANNEL_SETTING, project=project).value),
         headless=headless,
+        kill_switch=kill_switch,
     )

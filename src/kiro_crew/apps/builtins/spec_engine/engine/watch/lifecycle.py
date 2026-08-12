@@ -59,13 +59,27 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence
+from typing import Protocol, Sequence
 
 from ..state import CLAIM_DISPATCH, StateStore, WatchItemRecord, WatchObservation
 from .items import WatchedItem
 from .poll import HealthReason, PollOutcome, PollStatus
 
 logger = logging.getLogger(__name__)
+
+
+class DispatchGate(Protocol):
+    """Whether a watch source may have new work dispatched for it right now.
+
+    A seam rather than an import, so the zero-token watcher keeps deciding *what
+    changed* without also owning what a period costs. The engine's implementation
+    is ``budget.SourceCaps``, which answers for the source's spending cap and for
+    the kill switch together — a caller that had to ask two objects would
+    eventually ask one.
+    """
+
+    def dispatch_allowed(self, source: str) -> bool: ...
+
 
 #: The generation an item is first seen at. Generations count observed lifecycles,
 #: so the first sighting is the first one rather than a zeroth.
@@ -294,6 +308,12 @@ class WatchAdvance:
     granted: tuple[ItemChange, ...] = ()
     withheld: tuple[ItemChange, ...] = ()
     recorded: bool = False
+    #: Candidates the dispatch gate refused: the source is at its spending cap, or
+    #: everything is stopped. Their claims were not taken and the snapshot was not
+    #: recorded, so they are still candidates on a later poll.
+    gated: tuple[ItemChange, ...] = ()
+    #: Why the gate refused, for a surface reporting it. Empty when it did not.
+    gate_reason: str = ""
 
     @property
     def source(self) -> str:
@@ -302,6 +322,8 @@ class WatchAdvance:
     def describe(self) -> str:
         if not self.diff.derived:
             return self.diff.describe()
+        if self.gated:
+            return f"{self.diff.describe()}; {len(self.gated)} not dispatched: {self.gate_reason}"
         return (
             f"{self.diff.describe()}; {len(self.granted)} claimed, "
             f"{len(self.withheld)} already claimed"
@@ -407,7 +429,11 @@ def record_snapshot(state: StateStore, diff: WatchDiff) -> bool:
 
 
 def advance_watch(
-    state: StateStore, outcome: PollOutcome, *, run_id: str | None = None
+    state: StateStore,
+    outcome: PollOutcome,
+    *,
+    run_id: str | None = None,
+    gate: DispatchGate | None = None,
 ) -> WatchAdvance:
     """Diff *outcome*, claim its dispatch candidates, then record the snapshot.
 
@@ -418,8 +444,19 @@ def advance_watch(
     next poll sees the item as unchanged with nothing in the ledger to say it was
     ever considered — a missed dispatch with no trace and no recovery. Neither
     order can dispatch twice, and that is the property being protected.
+
+    *gate* decides whether this source may dispatch at all right now — its
+    spending cap for the period, and the kill switch. A refusal claims nothing
+    **and records nothing**: recording the snapshot would make these items
+    unchanged on the next poll, so they would never be dispatch candidates again
+    and the work would be lost the moment the cap lifted.
     """
     diff = diff_poll(state, outcome)
+    candidates = diff.dispatchable
+    if gate is not None and candidates and not gate.dispatch_allowed(diff.source):
+        reason = f"the dispatch gate refused watch source {diff.source!r}"
+        logger.warning("%s; %d candidate(s) left unclaimed", reason, len(candidates))
+        return WatchAdvance(diff=diff, gated=candidates, gate_reason=reason)
     granted, withheld = claim_dispatches(state, diff, run_id=run_id)
     recorded = record_snapshot(state, diff)
     if diff.derived:
