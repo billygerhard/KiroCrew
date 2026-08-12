@@ -156,6 +156,7 @@ PROJECT_FIELDS: tuple[str, ...] = (
     "base_branch",
     "protected_branches",
     "variables",
+    "intake",
     SECTION_WORKFLOW,
 )
 
@@ -172,6 +173,7 @@ SOURCE_FIELDS: tuple[str, ...] = (
     "maintainers",
     "spec_types",
     "autonomy",
+    "intake",
     "spend_cap",
     "feedback",
 )
@@ -182,6 +184,11 @@ CONFIG_ONLY_PATHS: tuple[str, ...] = (
     SECTION_WORKFLOW,
     SECTION_CAPABILITIES,
     f"{SECTION_PROJECTS}.*.{SECTION_WORKFLOW}",
+    # Intake guidance is text the engine puts in a headless run's seed beside the
+    # watched item, so a tool that could write it could write the run's own
+    # instructions. The source-level copy is already covered by the whole
+    # ``sources`` section above; this is the project-level one.
+    f"{SECTION_PROJECTS}.*.intake",
     # Not a whole section, but the same kind of thing as one. This switch
     # co-gates unattended integration into a protected destination alongside
     # the autonomy ladder, and integration is the one stage a mistake cannot
@@ -523,6 +530,8 @@ def _check_project(errors: list[ConfigError], entry: Mapping[str, Any], path: st
             _check_str_list(errors, value, field_path)
         elif key == "variables":
             _check_str_map(errors, value, field_path)
+        elif key == "intake":
+            _check_intake(errors, value, field_path)
         else:
             errors.append(ConfigError(field_path, "unknown project field"))
     # A project must be locatable: every later phase (isolate, stage commands,
@@ -552,6 +561,8 @@ def _check_source(errors: list[ConfigError], entry: Mapping[str, Any], path: str
             _check_spec_type_map(errors, value, field_path)
         elif key == "autonomy":
             _check_autonomy(errors, value, field_path)
+        elif key == "intake":
+            _check_intake(errors, value, field_path)
         elif key == "spend_cap":
             _check_spend_cap(errors, value, field_path)
         elif key == "feedback":
@@ -585,15 +596,65 @@ def _check_autonomy(errors: list[ConfigError], value: Any, path: str) -> None:
 
 
 def _check_spec_type_map(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate a classification-to-spec-type map, optionally keyed by class first.
+
+    Two shapes are accepted because two things are being said. The flat shape
+    (``bug: bugfix``) says what kind of work a classification is, which is a
+    property of the tracker. The nested shape (``external: {bug: quick}``) says
+    what kind of work the engine will *do* about it depending on who asked, which
+    is a trust decision. An operator who needs only the first should not have to
+    write a class dimension they have no rule for.
+    """
     if not isinstance(value, Mapping):
         errors.append(ConfigError(path, "expected an object keyed by classification"))
         return
+    classes = set(SUBMITTER_CLASSES) | {WILDCARD_KEY}
+    for key, entry in value.items():
+        entry_path = f"{path}.{key}"
+        if not isinstance(key, str) or not key.strip():
+            errors.append(ConfigError(entry_path, "classification must be a non-empty string"))
+        elif isinstance(entry, Mapping):
+            # A nested object is only meaningful under a submitter class: nesting
+            # under a classification would key the inner map by nothing.
+            if key not in classes:
+                errors.append(
+                    ConfigError(
+                        entry_path,
+                        "a nested map must be keyed by submitter class, one of: "
+                        + ", ".join(sorted(classes)),
+                    )
+                )
+                continue
+            _check_flat_spec_types(errors, entry, entry_path)
+        elif entry not in SPEC_TYPES:
+            errors.append(ConfigError(entry_path, _one_of_message(SPEC_TYPES)))
+
+
+def _check_flat_spec_types(errors: list[ConfigError], value: Mapping[str, Any], path: str) -> None:
     for classification, spec_type in value.items():
         entry_path = f"{path}.{classification}"
         if not isinstance(classification, str) or not classification.strip():
             errors.append(ConfigError(entry_path, "classification must be a non-empty string"))
         elif spec_type not in SPEC_TYPES:
             errors.append(ConfigError(entry_path, _one_of_message(SPEC_TYPES)))
+
+
+def _check_intake(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate intake guidance: one block of text per spec type.
+
+    The guidance reaches a run's seed, so it is accepted only as text and only
+    under a spec type the engine plans for. ``default`` covers every type.
+    """
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object keyed by spec type"))
+        return
+    types = set(SPEC_TYPES) | {WILDCARD_KEY}
+    for spec_type, guidance in value.items():
+        entry_path = f"{path}.{spec_type}"
+        if spec_type not in types:
+            errors.append(ConfigError(entry_path, _one_of_message(tuple(sorted(types)))))
+        elif not isinstance(guidance, str) or not guidance.strip():
+            errors.append(ConfigError(entry_path, "expected non-empty guidance text"))
 
 
 def _check_spend_cap(errors: list[ConfigError], value: Any, path: str) -> None:

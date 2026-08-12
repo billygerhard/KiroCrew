@@ -432,8 +432,8 @@ def advance_watch(
     state: StateStore,
     outcome: PollOutcome,
     *,
+    gate: DispatchGate,
     run_id: str | None = None,
-    gate: DispatchGate | None = None,
 ) -> WatchAdvance:
     """Diff *outcome*, claim its dispatch candidates, then record the snapshot.
 
@@ -450,10 +450,16 @@ def advance_watch(
     **and records nothing**: recording the snapshot would make these items
     unchanged on the next poll, so they would never be dispatch candidates again
     and the work would be lost the moment the cap lifted.
+
+    It is required rather than defaulted. This is the only path that takes a
+    dispatch claim, so a caller that could omit the gate would be an uncapped
+    dispatcher — and the omission would be invisible until a bill arrived, because
+    an unbounded run spends exactly like a bounded one until it passes the bound.
+    Requiring it makes forgetting a ``TypeError`` at the call site instead.
     """
     diff = diff_poll(state, outcome)
     candidates = diff.dispatchable
-    if gate is not None and candidates and not gate.dispatch_allowed(diff.source):
+    if candidates and not gate.dispatch_allowed(diff.source):
         reason = f"the dispatch gate refused watch source {diff.source!r}"
         logger.warning("%s; %d candidate(s) left unclaimed", reason, len(candidates))
         return WatchAdvance(diff=diff, gated=candidates, gate_reason=reason)

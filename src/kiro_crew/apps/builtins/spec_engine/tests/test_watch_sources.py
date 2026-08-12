@@ -37,6 +37,7 @@ TRACKER_MAP = {
     "address": "url",
     "classification": "labels.0.name",
     "submitter": "author.login",
+    "association": "authorAssociation",
 }
 
 
@@ -171,6 +172,7 @@ class TestFieldMapping:
                 "url": "https://example.invalid/issues/41",
                 "labels": [{"name": "bug"}, {"name": "regression"}],
                 "author": {"login": "someone"},
+                "authorAssociation": "CONTRIBUTOR",
             }
         )
         assert problems == ()
@@ -182,6 +184,7 @@ class TestFieldMapping:
             "address": "https://example.invalid/issues/41",
             "classification": "bug",
             "submitter": "someone",
+            "association": "CONTRIBUTOR",
         }
 
     def test_an_absent_path_yields_an_empty_field_and_no_problem(self) -> None:

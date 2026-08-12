@@ -418,13 +418,16 @@ class TestTheClaimPathHonoursTheGate:
         assert advance.gated == ()
         assert advance.recorded is True
 
-    def test_without_a_gate_the_claim_path_behaves_as_it_did(
-        self, store: StateStore, caps: SourceCaps
-    ) -> None:
-        advance = advance_watch(store, polled(CAPPED, item(CAPPED, "7")))
+    def test_the_claim_path_cannot_be_called_without_a_gate(self, store: StateStore) -> None:
+        # The gate is a required argument, so an uncapped dispatch path is not a
+        # thing a caller can build by omission. This replaces a test that pinned
+        # the opposite: while the parameter defaulted to None, the ungated path
+        # claimed and dispatched, and every caller had to remember the cap.
+        with pytest.raises(TypeError):
+            advance_watch(store, polled(CAPPED, item(CAPPED, "7")))  # type: ignore[call-arg]
 
-        assert [change.identifier for change in advance.granted] == ["7"]
-        assert advance.recorded is True
+        assert claims_for(store, CAPPED) == []
+        assert store.get_watch_item(CAPPED, "7") is None
 
 
 class TestCapsAndCeilingAreIndependent:

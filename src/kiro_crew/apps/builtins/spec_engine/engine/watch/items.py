@@ -6,13 +6,18 @@ stores it, shows it, and hands it to a model as quoted data. It is never a
 command, never a template, and never an instruction, and nothing here parses it
 looking for meaning.
 
-The field set is fixed at seven because those are the questions a dispatch
-decision asks: which item is this (``identifier``), what is it about (``title``,
-``body``), is it still open (``state``), where does a human go to see it
-(``address``), what kind of work is it (``classification``), and who asked
-(``submitter``). A source that reports more is welcome to; the mapping picks
-these out and drops the rest, so a tracker adding a field cannot change what a
-dispatch decision reads.
+The field set is fixed because those are the questions a dispatch decision asks:
+which item is this (``identifier``), what is it about (``title``, ``body``), is
+it still open (``state``), where does a human go to see it (``address``), what
+kind of work is it (``classification``), who asked (``submitter``), and what
+standing does the tracker say that person has (``association``). A source that
+reports more is welcome to; the mapping picks these out and drops the rest, so a
+tracker adding a field cannot change what a dispatch decision reads.
+
+``association`` is the tracker's own author-association text, and it is the only
+field read as a *statement about the author* rather than about the work. It is
+still untrusted text: it is matched against a fixed vocabulary, and text outside
+that vocabulary yields the least-trusted class rather than a guess.
 
 ``identifier`` is the one field with no empty answer. It is the key the claim
 ledger dedupes on, so an item without one cannot be dispatched at most once —
@@ -33,6 +38,7 @@ ITEM_FIELDS: tuple[str, ...] = (
     "address",
     "classification",
     "submitter",
+    "association",
 )
 
 #: Fields that must resolve to a non-blank value for an item to be usable.
@@ -57,6 +63,7 @@ class WatchedItem:
     address: str = ""
     classification: str = ""
     submitter: str = ""
+    association: str = ""
 
     def __post_init__(self) -> None:
         if not self.source.strip():

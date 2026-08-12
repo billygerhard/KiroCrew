@@ -1,7 +1,7 @@
 """Watch sources: a poll command plus a field mapping, both read from configuration.
 
 Defining a source takes no plugin code. A source is a program to run and a map
-from the engine's seven item fields to wherever that program's output puts them,
+from the engine's item fields to wherever that program's output puts them,
 so watching a new tracker is a configuration entry rather than a release.
 
 Three properties are worth stating, because each closes a failure this module
