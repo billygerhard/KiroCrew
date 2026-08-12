@@ -172,10 +172,27 @@ class TestEngineFloorIsNotBindable:
             with pytest.raises(EngineFloorViolation):
                 registry.register_builtin(capability, provider)
 
-    def test_invoking_an_engine_floor_capability_is_refused(self, store: ConfigStore) -> None:
+    def test_binding_an_engine_floor_capability_is_refused(self, store: ConfigStore) -> None:
         registry = CapabilityRegistry(store)
         with pytest.raises(EngineFloorViolation):
             registry.binding("budget_enforcement")
+
+    def test_invoking_an_engine_floor_capability_is_refused(self, store: ConfigStore) -> None:
+        """The funnel's own claim is that resolving, binding, OR invoking passes it.
+
+        Nothing reaches the invoke path by ordinary means, because building the
+        request is refused first, so this forges one past that outer layer to
+        establish that the property holds where the funnel says it does. It does
+        not pin any single guard: invoke checks the capability itself and then
+        resolves a binding that checks it again, so either refusal satisfies this.
+        The property is what matters, and until now no test reached invoke with a
+        floor capability at all.
+        """
+        forged = CapabilityRequest(capability="analysis", spec_type="feature")
+        object.__setattr__(forged, "capability", "budget_enforcement")
+
+        with pytest.raises(EngineFloorViolation):
+            CapabilityRegistry(store).invoke(forged)
 
     def test_a_request_cannot_even_be_built_for_an_engine_floor_capability(self) -> None:
         with pytest.raises(EngineFloorViolation):
@@ -670,6 +687,42 @@ class TestAuditRecord:
         # The identifiers themselves survive -- sanitizing is not redaction.
         assert any("13.1" in text for text in processed)
         assert any("26.1" in text for text in skipped_items)
+
+    def test_a_findings_own_identifier_fields_are_sanitized_too(
+        self, store: ConfigStore
+    ) -> None:
+        # The coverage block is not the only place short provider strings are
+        # transcribed. A finding's kind and its refs travel the same way, are
+        # constrained by the schema to nothing more than "non-empty", and reach
+        # supplementary reports and display entries.
+        bind(store, "analysis", transport=TRANSPORT_COMMAND, command=["analyzer"])
+        transport = StubTransport(
+            payload=response_payload(
+                "analysis",
+                findings=[
+                    {
+                        "kind": "unquantified\r\x1b[2Kforged",
+                        "severity": "warning",
+                        "message": "prose",
+                        "refs": ["13.4\r\x1b[2Kforged", "26.2\x00"],
+                    }
+                ],
+            )
+        )
+
+        result = registry_with(store, transport).invoke(request_for())
+        rendered = [finding.to_json_object() for finding in result.findings]
+
+        assert rendered, "the finding did not survive validation"
+        for record in rendered:
+            texts = [record["kind"], *record["refs"]]
+            for text in texts:
+                assert "\x1b" not in text
+                assert "\x00" not in text
+                assert "\r" not in text
+            # Sanitizing is not redaction: the identifiers still identify.
+            assert "unquantified" in record["kind"]
+            assert any("13.4" in ref for ref in record["refs"])
 
 
 class TestBuiltinReplacement:

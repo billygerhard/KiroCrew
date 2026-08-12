@@ -414,7 +414,12 @@ class ProviderFinding:
             "kind": sanitized(self.kind),
             "severity": self.severity.value,
             "message": self.message.for_display(),
-            "refs": list(self.refs),
+            # Sanitized for the same reason as the kind beside it. These are
+            # criterion and task identifiers, so the schema asks only for
+            # non-empty strings and a provider can put anything in one; they then
+            # travel into supplementary reports and display entries, where a
+            # carriage return in an identifier rewrites the line printed before it.
+            "refs": [sanitized(ref) for ref in self.refs],
         }
         if self.question is not None:
             record["question"] = self.question.to_json_object()
