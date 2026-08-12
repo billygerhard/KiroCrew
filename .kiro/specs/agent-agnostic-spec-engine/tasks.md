@@ -35,7 +35,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Waves DAG checks: acyclic, every incomplete leaf in exactly one wave, sequential wave ids
     - _Requirements: 1.3, 1.4, 1.5_
 
-- [ ] 4. Spec lifecycle and phase machine
+- [x] 4. Spec lifecycle and phase machine
   - [x] 4.1 Spec creation and spec types
     - Create spec directories with `.config.kiro` recording the spec type; derive the document plan (feature/bugfix/quick) from the recorded type
     - Unrecordable type fails creation atomically, leaving no partial directory; no validation or advancement without a recorded type
@@ -44,7 +44,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Read-only phase derivation from artifacts plus approval state; advancement refused on validation failure or missing approval with reasons returned
     - Approvals persist approver identity and timestamp; post-approval document edits (content hash) stale exactly the affected approvals
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
-  - [ ] 4.3 Interactive and policy approval recording
+  - [x] 4.3 Interactive and policy approval recording
     - Interactive runs record approvals only from explicit user action; headless runs record gate approvals from the Autonomy_Policy for covered gates and require humans for uncovered gates
     - Identical validation rules for artifacts from either mode
     - _Requirements: 6.1, 6.2, 6.4_
@@ -115,7 +115,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 32.1, 32.3, 32.4, 32.5, 32.6_
 
 - [ ] 8. Watchers and dispatch
-  - [ ] 8.1 Command-based watch sources and zero-token polling
+  - [x] 8.1 Command-based watch sources and zero-token polling
     - Sources defined as poll command plus field mapping (identifier, title, body, state, address, classification, submitter); disabled by default with per-source enablement
     - Poll tick runs from a script cron with zero model invocations while idle
     - _Requirements: 10.2, 10.6, 17.3_
@@ -239,7 +239,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 13.16, 16.3, 6.4, 17.1, 17.2_
 
 - [ ] 17. Analysis
-  - [ ] 17.1 Capability provider registry, schemas, and transports
+  - [x] 17.1 Capability provider registry, schemas, and transports
     - Resolve every Delegable_Capability from config to builtin, mcp, or command transport behind one invocation path; identical tool surface regardless; builtin provider shipped for each; Engine_Floor capabilities refuse any binding
     - Per-capability versioned request/response schemas; schema-validated responses; declared coverage surfaced; cost attributed to the run budget; provider output treated as untrusted data; provider identity, transport, coverage and degraded status audited and displayed
     - Unavailable, timed-out or schema-invalid provider falls back to builtin with a degraded marker and reason, never blocking the run; supplementary validation providers may only add findings, never suppress or downgrade engine findings or gates
@@ -250,7 +250,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Unavailable, timed-out, or schema-invalid provider falls back to the local analyzer with a degraded marker and reason, never blocking authoring; analyzer identity, coverage, and degraded status audited
     - Bind the analysis capability through the registry: request carries document location, spec type and format version; findings keyed to acceptance criteria route into the Review_Queue
     - _Requirements: 26.6, 26.7, 26.8_
-  - [ ] 17.2 Bundled local analyzer
+  - [x] 17.2 Bundled local analyzer
     - Deterministic structural checks: glossary terms used but undefined, unquantified qualifiers, criteria that are not independently testable, requirements with no covering task, overlapping or contradictory criteria within a requirement
     - Emit the shared Analysis_Findings schema with generated clarifying questions (choices, consequences, recommended answer); declare depth as structural; no network, zero model credits
     - _Requirements: 27.1, 27.2, 27.3, 27.4, 27.5_
