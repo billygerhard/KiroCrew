@@ -125,6 +125,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 8.3 Dispatcher routing, caps, and run seeding
     - Route via source config: target project, base branch, classification-to-spec-type and autonomy per submitter class; submitter class from maintainer list or author-association, least-trusted when undetermined
     - Global and per-project caps with arrival-order queueing; unmapped classification without a default is recorded, not dispatched; no target project refuses dispatch; item content passed as quoted data; intake guidance injected separately; runs seeded in the project working tree so native steering applies
+    - Consume what the tick and the lifecycle diff already produce. Tasks 8.1 and 8.2 built polling and the claim-keyed diff but no production caller, so a tick's items currently go nowhere; this is the consumer, and the "no target project refuses dispatch" property named above belongs here rather than to the poll
     - _Requirements: 10.1, 10.4, 10.5, 10.7, 10.12, 19.1, 19.2, 19.3, 19.4, 19.5, 19.6, 19.7_
   - [ ] 8.4 Item feedback and lifecycle cascade
     - Configured feedback commands post dispatch and completion updates to the item; mid-flight cancellation cancels the run, archives the spec, and audits the cascade; mid-run item edits ignored and audited
@@ -201,6 +202,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 - [ ] 13. App packaging and providers
   - [ ] 13.1 Manifest, discovery skill, and registration
     - app.json declaring the MCP server and skill; trigger phrases for natural spec requests; skill directs agents to obtain instructions from the tools before any spec operation
+    - Register the watcher's script cron and install its shim. Task 8.1 built the tick and proved it costs nothing, but nothing installs or schedules it, so an unregistered watcher polls no source at all — a review found the same inert shape in three separate tasks, which is why the wiring is named here rather than assumed
     - _Requirements: 4.1, 4.2, 4.3_
   - [ ] 13.2 Bundled presets
     - GitHub/GitLab watch source presets, git-with-PR and local-only workflow presets, quality-first and budget cost profiles, bundled screening guidance

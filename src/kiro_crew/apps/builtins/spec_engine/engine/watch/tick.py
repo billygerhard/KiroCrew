@@ -20,9 +20,12 @@ turn it is, and disabling a source removes its job. The tick re-reads
 behind by a failed removal must not poll a source the operator turned off.
 
 **Only trouble is delivered.** A tick that found nothing and saw nothing wrong
-raises ``Skip``: silent, no message, no credits. A tick that found items records
-them for the dispatcher and stays quiet, because an open issue is still open on
-the next tick and a message per tick per item is noise a human learns to ignore.
+raises ``Skip``: silent, no message, no credits. A tick that found items
+also stays quiet, because an open issue is still open on the next tick and a
+message per tick per item is noise a human learns to ignore. What happens to
+those items is not this module's decision: the tick reports what it saw, and the
+dispatcher that consumes a tick's items is separate work, so nothing here
+records or claims anything.
 An unhealthy source, though, is reported every time it is unhealthy — a watcher
 that cannot see is the one condition where silence is the bug.
 """
