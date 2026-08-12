@@ -160,7 +160,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 
   - [ ] 9.4 Test quality criteria in the review gate
     - Review verdicts judge tests explicitly: assertions derive from the code under test rather than test-constructed values, the test fails when the covered behavior is wrong, error and boundary cases covered; failing the criteria yields changes-required
-    - Optional mutation-probe gate: a suite that still passes under mutation is a gate failure; test quality findings recorded in the audit log
+    - Mandatory mutation probe, executed not judged: for each behaviour the task claims to cover, the gate neuters the mechanism in the engine tree, runs the covering tests, and requires a failure. A behaviour whose tests still pass under mutation is a gate failure, not a comment. Reading a test to decide whether it is adequate is not sufficient evidence and does not satisfy this gate
+    - The probe reports which test failed, so a mutation caught only by an unrelated test is distinguished from one caught by the test that claims the behaviour
+    - A behaviour covered by a repo-wide static guard rather than a unit test satisfies the gate when the guard fails under mutation; the gate records which artefact caught it
+    - Screen for the assertion shapes that pass regardless of the mechanism: a proxy the failure path also sets, a short-circuit reached before the property, only the direction a constant satisfies, a branch no test executes, a fake too broken to reach the branch under test, an assertion made vacuous by operator precedence or by a representation that escapes its own input, one sanitized field beside an unsanitized sibling, and a condition phrased in terms of the outputs a bug moves together
+    - Test quality findings recorded in the audit log
     - _Requirements: 30.1, 30.2, 30.3, 30.4_
 
 - [ ] 10. Engine MCP server
