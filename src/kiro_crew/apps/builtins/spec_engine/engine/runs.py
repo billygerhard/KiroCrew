@@ -516,6 +516,18 @@ class RunMachine:
 
     # ------------------------------------------------------------------ clock
 
+    @property
+    def store(self) -> StateStore:
+        """The state store this machine writes through.
+
+        Exposed so a component layered on the machine — the review queue, its
+        archival rules — reads and locks through the same store rather than being
+        handed a second one. Two stores rooted differently is a class of bug that
+        looks like state vanishing: the write lands, and the reader is looking at
+        another database.
+        """
+        return self._store
+
     def now(self) -> datetime:
         """The current instant, from the injected clock."""
         return self._clock()
@@ -558,7 +570,7 @@ class RunMachine:
                 posture=posture,
                 detail=payload,
             )
-        self._append_audit(
+        self.append_audit(
             ref,
             RUN_CREATED_EVENT,
             run=identifier,
@@ -618,7 +630,7 @@ class RunMachine:
         # wait on the audit log rather than on the state it actually contends for.
         if refusal is not None:
             from_state, to_state = refusal
-            self._append_audit(
+            self.append_audit(
                 ref,
                 RUN_TRANSITION_REFUSED_EVENT,
                 run=run_id,
@@ -631,7 +643,7 @@ class RunMachine:
                 },
             )
             raise IllegalTransition(run_id, from_state, to_state)
-        self._append_audit(
+        self.append_audit(
             ref,
             RUN_TRANSITIONED_EVENT,
             run=run_id,
@@ -732,7 +744,7 @@ class RunMachine:
             RunState.STALLED,
             reason=f"{phase.value} exceeded {timeout}s",
         )
-        self._append_audit(
+        self.append_audit(
             ref,
             RUN_STALLED_EVENT,
             run=record.run_id,
@@ -774,7 +786,7 @@ class RunMachine:
             logger.warning(
                 "stall notification for run %s was not delivered: %s", notice.run_id, exc
             )
-            self._append_audit(
+            self.append_audit(
                 ref,
                 RUN_NOTIFY_FAILED_EVENT,
                 run=notice.run_id,
@@ -947,7 +959,7 @@ class RunMachine:
             reason=f"resumed from {state.value}",
             lock=lock,
         )
-        self._append_audit(
+        self.append_audit(
             ref,
             RUN_RESUMED_EVENT,
             run=run_id,
@@ -978,7 +990,7 @@ class RunMachine:
         with self._store.lock(ref, owner=owner) as handle:
             yield handle
 
-    def _append_audit(
+    def append_audit(
         self,
         ref: SpecRef,
         event: str,
@@ -987,7 +999,13 @@ class RunMachine:
         initiator: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
-        """Append one run event, letting a failure to record it surface.
+        """Append one spec event, letting a failure to record it surface.
+
+        Public because the sibling modules built on this machine — the review
+        queue and its archival rules — record through the same log rather than
+        opening a second handle to it. Two handles can be rooted differently, and
+        an operator reading one log while the other holds half the history is the
+        failure the audit log exists to prevent.
 
         Deliberately unlike :meth:`_notify`, which swallows. A notification is a
         courtesy and its loss costs someone a message; the audit log is the
