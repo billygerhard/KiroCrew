@@ -414,7 +414,8 @@ class TestEditDetection:
         # real digest against a blank would report it as edited on the first poll
         # after the upgrade, so a blank reads as "unknown, not edited".
         store.record_watch_items(SOURCE, [WatchObservation(item_id="1", generation=1)])
-        assert store.get_watch_item(SOURCE, "1").content_digest == ""
+        row = store.get_watch_item(SOURCE, "1")
+        assert row is not None and row.content_digest == ""
 
         diff = diff_poll(store, polled(edited_item("1")))
 
@@ -446,7 +447,9 @@ class TestEditDetection:
 
         assert diff.changes[0].observation.content_digest == edited_item("1").content_digest
         record_snapshot(store, diff)
-        assert store.get_watch_item(SOURCE, "1").content_digest == edited_item("1").content_digest
+        stored = store.get_watch_item(SOURCE, "1")
+        assert stored is not None
+        assert stored.content_digest == edited_item("1").content_digest
 
     def test_a_reopened_item_is_not_reported_as_an_edit(self, store: StateStore) -> None:
         # A reopen dispatches a fresh run with the current content, so it is not
