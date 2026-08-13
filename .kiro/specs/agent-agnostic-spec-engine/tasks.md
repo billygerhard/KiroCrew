@@ -49,7 +49,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Identical validation rules for artifacts from either mode
     - _Requirements: 6.1, 6.2, 6.4_
 
-- [ ] 5. Autonomy policy and run lifecycle
+- [x] 5. Autonomy policy and run lifecycle
   - [x] 5.1 Autonomy_Policy resolution
     - Resolve per (source, spec type, submitter class); unconfigured resolves to authoring-only human-reserved execution; configured resolves exactly to the configured level
     - Strictly ordered levels with lower levels implied; loaded from configuration only
@@ -82,7 +82,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Completion and halt notifications carry total credit consumption and land in the audit log
     - _Requirements: 16.4, 16.5, 16.6_
 
-- [ ] 7. Delivery pipeline
+- [x] 7. Delivery pipeline
   - [x] 7.1 Stage executor with argv substitution
     - Read Delivery_Workflow stage-to-commands config; unconfigured stages skip; tokenize templates once and substitute variables as single literal argv elements via subprocess (no shell interpretation)
     - Run context plus custom project variables; valueless referenced variable fails the stage before execution; zero-config projects run authoring/execution in the working tree with autonomy capped at execution
@@ -94,11 +94,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [x] 7.3 Worktree isolation for concurrent runs
     - Git preset isolate creates a dedicated worktree on a new branch from the refreshed base; no two active runs share a working tree
     - _Requirements: 13.15, 13.16_
-  - [ ] 7.4 Teardown and workspace stewardship
+  - [x] 7.4 Teardown and workspace stewardship
     - Ledger records every workspace and per-run deployment; terminal state removes disposable materializations while preserving all branches and commits
     - Archive triggers teardown commands and ledger cleanup
     - _Requirements: 13.19, 20.1, 20.2, 20.3, 20.4_
-  - [ ] 7.5 Interactive delivery and completion notifications
+  - [x] 7.5 Interactive delivery and completion notifications
     - Explicit user action starts the same pipeline with identical stages, variables, and rules; completion or failure notifies with every executed stage's outcome
     - _Requirements: 13.22, 13.13_
 
@@ -107,7 +107,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Run context substitution including base branch so gates can compare against base; gate name, severity, exit status and captured output audited and displayed on the run; bundled presets for tests, coverage thresholds, lint and type checks; no gates configured is recorded, not an error
     - _Requirements: 13.23, 29.1, 29.2, 29.3, 29.4, 29.5, 29.6, 29.7, 29.8_
 
-  - [ ] 7.7 Phase-scoped prerequisite checks and safe failure
+  - [x] 7.7 Phase-scoped prerequisite checks and safe failure
     - Read-only, zero-token preflight per project, each check scoped to the phase requiring it: that phase's command programs resolve, the providers it binds reach, base branch exists, protected set valid, notification channel resolves, budget ceiling present per enabled level above authoring
     - Run gate evaluates every phase the run's autonomy level will reach, including phases executing later in the run, and refuses before the first credit is spent
     - Watch-source checks cover the programs needed to poll at all; an unavailable program reports unmet and unhealthy, never "no items"
@@ -217,6 +217,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - app.json declaring the MCP server and skill; trigger phrases for natural spec requests; skill directs agents to obtain instructions from the tools before any spec operation
     - Register the watcher's script cron and install its shim. Task 8.1 built the tick and proved it costs nothing, but nothing installs or schedules it, so an unregistered watcher polls no source at all — a review found the same inert shape in three separate tasks, which is why the wiring is named here rather than assumed
     - Reach the orchestrator through `orchestrator_for` rather than assembling a wave runner by hand. Task 9.1 made that factory the single construction point for the workspace broker, the role resolver and the completion reporter, so a surface that builds its own runner silently drops all three — the inertness moved up one level rather than away, and this is the task that closes it
+    - Call `prerequisites.gate_run` before an entry point starts a run, and refuse on a returned `RunRefusal`. Task 7.7 built the gate and proved it refuses, but nothing constructs it outside tests, so today an entry point can author a whole spec and only then discover its delivery program is absent. The gate must run before the first credit, which means before the first dispatch and not at the phase that needs the missing thing
     - _Requirements: 4.1, 4.2, 4.3_
   - [ ] 13.2 Bundled presets
     - GitHub/GitLab watch source presets, git-with-PR and local-only workflow presets, quality-first and budget cost profiles, bundled screening guidance
@@ -286,6 +287,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 34.1, 34.2, 34.4, 34.5, 34.6, 34.7, 34.8, 34.9, 34.10, 34.11_
   - [ ] 19.2 Doctor surfaces and surface equivalence
     - Doctor exposed as an Engine_MCP_Server tool and as the UI panel from the one engine operation; prerequisite Findings grouped by phase
+    - Take the grouping from `PrerequisiteReport.by_phase` in `engine/prerequisites.py` rather than regrouping the checks here. Task 7.7 built the phase scoping and the run gate reads it; a second grouping could disagree with the one the gate refuses on, so Doctor would show a phase as ready while a run is refused for it
     - Equivalence test: the tool and the UI path return identical Findings for the same state
     - _Requirements: 34.3, 32.2_
 

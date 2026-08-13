@@ -18,8 +18,8 @@
   "7.1": "completed",
   "7.2": "completed",
   "7.3": "completed",
-  "7.4": "in_progress",
-  "7.5": "in_progress",
+  "7.4": "completed",
+  "7.5": "completed",
   "8.1": "completed",
   "8.2": "completed",
   "8.3": "completed",
@@ -47,7 +47,7 @@
   "16.2": "queued",
   "5.5": "completed",
   "7.6": "completed",
-  "7.7": "queued",
+  "7.7": "completed",
   "8.7": "queued",
   "9.4": "queued",
   "12.5": "queued",
@@ -329,6 +329,21 @@
   {
    "ts": "2026-08-13T06:22:00",
    "taskId": "5.5",
+   "status": "completed"
+  },
+  {
+   "ts": "2026-08-13T06:41:43",
+   "taskId": "7.4",
+   "status": "completed"
+  },
+  {
+   "ts": "2026-08-13T06:41:43",
+   "taskId": "7.5",
+   "status": "completed"
+  },
+  {
+   "ts": "2026-08-13T06:41:43",
+   "taskId": "7.7",
    "status": "completed"
   }
  ]
