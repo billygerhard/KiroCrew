@@ -33,6 +33,7 @@ from hypothesis import HealthCheck, given
 from hypothesis import settings as hyp_settings
 from hypothesis import strategies as st
 
+from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyLevel
 from kiro_crew.apps.builtins.spec_engine.engine.budget import KillSwitch
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
@@ -47,24 +48,29 @@ from kiro_crew.apps.builtins.spec_engine.engine.state import (
     StateStore,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
+    AUDIT_ITEM_EDIT_IGNORED,
     CLAIM_UNMAPPED,
     INTAKE_HEADING,
     QUOTED_DATA_HEADING,
     ClassEvidence,
     DispatchRefusal,
     DispatchReport,
+    EditAuditStatus,
     ItemOutcome,
     PollOutcome,
     PollStatus,
     RunSeed,
     TickReport,
     WatchedItem,
+    audit_mid_run_edits,
     capacity,
+    diff_poll,
     dispatch_source,
     dispatch_tick,
     drain_queue,
     load_route,
     name_taken_items,
+    record_snapshot,
     record_unmapped,
     submitter_class_of,
     unmapped_items,
@@ -301,6 +307,15 @@ def dispatch(
     return dispatch_source(
         store, config, outcome, gate=gate if gate is not None else AllowAll(), start=starter
     )
+
+
+def _tick_audit(store: StateStore) -> AuditLog:
+    """The audit log ``dispatch_tick`` requires, rooted in the store's own tree.
+
+    One spelling so every tick in this module writes to the log the store's
+    ``audit`` reads back, rather than each call inventing a root.
+    """
+    return AuditLog(store.root)
 
 
 def spec_names(tree: Path) -> list[str]:
@@ -1294,6 +1309,7 @@ class TestTheSpendGateIsWired:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
         )
 
@@ -1311,6 +1327,7 @@ class TestTheSpendGateIsWired:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
         )
 
@@ -1325,6 +1342,7 @@ class TestTheSpendGateIsWired:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
@@ -1342,6 +1360,7 @@ class TestTheTickIsTheOnlyInput:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
@@ -1380,6 +1399,7 @@ class TestTheTickIsTheOnlyInput:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
@@ -1396,6 +1416,7 @@ class TestTheTickIsTheOnlyInput:
                 state=store,
                 config=config,
                 cascade=RecordingCascade(),
+                audit=_tick_audit(store),
                 start=starter,
                 gate=AllowAll(),
             )
@@ -1421,6 +1442,7 @@ class TestTheTickCascadesWithdrawals:
             state=store,
             config=config,
             cascade=RecordingCascade(),
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
@@ -1432,6 +1454,7 @@ class TestTheTickCascadesWithdrawals:
             state=store,
             config=config,
             cascade=recorder,
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
@@ -1455,12 +1478,182 @@ class TestTheTickCascadesWithdrawals:
             state=store,
             config=config,
             cascade=recorder,
+            audit=_tick_audit(store),
             start=starter,
             gate=AllowAll(),
         )
 
         assert recorder.archived == []
         assert reports[0].cascades == ()
+
+
+# --- a mid-run edit is ignored and audited ---------------------------------
+
+
+def item_with_body(identifier: str, body: str, *, state: str = "open") -> WatchedItem:
+    """An item whose body is set explicitly, so an edit can move the digest."""
+    return WatchedItem(
+        source=SOURCE,
+        identifier=identifier,
+        title=HOSTILE_TITLE,
+        body=body,
+        state=state,
+        address="https://example.invalid/items/" + identifier,
+        classification="bug",
+        submitter="someone",
+    )
+
+
+def _edited_diff(store: StateStore, identifier: str, *, state: str = "open") -> Any:
+    """A diff in which *identifier* is edited: recorded once, then re-polled changed."""
+    record_snapshot(store, diff_poll(store, polled(item_with_body(identifier, "original", state=state))))
+    return diff_poll(store, polled(item_with_body(identifier, "rewritten after the fact", state=state)))
+
+
+class TestAMidRunEditIsIgnoredAndAudited:
+    """An edit to a watched item with a run in flight is ignored and recorded.
+
+    The ignoring is already true -- an edited item stays ``unchanged`` and never
+    dispatches -- so these are mostly about the audit: it happens only while a run
+    is in flight, it never echoes the edited text, and the tick is actually wired
+    to call it. Deleting the ``audit_mid_run_edits`` call in ``dispatch_tick``
+    leaves the wiring test below with no recorded edit, the inert shape this
+    project has shipped before.
+    """
+
+    def test_the_tick_records_a_mid_run_edit_without_dispatching_it(
+        self, store: StateStore, config: ConfigStore, starter: Starter
+    ) -> None:
+        dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+        assert starter.identifiers == ["7"], "the item has to dispatch before it can be edited"
+
+        reports = dispatch_tick(
+            TickReport(outcomes=(polled(item_with_body("7", "rewritten while the run was live")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        # Not dispatched a second time, and surfaced as an ignored edit.
+        assert starter.identifiers == ["7"]
+        assert [result.item_id for result in reports[0].edits] == ["7"]
+        assert reports[0].edits[0].audited
+        # Recorded in the spec's audit log.
+        ref = store.list_specs()[0].ref
+        edits = [e for e in _tick_audit(store).read(ref) if e.event == AUDIT_ITEM_EDIT_IGNORED]
+        assert len(edits) == 1
+        detail = edits[0].detail
+        assert detail is not None and detail["item_id"] == "7"
+
+    def test_a_tick_with_no_edit_records_none(
+        self, store: StateStore, config: ConfigStore, starter: Starter
+    ) -> None:
+        # Paired with the wiring test so neither passes on a call that fires
+        # unconditionally: one requires the audit to happen, this one requires it
+        # to have found nothing when the item was not edited.
+        dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        reports = dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        assert reports[0].edits == ()
+        ref = store.list_specs()[0].ref
+        assert [e for e in _tick_audit(store).read(ref) if e.event == AUDIT_ITEM_EDIT_IGNORED] == []
+
+    def test_an_edit_with_a_run_in_flight_is_audited(self, store: StateStore) -> None:
+        store.create_run("run-1", SpecRef.of("/proj", "s"), state=RunState.EXECUTING.value,
+                         source=SOURCE, item_id="7")
+        audit = _tick_audit(store)
+
+        results = audit_mid_run_edits(store, _edited_diff(store, "7"), audit=audit)
+
+        assert [r.status for r in results] == [EditAuditStatus.AUDITED]
+        assert results[0].audited_runs == ("run-1",)
+        events = [e for e in audit.read(SpecRef.of("/proj", "s")) if e.event == AUDIT_ITEM_EDIT_IGNORED]
+        assert len(events) == 1
+        assert events[0].run == "run-1"
+        assert events[0].detail == {"source": SOURCE, "item_id": "7", "generation": 1}
+
+    def test_an_edit_with_no_run_in_flight_is_not_audited(self, store: StateStore) -> None:
+        audit = _tick_audit(store)
+
+        results = audit_mid_run_edits(store, _edited_diff(store, "7"), audit=audit)
+
+        assert [r.status for r in results] == [EditAuditStatus.NO_INFLIGHT_RUN]
+        assert results[0].audited_runs == ()
+        # Nothing was written for any spec: there was no mid-run to record.
+        assert not (store.root / "audit").exists() or all(
+            not any(f.suffix == ".jsonl" for f in d.iterdir())
+            for d in (store.root / "audit").iterdir()
+            if d.is_dir()
+        )
+
+    def test_an_edit_to_a_closed_item_whose_run_finished_is_not_audited(
+        self, store: StateStore
+    ) -> None:
+        # A closed item's run is already cancelled or done; an edit to it is not a
+        # mid-run edit, so a terminal run does not count as in flight.
+        store.create_run("run-1", SpecRef.of("/proj", "s"), state=RunState.CANCELLED.value,
+                         source=SOURCE, item_id="7")
+        audit = _tick_audit(store)
+
+        results = audit_mid_run_edits(store, _edited_diff(store, "7", state="closed"), audit=audit)
+
+        assert [r.status for r in results] == [EditAuditStatus.NO_INFLIGHT_RUN]
+
+    def test_the_audit_record_never_carries_the_edited_text(self, store: StateStore) -> None:
+        store.create_run("run-1", SpecRef.of("/proj", "s"), state=RunState.AUTHORING.value,
+                         source=SOURCE, item_id="7")
+        audit = _tick_audit(store)
+        secret = "PLANTED-INSTRUCTION-do-as-i-say"
+        record_snapshot(store, diff_poll(store, polled(item_with_body("7", "original"))))
+        diff = diff_poll(store, polled(item_with_body("7", secret)))
+
+        audit_mid_run_edits(store, diff, audit=audit)
+
+        raw = (audit.path_for(SpecRef.of("/proj", "s"))).read_text(encoding="utf-8")
+        assert secret not in raw
+
+    def test_a_failed_poll_audits_nothing(self, store: StateStore) -> None:
+        from kiro_crew.apps.builtins.spec_engine.engine.watch import HealthReason, PollStatus
+
+        store.create_run("run-1", SpecRef.of("/proj", "s"), state=RunState.EXECUTING.value,
+                         source=SOURCE, item_id="7")
+        failed = PollOutcome(
+            source=SOURCE,
+            status=PollStatus.UNHEALTHY,
+            reason=HealthReason.PROGRAM_UNAVAILABLE,
+            detail="the poll program is not on PATH",
+            program="tracker-cli",
+        )
+
+        assert audit_mid_run_edits(store, diff_poll(store, failed), audit=_tick_audit(store)) == ()
 
 
 def _spend(store: StateStore, run_id: str, amount: float) -> None:

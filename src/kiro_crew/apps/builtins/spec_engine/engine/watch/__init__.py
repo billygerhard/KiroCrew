@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from .dispatch import (
     ASSOCIATION_CLASSES,
+    AUDIT_ITEM_EDIT_IGNORED,
     CLAIM_NAME_TAKEN,
     CLAIM_UNMAPPED,
     DISPATCH_HEADING,
@@ -43,6 +44,8 @@ from .dispatch import (
     ClassEvidence,
     DispatchRefusal,
     DispatchReport,
+    EditAuditResult,
+    EditAuditStatus,
     ItemDisposition,
     ItemOutcome,
     QueueDispatch,
@@ -50,6 +53,7 @@ from .dispatch import (
     RunStarter,
     SourceRoute,
     SubmitterClass,
+    audit_mid_run_edits,
     capacity,
     cascade_cancellations,
     class_of_author,
@@ -139,6 +143,7 @@ from .tick import (
 
 __all__ = [
     "ASSOCIATION_CLASSES",
+    "AUDIT_ITEM_EDIT_IGNORED",
     "AUDIT_ITEM_FEEDBACK",
     "CLAIM_NAME_TAKEN",
     "CLAIM_UNMAPPED",
@@ -173,6 +178,8 @@ __all__ = [
     "ClassEvidence",
     "DispatchRefusal",
     "DispatchReport",
+    "EditAuditResult",
+    "EditAuditStatus",
     "FieldMapping",
     "DispatchGate",
     "HealthReason",
@@ -196,6 +203,7 @@ __all__ = [
     "advance_watch",
     "capacity",
     "cascade_cancellations",
+    "audit_mid_run_edits",
     "claim_dispatch",
     "claim_dispatches",
     "cron_definitions",

@@ -50,6 +50,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from ..audit import AuditLog
 from ..autonomy import AutonomyDecision, AutonomyPolicy
 from ..budget.caps import caps_for
 from ..config import ConfigStore
@@ -64,7 +65,7 @@ from ..config.schema import (
 from ..creation import SpecAlreadyExists, create_spec
 from ..delivery.variables import RunContext
 from ..runs import ACTIVE_PHASES, TERMINAL_STATES, RunState, new_run_id, run_state_of
-from ..state import QueueRecord, SpecRef, StateStore
+from ..state import QueueRecord, SpecRef, StatePersistenceError, StateStore
 from .feedback import FeedbackPoster
 from .items import ITEM_FIELDS, WatchedItem
 from .lifecycle import (
@@ -472,6 +473,11 @@ class DispatchReport:
     #: started moments earlier, and a teardown visible only to a later reader of
     #: the audit trail reads as a run that vanished.
     cascades: tuple["CascadeResult", ...] = ()
+    #: Mid-run edits this source's poll saw and recorded as ignored. An edit to a
+    #: watched item is never a dispatch candidate -- it keeps the item unchanged
+    #: -- so it produces no disposition; carried here so a caller can see that an
+    #: edit to an in-flight item was noticed and audited rather than acted on.
+    edits: tuple["EditAuditResult", ...] = ()
 
     @property
     def refused_source(self) -> DispatchRefusal | None:
@@ -856,6 +862,7 @@ def dispatch_tick(
     config: ConfigStore,
     start: RunStarter,
     cascade: CancelCascade,
+    audit: AuditLog,
     gate: DispatchGate | None = None,
     feedback: FeedbackPoster | None = None,
 ) -> tuple[DispatchReport, ...]:
@@ -874,15 +881,20 @@ def dispatch_tick(
     its run is in flight would keep spending until the run finished work nobody
     wants -- so the caller supplies it and the type system asks for it.
 
+    *audit* is required for the same reason: a mid-run edit to a watched item is
+    ignored for dispatch (it keeps the item unchanged) but must be *recorded* as
+    ignored, and an audit log a caller could omit would let the record silently
+    not happen -- the same shape as a writeback failure that surfaces nowhere.
+
     *feedback* is threaded through unchanged: item feedback is opt-in per source,
     so an absent poster is a valid configuration rather than a floor to enforce.
 
-    Withdrawals are cascaded after the source's own dispatch rather than before.
-    A cancelled item is not a dispatch candidate in the same poll that cancels it,
-    so the order cannot start what it is about to tear down, and the cascade reads
-    the diff the dispatch already derived instead of deriving a second one -- a
-    second ``advance_watch`` would record the snapshot twice and make the poll
-    after it read every item as unchanged.
+    Withdrawals are cascaded, and edits audited, after the source's own dispatch
+    rather than before. A cancelled or edited item is not a dispatch candidate in
+    the same poll, so the order cannot start what it is about to tear down or
+    audit, and both read the diff the dispatch already derived instead of deriving
+    a second one -- a second ``advance_watch`` would record the snapshot twice and
+    make the poll after it read every item as unchanged.
     """
     resolved = gate if gate is not None else caps_for(state, config)
     reports: list[DispatchReport] = []
@@ -894,7 +906,13 @@ def dispatch_tick(
             reports.append(dispatched)
             continue
         cascaded = cascade_cancellations(state, dispatched.advance.diff, cascade=cascade)
-        reports.append(replace(dispatched, cascades=cascaded) if cascaded else dispatched)
+        edited = audit_mid_run_edits(state, dispatched.advance.diff, audit=audit)
+        result = dispatched
+        if cascaded:
+            result = replace(result, cascades=cascaded)
+        if edited:
+            result = replace(result, edits=edited)
+        reports.append(result)
     return tuple(reports)
 
 
@@ -1099,6 +1117,150 @@ def cascade_cancellations(
                 generation=change.generation,
                 status=CascadeStatus.CASCADED,
                 archived_specs=tuple(archived),
+            )
+        )
+    return tuple(results)
+
+
+# --- mid-run edit audit ----------------------------------------------------
+
+
+#: Audit event recording that an edit to a watched item was seen and ignored
+#: because a run for it was in flight. The detail names the item, its generation,
+#: and the run -- never the edited text.
+AUDIT_ITEM_EDIT_IGNORED = "item.edit_ignored"
+
+
+class EditAuditStatus(str, Enum):
+    """What became of one edited item's mid-run audit."""
+
+    #: The item had an in-flight run, so its edit was recorded as ignored.
+    AUDITED = "audited"
+    #: The item was edited but no run of it is in flight, so nothing is recorded:
+    #: an edit to an item whose runs all finished is not a *mid-run* edit, and
+    #: requirement 21.3 is conditioned on a run being in flight.
+    NO_INFLIGHT_RUN = "no_inflight_run"
+
+
+@dataclass(frozen=True)
+class EditAuditResult:
+    """One edited item's audit outcome, across the runs it drove."""
+
+    source: str
+    item_id: str
+    generation: int
+    status: EditAuditStatus
+    #: The runs whose spec logs recorded the ignored edit, empty when none was
+    #: in flight.
+    audited_runs: tuple[str, ...] = ()
+    #: The specs those runs belong to, deduplicated, for a caller's summary.
+    audited_specs: tuple[str, ...] = ()
+
+    @property
+    def audited(self) -> bool:
+        return self.status is EditAuditStatus.AUDITED
+
+
+def audit_mid_run_edits(
+    state: StateStore,
+    diff: WatchDiff,
+    *,
+    audit: AuditLog,
+    actor: str | None = None,
+) -> tuple[EditAuditResult, ...]:
+    """Record that a mid-run edit to a watched item was seen and ignored.
+
+    Requirement 21.3: while a run is in flight, an edit to its triggering item is
+    ignored for dispatch and the fact that it happened is recorded. The ignoring
+    is already true by construction -- an edited item stays ``unchanged``, which
+    is never a dispatch candidate -- so this consumer's whole job is the audit,
+    and the audit is conditioned on a run still being in flight: an edit to an
+    item whose runs all finished is not a mid-run edit and is not recorded as one.
+    Only a non-terminal run counts as in flight, decided by the same
+    ``run_state_of`` / ``TERMINAL_STATES`` pair the cancellation cascade uses.
+
+    **The edited text is never recorded.** An audit entry is read by people who
+    did not author the item, and echoing an attacker-controlled body into the log
+    turns it into a second surface for whatever was planted there -- the defect
+    class this project keeps shipping. The entry names what was ignored (the item,
+    its generation, the run), not the new content.
+
+    A poll that derived nothing is skipped, for the same reason the cascade skips
+    it: a failed poll must not be read as evidence about its items. An audit
+    append that fails does not fail the tick -- it is logged and the result still
+    comes back, because a mid-run edit is not itself a reason to stop dispatching.
+    """
+    if not diff.derived or not diff.edited:
+        return ()
+    refs = {record.spec_key: record.ref for record in state.list_specs(include_archived=True)}
+    in_flight = [
+        record for record in state.list_runs() if run_state_of(record) not in TERMINAL_STATES
+    ]
+    results: list[EditAuditResult] = []
+    for change in diff.edited:
+        runs = [
+            record
+            for record in in_flight
+            if (record.source or "") == change.source
+            and (record.item_id or "") == change.identifier
+        ]
+        if not runs:
+            results.append(
+                EditAuditResult(
+                    source=change.source,
+                    item_id=change.identifier,
+                    generation=change.generation,
+                    status=EditAuditStatus.NO_INFLIGHT_RUN,
+                )
+            )
+            continue
+        audited_runs: list[str] = []
+        audited_specs: list[str] = []
+        for record in runs:
+            ref = refs.get(record.spec_key)
+            if ref is None:  # pragma: no cover - a run always has a registered spec
+                continue
+            try:
+                audit.append(
+                    ref,
+                    AUDIT_ITEM_EDIT_IGNORED,
+                    run=record.run_id,
+                    initiator=actor,
+                    detail={
+                        "source": change.source,
+                        "item_id": change.identifier,
+                        "generation": change.generation,
+                    },
+                )
+            except StatePersistenceError as exc:
+                # A mid-run edit is not a reason to stop dispatching, so a lost
+                # audit line is logged rather than allowed to fail the tick.
+                logger.warning(
+                    "a mid-run edit to item %r on source %r could not be audited for run %s: %s",
+                    change.identifier,
+                    change.source,
+                    record.run_id,
+                    exc,
+                )
+                continue
+            audited_runs.append(record.run_id)
+            if ref.name not in audited_specs:
+                audited_specs.append(ref.name)
+            logger.info(
+                "watched item %r on source %r was edited while run %s was in flight; the edit "
+                "is ignored for dispatch and recorded",
+                change.identifier,
+                change.source,
+                record.run_id,
+            )
+        results.append(
+            EditAuditResult(
+                source=change.source,
+                item_id=change.identifier,
+                generation=change.generation,
+                status=EditAuditStatus.AUDITED,
+                audited_runs=tuple(audited_runs),
+                audited_specs=tuple(audited_specs),
             )
         )
     return tuple(results)
