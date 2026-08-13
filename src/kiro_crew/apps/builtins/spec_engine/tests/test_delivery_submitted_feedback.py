@@ -179,8 +179,8 @@ class TestDeliverySubmittedFeedback:
         pipeline.deliver(context(workspace))
 
         feedback = [e for e in audit.read(ref) if e.event == AUDIT_ITEM_FEEDBACK]
-        assert [e.detail["outcome"] for e in feedback] == [FeedbackOutcome.POSTED.value]
-        assert feedback[0].detail["event"] == "delivery_submitted"
+        assert [(e.detail or {})["outcome"] for e in feedback] == [FeedbackOutcome.POSTED.value]
+        assert (feedback[0].detail or {})["event"] == "delivery_submitted"
 
     def test_no_submit_stage_posts_nothing(
         self, config: ConfigStore, state: StateStore, audit: AuditLog, ref: SpecRef, workspace: Path

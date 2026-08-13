@@ -312,7 +312,7 @@ class TestInteractiveAndUnconfigured:
 
         assert runner.calls == []
         feedback = [e for e in audit.read(ref) if e.event == AUDIT_ITEM_FEEDBACK]
-        assert [e.detail["outcome"] for e in feedback] == [FeedbackOutcome.UNCONFIGURED.value]
+        assert [(e.detail or {})["outcome"] for e in feedback] == [FeedbackOutcome.UNCONFIGURED.value]
 
     def test_the_writeback_is_recorded_in_the_audit_log(
         self,
@@ -332,5 +332,5 @@ class TestInteractiveAndUnconfigured:
 
         feedback = [e for e in audit.read(ref) if e.event == AUDIT_ITEM_FEEDBACK]
         assert len(feedback) == 1
-        assert feedback[0].detail["event"] == "awaiting_review"
-        assert feedback[0].detail["outcome"] == FeedbackOutcome.POSTED.value
+        assert (feedback[0].detail or {})["event"] == "awaiting_review"
+        assert (feedback[0].detail or {})["outcome"] == FeedbackOutcome.POSTED.value

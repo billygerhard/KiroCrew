@@ -116,8 +116,11 @@ def test_deleting_a_registration_hides_the_tool(monkeypatch: Any) -> None:
     del patched["validate_spec"]
     monkeypatch.setattr(server, "TOOLS", patched)
 
-    listed = {t["name"] for t in handle(_req("tools/list"))["result"]["tools"]}
+    tools = handle(_req("tools/list"))
+    assert tools is not None, "tools/list is a request and always answers"
+    listed = {t["name"] for t in tools["result"]["tools"]}
     assert "validate_spec" not in listed
 
     reply = handle(_req("tools/call", {"name": "validate_spec", "arguments": {}}))
+    assert reply is not None, "a call carrying an id always answers"
     assert reply["error"]["code"] == _METHOD_NOT_FOUND

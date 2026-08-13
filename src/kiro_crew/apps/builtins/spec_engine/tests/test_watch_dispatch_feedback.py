@@ -209,10 +209,12 @@ class TestPollPath:
             start=Starter(),
             feedback=poster_over(state, config, audit, runner),
         )
-        ref = report.dispatched[0].seed.ref
+        seed = report.dispatched[0].seed
+        assert seed is not None, "a dispatched item carries the seed of the run it started"
+        ref = seed.ref
         feedback = [e for e in audit.read(ref) if e.event == AUDIT_ITEM_FEEDBACK]
-        assert [e.detail["outcome"] for e in feedback] == [FeedbackOutcome.POSTED.value]
-        assert feedback[0].detail["event"] == "claimed"
+        assert [(e.detail or {})["outcome"] for e in feedback] == [FeedbackOutcome.POSTED.value]
+        assert (feedback[0].detail or {})["event"] == "claimed"
 
 
 class TestQueuePath:
@@ -240,7 +242,9 @@ class TestQueuePath:
         assert runner.calls == [("gh", "comment", "1")]
 
         # Free the slot, then drain: item 2 starts, and its claimed must post too.
-        state.update_run(report.dispatched[0].seed.run_id, state=RunState.DONE.value)
+        done = report.dispatched[0].seed
+        assert done is not None, "a dispatched item carries the seed of the run it started"
+        state.update_run(done.run_id, state=RunState.DONE.value)
         drained = drain_queue(state, config, gate=AllowAll(), start=Starter(), feedback=poster)
         assert [d.record.item_id for d in drained] == ["2"]
         assert runner.calls == [("gh", "comment", "1"), ("gh", "comment", "2")]
