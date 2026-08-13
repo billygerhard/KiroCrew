@@ -482,6 +482,29 @@ def release_dispatch_claim(state: StateStore, source: str, item_id: str, generat
     )
 
 
+def forget_snapshot(state: StateStore, source: str, item_id: str) -> bool:
+    """Forget an item's snapshot row so the next poll re-offers it as new.
+
+    The other half of the manual re-dispatch override, and the half
+    :func:`release_dispatch_claim` cannot do. Releasing the claim was never what
+    suppressed a waiting item: a still-open item already in the snapshot derives
+    :attr:`Transition.UNCHANGED`, which is not a dispatch candidate whatever the
+    ledger says. Forgetting the row is what turns the item's next observation back
+    into :attr:`Transition.NEW`, at :data:`FIRST_GENERATION`, so it is a candidate
+    again.
+
+    The watch-layer name for :meth:`StateStore.forget_watch_item`, the same way
+    :func:`release_dispatch_claim` names :meth:`StateStore.release_claim`: one
+    idiom over the store so the override does not reach past the watch API into
+    raw SQL. True when a row was forgotten, False when none was held.
+
+    Deliberately not the default for any poll path -- re-offering every unchanged
+    item each tick would spend on work nobody asked to redo. The suppression is
+    kept; this is how an operator lifts it for one item.
+    """
+    return state.forget_watch_item(source, item_id)
+
+
 def dispatched_generations(state: StateStore, source: str) -> dict[str, tuple[str, ...]]:
     """Every claimed generation per item for *source*, for display and diagnosis."""
     claimed: dict[str, list[str]] = {}

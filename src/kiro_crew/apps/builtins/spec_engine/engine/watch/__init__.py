@@ -65,9 +65,11 @@ from .feedback import (
     AUDIT_ITEM_FEEDBACK,
     FEEDBACK_FIELD,
     FeedbackOutcome,
+    FeedbackPoster,
     FeedbackReport,
     load_feedback,
     post_feedback,
+    release_writeback_claim,
 )
 from .items import ITEM_FIELDS, REQUIRED_ITEM_FIELDS, WatchedItem
 from .lifecycle import (
@@ -84,6 +86,7 @@ from .lifecycle import (
     claim_dispatches,
     diff_poll,
     dispatched_generations,
+    forget_snapshot,
     generation_key,
     is_open_state,
     observations_of,
@@ -194,6 +197,7 @@ __all__ = [
     "dispatch_tick",
     "dispatched_generations",
     "drain_queue",
+    "forget_snapshot",
     "generation_key",
     "install_tick_script",
     "is_open_state",
@@ -220,9 +224,11 @@ __all__ = [
     "class_of_author",
     "FEEDBACK_FIELD",
     "FeedbackOutcome",
+    "FeedbackPoster",
     "FeedbackReport",
     "load_feedback",
     "name_taken_items",
     "post_feedback",
+    "release_writeback_claim",
     "unmapped_items",
 ]

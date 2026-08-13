@@ -1289,6 +1289,28 @@ class StateStore:
         rows = self._query("SELECT * FROM watch_items WHERE source = ? ORDER BY item_id", (source,))
         return [_watch_item_record(row) for row in rows]
 
+    def forget_watch_item(self, source: str, item_id: str) -> bool:
+        """Forget one item's snapshot row, so the next poll derives it as new again.
+
+        The one thing a poll's snapshot otherwise never gives up, and the primitive
+        the manual re-dispatch override needs. A still-open item already recorded in
+        ``watch_items`` derives ``unchanged`` on every later poll and is therefore
+        not a dispatch candidate -- so releasing its dispatch claim alone cannot
+        re-offer it, because the snapshot row, not the claim, is what suppresses it.
+        Deleting the row makes the next observation of the item ``new`` at the first
+        generation.
+
+        True when a row was removed, False when the source held none for that item.
+        Deliberately the default for nothing: re-offering every unchanged item each
+        poll would spend credits on work nobody asked to redo, so forgetting a row
+        stays a deliberate act an operator takes.
+        """
+        with self._write() as conn:
+            cursor = conn.execute(
+                "DELETE FROM watch_items WHERE source = ? AND item_id = ?", (source, item_id)
+            )
+            return cursor.rowcount == 1
+
     # ---------------------------------------------------------- element trust
 
     def record_element_trust(
