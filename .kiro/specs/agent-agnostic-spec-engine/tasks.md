@@ -143,7 +143,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Screen each `ContentElement` under its own class from `engine/trust.py`, never the item's. Task 5.5 built the per-element derivation and the consumption gate but does not own screening, so this is where requirement 37.4 is satisfied: screening only the item at intake would classify a stranger's comment by the class of whoever opened the issue, which is the escalation 5.5 exists to prevent. Reach element text through `trust.consume` so an element edited after it was screened cannot be used under the old verdict
     - _Requirements: 25.1, 25.2, 25.3, 25.4, 25.5, 25.6, 25.7, 37.4_
 
-  - [ ] 8.7 Tracker housekeeping writeback
+  - [x] 8.7 Tracker housekeeping writeback
     - Named lifecycle events (claimed, awaiting review, delivery submitted, completed, failed or needs-human, refused) mapped to configured commands under the delivery stage-command rules; comment, label, state, assign, and link-artifact operations; bundled presets for the public hosts, per-event override for an organization's tracker, no non-public preset
     - Disabled by default, enabled per event per source through configuration only with no tool able to enable it; at-most-once per run per event recorded in the ledger so a repeated poll, retry, or resumed run does not repeat a delivered writeback
     - Failure recorded and surfaced without failing the run; content composed only from declared templates and engine values, never model-composed text or verbatim item body; zero model credits
@@ -152,7 +152,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Cover `sources.*.feedback` in the prerequisite check. It is a third place in the document holding argv the engine executes, alongside workflow stages and quality gates, and task 7.7 checks the other two plus each source's `poll` program. Without it a missing `gh` is discovered as a failed writeback that permanently holds its claim, rather than as an unmet prerequisite before the run starts
     - _Requirements: 36.1, 36.2, 36.3, 36.4, 36.5, 36.6, 36.7, 36.8, 10.10, 37.1_
 
-- [ ] 9. Orchestrator
+- [x] 9. Orchestrator
   - [x] 9.1 Wave loop and task persistence
     - Dispatch leaf tasks wave by wave with in-wave parallelism up to the concurrency cap; persist task status after every state change for resume
     - Wire the pieces earlier waves built as libraries but left unconstructed outside their tests: pass a workspace broker into the delivery pipeline so the shared-working-tree refusal actually runs, and resolve each dispatch's role through the role resolver. Reviews of tasks 7.3 and 9.2 found both inert in production; a library nothing constructs is an enforcement that never fires
@@ -169,7 +169,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Give the delivery pipeline a notifier, which is NOT the one-argument wiring it looks like: the engine has two `Notifier` protocols and they are not interchangeable. The budget one takes `notify(channel=..., message=..., detail=...)`, while the delivery one takes `send(...)` and deliberately holds no channel because configuration resolves the destination inside the notifier. Passing the orchestrator's budget notifier to the pipeline is a type error. Converge the two protocols on the delivery shape, or resolve a delivery notifier separately in the factory — until then an autonomous delivery records that it had no notifier and tells nobody its outcome
     - _Requirements: 9.3, 9.4_
 
-  - [ ] 9.4 Test quality criteria in the review gate
+  - [x] 9.4 Test quality criteria in the review gate
     - Review verdicts judge tests explicitly: assertions derive from the code under test rather than test-constructed values, the test fails when the covered behavior is wrong, error and boundary cases covered; failing the criteria yields changes-required
     - Mandatory mutation probe, executed not judged: for each behaviour the task claims to cover, the gate neuters the mechanism in the engine tree, runs the covering tests, and requires a failure. A behaviour whose tests still pass under mutation is a gate failure, not a comment. Reading a test to decide whether it is adequate is not sufficient evidence and does not satisfy this gate
     - The probe reports which test failed, so a mutation caught only by an unrelated test is distinguished from one caught by the test that claims the behaviour

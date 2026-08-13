@@ -48,8 +48,8 @@
     "5.5": "completed",
     "7.6": "completed",
     "7.7": "completed",
-    "8.7": "queued",
-    "9.4": "queued",
+    "8.7": "completed",
+    "9.4": "completed",
     "12.5": "queued",
     "13.4": "queued",
     "17.1": "completed",
@@ -399,6 +399,16 @@
     {
       "ts": "2026-08-13T15:04:15",
       "taskId": "11.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-13T16:29:15",
+      "taskId": "8.7",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-13T16:29:26",
+      "taskId": "9.4",
       "status": "completed"
     }
   ]
