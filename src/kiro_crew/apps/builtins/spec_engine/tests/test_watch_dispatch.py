@@ -43,6 +43,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
 from kiro_crew.apps.builtins.spec_engine.engine.runs import RunState
 from kiro_crew.apps.builtins.spec_engine.engine.state import (
     CLAIM_DISPATCH,
+    SpecRef,
     StateStore,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
@@ -169,6 +170,25 @@ class TestAFaultMidBatch:
         assert "2" not in started
         # Every candidate is accounted for, so none is silently lost.
         assert len(started) + len(queued) + len(refused) == len(identifiers)
+
+
+class RecordingCascade:
+    """Records which specs a withdrawal was cascaded onto.
+
+    A recorder rather than the real ``ReviewQueue`` because these tests are about
+    routing, capacity and the gate, and a cascade that actually cancelled runs
+    would change the run rows they assert on. Conformance to the seam is proved
+    against the real implementation in the cascade's own suite, and the tick's
+    wiring to it is proved below with the real one.
+    """
+
+    def __init__(self) -> None:
+        self.archived: list[tuple[str, str]] = []
+
+    def archive_cancelled_item(
+        self, ref: SpecRef, *, item_id: str, actor: str | None = None
+    ) -> None:
+        self.archived.append((ref.name, item_id))
 
 
 @pytest.fixture()
@@ -1273,6 +1293,7 @@ class TestTheSpendGateIsWired:
             TickReport(outcomes=(polled(item("8")),)),
             state=store,
             config=config,
+            cascade=RecordingCascade(),
             start=starter,
         )
 
@@ -1289,6 +1310,7 @@ class TestTheSpendGateIsWired:
             TickReport(outcomes=(polled(item("7")),)),
             state=store,
             config=config,
+            cascade=RecordingCascade(),
             start=starter,
         )
 
@@ -1302,6 +1324,7 @@ class TestTheSpendGateIsWired:
             TickReport(outcomes=(polled(item("7")),)),
             state=store,
             config=config,
+            cascade=RecordingCascade(),
             start=starter,
             gate=AllowAll(),
         )
@@ -1318,6 +1341,7 @@ class TestTheTickIsTheOnlyInput:
             TickReport(outcomes=(unhealthy(),)),
             state=store,
             config=config,
+            cascade=RecordingCascade(),
             start=starter,
             gate=AllowAll(),
         )
@@ -1355,6 +1379,7 @@ class TestTheTickIsTheOnlyInput:
             ),
             state=store,
             config=config,
+            cascade=RecordingCascade(),
             start=starter,
             gate=AllowAll(),
         )
@@ -1370,12 +1395,72 @@ class TestTheTickIsTheOnlyInput:
                 TickReport(outcomes=(polled(item("7")),)),
                 state=store,
                 config=config,
+                cascade=RecordingCascade(),
                 start=starter,
                 gate=AllowAll(),
             )
 
         assert starter.identifiers == ["7"]
         assert len(store.list_runs()) == 1
+
+
+class TestTheTickCascadesWithdrawals:
+    def test_an_item_withdrawn_while_its_run_is_in_flight_is_cascaded_by_the_tick(
+        self, store: StateStore, config: ConfigStore, starter: Starter
+    ) -> None:
+        """The tick is what turns a derived cancellation into a torn-down run.
+
+        The cascade primitive and its own conditions are proved in the cascade
+        suite against the real review queue. What is proved here is the wiring:
+        deleting the call in ``dispatch_tick`` leaves a withdrawn item's run in
+        flight and its spec live, which is the inert shape three earlier tasks
+        shipped -- a library with passing tests and no caller.
+        """
+        dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            start=starter,
+            gate=AllowAll(),
+        )
+        assert starter.identifiers == ["7"], "the item has to dispatch before it can be withdrawn"
+        recorder = RecordingCascade()
+
+        reports = dispatch_tick(
+            TickReport(outcomes=(polled(item("7", state="closed")),)),
+            state=store,
+            config=config,
+            cascade=recorder,
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        assert [identifier for _, identifier in recorder.archived] == ["7"]
+        assert [c.cascaded for c in reports[0].cascades] == [True]
+
+    def test_a_tick_with_no_withdrawal_carries_no_cascade(
+        self, store: StateStore, config: ConfigStore, starter: Starter
+    ) -> None:
+        """The report stays empty when nothing was withdrawn.
+
+        Paired with the test above so neither passes on a cascade that fires
+        unconditionally: one requires the call to happen, this one requires it to
+        have found nothing to do.
+        """
+        recorder = RecordingCascade()
+
+        reports = dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=recorder,
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        assert recorder.archived == []
+        assert reports[0].cascades == ()
 
 
 def _spend(store: StateStore, run_id: str, amount: float) -> None:

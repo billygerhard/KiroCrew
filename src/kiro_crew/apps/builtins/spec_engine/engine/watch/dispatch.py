@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -63,7 +63,7 @@ from ..config.schema import (
 )
 from ..creation import SpecAlreadyExists, create_spec
 from ..delivery.variables import RunContext
-from ..runs import ACTIVE_PHASES, RunState, new_run_id
+from ..runs import ACTIVE_PHASES, TERMINAL_STATES, RunState, new_run_id, run_state_of
 from ..state import QueueRecord, SpecRef, StateStore
 from .feedback import FeedbackPoster
 from .items import ITEM_FIELDS, WatchedItem
@@ -71,6 +71,7 @@ from .lifecycle import (
     DispatchGate,
     ItemChange,
     WatchAdvance,
+    WatchDiff,
     advance_watch,
     generation_key,
     release_dispatch_claim,
@@ -465,6 +466,12 @@ class DispatchReport:
     route: SourceRoute
     advance: WatchAdvance | None = None
     dispositions: tuple[ItemDisposition, ...] = ()
+    #: What became of this source's cancelled items. Carried on the report rather
+    #: than left only in the audit log so a caller can see that a withdrawal was
+    #: acted on: the cascade tears down a run the caller may have been told was
+    #: started moments earlier, and a teardown visible only to a later reader of
+    #: the audit trail reads as a run that vanished.
+    cascades: tuple["CascadeResult", ...] = ()
 
     @property
     def refused_source(self) -> DispatchRefusal | None:
@@ -848,24 +855,47 @@ def dispatch_tick(
     state: StateStore,
     config: ConfigStore,
     start: RunStarter,
+    cascade: CancelCascade,
     gate: DispatchGate | None = None,
     feedback: FeedbackPoster | None = None,
 ) -> tuple[DispatchReport, ...]:
-    """Dispatch every source a tick polled successfully.
+    """Dispatch every source a tick polled successfully, and act on its withdrawals.
 
     ``gate=None`` means *build the engine's own gate* over the given stores, not
     "no gate": the cap and the kill switch are constructed here so that the
     ordinary caller cannot end up with an uncapped path. Passing one explicitly is
     for a caller that already holds one, or a test that needs its clock.
 
+    *cascade* has no such default and is required, which is deliberate. The two
+    are not the same kind of seam: a gate can be built here from the stores this
+    function already holds, while cancelling a run and archiving its spec needs
+    the audit log this function does not have, so a default could only ever mean
+    *skip*. Skipping is the one thing it must not do -- an item withdrawn while
+    its run is in flight would keep spending until the run finished work nobody
+    wants -- so the caller supplies it and the type system asks for it.
+
     *feedback* is threaded through unchanged: item feedback is opt-in per source,
     so an absent poster is a valid configuration rather than a floor to enforce.
+
+    Withdrawals are cascaded after the source's own dispatch rather than before.
+    A cancelled item is not a dispatch candidate in the same poll that cancels it,
+    so the order cannot start what it is about to tear down, and the cascade reads
+    the diff the dispatch already derived instead of deriving a second one -- a
+    second ``advance_watch`` would record the snapshot twice and make the poll
+    after it read every item as unchanged.
     """
     resolved = gate if gate is not None else caps_for(state, config)
-    return tuple(
-        dispatch_source(state, config, outcome, gate=resolved, start=start, feedback=feedback)
-        for outcome in report.polled
-    )
+    reports: list[DispatchReport] = []
+    for outcome in report.polled:
+        dispatched = dispatch_source(
+            state, config, outcome, gate=resolved, start=start, feedback=feedback
+        )
+        if dispatched.advance is None:
+            reports.append(dispatched)
+            continue
+        cascaded = cascade_cancellations(state, dispatched.advance.diff, cascade=cascade)
+        reports.append(replace(dispatched, cascades=cascaded) if cascaded else dispatched)
+    return tuple(reports)
 
 
 def drain_queue(
@@ -951,6 +981,126 @@ def drain_queue(
                     )
                     continue
             results.append(_start_queued(state, config, taken, route, policy, start, feedback))
+    return tuple(results)
+
+
+# --- lifecycle cascade -----------------------------------------------------
+
+
+class CancelCascade(Protocol):
+    """Cancels a cancelled item's in-flight runs and archives its spec, atomically.
+
+    A seam rather than an import, so the watcher decides *which* items were
+    cancelled without also owning how a run is cancelled and a spec is archived
+    under one lock. The engine's implementation is ``review_queue.ReviewQueue``,
+    whose ``archive_cancelled_item`` does the cancel, the archive, the teardown,
+    and the audit as one locked cascade -- reached here rather than reimplemented,
+    because a second cancel-and-archive path would be a second answer to what
+    happens when an item is withdrawn.
+    """
+
+    def archive_cancelled_item(
+        self, ref: SpecRef, *, item_id: str, actor: str | None = None
+    ) -> Any: ...
+
+
+class CascadeStatus(str, Enum):
+    """What became of one cancelled item's cascade."""
+
+    #: The item had an in-flight run; its runs were cancelled and the spec archived.
+    CASCADED = "cascaded"
+    #: The item is cancelled but no run of it is in flight, so nothing is torn
+    #: down: the requirement cascades only *while a run is in flight*, and a spec
+    #: whose only runs already finished is history, not work to stop.
+    NO_INFLIGHT_RUN = "no_inflight_run"
+
+
+@dataclass(frozen=True)
+class CascadeResult:
+    """One cancelled item's cascade outcome, per spec it drove."""
+
+    source: str
+    item_id: str
+    generation: int
+    status: CascadeStatus
+    #: The specs archived for this item, empty when nothing was in flight.
+    archived_specs: tuple[str, ...] = ()
+
+    @property
+    def cascaded(self) -> bool:
+        return self.status is CascadeStatus.CASCADED
+
+
+def cascade_cancellations(
+    state: StateStore,
+    diff: WatchDiff,
+    *,
+    cascade: CancelCascade,
+    actor: str | None = None,
+) -> tuple[CascadeResult, ...]:
+    """Cascade every cancelled item in *diff* that has an in-flight run.
+
+    Requirement 21.2: an item cancelled while its run is in flight cancels the
+    run, archives the spec, and audits the cascade -- all of which
+    :meth:`CancelCascade.archive_cancelled_item` does atomically under the spec
+    lock, so this consumer's whole job is to find the in-flight runs the item
+    drove and hand each spec to that one primitive. It never cancels or archives
+    directly: a second path would be a second, unlocked answer to the same event.
+
+    A poll that derived nothing is skipped -- a failed poll must not read as every
+    open item cancelled at once, which is the cascade this refusal exists to
+    prevent. Only a non-terminal run counts as in flight: a spec whose runs all
+    finished is not torn down, because the requirement is conditioned on a run
+    still being in flight and rewriting a shipped run to cancelled would misreport
+    work that completed.
+    """
+    if not diff.derived or not diff.cancelled:
+        return ()
+    refs = {record.spec_key: record.ref for record in state.list_specs(include_archived=True)}
+    in_flight = [
+        record for record in state.list_runs() if run_state_of(record) not in TERMINAL_STATES
+    ]
+    results: list[CascadeResult] = []
+    for change in diff.cancelled:
+        specs: dict[str, None] = {}
+        for record in in_flight:
+            if (record.source or "") == change.source and (
+                record.item_id or ""
+            ) == change.identifier:
+                specs.setdefault(record.spec_key, None)
+        if not specs:
+            results.append(
+                CascadeResult(
+                    source=change.source,
+                    item_id=change.identifier,
+                    generation=change.generation,
+                    status=CascadeStatus.NO_INFLIGHT_RUN,
+                )
+            )
+            continue
+        archived: list[str] = []
+        for spec_key in specs:
+            ref = refs.get(spec_key)
+            if ref is None:  # pragma: no cover - a run always has a registered spec
+                continue
+            cascade.archive_cancelled_item(ref, item_id=change.identifier, actor=actor)
+            archived.append(ref.name)
+            logger.info(
+                "watched item %r on source %r was cancelled in flight; cancelled its runs "
+                "and archived spec %r",
+                change.identifier,
+                change.source,
+                ref.name,
+            )
+        results.append(
+            CascadeResult(
+                source=change.source,
+                item_id=change.identifier,
+                generation=change.generation,
+                status=CascadeStatus.CASCADED,
+                archived_specs=tuple(archived),
+            )
+        )
     return tuple(results)
 
 
