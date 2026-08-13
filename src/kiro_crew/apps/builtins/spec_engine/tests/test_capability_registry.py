@@ -404,6 +404,25 @@ class TestExternalProviderSuccess:
         assert "\u202e" not in shown
         assert "clean" in shown and "injected" in shown
 
+    def test_a_carriage_return_cannot_overwrite_the_line_already_shown(
+        self, store: ConfigStore
+    ) -> None:
+        # The one character that literally rewrites a printed line. Prose keeps
+        # its line breaks, so this cannot be dropped the way the identifier path
+        # drops it -- it becomes a break instead, which costs a provider nothing
+        # it was entitled to and leaves a reader no line that can be taken back.
+        shown = Untrusted("Analysis passed\rERROR: credentials required").for_display()
+        assert "\r" not in shown
+        assert "Analysis passed\nERROR: credentials required" == shown
+
+    def test_a_windows_authored_line_break_survives_as_one_break(
+        self, store: ConfigStore
+    ) -> None:
+        # Rewriting the pair to a single newline rather than dropping the return
+        # keeps prose a provider wrote on a CRLF platform readable, so the fix
+        # above is not paid for by mangling legitimate multi-line findings.
+        assert Untrusted("first\r\nsecond").for_display() == "first\nsecond"
+
 
 class TestDegradeDontBlock:
     def test_a_provider_that_times_out_falls_back_to_the_builtin_and_the_run_continues(

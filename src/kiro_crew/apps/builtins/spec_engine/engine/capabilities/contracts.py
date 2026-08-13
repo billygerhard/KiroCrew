@@ -82,6 +82,16 @@ _UNDISPLAYABLE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066
 #: are either a mistake or an attempt to make one audit line look like several.
 _UNPRINTABLE_IN_IDENTIFIER = re.compile(r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
 
+#: A carriage return, alone or leading a newline. Prose is allowed line breaks,
+#: so the display path cannot simply drop this the way the identifier path does,
+#: but a lone carriage return is not a line break -- it returns the cursor and
+#: lets the text after it overwrite the line already printed, which is how a
+#: finding message rewrites the engine-authored label above it in a terminal.
+#: Rewriting it to a newline keeps every character a provider sent, and keeps a
+#: break where prose authored on a CRLF platform meant one, while leaving no way
+#: to return to a line a reader has already been shown.
+_CARRIAGE_RETURN = re.compile(r"\r\n?")
+
 #: Cap on one displayed provider string. Provider output is unbounded input; a
 #: surface rendering it needs a ceiling that is not set by the provider.
 MAX_DISPLAY_CHARS = 4096
@@ -150,7 +160,7 @@ class Untrusted:
 
     def for_display(self, *, limit: int = MAX_DISPLAY_CHARS) -> str:
         """Return the text with undisplayable characters removed and a length cap."""
-        cleaned = _UNDISPLAYABLE.sub("", self.text)
+        cleaned = _UNDISPLAYABLE.sub("", _CARRIAGE_RETURN.sub("\n", self.text))
         if len(cleaned) <= limit:
             return cleaned
         return cleaned[:limit] + DISPLAY_TRUNCATION_NOTICE

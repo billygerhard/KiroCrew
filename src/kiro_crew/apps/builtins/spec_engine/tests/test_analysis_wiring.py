@@ -258,6 +258,17 @@ class TestFindingsAreKeyedToCriteria:
                 findings=[
                     {"kind": "a", "severity": "info", "message": "on 1.2", "refs": ["1.2"]},
                     {"kind": "b", "severity": "info", "message": "on 1.1", "refs": ["1.1"]},
+                    # One finding naming a real criterion AND an invented one, so
+                    # this test fails if keying ever passes provider refs through
+                    # rather than intersecting them. Its siblings all carry refs
+                    # that happen to be valid, which makes them agree with a
+                    # pass-through implementation and hold nothing.
+                    {
+                        "kind": "c",
+                        "severity": "info",
+                        "message": "on 1.1 and a criterion that does not exist",
+                        "refs": ["1.1", "9.9"],
+                    },
                 ]
             )
         )
@@ -266,6 +277,7 @@ class TestFindingsAreKeyedToCriteria:
         # Sorted by criterion, and every key is one the document declares.
         assert [item["criterion"] for item in items] == ["1.1", "1.2"]
         assert declared_criteria(ref) == {"1.1", "1.2"}
+        assert "9.9" not in {item["criterion"] for item in items}
 
     def test_untrusted_identifier_fields_reach_the_surface_sanitized(
         self, ref: SpecRef, config_store: ConfigStore

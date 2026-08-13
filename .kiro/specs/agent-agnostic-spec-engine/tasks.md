@@ -264,7 +264,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Per-capability versioned request/response schemas; schema-validated responses; declared coverage surfaced; cost attributed to the run budget; provider output treated as untrusted data; provider identity, transport, coverage and degraded status audited and displayed
     - Unavailable, timed-out or schema-invalid provider falls back to builtin with a degraded marker and reason, never blocking the run; supplementary validation providers may only add findings, never suppress or downgrade engine findings or gates
     - _Requirements: 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 26.8, 26.9, 26.10, 26.11, 26.12, 26.13, 26.14, 24.7, 11.2_
-  - [ ] 17.4 Analysis capability wiring
+  - [x] 17.4 Analysis capability wiring
     - Publish versioned request and Analysis_Findings JSON Schemas; resolve the Analysis_Provider from config (local in-process, or an MCP stdio child from configured command/env/timeout) behind one engine call with an identical tool surface either way
     - Validate every response against the schema; key findings to acceptance criteria; surface declared skipped coverage; attribute declared cost to the run's budget; treat finding text as untrusted data
     - Unavailable, timed-out, or schema-invalid provider falls back to the local analyzer with a degraded marker and reason, never blocking authoring; analyzer identity, coverage, and degraded status audited
@@ -277,6 +277,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 17.5 Builtin provider bindings
     - Register the engine's own paths as the builtin providers for authoring (seeded turn behind validation and the phase gate), review (seeded verdict turn with review and test-quality criteria), implementation (per-task subagent dispatch), and model catalog (host resolution)
     - Bind the bundled GitHub/GitLab watch presets, marking a source unhealthy with the missing program name when its command-line dependency is absent; ship no supplementary validation rules; UI identifies each capability's provider as builtin or external and each builtin as deterministic or model-backed
+    - Consume the analysis report rather than producing a second one. Task 17.4 built `AnalysisEngine`, `route_findings` and `AnalysisReport.to_review_items` in `engine/analysis.py`, and they have no non-test caller: the review binding is where criterion-keyed findings reach a human. Two things 17.4 could not do belong here. There is no findings sink in the data model -- `engine/review_queue.py` is a projection of runs in human-reserved states and the tables hold no analysis rows -- so persisting a report against a queued run is this task's, and inventing a second queue is not. And the surface that renders a finding's prose must escape control characters itself: the display contract keeps the line breaks prose is entitled to, so a terminal render that trusts them can still be reflowed by a crafted message
     - _Requirements: 31.1, 31.2, 31.3, 31.4, 31.5, 31.6, 31.7, 31.8_
 
   - [x] 17.3 Conformance runner
