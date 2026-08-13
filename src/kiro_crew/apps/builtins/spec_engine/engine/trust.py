@@ -45,6 +45,7 @@ __all__ = [
     "ElementTrust",
     "Reconciliation",
     "StaleContent",
+    "acknowledge",
     "consume",
     "derive",
     "reconcile",
@@ -189,10 +190,12 @@ class ElementTrust:
 class Reconciliation:
     """The current trust for an element, and whether it moved since last time.
 
-    *changed* is true when the element is at a revision the engine has not
-    classified. That is the signal to re-apply every decision gated on the class,
-    and it is true for a first sighting as well as an edit: neither has a
-    standing decision behind it.
+    *changed* is true when the element sits at a revision whose gated decisions
+    have not been re-applied. That covers a first sighting and an edit -- neither
+    has a standing decision behind it -- and it stays true across repeated calls
+    until :func:`acknowledge` is invoked. Reporting it once would mean a caller
+    that died between noticing and re-applying discharged an obligation it never
+    met, while the new text stayed fully consumable.
     """
 
     trust: ElementTrust
@@ -206,6 +209,16 @@ class Reconciliation:
     @property
     def previous_class(self) -> str:
         return self.previous.class_name if self.previous is not None else ""
+
+    @property
+    def revision_moved(self) -> bool:
+        """Whether this call is the one that observed the revision change.
+
+        Distinct from :attr:`changed`, which stays true while the obligation is
+        outstanding. A caller wanting "is this new information" asks this; a
+        caller asking "do I owe a re-application" asks ``changed``.
+        """
+        return self.previous is None or self.previous.revision != self.trust.revision
 
     @property
     def class_moved(self) -> bool:
@@ -243,22 +256,26 @@ def reconcile(
     *,
     scope: str = "",
 ) -> Reconciliation:
-    """Derive *element*'s class now and compare it with what was recorded.
+    """Derive *element*'s class now and report whether decisions are owed on it.
 
     *scope* is what consumed the element -- a watch source, or a run for review
     comments. It defaults to the route's source. Scoping the record means two
     runs reading the same item do not silently share one revision cursor, so
     neither can consume edited text under the other's re-derivation.
 
-    Recording happens here rather than in :func:`derive` so that classification
-    stays a pure function callers can use for a question, while the durable "this
-    revision has been classified" claim is made only by the path that also
-    reports whether it moved.
+    The returned ``changed`` is an outstanding-obligation flag, not an edge. It is
+    persisted with the row and keeps coming back true until :func:`acknowledge`
+    clears it, so this function can be called any number of times without
+    discharging anything. Recording happens here rather than in :func:`derive` so
+    classification stays a pure function callers can use for a question, while
+    the durable claim is made only by the path that also reports what is owed.
     """
     consumer = scope.strip() or route.source
     trust = derive(route, element)
-    previous = state.get_element_trust(consumer, element.element_id)
-    changed = previous is None or previous.revision != trust.revision
+    previous = state.get_element_trust(consumer, element.kind.value, element.element_id)
+    revision_moved = previous is None or previous.revision != trust.revision
+    still_pending = previous is not None and previous.pending_reapply
+    changed = revision_moved or still_pending
     state.record_element_trust(
         consumer,
         element_id=trust.element_id,
@@ -267,21 +284,52 @@ def reconcile(
         revision=trust.revision,
         class_name=trust.class_name,
         evidence=trust.submitter_class.evidence.value,
+        pending_reapply=changed,
     )
     return Reconciliation(trust=trust, changed=changed, previous=previous)
+
+
+def acknowledge(
+    state: StateStore,
+    route: SourceRoute,
+    element: ContentElement,
+    *,
+    scope: str = "",
+) -> bool:
+    """Record that every decision gated on *element*'s class has been re-applied.
+
+    Call this only after the re-application has actually happened. It is the sole
+    way :attr:`Reconciliation.changed` goes back to false, which is what makes an
+    interrupted caller safe: the obligation stays on the row, so the next
+    :func:`reconcile` still reports it rather than reading as "nothing happened".
+    """
+    consumer = scope.strip() or route.source
+    return state.acknowledge_element_trust(
+        consumer, element.kind.value, element.element_id
+    )
 
 
 def consume(element: ContentElement, trust: ElementTrust) -> str:
     """Return *element*'s text, refusing if *trust* is about other text.
 
-    The gate is the revision rather than the identifier: an element keeps its id
-    and its author across an edit, so those matching proves nothing about the
-    words. Callers reach content through this function so that "re-derive before
-    using changed content" is enforced at the point of use instead of asked for
-    in a docstring.
+    Identity is ``(kind, element_id)``, not the id alone. An id is unique only
+    within a kind -- a tracker numbers an item's comments from one, and nothing
+    requires a comment id to differ from its item's -- so comparing ids alone
+    lets one element's class authorize another's text. That is the inheritance
+    requirement 37.2 forbids in its third form, "or another element", and it is
+    the permissive direction: a maintainer's body trust would serve a stranger's
+    comment.
+
+    The revision is the second half of the gate, because an element keeps its
+    kind, its id and its author across an edit, so none of those prove anything
+    about the words. Callers reach content through this function so that
+    "re-derive before using changed content" is enforced at the point of use
+    instead of asked for in a docstring.
     """
-    if trust.element_id != element.element_id:
-        raise StaleContent(element.element_id, held=trust.revision, current=element.content_revision)
+    if (trust.kind, trust.element_id) != (element.kind, element.element_id):
+        raise StaleContent(
+            element.element_id, held=trust.revision, current=element.content_revision
+        )
     current = element.content_revision
     if trust.revision != current:
         raise StaleContent(element.element_id, held=trust.revision, current=current)

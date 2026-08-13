@@ -18,11 +18,14 @@ long after the run starts -- and refuses up front. Checking delivery only when
 delivery begins is what turns a missing program into a run that authored a whole
 spec and then could not ship it.
 
-**Read-only and zero-token.** Every check is a configuration read, a ``PATH``
-lookup, or a git ref query. Nothing here takes a model, a provider transport, or
-a ledger, so there is no path by which a preflight can spend: the absence is
-structural rather than promised, and the program lookup and branch lookup are
-injectable so the tests never touch the real environment either.
+**The checks are read-only and zero-token.** Every check is a configuration read,
+a ``PATH`` lookup, or a git ref query. Nothing here takes a model, a provider
+transport, or a ledger, so there is no path by which a preflight can spend: the
+absence is structural rather than promised, and the program lookup and branch
+lookup are injectable so the tests never touch the real environment either.
+:func:`gate_run` is the one exception to read-only, and deliberately: it appends
+the refusal to the audit log, because a run stopped for an unmet prerequisite has
+to leave a record of why.
 """
 
 from __future__ import annotations
@@ -38,9 +41,15 @@ from typing import Any
 from .audit import AuditLog
 from .autonomy import AutonomyLevel
 from .budget.ceiling import CEILING_SETTING, Budget, resolve_budget
+from .capabilities.contracts import EngineFloorViolation
 from .capabilities.registry import Binding, resolve_bindings
 from .config import ConfigStore
-from .config.schema import DELIVERY_STAGES, SECTION_QUALITY_GATES, SECTION_SOURCES
+from .config.schema import (
+    DELIVERY_STAGES,
+    SECTION_QUALITY_GATES,
+    SECTION_SOURCES,
+    ConfigValidationError,
+)
 from .delivery.flow import load_quality_gates
 from .delivery.integration import resolve_protected_branches
 from .delivery.workflow import DeliveryWorkflow
@@ -113,6 +122,10 @@ class CheckName(str, Enum):
     BUDGET_CEILING = "budget_ceiling"
     #: A watch source's poll program resolves, so the source can poll at all.
     WATCH_PROGRAMS = "watch_programs"
+    #: The configuration document itself can be read. Its own check because a
+    #: document that will not parse prevents every phase at once, and the refusal
+    #: still has to name a cause an operator can act on.
+    CONFIGURATION = "configuration"
 
 
 @dataclass(frozen=True)
@@ -258,11 +271,19 @@ def check_project(
     config: ConfigStore,
     *,
     project: str | None = None,
+    base_branch: str = "",
     which: ProgramResolver | None = None,
     branch_exists: BranchResolver | None = None,
     budget: Budget | None = None,
 ) -> PrerequisiteReport:
     """Evaluate every project prerequisite, each recorded against its phase.
+
+    *base_branch* is the run's resolved base, which is not always the project's.
+    A watch source declares its own, and the dispatch route carries it, so a run
+    seeded from that source integrates into a branch the project entry never
+    names. Passing it in rather than re-reading configuration is the same reason
+    ``resolve_protected_branches`` takes it: the branch this run would integrate
+    into is a property of the run.
 
     *which*, *branch_exists* and *budget* are injectable so this stays a pure read
     of configuration plus two lookups, and so a test can describe an environment
@@ -272,7 +293,7 @@ def check_project(
     checks: list[Prerequisite] = []
     checks.extend(_command_program_checks(config, project, resolve_program))
     checks.extend(_provider_checks(config, resolve_program))
-    checks.extend(_branch_checks(config, project, branch_exists))
+    checks.extend(_branch_checks(config, project, base_branch, branch_exists))
     checks.append(_channel_check(config, project))
     checks.extend(_ceiling_checks(config, project, budget))
     return PrerequisiteReport(checks=tuple(checks))
@@ -342,6 +363,7 @@ def gate_run(
     ref: SpecRef,
     *,
     project: str | None = None,
+    base_branch: str = "",
     run: str | None = None,
     which: ProgramResolver | None = None,
     branch_exists: BranchResolver | None = None,
@@ -354,12 +376,43 @@ def gate_run(
     omit the log would satisfy the refusal while losing the reason -- the same
     defect as a kill-switch stop that notifies nobody.
 
+    *base_branch* is the run's resolved base, which a watch-source run takes from
+    its source rather than from the project entry.
+
     Returns ``None`` when the run may start, so the caller's check reads as
     "refused or not" rather than as a truthiness test on a report.
     """
-    report = check_project(
-        config, project=project, which=which, branch_exists=branch_exists, budget=budget
-    )
+    try:
+        report = check_project(
+            config,
+            project=project,
+            base_branch=base_branch,
+            which=which,
+            branch_exists=branch_exists,
+            budget=budget,
+        )
+    except (ConfigValidationError, EngineFloorViolation) as exc:
+        # A document too broken to read is the strongest case of a prevented run,
+        # so it has to arrive as an audited refusal rather than as an exception
+        # that unwinds past the log. Letting it propagate would lose the reason in
+        # exactly the way the required audit argument exists to prevent.
+        unreadable = Prerequisite(
+            check=CheckName.CONFIGURATION,
+            phase=AutonomyLevel.AUTHORING,
+            met=False,
+            missing=f"the configuration could not be read: {exc}",
+            action="fix the configuration document at the path named above",
+        )
+        refusal = RunRefusal(level=level, unmet=(unreadable,))
+        audit.append(
+            ref,
+            AUDIT_PREREQUISITE_UNMET,
+            run=run,
+            initiator=None,
+            detail=refusal.detail(),
+            cost=0.0,
+        )
+        return refusal
     unmet = report.unmet_through(level)
     if not unmet:
         return None
@@ -492,12 +545,17 @@ def _capability_phase(capability: str) -> AutonomyLevel:
 
 
 def _branch_checks(
-    config: ConfigStore, project: str | None, branch_exists: BranchResolver | None
+    config: ConfigStore,
+    project: str | None,
+    supplied_base: str,
+    branch_exists: BranchResolver | None,
 ) -> list[Prerequisite]:
     checks: list[Prerequisite] = []
-    base = _base_branch(config, project)
-    # The run's base is passed in rather than re-read inside, so the protected
-    # set falls back to the same branch this project would integrate into.
+    # The run's own base wins over the project's. A watch source declares its own
+    # base, so verifying the project's would verify a branch this run never
+    # touches -- and a check that passes on the wrong branch is worse than one
+    # that is missing, because it reports readiness it did not establish.
+    base = supplied_base.strip() or _base_branch(config, project)
     protected = resolve_protected_branches(
         config.document(), project=project, base_branch=base
     )
@@ -516,13 +574,12 @@ def _branch_checks(
             declared_at=protected.declared_at,
         )
     )
-    base = _base_branch(config, project)
     if not base:
-        # No configured base branch is the zero-configuration state rather than a
-        # misconfiguration: the delivery workflow that would need one is absent
-        # too, and the ladder already caps such a project below delivery. The
-        # protected-set check above still ran, because an empty protected set is
-        # a real gap at integration whatever the base branch says.
+        # No base from the run and none from the project is the zero-configuration
+        # state rather than a misconfiguration: the delivery workflow that would
+        # need one is absent too, and the ladder caps such a project below
+        # delivery. The protected-set check above still ran, because an empty
+        # protected set is a real gap at integration whatever the base says.
         return checks
     resolver = branch_exists or _git_branch_exists(_project_path(config, project))
     present = resolver(base)
@@ -535,9 +592,11 @@ def _branch_checks(
             action=(
                 ""
                 if present
-                else f"create {base!r}, or point projects.{project}.base_branch at one that exists"
+                else f"create {base!r}, or point the base branch at one that exists"
             ),
-            declared_at=f"projects.{project}.base_branch",
+            declared_at=(
+                f"projects.{project}.base_branch" if project else "base_branch"
+            ),
         )
     )
     return checks
@@ -644,24 +703,46 @@ def _program_check(
 def _git_branch_exists(root: Path | None) -> BranchResolver:
     """A read-only branch lookup rooted at *root*.
 
-    ``rev-parse --verify`` with an explicit argv list and no shell. When there is
-    no project path to ask in, every branch reads as absent rather than as
+    Verifies the refs delivery actually fetches and checks out, not a bare
+    revision. ``rev-parse --verify <name>`` accepts a tag or a raw SHA, and the
+    bundled git isolate preset builds its worktree from ``origin/<base>`` -- so a
+    project whose base exists only as a tag, or only locally, would pass the
+    preflight and then fail at the isolate stage. That is exactly the
+    discovered-halfway-through failure this module exists to prevent, so the local
+    head and the remote-tracking ref are both accepted and nothing else is.
+
+    ``--end-of-options`` is not optional: a configured branch beginning with ``-``
+    would otherwise be parsed as a git option, and some read-only ``rev-parse``
+    options exit zero -- turning a fail-closed check into a false pass. When there
+    is no project path to ask in, every branch reads as absent rather than as
     present: an unanswerable question must not resolve to "fine".
     """
 
     def exists(branch: str) -> bool:
-        if root is None or not branch:
+        if root is None or not branch.strip():
             return False
-        try:
-            completed = subprocess.run(  # nosec B603 - fixed argv, no shell, read-only
-                ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", branch],
-                capture_output=True,
-                check=False,
-                timeout=_GIT_TIMEOUT_S,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return completed.returncode == 0
+        for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+            try:
+                completed = subprocess.run(  # nosec B603 - fixed argv, no shell, read-only
+                    [
+                        "git",
+                        "-C",
+                        str(root),
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--end-of-options",
+                        ref,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    timeout=_GIT_TIMEOUT_S,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if completed.returncode == 0:
+                return True
+        return False
 
     return exists
 
@@ -719,9 +800,3 @@ def _argv(value: Any) -> tuple[str, ...]:
     if isinstance(value, str) or not isinstance(value, Sequence):
         return ()
     return tuple(str(item) for item in value if isinstance(item, (str, int, float)))
-
-
-def _command_list(value: Any) -> tuple[tuple[str, ...], ...]:
-    if isinstance(value, str) or not isinstance(value, Sequence):
-        return ()
-    return tuple(_argv(item) for item in value)

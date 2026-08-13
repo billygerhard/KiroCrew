@@ -20,6 +20,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.trust import (
     ContentElement,
     ElementKind,
     StaleContent,
+    acknowledge,
     consume,
     derive,
     reconcile,
@@ -136,10 +137,59 @@ class TestRevisionTracking:
         self, state: StateStore, route: SourceRoute
     ) -> None:
         element = comment(MAINTAINER)
-        reconcile(state, route, element)
+        first = reconcile(state, route, element)
+        acknowledge(state, route, element)
         again = reconcile(state, route, element)
+        assert first.changed
         assert not again.changed
         assert again.previous_revision == element.content_revision
+
+    def test_an_unacknowledged_change_keeps_reporting_until_it_is_acknowledged(
+        self, state: StateStore, route: SourceRoute
+    ) -> None:
+        """The obligation must survive being observed.
+
+        A caller that dies between seeing changed=True and re-applying the gated
+        decisions has not discharged anything, and a flag cleared by the act of
+        reading it would make the second look indistinguishable from "nothing
+        happened" -- while the new text stayed fully consumable.
+        """
+        element = comment(MAINTAINER, text="original")
+        reconcile(state, route, element)
+        acknowledge(state, route, element)
+
+        edited = comment(MAINTAINER, text="rewritten")
+        assert reconcile(state, route, edited).changed
+        # The caller crashed here, before re-applying anything.
+        assert reconcile(state, route, edited).changed
+        assert reconcile(state, route, edited).changed
+
+        assert acknowledge(state, route, edited)
+        assert not reconcile(state, route, edited).changed
+
+    def test_acknowledging_nothing_reports_nothing_was_pending(
+        self, state: StateStore, route: SourceRoute
+    ) -> None:
+        element = comment(MAINTAINER)
+        reconcile(state, route, element)
+        assert acknowledge(state, route, element)
+        assert not acknowledge(state, route, element)
+
+    def test_revision_moved_distinguishes_the_edge_from_the_obligation(
+        self, state: StateStore, route: SourceRoute
+    ) -> None:
+        """Two different questions: is this new, and do I still owe work."""
+        element = comment(MAINTAINER, text="original")
+        reconcile(state, route, element)
+        acknowledge(state, route, element)
+
+        edited = comment(MAINTAINER, text="rewritten")
+        first = reconcile(state, route, edited)
+        second = reconcile(state, route, edited)
+
+        assert first.revision_moved
+        assert not second.revision_moved
+        assert second.changed
 
     def test_edited_text_reports_changed_even_with_the_same_id_and_author(
         self, state: StateStore, route: SourceRoute
@@ -222,6 +272,59 @@ class TestConsumptionGate:
         two = comment(MAINTAINER, element_id="c-2", text="shared text")
         with pytest.raises(StaleContent):
             consume(two, derive(route, one))
+
+    def test_one_kinds_trust_does_not_authorize_another_kinds_text(
+        self, route: SourceRoute
+    ) -> None:
+        """R37.2's third form: never inherited from another element.
+
+        An id is unique only within a kind -- a tracker numbers an item's comments
+        from one, and nothing makes a comment id differ from its item's. Comparing
+        ids alone would serve a stranger's comment under a maintainer's body
+        trust, which is the permissive direction.
+        """
+        shared = "7"
+        body_element = ContentElement(
+            kind=ElementKind.ITEM_BODY,
+            element_id=shared,
+            author=MAINTAINER,
+            text="shared text",
+        )
+        stranger_comment = ContentElement(
+            kind=ElementKind.ITEM_COMMENT,
+            element_id=shared,
+            author="stranger",
+            text="shared text",
+        )
+        body_trust = derive(route, body_element)
+        assert body_trust.class_name == "maintainer"
+        assert derive(route, stranger_comment).class_name == LEAST_TRUSTED_CLASS
+
+        with pytest.raises(StaleContent):
+            consume(stranger_comment, body_trust)
+
+    def test_two_kinds_sharing_an_id_keep_separate_records(
+        self, state: StateStore, route: SourceRoute
+    ) -> None:
+        """Keyed on the id alone, the comment's row overwrote the body's."""
+        shared = "7"
+        body_element = ContentElement(
+            kind=ElementKind.ITEM_BODY, element_id=shared, author=MAINTAINER, text="body"
+        )
+        comment_element = ContentElement(
+            kind=ElementKind.ITEM_COMMENT, element_id=shared, author="stranger", text="c"
+        )
+        reconcile(state, route, body_element)
+        acknowledge(state, route, body_element)
+        reconcile(state, route, comment_element)
+
+        # The body's own record survives, so its verdict is still right.
+        assert not reconcile(state, route, body_element).changed
+        recorded = {(row.kind, row.class_name) for row in state.list_element_trust(SOURCE)}
+        assert recorded == {
+            (ElementKind.ITEM_BODY.value, "maintainer"),
+            (ElementKind.ITEM_COMMENT.value, LEAST_TRUSTED_CLASS),
+        }
 
     def test_re_deriving_after_the_edit_permits_the_new_text(self, route: SourceRoute) -> None:
         edited = comment(MAINTAINER, text="rewritten")

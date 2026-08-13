@@ -510,6 +510,11 @@ class QueueDispatch:
     seed: RunSeed | None = None
     refusal: DispatchRefusal | None = None
     detail: str = ""
+    #: Whether this refusal wrote its own ledger row. False on a repeat, so a
+    #: caller can tell "refused and recorded" from "refused again, already on
+    #: file" -- without it, a retry of an already-recorded refusal is silent in
+    #: every channel, because the log is gated on the same fact.
+    recorded: bool = False
 
 
 # --- routing ---------------------------------------------------------------
@@ -1101,20 +1106,43 @@ def _start_queued(
     the meantime meant that fix to apply.
     """
     item = _item_from_payload(record)
-    generation = int(record.generation or "1")
+    if not record.generation.strip():
+        # Fail rather than assume generation 1. Every enqueue writes
+        # generation_key(change.generation), so a blank column means the row was
+        # not written by this engine -- and guessing 1 would key the ledger row
+        # and the claim release to a different generation than the item's, so a
+        # release would delete nothing and report nothing.
+        raise ValueError(
+            f"queued item {record.item_id!r} from source {record.source!r} "
+            "carries no lifecycle generation"
+        )
+    generation = int(record.generation)
     klass = submitter_class_of(route, item)
     spec_type, _ = route.spec_type_for(item.classification, klass.name)
     if not spec_type:
+        # Same treatment as the poll path, and it matters more here: this row has
+        # already been dequeued, and drain_queue's contract is that a dequeued row
+        # cannot be re-queued. Without the release and the ledger row the item
+        # would have no queue row, a held claim no later poll can retake, and no
+        # entry naming it anywhere -- lost from the backlog and from every report
+        # at once. Reachable in ordinary operation: an operator who narrows a
+        # mapping between enqueue and drain lands every waiting item here.
+        recorded = record_refusal(
+            state, CLAIM_UNMAPPED, record.source, record.item_id, generation
+        )
+        release_dispatch_claim(state, record.source, record.item_id, generation)
         detail = (
             f"queued item {record.item_id!r} has classification {item.classification!r}, "
             f"which watch source {record.source!r} no longer maps to a spec type"
         )
-        logger.warning("%s", detail)
+        if recorded:
+            logger.warning("%s", detail)
         return QueueDispatch(
             record=record,
             outcome=ItemOutcome.REFUSED,
             refusal=DispatchRefusal.UNMAPPED_CLASSIFICATION,
             detail=detail,
+            recorded=recorded,
         )
     seeded = _seed_run(
         state,
@@ -1131,6 +1159,7 @@ def _start_queued(
             outcome=ItemOutcome.REFUSED,
             refusal=seeded.refusal,
             detail=seeded.detail,
+            recorded=seeded.recorded,
         )
     start(seeded)
     logger.info(

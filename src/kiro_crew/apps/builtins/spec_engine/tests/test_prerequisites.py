@@ -13,13 +13,17 @@ from kiro_crew.apps.builtins.spec_engine.engine.budget.ceiling import (
     CEILING_SETTING,
     Budget,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.config.schema import DELIVERY_STAGES
+from kiro_crew.apps.builtins.spec_engine.engine.config.schema import (
+    DELEGABLE_CAPABILITIES,
+    DELIVERY_STAGES,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.config.store import (
     DASHBOARD_SURFACE,
     ConfigStore,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import (
     AUDIT_PREREQUISITE_UNMET,
+    CAPABILITY_PHASES,
     STAGE_PHASES,
     CheckName,
     Prerequisite,
@@ -109,6 +113,16 @@ class TestPhaseScoping:
     def test_every_delivery_stage_has_a_phase(self) -> None:
         """A stage with no phase would be checked at the wrong rung, or not at all."""
         assert set(STAGE_PHASES) == set(DELIVERY_STAGES)
+
+    def test_every_delegable_capability_has_a_phase(self) -> None:
+        """The mirror of the stage ratchet, so the map cannot drift unnoticed.
+
+        The default for an unmapped capability is authoring, the lowest rung, so
+        drift over-checks rather than exempts -- a false refusal, not an authority
+        leak. This test is what makes the drift visible to whoever adds the
+        capability instead of to a confused operator.
+        """
+        assert set(CAPABILITY_PHASES) == set(DELEGABLE_CAPABILITIES)
 
     def test_an_unknown_stage_raises_rather_than_defaulting(self) -> None:
         with pytest.raises(ValueError):
@@ -225,6 +239,89 @@ class TestChecks:
         with_bounded_ceiling(config)
         report = check_project(config, project=PROJECT, which=no_programs, branch_exists=exists)
         assert [c for c in report.checks if c.check is CheckName.PROVIDERS] == []
+
+    def test_an_empty_protected_set_is_unmet_at_integration(
+        self, config: ConfigStore
+    ) -> None:
+        """The one check whose failure nothing demonstrated.
+
+        Reachable: resolve_protected_branches returns an empty set when neither
+        protected_branches nor a base branch is configured, and integration is the
+        one stage a mistake cannot undo.
+        """
+        with_bounded_ceiling(config)
+        configure(config, {"projects": {PROJECT: {"path": f"/w/{PROJECT}"}}})
+        report = check_project(
+            config, project=PROJECT, which=always_present, branch_exists=exists
+        )
+
+        protected = [c for c in report.unmet if c.check is CheckName.PROTECTED_BRANCHES]
+        assert len(protected) == 1
+        assert protected[0].phase is AutonomyLevel.INTEGRATION
+        assert protected[0].action
+
+    def test_a_configured_protected_set_is_met(self, config: ConfigStore) -> None:
+        with_bounded_ceiling(config)
+        configure(
+            config,
+            {
+                "projects": {
+                    PROJECT: {"path": f"/w/{PROJECT}", "protected_branches": ["main"]}
+                }
+            },
+        )
+        report = check_project(
+            config, project=PROJECT, which=always_present, branch_exists=exists
+        )
+        assert [c for c in report.unmet if c.check is CheckName.PROTECTED_BRANCHES] == []
+
+    def test_the_runs_own_base_is_verified_not_the_projects(
+        self, config: ConfigStore
+    ) -> None:
+        """A watch-source run integrates into a branch the project never names.
+
+        Verifying the project's base here would report readiness for a branch this
+        run does not touch, and leave the one it does touch unchecked.
+        """
+        with_bounded_ceiling(config)
+        with_delivery_workflow(config)
+        asked: list[str] = []
+
+        def only_main(branch: str) -> bool:
+            asked.append(branch)
+            return branch == "main"
+
+        report = check_project(
+            config,
+            project=PROJECT,
+            base_branch="release-2",
+            which=always_present,
+            branch_exists=only_main,
+        )
+
+        assert asked == ["release-2"]
+        base = [c for c in report.unmet if c.check is CheckName.BASE_BRANCH]
+        assert len(base) == 1
+        assert "release-2" in base[0].missing
+
+    def test_a_source_supplied_base_makes_the_check_run_at_all(
+        self, config: ConfigStore
+    ) -> None:
+        """With no project base, the check used to be skipped entirely."""
+        with_bounded_ceiling(config)
+        configure(config, {"projects": {PROJECT: {"path": f"/w/{PROJECT}"}}})
+
+        report = check_project(
+            config,
+            project=PROJECT,
+            base_branch="from-the-source",
+            which=always_present,
+            branch_exists=missing,
+        )
+
+        assert [c.check for c in report.unmet if c.check is CheckName.BASE_BRANCH] == [
+            CheckName.BASE_BRANCH
+        ]
 
     def test_an_absent_base_branch_is_unmet_at_delivery(self, config: ConfigStore) -> None:
         with_bounded_ceiling(config)

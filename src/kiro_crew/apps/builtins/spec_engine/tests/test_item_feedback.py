@@ -23,7 +23,11 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery.stages import (
     StageExecutor,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.delivery.variables import RunContext
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.watch.feedback import (
     AUDIT_ITEM_FEEDBACK,
     FeedbackOutcome,
@@ -162,6 +166,30 @@ class TestLoading:
         loaded = load_feedback(config, SOURCE)
         assert list(loaded) == ["claimed"]
         assert loaded["claimed"][0].program == "gh"
+
+    def test_an_empty_command_list_is_an_error_not_silence(
+        self, config: ConfigStore
+    ) -> None:
+        """The schema calls this "at least one command"; the loader must agree.
+
+        Skipping it would report the event as UNCONFIGURED, which is the typo
+        becoming silence that this loader exists to prevent.
+        """
+        hand_edit(
+            config,
+            {"sources": {SOURCE: {"poll": ["tracker-cli"], "feedback": {"claimed": []}}}},
+        )
+        with pytest.raises(ConfigValidationError):
+            load_feedback(config, SOURCE)
+
+    def test_an_undeclared_source_is_an_error_not_silence(
+        self, config: ConfigStore
+    ) -> None:
+        """Strict about the event name and silent about the source name would make
+        a misspelled source indistinguishable from one with nothing configured."""
+        configure(config, {"sources": {SOURCE: {"poll": ["tracker-cli"]}}})
+        with pytest.raises(ConfigValidationError):
+            load_feedback(config, "githb")
 
     def test_an_unparseable_map_raises_rather_than_reading_as_no_feedback(
         self, config: ConfigStore
@@ -444,6 +472,43 @@ class TestAuditAndCost:
         detail = audit.read(ref)[0].detail or {}
         assert detail["outcome"] == FeedbackOutcome.FAILED.value
         assert detail["reason"]
+
+    def test_an_unwritable_audit_log_does_not_fail_the_run(
+        self,
+        state: StateStore,
+        config: ConfigStore,
+        ref: SpecRef,
+        context: RunContext,
+        tmp_path: Path,
+    ) -> None:
+        """R36.6: a writeback failure must not fail the run.
+
+        The audit append happens after the comment has already landed, so an
+        unwritable log turning into an exception would make the one thing that
+        must not fail the run into the thing that fails it.
+        """
+
+        class Unwritable(AuditLog):
+            def append(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+                raise StatePersistenceError("the disk is full")
+
+        with_feedback(config, claimed=[["gh", "comment", "{item_id}"]])
+        runner = Runner()
+
+        report = post_feedback(
+            state,
+            config,
+            Unwritable(tmp_path / "audit"),
+            ref,
+            source=SOURCE,
+            event=EVENT,
+            run_id=RUN,
+            context=context,
+            executor=executor(config, runner),
+        )
+
+        assert report.outcome is FeedbackOutcome.POSTED
+        assert runner.calls == [("gh", "comment", "42")]
 
     def test_feedback_costs_no_model_credits(
         self,

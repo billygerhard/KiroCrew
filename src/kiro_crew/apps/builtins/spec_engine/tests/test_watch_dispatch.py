@@ -24,6 +24,7 @@ The four that would cost the most if they silently stopped working:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -1032,6 +1033,35 @@ class TestConcurrencyCaps:
 
 
 class TestDrainingTheQueue:
+    def test_a_queued_item_whose_mapping_was_narrowed_stays_recoverable(
+        self, store: StateStore, config: ConfigStore, starter: Starter, allow: AllowAll
+    ) -> None:
+        """The queue path's refusal is the worse one: its row is already gone.
+
+        drain_queue cannot re-queue a dequeued row, so without the release and the
+        ledger row this item would end with no queue row, a held claim no later
+        poll can retake, and nothing naming it anywhere -- gone from the backlog
+        and from every report at once.
+        """
+        configure(config, {"concurrency": {"global_max_runs": 1}})
+        dispatch(store, config, polled(item("7"), item("8")), starter)
+        finish(store, starter.seeds[0].run_id)
+
+        # The operator narrows the mapping while item 8 waits. Done by editing the
+        # document because config writes merge key by key, so a removal cannot be
+        # expressed as a patch -- which is how an operator would do it too.
+        document = json.loads(config.path.read_text(encoding="utf-8"))
+        document["sources"][SOURCE]["spec_types"] = {"feature": "feature"}
+        config.path.write_text(json.dumps(document), encoding="utf-8")
+
+        drained = drain_queue(store, config, gate=allow, start=starter)
+
+        refused = [d for d in drained if d.outcome is ItemOutcome.REFUSED]
+        assert [d.refusal for d in refused] == [DispatchRefusal.UNMAPPED_CLASSIFICATION]
+        assert refused[0].recorded is True
+        assert unmapped_items(store, SOURCE) == {"8": ("1",)}
+        assert "8" not in claims_for(store)
+
     def test_capacity_freeing_starts_the_oldest_queued_item_first(
         self, store: StateStore, config: ConfigStore, starter: Starter, allow: AllowAll
     ) -> None:

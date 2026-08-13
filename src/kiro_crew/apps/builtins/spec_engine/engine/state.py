@@ -186,17 +186,25 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # than only the class because the question this table answers is not "what
     # class did this author have" but "is the class on file still about the text
     # we are holding" -- an edited comment keeps its id and its author.
+    #
+    # `kind` is part of the key, not a payload column. An element id is unique
+    # only within its kind, so keying on the id alone would let a comment's row
+    # overwrite its item body's and then report the survivor as unchanged.
+    # `pending_reapply` outlives the observation that set it: a caller that sees a
+    # changed element owes a re-application of every decision gated on the class,
+    # and that obligation must survive a crash between noticing and doing it.
     """
     CREATE TABLE IF NOT EXISTS element_trust (
-        scope       TEXT NOT NULL,
-        element_id  TEXT NOT NULL,
-        kind        TEXT NOT NULL,
-        author      TEXT NOT NULL DEFAULT '',
-        revision    TEXT NOT NULL,
-        class_name  TEXT NOT NULL,
-        evidence    TEXT NOT NULL,
-        derived_ts  TEXT NOT NULL,
-        PRIMARY KEY (scope, element_id)
+        scope           TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        element_id      TEXT NOT NULL,
+        author          TEXT NOT NULL DEFAULT '',
+        revision        TEXT NOT NULL,
+        class_name      TEXT NOT NULL,
+        evidence        TEXT NOT NULL,
+        pending_reapply INTEGER NOT NULL DEFAULT 0,
+        derived_ts      TEXT NOT NULL,
+        PRIMARY KEY (scope, kind, element_id)
     )
     """,
     """
@@ -445,6 +453,11 @@ class ElementTrustRecord:
     class_name: str
     evidence: str
     derived_ts: str
+    #: Whether a caller still owes a re-application of the decisions gated on this
+    #: element's class. Set when the revision moves, cleared only by an explicit
+    #: acknowledgement, so a crash between noticing and re-applying leaves the
+    #: obligation outstanding instead of silently discharging it.
+    pending_reapply: bool = False
 
 
 @dataclass(frozen=True)
@@ -559,6 +572,7 @@ def _element_trust_record(row: sqlite3.Row) -> ElementTrustRecord:
         class_name=row["class_name"],
         evidence=row["evidence"],
         derived_ts=row["derived_ts"],
+        pending_reapply=bool(row["pending_reapply"]),
     )
 
 
@@ -656,6 +670,7 @@ class StateStore:
     def _ensure_schema(self) -> None:
         with self._schema_lock:
             with self._write() as conn:
+                self._migrate(conn)
                 for statement in _SCHEMA_STATEMENTS:
                     conn.execute(statement)
                 conn.execute(
@@ -663,6 +678,35 @@ class StateStore:
                     "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                     (str(SCHEMA_VERSION),),
                 )
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring a pre-existing database up to the current shape.
+
+        Runs before the ``CREATE TABLE IF NOT EXISTS`` replay, which converges an
+        *additive* change on its own but cannot alter a table that already exists.
+        A non-additive change therefore needs a step here, or an older database
+        keeps its old shape while the code assumes the new one -- and the version
+        stamp would not catch it, because nothing reads the stamp to decide.
+
+        ``element_trust`` gained ``kind`` in its primary key: keyed on the id
+        alone, a comment's row overwrites its item body's. The table is dropped
+        rather than copied because it is a cache of a derivation that can always
+        be recomputed from the elements themselves, and carrying rows keyed the
+        wrong way forward would preserve exactly the collision being fixed.
+        """
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'element_trust'"
+        ).fetchone()
+        if row is None:
+            return
+        keyed_on = [
+            column["name"]
+            for column in conn.execute("PRAGMA table_info(element_trust)").fetchall()
+            if column["pk"]
+        ]
+        if "kind" not in keyed_on:
+            conn.execute("DROP TABLE element_trust")
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -1257,6 +1301,7 @@ class StateStore:
         revision: str,
         class_name: str,
         evidence: str,
+        pending_reapply: bool = False,
     ) -> ElementTrustRecord:
         """Record the class derived for one element at one revision.
 
@@ -1264,46 +1309,79 @@ class StateStore:
         table answers "is the class on file current" and only the latest
         revision can answer it. The audit log is where the history lives, and it
         is append-only for exactly this reason.
+
+        ``pending_reapply`` is OR-ed with what is already stored rather than
+        replacing it. A pending obligation may only be cleared by
+        :meth:`acknowledge_element_trust`; if a plain re-record could clear it,
+        merely looking at the element again would discharge a re-application that
+        never happened.
         """
         if not scope.strip():
             raise ValueError("an element trust record must name the scope that consumed it")
         if not element_id.strip():
             raise ValueError("an element trust record must name the element")
+        if not kind.strip():
+            raise ValueError("an element trust record must name the element kind")
         if not revision.strip():
             raise ValueError("an element trust record must carry the revision it was derived from")
         now = utc_now_iso()
         with self._write() as conn:
             conn.execute(
-                "INSERT INTO element_trust (scope, element_id, kind, author, revision, "
-                "class_name, evidence, derived_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT (scope, element_id) DO UPDATE SET "
-                "kind = excluded.kind, author = excluded.author, "
-                "revision = excluded.revision, class_name = excluded.class_name, "
-                "evidence = excluded.evidence, derived_ts = excluded.derived_ts",
-                (scope, element_id, kind, author, revision, class_name, evidence, now),
+                "INSERT INTO element_trust (scope, kind, element_id, author, revision, "
+                "class_name, evidence, pending_reapply, derived_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (scope, kind, element_id) DO UPDATE SET "
+                "author = excluded.author, revision = excluded.revision, "
+                "class_name = excluded.class_name, evidence = excluded.evidence, "
+                "pending_reapply = MAX(element_trust.pending_reapply, excluded.pending_reapply), "
+                "derived_ts = excluded.derived_ts",
+                (
+                    scope,
+                    kind,
+                    element_id,
+                    author,
+                    revision,
+                    class_name,
+                    evidence,
+                    1 if pending_reapply else 0,
+                    now,
+                ),
             )
-        return ElementTrustRecord(
-            scope=scope,
-            element_id=element_id,
-            kind=kind,
-            author=author,
-            revision=revision,
-            class_name=class_name,
-            evidence=evidence,
-            derived_ts=now,
-        )
+        stored = self.get_element_trust(scope, kind, element_id)
+        if stored is None:  # pragma: no cover - the insert above just wrote it
+            raise StatePersistenceError(
+                f"element trust for {element_id!r} in scope {scope!r} did not persist"
+            )
+        return stored
 
-    def get_element_trust(self, scope: str, element_id: str) -> ElementTrustRecord | None:
+    def acknowledge_element_trust(self, scope: str, kind: str, element_id: str) -> bool:
+        """Clear one element's pending re-application. True if one was pending.
+
+        The only way the flag goes down. A caller invokes this AFTER re-applying
+        every decision gated on the element's class, so an interrupted caller
+        leaves the obligation on the row and the next reconcile still reports it.
+        """
+        with self._write() as conn:
+            cursor = conn.execute(
+                "UPDATE element_trust SET pending_reapply = 0 "
+                "WHERE scope = ? AND kind = ? AND element_id = ? AND pending_reapply = 1",
+                (scope, kind, element_id),
+            )
+            return cursor.rowcount == 1
+
+    def get_element_trust(
+        self, scope: str, kind: str, element_id: str
+    ) -> ElementTrustRecord | None:
         row = self._query_one(
-            "SELECT * FROM element_trust WHERE scope = ? AND element_id = ?",
-            (scope, element_id),
+            "SELECT * FROM element_trust WHERE scope = ? AND kind = ? AND element_id = ?",
+            (scope, kind, element_id),
         )
         return _element_trust_record(row) if row is not None else None
 
     def list_element_trust(self, scope: str) -> list[ElementTrustRecord]:
-        """Every element recorded under *scope*, in element order."""
+        """Every element recorded under *scope*, in kind then element order."""
         rows = self._query(
-            "SELECT * FROM element_trust WHERE scope = ? ORDER BY element_id", (scope,)
+            "SELECT * FROM element_trust WHERE scope = ? ORDER BY kind, element_id", (scope,)
         )
         return [_element_trust_record(row) for row in rows]
 
