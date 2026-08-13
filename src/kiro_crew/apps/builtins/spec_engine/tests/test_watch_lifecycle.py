@@ -350,6 +350,160 @@ class TestDiff:
         assert "1 new" in diff.describe()
 
 
+# --- detecting a mid-run edit ----------------------------------------------
+
+
+def edited_item(
+    identifier: str,
+    *,
+    title: str = HOSTILE_TITLE,
+    body: str = HOSTILE_BODY,
+    state: str = "open",
+    address: str = "https://example.invalid/items/1",
+    classification: str = "bug",
+    submitter: str = "someone",
+) -> WatchedItem:
+    """A watched item with every field the digest might read set explicitly."""
+    return WatchedItem(
+        source=SOURCE,
+        identifier=identifier,
+        title=title,
+        body=body,
+        state=state,
+        address=address,
+        classification=classification,
+        submitter=submitter,
+    )
+
+
+class TestEditDetection:
+    """An edit is a content change with an unchanged lifecycle position.
+
+    It is detected by comparing a content digest against the one the snapshot
+    recorded, so the two silent failures this guards are a digest that is not
+    stable (every re-poll reports a spurious edit) and a blank recorded digest
+    read as an edit (every row in an upgraded store reports one on the next poll).
+    """
+
+    def test_an_edit_to_a_recorded_item_is_flagged_without_being_dispatchable(
+        self, store: StateStore
+    ) -> None:
+        record_snapshot(store, diff_poll(store, polled(edited_item("1", body="original"))))
+
+        diff = diff_poll(store, polled(edited_item("1", body="rewritten after the fact")))
+
+        change = diff.changes[0]
+        assert change.transition is Transition.UNCHANGED
+        assert change.edited is True
+        assert change.dispatchable is False
+        assert [c.identifier for c in diff.edited] == ["1"]
+
+    def test_a_repoll_with_identical_content_reports_no_edit(self, store: StateStore) -> None:
+        # The one that catches a digest that is not stable: recording the
+        # snapshot stores the item's digest, and the same item observed again
+        # must hash to the same value or every poll would report a phantom edit.
+        record_snapshot(store, diff_poll(store, polled(edited_item("1"))))
+
+        diff = diff_poll(store, polled(edited_item("1")))
+
+        assert diff.changes[0].edited is False
+        assert diff.edited == ()
+
+    def test_a_preexisting_row_with_no_digest_reads_as_not_edited(self, store: StateStore) -> None:
+        # A row written before digests were stored holds a blank one. Comparing a
+        # real digest against a blank would report it as edited on the first poll
+        # after the upgrade, so a blank reads as "unknown, not edited".
+        store.record_watch_items(SOURCE, [WatchObservation(item_id="1", generation=1)])
+        assert store.get_watch_item(SOURCE, "1").content_digest == ""
+
+        diff = diff_poll(store, polled(edited_item("1")))
+
+        assert diff.changes[0].edited is False
+
+    def test_a_change_to_a_non_content_field_is_not_an_edit(self, store: StateStore) -> None:
+        # The address is where a human looks and the submitter drives the trust
+        # class on its own path; neither changes what a run was given, so a change
+        # to one is not a content edit.
+        record_snapshot(store, diff_poll(store, polled(edited_item("1", address="url-a"))))
+
+        diff = diff_poll(store, polled(edited_item("1", address="url-b", submitter="someone-else")))
+
+        assert diff.changes[0].edited is False
+
+    def test_a_classification_change_is_an_edit(self, store: StateStore) -> None:
+        # Classification selects the spec type, so editing it would author a
+        # different kind of spec; it is part of the content the digest covers.
+        record_snapshot(store, diff_poll(store, polled(edited_item("1", classification="bug"))))
+
+        diff = diff_poll(store, polled(edited_item("1", classification="feature")))
+
+        assert diff.changes[0].edited is True
+
+    def test_the_recorded_snapshot_carries_the_items_digest(self, store: StateStore) -> None:
+        # The observation the diff would record has to carry the digest, or the
+        # next poll compares against a blank and never sees an edit.
+        diff = diff_poll(store, polled(edited_item("1")))
+
+        assert diff.changes[0].observation.content_digest == edited_item("1").content_digest
+        record_snapshot(store, diff)
+        assert store.get_watch_item(SOURCE, "1").content_digest == edited_item("1").content_digest
+
+    def test_a_reopened_item_is_not_reported_as_an_edit(self, store: StateStore) -> None:
+        # A reopen dispatches a fresh run with the current content, so it is not
+        # a mid-run edit even though the content differs from the closed snapshot.
+        record_snapshot(store, diff_poll(store, polled(edited_item("1", body="a"))))
+        record_snapshot(store, diff_poll(store, polled(edited_item("1", body="a", state="closed"))))
+
+        diff = diff_poll(store, polled(edited_item("1", body="b", state="open")))
+
+        assert diff.changes[0].transition is Transition.REOPENED
+        assert diff.changes[0].edited is False
+        assert diff.edited == ()
+
+    def test_an_edit_cannot_be_flagged_on_a_non_unchanged_transition(self) -> None:
+        with pytest.raises(ValueError, match="unchanged lifecycle position"):
+            ItemChange(
+                item=edited_item("1"),
+                transition=Transition.NEW,
+                generation=FIRST_GENERATION,
+                previous_generation=None,
+                is_open=True,
+                edited=True,
+            )
+
+
+class TestContentDigest:
+    """The digest is one function, stable, and never the item text."""
+
+    def test_the_digest_is_stable_across_constructions(self) -> None:
+        assert edited_item("1").content_digest == edited_item("1").content_digest
+
+    def test_only_content_fields_move_the_digest(self) -> None:
+        base = edited_item("1")
+        assert edited_item("1", address="different").content_digest == base.content_digest
+        assert edited_item("1", submitter="different").content_digest == base.content_digest
+        assert edited_item("1", state="closed").content_digest == base.content_digest
+
+    def test_each_content_field_moves_the_digest(self) -> None:
+        base = edited_item("1")
+        assert edited_item("1", title="x").content_digest != base.content_digest
+        assert edited_item("1", body="x").content_digest != base.content_digest
+        assert edited_item("1", classification="x").content_digest != base.content_digest
+
+    def test_length_prefixing_prevents_a_field_boundary_collision(self) -> None:
+        # Without a length prefix, moving a character across the title/body
+        # boundary would leave the concatenation -- and the digest -- unchanged.
+        assert (
+            edited_item("1", title="ab", body="c").content_digest
+            != edited_item("1", title="a", body="bc").content_digest
+        )
+
+    def test_the_digest_is_not_the_item_text(self) -> None:
+        digest = edited_item("1", body=HOSTILE_BODY).content_digest
+        assert HOSTILE_BODY not in digest
+        assert len(digest) == 64  # a sha256 hex digest
+
+
 class TestOpenness:
     """Which state text counts as closed, and which is left alone."""
 

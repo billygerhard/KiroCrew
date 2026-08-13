@@ -27,6 +27,7 @@ is reported as rejected rather than carried with a blank.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 #: The fields a watch source's mapping yields, in reporting order.
@@ -43,6 +44,17 @@ ITEM_FIELDS: tuple[str, ...] = (
 
 #: Fields that must resolve to a non-blank value for an item to be usable.
 REQUIRED_ITEM_FIELDS: tuple[str, ...] = ("identifier",)
+
+#: Fields the content digest is taken over: the ones that would change what a
+#: run was given. ``title`` and ``body`` are the quoted data a run authors from;
+#: ``classification`` selects the spec type, so an edit to it would author a
+#: different kind of spec. The other fields do not: ``identifier`` is the claim
+#: key (an item that changed it is a different item, not an edit of this one),
+#: ``state`` drives the lifecycle transition rather than the content, ``address``
+#: is where a human looks, and ``submitter``/``association`` drive the trust
+#: class, which is re-derived on its own path. A field added to a source's
+#: mapping does not widen this set.
+CONTENT_DIGEST_FIELDS: tuple[str, ...] = ("title", "body", "classification")
 
 
 @dataclass(frozen=True)
@@ -75,3 +87,27 @@ class WatchedItem:
     def fields(self) -> dict[str, str]:
         """The mapped fields, keyed by engine field name."""
         return {name: getattr(self, name) for name in ITEM_FIELDS}
+
+    @property
+    def content_digest(self) -> str:
+        """A stable hash over the fields that would change what a run was given.
+
+        The one function that computes an item's digest, so the value written to
+        a snapshot row and the value a later poll compares against it are the
+        same by construction: a second spelling of this would let one poll record
+        a digest a later one could never match, reporting an edit on every
+        subsequent poll. The fields are length-prefixed before hashing so no
+        pair of values can be rearranged across the field boundary into the same
+        digest -- ``title='ab', body='c'`` must not collide with
+        ``title='a', body='bc'``.
+
+        Never reversible and never the text: the digest is what lets the engine
+        notice an edit without keeping a second copy of an attacker-controlled
+        body in its state store.
+        """
+        hasher = hashlib.sha256()
+        for name in CONTENT_DIGEST_FIELDS:
+            encoded = getattr(self, name).encode("utf-8")
+            hasher.update(f"{name}:{len(encoded)}:".encode("ascii"))
+            hasher.update(encoded)
+        return hasher.hexdigest()

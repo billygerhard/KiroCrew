@@ -75,7 +75,7 @@ from .feedback import (
     post_feedback,
     release_writeback_claim,
 )
-from .items import ITEM_FIELDS, REQUIRED_ITEM_FIELDS, WatchedItem
+from .items import CONTENT_DIGEST_FIELDS, ITEM_FIELDS, REQUIRED_ITEM_FIELDS, WatchedItem
 from .lifecycle import (
     CLOSED_STATES,
     DISPATCHING_TRANSITIONS,
@@ -143,6 +143,7 @@ __all__ = [
     "CLAIM_NAME_TAKEN",
     "CLAIM_UNMAPPED",
     "CLOSED_STATES",
+    "CONTENT_DIGEST_FIELDS",
     "CRON_ENTRY_POINT",
     "CRON_JOB_PREFIX",
     "CRON_SCRIPT_FILENAME",

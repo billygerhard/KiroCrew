@@ -156,10 +156,19 @@ class ItemChange:
     generation: int
     previous_generation: int | None
     is_open: bool
+    #: Whether the item's content changed while its lifecycle position did not.
+    #: Only an ``unchanged`` item can be edited: a content change that also moved
+    #: the lifecycle is a reopen or a cancellation, and a first sighting has no
+    #: baseline to have differed from. An edit is never a dispatch candidate --
+    #: it keeps the item ``unchanged`` -- so this flag surfaces the edit for
+    #: auditing without making it dispatchable.
+    edited: bool = False
 
     def __post_init__(self) -> None:
         if self.generation < FIRST_GENERATION:
             raise ValueError("a lifecycle generation starts at one and only rises")
+        if self.edited and self.transition is not Transition.UNCHANGED:
+            raise ValueError("an edit is a content change with an unchanged lifecycle position")
         if self.transition is Transition.NEW:
             if self.previous_generation is not None:
                 raise ValueError("a new item has no previous generation")
@@ -205,6 +214,7 @@ class ItemChange:
             generation=self.generation,
             item_state=self.item.state,
             is_open=self.is_open,
+            content_digest=self.item.content_digest,
         )
 
 
@@ -266,6 +276,19 @@ class WatchDiff:
         return self._of(Transition.UNCHANGED)
 
     @property
+    def edited(self) -> tuple[ItemChange, ...]:
+        """Items whose content changed while their lifecycle position did not.
+
+        A subset of :attr:`unchanged`, never disjoint from it: an edit is not a
+        transition of its own, so it does not remove the item from the unchanged
+        set or make it a dispatch candidate. It is surfaced so that an edit made
+        while a run for the item is in flight can be recorded as ignored -- the
+        item was rewritten after a run had already been given the old content,
+        and requirement 21.3 wants that visible to an operator.
+        """
+        return tuple(change for change in self.changes if change.edited)
+
+    @property
     def dispatchable(self) -> tuple[ItemChange, ...]:
         """Dispatch candidates in the order the source reported them.
 
@@ -293,6 +316,8 @@ class WatchDiff:
             f"{len(self.cancelled)} cancelled",
             f"{len(self.unchanged)} unchanged",
         ]
+        if self.edited:
+            parts.append(f"{len(self.edited)} edited")
         if self.unreported:
             parts.append(f"{len(self.unreported)} unreported")
         if self.duplicates:
@@ -556,7 +581,22 @@ def _derive(item: WatchedItem, previous: WatchItemRecord | None) -> ItemChange:
         generation=previous.generation,
         previous_generation=previous.generation,
         is_open=is_open,
+        edited=_is_edit(item, previous),
     )
+
+
+def _is_edit(item: WatchedItem, previous: WatchItemRecord) -> bool:
+    """Whether *item*'s content differs from the digest the snapshot recorded.
+
+    A blank recorded digest reads as *unknown*, never as an edit: it is what a
+    row written before digests were stored, or one an upgrade migrated in, holds,
+    and comparing a real digest against a blank would report every such row as
+    edited on the first poll after an upgrade. Only two real digests that differ
+    are an edit. The item's own digest is always present (a sha256 of its fields),
+    so the blank being guarded is always the recorded side.
+    """
+    recorded = previous.content_digest
+    return bool(recorded) and recorded != item.content_digest
 
 
 def _normalized(text: str) -> str:
