@@ -144,7 +144,7 @@ class TestRequestChanges:
         reviser = CapturingReviser()
 
         outcome = queue.request_changes(
-            ref, run_id, comment="Tighten requirement 2.", reviser=reviser, actor="user:ada"
+            ref, run_id, comment="Tighten ``requirement`` 2.", reviser=reviser, actor="user:ada"
         )
 
         assert isinstance(outcome, RequestChangesOutcome)
@@ -159,10 +159,24 @@ class TestRequestChanges:
         request = reviser.requests[0]
         assert request.run_id == run_id and request.gate == "requirements"
         assert request.cycle == 1 and request.project == "example"
+        # A second, independent catcher for the fence: the text the turn actually
+        # receives must have a backtick fence immediately BEFORE the comment, so a
+        # regression that stops quoting here fails a test other than the one in
+        # TestCommentIsQuotedData. That class covers the attack; this covers the
+        # wiring, and a guarantee held by one test has bitten this project before.
+        #
+        # Asserting on the text before the comment rather than on "a fence exists
+        # somewhere" is the point: the composed text carries other fenced sections,
+        # so a mere `"```" in text` passes even with the comment inserted raw --
+        # a proxy the failure path also sets, which is one of the shapes the
+        # test-quality criteria screen for.
+        text = request.revision_text()
+        before, _, _ = text.partition("Tighten ``requirement`` 2.")
+        assert before.rstrip("\n").endswith("`"), "the comment is not inside a fence"
         # The comment was recorded in the audit log as data.
         events = [json.loads(line) for line in _audit_lines(audit, ref)]
         recorded = [e for e in events if e["event"] == "spec.review.changes-requested"]
-        assert recorded and recorded[0]["detail"]["comment"] == "Tighten requirement 2."
+        assert recorded and recorded[0]["detail"]["comment"] == "Tighten ``requirement`` 2."
 
     def test_a_reviser_that_fails_leaves_the_run_in_its_prior_state(
         self, machine: RunMachine, queue: ReviewQueue, project: Path, audit: AuditLog
