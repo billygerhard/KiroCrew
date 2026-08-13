@@ -191,7 +191,23 @@ def run_argv(argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcom
         try:
             stdout, stderr = started.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+            # Already gone is the outcome a kill wants, so a child that exited
+            # between the deadline and the signal is not a failure to report --
+            # letting ProcessLookupError escape would turn a command that
+            # finished right at its timeout into a crash instead of a timed-out
+            # stage. kill_process_tree propagates it by design, for callers that
+            # need to tell "gone" from "could not signal"; this is not one.
+            try:
+                platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "could not stop %r (pid %d) after its timeout: %s",
+                    argv[0],
+                    started.pid,
+                    exc,
+                )
             try:
                 stdout, stderr = started.communicate(timeout=_DRAIN_TIMEOUT_S)
             except subprocess.TimeoutExpired:

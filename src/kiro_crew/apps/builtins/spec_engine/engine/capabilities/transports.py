@@ -115,6 +115,26 @@ class ChildOutcome:
     start_error: str = ""
 
 
+def _stop_child(pid: int, program: str) -> None:
+    """Stop a child and its descendants, treating an already-dead one as done.
+
+    ``kill_process_tree`` deliberately lets ``ProcessLookupError`` propagate so a
+    caller can tell "already gone" from "could not signal". For a timeout or a
+    broken pipe that distinction does not exist: the goal is that the child is
+    not running, and a child that exited on its own between the deadline and the
+    signal has satisfied it. Letting the error escape turned a provider that
+    answered and exited right at its deadline into a crash instead of a reported
+    timeout -- reachable under load, and reported by the suite as a raise from
+    the transport rather than the timeout finding the caller expects.
+    """
+    try:
+        platform_compat.kill_process_tree(pid, platform_compat.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        logger.warning("could not stop %r (pid %d) after it stopped answering: %s", program, pid, exc)
+
+
 def run_provider_child(
     argv: Sequence[str],
     *,
@@ -174,7 +194,7 @@ def run_provider_child(
         try:
             stdout, stderr = started.communicate(input=stdin_text, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+            _stop_child(started.pid, argv[0])
             try:
                 stdout, stderr = started.communicate(timeout=_DRAIN_TIMEOUT_S)
             except subprocess.TimeoutExpired:
@@ -185,7 +205,7 @@ def run_provider_child(
                 timed_out=True,
             )
         except (BrokenPipeError, OSError) as exc:
-            platform_compat.kill_process_tree(started.pid, platform_compat.SIGKILL)
+            _stop_child(started.pid, argv[0])
             return ChildOutcome(start_error=f"{argv[0]!r} closed its input: {exc}")
         return ChildOutcome(
             exit_code=started.returncode,
