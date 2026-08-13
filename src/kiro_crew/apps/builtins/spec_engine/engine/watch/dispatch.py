@@ -62,8 +62,10 @@ from ..config.schema import (
     WILDCARD_KEY,
 )
 from ..creation import SpecAlreadyExists, create_spec
+from ..delivery.variables import RunContext
 from ..runs import ACTIVE_PHASES, RunState, new_run_id
 from ..state import QueueRecord, SpecRef, StateStore
+from .feedback import FeedbackPoster
 from .items import ITEM_FIELDS, WatchedItem
 from .lifecycle import (
     DispatchGate,
@@ -670,9 +672,7 @@ def record_unmapped(state: StateStore, change: ItemChange) -> bool:
     )
 
 
-def record_name_taken(
-    state: StateStore, source: str, identifier: str, generation: int
-) -> bool:
+def record_name_taken(state: StateStore, source: str, identifier: str, generation: int) -> bool:
     """Record an item whose spec name is already taken. Once per generation.
 
     Without this row the collision was invisible: the dispatch claim was kept, so
@@ -702,6 +702,7 @@ def dispatch_source(
     *,
     gate: DispatchGate,
     start: RunStarter,
+    feedback: FeedbackPoster | None = None,
 ) -> DispatchReport:
     """Take one poll all the way to started runs, queued items, and refusals.
 
@@ -711,6 +712,13 @@ def dispatch_source(
     than as an error. The starter is required for the same reason in the other
     direction — a dispatcher with nothing to start would claim items, create
     specs, and silently run nothing.
+
+    *feedback* is the item-feedback poster. It is optional because item feedback
+    is configuration a source opts into (requirement 10.10 writes back *where
+    feedback commands are configured*), not an engine floor: absent it, no
+    ``claimed`` comment is posted and the dispatch is otherwise unchanged. When
+    present it is the same poster the run lifecycle and the delivery flow use, so
+    all three sites take the one writeback claim and post by the one route.
     """
     route = load_route(config, outcome.source)
     if not route.routable:
@@ -763,9 +771,7 @@ def dispatch_source(
             # later poll derives `unchanged` and spends nothing. Re-offering a
             # refused item stays a deliberate act. The ledger row this just
             # wrote is what makes it enumerable in the meantime.
-            release_dispatch_claim(
-                state, outcome.source, change.identifier, change.generation
-            )
+            release_dispatch_claim(state, outcome.source, change.identifier, change.generation)
             detail = (
                 f"watch source {outcome.source!r} maps no spec type for classification "
                 f"{change.item.classification!r} and declares no {WILDCARD_KEY!r}, so item "
@@ -800,6 +806,7 @@ def dispatch_source(
                 klass=klass,
                 policy=policy,
                 start=start,
+                feedback=feedback,
             )
         except Exception as exc:  # a starter or a run write can fail for its own reasons
             # Every candidate in this batch is already claimed and snapshotted, so
@@ -842,6 +849,7 @@ def dispatch_tick(
     config: ConfigStore,
     start: RunStarter,
     gate: DispatchGate | None = None,
+    feedback: FeedbackPoster | None = None,
 ) -> tuple[DispatchReport, ...]:
     """Dispatch every source a tick polled successfully.
 
@@ -849,10 +857,13 @@ def dispatch_tick(
     "no gate": the cap and the kill switch are constructed here so that the
     ordinary caller cannot end up with an uncapped path. Passing one explicitly is
     for a caller that already holds one, or a test that needs its clock.
+
+    *feedback* is threaded through unchanged: item feedback is opt-in per source,
+    so an absent poster is a valid configuration rather than a floor to enforce.
     """
     resolved = gate if gate is not None else caps_for(state, config)
     return tuple(
-        dispatch_source(state, config, outcome, gate=resolved, start=start)
+        dispatch_source(state, config, outcome, gate=resolved, start=start, feedback=feedback)
         for outcome in report.polled
     )
 
@@ -863,6 +874,7 @@ def drain_queue(
     *,
     gate: DispatchGate,
     start: RunStarter,
+    feedback: FeedbackPoster | None = None,
 ) -> tuple[QueueDispatch, ...]:
     """Start queued items in arrival order as capacity frees.
 
@@ -938,7 +950,7 @@ def drain_queue(
                         )
                     )
                     continue
-            results.append(_start_queued(state, config, taken, route, policy, start))
+            results.append(_start_queued(state, config, taken, route, policy, start, feedback))
     return tuple(results)
 
 
@@ -955,6 +967,7 @@ def _dispatch_one(
     klass: SubmitterClass,
     policy: AutonomyPolicy,
     start: RunStarter,
+    feedback: FeedbackPoster | None = None,
 ) -> ItemDisposition:
     """Create the spec and the run row, then hand the seed to the starter."""
     seed = _seed_run(
@@ -969,6 +982,7 @@ def _dispatch_one(
     if isinstance(seed, ItemDisposition):
         return seed
     start(seed)
+    _post_claimed(feedback, seed)
     logger.info(
         "dispatched watch item %r generation %d as %s spec %r in project %r (%s, %s)",
         change.identifier,
@@ -984,6 +998,38 @@ def _dispatch_one(
         generation=change.generation,
         outcome=ItemOutcome.DISPATCHED,
         seed=seed,
+    )
+
+
+def _post_claimed(feedback: FeedbackPoster | None, seed: RunSeed) -> None:
+    """Write back the item's ``claimed`` feedback beside the run its dispatch started.
+
+    Posted after the run is started, not before: the poster takes its own
+    at-most-once writeback claim and records a failure without raising, so a
+    tracker that refuses the comment cannot unstart a run that is already under
+    way. The queue-drain path posts through this same helper, so a poll and a
+    later drain of the same item cannot say ``claimed`` twice by two routes --
+    the second attempt finds the writeback claim already held.
+
+    Absent a poster nothing is posted, because item feedback is a per-source
+    opt-in rather than a floor. The poster itself then declines a source that
+    configured no feedback, so the ordinary case spawns nothing either way.
+    """
+    if feedback is None:
+        return
+    feedback.post(
+        seed.ref,
+        source=seed.source,
+        run_id=seed.run_id,
+        event="claimed",
+        context=RunContext(
+            spec_name=seed.ref.name,
+            spec_type=seed.spec_type,
+            workspace_path=str(seed.working_tree),
+            base_branch=seed.base_branch,
+            item_id=seed.item.identifier,
+            item_url=seed.item.address,
+        ),
     )
 
 
@@ -1098,6 +1144,7 @@ def _start_queued(
     route: SourceRoute,
     policy: AutonomyPolicy,
     start: RunStarter,
+    feedback: FeedbackPoster | None = None,
 ) -> QueueDispatch:
     """Start one dequeued entry, re-resolving its routing from configuration.
 
@@ -1127,9 +1174,7 @@ def _start_queued(
         # entry naming it anywhere -- lost from the backlog and from every report
         # at once. Reachable in ordinary operation: an operator who narrows a
         # mapping between enqueue and drain lands every waiting item here.
-        recorded = record_refusal(
-            state, CLAIM_UNMAPPED, record.source, record.item_id, generation
-        )
+        recorded = record_refusal(state, CLAIM_UNMAPPED, record.source, record.item_id, generation)
         release_dispatch_claim(state, record.source, record.item_id, generation)
         detail = (
             f"queued item {record.item_id!r} has classification {item.classification!r}, "
@@ -1162,6 +1207,7 @@ def _start_queued(
             recorded=seeded.recorded,
         )
     start(seeded)
+    _post_claimed(feedback, seeded)
     logger.info(
         "started queued watch item %r as spec %r in project %r",
         record.item_id,
