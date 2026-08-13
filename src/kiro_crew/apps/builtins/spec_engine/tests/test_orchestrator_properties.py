@@ -40,7 +40,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.runs import (
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 from .conftest import make_spec_dir
-from .test_orchestrator_waves import PROJECT, RUN, write_tasks
+from .test_orchestrator_waves import PROJECT, RUN, RecordingReviewer, write_tasks
 
 #: The loop spawns threads and writes to a real store, so keep the count modest.
 MAX_EXAMPLES = 30
@@ -123,6 +123,7 @@ def test_no_task_starts_before_every_earlier_wave_reached_a_terminal_state(
             base_branch="main",
         ),
         worker=worker,
+        reviewer=RecordingReviewer(),
         project=PROJECT,
         audit=AuditLog(root / f"audit-{seed}"),
         accounting=RunAccounting(state, ledger=MeteringLedger(root / f"usage-{seed}")),
@@ -201,6 +202,7 @@ def test_every_leaf_the_graph_schedules_ends_recorded_terminal(
             base_branch="main",
         ),
         worker=worker,
+        reviewer=RecordingReviewer(),
         project=PROJECT,
         accounting=RunAccounting(state, ledger=MeteringLedger(root / f"usage-{seed}")),
         machine=machine,

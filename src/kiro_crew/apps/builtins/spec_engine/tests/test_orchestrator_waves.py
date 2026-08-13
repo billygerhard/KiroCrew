@@ -26,7 +26,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import pytest
 
@@ -49,16 +49,21 @@ from kiro_crew.apps.builtins.spec_engine.engine.budget import (
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     ISOLATE_STAGE,
+    NO_NOTIFIER_REASON,
     CommandOutcome,
     DeliveryAuthority,
     RunContext,
     StageOutcome,
+    WorkspaceJanitor,
     resolve_authority,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.notify import HostNotifier
 from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
+    TASK_RETRY_LIMIT_SETTING,
     WAVE_CONCURRENCY_SETTING,
     WORKSPACES_DIRNAME,
     ExecutionOutcome,
+    ReviewVerdict,
     RunCompletion,
     ScheduleProblem,
     TaskResult,
@@ -69,6 +74,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.roles import (
     ROLE_IMPLEMENT,
+    ROLE_REVIEW,
     Dispatch,
     RolePlan,
     SessionDefault,
@@ -237,6 +243,37 @@ class Worker:
         return {name for kind, name in self.events[:index] if kind == "end"}
 
 
+class RecordingReviewer:
+    """A reviewer that approves by default and records the dispatch it ran on.
+
+    ``reject`` names tasks whose every review requires changes; ``reject_first``
+    names how many of a task's reviews require changes before it is approved, so
+    a test can drive the retry-until-approval path. The dispatch each review ran
+    on is kept so a test can assert the verdict used the review role's model.
+    """
+
+    def __init__(
+        self,
+        *,
+        reject: Iterable[str] = (),
+        reject_first: dict[str, int] | None = None,
+    ) -> None:
+        self._always_reject = set(reject)
+        self._reject_first = dict(reject_first or {})
+        self.seen: dict[str, int] = {}
+        self.dispatched: dict[str, Dispatch] = {}
+
+    def __call__(self, *, task: str, dispatch: Dispatch, context: RunContext) -> ReviewVerdict:
+        count = self.seen.get(task, 0)
+        self.seen[task] = count + 1
+        self.dispatched[task] = dispatch
+        if task in self._always_reject:
+            return ReviewVerdict(approved=False, reason=f"{task} needs changes")
+        if count < self._reject_first.get(task, 0):
+            return ReviewVerdict(approved=False, reason=f"{task} needs changes (round {count})")
+        return ReviewVerdict(approved=True, reason=f"{task} approved")
+
+
 @dataclass(frozen=True)
 class Harness:
     """A project, a spec, and the engine state a run of it needs."""
@@ -380,6 +417,8 @@ def runner_for(
     level: AutonomyLevel = AutonomyLevel.DELIVERY,
     session_default: SessionDefault = SessionDefault(model=SESSION_MODEL),
     headless: bool = False,
+    reviewer: RecordingReviewer | None = None,
+    delivery_notifier: Any = None,
 ) -> WaveRunner:
     """Build the runner the way a real caller does: through the factory."""
     return orchestrator_for(
@@ -389,11 +428,13 @@ def runner_for(
         config=harness.config,
         authority=authority_for(harness, level),
         worker=worker,
+        reviewer=reviewer if reviewer is not None else RecordingReviewer(),
         project=PROJECT,
         session_default=session_default,
         audit=harness.audit,
         headless=headless,
         notifier=harness.notifier,
+        delivery_notifier=delivery_notifier,
         accounting=harness.accounting,
         kill_switch=harness.switch,
         runner=harness.runner,
@@ -975,6 +1016,8 @@ class TestTheBudgetStopsDispatch:
             guard=unbounded,
             pipeline=runner_for(harness, worker).pipeline,
             worker=worker,
+            reviewer=RecordingReviewer(),
+            janitor=WorkspaceJanitor(harness.state, root=workspace_root(harness.state)),
             project=PROJECT,
             audit=harness.audit,
         )
@@ -1114,3 +1157,244 @@ def _snapshot(spec_dir: Path) -> dict[str, str]:
         for path in sorted(spec_dir.rglob("*"))
         if path.is_file()
     }
+
+
+def set_retry_limit(harness: Harness, limit: int) -> None:
+    harness.config.write(
+        {"limits": {TASK_RETRY_LIMIT_SETTING.split(".", 1)[1]: limit}},
+        surface=DASHBOARD_SURFACE,
+    )
+
+
+class TestTheReviewGateAndRetryPolicy:
+    """A task is complete only after an approving verdict, and unsuccessful
+    outcomes retry to the limit without abandoning independent siblings."""
+
+    def test_a_task_is_reviewed_on_the_review_roles_model_before_it_completes(
+        self, harness: Harness
+    ) -> None:
+        """The verdict runs on the review role, not the implementer's.
+
+        Naming the review model rather than "not empty" is the point: an unwired
+        review dispatch would resolve to the implement model or the session
+        default, both of which are also not empty.
+        """
+        harness.start_run()
+        reviewer = RecordingReviewer()
+        worker = Worker()
+
+        report = runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert set(reviewer.dispatched) == {"1.1", "1.2", "2.1"}
+        for task, dispatch in reviewer.dispatched.items():
+            assert dispatch.role == ROLE_REVIEW, task
+            assert dispatch.model == REVIEW_MODEL, task
+        assert all(attempt.reviewed for attempt in report.attempts)
+
+    def test_an_implemented_task_that_review_rejects_does_not_complete(
+        self, harness: Harness
+    ) -> None:
+        """The implementation succeeded every time; only the missing approval
+        keeps the task from completing, which is the whole of the gate."""
+        set_retry_limit(harness, 1)
+        harness.start_run()
+        worker = Worker()
+        reviewer = RecordingReviewer(reject={"1.1"})
+
+        report = runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.FAILED
+        assert report.failed_tasks == ("1.1",)
+        assert harness.detail_statuses()["1.1"] is TaskStatus.FAILED
+        # Implemented on every attempt, so the failure is the verdict's, not the
+        # worker's: 1 retry means two implementation rounds and two reviews.
+        assert worker.dispatched.count("1.1") == 2
+        assert reviewer.seen["1.1"] == 2
+
+    def test_a_task_completes_once_review_stops_requiring_changes(self, harness: Harness) -> None:
+        """The retry-until-approval path: two changes-required verdicts, then an
+        approval on the third attempt, all within the limit."""
+        set_retry_limit(harness, 3)
+        harness.start_run()
+        worker = Worker()
+        reviewer = RecordingReviewer(reject_first={"1.1": 2})
+
+        report = runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert harness.detail_statuses()["1.1"] is TaskStatus.COMPLETE
+        assert reviewer.seen["1.1"] == 3
+        completed = next(a for a in report.attempts if a.task == "1.1")
+        assert completed.attempts == 3
+
+    def test_an_implementation_failure_retries_to_the_limit_then_fails(
+        self, harness: Harness
+    ) -> None:
+        set_retry_limit(harness, 2)
+        harness.start_run()
+        worker = Worker(fail=["1.1"])
+        reviewer = RecordingReviewer()
+
+        report = runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        assert report.failed_tasks == ("1.1",)
+        # Three implementation rounds (initial + two retries); review is never
+        # reached because the implementation never succeeded.
+        assert worker.dispatched.count("1.1") == 3
+        assert "1.1" not in reviewer.seen
+        failed = next(a for a in report.attempts if a.task == "1.1")
+        assert failed.attempts == 3
+        assert failed.reviewed is False
+
+    def test_an_infrastructure_failure_in_the_worker_retries_like_any_other(
+        self, harness: Harness
+    ) -> None:
+        """A raised worker is an unsuccessful round, not an immediate failure.
+
+        It retries to the limit and then fails, the same as a returned failure,
+        so an infrastructure hiccup on the first try is not a whole task lost.
+        """
+        set_retry_limit(harness, 2)
+        harness.start_run()
+        calls: dict[str, int] = {}
+
+        def explode(task: str) -> None:
+            calls[task] = calls.get(task, 0) + 1
+            if task == "1.1":
+                raise RuntimeError("the subagent host went away")
+
+        report = runner_for(harness, Worker(during=explode)).execute(context_for(harness))
+
+        assert report.failed_tasks == ("1.1",)
+        assert calls["1.1"] == 3
+
+    def test_a_sibling_still_completes_when_another_leaf_exhausts_its_retries(
+        self, harness: Harness
+    ) -> None:
+        """The load-bearing clause: one leaf failing after its retries must not
+        abandon the independent leaf running beside it in the same wave."""
+        write_tasks(harness.ref.spec_dir, [["1.1", "1.2"]])
+        set_cap(harness, 2)
+        set_retry_limit(harness, 1)
+        harness.start_run()
+        worker = Worker(fail=["1.1"])
+        reviewer = RecordingReviewer()
+
+        report = runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.FAILED
+        assert report.failed_tasks == ("1.1",)
+        assert harness.detail_statuses() == {
+            "1.1": TaskStatus.FAILED,
+            "1.2": TaskStatus.COMPLETE,
+        }
+
+    def test_a_failed_leaf_does_not_abandon_a_later_waves_independent_task(
+        self, harness: Harness
+    ) -> None:
+        """A leaf failing after retries fails that leaf; the later wave still
+        runs, so its independent work is not abandoned."""
+        set_retry_limit(harness, 0)
+        harness.start_run()
+        worker = Worker(fail=["1.1"])
+
+        report = runner_for(harness, worker).execute(context_for(harness))
+
+        assert report.failed_tasks == ("1.1",)
+        assert harness.detail_statuses()["2.1"] is TaskStatus.COMPLETE
+
+    def test_the_retry_limit_is_honoured_from_configuration(self, harness: Harness) -> None:
+        """Zero retries means one attempt; the limit is read, not hardcoded."""
+        set_retry_limit(harness, 0)
+        harness.start_run()
+        worker = Worker(fail=["1.1"])
+
+        runner_for(harness, worker).execute(context_for(harness))
+
+        assert worker.dispatched.count("1.1") == 1
+
+
+class TestTheWorkspaceJanitorIsWired:
+    def test_a_terminal_run_has_its_disposable_checkout_retired(self, harness: Harness) -> None:
+        """Finish sweeps the run's disposable workspace.
+
+        The row is claimed at isolate and is still active after execution; only
+        the terminal-state sweep in finish takes it back. Removing the retire call
+        leaves the row active, so this is the assertion that fails when the wiring
+        is gone even though the janitor library is untouched.
+        """
+        run_id = harness.start_run()
+        runner = runner_for(harness, Worker())
+        execution = runner.execute(context_for(harness))
+        assert harness.state.list_workspaces(run_id=run_id), "isolate claims a workspace"
+
+        runner.finish(execution)
+
+        assert harness.state.list_workspaces(run_id=run_id) == []
+        assert harness.machine.state_of(run_id) is RunState.DONE
+
+    def test_a_parked_run_keeps_its_workspace(self, harness: Harness) -> None:
+        """A halted-for-budget run is resumable, so its checkout is not swept:
+        it is the tree the resumed run will pick up in."""
+        run_id = harness.start_run()
+        harness.spend(9.0)
+        runner = runner_for(harness, Worker())
+        execution = runner.execute(context_for(harness))
+        assert harness.machine.state_of(run_id) is RunState.HALTED_BUDGET
+        assert harness.state.list_workspaces(run_id=run_id)
+
+        runner.finish(execution)
+
+        assert harness.machine.state_of(run_id) is RunState.HALTED_BUDGET
+        assert harness.state.list_workspaces(run_id=run_id), "a parked run keeps its tree"
+
+
+class _FakeBus:
+    """The host notification bus reduced to what routing pushes into it."""
+
+    def __init__(self) -> None:
+        self.pushed: list[Any] = []
+        self.registered: dict[str, str] = {}
+
+    def is_registered(self, channel: str) -> bool:
+        return channel in self.registered
+
+    def register_channel(self, channel: str, default_priority: str = "default") -> None:
+        self.registered[channel] = default_priority
+
+    def push(self, payload: Any) -> dict[str, Any]:
+        self.pushed.append(payload)
+        return {"channel": payload.channel}
+
+
+class TestTheDeliveryPipelineNotifies:
+    def test_a_wired_delivery_notifier_receives_the_outcome(self, harness: Harness) -> None:
+        """The factory hands the pipeline a notifier, so a delivery's outcome
+        reaches somebody rather than being recorded as told to nobody."""
+        harness.start_run()
+        bus = _FakeBus()
+        notifier = HostNotifier(harness.config, project=PROJECT, bus=bus, limiter=None)
+        runner = runner_for(harness, Worker(), delivery_notifier=notifier)
+        runner.pipeline.isolate(context_for(harness), run_id=RUN)
+
+        run = runner.pipeline.deliver(context_for(harness))
+
+        assert run.notice is not None
+        assert run.notice.notified is True
+        assert run.notice.error == ""
+        assert bus.pushed
+
+    def test_a_delivery_with_no_notifier_records_that_it_told_nobody(
+        self, harness: Harness
+    ) -> None:
+        """Removing the notifier from the factory's pipeline construction lands
+        here: the completion notice records that no notifier was wired."""
+        harness.start_run()
+        runner = runner_for(harness, Worker())
+        runner.pipeline.isolate(context_for(harness), run_id=RUN)
+
+        run = runner.pipeline.deliver(context_for(harness))
+
+        assert run.notice is not None
+        assert run.notice.error == NO_NOTIFIER_REASON

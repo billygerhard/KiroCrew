@@ -59,6 +59,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config.schema import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     DELIVERY_FLOW_STAGES,
+    DEPLOYMENT_KIND,
     EVENT_FIX_DISPATCH,
     EVENT_GATE,
     EVENT_GATES,
@@ -91,6 +92,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     RunContext,
     StageOutcome,
     StageResult,
+    WorkspaceBroker,
     gate_presets,
     load_quality_gates,
     resolve_authority,
@@ -109,6 +111,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     POLICY_ACTOR_SCHEME,
     policy_actor,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.state import StateStore
 from kiro_crew.notifications.bus import NotificationPayload, NotificationValidationError
 
 PROJECT = "acme"
@@ -689,6 +692,78 @@ class TestPublishOutput:
         )
 
         assert pipeline.deliver(context(workspace)).deployment_addresses == ()
+
+
+class TestDeploymentIsRecorded:
+    """A published address is a live environment the run created; archive finds
+    it from the ledger, so the flow records it against the run."""
+
+    def _broker_pipeline(
+        self, tmp_path: Path, store: ConfigStore, runner: ScriptedRunner
+    ) -> tuple[DeliveryPipeline, StateStore]:
+        store.write(workflow_document(), surface=DASHBOARD_SURFACE)
+        state = StateStore(root=tmp_path / "engine-state")
+        broker = WorkspaceBroker(state, root=tmp_path / "workspaces")
+        authority = resolve_authority(
+            store, decision=decision_at(AutonomyLevel.DELIVERY), project=PROJECT, base_branch=BASE
+        )
+        pipeline = DeliveryPipeline(
+            store, authority=authority, project=PROJECT, runner=runner, isolation=broker
+        )
+        return pipeline, state
+
+    def _deployments(self, state: StateStore, run_id: str) -> list[Any]:
+        return [
+            record
+            for record in state.list_workspaces(run_id=run_id)
+            if record.kind == DEPLOYMENT_KIND
+        ]
+
+    def test_a_published_address_is_recorded_against_the_run(
+        self, tmp_path: Path, store: ConfigStore, workspace: Path
+    ) -> None:
+        """Removing the record_deployment call lands here: the address is
+        surfaced on the run but no ledger row is written for it."""
+        runner = ScriptedRunner(stdout={PUBLISH_PROGRAM: "deployed to https://example.test/pr-9\n"})
+        pipeline, state = self._broker_pipeline(tmp_path, store, runner)
+        pipeline.isolate(context(workspace), run_id="run-deploy")
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.PASSED
+        deployments = self._deployments(state, "run-deploy")
+        assert [record.address for record in deployments] == ["https://example.test/pr-9"]
+        # Recorded non-disposable, so the terminal sweep never treats the address
+        # as a path to delete.
+        assert deployments[0].disposable is False
+
+    def test_an_address_from_a_failed_publish_is_still_recorded(
+        self, tmp_path: Path, store: ConfigStore, workspace: Path
+    ) -> None:
+        runner = ScriptedRunner(
+            exits={PUBLISH_PROGRAM: [1]},
+            stdout={PUBLISH_PROGRAM: "partially deployed to https://example.test/half\n"},
+        )
+        pipeline, state = self._broker_pipeline(tmp_path, store, runner)
+        pipeline.isolate(context(workspace), run_id="run-deploy")
+
+        run = pipeline.deliver(context(workspace))
+
+        assert run.outcome is DeliveryOutcome.FAILED
+        assert [record.address for record in self._deployments(state, "run-deploy")] == [
+            "https://example.test/half"
+        ]
+
+    def test_a_publish_with_no_address_records_no_deployment(
+        self, tmp_path: Path, store: ConfigStore, workspace: Path
+    ) -> None:
+        runner = ScriptedRunner(stdout={PUBLISH_PROGRAM: "deployed. see the console.\n"})
+        pipeline, state = self._broker_pipeline(tmp_path, store, runner)
+        pipeline.isolate(context(workspace), run_id="run-deploy")
+
+        pipeline.deliver(context(workspace))
+
+        assert self._deployments(state, "run-deploy") == []
 
 
 class TestIntegrationInTheFlow:

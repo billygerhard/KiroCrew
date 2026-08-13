@@ -819,6 +819,11 @@ class DeliveryPipeline:
         self._channel = channel
         self._on_submitted = on_submitted
         self._isolated: StageResult | None = None
+        #: The run this pipeline isolated for, learned at isolate time. A
+        #: published deployment is recorded against it so archive can find the
+        #: environment from the run identifier alone; without it a deployment row
+        #: would be keyed to nobody and could never be torn down.
+        self._run_id: str = ""
 
     @property
     def workflow(self) -> DeliveryWorkflow:
@@ -851,6 +856,10 @@ class DeliveryPipeline:
         """
         result = self._isolate(context, run_id=run_id)
         self._isolated = result
+        # Learned here rather than at deliver time: isolation is where the run's
+        # own working tree is claimed, so it is the one point that knows which run
+        # a later publish deployment belongs to.
+        self._run_id = run_id
         return result
 
     def _isolate(self, context: RunContext, *, run_id: str) -> StageResult:
@@ -1060,6 +1069,11 @@ class DeliveryPipeline:
         addresses = _deployment_addresses(publish)
         if addresses:
             self._record(EVENT_PUBLISHED, {"addresses": list(addresses)})
+            # Recorded whether or not publish exited zero: a command that
+            # deployed and then failed still left a live environment, and
+            # requirement 20.1 records every deployment the run created so
+            # archive's teardown commands can find it from the run id alone.
+            self._record_deployments(addresses)
         if not publish.ok:
             return self._failed(
                 context,
@@ -1269,6 +1283,33 @@ class DeliveryPipeline:
             },
         )
         return dispatch
+
+    def _record_deployments(self, addresses: Sequence[str]) -> None:
+        """Record each published address in the workspace ledger against the run.
+
+        The broker holds the ledger and knows how to record a deployment as a
+        non-disposable row, so recording routes through it rather than opening a
+        second writer — the isolation module explains why a deployment is not a
+        path the terminal sweep may delete.
+
+        Skipped without a broker or without a run identity: both are the ledger
+        coordinates a deployment row is keyed on, and a row keyed to neither could
+        never be found for teardown. Recording is best-effort like the rest of the
+        delivery's side effects — a ledger write that fails is logged and does not
+        fail a delivery whose change already published.
+        """
+        if self._isolation is None or not self._run_id.strip():
+            return
+        for address in addresses:
+            try:
+                self._isolation.record_deployment(self._run_id, address=address)
+            except Exception as exc:  # a ledger write must not unwind a publish
+                logger.warning(
+                    "could not record deployment %s for run %s: %s",
+                    address,
+                    self._run_id,
+                    exc,
+                )
 
     # --- the completion notice ---------------------------------------------
 

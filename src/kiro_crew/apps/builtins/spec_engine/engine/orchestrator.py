@@ -36,9 +36,25 @@ instead of two agents committing over each other. A pipeline built without the
 broker still isolates and never refuses, which is why the construction here
 passes one rather than accepting one.
 
-Retries, review verdicts, and dependency-aware abandonment are the retry policy's
-and are deliberately absent: this loop records what happened to each leaf and
-keeps going, so the policy layered on top decides what a failure costs.
+**A successful implementation is not a completed task until it is approved.**
+Every leaf that its worker reports done is reviewed on the review role's model
+before the loop records it complete, and only an approving verdict makes it
+complete. Any unsuccessful outcome — the implementation failing, the review
+requiring changes, or an infrastructure failure raising out of either — retries
+the leaf up to the configured limit and then fails it. The retry is per leaf and
+runs on that leaf's own worker thread, so a leaf that exhausts its retries fails
+alone: its independent siblings in the same wave finish, and the later waves
+still run. There is one path to a complete leaf, and it goes through the verdict;
+a run built without a reviewer cannot complete a task at all, which is why the
+reviewer is required rather than defaulted.
+
+**A run that becomes terminal takes its disposable workspace back.**
+:meth:`WaveRunner.finish` is where a run reaches done, failed, or cancelled, so
+it is where the workspace janitor retires the run's checkout — a worktree or a
+temporary copy that is worth nothing once the run is over and is the reason disk
+fills up if nobody removes it. Branches, commits, and published deployments are
+left untouched; only the disposable materialization is swept, and only at a
+terminal state, never for a parked run that will resume.
 """
 
 from __future__ import annotations
@@ -75,9 +91,13 @@ from .delivery import (
     CommandRunner,
     DeliveryAuthority,
     DeliveryPipeline,
+)
+from .delivery import Notifier as DeliveryNotifier
+from .delivery import (
     RunContext,
     StageResult,
     WorkspaceBroker,
+    WorkspaceJanitor,
 )
 from .documents import DocumentKind
 from .roles import Dispatch, RolePlan, SessionDefault, WorkKind
@@ -97,6 +117,11 @@ logger = logging.getLogger(__name__)
 #: Setting bounding how many leaves of one wave are dispatched at once.
 WAVE_CONCURRENCY_SETTING = "concurrency.wave_max_tasks"
 
+#: Setting bounding how many times one leaf is retried before it is failed. A
+#: leaf that exhausts it fails without abandoning its independent siblings. The
+#: registry owns the number; named here so the retry policy holds no literal.
+TASK_RETRY_LIMIT_SETTING = "limits.task_retry_limit"
+
 #: Directory under the state root that run workspaces are created in. Under the
 #: state root rather than beside the spec: engine state lives outside the
 #: interop contract, and a worktree inside a project's own tree would read as
@@ -113,6 +138,8 @@ WORKER_THREAD_PREFIX = "spec-task"
 WAVE_DISPATCHED_EVENT = "spec.orchestrator.wave-dispatched"
 #: One leaf finished, with the status that was persisted for it.
 TASK_SETTLED_EVENT = "spec.orchestrator.task-settled"
+#: One leaf's implementation was reviewed, with the verdict it received.
+TASK_REVIEWED_EVENT = "spec.orchestrator.task-reviewed"
 #: The wave loop stopped, for whatever reason.
 EXECUTION_FINISHED_EVENT = "spec.orchestrator.execution-finished"
 #: The run ended and its consumption was reported.
@@ -302,6 +329,48 @@ class TaskWorker(Protocol):
 
 
 @dataclass(frozen=True)
+class ReviewVerdict:
+    """A review role's judgement of one implemented leaf.
+
+    ``approved`` is the whole gate: a task is not complete until it carries an
+    approving verdict, so a reviewer that cannot decide returns ``approved=False``
+    with a reason rather than a value the loop could read as approval.
+    """
+
+    approved: bool
+    reason: str = ""
+
+
+class Reviewer(Protocol):
+    """Judges an implemented leaf on the review role's model.
+
+    Handed the review dispatch the run's plan resolved, so the verdict runs on
+    the review role's agent, model, and effort rather than the implementer's —
+    the whole point of routing review to a smarter model. A worker that resolved
+    its own role would be a second answer to the question the plan already
+    answered, so the seam takes the dispatch rather than looking one up.
+    """
+
+    def __call__(self, *, task: str, dispatch: Dispatch, context: RunContext) -> ReviewVerdict: ...
+
+
+@dataclass(frozen=True)
+class LeafOutcome:
+    """What the retry-and-review policy made of one leaf, across its attempts.
+
+    The loop persists a status from this and records what happened. ``reviewed``
+    says whether the final attempt reached a review verdict, so a failure at
+    implementation is distinguishable from a failure at review; ``attempts`` is
+    how many implementation rounds were spent, one when the first was approved.
+    """
+
+    ok: bool
+    reason: str = ""
+    attempts: int = 1
+    reviewed: bool = False
+
+
+@dataclass(frozen=True)
 class TaskAttempt:
     """One dispatched leaf: what it was routed to, and how it ended."""
 
@@ -310,6 +379,10 @@ class TaskAttempt:
     role: str = ""
     model: str = ""
     reason: str = ""
+    #: Implementation rounds spent on this leaf, one when the first was approved.
+    attempts: int = 1
+    #: Whether the final attempt reached a review verdict.
+    reviewed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -322,6 +395,8 @@ class TaskAttempt:
             "role": self.role,
             "model": self.model,
             "reason": self.reason,
+            "attempts": self.attempts,
+            "reviewed": self.reviewed,
         }
 
 
@@ -421,8 +496,10 @@ class WaveRunner:
     Engine_Floor and a loop that could be built without one would dispatch
     unbounded work whenever a caller forgot it; the role plan is what keeps a
     dispatch off the session default model by accident; the pipeline is what
-    isolates the run's working tree before the first edit. A seam that defaults
-    to off delegates the decision to whoever writes the next caller.
+    isolates the run's working tree before the first edit; the reviewer is what
+    keeps a task from completing on an implementation nobody judged; the janitor
+    is what takes the run's disposable checkout back when it ends. A seam that
+    defaults to off delegates the decision to whoever writes the next caller.
     """
 
     def __init__(
@@ -436,6 +513,8 @@ class WaveRunner:
         guard: BudgetGuard,
         pipeline: DeliveryPipeline,
         worker: TaskWorker,
+        reviewer: Reviewer,
+        janitor: WorkspaceJanitor,
         project: str | None = None,
         audit: AuditLog | None = None,
     ) -> None:
@@ -449,6 +528,8 @@ class WaveRunner:
         self._guard = guard
         self._pipeline = pipeline
         self._worker = worker
+        self._reviewer = reviewer
+        self._janitor = janitor
         self._project = project
         self._audit = audit
 
@@ -569,7 +650,7 @@ class WaveRunner:
         """
         cap = self._cap()
         queue = list(pending)
-        running: dict[Future[TaskResult], str] = {}
+        running: dict[Future[LeafOutcome], str] = {}
         attempts: list[TaskAttempt] = []
         routed: dict[str, Dispatch] = {}
         halt: DispatchDecision | None = None
@@ -596,7 +677,9 @@ class WaveRunner:
                         # is never incremented from two workers at once.
                         self._guard.open_turn()
                         running[
-                            pool.submit(self._worker, task=task, dispatch=dispatch, context=context)
+                            pool.submit(
+                                self._attempt, task=task, dispatch=dispatch, context=context
+                            )
                         ] = task
                     self._record(
                         WAVE_DISPATCHED_EVENT,
@@ -611,7 +694,7 @@ class WaveRunner:
                     break
                 done, _ = wait(set(running), return_when=FIRST_COMPLETED)
                 settled: dict[str, TaskStatus] = {}
-                results: dict[str, TaskResult] = {}
+                results: dict[str, LeafOutcome] = {}
                 for future in done:
                     task = running.pop(future)
                     self._guard.settle_turn()
@@ -624,12 +707,15 @@ class WaveRunner:
                 self.record_statuses(settled)
                 for task, status in settled.items():
                     dispatch = routed[task]
+                    outcome = results[task]
                     attempt = TaskAttempt(
                         task=task,
                         status=status,
                         role=dispatch.role,
                         model=dispatch.model,
-                        reason=results[task].reason,
+                        reason=outcome.reason,
+                        attempts=outcome.attempts,
+                        reviewed=outcome.reviewed,
                     )
                     attempts.append(attempt)
                     self._record(TASK_SETTLED_EVENT, {"wave": wave.identifier, **attempt.detail()})
@@ -643,21 +729,102 @@ class WaveRunner:
             halt,
         )
 
-    def _result_of(self, future: Future[TaskResult], task: str) -> TaskResult:
-        """The worker's verdict, or the failure it raised instead of returning one.
+    def _attempt(self, *, task: str, dispatch: Dispatch, context: RunContext) -> LeafOutcome:
+        """Implement a leaf, review it, and retry the pair up to the limit.
 
-        A worker that raises is an infrastructure failure of one leaf, and one
-        leaf's infrastructure failure must not take the independent leaves running
-        beside it with it — nor leave the run with a dispatched task that has no
-        recorded outcome, which is what a resumed run would pay for again. This is
-        the only place a raised worker is turned into a status, so there is one
-        answer to what a raising task costs rather than two that can drift.
+        The whole retry-and-review policy for one leaf, run on that leaf's own
+        worker thread. Each round implements, and on a successful implementation
+        obtains a review verdict on the review role's model; only an approving
+        verdict returns success. Any unsuccessful round — the implementation not
+        completing, the review requiring changes, or either raising — is retried
+        until the configured limit is spent, and then the leaf fails.
+
+        Because this runs per leaf on its own thread, a leaf that exhausts its
+        retries fails alone: its independent siblings in the same wave keep
+        running, and the loop's later waves are untouched. Nothing here writes a
+        status or an audit record — the loop persists and records what this
+        returns, from its own thread, so the store and the audit log are written
+        by one writer rather than raced by the pool.
+        """
+        limit = self._retry_limit()
+        reason = ""
+        reviewed = False
+        attempt = 0
+        while True:
+            impl = self._implement(task, dispatch, context)
+            if impl.ok:
+                verdict = self._review(task, context)
+                reviewed = True
+                if verdict.approved:
+                    return LeafOutcome(
+                        ok=True,
+                        reason=verdict.reason or "the implementation was approved",
+                        attempts=attempt + 1,
+                        reviewed=True,
+                    )
+                reason = verdict.reason or "the review verdict required changes"
+            else:
+                reviewed = False
+                reason = impl.reason or "the implementation did not complete"
+            if attempt >= limit:
+                return LeafOutcome(
+                    ok=False,
+                    reason=f"{reason} (after {attempt + 1} attempts)",
+                    attempts=attempt + 1,
+                    reviewed=reviewed,
+                )
+            attempt += 1
+
+    def _implement(self, task: str, dispatch: Dispatch, context: RunContext) -> TaskResult:
+        """Dispatch one implementation round, turning a raise into a failed round.
+
+        A worker that raises is an infrastructure failure of this leaf, and it is
+        turned into an unsuccessful result here so the retry policy treats it like
+        any other unsuccessful round rather than tearing down the wave the leaf
+        shares with independent work.
+        """
+        try:
+            return self._worker(task=task, dispatch=dispatch, context=context)
+        except Exception as exc:  # a worker's failure is this leaf's failure
+            logger.warning(
+                "task %s of run %s raised during implementation: %s", task, self._run_id, exc
+            )
+            return TaskResult(ok=False, reason=f"the task dispatch raised: {exc}")
+
+    def _review(self, task: str, context: RunContext) -> ReviewVerdict:
+        """Obtain a review verdict on the review role's model.
+
+        The review dispatch is resolved from the run's own plan, so the verdict
+        runs on the review role's agent, model, and effort. A reviewer that raises
+        is a failed review, not an approval: it returns a non-approving verdict so
+        an infrastructure failure in the reviewer can never be read as a pass.
+        """
+        review_dispatch = self._plan.dispatch(WorkKind.TASK_REVIEW, subagent=True)
+        try:
+            return self._reviewer(task=task, dispatch=review_dispatch, context=context)
+        except Exception as exc:  # a reviewer's failure is not an approval
+            logger.warning("review of task %s of run %s raised: %s", task, self._run_id, exc)
+            return ReviewVerdict(approved=False, reason=f"the review dispatch raised: {exc}")
+
+    def _retry_limit(self) -> int:
+        """Retries one leaf earns before it fails, never below zero."""
+        setting = self._config.effective(TASK_RETRY_LIMIT_SETTING, project=self._project)
+        return max(0, int(setting.value))
+
+    def _result_of(self, future: Future[LeafOutcome], task: str) -> LeafOutcome:
+        """The leaf's outcome, or the failure it raised instead of returning one.
+
+        The attempt loop already turns a raising worker or reviewer into an
+        unsuccessful round, so a raise reaching here is the loop itself failing
+        rather than a task's own dispatch. It is still one leaf's failure and must
+        not take its independent siblings down, nor leave a dispatched leaf with
+        no recorded outcome, so it becomes a failed status the same way.
         """
         try:
             return future.result()
-        except Exception as exc:  # a worker's failure is this task's failure
+        except Exception as exc:  # the attempt loop itself failed for this leaf
             logger.warning("task %s of run %s raised: %s", task, self._run_id, exc)
-            return TaskResult(ok=False, reason=f"the task dispatch raised: {exc}")
+            return LeafOutcome(ok=False, reason=f"the task dispatch raised: {exc}")
 
     # --- completion --------------------------------------------------------
 
@@ -705,6 +872,12 @@ class WaveRunner:
                 reason=report.reason or f"execution {report.outcome.value}",
             )
             transitioned = True
+        # The run is terminal here — it was already, or it just moved. Its
+        # disposable checkout is worth nothing now and is the reason disk fills
+        # up if nobody sweeps it, so it is retired before the run is reported
+        # done. Branches, commits, and deployments are left untouched; a parked
+        # run returned above never reaches this.
+        self._retire()
         completion = self._guard.report_completion()
         self._record(
             RUN_COMPLETED_EVENT,
@@ -769,6 +942,19 @@ class WaveRunner:
         self._record(EXECUTION_FINISHED_EVENT, report.detail())
         return report
 
+    def _retire(self) -> None:
+        """Take the run's disposable materializations back at a terminal state.
+
+        Best-effort like every other side effect the run leaves behind: the run
+        state is primary, so a teardown that cannot complete is logged and does
+        not unwind the completion the run already reached. The janitor itself
+        keeps branches, commits, and deployments — it removes only the checkout.
+        """
+        try:
+            self._janitor.retire_run(self._run_id)
+        except Exception:  # cleanup failing must not lose the run's completion
+            logger.warning("workspace teardown for run %s failed", self._run_id, exc_info=True)
+
     def _record(self, event: str, detail: dict[str, Any]) -> None:
         if self._audit is None:
             return
@@ -810,11 +996,13 @@ def orchestrator_for(
     config: ConfigStore,
     authority: DeliveryAuthority,
     worker: TaskWorker,
+    reviewer: Reviewer,
     project: str | None = None,
     session_default: SessionDefault = SessionDefault(),
     audit: AuditLog | None = None,
     headless: bool = False,
     notifier: Notifier | None = None,
+    delivery_notifier: DeliveryNotifier | None = None,
     accounting: RunAccounting | None = None,
     ledger: MeteringLedger | None = None,
     kill_switch: KillSwitch | None = None,
@@ -826,22 +1014,44 @@ def orchestrator_for(
 
     This is the wiring point, and each piece it builds is inert unless something
     builds it: a pipeline with no broker isolates without ever refusing a shared
-    tree, a dispatch with no role plan runs on the session default, and a
-    consumption report nobody asks for is never made. Constructing them here —
-    rather than accepting them as optional arguments — is what makes those
-    enforcements fire for every caller instead of for the ones that remembered.
+    tree, a dispatch with no role plan runs on the session default, a consumption
+    report nobody asks for is never made, a delivery with no notifier tells nobody
+    its outcome, and a run with no janitor leaves its checkout on disk for good.
+    Constructing them here — rather than accepting them as optional arguments — is
+    what makes those enforcements fire for every caller instead of for the ones
+    that remembered.
+
+    The reviewer is required rather than defaulted for the same reason, but a
+    sharper one: it is the review gate, and a default would be a route to a
+    completed task that no verdict ever judged. The caller supplies both the
+    implementation worker and the reviewer — in the default build, the builtin
+    implementation and review providers.
+
+    Two ``Notifier`` seams meet here and they are not the same shape: the budget
+    ceiling's ``notify(channel=, message=, detail=)`` and the delivery pipeline's
+    ``send(...)``. ``HostNotifier`` satisfies both, so a production caller passes
+    one object as both ``notifier`` and ``delivery_notifier``; they are separate
+    parameters because converging the two protocols onto one shape would mean
+    rewriting the budget module's call sites, which this construction point does
+    not own. The delivery notifier is passed with no channel: configuration
+    resolves the destination inside the notifier, and naming one here would take
+    that decision away from the project.
     """
     if machine is None:
         machine = RunMachine(state, config, project=project, audit=audit)
-    broker = WorkspaceBroker(state, root=workspace_root(state, workspaces_root))
+    ws_root = workspace_root(state, workspaces_root)
+    recorder = _audit_recorder(audit, ref, run_id) if audit is not None else None
+    broker = WorkspaceBroker(state, root=ws_root)
     pipeline = DeliveryPipeline(
         config,
         authority=authority,
         project=project,
         runner=runner,
-        audit=_audit_recorder(audit, ref, run_id) if audit is not None else None,
+        audit=recorder,
         isolation=broker,
+        notifier=delivery_notifier,
     )
+    janitor = WorkspaceJanitor(state, root=ws_root, runner=runner, audit=recorder)
     return WaveRunner(
         ref,
         run_id,
@@ -864,6 +1074,8 @@ def orchestrator_for(
         ),
         pipeline=pipeline,
         worker=worker,
+        reviewer=reviewer,
+        janitor=janitor,
         project=project,
         audit=audit,
     )
