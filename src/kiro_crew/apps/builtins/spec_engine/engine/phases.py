@@ -527,6 +527,26 @@ def _validate_gate(gate: GateState) -> ValidationReport | None:
     return validate_document_text(text, kind=gate.kind, file=str(gate.path))
 
 
+def validate_gate(state: PhaseState, gate: str) -> ValidationReport | None:
+    """Validate one gate's current document under the native-format rules.
+
+    The revision feedback loop calls this when a revision turn completes, to
+    judge the revised document. It reuses :func:`_validate_gate`, so the rules a
+    revision is held to are the exact rules the original document was: the check
+    re-reads the document from disk and runs :func:`validate_document_text`, the
+    same function :func:`approve` and :func:`advance` read through. Nothing is
+    carried forward from the request-changes decision, so a revision cannot be
+    judged against a snapshot of the rules taken when it was requested.
+
+    ``None`` when the named gate is not in the plan or its document is absent:
+    an absent document is the gate's own concern, not a validation verdict.
+    """
+    target = state.gate_named(gate)
+    if target is None or not target.present:
+        return None
+    return _validate_gate(target)
+
+
 def _gate_reasons(gate: GateState) -> tuple[tuple[Reason, ...], ValidationReport | None]:
     """Every reason *gate* is not settled, with the report that produced any."""
     if not gate.present:

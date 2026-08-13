@@ -285,6 +285,17 @@ class ResumeGranularity(str, Enum):
 DETAIL_PHASE_ENTERED = "phase_entered_ts"
 DETAIL_PARKED_FROM = "parked_from"
 DETAIL_TASKS = "tasks"
+#: How many authoring revision cycles a run has spent at each review gate, keyed
+#: by gate name. The count is per gate rather than per run because the revision
+#: limit is per gate: a spec re-reviewed at design after its requirements were
+#: settled starts design's count at zero. Written by the review feedback loop
+#: only, so it lives beside :data:`DETAIL_TASKS` under this module's namespace.
+DETAIL_REVISION_CYCLES = "revision_cycles"
+#: Gate names at which a run has exhausted its revision cycles and been marked
+#: needing human attention, so the loop dispatches no further revision turn for
+#: that gate. A list rather than a flag because a run reviewed across several
+#: gates can exhaust one without the others.
+DETAIL_REVISION_EXHAUSTED = "revision_exhausted"
 
 #: Prefix on a generated run identifier, so a run id is recognisable in a
 #: session name, a log line, or a metering record.
@@ -415,6 +426,37 @@ def task_statuses(record: RunRecord) -> dict[str, TaskStatus]:
         if status is not None:
             parsed[str(number)] = status
     return parsed
+
+
+def revision_cycles(record: RunRecord) -> dict[str, int]:
+    """The run's spent revision-cycle count per review gate, keyed by gate name.
+
+    A gate absent from the map has spent none. Values are coerced defensively:
+    a bool is not a count (``isinstance(True, int)`` is true, so it is excluded),
+    and a negative or non-integer value is dropped rather than trusted, because
+    the count gates whether another revision turn is dispatched.
+    """
+    stored = record.detail.get(DETAIL_REVISION_CYCLES)
+    if not isinstance(stored, Mapping):
+        return {}
+    cycles: dict[str, int] = {}
+    for gate, raw in stored.items():
+        if isinstance(gate, str) and isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            cycles[gate] = raw
+    return cycles
+
+
+def revision_exhausted_gates(record: RunRecord) -> frozenset[str]:
+    """Gates at which the run was marked needing human attention.
+
+    Once a gate is here the feedback loop dispatches no further revision turn for
+    it: the run waits for a person. Read defensively, since a foreign value in
+    the shared detail column must not read as an exhausted gate.
+    """
+    stored = record.detail.get(DETAIL_REVISION_EXHAUSTED)
+    if not isinstance(stored, list):
+        return frozenset()
+    return frozenset(gate for gate in stored if isinstance(gate, str) and gate)
 
 
 def new_run_id() -> str:
@@ -572,6 +614,23 @@ class RunMachine:
         another database.
         """
         return self._store
+
+    @property
+    def config(self) -> ConfigStore:
+        """The config store this machine resolves limits and timeouts through.
+
+        Exposed for the same reason as :attr:`store`: a component layered on the
+        machine — the review feedback loop reading the revision-cycle limit —
+        resolves settings through the one config the machine already holds, with
+        the machine's own project scope, rather than being handed a second store
+        that could resolve a different effective value for the same key.
+        """
+        return self._config
+
+    @property
+    def project(self) -> str | None:
+        """The configured project key this machine scopes per-project settings to."""
+        return self._project
 
     def now(self) -> datetime:
         """The current instant, from the injected clock."""
