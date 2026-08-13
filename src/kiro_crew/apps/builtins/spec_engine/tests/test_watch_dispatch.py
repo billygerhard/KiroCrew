@@ -62,6 +62,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     dispatch_tick,
     drain_queue,
     load_route,
+    name_taken_items,
     record_unmapped,
     submitter_class_of,
     unmapped_items,
@@ -427,10 +428,12 @@ class TestSpecTypeMapping:
         # No spec directory either: an unmapped item has no document plan, so a
         # created spec would be a spec nothing can author.
         assert spec_names(tree) == []
-        # The dispatch claim is still taken, and deliberately so: the item was
-        # considered, and the claim is the row an operator releases to re-offer it
-        # once the mapping exists.
-        assert claims_for(store) == ["7"]
+        # The dispatch claim is released. An unmapped classification is fixed by
+        # adding one mapping, and that fix has to make the waiting items
+        # dispatchable on the next poll -- a kept claim would mean recovering
+        # every accumulated item by hand. The ledger row above is what keeps the
+        # reporting once per generation now that the claim no longer does.
+        assert claims_for(store) == []
 
     def test_an_unmapped_item_is_recorded_once_per_generation(
         self, store: StateStore, config: ConfigStore
@@ -840,6 +843,77 @@ class TestTheRunIsSeededInTheProject:
 
         assert [d.refusal for d in report.refused] == [DispatchRefusal.SPEC_NAME_TAKEN]
         assert starter.identifiers == ["8"]
+
+    def test_a_name_collision_leaves_the_item_recoverable_and_enumerable(
+        self, store: StateStore, config: ConfigStore, starter: Starter, tree: Path
+    ) -> None:
+        """Both halves of the finding: the claim goes back and a row names the item.
+
+        Keeping the dispatch claim with no ledger row made this refusal invisible
+        as well as permanent -- the item was neither a candidate nor listed
+        anywhere, so it could not be found by hand, let alone recovered.
+        """
+        (tree / ".kiro" / "specs" / "bugfix-upstream-issues-7").mkdir(parents=True)
+
+        report = dispatch(store, config, polled(item("7")), starter)
+
+        assert [d.refusal for d in report.refused] == [DispatchRefusal.SPEC_NAME_TAKEN]
+        assert report.refused[0].recorded is True
+        assert name_taken_items(store, SOURCE) == {"7": ("1",)}
+        assert claims_for(store) == []
+
+    def test_a_refused_item_is_not_re_offered_by_a_later_unchanged_poll(
+        self, store: StateStore, config: ConfigStore, starter: Starter, tree: Path
+    ) -> None:
+        """Releasing the claim does not turn one refusal into a per-poll retry.
+
+        The snapshot is what suppresses an unchanged item, not the claim: a second
+        poll of the same open item derives ``unchanged``, which is not a dispatch
+        candidate. So the released claim costs nothing per tick, and re-offering a
+        refused item stays a deliberate act rather than a side effect of polling.
+        """
+        (tree / ".kiro" / "specs" / "bugfix-upstream-issues-7").mkdir(parents=True)
+
+        dispatch(store, config, polled(item("7")), starter)
+        second = dispatch(store, config, polled(item("7")), starter)
+
+        assert second.refused == ()
+        assert second.dispatched == ()
+        assert name_taken_items(store, SOURCE) == {"7": ("1",)}
+
+    def test_the_collision_row_and_the_unmapped_row_do_not_share_a_kind(
+        self, store: StateStore, config: ConfigStore, starter: Starter, tree: Path
+    ) -> None:
+        """Two different refusals an operator resolves two different ways."""
+        (tree / ".kiro" / "specs" / "bugfix-upstream-issues-7").mkdir(parents=True)
+
+        dispatch(store, config, polled(item("7")), starter)
+        dispatch(store, config, polled(item("9", classification="question")), starter)
+
+        assert name_taken_items(store, SOURCE) == {"7": ("1",)}
+        assert unmapped_items(store, SOURCE) == {"9": ("1",)}
+
+    def test_a_reopen_after_a_refusal_dispatches_the_new_generation(
+        self, store: StateStore, config: ConfigStore, starter: Starter, tree: Path
+    ) -> None:
+        """What the released claim actually buys, on the path that reaches it.
+
+        A reopen raises the generation, so the item is a candidate again -- and a
+        kept claim at the *refused* generation is not what would have stopped it.
+        The value of releasing is that the manual re-dispatch override, which
+        overrides the claim ledger for the same generation, has nothing left to
+        fight; recording that the override also needs the snapshot row cleared is
+        on task 8.4.
+        """
+        dispatch(store, config, polled(item("7", classification="question")), starter)
+        assert starter.identifiers == []
+
+        configure(config, {"sources": {SOURCE: {"spec_types": {"question": "bugfix"}}}})
+        dispatch(store, config, polled(item("7", classification="question", state="closed")), starter)
+        dispatch(store, config, polled(item("7", classification="question")), starter)
+
+        assert starter.identifiers == ["7"]
+        assert [seed.generation for seed in starter.seeds] == [2]
 
     def test_a_punctuated_identifier_becomes_a_usable_spec_name(
         self, store: StateStore, config: ConfigStore, starter: Starter

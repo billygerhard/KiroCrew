@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from .dispatch import (
     ASSOCIATION_CLASSES,
+    CLAIM_NAME_TAKEN,
     CLAIM_UNMAPPED,
     DISPATCH_HEADING,
     GLOBAL_CAP_SETTING,
@@ -47,11 +48,16 @@ from .dispatch import (
     SourceRoute,
     SubmitterClass,
     capacity,
+    class_of_author,
     dispatch_source,
     dispatch_tick,
     drain_queue,
     load_route,
+    name_taken_items,
+    record_name_taken,
+    record_refusal,
     record_unmapped,
+    recorded_items,
     submitter_class_of,
     unmapped_items,
 )
@@ -118,6 +124,7 @@ from .tick import (
 
 __all__ = [
     "ASSOCIATION_CLASSES",
+    "CLAIM_NAME_TAKEN",
     "CLAIM_UNMAPPED",
     "CLOSED_STATES",
     "CRON_ENTRY_POINT",
@@ -191,12 +198,17 @@ __all__ = [
     "poll_tick",
     "poll_timeout_s",
     "record_snapshot",
+    "record_name_taken",
+    "record_refusal",
     "record_unmapped",
+    "recorded_items",
     "release_dispatch_claim",
     "run_tick_script",
     "source_names",
     "source_of_job",
     "submitter_class_of",
     "tick_script_path",
+    "class_of_author",
+    "name_taken_items",
     "unmapped_items",
 ]

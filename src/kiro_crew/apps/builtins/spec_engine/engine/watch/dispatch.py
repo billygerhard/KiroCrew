@@ -65,7 +65,14 @@ from ..creation import SpecAlreadyExists, create_spec
 from ..runs import ACTIVE_PHASES, RunState, new_run_id
 from ..state import QueueRecord, SpecRef, StateStore
 from .items import ITEM_FIELDS, WatchedItem
-from .lifecycle import DispatchGate, ItemChange, WatchAdvance, advance_watch, generation_key
+from .lifecycle import (
+    DispatchGate,
+    ItemChange,
+    WatchAdvance,
+    advance_watch,
+    generation_key,
+    release_dispatch_claim,
+)
 from .poll import PollOutcome
 from .tick import TickReport
 
@@ -76,6 +83,12 @@ logger = logging.getLogger(__name__)
 #: same at-most-once question: an unmapped item is reported by every later poll,
 #: and one record per item generation is the useful version of that.
 CLAIM_UNMAPPED = "unmapped"
+
+#: Ledger kind recording an item whose resolved spec name is already taken. Its
+#: own kind rather than the dispatch claim, so the item is enumerable: the
+#: dispatch claim is released and this row carries the once-per-generation
+#: reporting instead.
+CLAIM_NAME_TAKEN = "name_taken"
 
 #: Source entry fields this module reads. The schema owns the vocabulary.
 MAINTAINERS_FIELD = "maintainers"
@@ -623,26 +636,55 @@ def capacity(state: StateStore, config: ConfigStore, route: SourceRoute) -> Capa
     )
 
 
-def record_unmapped(state: StateStore, change: ItemChange) -> bool:
-    """Record an item whose classification maps to no spec type. Once per generation.
+def record_refusal(
+    state: StateStore, kind: str, source: str, identifier: str, generation: int
+) -> bool:
+    """Record a refused item under *kind*. Once per generation.
 
-    True the first time only, so an item every poll keeps reporting is one entry
-    an operator can act on rather than one per tick.
+    True the first time only, so an item every poll keeps refusing is one entry an
+    operator can act on rather than one per tick. Shared by every
+    refusal-that-releases-its-claim, because the ledger row is what replaces the
+    dispatch claim as the once-per-generation record -- two spellings of this
+    write could disagree on the generation column and report the same item twice.
     """
-    return state.claim(
-        CLAIM_UNMAPPED,
-        change.source,
-        change.identifier,
-        generation=generation_key(change.generation),
+    return state.claim(kind, source, identifier, generation=generation_key(generation))
+
+
+def recorded_items(state: StateStore, kind: str, source: str) -> dict[str, tuple[str, ...]]:
+    """Every recorded generation per item under *kind* for *source*, for display."""
+    recorded: dict[str, list[str]] = {}
+    for record in state.list_claims(kind=kind, scope=source):
+        recorded.setdefault(record.subject, []).append(record.generation)
+    return {subject: tuple(generations) for subject, generations in recorded.items()}
+
+
+def record_unmapped(state: StateStore, change: ItemChange) -> bool:
+    """Record an item whose classification maps to no spec type. Once per generation."""
+    return record_refusal(
+        state, CLAIM_UNMAPPED, change.source, change.identifier, change.generation
     )
+
+
+def record_name_taken(
+    state: StateStore, source: str, identifier: str, generation: int
+) -> bool:
+    """Record an item whose spec name is already taken. Once per generation.
+
+    Without this row the collision was invisible: the dispatch claim was kept, so
+    the item was not a candidate again, and no ledger entry named it -- an item
+    silently absent from both the backlog and every report.
+    """
+    return record_refusal(state, CLAIM_NAME_TAKEN, source, identifier, generation)
 
 
 def unmapped_items(state: StateStore, source: str) -> dict[str, tuple[str, ...]]:
     """Every recorded unmapped generation per item for *source*, for display."""
-    recorded: dict[str, list[str]] = {}
-    for record in state.list_claims(kind=CLAIM_UNMAPPED, scope=source):
-        recorded.setdefault(record.subject, []).append(record.generation)
-    return {subject: tuple(generations) for subject, generations in recorded.items()}
+    return recorded_items(state, CLAIM_UNMAPPED, source)
+
+
+def name_taken_items(state: StateStore, source: str) -> dict[str, tuple[str, ...]]:
+    """Every recorded spec-name collision per item for *source*, for display."""
+    return recorded_items(state, CLAIM_NAME_TAKEN, source)
 
 
 # --- dispatch --------------------------------------------------------------
@@ -704,12 +746,31 @@ def dispatch_source(
         spec_type, declared_at = route.spec_type_for(change.item.classification, klass.name)
         if not spec_type:
             recorded = record_unmapped(state, change)
+            # The claim goes back. Every other refusal in this module leaves the
+            # backlog intact so that fixing the configuration is all it takes,
+            # and holding a claim for work this tick declined to do is a lock
+            # with no owner: the manual re-dispatch override exists to override
+            # the claim ledger, and it should not have to fight a claim the
+            # refusal never needed.
+            #
+            # Releasing does not re-offer the item by itself, and deliberately
+            # not: the snapshot row is what suppresses an unchanged item, so a
+            # later poll derives `unchanged` and spends nothing. Re-offering a
+            # refused item stays a deliberate act. The ledger row this just
+            # wrote is what makes it enumerable in the meantime.
+            release_dispatch_claim(
+                state, outcome.source, change.identifier, change.generation
+            )
             detail = (
                 f"watch source {outcome.source!r} maps no spec type for classification "
                 f"{change.item.classification!r} and declares no {WILDCARD_KEY!r}, so item "
                 f"{change.identifier!r} is recorded as unmapped and not dispatched"
             )
-            logger.warning("%s", detail)
+            if recorded:
+                # Once per generation. The queue path can reach this refusal for a
+                # generation the poll path already recorded, and one entry per
+                # generation is what an operator can act on.
+                logger.warning("%s", detail)
             dispositions.append(
                 ItemDisposition(
                     identifier=change.identifier,
@@ -943,17 +1004,28 @@ def _seed_run(
     try:
         created = create_spec(route.working_tree, name, spec_type, store=state)
     except SpecAlreadyExists as exc:
+        # Record the collision under its own kind, then release the claim. Keeping
+        # the claim with no ledger row made this refusal invisible as well as
+        # unrecoverable: the item was not a candidate again and nothing named it,
+        # so it could not be found by hand. The slug folds punctuation and
+        # truncates at 40 characters, so on a custom source whose identifier is
+        # untrusted text two distinct items can converge on one name -- which
+        # makes being able to find the loser a real need.
+        recorded = record_name_taken(state, route.source, item.identifier, generation)
+        release_dispatch_claim(state, route.source, item.identifier, generation)
         detail = (
             f"item {item.identifier!r} resolves to spec {name!r} in project "
             f"{route.project!r}, which already exists: {exc}"
         )
-        logger.warning("%s", detail)
+        if recorded:
+            logger.warning("%s", detail)
         return ItemDisposition(
             identifier=item.identifier,
             generation=generation,
             outcome=ItemOutcome.REFUSED,
             refusal=DispatchRefusal.SPEC_NAME_TAKEN,
             detail=detail,
+            recorded=recorded,
         )
     decision = policy.resolve(
         source=route.source,
