@@ -74,6 +74,7 @@ from .lifecycle import (
     WatchAdvance,
     WatchDiff,
     advance_watch,
+    diff_poll,
     generation_key,
     release_dispatch_claim,
 )
@@ -892,9 +893,12 @@ def dispatch_tick(
     Withdrawals are cascaded, and edits audited, after the source's own dispatch
     rather than before. A cancelled or edited item is not a dispatch candidate in
     the same poll, so the order cannot start what it is about to tear down or
-    audit, and both read the diff the dispatch already derived instead of deriving
-    a second one -- a second ``advance_watch`` would record the snapshot twice and
-    make the poll after it read every item as unchanged.
+    audit, and both reuse the diff the dispatch already derived rather than
+    deriving a second one -- a second ``advance_watch`` would record the snapshot
+    twice and make the poll after it read every item as unchanged. A source the
+    route refused has no such diff, so one is derived read-only for it instead:
+    the run being torn down started before the route broke, and it must not
+    outlive the withdrawal just because new work has nowhere to go.
     """
     resolved = gate if gate is not None else caps_for(state, config)
     reports: list[DispatchReport] = []
@@ -902,11 +906,17 @@ def dispatch_tick(
         dispatched = dispatch_source(
             state, config, outcome, gate=resolved, start=start, feedback=feedback
         )
-        if dispatched.advance is None:
-            reports.append(dispatched)
-            continue
-        cascaded = cascade_cancellations(state, dispatched.advance.diff, cascade=cascade)
-        edited = audit_mid_run_edits(state, dispatched.advance.diff, audit=audit)
+        # A source the route refused has no advance, because nothing may start
+        # here -- but a withdrawal and an edit both concern a run that ALREADY
+        # started, and neither needs somewhere to put new work. Skipping them
+        # would mean an operator who removes a project's path leaves a withdrawn
+        # item's run executing until they put it back. Deriving read-only is what
+        # makes that safe: diff_poll writes nothing, so the snapshot stays
+        # unrecorded and a repaired route still re-derives the items this tick
+        # could not dispatch.
+        diff = dispatched.advance.diff if dispatched.advance is not None else diff_poll(state, outcome)
+        cascaded = cascade_cancellations(state, diff, cascade=cascade)
+        edited = audit_mid_run_edits(state, diff, audit=audit)
         result = dispatched
         if cascaded:
             result = replace(result, cascades=cascaded)

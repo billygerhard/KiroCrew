@@ -59,7 +59,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from ..state import CLAIM_DISPATCH, StateStore, WatchItemRecord, WatchObservation
 from .items import WatchedItem
@@ -610,8 +610,3 @@ def _normalized(text: str) -> str:
     for separator in ("_", "-"):
         folded = folded.replace(separator, " ")
     return " ".join(folded.split())
-
-
-def observations_of(changes: Sequence[ItemChange]) -> tuple[WatchObservation, ...]:
-    """The snapshot rows *changes* would record, for a caller assembling its own set."""
-    return tuple(change.observation for change in changes)

@@ -1655,6 +1655,42 @@ class TestAMidRunEditIsIgnoredAndAudited:
 
         assert audit_mid_run_edits(store, diff_poll(store, failed), audit=_tick_audit(store)) == ()
 
+    def test_a_withdrawal_is_honoured_even_when_the_source_became_unroutable(
+        self, store: StateStore, config: ConfigStore, starter: Starter, tmp_path: Path
+    ) -> None:
+        """A broken route stops new work; it must not keep a withdrawn run alive.
+
+        The route is what decides where new work goes, and a withdrawal concerns a
+        run that already started -- so an operator who moves a project's path must
+        not thereby leave a cancelled item's run executing until they move it back.
+        """
+        dispatch_tick(
+            TickReport(outcomes=(polled(item("7")),)),
+            state=store,
+            config=config,
+            cascade=RecordingCascade(),
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+        assert starter.identifiers == ["7"], "the item has to dispatch before it can be withdrawn"
+        configure(config, {"projects": {PROJECT: {"path": str(tmp_path / "moved-away")}}})
+        recorder = RecordingCascade()
+
+        reports = dispatch_tick(
+            TickReport(outcomes=(polled(item("7", state="closed")),)),
+            state=store,
+            config=config,
+            cascade=recorder,
+            audit=_tick_audit(store),
+            start=starter,
+            gate=AllowAll(),
+        )
+
+        assert reports[0].refused_source is DispatchRefusal.PROJECT_TREE_MISSING
+        assert [identifier for _, identifier in recorder.archived] == ["7"]
+        assert [c.cascaded for c in reports[0].cascades] == [True]
+
 
 def _spend(store: StateStore, run_id: str, amount: float) -> None:
     """Attribute *amount* to *run_id* in the host's default metering ledger.

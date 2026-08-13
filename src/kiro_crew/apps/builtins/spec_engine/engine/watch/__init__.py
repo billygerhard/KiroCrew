@@ -97,7 +97,6 @@ from .lifecycle import (
     forget_snapshot,
     generation_key,
     is_open_state,
-    observations_of,
     record_snapshot,
     release_dispatch_claim,
 )
@@ -220,7 +219,6 @@ __all__ = [
     "is_open_state",
     "load_route",
     "load_sources",
-    "observations_of",
     "poll",
     "poll_interval_s",
     "poll_source",
