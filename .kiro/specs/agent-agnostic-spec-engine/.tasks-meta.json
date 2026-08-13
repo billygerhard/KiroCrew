@@ -59,7 +59,7 @@
     "17.3": "completed",
     "19.1": "queued",
     "19.2": "queued",
-    "17.6": "queued",
+    "17.6": "completed",
     "18.1": "queued"
   },
   "pbt": {},
@@ -389,6 +389,11 @@
     {
       "ts": "2026-08-13T13:35:46",
       "taskId": "8.6",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-13T14:05:52",
+      "taskId": "17.6",
       "status": "completed"
     }
   ]

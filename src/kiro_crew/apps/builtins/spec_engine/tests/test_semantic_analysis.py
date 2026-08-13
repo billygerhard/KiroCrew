@@ -446,6 +446,46 @@ class TestUnavailableTurnDegrades:
 
 
 class TestWallClockDeadline:
+    def test_a_worker_that_finished_before_the_first_poll_reports_done_not_timed_out(
+        self, ref: SpecRef, config_store: ConfigStore, state_store: StateStore
+    ) -> None:
+        """A completed result is preferred over the deadline that has since passed.
+
+        `poll` asks whether the work finished before it asks whether the clock ran
+        out, so a turn that answered late but before anyone looked is reported as
+        done with its findings rather than discarded as timed out. That ordering is
+        a choice, not an accident: the deadline exists to stop a caller waiting on
+        work that may never finish, and there is nothing to protect a caller from
+        once the answer is already in hand. Its sibling below covers the case the
+        deadline does govern -- a job OBSERVED past its deadline stays timed out
+        even when the worker finishes afterwards.
+        """
+        config_store.write({"timeouts": {"analysis_job_s": 1}}, surface=DASHBOARD_SURFACE)
+        provider = StubTurnProvider(payload=valid_semantic_payload())
+        clock = Clock()
+        jobs = AnalysisJobs(
+            analysis_engine(config_store),
+            config_store,
+            semantic=semantic_analyzer(config_store, state_store, provider),
+            clock=clock,
+        )
+        try:
+            job_id = jobs.submit(ref, run="run-1", semantic=True)
+            # Waited on the future rather than by polling, because a poll is the
+            # very thing under test: polling to wait would resolve the job while
+            # the clock was still inside the deadline and prove nothing.
+            jobs._jobs[job_id].future.result(timeout=5)
+            # The clock is advanced past the deadline BEFORE the first poll, so
+            # the only thing deciding the answer is which question poll asks first.
+            clock.now += 10
+
+            view = jobs.poll(job_id)
+
+            assert view.status is JobStatus.DONE
+            assert view.report is not None
+        finally:
+            jobs.close()
+
     def test_a_job_that_exceeds_its_deadline_times_out_with_progress(
         self, ref: SpecRef, config_store: ConfigStore, state_store: StateStore
     ) -> None:

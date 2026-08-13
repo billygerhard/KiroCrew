@@ -231,6 +231,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Register the engine's builtin providers and pass a findings sink. Task 17.5 built `register_builtins(registry, model_resolver=...)` and the `FindingsSink` seam but has no production caller, so today no capability resolves to a builtin and every analysis report lands in a memory-only default. Call it at the registry construction point and hand `AnalysisEngine` the durable sink once it exists
     - Also call `orchestrator_for` and, after `execute()`, the pipeline's `deliver()`. Task 9.3 wired the review gate, the retry policy, the workspace janitor's `retire_run` and `record_deployment`, and resolved a SEPARATE delivery notifier — `orchestrator_for` now takes both `notifier` (budget) and `delivery_notifier` (delivery), and a production caller passes the same host notifier to both because it satisfies each protocol. Neither `orchestrator_for` nor `deliver()` has a non-test caller yet
     - Make the execution gate read the run's PERSISTED posture, not re-resolve autonomy from config. Two reviews raised the same shape independently. Task 8.6 caps a quarantined run to authoring and persists `posture` plus `screening_quarantined` on the run row, but nothing outside tests reads `posture` back to reconstruct a decision — so a driver that re-resolves from `AutonomyPolicy` would run a quarantined item at its configured level with never-screened text, and requirement 25.4's "regardless of policy" would be false exactly when it matters. Task 9.3's review found the sibling: `completed_tasks` counts a leaf complete when its tasks.md checkbox is set, with no attribution, so a checkbox reaching the canonical spec directory would let a resumed run skip the review gate that 9.3 built. Both are resume paths trusting a stored fact whose authority nothing checks — treat the approving verdict and the persisted posture as the authorities, and add the resume tests neither task could write without a driver
+    - Build the concrete semantic turn provider, and decide the stamp timing when you do. Task 17.6 built `SemanticAnalyzer`, `AnalysisJobs` and the `SemanticTurnProvider` Protocol with its total wall-clock deadline, but the Protocol has no implementation, so model-backed analysis depth cannot run at all yet — the structural tier answers instead, which is why nothing is broken today. One property is the provider's to honour and its review could not exercise: the turn's session is stamped to the run only AFTER the provider returns, so an in-flight turn's spend is attributed post-hoc and the kill switch cannot preempt it. Stamp on dispatch if the host session key is knowable before the turn completes
     - _Requirements: 4.1, 4.2, 4.3_
   - [ ] 13.2 Bundled presets
     - GitHub/GitLab watch source presets, git-with-PR and local-only workflow presets, quality-first and budget cost profiles, bundled screening guidance
@@ -267,7 +268,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Fixture git repository with a local bare remote exercising isolate through teardown offline; seeded fake metering ledger exercising budget halt; deterministic stages verified to make zero model invocations
     - _Requirements: 13.16, 16.3, 6.4, 17.1, 17.2_
 
-- [ ] 17. Analysis
+- [x] 17. Analysis
   - [x] 17.1 Capability provider registry, schemas, and transports
     - Resolve every Delegable_Capability from config to builtin, mcp, or command transport behind one invocation path; identical tool surface regardless; builtin provider shipped for each; Engine_Floor capabilities refuse any binding
     - Per-capability versioned request/response schemas; schema-validated responses; declared coverage surfaced; cost attributed to the run budget; provider output treated as untrusted data; provider identity, transport, coverage and degraded status audited and displayed
@@ -307,7 +308,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Equivalence test: the tool and the UI path return identical Findings for the same state
     - _Requirements: 34.3, 32.2_
 
-  - [ ] 17.6 Semantic builtin and the async analysis job shape
+  - [x] 17.6 Semantic builtin and the async analysis job shape
     - Model-backed analysis builtin dispatching an agent turn with an authored analysis prompt at the agent, model, and effort configured for the analysis role, no network service; submit/poll job shape shared by every transport; configured total wall-clock deadline failing the job with elapsed time and partial progress
     - Dispatched turn output schema-validated before recording, invalid output fails the job with nothing partial recorded; spend attributed to the run's budget and subject to the ceiling and kill switch; every result records depth and provider identity; one findings schema across depths and transports
     - Every capability answers from a working builtin: no absent, stubbed, or not-configured tool in the surface
