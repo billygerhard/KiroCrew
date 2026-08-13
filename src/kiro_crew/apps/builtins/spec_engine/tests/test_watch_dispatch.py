@@ -162,6 +162,7 @@ class TestAFaultMidBatch:
             polled(*[item(number) for number in identifiers]),
             gate=AllowAll(),
             start=RaisingStarter("2"),
+            screener=_SCREENER,
         )
 
         started = [d.identifier for d in report.dispatched]
@@ -297,6 +298,23 @@ def claims_for(store: StateStore, source: str = SOURCE) -> list[str]:
     return [record.subject for record in store.list_claims(kind=CLAIM_DISPATCH, scope=source)]
 
 
+class CleanScreener:
+    """A screener that clears every seed, standing in for a clean verdict.
+
+    The dispatch mechanics under test here — routing, capacity, the claim ledger
+    — are independent of the screening outcome, so these tests run under a
+    screener that always returns the seed unchanged. The wiring that a real
+    quarantine caps the seed is proved against the real ``IntakeScreener`` in the
+    screening suite, where deleting the construction fails a test.
+    """
+
+    def screen_seed(self, route: Any, seed: RunSeed) -> RunSeed:
+        return seed
+
+
+_SCREENER = CleanScreener()
+
+
 def dispatch(
     store: StateStore,
     config: ConfigStore,
@@ -305,7 +323,12 @@ def dispatch(
     gate: Any = None,
 ) -> DispatchReport:
     return dispatch_source(
-        store, config, outcome, gate=gate if gate is not None else AllowAll(), start=starter
+        store,
+        config,
+        outcome,
+        gate=gate if gate is not None else AllowAll(),
+        start=starter,
+        screener=_SCREENER,
     )
 
 
@@ -1089,7 +1112,7 @@ class TestDrainingTheQueue:
         document["sources"][SOURCE]["spec_types"] = {"feature": "feature"}
         config.path.write_text(json.dumps(document), encoding="utf-8")
 
-        drained = drain_queue(store, config, gate=allow, start=starter)
+        drained = drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         refused = [d for d in drained if d.outcome is ItemOutcome.REFUSED]
         assert [d.refusal for d in refused] == [DispatchRefusal.UNMAPPED_CLASSIFICATION]
@@ -1104,7 +1127,7 @@ class TestDrainingTheQueue:
         dispatch(store, config, polled(item("7"), item("8"), item("9")), starter)
         finish(store, starter.seeds[0].run_id)
 
-        drained = drain_queue(store, config, gate=allow, start=starter)
+        drained = drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         assert [d.record.item_id for d in drained] == ["8"]
         assert starter.identifiers == ["7", "8"]
@@ -1117,7 +1140,7 @@ class TestDrainingTheQueue:
         configure(config, {"concurrency": {"global_max_runs": 1}})
         dispatch(store, config, polled(item("7"), item("8")), starter)
 
-        assert drain_queue(store, config, gate=allow, start=starter) == ()
+        assert drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER) == ()
         assert [record.item_id for record in store.list_queue()] == ["8"]
 
     def test_a_gated_source_leaves_its_queued_item_queued(
@@ -1127,7 +1150,7 @@ class TestDrainingTheQueue:
         dispatch(store, config, polled(item("7"), item("8")), starter)
         finish(store, starter.seeds[0].run_id)
 
-        drained = drain_queue(store, config, gate=RefuseAll(), start=starter)
+        drained = drain_queue(store, config, gate=RefuseAll(), start=starter, screener=_SCREENER)
 
         assert [d.outcome for d in drained] == [ItemOutcome.QUEUED]
         assert drained[0].refusal is DispatchRefusal.GATED
@@ -1166,7 +1189,7 @@ class TestDrainingTheQueue:
         )
         finish(store, starter.seeds[0].run_id)
 
-        drained = drain_queue(store, config, gate=RefuseOne(SOURCE), start=starter)
+        drained = drain_queue(store, config, gate=RefuseOne(SOURCE), start=starter, screener=_SCREENER)
 
         assert [d.refusal for d in drained] == [DispatchRefusal.GATED]
         assert starter.identifiers == ["7"]
@@ -1182,7 +1205,7 @@ class TestDrainingTheQueue:
         finish(store, starter.seeds[0].run_id)
         configure(config, {"sources": {SOURCE: {"project": None}}})
 
-        drained = drain_queue(store, config, gate=allow, start=starter)
+        drained = drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         assert [d.refusal for d in drained] == [DispatchRefusal.NO_TARGET_PROJECT]
         assert [record.item_id for record in store.list_queue()] == ["8"]
@@ -1232,7 +1255,7 @@ class TestDrainingTheQueue:
         freed = next(s for s in starter.seeds if s.source == OTHER_SOURCE)
         finish(store, freed.run_id)
 
-        drained = drain_queue(store, config, gate=allow, start=starter)
+        drained = drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         # The first project is still at its cap; its queue head must not stop the
         # other project's item from starting.
@@ -1247,7 +1270,7 @@ class TestDrainingTheQueue:
         finish(store, starter.seeds[0].run_id)
         configure(config, {"sources": {SOURCE: {"spec_types": {"bug": None}}}})
 
-        drained = drain_queue(store, config, gate=allow, start=starter)
+        drained = drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         assert [d.refusal for d in drained] == [DispatchRefusal.UNMAPPED_CLASSIFICATION]
         assert starter.identifiers == ["7"]
@@ -1259,7 +1282,7 @@ class TestDrainingTheQueue:
         dispatch(store, config, polled(item("7"), item("8")), starter)
         finish(store, starter.seeds[0].run_id)
 
-        drain_queue(store, config, gate=allow, start=starter)
+        drain_queue(store, config, gate=allow, start=starter, screener=_SCREENER)
 
         # The item waited in the queue rather than being re-polled, so its own
         # text has to survive the wait intact and still arrive as quoted data.
@@ -1299,7 +1322,7 @@ class TestTheSpendGateIsWired:
             {"sources": {SOURCE: {"spend_cap": {"credits": 1.0, "period_days": 30}}}},
         )
         seeded = Starter()
-        dispatch_source(store, config, polled(item("7")), gate=AllowAll(), start=seeded)
+        dispatch_source(store, config, polled(item("7")), gate=AllowAll(), start=seeded, screener=_SCREENER)
         # The cap reads spend from the metering ledger, so the run's cost has to be
         # attributable there rather than only cached on the run row.
         _spend(store, seeded.seeds[0].run_id, 5.0)
@@ -1311,6 +1334,7 @@ class TestTheSpendGateIsWired:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
         )
 
         assert starter.seeds == []
@@ -1329,6 +1353,7 @@ class TestTheSpendGateIsWired:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
         )
 
         assert starter.seeds == []
@@ -1344,6 +1369,7 @@ class TestTheSpendGateIsWired:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1362,6 +1388,7 @@ class TestTheTickIsTheOnlyInput:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1401,6 +1428,7 @@ class TestTheTickIsTheOnlyInput:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1418,6 +1446,7 @@ class TestTheTickIsTheOnlyInput:
                 cascade=RecordingCascade(),
                 audit=_tick_audit(store),
                 start=starter,
+                screener=_SCREENER,
                 gate=AllowAll(),
             )
 
@@ -1444,6 +1473,7 @@ class TestTheTickCascadesWithdrawals:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
         assert starter.identifiers == ["7"], "the item has to dispatch before it can be withdrawn"
@@ -1456,6 +1486,7 @@ class TestTheTickCascadesWithdrawals:
             cascade=recorder,
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1480,6 +1511,7 @@ class TestTheTickCascadesWithdrawals:
             cascade=recorder,
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1531,6 +1563,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
         assert starter.identifiers == ["7"], "the item has to dispatch before it can be edited"
@@ -1542,6 +1575,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1569,6 +1603,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1579,6 +1614,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1671,6 +1707,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=RecordingCascade(),
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
         assert starter.identifiers == ["7"], "the item has to dispatch before it can be withdrawn"
@@ -1684,6 +1721,7 @@ class TestAMidRunEditIsIgnoredAndAudited:
             cascade=recorder,
             audit=_tick_audit(store),
             start=starter,
+            screener=_SCREENER,
             gate=AllowAll(),
         )
 
@@ -1774,6 +1812,7 @@ class TestDispatchProperties:
             polled(*[item(number) for number in identifiers]),
             gate=AllowAll(),
             start=starter,
+            screener=_SCREENER,
         )
 
         expected = min(count, global_cap, project_cap)
@@ -1812,6 +1851,7 @@ class TestDispatchProperties:
             polled(item("7", classification=classification, association=association)),
             gate=AllowAll(),
             start=starter,
+            screener=_SCREENER,
         )
 
         mapped = default_mapped or classification == "bug"

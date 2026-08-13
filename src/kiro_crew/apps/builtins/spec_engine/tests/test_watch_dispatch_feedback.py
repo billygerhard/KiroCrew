@@ -66,6 +66,16 @@ class AllowAll:
         return True
 
 
+class CleanScreener:
+    """A screener that clears every seed; these tests are about feedback, not screening."""
+
+    def screen_seed(self, route: object, seed: RunSeed) -> RunSeed:
+        return seed
+
+
+_SCREENER = CleanScreener()
+
+
 @pytest.fixture()
 def state(tmp_path: Path) -> Iterator[StateStore]:
     store = StateStore(root=tmp_path / "state")
@@ -152,6 +162,7 @@ class TestPollPath:
             polled(item("7")),
             gate=AllowAll(),
             start=Starter(),
+            screener=_SCREENER,
             feedback=poster_over(state, config, audit, runner),
         )
 
@@ -162,7 +173,7 @@ class TestPollPath:
         self, state: StateStore, config: ConfigStore
     ) -> None:
         starter = Starter()
-        report = dispatch_source(state, config, polled(item("7")), gate=AllowAll(), start=starter)
+        report = dispatch_source(state, config, polled(item("7")), gate=AllowAll(), start=starter, screener=_SCREENER)
 
         assert [d.identifier for d in report.dispatched] == ["7"]
         assert len(starter.seeds) == 1
@@ -193,6 +204,7 @@ class TestPollPath:
             polled(item("7")),
             gate=AllowAll(),
             start=Starter(),
+            screener=_SCREENER,
             feedback=poster_over(state, config, audit, runner),
         )
         assert runner.calls == []
@@ -207,6 +219,7 @@ class TestPollPath:
             polled(item("7")),
             gate=AllowAll(),
             start=Starter(),
+            screener=_SCREENER,
             feedback=poster_over(state, config, audit, runner),
         )
         seed = report.dispatched[0].seed
@@ -232,6 +245,7 @@ class TestQueuePath:
             polled(item("1"), item("2")),
             gate=AllowAll(),
             start=Starter(),
+            screener=_SCREENER,
             feedback=poster,
         )
         dispatched = [d.identifier for d in report.dispatched]
@@ -245,6 +259,6 @@ class TestQueuePath:
         done = report.dispatched[0].seed
         assert done is not None, "a dispatched item carries the seed of the run it started"
         state.update_run(done.run_id, state=RunState.DONE.value)
-        drained = drain_queue(state, config, gate=AllowAll(), start=Starter(), feedback=poster)
+        drained = drain_queue(state, config, gate=AllowAll(), start=Starter(), screener=_SCREENER, feedback=poster)
         assert [d.record.item_id for d in drained] == ["2"]
         assert runner.calls == [("gh", "comment", "1"), ("gh", "comment", "2")]

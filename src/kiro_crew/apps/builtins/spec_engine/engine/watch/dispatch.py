@@ -430,6 +430,25 @@ class RunStarter(Protocol):
     def __call__(self, seed: RunSeed) -> None: ...
 
 
+class SeedScreener(Protocol):
+    """Screens a seed's untrusted content before the run proceeds past intake.
+
+    A seam rather than an import, for the same reason as :class:`RunStarter` and
+    because the concrete screener lives in ``watch.screening`` and reaches back
+    into this module for :class:`SourceRoute` and :class:`RunSeed` — depending on
+    it here would be a cycle. It is required at every dispatch entry point, so a
+    caller cannot half-wire the path and start unattended runs on unscreened
+    text; an implementation that cannot screen fails closed by capping the seed
+    to authoring rather than returning it untouched.
+
+    :meth:`screen_seed` returns the seed to start: unchanged when the content
+    screened clean, or capped to the authoring rung when it did not, with the
+    quarantine recorded and notified as a side effect.
+    """
+
+    def screen_seed(self, route: SourceRoute, seed: RunSeed) -> RunSeed: ...
+
+
 class ItemOutcome(str, Enum):
     """What became of one dispatch candidate."""
 
@@ -716,16 +735,21 @@ def dispatch_source(
     *,
     gate: DispatchGate,
     start: RunStarter,
+    screener: SeedScreener,
     feedback: FeedbackPoster | None = None,
 ) -> DispatchReport:
     """Take one poll all the way to started runs, queued items, and refusals.
 
-    *gate* and *start* are required. The gate is the per-source spending cap and
-    the kill switch, which are engine floors: a dispatch path that could be built
-    without one would be uncapped, and the omission would show up as spend rather
-    than as an error. The starter is required for the same reason in the other
-    direction — a dispatcher with nothing to start would claim items, create
-    specs, and silently run nothing.
+    *gate*, *start*, and *screener* are required. The gate is the per-source
+    spending cap and the kill switch, which are engine floors: a dispatch path
+    that could be built without one would be uncapped, and the omission would
+    show up as spend rather than as an error. The starter is required for the
+    same reason in the other direction — a dispatcher with nothing to start would
+    claim items, create specs, and silently run nothing. The screener is required
+    for a third: intake screening is on by default for every submitter class, so
+    a seam that defaulted to off would let a crafted item steer an unattended run
+    on the one path nobody wired it into. Every seed reaches the starter only
+    after the screener has had it.
 
     *feedback* is the item-feedback poster. It is optional because item feedback
     is configuration a source opts into (requirement 10.10 writes back *where
@@ -820,6 +844,7 @@ def dispatch_source(
                 klass=klass,
                 policy=policy,
                 start=start,
+                screener=screener,
                 feedback=feedback,
             )
         except Exception as exc:  # a starter or a run write can fail for its own reasons
@@ -862,6 +887,7 @@ def dispatch_tick(
     state: StateStore,
     config: ConfigStore,
     start: RunStarter,
+    screener: SeedScreener,
     cascade: CancelCascade,
     audit: AuditLog,
     gate: DispatchGate | None = None,
@@ -873,6 +899,12 @@ def dispatch_tick(
     "no gate": the cap and the kill switch are constructed here so that the
     ordinary caller cannot end up with an uncapped path. Passing one explicitly is
     for a caller that already holds one, or a test that needs its clock.
+
+    *screener* has no such default and is required. Unlike the gate, it cannot be
+    built here: screening dispatches a turn on the review model, which is a host
+    seam the engine library does not hold, so a default could only mean *do not
+    screen* — the one thing intake screening must never silently become. It is
+    threaded to :func:`dispatch_source` unchanged.
 
     *cascade* has no such default and is required, which is deliberate. The two
     are not the same kind of seam: a gate can be built here from the stores this
@@ -904,7 +936,13 @@ def dispatch_tick(
     reports: list[DispatchReport] = []
     for outcome in report.polled:
         dispatched = dispatch_source(
-            state, config, outcome, gate=resolved, start=start, feedback=feedback
+            state,
+            config,
+            outcome,
+            gate=resolved,
+            start=start,
+            screener=screener,
+            feedback=feedback,
         )
         # A source the route refused has no advance, because nothing may start
         # here -- but a withdrawal and an edit both concern a run that ALREADY
@@ -932,6 +970,7 @@ def drain_queue(
     *,
     gate: DispatchGate,
     start: RunStarter,
+    screener: SeedScreener,
     feedback: FeedbackPoster | None = None,
 ) -> tuple[QueueDispatch, ...]:
     """Start queued items in arrival order as capacity frees.
@@ -940,6 +979,12 @@ def drain_queue(
     skipped rather than allowed to block every other project's queue: the caps
     are per project, so one busy tracker must not be able to stall another's work
     by filling its own slots.
+
+    The gate, the starter, and the screener are required for the same reasons as
+    on the poll path: the queue is the second place a claimed item reaches a run,
+    so a screener wired only into :func:`dispatch_source` would leave every queued
+    item unscreened. Every queued seed reaches the starter only after the screener
+    has had it, exactly as on the poll path.
 
     Nothing is dequeued until it is known to be startable. The queue's uniqueness
     is on (source, item, generation) and a dequeued row cannot be re-queued, so
@@ -1008,7 +1053,9 @@ def drain_queue(
                         )
                     )
                     continue
-            results.append(_start_queued(state, config, taken, route, policy, start, feedback))
+            results.append(
+                _start_queued(state, config, taken, route, policy, start, screener, feedback)
+            )
     return tuple(results)
 
 
@@ -1289,9 +1336,10 @@ def _dispatch_one(
     klass: SubmitterClass,
     policy: AutonomyPolicy,
     start: RunStarter,
+    screener: SeedScreener,
     feedback: FeedbackPoster | None = None,
 ) -> ItemDisposition:
-    """Create the spec and the run row, then hand the seed to the starter."""
+    """Create the spec and the run row, screen the item, then hand it to the starter."""
     seed = _seed_run(
         state,
         route,
@@ -1303,6 +1351,10 @@ def _dispatch_one(
     )
     if isinstance(seed, ItemDisposition):
         return seed
+    # Screen before the run proceeds past intake. The screener returns the seed
+    # unchanged when the content is clean and a seed capped to authoring when it
+    # is not, so the starter never receives an unscreened seed on this path.
+    seed = screener.screen_seed(route, seed)
     start(seed)
     _post_claimed(feedback, seed)
     logger.info(
@@ -1466,6 +1518,7 @@ def _start_queued(
     route: SourceRoute,
     policy: AutonomyPolicy,
     start: RunStarter,
+    screener: SeedScreener,
     feedback: FeedbackPoster | None = None,
 ) -> QueueDispatch:
     """Start one dequeued entry, re-resolving its routing from configuration.
@@ -1528,6 +1581,10 @@ def _start_queued(
             detail=seeded.detail,
             recorded=seeded.recorded,
         )
+    # The queue is the second path a claimed item reaches a run, so it screens
+    # exactly as the poll path does: a screener wired into one but not the other
+    # would be no screen at all for everything that queued behind the cap.
+    seeded = screener.screen_seed(route, seeded)
     start(seeded)
     _post_claimed(feedback, seeded)
     logger.info(
