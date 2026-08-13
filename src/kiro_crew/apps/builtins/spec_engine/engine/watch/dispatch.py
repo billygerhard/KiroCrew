@@ -559,8 +559,8 @@ def load_route(config: ConfigStore, source: str) -> SourceRoute:
     )
 
 
-def submitter_class_of(route: SourceRoute, item: WatchedItem) -> SubmitterClass:
-    """Derive *item*'s trust class from the maintainer list, then the association.
+def class_of_author(route: SourceRoute, author: str, association: str = "") -> SubmitterClass:
+    """Derive one author's trust class from the maintainer list, then the association.
 
     The maintainer list wins because it is what an operator declared about a
     person, and the association is what a tracker asserts about them. Anything
@@ -568,18 +568,35 @@ def submitter_class_of(route: SourceRoute, item: WatchedItem) -> SubmitterClass:
     one, and a source that maps neither field all describe an author this engine
     knows nothing about, and treating an unknown author as trusted is the one
     error a stranger could exploit on purpose.
+
+    This takes an author rather than an item because an item is not the only
+    thing with one. Comments on an item and comments on a review artifact each
+    have their own author, and every trust question in the engine has to be
+    answered by this one function: a second derivation beside it is a second
+    spelling of the same guarantee, and this session's security findings were
+    all one guarantee enforced on one of two equivalent paths.
     """
-    submitter = _identity(item.submitter)
-    if submitter and submitter in route.maintainers:
+    identity = _identity(author)
+    if identity and identity in route.maintainers:
         return SubmitterClass(
             name="maintainer",
             evidence=ClassEvidence.MAINTAINER_LIST,
             declared_at=f"{SECTION_SOURCES}.{route.source}.{MAINTAINERS_FIELD}",
         )
-    mapped = ASSOCIATION_CLASSES.get(_folded(item.association))
+    mapped = ASSOCIATION_CLASSES.get(_folded(association))
     if mapped is not None:
         return SubmitterClass(name=mapped, evidence=ClassEvidence.ASSOCIATION)
     return SubmitterClass(name=LEAST_TRUSTED_CLASS, evidence=ClassEvidence.UNDETERMINED)
+
+
+def submitter_class_of(route: SourceRoute, item: WatchedItem) -> SubmitterClass:
+    """Derive *item*'s trust class from its own submitter.
+
+    An item's body is a content element like any other, and its author is the
+    item's submitter, so this is :func:`class_of_author` applied to that pair
+    rather than a rule of its own.
+    """
+    return class_of_author(route, item.submitter, item.association)
 
 
 def capacity(state: StateStore, config: ConfigStore, route: SourceRoute) -> Capacity:

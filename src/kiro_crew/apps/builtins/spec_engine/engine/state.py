@@ -90,7 +90,7 @@ CLAIM_DISPATCH = "dispatch"
 CLAIM_WRITEBACK = "writeback"
 
 #: Schema version recorded in ``schema_meta``. Bump only alongside a migration.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -179,6 +179,24 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         first_seen_ts TEXT NOT NULL,
         observed_ts   TEXT NOT NULL,
         PRIMARY KEY (source, item_id)
+    )
+    """,
+    # One row per content element, keyed by the scope that consumed it, holding
+    # the revision its class was derived from. The revision is in the row rather
+    # than only the class because the question this table answers is not "what
+    # class did this author have" but "is the class on file still about the text
+    # we are holding" -- an edited comment keeps its id and its author.
+    """
+    CREATE TABLE IF NOT EXISTS element_trust (
+        scope       TEXT NOT NULL,
+        element_id  TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        author      TEXT NOT NULL DEFAULT '',
+        revision    TEXT NOT NULL,
+        class_name  TEXT NOT NULL,
+        evidence    TEXT NOT NULL,
+        derived_ts  TEXT NOT NULL,
+        PRIMARY KEY (scope, element_id)
     )
     """,
     """
@@ -410,6 +428,26 @@ class WatchItemRecord:
 
 
 @dataclass(frozen=True)
+class ElementTrustRecord:
+    """The trust class last derived for one content element, and from what.
+
+    ``revision`` is the element revision the class was derived from, which is
+    what makes an edit detectable: a later revision means the recorded class
+    describes text that is no longer there, so it cannot authorize a decision
+    about the text that replaced it.
+    """
+
+    scope: str
+    element_id: str
+    kind: str
+    author: str
+    revision: str
+    class_name: str
+    evidence: str
+    derived_ts: str
+
+
+@dataclass(frozen=True)
 class WorkspaceRecord:
     workspace_id: int
     run_id: str
@@ -508,6 +546,19 @@ def _watch_item_record(row: sqlite3.Row) -> WatchItemRecord:
         is_open=bool(row["is_open"]),
         first_seen_ts=row["first_seen_ts"],
         observed_ts=row["observed_ts"],
+    )
+
+
+def _element_trust_record(row: sqlite3.Row) -> ElementTrustRecord:
+    return ElementTrustRecord(
+        scope=row["scope"],
+        element_id=row["element_id"],
+        kind=row["kind"],
+        author=row["author"],
+        revision=row["revision"],
+        class_name=row["class_name"],
+        evidence=row["evidence"],
+        derived_ts=row["derived_ts"],
     )
 
 
@@ -1193,6 +1244,68 @@ class StateStore:
         """
         rows = self._query("SELECT * FROM watch_items WHERE source = ? ORDER BY item_id", (source,))
         return [_watch_item_record(row) for row in rows]
+
+    # ---------------------------------------------------------- element trust
+
+    def record_element_trust(
+        self,
+        scope: str,
+        *,
+        element_id: str,
+        kind: str,
+        author: str,
+        revision: str,
+        class_name: str,
+        evidence: str,
+    ) -> ElementTrustRecord:
+        """Record the class derived for one element at one revision.
+
+        Overwrites the element's previous row rather than appending, because this
+        table answers "is the class on file current" and only the latest
+        revision can answer it. The audit log is where the history lives, and it
+        is append-only for exactly this reason.
+        """
+        if not scope.strip():
+            raise ValueError("an element trust record must name the scope that consumed it")
+        if not element_id.strip():
+            raise ValueError("an element trust record must name the element")
+        if not revision.strip():
+            raise ValueError("an element trust record must carry the revision it was derived from")
+        now = utc_now_iso()
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO element_trust (scope, element_id, kind, author, revision, "
+                "class_name, evidence, derived_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (scope, element_id) DO UPDATE SET "
+                "kind = excluded.kind, author = excluded.author, "
+                "revision = excluded.revision, class_name = excluded.class_name, "
+                "evidence = excluded.evidence, derived_ts = excluded.derived_ts",
+                (scope, element_id, kind, author, revision, class_name, evidence, now),
+            )
+        return ElementTrustRecord(
+            scope=scope,
+            element_id=element_id,
+            kind=kind,
+            author=author,
+            revision=revision,
+            class_name=class_name,
+            evidence=evidence,
+            derived_ts=now,
+        )
+
+    def get_element_trust(self, scope: str, element_id: str) -> ElementTrustRecord | None:
+        row = self._query_one(
+            "SELECT * FROM element_trust WHERE scope = ? AND element_id = ?",
+            (scope, element_id),
+        )
+        return _element_trust_record(row) if row is not None else None
+
+    def list_element_trust(self, scope: str) -> list[ElementTrustRecord]:
+        """Every element recorded under *scope*, in element order."""
+        rows = self._query(
+            "SELECT * FROM element_trust WHERE scope = ? ORDER BY element_id", (scope,)
+        )
+        return [_element_trust_record(row) for row in rows]
 
     # -------------------------------------------------------------- workspaces
 

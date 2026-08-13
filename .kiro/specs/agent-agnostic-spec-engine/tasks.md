@@ -67,7 +67,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Failed validation or missing approvals refuse regardless of policy; refused requests and started executions audited with initiator
     - _Requirements: 8.1, 8.3, 8.4, 8.5_
 
-  - [ ] 5.5 Per-element content trust derivation
+  - [x] 5.5 Per-element content trust derivation
     - Submitter class derived from each authored element's own author for item bodies, item comments, and review artifact comments; never inherited from the item, artifact, or another element; undeterminable author yields the least-trusted class
     - A changed element re-derives its class and re-applies every gated decision before the new content is used; intake screening applies per element by its own class; class, author, and content revision recorded for every gated decision; trust configuration is config-only with no tool able to modify it
     - _Requirements: 37.1, 37.2, 37.3, 37.4, 37.5, 37.6_
@@ -138,7 +138,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 8.6 Intake injection screening
     - Screen dispatched items with bundled guidance plus configured intake guidance on the review role's model; enabled by default per submitter class with explicit opt-out
     - Suspected injection quarantines at authoring level regardless of policy, flags findings in the Review_Queue, and notifies; reviewer release is the human gate; verdicts audited and cost attributed to the run
-    - _Requirements: 25.1, 25.2, 25.3, 25.4, 25.5, 25.6, 25.7_
+    - Screen each `ContentElement` under its own class from `engine/trust.py`, never the item's. Task 5.5 built the per-element derivation and the consumption gate but does not own screening, so this is where requirement 37.4 is satisfied: screening only the item at intake would classify a stranger's comment by the class of whoever opened the issue, which is the escalation 5.5 exists to prevent. Reach element text through `trust.consume` so an element edited after it was screened cannot be used under the old verdict
+    - _Requirements: 25.1, 25.2, 25.3, 25.4, 25.5, 25.6, 25.7, 37.4_
 
   - [ ] 8.7 Tracker housekeeping writeback
     - Named lifecycle events (claimed, awaiting review, delivery submitted, completed, failed or needs-human, refused) mapped to configured commands under the delivery stage-command rules; comment, label, state, assign, and link-artifact operations; bundled presets for the public hosts, per-event override for an organization's tracker, no non-public preset
