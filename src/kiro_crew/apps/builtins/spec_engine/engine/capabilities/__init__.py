@@ -138,6 +138,7 @@ from .registry import (
     builtin_binding,
     external_identity,
     resolve_bindings,
+    response_from_payload,
 )
 from .schemas import (
     CURRENT_SCHEMA_VERSION,
@@ -274,6 +275,7 @@ __all__ = [
     "register_builtins",
     "require_delegable",
     "resolve_bindings",
+    "response_from_payload",
     "run_provider_child",
     "sanitized",
     "schema_for",

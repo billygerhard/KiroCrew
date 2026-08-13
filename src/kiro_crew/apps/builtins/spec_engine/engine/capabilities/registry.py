@@ -480,7 +480,7 @@ class CapabilityRegistry:
                         transport=binding.transport,
                     )
                 else:
-                    response = _response_from_payload(request.capability, payload)
+                    response = response_from_payload(request.capability, payload)
                     return CapabilityResult(
                         request=deadlined,
                         provider=external_identity(
@@ -635,12 +635,17 @@ def _payload_from_response(response: CapabilityResponse) -> dict[str, Any]:
     return response.to_wire()
 
 
-def _response_from_payload(capability: str, payload: Mapping[str, Any]) -> CapabilityResponse:
+def response_from_payload(capability: str, payload: Mapping[str, Any]) -> CapabilityResponse:
     """Build a response from a payload that already passed its schema.
 
     Every provider-authored string is wrapped as untrusted on the way in, at the
     one place a payload becomes engine data. Wrapping later would leave a window
     in which the text is an ordinary ``str``, and a window is all it takes.
+
+    Public because the semantic analyzer's dispatched-turn output is the same
+    untrusted, schema-valid analysis payload an external provider returns, and it
+    becomes engine data through this one wrapping rather than a second spelling of
+    it.
     """
     provider = payload.get("provider", {})
     provider_name = str(provider.get("name", "")) if isinstance(provider, Mapping) else ""
