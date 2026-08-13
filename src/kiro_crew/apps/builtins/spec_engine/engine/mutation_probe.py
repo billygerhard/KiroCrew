@@ -125,10 +125,13 @@ class ProbeOutcome(str, Enum):
     #: NOT covered — a gate failure, not a comment.
     SURVIVED = "survived"
     #: The probe could not gather evidence: the text was absent or ambiguous, the
-    #: edit did not change the file, a covering check could not be started, or the
-    #: file could not be restored. Never read as passing — an inconclusive probe
-    #: proves nothing, and the two false "no failures" results this project drew
-    #: from a pattern that matched nothing came from treating this as a pass.
+    #: edit did not change the file, a covering check could not be started, or a
+    #: covering check was already red before the mutation. Never read as passing —
+    #: an inconclusive probe proves nothing, and the two false "no failures"
+    #: results this project drew from a pattern that matched nothing came from
+    #: treating this as a pass. A file that cannot be RESTORED is deliberately not
+    #: here: that raises, because it is an emergency about the tree rather than a
+    #: result about the mutation, and it must not be mistakable for one.
     ERROR = "error"
 
 
@@ -206,10 +209,14 @@ def _tree_lock(tree_root: Path) -> Iterator[None]:
     """Serialize probers against *tree_root* for the duration of the block.
 
     A second prober mutating the same tree at the same time would make any run
-    evidence about neither mutation, so the whole mutate-run-restore is held under
-    one exclusive lock keyed to the tree. The lock file lives beside the tree so
-    two processes agree on the same lock; it is left in place because unlinking it
-    would open the very race it exists to close.
+    evidence about neither mutation, so the read of the pre-mutation baseline, the
+    write, the checks and the restore are ALL held under one exclusive lock keyed
+    to the tree. The read has to be inside it: a prober that read first and locked
+    second would take the other prober's mutation as its baseline and "restore" to
+    that, leaving a mutation in the tree permanently while both probers reported
+    success. The lock file lives beside the tree so two processes agree on the same
+    lock; it is left in place because unlinking it would open the very race it
+    exists to close.
     """
     lock_path = tree_root / LOCK_FILENAME
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
@@ -247,8 +254,12 @@ def run_probe(
     Applies exactly one edit, verifies it landed, runs each declared covering
     check through *runner* in *tree_root*, then reverts the edit and asserts the
     file is byte-identical to its pre-mutation content. Returns a result saying
-    whether the mutation was caught and which artefact caught it. Never runs a
-    check the caller did not declare, and never runs the whole suite.
+    whether the mutation was caught and which artefact caught it. Runs only the
+    argvs the caller declared -- that is what is enforced, and it is why a
+    whole-suite result never enters by accident. It cannot be enforced further:
+    an argv is opaque, so a caller that DECLARES the whole suite as its covering
+    check gets the whole suite, and reading that result as evidence about one
+    mutation is the caller's error to avoid.
     """
     target = _resolve_target(mutation, tree_root)
     if target is None:
@@ -257,57 +268,91 @@ def run_probe(
             outcome=ProbeOutcome.ERROR,
             reason=f"the file to mutate is not inside the tree {str(tree_root)!r}",
         )
-    try:
-        original_bytes = target.read_bytes()
-    except OSError as exc:
-        return ProbeResult(
-            mutation=mutation, outcome=ProbeOutcome.ERROR, reason=f"cannot read {target}: {exc}"
-        )
-    try:
-        text = original_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        return ProbeResult(
-            mutation=mutation, outcome=ProbeOutcome.ERROR, reason=f"{target} is not utf-8: {exc}"
-        )
-
-    # Screen the pattern before touching the file. A pattern that matches nothing
-    # is an error, never a pass (a clean run then measures nothing); a pattern that
-    # matches twice is ambiguous, and a single replace would neuter an arbitrary
-    # occurrence. Either way, refuse before mutating.
-    occurrences = text.count(mutation.original)
-    if occurrences == 0:
-        return ProbeResult(
-            mutation=mutation,
-            outcome=ProbeOutcome.ERROR,
-            reason=f"the text to mutate was not found in {target}",
-        )
-    if occurrences > 1:
-        return ProbeResult(
-            mutation=mutation,
-            outcome=ProbeOutcome.ERROR,
-            reason=(
-                f"the text to mutate occurs {occurrences} times in {target}; "
-                "refusing to guess which to neuter"
-            ),
-        )
-    # The inverse edit must be unambiguous too, so that restoring reverts precisely
-    # the one occurrence introduced. If the replacement text already appears, the
-    # revert could not tell the introduced copy from a pre-existing one.
-    if mutation.replacement and mutation.replacement in text:
-        return ProbeResult(
-            mutation=mutation,
-            outcome=ProbeOutcome.ERROR,
-            reason=(
-                f"the replacement text already appears in {target}; "
-                "the inverse edit would be ambiguous"
-            ),
-        )
-
-    mutated = text.replace(mutation.original, mutation.replacement, 1)
-
+    # Everything from here runs under the tree lock, including the READ. A second
+    # prober that read first and locked second would capture the first prober's
+    # mutation as its baseline, "restore" to that, and leave the first mutation in
+    # the tree permanently -- with both probers reporting success, because each
+    # verified byte-identity against the baseline it had read. That is the silent
+    # neutering this module exists to prevent, so the baseline itself has to be
+    # taken under the same exclusive lock as the write.
     with _tree_lock(tree_root):
-        target.write_bytes(mutated.encode("utf-8"))
         try:
+            original_bytes = target.read_bytes()
+        except OSError as exc:
+            return ProbeResult(
+                mutation=mutation, outcome=ProbeOutcome.ERROR, reason=f"cannot read {target}: {exc}"
+            )
+        try:
+            text = original_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return ProbeResult(
+                mutation=mutation,
+                outcome=ProbeOutcome.ERROR,
+                reason=f"{target} is not utf-8: {exc}",
+            )
+
+        # Screen the pattern before touching the file. A pattern that matches
+        # nothing is an error, never a pass (a clean run then measures nothing); a
+        # pattern that matches twice is ambiguous, and a single replace would
+        # neuter an arbitrary occurrence. Either way, refuse before mutating.
+        occurrences = text.count(mutation.original)
+        if occurrences == 0:
+            return ProbeResult(
+                mutation=mutation,
+                outcome=ProbeOutcome.ERROR,
+                reason=f"the text to mutate was not found in {target}",
+            )
+        if occurrences > 1:
+            return ProbeResult(
+                mutation=mutation,
+                outcome=ProbeOutcome.ERROR,
+                reason=(
+                    f"the text to mutate occurs {occurrences} times in {target}; "
+                    "refusing to guess which to neuter"
+                ),
+            )
+        # The inverse edit must be unambiguous too, so that restoring reverts
+        # precisely the one occurrence introduced. If the replacement text already
+        # appears, the revert could not tell the introduced copy from a
+        # pre-existing one.
+        if mutation.replacement and mutation.replacement in text:
+            return ProbeResult(
+                mutation=mutation,
+                outcome=ProbeOutcome.ERROR,
+                reason=(
+                    f"the replacement text already appears in {target}; "
+                    "the inverse edit would be ambiguous"
+                ),
+            )
+
+        # Establish that the covering checks are GREEN before mutating. Without
+        # this, any non-zero exit reads as a catch, so a check that is red for its
+        # own reasons -- a broken import, a mistyped node id that collects nothing
+        # and exits non-zero, a pre-existing failure -- would be counted as proof
+        # the mutation was detected. That is the same hazard as a mutation that
+        # never landed, on the other side of the experiment: the unlanded CHECK.
+        # A probe is a controlled comparison, so it needs both ends controlled.
+        baseline = _baseline_failures(
+            tree_root=tree_root, runner=runner, timeout_s=timeout_s, checks=mutation.covering
+        )
+        if baseline:
+            return ProbeResult(
+                mutation=mutation,
+                outcome=ProbeOutcome.ERROR,
+                reason=(
+                    "these covering checks already fail without the mutation, so they "
+                    f"cannot evidence it: {', '.join(baseline)}"
+                ),
+            )
+
+        mutated = text.replace(mutation.original, mutation.replacement, 1)
+        try:
+            # The write is INSIDE the try, so a write that lands partial content and
+            # then raises -- or an interrupt arriving between the write and the try --
+            # still reaches the restore. _restore is safe to run even when the write
+            # never landed, because reverting the inverse edit on unmutated text is a
+            # no-op and byte-identity is asserted either way.
+            target.write_bytes(mutated.encode("utf-8"))
             landed = target.read_bytes()
             if landed == original_bytes or mutation.replacement not in landed.decode("utf-8"):
                 # The edit did not change the file. Anything measured now measures
@@ -325,6 +370,34 @@ def run_probe(
             # bytes are a belt, not the method, and byte-identity is asserted even
             # when the belt is used.
             _restore(target, original_bytes, mutation)
+
+
+def _baseline_failures(
+    *,
+    tree_root: Path,
+    runner: CommandRunner,
+    timeout_s: int,
+    checks: tuple[CoveringCheck, ...],
+) -> tuple[str, ...]:
+    """Names of covering checks that already fail on the UNMUTATED tree.
+
+    A probe is a controlled comparison: it concludes "the mutation was detected"
+    from a check going red. That inference only holds if the check was green to
+    begin with. A check that is red for its own reasons -- a broken import, a
+    mistyped node id that collects nothing and still exits non-zero, a failure
+    someone else left -- would otherwise be counted as proof, and the gate would
+    pass on a behaviour nothing actually covers.
+
+    This is the same hazard as a mutation that never landed, seen from the other
+    end of the experiment: there the treatment was absent, here the control is
+    already broken. Both make the result evidence about nothing, so both refuse.
+    """
+    failing: list[str] = []
+    for check in checks:
+        produced = runner(list(check.argv), cwd=tree_root, timeout_s=timeout_s)
+        if _classify(produced) is not _CheckStatus.PASSED:
+            failing.append(check.name)
+    return tuple(failing)
 
 
 def _run_checks(

@@ -45,12 +45,39 @@ class RecordingRunner:
         self.responses = responses or {}
         self.calls: list[tuple[str, ...]] = []
 
-    def __call__(
-        self, argv: Sequence[str], *, cwd: Path, timeout_s: int
-    ) -> CommandOutcome:
+    def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
         recorded = tuple(argv)
         self.calls.append(recorded)
         return self.responses.get(recorded, PASSED)
+
+
+class DetectingRunner:
+    """A runner whose checks pass on the clean tree and fail on the mutated one.
+
+    This is what a real covering check does, and the probe now requires it: a check
+    that fails unconditionally cannot evidence a mutation, because it was already
+    red before the mutation existed. Answering from the FILE's current content --
+    rather than from a fixed table -- is what makes a catch here mean "this check
+    noticed the mutation" instead of "this check always fails".
+
+    ``blind`` names argvs that pass either way, standing in for a check that does
+    not cover the neutered behaviour at all.
+    """
+
+    def __init__(
+        self, target: Path, marker: str, *, blind: tuple[tuple[str, ...], ...] = ()
+    ) -> None:
+        self.target = target
+        self.marker = marker
+        self.blind = set(blind)
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
+        recorded = tuple(argv)
+        self.calls.append(recorded)
+        if recorded in self.blind:
+            return PASSED
+        return FAILED if self.marker in self.target.read_text() else PASSED
 
 
 class RaisingRunner:
@@ -59,9 +86,7 @@ class RaisingRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
 
-    def __call__(
-        self, argv: Sequence[str], *, cwd: Path, timeout_s: int
-    ) -> CommandOutcome:
+    def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
         self.calls.append(tuple(argv))
         raise RuntimeError("the covering check blew up mid-run")
 
@@ -144,7 +169,7 @@ def test_survived_mutation_is_a_named_gate_failure(tmp_path: Path) -> None:
 def test_caught_mutation_names_the_failing_check(tmp_path: Path) -> None:
     mechanism = _mechanism(tmp_path)
     argv = ("pytest", "parity")
-    runner = RecordingRunner({argv: FAILED})
+    runner = DetectingRunner(mechanism, "True")
     mutation = Mutation(
         behaviour="parity check",
         path=mechanism,
@@ -170,7 +195,8 @@ def test_a_catch_by_an_unrelated_check_is_distinguished(tmp_path: Path) -> None:
     mechanism = _mechanism(tmp_path)
     claiming = CoveringCheck(name="parity-test", argv=("pytest", "parity"))
     unrelated = CoveringCheck(name="import-smoke-guard", argv=("pytest", "smoke"))
-    runner = RecordingRunner({unrelated.argv: FAILED})  # claiming still passes
+    # The claiming check is blind to the mutation; only the unrelated one reacts.
+    runner = DetectingRunner(mechanism, "True", blind=(claiming.argv,))
     mutation = Mutation(
         behaviour="parity check",
         path=mechanism,
@@ -190,7 +216,7 @@ def test_a_static_guard_is_named_as_the_catcher(tmp_path: Path) -> None:
     """A repo-wide guard, not a unit test, catches the mutation — and is named."""
     mechanism = _mechanism(tmp_path)
     guard = CoveringCheck(name="flake8 repo-wide guard", argv=("flake8", str(mechanism)))
-    runner = RecordingRunner({guard.argv: FAILED})
+    runner = DetectingRunner(mechanism, "True")
     mutation = Mutation(
         behaviour="parity check",
         path=mechanism,
@@ -283,9 +309,25 @@ def test_replacement_already_present_refuses(tmp_path: Path) -> None:
 
 
 def test_a_check_that_cannot_run_is_an_error_not_a_survival(tmp_path: Path) -> None:
+    """A check that runs clean but cannot run once mutated is inconclusive.
+
+    This is a real shape, not a contrived one: a mutation can leave the file
+    unparseable, so the runner fails to collect rather than reporting a failure.
+    That must not read as a survived mutation, and it must not read as a catch
+    either -- nothing was measured.
+    """
     mechanism = _mechanism(tmp_path)
     argv = ("pytest", "parity")
-    runner = RecordingRunner({argv: UNRUNNABLE})
+
+    class BreaksUnderMutation:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
+            self.calls.append(tuple(argv))
+            return UNRUNNABLE if "True" in mechanism.read_text() else PASSED
+
+    runner = BreaksUnderMutation()
     mutation = Mutation(
         behaviour="parity check",
         path=mechanism,
@@ -298,6 +340,34 @@ def test_a_check_that_cannot_run_is_an_error_not_a_survival(tmp_path: Path) -> N
 
     assert result.outcome is ProbeOutcome.ERROR
     assert "could not be run" in result.reason
+
+
+def test_a_check_already_red_without_the_mutation_cannot_evidence_it(tmp_path: Path) -> None:
+    """A check that fails anyway is refused before the file is touched.
+
+    Without this the probe would conclude "detected" from a check that was red
+    for its own reasons -- a broken import, a mistyped node id that collects
+    nothing and still exits non-zero. That is the unlanded CHECK, the sibling of
+    the unlanded mutation, and it made a gate pass on a behaviour nothing covered.
+    """
+    mechanism = _mechanism(tmp_path)
+    before = mechanism.read_bytes()
+    argv = ("pytest", "mistyped-node-id")
+    runner = RecordingRunner({argv: FAILED})  # red whether or not anything is mutated
+    mutation = Mutation(
+        behaviour="parity check",
+        path=mechanism,
+        original="n % 2 == 0",
+        replacement="True",
+        covering=(CoveringCheck(name="parity-test", argv=argv),),
+    )
+
+    result = run_probe(mutation, tree_root=tmp_path, runner=runner)
+
+    assert result.outcome is ProbeOutcome.ERROR
+    assert "already fail without the mutation" in result.reason
+    # And the file was never touched, so a refusal costs the tree nothing.
+    assert mechanism.read_bytes() == before
 
 
 # --- correctness property (a): restore is byte-identical however the run ends -
@@ -345,10 +415,13 @@ def test_only_the_declared_covering_argvs_run(tmp_path: Path) -> None:
 
     run_probe(mutation, tree_root=tmp_path, runner=runner)
 
-    # Exactly the declared argvs, in order — nothing wider. A whole-suite argv
-    # (a pytest invocation with no node id) never appears because the probe only
-    # ever iterates the declared covering set.
-    assert runner.calls == [first.argv, second.argv]
+    # Nothing wider than the declared set, ever. A whole-suite argv (a pytest
+    # invocation with no node id) never appears, because the probe only iterates
+    # the declared covering checks. Each declared argv is run TWICE -- once to
+    # establish it is green on the clean tree, once under the mutation -- so the
+    # property is about which argvs appear, not how many times.
+    assert set(runner.calls) == {first.argv, second.argv}
+    assert runner.calls == [first.argv, second.argv, first.argv, second.argv]
 
 
 def test_a_file_outside_the_tree_is_refused(tmp_path: Path) -> None:
