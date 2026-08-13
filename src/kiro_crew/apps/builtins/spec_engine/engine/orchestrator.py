@@ -62,7 +62,7 @@ from __future__ import annotations
 import json
 import logging
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -100,6 +100,7 @@ from .delivery import (
     WorkspaceJanitor,
 )
 from .documents import DocumentKind
+from .review_criteria import TestQualityAssessment
 from .roles import Dispatch, RolePlan, SessionDefault, WorkKind
 from .runs import (
     PARKED_STATES,
@@ -335,10 +336,29 @@ class ReviewVerdict:
     ``approved`` is the whole gate: a task is not complete until it carries an
     approving verdict, so a reviewer that cannot decide returns ``approved=False``
     with a reason rather than a value the loop could read as approval.
+
+    Test quality is judged by the same verdict, not a second gate: ``test_quality``
+    carries the assessment against the review criteria, and a verdict cannot read
+    ``approved`` while that assessment is unsatisfied. The fold is fail-closed and
+    lives in one place, so a reviewer that judged the implementation sound but its
+    tests inadequate produces a changes-required verdict through the one spelling
+    the loop already reads — there is no route to completion that skips it.
     """
 
     approved: bool
     reason: str = ""
+    test_quality: TestQualityAssessment = field(default_factory=TestQualityAssessment)
+
+    def __post_init__(self) -> None:
+        # A verdict that approves the implementation but carries unmet test-quality
+        # findings is contradictory; the safe reading is changes-required. Coerce
+        # here rather than trusting every caller to, so ``approved`` — the one
+        # value the completion gate reads — can never be true past a failed
+        # criterion, and a second path to approval cannot open by omission.
+        if self.approved and not self.test_quality.satisfied:
+            object.__setattr__(self, "approved", False)
+            if not self.reason:
+                object.__setattr__(self, "reason", "the tests did not meet the test quality criteria")
 
 
 class Reviewer(Protocol):
@@ -368,6 +388,10 @@ class LeafOutcome:
     reason: str = ""
     attempts: int = 1
     reviewed: bool = False
+    #: The test-quality assessment of the verdict that decided this leaf. Carried
+    #: out of the worker thread so the loop — the one writer of the audit log —
+    #: records the findings; empty when no review ran or the tests met the criteria.
+    test_quality: TestQualityAssessment = field(default_factory=TestQualityAssessment)
 
 
 @dataclass(frozen=True)
@@ -718,6 +742,19 @@ class WaveRunner:
                         reviewed=outcome.reviewed,
                     )
                     attempts.append(attempt)
+                    # Record test-quality findings on their own event so a run's
+                    # audit log says which criteria a task's tests failed, separate
+                    # from the settled status. Only when findings exist: an approved
+                    # leaf and a leaf that never reached review carry none.
+                    if not outcome.test_quality.satisfied:
+                        self._record(
+                            TASK_REVIEWED_EVENT,
+                            {
+                                "wave": wave.identifier,
+                                "task": task,
+                                **outcome.test_quality.detail(),
+                            },
+                        )
                     self._record(TASK_SETTLED_EVENT, {"wave": wave.identifier, **attempt.detail()})
         return (
             WaveReport(
@@ -750,21 +787,28 @@ class WaveRunner:
         reason = ""
         reviewed = False
         attempt = 0
+        # The assessment of the last review that ran, carried to the failure
+        # return so the loop can record its findings; an implementation that never
+        # reached review leaves it empty, which records nothing.
+        assessment = TestQualityAssessment()
         while True:
             impl = self._implement(task, dispatch, context)
             if impl.ok:
                 verdict = self._review(task, context)
                 reviewed = True
+                assessment = verdict.test_quality
                 if verdict.approved:
                     return LeafOutcome(
                         ok=True,
                         reason=verdict.reason or "the implementation was approved",
                         attempts=attempt + 1,
                         reviewed=True,
+                        test_quality=verdict.test_quality,
                     )
                 reason = verdict.reason or "the review verdict required changes"
             else:
                 reviewed = False
+                assessment = TestQualityAssessment()
                 reason = impl.reason or "the implementation did not complete"
             if attempt >= limit:
                 return LeafOutcome(
@@ -772,6 +816,7 @@ class WaveRunner:
                     reason=f"{reason} (after {attempt + 1} attempts)",
                     attempts=attempt + 1,
                     reviewed=reviewed,
+                    test_quality=assessment,
                 )
             attempt += 1
 
