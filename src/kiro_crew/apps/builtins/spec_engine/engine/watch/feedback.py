@@ -57,9 +57,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AUDIT_ITEM_FEEDBACK",
     "FEEDBACK_FIELD",
+    "FEEDBACK_PRESETS",
+    "FEEDBACK_PRESET_HOSTS",
     "FeedbackOutcome",
     "FeedbackPoster",
     "FeedbackReport",
+    "feedback_presets",
     "load_feedback",
     "post_feedback",
     "release_writeback_claim",
@@ -70,6 +73,119 @@ FEEDBACK_FIELD = "feedback"
 
 #: Audit event for one item-feedback attempt.
 AUDIT_ITEM_FEEDBACK = "item.feedback"
+
+#: Bundled tracker-housekeeping presets, keyed by the public host they drive.
+#:
+#: Each maps a subset of :data:`~..config.schema.ITEM_LIFECYCLE_EVENTS` to argv
+#: lists, demonstrating the operations requirement 36.1 names -- comment, set
+#: label, set state, assign, and referencing the review artifact -- through the
+#: host's own CLI (``gh`` / ``glab``). Like the quality-gate presets, these are
+#: starting points copied into ``sources.<source>.feedback`` and edited there,
+#: not a live binding: a per-event override is simply the copied event's command
+#: list, replaced.
+#:
+#: **Public hosts only, structurally.** This table is a closed literal of the
+#: public hosts the engine already bundles watch sources for, and
+#: :func:`feedback_presets` raises for any other name. There is no registration
+#: path, so a preset for a private or internal tracker cannot exist -- shipping
+#: one would put an organization's argv in the engine. An organization points an
+#: event at its own tracker by writing that event's command list into its
+#: source's ``feedback`` map directly, which is configuration, not a bundled
+#: preset.
+#:
+#: **Only run-context variables that exist when the event fires.** A command that
+#: referenced an unset variable would fail its event before execution (36.2), so
+#: every ``{name}`` here is a real :data:`~..delivery.variables.RUN_CONTEXT_VARIABLES`
+#: name present at that lifecycle point: ``item_url`` / ``item_id`` for the
+#: triggering item at every event, ``branch_name`` only from delivery onward,
+#: ``review_title`` only once a review artifact exists.
+FEEDBACK_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
+    "github": {
+        "claimed": (
+            ("gh", "issue", "comment", "{item_url}", "--body",
+             "Automated spec authoring has started for this item."),
+            ("gh", "issue", "edit", "{item_url}", "--add-label", "in-progress"),
+            ("gh", "issue", "edit", "{item_url}", "--add-assignee", "@me"),
+        ),
+        "awaiting_review": (
+            ("gh", "issue", "comment", "{item_url}", "--body",
+             "Spec is awaiting review: {review_title}"),
+        ),
+        "delivery_submitted": (
+            ("gh", "issue", "comment", "{item_url}", "--body",
+             "Delivery submitted from branch {branch_name}."),
+        ),
+        "completed": (
+            ("gh", "issue", "comment", "{item_url}", "--body", "Spec run completed."),
+            ("gh", "issue", "close", "{item_url}"),
+        ),
+        "failed": (
+            ("gh", "issue", "edit", "{item_url}", "--add-label", "needs-human"),
+            ("gh", "issue", "comment", "{item_url}", "--body",
+             "Spec run needs a human: it failed or requires attention."),
+        ),
+        "refused": (
+            ("gh", "issue", "edit", "{item_url}", "--add-label", "needs-human"),
+            ("gh", "issue", "comment", "{item_url}", "--body",
+             "Spec run was refused by the autonomy policy and needs a human."),
+        ),
+    },
+    "gitlab": {
+        "claimed": (
+            ("glab", "issue", "note", "{item_id}", "--message",
+             "Automated spec authoring has started for this item."),
+            ("glab", "issue", "update", "{item_id}", "--label", "in-progress"),
+        ),
+        "awaiting_review": (
+            ("glab", "issue", "note", "{item_id}", "--message",
+             "Spec is awaiting review: {review_title}"),
+        ),
+        "delivery_submitted": (
+            ("glab", "issue", "note", "{item_id}", "--message",
+             "Delivery submitted from branch {branch_name}."),
+        ),
+        "completed": (
+            ("glab", "issue", "note", "{item_id}", "--message", "Spec run completed."),
+            ("glab", "issue", "close", "{item_id}"),
+        ),
+        "failed": (
+            ("glab", "issue", "update", "{item_id}", "--label", "needs-human"),
+            ("glab", "issue", "note", "{item_id}", "--message",
+             "Spec run needs a human: it failed or requires attention."),
+        ),
+        "refused": (
+            ("glab", "issue", "update", "{item_id}", "--label", "needs-human"),
+            ("glab", "issue", "note", "{item_id}", "--message",
+             "Spec run was refused by the autonomy policy and needs a human."),
+        ),
+    },
+}
+
+#: The public hosts a bundled feedback preset exists for, in declaration order.
+FEEDBACK_PRESET_HOSTS: tuple[str, ...] = tuple(FEEDBACK_PRESETS)
+
+
+def feedback_presets(host: str) -> dict[str, list[list[str]]]:
+    """Return *host*'s bundled feedback map, ready to write into a source.
+
+    The result is the shape ``sources.<source>.feedback`` takes -- an event-keyed
+    map of command lists -- deep-copied so a configuration surface can offer it
+    for editing without an edit reaching back into the bundled table and changing
+    what every later source is offered.
+
+    Raises ``KeyError`` for any host that is not a bundled public one. This is the
+    structural half of "no non-public preset": there is no name a caller can pass
+    that yields a preset for a private tracker, because the table holds only the
+    public hosts and every miss raises rather than inventing an empty map.
+    """
+    preset = FEEDBACK_PRESETS.get(host)
+    if preset is None:
+        raise KeyError(
+            f"no bundled feedback preset for {host!r}; bundled presets exist only for the "
+            f"public hosts {', '.join(FEEDBACK_PRESET_HOSTS)}, and an organization's tracker "
+            "is served by writing its own feedback commands into the source"
+        )
+    return {event: [list(argv) for argv in commands] for event, commands in preset.items()}
 
 
 class FeedbackOutcome(str, Enum):
