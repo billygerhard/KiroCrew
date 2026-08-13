@@ -70,6 +70,11 @@ from .dispatch import (
     submitter_class_of,
     unmapped_items,
 )
+from .echo import (
+    ECHO_FIELD,
+    echo_permitted_for,
+    echoable_text,
+)
 from .feedback import (
     AUDIT_ITEM_FEEDBACK,
     FEEDBACK_FIELD,
@@ -173,6 +178,7 @@ __all__ = [
     "CRON_TIMEOUT_MARGIN_S",
     "DISPATCH_HEADING",
     "DISPATCHING_TRANSITIONS",
+    "ECHO_FIELD",
     "ENABLED_KEY",
     "FIELD_MAP_KEY",
     "FIRST_GENERATION",
@@ -243,6 +249,8 @@ __all__ = [
     "dispatch_tick",
     "dispatched_generations",
     "drain_queue",
+    "echo_permitted_for",
+    "echoable_text",
     "elements_of_item",
     "forget_snapshot",
     "generation_key",
