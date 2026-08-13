@@ -306,6 +306,40 @@ class TestCycleLimit:
         entry = next(e for e in queue.entries() if e.run_id == run_id)
         assert entry.revision_exhausted
 
+    def test_raising_the_limit_clears_the_mark_the_gate_no_longer_earns(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, project: Path
+    ) -> None:
+        """The mark says "this gate ran out of tries", so it must not outlive that.
+
+        Enforcement never reads the mark -- it counts cycles -- so a stale one could
+        never have let a revision through. What it could do is tell a reviewer the
+        run was waiting on them while it was in fact working, which is the failure
+        that matters for a queue a person reads.
+        """
+        config.write({"limits": {"revision_cycle_limit": 1}}, surface=DASHBOARD_SURFACE)
+        machine = RunMachine(store, config, audit=audit)
+        queue = ReviewQueue(machine)
+        ref = SpecRef.of(project, "example")
+        run_id = _awaiting_review(machine, ref, project)
+        reviser = CapturingReviser()
+        queue.request_changes(ref, run_id, comment="a", reviser=reviser, actor="user:ada")
+        queue.complete_revision(ref, run_id, actor="user:ada")
+        exhausted = queue.request_changes(
+            ref, run_id, comment="b", reviser=reviser, actor="user:ada"
+        )
+        assert exhausted.needs_human
+        assert "requirements" in revision_exhausted_gates(machine.get(run_id))
+
+        # An operator decides the run deserves more attempts.
+        config.write({"limits": {"revision_cycle_limit": 3}}, surface=DASHBOARD_SURFACE)
+        again = queue.request_changes(ref, run_id, comment="c", reviser=reviser, actor="user:ada")
+
+        assert again.dispatched
+        assert revision_exhausted_gates(machine.get(run_id)) == frozenset()
+        queue.complete_revision(ref, run_id, actor="user:ada")
+        entry = next(e for e in queue.entries() if e.run_id == run_id)
+        assert not entry.revision_exhausted
+
     def test_a_gate_at_the_limit_dispatches_nothing_even_on_the_first_call(
         self, machine: RunMachine, queue: ReviewQueue, store: StateStore, project: Path
     ) -> None:

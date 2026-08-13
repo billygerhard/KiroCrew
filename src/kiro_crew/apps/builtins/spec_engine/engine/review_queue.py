@@ -873,13 +873,22 @@ class ReviewQueue:
         # two cannot diverge. transition merges detail, so only the cycles key is
         # written and every other writer's key is left alone.
         cycles = {**revision_cycles(record), gate: cycle}
+        moved: dict[str, object] = {DETAIL_REVISION_CYCLES: cycles}
+        still_exhausted = revision_exhausted_gates(record) - {gate}
+        if still_exhausted != revision_exhausted_gates(record):
+            # This gate is revising again, which it can only be doing because an
+            # operator raised the limit -- so the mark saying it ran out of tries
+            # is now false. Enforcement never read the mark (it counts cycles), so
+            # leaving it would not have let a revision through; it would have told
+            # a reviewer the run was waiting on them when it was working.
+            moved[DETAIL_REVISION_EXHAUSTED] = sorted(still_exhausted)
         self._machine.transition(
             ref,
             record.run_id,
             RunState.AUTHORING,
             initiator=actor,
             reason=f"changes requested at {gate}",
-            detail={DETAIL_REVISION_CYCLES: cycles},
+            detail=moved,
             lock=lock,
         )
         self._machine.append_audit(
