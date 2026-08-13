@@ -137,7 +137,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
   - [ ] 8.5 Public-source autonomy warning
     - Enabling execution-or-higher autonomy on a publicly submittable source warns and records the acknowledgment
     - _Requirements: 10.11_
-  - [ ] 8.6 Intake injection screening
+  - [x] 8.6 Intake injection screening
     - Screen dispatched items with bundled guidance plus configured intake guidance on the review role's model; enabled by default per submitter class with explicit opt-out
     - Suspected injection quarantines at authoring level regardless of policy, flags findings in the Review_Queue, and notifies; reviewer release is the human gate; verdicts audited and cost attributed to the run
     - Screen each `ContentElement` under its own class from `engine/trust.py`, never the item's. Task 5.5 built the per-element derivation and the consumption gate but does not own screening, so this is where requirement 37.4 is satisfied: screening only the item at intake would classify a stranger's comment by the class of whoever opened the issue, which is the escalation 5.5 exists to prevent. Reach element text through `trust.consume` so an element edited after it was screened cannot be used under the old verdict
@@ -163,7 +163,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Determine each work unit's role and resolve agent, model, and effort from the selected Cost_Profile; session default agent/model fallback with a report when unset
     - Config-time verification that an assigned agent's tool surface includes the engine tools; subagents inherit the run's role assignments
     - _Requirements: 9.2, 15.1, 15.2, 15.3, 15.5, 15.6_
-  - [ ] 9.3 Review verdicts and retry policy
+  - [x] 9.3 Review verdicts and retry policy
     - Successful implementations get a review verdict on the review role's model; no completion without approval; any unsuccessful completion (implementation, review rejection, infrastructure) retries to the limit then fails without abandoning independent tasks
     - Call the two seams task 7.4 built and could not reach from its own files. `WaveRunner.finish` is where a run becomes terminal, so it is where the workspace janitor's `retire_run` belongs — without it every completed run leaves its checkout on disk for good. And `DeliveryRun.deployment_addresses` is produced but `record_deployment` is never called, so the ledger has no row for a live environment the engine created. Both are one call each; both are inert today
     - Give the delivery pipeline a notifier, which is NOT the one-argument wiring it looks like: the engine has two `Notifier` protocols and they are not interchangeable. The budget one takes `notify(channel=..., message=..., detail=...)`, while the delivery one takes `send(...)` and deliberately holds no channel because configuration resolves the destination inside the notifier. Passing the orchestrator's budget notifier to the pipeline is a type error. Converge the two protocols on the delivery shape, or resolve a delivery notifier separately in the factory — until then an autonomous delivery records that it had no notifier and tells nobody its outcome
@@ -283,7 +283,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Deterministic structural checks: glossary terms used but undefined, unquantified qualifiers, criteria that are not independently testable, requirements with no covering task, overlapping or contradictory criteria within a requirement
     - Emit the shared Analysis_Findings schema with generated clarifying questions (choices, consequences, recommended answer); declare depth as structural; no network, zero model credits
     - _Requirements: 27.1, 27.2, 27.3, 27.4, 27.5_
-  - [ ] 17.5 Builtin provider bindings
+  - [x] 17.5 Builtin provider bindings
     - Register the engine's own paths as the builtin providers for authoring (seeded turn behind validation and the phase gate), review (seeded verdict turn with review and test-quality criteria), implementation (per-task subagent dispatch), and model catalog (host resolution)
     - Bind the bundled GitHub/GitLab watch presets, marking a source unhealthy with the missing program name when its command-line dependency is absent; ship no supplementary validation rules; UI identifies each capability's provider as builtin or external and each builtin as deterministic or model-backed
     - Consume the analysis report rather than producing a second one. Task 17.4 built `AnalysisEngine`, `route_findings` and `AnalysisReport.to_review_items` in `engine/analysis.py`, and they have no non-test caller: the review binding is where criterion-keyed findings reach a human. Two things 17.4 could not do belong here. There is no findings sink in the data model -- `engine/review_queue.py` is a projection of runs in human-reserved states and the tables hold no analysis rows -- so persisting a report against a queued run is this task's, and inventing a second queue is not. And the surface that renders a finding's prose must escape control characters itself: the display contract keeps the line breaks prose is entitled to, so a terminal render that trusts them can still be reflowed by a crafted message

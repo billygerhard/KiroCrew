@@ -158,12 +158,18 @@ class TestDocumentValidation:
 
     def test_screening_refuses_the_default_key_that_would_disable_it_for_everyone(self):
         doc = {"sources": {"s": {"poll": ["gh"], "screening": {"default": False}}}}
-        errors = validate_config_document(doc)
-        assert [e.path for e in errors] == ["sources.s.screening.default"]
-        # The reader refuses it too. Enforcing it here as well is what lets an
-        # operator find out at the moment they save, instead of saving a setting
-        # that is silently ignored and believing screening is off.
-        assert "no single setting" in errors[0].message
+        # Reported against the map rather than the key, which is what makes this
+        # assertion structural: losing the wildcard branch would error one level
+        # down at ...screening.default as an unknown class instead.
+        assert _paths(doc) == ["sources.s.screening"]
+
+    def test_screening_refuses_the_default_key_beside_a_valid_class(self):
+        doc = {
+            "sources": {
+                "s": {"poll": ["gh"], "screening": {"maintainer": False, "default": False}}
+            }
+        }
+        assert _paths(doc) == ["sources.s.screening"]
 
     def test_screening_rejects_an_unknown_class_and_a_non_boolean(self):
         doc = {"sources": {"s": {"poll": ["gh"], "screening": {"maintainerz": False}}}}

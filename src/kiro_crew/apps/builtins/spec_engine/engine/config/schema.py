@@ -610,9 +610,16 @@ def _check_screening(errors: list[ConfigError], value: Any, path: str) -> None:
     for klass, enabled in value.items():
         klass_path = f"{path}.{klass}"
         if klass == WILDCARD_KEY:
+            # Reported against the MAP, not the key, and deliberately so. Every
+            # other rejection here is about one entry being wrong; this one is
+            # about the map carrying a key that would turn screening off for
+            # every class at once, which is a property of the map. It also makes
+            # the rejection distinguishable by path: were this branch lost, the
+            # key would still error one level down as an unknown class, so a test
+            # could only tell the two apart by their wording.
             errors.append(
                 ConfigError(
-                    klass_path,
+                    path,
                     "screening has no default key: it is opted out per submitter class so that "
                     "no single setting can disable it for every class",
                 )
