@@ -119,6 +119,9 @@ class TestQualityFinding:
     criterion: str
     detail: str
 
+    # This is a domain type, not a pytest case; its name begins with "Test".
+    __test__ = False
+
     def to_json_object(self) -> dict[str, str]:
         return {"criterion": self.criterion, "detail": self.detail}
 
@@ -135,6 +138,9 @@ class TestQualityAssessment:
     """
 
     findings: tuple[TestQualityFinding, ...] = field(default_factory=tuple)
+
+    # This is a domain type, not a pytest case; its name begins with "Test".
+    __test__ = False
 
     @property
     def satisfied(self) -> bool:

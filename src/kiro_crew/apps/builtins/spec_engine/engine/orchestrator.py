@@ -358,7 +358,9 @@ class ReviewVerdict:
         if self.approved and not self.test_quality.satisfied:
             object.__setattr__(self, "approved", False)
             if not self.reason:
-                object.__setattr__(self, "reason", "the tests did not meet the test quality criteria")
+                object.__setattr__(
+                    self, "reason", "the tests did not meet the test quality criteria"
+                )
 
 
 class Reviewer(Protocol):
