@@ -13,6 +13,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from kiro_crew.apps.builtins.spec_engine.engine.review_criteria import (
+    ASSERTION_SHAPE_SCREEN,
+    EQUIVALENT_PATH_QUESTION,
+    TEST_QUALITY_CRITERIA,
+)
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.guidance import (
     AUTHORING_FLOWS,
     GuidanceUnavailable,
@@ -62,6 +67,26 @@ def test_review_prompt_carries_the_test_quality_criteria() -> None:
     text = _text(_call("get_review_prompt", {}))
     assert "request-changes" in text
     assert "boundary" in text.lower()
+
+
+def test_the_review_prompt_is_the_criteria_source_not_a_second_spelling() -> None:
+    """The text a reviewer reads must BE the criteria, not a copy of them.
+
+    A finding names a criterion's key, so if the guidance re-spelled the criteria
+    the copy a reviewer judges against could drift from the copy those keys belong
+    to and nothing would notice. That is the defect class this project has shipped
+    four times, so it is worth a test rather than a convention: re-spelling any
+    criterion in the guidance fails here.
+    """
+    text = _text(_call("get_review_prompt", {}))
+    for criterion in TEST_QUALITY_CRITERIA:
+        assert criterion.statement in text, f"{criterion.key} is not the guidance's own text"
+    # The screen and the equivalent-path question are the parts distilled from the
+    # defects this project actually shipped, so a reviewer has to receive them --
+    # they were unreachable from the seed when this was first built.
+    for shape in ASSERTION_SHAPE_SCREEN:
+        assert shape in text, f"the screen omits {shape!r}"
+    assert EQUIVALENT_PATH_QUESTION in text
 
 
 def test_unavailable_authoring_flow_is_an_error_not_partial_text() -> None:

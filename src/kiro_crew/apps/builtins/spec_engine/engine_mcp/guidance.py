@@ -21,6 +21,12 @@ Two rules keep this text trustworthy as instructions:
 
 from __future__ import annotations
 
+from ..engine.review_criteria import (
+    ASSERTION_SHAPE_SCREEN,
+    EQUIVALENT_PATH_QUESTION,
+    TEST_QUALITY_CRITERIA,
+)
+
 #: Shared vocabulary the guidance leans on, stated once so the flows agree.
 _PHASE_RULES = """\
 The engine enforces the phase order for you; it does not take your word that a
@@ -185,7 +191,25 @@ where it stopped rather than restarting.
 {_TASKS_FORMAT}
 """
 
-_REVIEW = """\
+
+def _criteria_block() -> str:
+    """Render the test-quality criteria as the review guidance's bullet list.
+
+    Derived from ``TEST_QUALITY_CRITERIA`` rather than restated here, because a
+    criterion spelled twice is the defect this project keeps shipping: the copy a
+    reviewer reads would drift from the copy a finding is routed to, and nothing
+    would notice. A finding names a criterion's key, so the text a reviewer judges
+    against has to be the text those keys belong to.
+    """
+    return "\n".join(f"* {criterion.statement}" for criterion in TEST_QUALITY_CRITERIA)
+
+
+def _screen_block() -> str:
+    """Render the passing-regardless assertion shapes as a bullet list."""
+    return "\n".join(f"* {shape}" for shape in ASSERTION_SHAPE_SCREEN)
+
+
+_REVIEW = f"""\
 # Reviewing a task implementation
 
 Return a verdict of `approve` or `request-changes`. Approve only when the
@@ -193,11 +217,14 @@ implementation matches the task's scope and its tests would actually catch a
 regression. Judge the tests explicitly against these criteria, and treat any
 failure as request-changes rather than a comment:
 
-* Assertions derive from the code under test, not from values the test itself
-  constructed, so the assertion cannot pass by restating its own input.
-* The test fails when the covered behavior is wrong — a test that passes under a
-  broken implementation proves nothing.
-* Error cases and boundary cases are covered, not only the path that works.
+{_criteria_block()}
+
+Screen the assertions against every one of these shapes. Each is a way a test
+can be green while proving nothing, and each was found in real tests here:
+
+{_screen_block()}
+
+{EQUIVALENT_PATH_QUESTION}
 
 When you request changes, state which criterion failed and what would satisfy
 it, so the next revision turn has something concrete to act on.
@@ -238,9 +265,7 @@ class GuidanceUnavailable(Exception):
     def __init__(self, flow: str, available: tuple[str, ...]) -> None:
         self.flow = flow
         self.available = available
-        super().__init__(
-            f"no guidance for flow {flow!r}; available flows: {', '.join(available)}"
-        )
+        super().__init__(f"no guidance for flow {flow!r}; available flows: {', '.join(available)}")
 
 
 def get_guidance(flow: str) -> str:

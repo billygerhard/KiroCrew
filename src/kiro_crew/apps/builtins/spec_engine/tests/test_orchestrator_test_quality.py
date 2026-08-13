@@ -268,6 +268,35 @@ def _test_quality_events(harness: Harness, run_id: str = RUN) -> list[dict[str, 
     ]
 
 
+class VaryingReviewer(RecordingReviewer):
+    """A reviewer that reports DIFFERENT findings on successive attempts.
+
+    ``AssessingReviewer`` returns the same finding every round, which cannot tell
+    "the last verdict's findings" apart from "every verdict's findings" -- the two
+    behaviours agree when the rounds agree. This one disagrees with itself on
+    purpose, so the distinction is observable.
+    """
+
+    def __init__(
+        self, *, by_attempt: dict[str, tuple[tuple[TestQualityFinding, ...], ...]]
+    ) -> None:
+        super().__init__()
+        self._by_attempt = dict(by_attempt)
+        self._seen_count: dict[str, int] = {}
+
+    def __call__(self, *, task: str, dispatch: Dispatch, context: RunContext) -> ReviewVerdict:
+        super().__call__(task=task, dispatch=dispatch, context=context)
+        rounds = self._by_attempt.get(task, ())
+        index = self._seen_count.get(task, 0)
+        self._seen_count[task] = index + 1
+        findings = rounds[index] if index < len(rounds) else (rounds[-1] if rounds else ())
+        return ReviewVerdict(
+            approved=True,  # the implementation is sound; only the tests are not
+            reason=f"{task} implementation judged",
+            test_quality=TestQualityAssessment(findings=findings),
+        )
+
+
 class TestTheGateAndTheAuditRecordThroughTheLoop:
     def test_a_task_whose_tests_fail_the_criteria_never_completes(self, harness: Harness) -> None:
         # The worker succeeds every round and the reviewer would approve the
@@ -308,6 +337,39 @@ class TestTheGateAndTheAuditRecordThroughTheLoop:
             ]
             for event in recorded
         )
+
+    def test_a_criterion_from_an_earlier_attempt_is_not_dropped_by_a_later_one(
+        self, harness: Harness
+    ) -> None:
+        """Each attempt's findings are kept, not overwritten by the last review.
+
+        A leaf can fail its first attempt on one criterion and its second on
+        another. A verdict that reported a finding is not un-reporting it by being
+        followed, so recording only the final round would lose the first
+        criterion -- and the audit record is the only durable trace there is.
+        """
+        set_retry_limit(harness, 1)  # two attempts
+        harness.start_run()
+        worker = Worker()
+        first = (TestQualityFinding(criterion=DERIVED_ASSERTIONS.key, detail="echoes its input"),)
+        second = (
+            TestQualityFinding(criterion=ERROR_AND_BOUNDARY_CASES.key, detail="no empty input"),
+        )
+        reviewer = VaryingReviewer(by_attempt={"1.1": (first, second)})
+
+        runner_for(harness, worker, reviewer=reviewer).execute(context_for(harness))
+
+        recorded = _test_quality_events(harness)
+        criteria: set[str] = set()
+        for event in recorded:
+            if event.get("task") != "1.1":
+                continue
+            findings = event.get("findings")
+            assert isinstance(findings, list)
+            for finding in findings:
+                assert isinstance(finding, dict)
+                criteria.add(str(finding["criterion"]))
+        assert criteria == {DERIVED_ASSERTIONS.key, ERROR_AND_BOUNDARY_CASES.key}
 
     def test_tests_that_meet_the_criteria_complete_and_record_no_finding(
         self, harness: Harness

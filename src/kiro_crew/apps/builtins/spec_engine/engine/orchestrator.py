@@ -100,7 +100,7 @@ from .delivery import (
     WorkspaceJanitor,
 )
 from .documents import DocumentKind
-from .review_criteria import TestQualityAssessment
+from .review_criteria import TestQualityAssessment, TestQualityFinding
 from .roles import Dispatch, RolePlan, SessionDefault, WorkKind
 from .runs import (
     PARKED_STATES,
@@ -789,16 +789,25 @@ class WaveRunner:
         reason = ""
         reviewed = False
         attempt = 0
-        # The assessment of the last review that ran, carried to the failure
-        # return so the loop can record its findings; an implementation that never
-        # reached review leaves it empty, which records nothing.
-        assessment = TestQualityAssessment()
+        # Every finding any review of this leaf reported, in the order first seen
+        # and without repeats. Accumulated rather than overwritten because a leaf
+        # can fail attempt one on a different criterion than attempt two, and a
+        # verdict that reported a finding is not un-reported by a later round --
+        # recording only the last would silently drop the earlier criterion.
+        #
+        # Deliberately NOT carried to the success return: a leaf approved in the
+        # end has adequate tests, and attaching a finding to a completed task
+        # would say the opposite. Findings explain a failure, so they travel with
+        # one.
+        recorded: list[TestQualityFinding] = []
         while True:
             impl = self._implement(task, dispatch, context)
             if impl.ok:
                 verdict = self._review(task, context)
                 reviewed = True
-                assessment = verdict.test_quality
+                for finding in verdict.test_quality.findings:
+                    if finding not in recorded:
+                        recorded.append(finding)
                 if verdict.approved:
                     return LeafOutcome(
                         ok=True,
@@ -810,7 +819,6 @@ class WaveRunner:
                 reason = verdict.reason or "the review verdict required changes"
             else:
                 reviewed = False
-                assessment = TestQualityAssessment()
                 reason = impl.reason or "the implementation did not complete"
             if attempt >= limit:
                 return LeafOutcome(
@@ -818,7 +826,7 @@ class WaveRunner:
                     reason=f"{reason} (after {attempt + 1} attempts)",
                     attempts=attempt + 1,
                     reviewed=reviewed,
-                    test_quality=assessment,
+                    test_quality=TestQualityAssessment(findings=tuple(recorded)),
                 )
             attempt += 1
 

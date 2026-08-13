@@ -176,6 +176,7 @@ SOURCE_FIELDS: tuple[str, ...] = (
     "autonomy",
     "intake",
     "screening",
+    "echo",
     "spend_cap",
     "feedback",
 )
@@ -587,6 +588,8 @@ def _check_source(errors: list[ConfigError], entry: Mapping[str, Any], path: str
             _check_feedback(errors, value, field_path)
         elif key == "screening":
             _check_screening(errors, value, field_path)
+        elif key == "echo":
+            _check_echo(errors, value, field_path)
         else:
             errors.append(ConfigError(field_path, "unknown source field"))
     if "poll" not in entry:
@@ -629,6 +632,48 @@ def _check_screening(errors: list[ConfigError], value: Any, path: str) -> None:
             errors.append(ConfigError(klass_path, "unknown submitter class"))
             continue
         if not isinstance(enabled, bool):
+            errors.append(ConfigError(klass_path, "expected true or false"))
+
+
+def _check_echo(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate a per-submitter-class permission to republish element text.
+
+    Refuses the same two things the reader refuses, so an operator finds out at
+    write time instead of saving a setting that is silently ignored: the wildcard
+    key, which would permit echoing for every class at once, and the least-trusted
+    class, which is never echoable however it is configured. Both are reported
+    against the MAP rather than the key, because each is a property of the map
+    carrying the key -- and because it keeps the rejection distinguishable by
+    path, since a lost branch would still error one level down as an unknown
+    class and only the wording would differ.
+    """
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object keyed by submitter class"))
+        return
+    for klass, permitted in value.items():
+        klass_path = f"{path}.{klass}"
+        if klass == WILDCARD_KEY:
+            errors.append(
+                ConfigError(
+                    path,
+                    "echo has no default key: it is permitted per submitter class so that no "
+                    "single setting can republish every class's text",
+                )
+            )
+            continue
+        if klass == LEAST_TRUSTED_CLASS:
+            errors.append(
+                ConfigError(
+                    path,
+                    f"{LEAST_TRUSTED_CLASS!r} is never echoable: republishing the least trusted "
+                    "class's text under the engine's name is refused however it is configured",
+                )
+            )
+            continue
+        if klass not in SUBMITTER_CLASSES:
+            errors.append(ConfigError(klass_path, "unknown submitter class"))
+            continue
+        if not isinstance(permitted, bool):
             errors.append(ConfigError(klass_path, "expected true or false"))
 
 
