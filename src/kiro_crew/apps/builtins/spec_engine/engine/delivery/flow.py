@@ -222,6 +222,16 @@ class FixTaskDispatcher(Protocol):
 #: supplies rather than a log this module opens.
 AuditRecorder = Callable[[str, dict[str, Any]], None]
 
+#: Notified once, after the submit stage has actually raised the review artifact.
+#: The pipeline owns *when* the artifact exists; it does not own the item-feedback
+#: writeback, its ledger claim, or the tracker conversation, all of which live in
+#: the watch layer. So the seam is a callback the driver backs with the one shared
+#: feedback poster rather than an import of it: keeping the poster out of the
+#: delivery layer is what stops a second writeback route from appearing here, and
+#: routing the callback through that one poster is what keeps the ``delivery_submitted``
+#: comment on the same at-most-once ledger as every other lifecycle event.
+OnSubmitted = Callable[[RunContext], None]
+
 #: Audit event names.
 EVENT_STAGE = "delivery.stage"
 EVENT_FIX_DISPATCH = "delivery.fix_dispatch"
@@ -794,6 +804,7 @@ class DeliveryPipeline:
         isolation: WorkspaceBroker | None = None,
         notifier: Notifier | None = None,
         channel: str = "",
+        on_submitted: OnSubmitted | None = None,
     ) -> None:
         self._store = store
         self._project = project
@@ -806,6 +817,7 @@ class DeliveryPipeline:
         self._isolation = isolation
         self._notifier = notifier
         self._channel = channel
+        self._on_submitted = on_submitted
         self._isolated: StageResult | None = None
 
     @property
@@ -1023,6 +1035,7 @@ class DeliveryPipeline:
                 gate_rounds=rounds,
                 declared_gates=declared,
             )
+        self._post_submitted(context, submit)
 
         post_submit = tuple(gate for gate in gates if gate.runs_at(GATE_POSITION_POST_SUBMIT))
         attempts.extend(self._verify(context, gates=post_submit))
@@ -1393,6 +1406,20 @@ class DeliveryPipeline:
         result = self._executor.run(stage, context)
         self._record_stage(result)
         return result
+
+    def _post_submitted(self, context: RunContext, submit: StageResult) -> None:
+        """Announce that the review artifact was raised, once, after submit.
+
+        Only when the submit stage actually spawned a command: a project with no
+        submit stage skips it, and there is no artifact to write back about, so a
+        ``delivery_submitted`` comment then would report a submission that never
+        happened. Best-effort like the rest of the notice path -- the observer is
+        backed by the feedback poster, which records a failure without raising, so
+        a tracker refusal cannot unwind a delivery that already submitted.
+        """
+        if self._on_submitted is None or not submit.executed:
+            return
+        self._on_submitted(context)
 
     def _record_stage(self, result: StageResult) -> None:
         self._record(
