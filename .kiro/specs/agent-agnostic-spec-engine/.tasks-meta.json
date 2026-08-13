@@ -31,7 +31,7 @@
     "9.3": "completed",
     "10.1": "in_progress",
     "10.2": "queued",
-    "11.1": "queued",
+    "11.1": "completed",
     "11.2": "queued",
     "12.1": "queued",
     "12.2": "queued",
@@ -394,6 +394,11 @@
     {
       "ts": "2026-08-13T14:05:52",
       "taskId": "17.6",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-13T15:04:15",
+      "taskId": "11.1",
       "status": "completed"
     }
   ]
