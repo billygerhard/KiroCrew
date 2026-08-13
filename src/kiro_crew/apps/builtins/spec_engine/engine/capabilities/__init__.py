@@ -46,6 +46,15 @@ on its own and free of anything it did not write.
 
 from __future__ import annotations
 
+from .builtins import (
+    AUTHORING_PROVIDER,
+    IMPLEMENTATION_PROVIDER,
+    MODEL_CATALOG_PROVIDER,
+    REVIEW_PROVIDER,
+    HostModelCatalog,
+    ModelResolver,
+    register_builtins,
+)
 from .conformance import (
     CHECK_CLASSES,
     CHECK_DECLARED_COVERAGE,
@@ -167,6 +176,7 @@ from .transports import (
 __all__ = [
     "ARTIFACT_KINDS",
     "AUDIT_EVENT_CAPABILITY",
+    "AUTHORING_PROVIDER",
     "CAPABILITY_TIMEOUT_SETTING",
     "CHECK_CLASSES",
     "CHECK_DECLARED_COVERAGE",
@@ -191,14 +201,17 @@ __all__ = [
     "FIXTURE_MINIMAL_REQUEST",
     "FIXTURE_OVERSIZED_DOCUMENT",
     "FIXTURE_PLANTED_AMBIGUITY",
+    "IMPLEMENTATION_PROVIDER",
     "MAX_DISPLAY_CHARS",
     "MAX_OUTPUT_CHARS",
     "MCP_PROTOCOL_VERSION",
     "MCP_TOOL_PREFIX",
+    "MODEL_CATALOG_PROVIDER",
     "NATIVE_FORMAT_VERSION",
     "OVERSIZED_MIN_CHARS",
     "REQUEST",
     "RESPONSE",
+    "REVIEW_PROVIDER",
     "TRANSPORT_BUILTIN",
     "TRANSPORT_COMMAND",
     "TRANSPORT_MCP",
@@ -230,7 +243,9 @@ __all__ = [
     "EngineFloorViolation",
     "EntryOrigin",
     "FindingSeverity",
+    "HostModelCatalog",
     "McpProviderTransport",
+    "ModelResolver",
     "PayloadSchema",
     "PlantedDefect",
     "ProviderFinding",
@@ -256,6 +271,7 @@ __all__ = [
     "oversized_requirements",
     "published_schemas",
     "published_versions",
+    "register_builtins",
     "require_delegable",
     "resolve_bindings",
     "run_provider_child",

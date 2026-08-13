@@ -40,9 +40,9 @@ never let provider prose forge the structure the engine authored around it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from . import local_analyzer, phases, spec_types
 from .capabilities.contracts import (
@@ -175,6 +175,35 @@ class AnalysisReport:
             )
         return tuple(items)
 
+    def review_rows(self, run: str) -> tuple[dict[str, Any], ...]:
+        """One persistable row per finding, ready to store against a queued run.
+
+        This is the shape a findings sink writes: a flat row per finding rather
+        than the grouped-by-criterion view :meth:`to_review_items` renders, so a
+        store keyed on ``(run, criterion)`` can hold each finding as a row and a
+        surface can re-group them without the engine having pre-decided the
+        grouping. A keyed finding names the engine criterion identifier it
+        concerns; an unkeyed one carries ``None`` and ``keyed=False`` rather than
+        being dropped, because a finding the provider could not key is still a
+        finding a reviewer should see.
+
+        Every finding is rendered through
+        :meth:`~.contracts.ProviderFinding.to_json_object`, which sanitizes the
+        identifier-shaped fields and puts the prose through the display path. The
+        row itself carries no other provider-authored string: ``criterion`` is an
+        engine identifier, ``provider`` is the engine-resolved identity name, and
+        the rest are booleans. So a stored row cannot smuggle a control character
+        past the surface that later renders it, and a crafted message can neither
+        overwrite the line above it nor forge a criterion it does not concern.
+        """
+        rows: list[dict[str, Any]] = []
+        for criterion in sorted(self.by_criterion, key=_criterion_sort_key):
+            for finding in self.by_criterion[criterion]:
+                rows.append(_review_row(run, self, finding, criterion=criterion))
+        for finding in self.unkeyed:
+            rows.append(_review_row(run, self, finding, criterion=None))
+        return tuple(rows)
+
 
 def _criterion_sort_key(identifier: str) -> tuple[int, int, str]:
     """Order criteria numerically by requirement then criterion, then by text.
@@ -188,6 +217,64 @@ def _criterion_sort_key(identifier: str) -> tuple[int, int, str]:
         return (int(requirement), int(criterion), identifier)
     except ValueError:
         return (1 << 30, 1 << 30, identifier)
+
+
+def _review_row(
+    run: str,
+    report: "AnalysisReport",
+    finding: ProviderFinding,
+    *,
+    criterion: str | None,
+) -> dict[str, Any]:
+    """One persistable finding row for the Review_Queue.
+
+    The finding renders through its own ``to_json_object``, which is the display
+    contract: identifier-shaped fields sanitized, prose put through the display
+    path. Nothing else on the row is provider-authored text.
+    """
+    return {
+        "run": run,
+        "criterion": criterion,
+        "keyed": criterion is not None,
+        "provider": report.provider.name,
+        "degraded": report.degraded,
+        "finding": finding.to_json_object(),
+    }
+
+
+class FindingsSink(Protocol):
+    """Where a routed analysis report is recorded against a queued run.
+
+    A narrow seam, mirroring the capability registry's :class:`CostSink`: the
+    engine hands over the rows to persist and does not decide where they live.
+    The durable implementation belongs to the state store and the Review_Queue
+    projection, which own the tables and the human-facing surface.
+    """
+
+    def record(self, ref: SpecRef, *, run: str, report: "AnalysisReport") -> None: ...
+
+
+@dataclass
+class RecordingFindingsSink:
+    """Keeps routed reports in memory. The default when no durable sink is wired.
+
+    Recording rather than discarding matters even before a table exists: a run
+    whose analysis findings were never captured cannot be reconciled afterwards,
+    and "there was nowhere to put them at the time" is not an account of what the
+    analyzer found. It holds the same rows :meth:`AnalysisReport.review_rows`
+    produces, so a caller inspecting what was recorded reads exactly what a
+    durable sink would have stored.
+    """
+
+    recorded: list[dict[str, Any]] = field(default_factory=list)
+
+    def record(self, ref: SpecRef, *, run: str, report: "AnalysisReport") -> None:
+        for row in report.review_rows(run):
+            self.recorded.append({"project": ref.project, "spec": ref.name, **row})
+
+    def rows_for(self, run: str) -> tuple[dict[str, Any], ...]:
+        """Every recorded row belonging to *run*."""
+        return tuple(row for row in self.recorded if row.get("run") == run)
 
 
 def declared_criteria(ref: SpecRef) -> frozenset[str]:
@@ -242,16 +329,33 @@ class AnalysisEngine:
     keying and nothing that the registry already owns.
     """
 
-    def __init__(self, registry: CapabilityRegistry) -> None:
+    def __init__(
+        self,
+        registry: CapabilityRegistry,
+        *,
+        findings_sink: "FindingsSink | None" = None,
+    ) -> None:
         self._registry = registry
         # The construction that wires the fallback. Registering the analyzer as
         # the builtin is what makes a broken external provider degrade to
         # structural analysis rather than to the shipped no-coverage default.
         self._analyzer = local_analyzer.register(registry)
+        # A sink is always present, for the same reason the registry keeps a
+        # RecordingCostSink: a routed report with nowhere to go is a report
+        # nobody can reconcile later. The default records in memory; a durable
+        # sink writing to the state store and the Review_Queue projection is
+        # supplied by the surface that owns those tables.
+        self._findings_sink: FindingsSink = (
+            findings_sink if findings_sink is not None else RecordingFindingsSink()
+        )
 
     @property
     def analyzer(self) -> local_analyzer.LocalAnalyzer:
         return self._analyzer
+
+    @property
+    def findings_sink(self) -> "FindingsSink":
+        return self._findings_sink
 
     def build_request(
         self,
@@ -310,11 +414,18 @@ class AnalysisEngine:
         run, records the call in the audit log, and degrades to the bound builtin
         — the analyzer — on any provider failure. The criteria are read before
         the call so the keys come from the document the request described.
+
+        The routed report is handed to the findings sink before it is returned,
+        which is what gives it a consumer rather than leaving it a value the
+        caller may forget to persist. The default sink records in memory; the
+        durable one keyed to the run is the surface owner's to supply.
         """
         request = self.build_request(ref, run=run, parameters=parameters)
         criteria = declared_criteria(ref)
         result = self._registry.invoke(request, ref=ref, initiator=initiator)
-        return route_findings(result, criteria)
+        report = route_findings(result, criteria)
+        self._findings_sink.record(ref, run=run, report=report)
+        return report
 
 
 def _sidecar_artifact(spec_dir: Path) -> ArtifactRef | None:

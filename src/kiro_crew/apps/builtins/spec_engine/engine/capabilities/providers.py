@@ -78,9 +78,17 @@ def builtin_identity(
 class DeclaredSkipProvider:
     """A builtin that answers with an honest, complete declaration of no coverage.
 
-    Deterministic by construction: it invokes no model, reaches no network, and
-    spends nothing, so it is always available as the fallback that keeps a broken
-    external provider from blocking a run.
+    The ``serve`` call itself is always free: it invokes no model, reaches no
+    network, and spends nothing, so an instance is available as the fallback that
+    keeps a broken external provider from blocking a run.
+
+    :attr:`nature` describes the engine *path* the builtin stands for, not the
+    ``serve`` call. The shipped defaults are deterministic. A capability the
+    engine serves by seeding an agent turn — authoring, review, implementation —
+    registers one of these to declare the same honest no-coverage answer, but
+    with :attr:`ProviderNature.MODEL_BACKED` so a surface shows that the path it
+    stands in for spends credits. Getting that wrong is not cosmetic: it is how an
+    operator learns which capabilities cost money.
     """
 
     capability: str
@@ -89,10 +97,12 @@ class DeclaredSkipProvider:
     #: Body the capability's response schema requires. Empty for capabilities
     #: whose schema needs no fields.
     result: Mapping[str, object] = field(default_factory=dict)
+    #: The nature of the engine path this builtin stands for.
+    nature: ProviderNature = ProviderNature.DETERMINISTIC
 
     @property
     def identity(self) -> ProviderIdentity:
-        return builtin_identity(self.provider_name)
+        return builtin_identity(self.provider_name, nature=self.nature)
 
     def serve(self, request: CapabilityRequest) -> CapabilityResponse:
         # Every requested artifact is named as skipped. Naming the artifacts
