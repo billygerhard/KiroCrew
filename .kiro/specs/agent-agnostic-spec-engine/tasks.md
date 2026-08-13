@@ -145,6 +145,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Named lifecycle events (claimed, awaiting review, delivery submitted, completed, failed or needs-human, refused) mapped to configured commands under the delivery stage-command rules; comment, label, state, assign, and link-artifact operations; bundled presets for the public hosts, per-event override for an organization's tracker, no non-public preset
     - Disabled by default, enabled per event per source through configuration only with no tool able to enable it; at-most-once per run per event recorded in the ledger so a repeated poll, retry, or resumed run does not repeat a delivered writeback
     - Failure recorded and surfaced without failing the run; content composed only from declared templates and engine values, never model-composed text or verbatim item body; zero model credits
+    - Extend `engine/watch/feedback.py` rather than adding a second writeback path. Task 8.4 built the one that posts a configured event's argv through the delivery executor, claims `writeback` per run per event before spawning, records every outcome including unconfigured, and treats a failure as recorded-not-fatal — all four of which this task also requires. A second path would be a second answer to what has already been said to an item, and the two ledgers would disagree the first time a run resumed
     - _Requirements: 36.1, 36.2, 36.3, 36.4, 36.5, 36.6, 36.7, 36.8, 10.10, 37.1_
 
 - [ ] 9. Orchestrator

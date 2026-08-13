@@ -61,6 +61,14 @@ from .dispatch import (
     submitter_class_of,
     unmapped_items,
 )
+from .feedback import (
+    AUDIT_ITEM_FEEDBACK,
+    FEEDBACK_FIELD,
+    FeedbackOutcome,
+    FeedbackReport,
+    load_feedback,
+    post_feedback,
+)
 from .items import ITEM_FIELDS, REQUIRED_ITEM_FIELDS, WatchedItem
 from .lifecycle import (
     CLOSED_STATES,
@@ -124,6 +132,7 @@ from .tick import (
 
 __all__ = [
     "ASSOCIATION_CLASSES",
+    "AUDIT_ITEM_FEEDBACK",
     "CLAIM_NAME_TAKEN",
     "CLAIM_UNMAPPED",
     "CLOSED_STATES",
@@ -209,6 +218,11 @@ __all__ = [
     "submitter_class_of",
     "tick_script_path",
     "class_of_author",
+    "FEEDBACK_FIELD",
+    "FeedbackOutcome",
+    "FeedbackReport",
+    "load_feedback",
     "name_taken_items",
+    "post_feedback",
     "unmapped_items",
 ]

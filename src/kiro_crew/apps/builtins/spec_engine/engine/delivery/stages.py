@@ -287,6 +287,37 @@ class StageExecutor:
             raise ValueError(f"unknown delivery stage: {stage!r}")
         if not commands:
             raise ValueError(f"no commands to run for the {stage!r} stage")
+        return self.run_labelled(
+            stage, context, commands, origin=origin, declared_at=declared_at
+        )
+
+    def run_labelled(
+        self,
+        label: str,
+        context: RunContext,
+        commands: Sequence[CommandTemplate],
+        *,
+        origin: ValueOrigin | None = None,
+        declared_at: str = "",
+    ) -> StageResult:
+        """Run *commands* under *label*, whatever kind of command list it is.
+
+        The execution path with no opinion about what the list is for: validate
+        the whole list, substitute one variable set, refuse a valueless reference
+        before spawning anything, then run in the run's workspace under the
+        configured timeout.
+
+        *label* is not checked against the delivery stages, because the callers
+        are not all stages -- item feedback commands are keyed by lifecycle event.
+        Those callers still come through here rather than growing an executor of
+        their own: a second one would be a second answer to how configured argv
+        gets substituted and spawned, and only one of the two would carry the
+        rule that an empty substitution refuses instead of running a command that
+        means something else.
+        """
+        if not commands:
+            raise ValueError(f"no commands to run for {label!r}")
+        stage = label
         try:
             values = build_variables(context, self._workflow.project_variables())
         except (ConfigValidationError, VariableError) as exc:
