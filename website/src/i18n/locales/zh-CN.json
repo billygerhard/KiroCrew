@@ -4115,6 +4115,48 @@
         "preview_unavailable": "预览不可用"
       }
     },
+    "projectScaffolder": {
+      "manifest": {
+        "display_name": "从项目创建文件夹",
+        "description": "指定一个项目目录，它会找出其中包含哪些子项目，然后为每个子项目创建一个对应的侧边栏文件夹。扫描是只读的，因此在创建任何内容之前，你可以看到完整列表并勾选需要的项。子项目会按照磁盘上的层级嵌套在其父项之下，已经设置好的内容会显示出来，但绝不会重复创建。",
+        "page_label": "生成文件夹",
+        "highlight_1": "先以只读方式扫描，在你确认所选内容之前不会创建任何东西",
+        "highlight_2": "按父目录对预览分组，每组都有全选和全不选",
+        "highlight_3": "高置信度的匹配默认勾选；较弱的匹配供你自行选择",
+        "highlight_4": "显示每个匹配背后的依据，让你了解某个目录为何被选中",
+        "highlight_5": "已有的文件夹会列出但会被跳过，绝不重复创建",
+        "highlight_6": "准确报告创建了哪些、跳过了哪些，以及哪些失败及原因"
+      },
+      "projectScaffolderPage": {
+        "absolute_path_to_a_project_directory": "项目目录的绝对路径",
+        "already_set_up": "已设置",
+        "create_folders": "创建文件夹",
+        "create_folders_from_project": "从项目创建文件夹",
+        "create_the_root_folder_only": "仅创建根文件夹",
+        "creating": "正在创建",
+        "directly_under_the_root": "直接位于根目录下",
+        "n_already_existed": "{{n}} 个已存在",
+        "n_created": "已创建 {{n}} 个",
+        "n_failed": "{{n}} 个失败",
+        "n_selected": "已选择 {{n}} 个",
+        "no_sub_projects_found": "未找到子项目",
+        "nothing_under_this_directory_looked_like_a_proje": "此目录下没有任何内容看起来像一个项目。你仍然可以为该目录本身创建一个文件夹。",
+        "preview": "预览",
+        "project_directory": "项目目录",
+        "re_scan": "重新扫描",
+        "results": "结果",
+        "scan": "扫描",
+        "scan_a_project_directory_then_create_a_sidebar": "扫描一个项目目录，然后为你选择的每个子项目创建一个侧边栏文件夹。",
+        "scanning": "正在扫描",
+        "select_all": "全选",
+        "select_none": "全不选",
+        "signals": "依据",
+        "this_preview_no_longer_matches_the_directory_on": "此预览已与磁盘上的目录不一致。请先重新扫描再创建文件夹。",
+        "tier_confident": "高置信度",
+        "tier_offered": "可选",
+        "warnings": "警告"
+      }
+    },
     "projects": {
       "manifest": {
         "description": "把多步骤的活儿交出去，让它无人值守地跑到完成。用自然语言描述工作、粘贴写好的规格，或者上传 YAML 文件，然后可以先生成计划审查步骤，也可以直接开跑。每次运行都有自己的页面，逐步显示进度，你随时可以暂停、恢复、重试或停止。",

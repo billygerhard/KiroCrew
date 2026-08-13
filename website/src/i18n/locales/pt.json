@@ -4241,6 +4241,48 @@
         "preview_unavailable": "Pré-visualização não disponível"
       }
     },
+    "projectScaffolder": {
+      "manifest": {
+        "display_name": "Criar pastas a partir de um projeto",
+        "description": "Aponte-o para um diretório de projeto e ele descobre quais subprojetos existem dentro, criando depois uma pasta da barra lateral para cada um. A análise é somente de leitura, por isso você vê a lista completa e marca o que quiser antes de qualquer coisa ser criada. Os subprojetos ficam aninhados sob o diretório superior tal como no disco, e o que você já configurou é mostrado mas nunca criado duas vezes.",
+        "page_label": "Gerar pastas",
+        "highlight_1": "Analisa primeiro em modo somente leitura, então nada é criado até você confirmar uma seleção",
+        "highlight_2": "Agrupa a pré-visualização por diretório superior, com selecionar tudo e limpar seleção por grupo",
+        "highlight_3": "As correspondências confiáveis vêm marcadas; as mais fracas ficam para você escolher",
+        "highlight_4": "Mostra os sinais por trás de cada correspondência, para você ver por que um diretório foi escolhido",
+        "highlight_5": "As pastas que você já tem aparecem na lista mas são ignoradas, nunca duplicadas",
+        "highlight_6": "Informa exatamente o que foi criado, o que foi ignorado, e o que falhou e por quê"
+      },
+      "projectScaffolderPage": {
+        "absolute_path_to_a_project_directory": "Caminho absoluto para um diretório de projeto",
+        "already_set_up": "Já configurado",
+        "create_folders": "Criar pastas",
+        "create_folders_from_project": "Criar pastas a partir de um projeto",
+        "create_the_root_folder_only": "Criar apenas a pasta raiz",
+        "creating": "Criando",
+        "directly_under_the_root": "Diretamente sob a raiz",
+        "n_already_existed": "{{n}} já existiam",
+        "n_created": "{{n}} criadas",
+        "n_failed": "{{n}} com falha",
+        "n_selected": "{{n}} selecionadas",
+        "no_sub_projects_found": "Nenhum subprojeto encontrado",
+        "nothing_under_this_directory_looked_like_a_proje": "Nada dentro deste diretório parecia um projeto. Você ainda pode criar uma pasta para o próprio diretório.",
+        "preview": "Pré-visualização",
+        "project_directory": "Diretório do projeto",
+        "re_scan": "Analisar de novo",
+        "results": "Resultados",
+        "scan": "Analisar",
+        "scan_a_project_directory_then_create_a_sidebar": "Analise um diretório de projeto e crie uma pasta da barra lateral para cada subprojeto que escolher.",
+        "scanning": "Analisando",
+        "select_all": "Selecionar tudo",
+        "select_none": "Limpar seleção",
+        "signals": "Sinais",
+        "this_preview_no_longer_matches_the_directory_on": "Esta pré-visualização já não corresponde ao diretório em disco. Analise de novo antes de criar pastas.",
+        "tier_confident": "Confiável",
+        "tier_offered": "Opcional",
+        "warnings": "Avisos"
+      }
+    },
     "projects": {
       "manifest": {
         "description": "Entregue um trabalho de várias etapas e deixe que ele vá até o fim sem supervisão. Descreva o trabalho em linguagem simples, cole uma especificação escrita ou envie um arquivo YAML e, então, gere primeiro um plano para revisar as etapas ou comece na hora. Cada execução ganha uma página própria com o progresso passo a passo, e você pode pausar, retomar, tentar novamente ou parar a qualquer momento.",
