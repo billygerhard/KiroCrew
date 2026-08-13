@@ -705,6 +705,15 @@ class ComputerUseConfig:
     screenshot_jpeg_quality: int = 55   # JPEG quality (NOT browse's 70); 1280/q55 measured at ~8.3K tokens vs 41K for a raw PNG
 
 @dataclass
+class ScaffoldConfig:
+    # Limits for the read-only project scanner behind POST /api/chat/folders/scan —
+    # see learn-cron-dashboard.md → "Chat Folder Scaffolding". The scanner takes both
+    # values as ARGUMENTS and never reads config itself, which is what keeps its output
+    # a pure function of the filesystem plus these two settings.
+    extra_manifest_signals: list[str] = []  # extra manifest FILENAMES (bare names, not paths) that mark a directory as a package, on top of the built-in set (package.json, pyproject.toml, Cargo.toml, go.mod, pom.xml, build.gradle, build.gradle.kts). Additive only — a bad value costs a false positive rather than silently disabling detection of an ecosystem; non-string entries are dropped at load; blank entries are ignored by the scanner.
+    depth_cap: int = 5                      # directory levels below the scan root the walk descends (DEFAULT_SCAFFOLD_DEPTH_CAP). Load-time floor of 1: a cap of 0 would scan nothing and read as a broken scanner rather than as a wrong cap.
+
+@dataclass
 class MessagingConfig:
     use_transport: bool = True     # route inbound Slack through SlackTransport → TurnDriver → SlackRenderer (the canonical path); false falls back to the native handle_message monolith
 
