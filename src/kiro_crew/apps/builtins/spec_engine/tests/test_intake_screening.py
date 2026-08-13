@@ -347,6 +347,42 @@ class TestThePollPathScreens:
         events = _trust_events(state, seed.ref)
         assert events[0].detail["context"]["verdict"] == ScreeningVerdict.UNAVAILABLE.value
 
+    def test_a_provider_fault_it_never_declared_also_fails_closed(self, tmp_path: Path) -> None:
+        """A provider can fail in ways it did not declare, and must still quarantine.
+
+        It spawns a turn and parses a response, so a timeout, an unparseable or
+        empty verdict, or a library raising its own type are all reachable. When
+        only the declared exception was caught, those escaped to the dispatcher
+        and became a refusal AFTER the run row existed -- fail-closed, but the row
+        held a concurrency slot with no quarantine and no screening record, which
+        is a worse outcome to explain than the one it replaced.
+        """
+        tree = _tree(tmp_path)
+        state = StateStore(root=tmp_path / "state")
+        config = _write_config(tmp_path, tree)
+        starter = _Starter()
+
+        class ExplodingProvider:
+            def screen(self, request: object) -> object:
+                raise TimeoutError("the screening turn did not answer")
+
+        dispatch_source(
+            state,
+            config,
+            _polled(_item()),
+            gate=_AllowAll(),
+            start=starter,
+            screener=_screener(config, state, ExplodingProvider()),
+        )
+
+        assert starter.seeds, "the item was refused instead of quarantined"
+        seed = starter.seeds[0]
+        assert seed.autonomy.level is AutonomyLevel.AUTHORING
+        run = state.get_run(seed.run_id)
+        assert run is not None and run.detail.get("screening_quarantined") is True
+        events = _trust_events(state, seed.ref)
+        assert events[0].detail["context"]["verdict"] == ScreeningVerdict.UNAVAILABLE.value
+
 
 # --- the queue path --------------------------------------------------------
 
@@ -527,6 +563,37 @@ class TestOptOutCostAndGuidance:
         tree = _tree(tmp_path)
         # A wildcard opt-out is not honoured, so it cannot disable them all at once.
         config = _write_config(tmp_path, tree, extra_source={"screening": {"default": False}})
+        for klass in ("maintainer", "member", "contributor", "external"):
+            assert screening_enabled_for(config, SOURCE, klass) is True
+
+    def test_a_wildcard_opt_out_still_screens_a_dispatched_item(self, tmp_path: Path) -> None:
+        """The same rule, asserted end to end rather than on the reader alone.
+
+        Its sibling above checks ``screening_enabled_for`` directly, so both fail
+        together only if the rule itself goes -- and deleting one cannot quietly
+        reopen a disable-all, which is what a single test holding a security
+        invariant allows.
+        """
+        tree = _tree(tmp_path)
+        state = StateStore(root=tmp_path / "state")
+        config = _write_config(tmp_path, tree, extra_source={"screening": {"default": False}})
+        starter = _Starter()
+
+        dispatch_source(
+            state,
+            config,
+            _polled(_item()),
+            gate=_AllowAll(),
+            start=starter,
+            screener=_screener(config, state, SuspectProvider()),
+        )
+
+        # The wildcard did not disable it: the suspect verdict still quarantined.
+        assert starter.seeds[0].autonomy.level is AutonomyLevel.AUTHORING
+
+    def test_an_unknown_class_key_cannot_opt_anything_out(self, tmp_path: Path) -> None:
+        tree = _tree(tmp_path)
+        config = _write_config(tmp_path, tree, extra_source={"screening": {"maintainerz": False}})
         for klass in ("maintainer", "member", "contributor", "external"):
             assert screening_enabled_for(config, SOURCE, klass) is True
 

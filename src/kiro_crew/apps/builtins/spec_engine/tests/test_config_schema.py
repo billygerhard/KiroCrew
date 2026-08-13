@@ -152,6 +152,25 @@ class TestDocumentValidation:
     def test_source_requires_a_poll_command(self):
         assert _paths({"sources": {"s": {"project": "acme"}}}) == ["sources.s.poll"]
 
+    def test_a_per_class_screening_opt_out_validates(self):
+        doc = {"sources": {"s": {"poll": ["gh"], "screening": {"maintainer": False}}}}
+        assert _paths(doc) == []
+
+    def test_screening_refuses_the_default_key_that_would_disable_it_for_everyone(self):
+        doc = {"sources": {"s": {"poll": ["gh"], "screening": {"default": False}}}}
+        errors = validate_config_document(doc)
+        assert [e.path for e in errors] == ["sources.s.screening.default"]
+        # The reader refuses it too. Enforcing it here as well is what lets an
+        # operator find out at the moment they save, instead of saving a setting
+        # that is silently ignored and believing screening is off.
+        assert "no single setting" in errors[0].message
+
+    def test_screening_rejects_an_unknown_class_and_a_non_boolean(self):
+        doc = {"sources": {"s": {"poll": ["gh"], "screening": {"maintainerz": False}}}}
+        assert _paths(doc) == ["sources.s.screening.maintainerz"]
+        doc = {"sources": {"s": {"poll": ["gh"], "screening": {"external": "no"}}}}
+        assert _paths(doc) == ["sources.s.screening.external"]
+
     def test_engine_floor_capability_cannot_be_bound(self):
         for capability in ENGINE_FLOOR_CAPABILITIES:
             doc = {"capabilities": {capability: {"transport": "mcp", "command": ["x"]}}}

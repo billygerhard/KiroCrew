@@ -472,6 +472,30 @@ class IntakeScreener:
                 reason=f"the screening provider could not produce a verdict: {exc}",
             )
             return self._record(run_id, ref, outcome)
+        except Exception as exc:  # noqa: BLE001 - any provider fault must quarantine
+            # A provider is a host seam: it spawns a turn, parses a response, and
+            # can fail in ways it never declared -- a timeout, an unparseable or
+            # empty verdict, a library raising its own type. Catching only the
+            # declared exception let those escape to the dispatcher, which turned
+            # them into a refusal AFTER the run row existed: fail-closed, but it
+            # left a row occupying a concurrency slot with no quarantine and no
+            # screening record. Treating any fault as unavailable keeps the
+            # fail-closed direction and makes the outcome one an operator can see.
+            logger.warning(
+                "the screening provider raised %s for element %r; treating as unavailable",
+                type(exc).__name__,
+                element.element_id,
+                exc_info=exc,
+            )
+            outcome = ElementScreening(
+                trust=trust,
+                verdict=ScreeningVerdict.UNAVAILABLE,
+                reason=(
+                    "the screening provider failed with "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+            return self._record(run_id, ref, outcome)
         verdict = (
             ScreeningVerdict.SUSPECTED_INJECTION if response.suspected else ScreeningVerdict.CLEAN
         )

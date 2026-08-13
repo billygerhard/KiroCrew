@@ -175,6 +175,7 @@ SOURCE_FIELDS: tuple[str, ...] = (
     "spec_types",
     "autonomy",
     "intake",
+    "screening",
     "spend_cap",
     "feedback",
 )
@@ -584,10 +585,44 @@ def _check_source(errors: list[ConfigError], entry: Mapping[str, Any], path: str
             _check_spend_cap(errors, value, field_path)
         elif key == "feedback":
             _check_feedback(errors, value, field_path)
+        elif key == "screening":
+            _check_screening(errors, value, field_path)
         else:
             errors.append(ConfigError(field_path, "unknown source field"))
     if "poll" not in entry:
         errors.append(ConfigError(f"{path}.poll", "required source field is missing"))
+
+
+def _check_screening(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate a per-submitter-class intake screening opt-out.
+
+    Deliberately stricter than the sibling maps above in one respect: the
+    wildcard key every other class-keyed setting accepts is refused here,
+    because screening is what stops attacker-authored text from steering a run
+    and one key that turned it off for every class would be the disable-all
+    switch the requirement forbids. The reader defends the same rule, so this is
+    the second place it holds rather than the only one -- but it is the place an
+    operator finds out, instead of saving a setting that is silently ignored.
+    """
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object keyed by submitter class"))
+        return
+    for klass, enabled in value.items():
+        klass_path = f"{path}.{klass}"
+        if klass == WILDCARD_KEY:
+            errors.append(
+                ConfigError(
+                    klass_path,
+                    "screening has no default key: it is opted out per submitter class so that "
+                    "no single setting can disable it for every class",
+                )
+            )
+            continue
+        if klass not in SUBMITTER_CLASSES:
+            errors.append(ConfigError(klass_path, "unknown submitter class"))
+            continue
+        if not isinstance(enabled, bool):
+            errors.append(ConfigError(klass_path, "expected true or false"))
 
 
 def _check_autonomy(errors: list[ConfigError], value: Any, path: str) -> None:
