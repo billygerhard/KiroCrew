@@ -5,7 +5,7 @@ already passed the schema, so nothing here refuses a write; each advisory names 
 combination that is legal, saved, and worth telling the operator about before
 they walk away from it.
 
-Two advisories live here, and they share one reason to exist: the moment the
+Two advisories share one reason to exist: the moment the
 document is written is the last moment a human is present, and both conditions
 otherwise surface hours later in an unattended run with nobody reading its output.
 
@@ -22,14 +22,30 @@ routes review to a specific agent is making a quality decision, and an agent who
 tool allowlist filters the engine's MCP server cannot record a verdict at all. The
 run would fail mid-flight, at the point the assignment was supposed to improve.
 
+A third advisory is stronger than a warning, because a stranger is on the other
+end of it. **Execution-or-higher autonomy armed on a publicly submittable
+source** means an item created by someone the operator has never met can start a
+run that spends credits and runs configured commands with no human gate. So this
+one both warns *and* requires an acknowledgment: the warning is the last point
+the operator is told what they are turning on, and the acknowledgment is the
+record that they were told. The warning is emitted whenever the source is public
+— including when the operator never said whether it is, because undetermined
+resolves to public here for the same reason the trust model treats an unknown
+author as least-trusted: the safe direction when unsure is to warn, not to stay
+silent. "Execution or higher" is read off the ladder's own ordering rather than a
+list of level names, so a rung added above execution later is covered without an
+edit here.
+
 The warning is raised **where the setting is written**, not where it would fire,
 and it carries the dotted path of the declaration rather than a prose description
 of it, so an operator lands on the exact key to change.
 
-Recording is left to the caller through :data:`WarningRecorder`. The audit log is
+Recording is left to the caller through :data:`WarningRecorder` (for warnings)
+and :func:`acknowledge` (for the acknowledgment record). The audit log is
 per-spec and a configuration edit is per-project, so binding the two here would
 force this module to invent a spec identity it does not have; a surface that has
-one passes a recorder, and a surface that does not still gets the warning.
+one passes a recorder and records the acknowledgment, and a surface that does not
+still gets the warning.
 """
 
 from __future__ import annotations
@@ -40,7 +56,7 @@ from typing import Any, Callable, Mapping, Sequence
 from .agent_surface import ENGINE_MCP_SERVER, AgentSurfaceLookup, disk_lookup
 from .effective import resolve
 from .profiles import FIELD_AGENT, profiles
-from .schema import SECTION_PROJECTS, SECTION_WORKFLOW
+from .schema import AUTONOMY_LEVELS, SECTION_PROJECTS, SECTION_SOURCES, SECTION_WORKFLOW
 from .settings import SETTINGS
 
 #: Stable identifier for the auto-integration-without-verification advisory.
@@ -55,8 +71,16 @@ AGENT_MISSING_ENGINE_TOOLS = "cost_profiles.agent_missing_engine_tools"
 #: An assigned agent has no configuration this host can find.
 AGENT_NOT_INSTALLED = "cost_profiles.agent_not_installed"
 
+#: Execution-or-higher autonomy is armed on a publicly submittable source. Unlike
+#: the other advisories this one requires an acknowledgment, because a stranger
+#: can create the item that starts the run it authorizes.
+PUBLIC_SOURCE_AUTONOMY = "sources.public_source_autonomy"
+
 #: Audit event name for a recorded configuration warning.
 CONFIG_WARNING_EVENT = "config.warning"
+
+#: Audit event name for a recorded acknowledgment of a warning that requires one.
+CONFIG_ACKNOWLEDGMENT_EVENT = "config.acknowledgment"
 
 #: The setting that arms unattended integration.
 AUTO_INTEGRATE_SETTING = "delivery.auto_integrate"
@@ -65,6 +89,23 @@ AUTO_INTEGRATE_SETTING = "delivery.auto_integrate"
 #: whose absence this module asks about.
 _STAGES_KEY = "stages"
 _VERIFY_STAGE = "verify"
+
+#: Source-entry key declaring whether items are publicly submittable. The schema
+#: owns the source field vocabulary; this names the one this module reads.
+_PUBLIC_KEY = "public"
+
+#: Source-entry key holding the per-(class, type) autonomy grid. Named locally
+#: for the same reason the poller names its own keys: this module reads config,
+#: it does not import the resolver that also names this field, so a circular
+#: import between the config package and the autonomy resolver stays impossible.
+_AUTONOMY_KEY = "autonomy"
+
+#: The ladder rung at which unattended execution begins. Named once; the covered
+#: set is everything at or above it in :data:`AUTONOMY_LEVELS`, so a rung added
+#: above execution later is covered without editing this module. Enumerating the
+#: covered names instead ("execution", "delivery", "integration") is the exact
+#: shape that stops covering a level the ladder gains after it was written.
+_EXECUTION_LEVEL = "execution"
 
 
 @dataclass(frozen=True)
@@ -76,6 +117,11 @@ class ConfigWarning:
     message: str
     #: The project the warning applies to, ``None`` for an app-wide setting.
     project: str | None = None
+    #: Whether an operator must acknowledge this warning, not merely be shown it.
+    #: Most advisories are for display; this is set only where a warning names an
+    #: authority a stranger could exercise, so the record that the operator was
+    #: told is worth keeping. An acknowledgment is built through :func:`acknowledge`.
+    requires_acknowledgment: bool = False
 
     def __str__(self) -> str:  # pragma: no cover - display only
         return f"{self.path}: {self.message}"
@@ -91,6 +137,61 @@ class ConfigWarning:
 
 #: Handed each warning by a surface that wants to show or record it.
 WarningRecorder = Callable[[ConfigWarning], None]
+
+
+@dataclass(frozen=True)
+class Acknowledgment:
+    """A human's explicit acknowledgment of one warning that requires one.
+
+    The point of the type is that it cannot be produced implicitly. It is built
+    only by :func:`acknowledge`, which refuses a warning that does not ask for an
+    acknowledgment and refuses an empty actor — so an absent key, a default
+    value, or anything the engine wrote for itself can never stand in for a human
+    saying "yes, I know what this arms". ``actor`` is who said it; ``code`` and
+    ``path`` tie it to the exact declaration, so an acknowledgment of one source
+    is not silently reused for another.
+    """
+
+    code: str
+    path: str
+    actor: str
+    project: str | None = None
+
+    def __str__(self) -> str:  # pragma: no cover - display only
+        return f"{self.actor} acknowledged {self.code} at {self.path}"
+
+    @property
+    def detail(self) -> dict[str, Any]:
+        """Audit detail: what was acknowledged, where, and by whom."""
+        record: dict[str, Any] = {"code": self.code, "path": self.path, "actor": self.actor}
+        if self.project is not None:
+            record["project"] = self.project
+        return record
+
+
+def acknowledge(warning: ConfigWarning, actor: str) -> Acknowledgment:
+    """Build the record that *actor* was warned about *warning* and proceeded.
+
+    The two guards are the whole point: an acknowledgment that a default value,
+    an absent field, or the engine itself could satisfy would record nothing an
+    operator actually did.
+
+    Raises ``ValueError`` when *warning* does not require an acknowledgment (only
+    ack-requiring warnings have one to give), and when *actor* is empty or blank
+    (an acknowledgment with nobody behind it is the implicit acceptance the
+    warning exists to prevent).
+    """
+    if not warning.requires_acknowledgment:
+        raise ValueError(f"warning {warning.code!r} does not require an acknowledgment")
+    identity = actor.strip()
+    if not identity:
+        raise ValueError("an acknowledgment needs the identity of who gave it")
+    return Acknowledgment(
+        code=warning.code,
+        path=warning.path,
+        actor=identity,
+        project=warning.project,
+    )
 
 
 def document_warnings(
@@ -112,6 +213,7 @@ def document_warnings(
     """
     warnings: list[ConfigWarning] = []
     warnings.extend(_assigned_agent_warnings(doc, agents))
+    warnings.extend(_public_source_autonomy_warnings(doc))
     projects = doc.get(SECTION_PROJECTS)
     names = tuple(projects) if isinstance(projects, Mapping) else ()
     if not names:
@@ -194,6 +296,93 @@ def _assigned_agent_warnings(
             )
         )
     return tuple(warnings)
+
+
+def _public_source_autonomy_warnings(doc: Mapping[str, Any]) -> tuple[ConfigWarning, ...]:
+    """One warning per publicly submittable source that arms execution or higher.
+
+    One per source, not one per armed grid cell: a source is the unit an operator
+    turned autonomy on for, and a source that grants execution to three submitter
+    classes is one decision to acknowledge, not three. The armed cells are named
+    in the message so the operator can see exactly which grants earned it.
+    """
+    sources = doc.get(SECTION_SOURCES)
+    if not isinstance(sources, Mapping):
+        return ()
+    warnings: list[ConfigWarning] = []
+    for name, entry in sources.items():
+        if not isinstance(name, str) or not isinstance(entry, Mapping):
+            continue
+        if not _source_is_public(entry):
+            continue
+        armed = _armed_autonomy_cells(entry, name)
+        if not armed:
+            continue
+        base_path = f"{SECTION_SOURCES}.{name}.{_AUTONOMY_KEY}"
+        grants = ", ".join(f"{cell} = {level}" for cell, level in armed)
+        warnings.append(
+            ConfigWarning(
+                code=PUBLIC_SOURCE_AUTONOMY,
+                path=base_path,
+                message=(
+                    f"source {name!r} accepts publicly submitted items and grants "
+                    f"execution-or-higher autonomy ({grants}), so an item created by "
+                    "anyone can start a run that spends credits and runs configured "
+                    "commands with no human gate; acknowledge this or lower the autonomy "
+                    "level, and set this source's 'public' flag to false if its items "
+                    "are not publicly submittable"
+                ),
+                requires_acknowledgment=True,
+            )
+        )
+    return tuple(warnings)
+
+
+def _source_is_public(entry: Mapping[str, Any]) -> bool:
+    """Whether a source's items are publicly submittable.
+
+    Undetermined is public. A source that never declared the flag resolves to
+    public so the warning fires when the operator has not said, matching the
+    trust model's least-trusted-when-unknown stance: a spurious warning costs a
+    sentence read, a missed one costs an unattended run a stranger started.
+    """
+    declared = entry.get(_PUBLIC_KEY)
+    if isinstance(declared, bool):
+        return declared
+    return True
+
+
+def _armed_autonomy_cells(entry: Mapping[str, Any], name: str) -> tuple[tuple[str, str], ...]:
+    """The (dotted path, level) of every grid cell at execution or higher."""
+    grid = entry.get(_AUTONOMY_KEY)
+    if not isinstance(grid, Mapping):
+        return ()
+    armed: list[tuple[str, str]] = []
+    for class_key, by_type in grid.items():
+        if not isinstance(class_key, str) or not isinstance(by_type, Mapping):
+            continue
+        for type_key, level in by_type.items():
+            if not isinstance(type_key, str) or not isinstance(level, str):
+                continue
+            if _is_execution_or_higher(level):
+                cell = f"{SECTION_SOURCES}.{name}.{_AUTONOMY_KEY}.{class_key}.{type_key}"
+                armed.append((cell, level))
+    return tuple(armed)
+
+
+def _is_execution_or_higher(level: str) -> bool:
+    """Whether *level* is execution or a more autonomous rung of the ladder.
+
+    Derived from :data:`AUTONOMY_LEVELS`, the ladder's single owner, so "or
+    higher" tracks the ordering rather than a frozen list of names. An
+    unrecognised level (which a validated document cannot hold, but a hand-edited
+    file reaching this read can) is treated as covered: warn when unsure.
+    """
+    try:
+        rank = AUTONOMY_LEVELS.index(level)
+    except ValueError:
+        return True
+    return rank >= AUTONOMY_LEVELS.index(_EXECUTION_LEVEL)
 
 
 def _auto_integrate_warnings(

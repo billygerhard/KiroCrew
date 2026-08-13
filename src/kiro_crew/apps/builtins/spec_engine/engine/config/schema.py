@@ -167,6 +167,7 @@ SOURCE_FIELDS: tuple[str, ...] = (
     "enabled",
     "poll",
     "field_map",
+    "public",
     "project",
     "base_branch",
     "preset",
@@ -554,6 +555,14 @@ def _check_source(errors: list[ConfigError], entry: Mapping[str, Any], path: str
         if key in SETTING_GROUPS:
             _check_group(errors, key, value, Scope.SOURCE, field_path)
         elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append(ConfigError(field_path, "expected true or false"))
+        elif key == "public":
+            # Whether this source's items are publicly submittable, which decides
+            # whether arming unattended execution on it earns the public-source
+            # advisory. Absence is deliberately left to the advisory to read as
+            # undetermined; the schema only pins the shape when the operator does
+            # declare it.
             if not isinstance(value, bool):
                 errors.append(ConfigError(field_path, "expected true or false"))
         elif key == "poll":
