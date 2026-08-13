@@ -11,6 +11,7 @@ that the runner was called.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -19,6 +20,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from kiro_crew.apps.builtins.spec_engine.engine import mutation_probe
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import CommandOutcome
 from kiro_crew.apps.builtins.spec_engine.engine.mutation_probe import (
     CoveringCheck,
@@ -533,3 +535,96 @@ def test_restore_is_byte_identical_for_any_surrounding_content(
     with pytest.raises(RuntimeError):
         run_probe(raising, tree_root=tree, runner=RaisingRunner())
     assert target.read_bytes() == before
+
+
+# --- the gate command: the outcome has to survive being an exit status ---------
+
+
+def _spec_file(tmp_path: Path, mechanism: Path, *, argv: list[str], replacement: str) -> Path:
+    spec = tmp_path / "mutation-probe.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "behaviour": "parity check",
+                "path": str(mechanism),
+                "original": "n % 2 == 0",
+                "replacement": replacement,
+                "covering": [{"name": "parity-test", "argv": argv}],
+            }
+        )
+    )
+    return spec
+
+
+def test_a_caught_mutation_exits_zero_so_the_gate_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mechanism = _mechanism(tmp_path)
+    spec = _spec_file(tmp_path, mechanism, argv=["parity-check"], replacement="True")
+    # A real covering check: green on the clean tree, red once the guard is gone.
+    monkeypatch.setattr(
+        mutation_probe,
+        "run_argv",
+        lambda argv, *, cwd, timeout_s: (FAILED if "True" in mechanism.read_text() else PASSED),
+    )
+
+    assert mutation_probe.main([str(spec), "--tree-root", str(tmp_path)]) == 0
+
+
+def test_a_survived_mutation_exits_nonzero_so_the_gate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of 30.2 as a gate: green-under-mutation must FAIL the gate.
+
+    A pipeline reads the exit status and nothing else, so if this returned zero the
+    requirement would be unenforceable no matter what the record said.
+    """
+    mechanism = _mechanism(tmp_path)
+    spec = _spec_file(tmp_path, mechanism, argv=["blind-check"], replacement="True")
+    monkeypatch.setattr(mutation_probe, "run_argv", lambda argv, *, cwd, timeout_s: PASSED)
+
+    assert mutation_probe.main([str(spec), "--tree-root", str(tmp_path)]) == 1
+
+
+def test_an_inconclusive_probe_is_distinguishable_from_a_survived_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed mutation and an uncovered behaviour need different actions.
+
+    Collapsing them would send someone to write tests for what is actually a typo
+    in the spec, so the exit statuses differ.
+    """
+    mechanism = _mechanism(tmp_path)
+    spec = _spec_file(
+        tmp_path, mechanism, argv=["parity-check"], replacement="never-appears-anywhere"
+    )
+    spec.write_text(spec.read_text().replace('"n % 2 == 0"', '"text that is not present"'))
+    monkeypatch.setattr(mutation_probe, "run_argv", lambda argv, *, cwd, timeout_s: PASSED)
+
+    code = mutation_probe.main([str(spec), "--tree-root", str(tmp_path)])
+
+    assert code == 2
+    assert code != 1
+
+
+def test_a_spec_declaring_no_covering_checks_is_refused(tmp_path: Path) -> None:
+    """No checks would run nothing and then report a survived mutation.
+
+    That is the gate failing for the wrong reason -- indistinguishable from real
+    uncovered behaviour -- so an empty covering list is refused as malformed.
+    """
+    mechanism = _mechanism(tmp_path)
+    spec = tmp_path / "mutation-probe.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "behaviour": "parity check",
+                "path": str(mechanism),
+                "original": "n % 2 == 0",
+                "replacement": "True",
+                "covering": [],
+            }
+        )
+    )
+
+    assert mutation_probe.main([str(spec), "--tree-root", str(tmp_path)]) == 2

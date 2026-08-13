@@ -41,8 +41,12 @@ Five hazards this probe is built to refuse rather than paper over:
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
+import sys
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -470,3 +474,101 @@ def _restore(target: Path, original_bytes: bytes, mutation: Mutation) -> None:
                 f"could not restore {target} after probing {mutation.behaviour!r}; "
                 "the mechanism may be left neutered"
             )
+
+
+#: Exit status when the mutation was caught -- the only outcome a gate passes on.
+EXIT_CAUGHT = 0
+#: Exit status when the covering checks stayed green under the mutation. This is
+#: the gate FAILURE the task exists to produce: a behaviour whose tests do not
+#: notice it being broken is not covered, and a still-green suite is a failure
+#: rather than a comment.
+EXIT_SURVIVED = 1
+#: Exit status when the probe could not gather evidence at all. Distinct from
+#: SURVIVED on purpose: "your mutation was malformed" and "your tests do not
+#: cover this" call for different actions, and a gate that collapsed them would
+#: send someone to write tests for a typo.
+EXIT_INCONCLUSIVE = 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one probe described by a JSON spec file and report through the exit code.
+
+    This is the entry point a Quality_Gate configures: the delivery pipeline runs
+    configured gate commands and reads their exit status, so the probe has to speak
+    that language rather than return a record only Python can read. The spec is a
+    file rather than flags because a mutation's original and replacement are code
+    fragments, and putting code fragments through shell quoting is how a probe ends
+    up measuring something other than what was written.
+    """
+    parser = argparse.ArgumentParser(
+        prog="mutation-probe",
+        description="Neuter one mechanism, run its covering checks, require a failure.",
+    )
+    parser.add_argument("spec", type=Path, help="JSON file describing the mutation")
+    parser.add_argument(
+        "--tree-root",
+        type=Path,
+        default=None,
+        help="the tree the mutation is inside (default: the working directory)",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    tree_root = args.tree_root if args.tree_root is not None else Path.cwd()
+
+    try:
+        document = json.loads(args.spec.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"mutation-probe: cannot read {args.spec}: {exc}", file=sys.stderr)
+        return EXIT_INCONCLUSIVE
+    try:
+        mutation = _mutation_from_document(document, spec_dir=args.spec.parent)
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"mutation-probe: {args.spec} is not a valid mutation spec: {exc}", file=sys.stderr)
+        return EXIT_INCONCLUSIVE
+
+    # Passed explicitly rather than left to run_probe's default: a default binds at
+    # definition time, so the entry point would be the one path whose runner could
+    # not be substituted -- and that is the path a gate actually takes.
+    result = run_probe(mutation, tree_root=tree_root, runner=run_argv)
+    print(json.dumps(result.to_json_object(), indent=2))
+    if result.outcome is ProbeOutcome.CAUGHT:
+        return EXIT_CAUGHT
+    print(f"mutation-probe: {result.gate_failure_reason()}", file=sys.stderr)
+    return EXIT_SURVIVED if result.outcome is ProbeOutcome.SURVIVED else EXIT_INCONCLUSIVE
+
+
+def _mutation_from_document(document: object, *, spec_dir: Path) -> Mutation:
+    """Build a Mutation from the parsed spec, refusing anything underspecified.
+
+    Every field is required. A default for ``replacement`` would let a spec neuter
+    a mechanism by deleting text it never named, and a default for ``covering``
+    would run no checks and then report a survived mutation -- the gate failing for
+    the wrong reason, which is worse than not running.
+    """
+    if not isinstance(document, Mapping):
+        raise TypeError("expected a JSON object")
+    covering_raw = document["covering"]
+    if not isinstance(covering_raw, list) or not covering_raw:
+        raise ValueError("covering must be a non-empty list of checks")
+    covering: list[CoveringCheck] = []
+    for entry in covering_raw:
+        if not isinstance(entry, Mapping):
+            raise TypeError("each covering check must be an object")
+        argv = entry["argv"]
+        if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+            raise ValueError("a covering check's argv must be a list of strings")
+        covering.append(CoveringCheck(name=str(entry["name"]), argv=tuple(argv)))
+    path = Path(str(document["path"]))
+    return Mutation(
+        behaviour=str(document["behaviour"]),
+        # A relative path resolves against the SPEC's directory, not the process
+        # working directory, so a spec committed beside the code it probes means the
+        # same thing wherever the gate is run from.
+        path=path if path.is_absolute() else (spec_dir / path),
+        original=str(document["original"]),
+        replacement=str(document["replacement"]),
+        covering=tuple(covering),
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry point
+    raise SystemExit(main())

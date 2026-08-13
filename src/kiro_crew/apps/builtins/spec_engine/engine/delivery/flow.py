@@ -371,6 +371,26 @@ QUALITY_GATE_PRESETS: Mapping[str, Mapping[str, Any]] = {
         "severity": GATE_SEVERITY_BLOCKING,
         "commands": [["make", "typecheck"]],
     },
+    "mutation-probe": {
+        "name": "mutation-probe",
+        "position": GATE_POSITION_PRE_SUBMIT,
+        "severity": GATE_SEVERITY_BLOCKING,
+        # Blocking on purpose: a behaviour whose covering checks stay green while
+        # its mechanism is neutered is not covered, and that is a failure rather
+        # than a comment. The spec file names the mechanism, the replacement that
+        # neuters it, and the checks that claim to cover it; a project commits one
+        # beside the code it probes and points this command at it. Last in the
+        # table because it is the only gate that asks about the TESTS rather than
+        # about the code.
+        "commands": [
+            [
+                "python",
+                "-m",
+                "kiro_crew.apps.builtins.spec_engine.engine.mutation_probe",
+                "mutation-probe.json",
+            ]
+        ],
+    },
 }
 
 

@@ -1451,7 +1451,13 @@ class TestGateRecording:
 
 class TestGateConfiguration:
     def test_the_bundled_presets_cover_tests_coverage_lint_and_type_checks(self) -> None:
-        assert set(QUALITY_GATE_PRESETS) == {"tests", "coverage", "lint", "types"}
+        assert set(QUALITY_GATE_PRESETS) == {
+            "tests",
+            "coverage",
+            "lint",
+            "types",
+            "mutation-probe",
+        }
 
     def test_a_preset_is_valid_configuration_and_loads_back_as_a_gate(
         self, store: ConfigStore
@@ -1465,7 +1471,13 @@ class TestGateConfiguration:
 
         loaded = load_quality_gates(store.document())
 
-        assert [entry.name for entry in loaded] == ["tests", "coverage", "lint", "types"]
+        assert [entry.name for entry in loaded] == [
+            "tests",
+            "coverage",
+            "lint",
+            "types",
+            "mutation-probe",
+        ]
         severities = {entry.name: entry.severity for entry in loaded}
         assert severities["tests"] == GATE_SEVERITY_BLOCKING
         # A coverage threshold dips on an honest refactor, so it reports rather
