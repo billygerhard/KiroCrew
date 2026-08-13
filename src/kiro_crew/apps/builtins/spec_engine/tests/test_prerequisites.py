@@ -431,6 +431,115 @@ class TestWatchSourceChecks:
         assert "no poll command" in report.unmet[0].missing
         assert report.unmet[0].source == "never-declared"
 
+    def test_a_feedback_program_missing_is_unmet_before_the_run(
+        self, config: ConfigStore
+    ) -> None:
+        """The failure this coverage exists for: a feedback program absent on PATH.
+
+        Without this check the missing program is discovered as a failed writeback
+        that keeps its ledger claim, suppressing the event for the whole run. Here
+        it is an unmet prerequisite that names the program, the event, and the
+        source before a credit is spent.
+        """
+        configure(
+            config,
+            {
+                "sources": {
+                    "tracker": {
+                        "poll": ["list-issues"],
+                        "feedback": {"completed": [["gh", "issue", "comment"]]},
+                    }
+                }
+            },
+        )
+        report = check_source(config, "tracker", which=resolver("list-issues"))
+
+        assert not report.met
+        unmet = report.unmet[0]
+        assert unmet.check is CheckName.WATCH_PROGRAMS
+        assert unmet.source == "tracker"
+        assert "gh" in unmet.missing
+        assert "completed" in unmet.missing
+        assert unmet.declared_at == "sources.tracker.feedback.completed"
+
+    def test_feedback_programs_present_alongside_poll_is_met(
+        self, config: ConfigStore
+    ) -> None:
+        configure(
+            config,
+            {
+                "sources": {
+                    "tracker": {
+                        "poll": ["list-issues"],
+                        "feedback": {
+                            "claimed": [["gh", "issue", "comment"]],
+                            "completed": [["gh", "issue", "edit"]],
+                        },
+                    }
+                }
+            },
+        )
+        assert check_source(config, "tracker", which=resolver("list-issues", "gh")).met
+
+    def test_every_feedback_program_is_checked_not_only_the_first(
+        self, config: ConfigStore
+    ) -> None:
+        """A second command in the same event, and a second event, both count.
+
+        A check that only looked at the first command or the first event would
+        pass a host missing the program the later one needs.
+        """
+        configure(
+            config,
+            {
+                "sources": {
+                    "tracker": {
+                        "poll": ["list-issues"],
+                        "feedback": {
+                            "claimed": [["gh", "issue", "comment"], ["glab", "issue", "note"]],
+                            "completed": [["jira", "transition"]],
+                        },
+                    }
+                }
+            },
+        )
+        report = check_source(
+            config, "tracker", which=resolver("list-issues", "gh")
+        )
+        missing_programs = {u.missing for u in report.unmet}
+        assert any("glab" in m for m in missing_programs)
+        assert any("jira" in m for m in missing_programs)
+
+    def test_a_malformed_feedback_map_is_surfaced_not_raised(
+        self, config: ConfigStore
+    ) -> None:
+        """An unreadable feedback map is an unmet check, never an exception.
+
+        Written to the raw document so the invalid shape survives to the
+        prerequisite read; the point is that check_source reports it rather than
+        letting a ConfigValidationError unwind past the gate.
+        """
+        import json
+
+        config.path.parent.mkdir(parents=True, exist_ok=True)
+        config.path.write_text(
+            json.dumps(
+                {
+                    "sources": {
+                        "tracker": {
+                            "poll": ["list-issues"],
+                            "feedback": {"completed": "not-a-command-list"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = check_source(config, "tracker", which=always_present)
+        assert not report.met
+        assert any("could not be read" in u.missing for u in report.unmet)
+
 
 class TestRunGate:
     def test_a_run_is_refused_before_any_credit_when_a_later_phase_is_unmet(

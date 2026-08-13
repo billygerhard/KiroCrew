@@ -333,27 +333,103 @@ def check_source(
         )
     program = argv[0]
     resolved = resolve_program(program)
-    return PrerequisiteReport(
-        checks=(
+    checks: list[Prerequisite] = [
+        Prerequisite(
+            check=CheckName.WATCH_PROGRAMS,
+            phase=AutonomyLevel.AUTHORING,
+            met=resolved is not None,
+            missing=(
+                ""
+                if resolved is not None
+                else f"poll program {program!r} for source {source!r} is not on PATH"
+            ),
+            action=(
+                ""
+                if resolved is not None
+                else f"install {program!r} or change {path} to a program this host has"
+            ),
+            declared_at=path,
+            source=source,
+        ),
+    ]
+    checks.extend(_feedback_program_checks(config, source, resolve_program))
+    return PrerequisiteReport(checks=tuple(checks))
+
+
+def _feedback_program_checks(
+    config: ConfigStore, source: str, which: ProgramResolver
+) -> list[Prerequisite]:
+    """One check per program a source's item-feedback commands invoke.
+
+    ``sources.<source>.feedback`` is the third place in the document that holds
+    argv the engine executes, alongside workflow stages and quality gates. Left
+    unchecked, a missing ``gh`` is not discovered until a lifecycle event fires a
+    writeback -- and that failure keeps its ledger claim on purpose, so the event
+    is suppressed for the run rather than retried. Catching the absent program
+    here turns a permanently held claim into an unmet prerequisite before the
+    run starts.
+
+    Read through :func:`~.watch.feedback.load_feedback` rather than re-parsed, so
+    this and the writeback path cannot disagree about which programs a feedback
+    map names -- the same reason quality-gate programs are read through their
+    loader. A map too malformed to read is surfaced as one unmet check naming the
+    path, not raised: a source's writeback config is then caught up front like
+    every other prerequisite rather than as an exception mid-poll.
+
+    Phased at authoring because ``claimed`` writes back the moment a run is
+    claimed, so even an authoring-only dispatch reaches these programs; a later
+    phase would let a missing feedback program slip past the gate of a run that
+    still posts feedback.
+    """
+    # Imported in-function: pulling the whole watch package in at module load is
+    # unnecessary for the many callers that never reach a source, and load_feedback
+    # is the one thing this needs from it.
+    from .watch.feedback import FEEDBACK_FIELD, load_feedback
+
+    base = f"{SECTION_SOURCES}.{source}.{FEEDBACK_FIELD}"
+    try:
+        commands_by_event = load_feedback(config, source)
+    except ConfigValidationError as exc:
+        return [
             Prerequisite(
                 check=CheckName.WATCH_PROGRAMS,
                 phase=AutonomyLevel.AUTHORING,
-                met=resolved is not None,
-                missing=(
-                    ""
-                    if resolved is not None
-                    else f"poll program {program!r} for source {source!r} is not on PATH"
-                ),
-                action=(
-                    ""
-                    if resolved is not None
-                    else f"install {program!r} or change {path} to a program this host has"
-                ),
-                declared_at=path,
+                met=False,
+                missing=f"the feedback configuration for source {source!r} could not be read: {exc}",
+                action=f"fix the feedback configuration under {base}",
+                declared_at=base,
                 source=source,
-            ),
-        )
-    )
+            )
+        ]
+    checks: list[Prerequisite] = []
+    for event, commands in commands_by_event.items():
+        declared_at = f"{base}.{event}"
+        for command in commands:
+            program = command.program
+            resolved = which(program) if program else None
+            checks.append(
+                Prerequisite(
+                    check=CheckName.WATCH_PROGRAMS,
+                    phase=AutonomyLevel.AUTHORING,
+                    met=resolved is not None,
+                    missing=(
+                        ""
+                        if resolved is not None
+                        else (
+                            f"feedback program {program!r} for event {event!r} on source "
+                            f"{source!r} is not on PATH"
+                        )
+                    ),
+                    action=(
+                        ""
+                        if resolved is not None
+                        else f"install {program!r} or change {declared_at} to a program this host has"
+                    ),
+                    declared_at=declared_at,
+                    source=source,
+                )
+            )
+    return checks
 
 
 def gate_run(
