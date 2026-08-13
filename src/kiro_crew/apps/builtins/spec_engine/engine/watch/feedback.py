@@ -45,7 +45,12 @@ from ..config.schema import (
 from ..delivery.stages import StageExecutor, StageOutcome, StageResult
 from ..delivery.templates import CommandTemplate, TemplateError
 from ..delivery.variables import RunContext
-from ..state import SpecRef, StatePersistenceError, StateStore
+from ..state import (
+    CLAIM_WRITEBACK,
+    SpecRef,
+    StatePersistenceError,
+    StateStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +58,11 @@ __all__ = [
     "AUDIT_ITEM_FEEDBACK",
     "FEEDBACK_FIELD",
     "FeedbackOutcome",
+    "FeedbackPoster",
     "FeedbackReport",
     "load_feedback",
     "post_feedback",
+    "release_writeback_claim",
 ]
 
 #: Source field holding the event-to-commands map.
@@ -96,6 +103,41 @@ class FeedbackReport:
         return self.outcome is FeedbackOutcome.POSTED
 
     @property
+    def suppressed(self) -> bool:
+        """Whether this event is now held back from posting until a release.
+
+        A failed post keeps its claim on purpose -- retrying a command that may
+        already have commented is how one event becomes two comments -- so the
+        event stays suppressed for the run until someone who knows what landed
+        clears the ledger row. The only outcome that suppresses is ``FAILED``:
+        ``ALREADY_POSTED`` means an earlier attempt held, not that this one
+        needs releasing.
+        """
+        return self.outcome is FeedbackOutcome.FAILED
+
+    def clears(self) -> dict[str, str]:
+        """The ledger row an operator releases to let this event post again.
+
+        Named rather than described so a report and the audit detail point at the
+        exact claim :func:`release_writeback_claim` deletes, not a paraphrase of
+        it. Empty when nothing is suppressed.
+        """
+        if not self.suppressed:
+            return {}
+        return {"kind": CLAIM_WRITEBACK, "scope": self.run_id, "subject": self.event}
+
+    def suppression_note(self) -> str:
+        """One line for a FAILED report saying the event is suppressed and how to clear it."""
+        if not self.suppressed:
+            return ""
+        return (
+            f"the {self.event!r} feedback for run {self.run_id} is now suppressed; its "
+            f"writeback claim (kind={CLAIM_WRITEBACK}, scope={self.run_id}, "
+            f"subject={self.event}) is kept so a retry cannot comment twice, and "
+            "release_writeback_claim clears it once an operator knows what landed"
+        )
+
+    @property
     def spent_credits(self) -> float:
         """Always zero. Feedback runs configured argv, never a model."""
         return 0.0
@@ -106,7 +148,7 @@ class FeedbackReport:
         return f"{self.event}: {self.outcome.value}"
 
     def detail(self) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             "source": self.source,
             "event": self.event,
             "outcome": self.outcome.value,
@@ -117,6 +159,14 @@ class FeedbackReport:
             "variables_used": list(self.result.variables_used) if self.result else [],
             "commands_run": len(self.result.commands) if self.result else 0,
         }
+        if self.suppressed:
+            # A failed post keeps its claim, so the audit trail has to say the
+            # event is now held back and name the ledger row that releases it --
+            # otherwise the only surface for a permanently suppressed event is
+            # reading the claims table by hand.
+            record["suppressed"] = True
+            record["clears"] = self.clears()
+        return record
 
 
 def load_feedback(config: ConfigStore, source: str) -> dict[str, tuple[CommandTemplate, ...]]:
@@ -250,9 +300,7 @@ def post_feedback(
 
     result = executor.run_labelled(event, context, commands, declared_at=declared_at)
     outcome = (
-        FeedbackOutcome.POSTED
-        if result.outcome is StageOutcome.PASSED
-        else FeedbackOutcome.FAILED
+        FeedbackOutcome.POSTED if result.outcome is StageOutcome.PASSED else FeedbackOutcome.FAILED
     )
     if outcome is FeedbackOutcome.FAILED:
         # The claim stays taken. Retrying a writeback whose command may already
@@ -315,3 +363,109 @@ def _source_entry(config: ConfigStore, source: str) -> Mapping[str, Any] | None:
         return None
     entry = node.get(source)
     return entry if isinstance(entry, Mapping) else None
+
+
+def release_writeback_claim(state: StateStore, run_id: str, event: str) -> bool:
+    """Drop one lifecycle-event writeback claim so the event can post again.
+
+    The operator surface for a suppressed event, and the twin of
+    :func:`~.lifecycle.release_dispatch_claim`: one release idiom over the shared
+    claim ledger rather than hand-written SQL against the store. A failed post
+    keeps its claim on purpose -- retrying a command that may already have
+    commented is how one event becomes two -- so the event stays suppressed for
+    the run until someone who knows what landed clears it here.
+
+    True when a claim was cleared, False when none was held. Unlike its dispatch
+    twin it takes no lifecycle generation, because a writeback claim is keyed on
+    the run and the event alone: a run does not span generations, so there is
+    nothing for a generation to disambiguate.
+    """
+    if event not in ITEM_LIFECYCLE_EVENTS:
+        raise ValueError(f"unknown item lifecycle event: {event!r}")
+    if not run_id.strip():
+        raise ValueError("a writeback release must name the run whose claim it clears")
+    return state.release_claim(CLAIM_WRITEBACK, run_id, event)
+
+
+@dataclass(frozen=True)
+class FeedbackPoster:
+    """Posts a run's item-feedback events by one route, at every wiring site.
+
+    The feedback library posts one event for one run; this is what the lifecycle
+    points call so all of them post the same way. Bundling the stores here rather
+    than threading four arguments through each site is what keeps the ledger
+    agreeing with itself: a second site that built its own executor or reached
+    the claim by a different key would be the equivalent-second-path defect that
+    lets a resumed run comment twice.
+
+    **The gate is "did the source ask for feedback".** Requirement 10.10 writes
+    back *where item feedback commands are configured*, so a source that declares
+    no ``feedback`` map at all posts nothing and records nothing -- the ordinary
+    case, and the one that must stay silent so an unattended engine does not
+    narrate every transition of every run to a tracker nobody configured. A
+    source that declares the map but this event is not in it is handed to
+    :func:`post_feedback`, which records it ``UNCONFIGURED``: the operator asked
+    for some feedback, so "nothing for this event" is a stated answer rather than
+    silence. A source a run names but configuration does not declare is treated
+    as no feedback, because a run must never point at an undeclared source and
+    posting would only manufacture a FAILED row for a misconfiguration this class
+    is not the place to surface.
+    """
+
+    state: StateStore
+    config: ConfigStore
+    audit: AuditLog
+    project: str | None = None
+    #: Executor every post routes through when a call names none. Left unset in
+    #: production, where each post builds one for the run's project; a caller that
+    #: needs a specific runner (a test's recording runner, a shared executor)
+    #: sets it once here rather than passing it to every ``post``.
+    executor: StageExecutor | None = None
+
+    def post(
+        self,
+        ref: SpecRef,
+        *,
+        source: str | None,
+        run_id: str,
+        event: str,
+        context: RunContext,
+        executor: StageExecutor | None = None,
+    ) -> FeedbackReport | None:
+        """Post *event* for *run_id*, or ``None`` when this source posts nothing.
+
+        Returns the :class:`FeedbackReport` when a post was attempted so a caller
+        can surface a suppressed failure, and ``None`` when the source configured
+        no feedback -- the two are different: a report says the mechanism ran, a
+        ``None`` says there was nothing to run.
+        """
+        if not (source or "").strip():
+            # An interactive run has no triggering item, so there is no tracker
+            # conversation to write back to. Not an error: most runs of a spec a
+            # person authored by hand reach these same transitions.
+            return None
+        assert source is not None  # narrowed by the guard above, for the checker
+        if not self._declares_feedback(source):
+            return None
+        resolved = executor or self.executor or StageExecutor(self.config, project=self.project)
+        return post_feedback(
+            self.state,
+            self.config,
+            self.audit,
+            ref,
+            source=source,
+            event=event,
+            run_id=run_id,
+            context=context,
+            executor=resolved,
+        )
+
+    def _declares_feedback(self, source: str) -> bool:
+        """Whether *source* declares a feedback map at all.
+
+        A missing source and a source without the map both answer False: neither
+        asked for feedback, and the difference between them is a configuration
+        fault this poster does not exist to report.
+        """
+        entry = _source_entry(self.config, source)
+        return entry is not None and entry.get(FEEDBACK_FIELD) is not None

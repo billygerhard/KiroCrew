@@ -305,6 +305,32 @@ RUN_RESUMED_EVENT = "spec.run.resumed"
 RUN_NOTIFY_FAILED_EVENT = "spec.run.notification-failed"
 
 
+def lifecycle_event_for(from_state: RunState, to_state: RunState) -> str | None:
+    """The item-feedback event a transition emits, or ``None`` when it emits none.
+
+    Only the states an item's watchers care about map to an event, and each maps
+    to exactly one so the writeback ledger's at-most-once key is stable: a run
+    that re-enters ``awaiting_review`` on a revision cycle posts that event once,
+    not once per cycle.
+
+    ``failed`` and ``refused`` are both the terminal ``failed`` state, told apart
+    by where the run came from. A run that never left ``queued`` failed before it
+    authored anything -- an execution gate or a prerequisite refused it -- which
+    reads to the item's watchers as *refused*, the request declined. A run that
+    failed from any working phase did work that then broke, which reads as
+    *failed*. The distinction is drawn from the transition rather than the reason
+    string because the reason is prose a human wrote and the from-state is the
+    machine's own record of whether the run ever ran.
+    """
+    if to_state is RunState.AWAITING_REVIEW:
+        return "awaiting_review"
+    if to_state is RunState.DONE:
+        return "completed"
+    if to_state is RunState.FAILED:
+        return "refused" if from_state is RunState.QUEUED else "failed"
+    return None
+
+
 class RunError(Exception):
     """Base class for run lifecycle failures."""
 
@@ -511,6 +537,7 @@ class RunMachine:
         audit: AuditLog | None = None,
         notifier: Notifier | None = None,
         clock: Callable[[], datetime] | None = None,
+        feedback: Any | None = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -520,6 +547,17 @@ class RunMachine:
         self._audit = audit
         self._notifier: Notifier = notifier if notifier is not None else log_notification
         self._clock: Callable[[], datetime] = clock if clock is not None else _utc_now
+        #: Item-feedback poster, built lazily on first use unless one is injected.
+        #: Constructed from this machine's own stores rather than injected in
+        #: production, so a run's lifecycle transitions write back to its
+        #: triggering item wherever the machine is constructed -- the
+        #: orchestrator, the review queue, a driver -- without each of those
+        #: having to remember to wire it. An injected poster (a test's, or a
+        #: caller that already holds one) is used as-is. Requires the audit log,
+        #: because a writeback records its outcome there and a poster that could
+        #: post without recording would drop the one trace that a tracker refused.
+        self._feedback: Any = feedback
+        self._feedback_ready = feedback is not None
 
     # ------------------------------------------------------------------ clock
 
@@ -655,6 +693,7 @@ class RunMachine:
             initiator=initiator,
             detail={"from": from_state.value, "to": to_state.value, "reason": reason},
         )
+        self._observe_transition(ref, updated, from_state, to_state, initiator=initiator)
         return updated
 
     # ------------------------------------------------------------------ reads
@@ -993,9 +1032,7 @@ class RunMachine:
             # handle for a different spec would pass it and leave the writes in
             # this block unlocked.
             if lock.ref != ref:
-                raise StatePersistenceError(
-                    f"lock is held for {lock.ref.key}, not {ref.key}"
-                )
+                raise StatePersistenceError(f"lock is held for {lock.ref.key}, not {ref.key}")
             self._store.verify_lock(lock)
             yield lock
             return
@@ -1033,6 +1070,98 @@ class RunMachine:
         if self._audit is None:
             return
         self._audit.append(ref, event, run=run, initiator=initiator, detail=detail)
+
+    def _observe_transition(
+        self,
+        ref: SpecRef,
+        record: RunRecord,
+        from_state: RunState,
+        to_state: RunState,
+        *,
+        initiator: str | None = None,
+    ) -> None:
+        """The single point every committed transition is observed from.
+
+        Called once per successful move, outside the lock and after the audit,
+        with the post-transition record and both ends of the move already in
+        hand. It exists so that a second thing that has to happen *at a
+        transition* -- item feedback today, the awaiting-review human-gate
+        notification requirement 6.3 wants next -- is one more line here rather
+        than a second call to :meth:`transition` or a second walk of the state
+        machine. Both observers then see the same ``from_state``/``to_state`` the
+        machine just decided, so they cannot disagree about what moved.
+
+        A second observer added here inherits the two properties this call site
+        already guarantees and a caller would have to re-earn: it runs only after
+        the state change is durable, and it runs outside the spec lock, so a slow
+        observer cannot stall a contended write or unwind a move that happened.
+        """
+        self._post_item_feedback(ref, record, from_state, to_state)
+
+    def _item_feedback(self) -> Any:
+        """The item-feedback poster, or ``None`` when this machine cannot post.
+
+        Built once, on first transition. Absent without an audit log because a
+        writeback records its outcome there, and a poster that could act without
+        recording would drop the one trace that a tracker refused a comment. The
+        import is deferred to break the cycle: the watch package imports this
+        module, so importing its feedback poster at module load would import a
+        half-built ``runs``.
+        """
+        if not self._feedback_ready:
+            self._feedback_ready = True
+            if self._audit is not None:
+                from .watch.feedback import FeedbackPoster
+
+                self._feedback = FeedbackPoster(
+                    self._store, self._config, self._audit, project=self._project
+                )
+        return self._feedback
+
+    def _post_item_feedback(
+        self,
+        ref: SpecRef,
+        record: RunRecord,
+        from_state: RunState,
+        to_state: RunState,
+    ) -> None:
+        """Write back to the run's triggering item at a mapped transition.
+
+        Outside the lock and after the audit, for the same reason the transition
+        audit is: the state change is already durable, and a feedback command
+        spawns a subprocess the spec lock must not be held across. Best-effort by
+        construction -- :func:`~.watch.feedback.post_feedback` never raises -- so a
+        tracker that refuses a comment cannot unwind a transition that happened.
+
+        Nothing is posted for a run with no source: those are specs a person
+        authored by hand, which reach these same transitions with no item to
+        report to. The poster itself declines a source that configured no
+        feedback, so the common case spawns nothing.
+        """
+        event = lifecycle_event_for(from_state, to_state)
+        if event is None:
+            return
+        poster = self._item_feedback()
+        if poster is None:
+            return
+        from .delivery.variables import RunContext
+
+        detail = record.detail
+        context = RunContext(
+            spec_name=ref.name,
+            spec_type=str(detail.get("spec_type", "")),
+            workspace_path=str(detail.get("working_tree", "")),
+            base_branch=str(detail.get("base_branch", "")),
+            item_id=record.item_id or str(detail.get("item_id", "")),
+            item_url=str(detail.get("item_url", "")),
+        )
+        poster.post(
+            ref,
+            source=record.source,
+            run_id=record.run_id,
+            event=event,
+            context=context,
+        )
 
 
 def _parse_ts(value: str) -> datetime | None:
