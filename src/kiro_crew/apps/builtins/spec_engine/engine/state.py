@@ -90,7 +90,7 @@ CLAIM_DISPATCH = "dispatch"
 CLAIM_WRITEBACK = "writeback"
 
 #: Schema version recorded in ``schema_meta``. Bump only alongside a migration.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
@@ -169,15 +169,25 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     # `is_open` is the lifecycle authority, not `item_state`. The state text is
     # whatever the tracker printed, kept for display and diagnosis; an item the
     # source stopped reporting has no state text at all.
+    #
+    # `content_digest` is a hash over the fields that would change what a run was
+    # given (title, body, classification), so a poll can tell an edited item from
+    # an untouched one even though neither moved its lifecycle position. It is a
+    # digest, not the text: the body is attacker-controlled untrusted data, and a
+    # second copy of it in the state store is a second surface to leak. An empty
+    # digest means "unknown" -- a row written before digests were stored, or one
+    # an upgrade migrated in -- and reads as not-edited, so no pre-existing row
+    # reports a spurious edit on the first poll after an upgrade.
     """
     CREATE TABLE IF NOT EXISTS watch_items (
-        source        TEXT NOT NULL,
-        item_id       TEXT NOT NULL,
-        generation    INTEGER NOT NULL DEFAULT 1,
-        item_state    TEXT NOT NULL DEFAULT '',
-        is_open       INTEGER NOT NULL DEFAULT 1,
-        first_seen_ts TEXT NOT NULL,
-        observed_ts   TEXT NOT NULL,
+        source         TEXT NOT NULL,
+        item_id        TEXT NOT NULL,
+        generation     INTEGER NOT NULL DEFAULT 1,
+        item_state     TEXT NOT NULL DEFAULT '',
+        is_open        INTEGER NOT NULL DEFAULT 1,
+        content_digest TEXT NOT NULL DEFAULT '',
+        first_seen_ts  TEXT NOT NULL,
+        observed_ts    TEXT NOT NULL,
         PRIMARY KEY (source, item_id)
     )
     """,
@@ -414,6 +424,11 @@ class WatchObservation:
     generation: int
     item_state: str = ""
     is_open: bool = True
+    #: Hash over the fields that would change what a run was given (title, body,
+    #: classification). Empty means "not computed" -- a caller that does not track
+    #: content leaves it blank, and a blank recorded digest reads as unknown
+    #: rather than as an edit. The digest itself is never the item text.
+    content_digest: str = ""
 
     def __post_init__(self) -> None:
         if not self.item_id.strip():
@@ -433,6 +448,11 @@ class WatchItemRecord:
     is_open: bool
     first_seen_ts: str
     observed_ts: str
+    #: The content digest recorded with this row, or the empty string for a row
+    #: written before digests were stored (or migrated in by an upgrade). Empty
+    #: reads as "unknown": it is never compared as though it were an edit, so an
+    #: upgraded store does not report every pre-existing row as edited.
+    content_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -559,6 +579,7 @@ def _watch_item_record(row: sqlite3.Row) -> WatchItemRecord:
         is_open=bool(row["is_open"]),
         first_seen_ts=row["first_seen_ts"],
         observed_ts=row["observed_ts"],
+        content_digest=row["content_digest"],
     )
 
 
@@ -685,16 +706,30 @@ class StateStore:
 
         Runs before the ``CREATE TABLE IF NOT EXISTS`` replay, which converges an
         *additive* change on its own but cannot alter a table that already exists.
-        A non-additive change therefore needs a step here, or an older database
-        keeps its old shape while the code assumes the new one -- and the version
-        stamp would not catch it, because nothing reads the stamp to decide.
+        A non-additive change, or a new column on a table that already exists,
+        therefore needs a step here, or an older database keeps its old shape
+        while the code assumes the new one -- and the version stamp would not
+        catch it, because nothing reads the stamp to decide.
 
         ``element_trust`` gained ``kind`` in its primary key: keyed on the id
         alone, a comment's row overwrites its item body's. The table is dropped
         rather than copied because it is a cache of a derivation that can always
         be recomputed from the elements themselves, and carrying rows keyed the
         wrong way forward would preserve exactly the collision being fixed.
+
+        ``watch_items`` gained ``content_digest``: an additive column, so it is
+        added in place rather than dropped. The snapshot is a lifecycle ledger,
+        not a recomputable cache -- dropping it would restart every open item at
+        the first generation, whose dispatch claim is already held, and silently
+        swallow the next reopen. A pre-existing row's digest defaults to the empty
+        string, which reads as "unknown, not edited", so no upgraded row reports a
+        spurious edit on the poll after the upgrade.
         """
+        StateStore._drop_miskeyed_element_trust(conn)
+        StateStore._add_watch_item_digest(conn)
+
+    @staticmethod
+    def _drop_miskeyed_element_trust(conn: sqlite3.Connection) -> None:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'element_trust'"
         ).fetchone()
@@ -707,6 +742,21 @@ class StateStore:
         ]
         if "kind" not in keyed_on:
             conn.execute("DROP TABLE element_trust")
+
+    @staticmethod
+    def _add_watch_item_digest(conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'watch_items'"
+        ).fetchone()
+        if row is None:
+            return
+        columns = [
+            column["name"] for column in conn.execute("PRAGMA table_info(watch_items)").fetchall()
+        ]
+        if "content_digest" not in columns:
+            conn.execute(
+                "ALTER TABLE watch_items ADD COLUMN content_digest TEXT NOT NULL DEFAULT ''"
+            )
 
     @contextlib.contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -1259,16 +1309,19 @@ class StateStore:
             for observation in observations:
                 conn.execute(
                     "INSERT INTO watch_items (source, item_id, generation, item_state, "
-                    "is_open, first_seen_ts, observed_ts) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "is_open, content_digest, first_seen_ts, observed_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT (source, item_id) DO UPDATE SET "
                     "generation = excluded.generation, item_state = excluded.item_state, "
-                    "is_open = excluded.is_open, observed_ts = excluded.observed_ts",
+                    "is_open = excluded.is_open, content_digest = excluded.content_digest, "
+                    "observed_ts = excluded.observed_ts",
                     (
                         source,
                         observation.item_id,
                         observation.generation,
                         observation.item_state,
                         1 if observation.is_open else 0,
+                        observation.content_digest,
                         now,
                         now,
                     ),
