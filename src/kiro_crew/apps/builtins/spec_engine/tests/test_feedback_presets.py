@@ -57,6 +57,26 @@ class TestPublicHostOnly:
         with pytest.raises(KeyError):
             feedback_presets("internal-tracker")
 
+    def test_a_mistyped_host_cannot_silently_configure_a_source_that_posts_nothing(self) -> None:
+        """The second, independent catcher for the refusal half of this guarantee.
+
+        The two tests above pin what the TABLE contains; only the one above pins
+        that a LOOKUP miss refuses, and a guarantee resting on a single assertion
+        is the shape this project has shipped four times. This asserts the harm
+        rather than restating the raise: an operator copying a preset for a
+        mistyped host must not end up with a source whose feedback map is empty,
+        because that source posts nothing and looks configured while doing it.
+        """
+        built: dict[str, object] = {}
+        try:
+            built = {"feedback": feedback_presets("github-enterprise")}
+        except KeyError:
+            pass
+        assert built == {}, "a miss produced a usable feedback map instead of refusing"
+        # And the positive half, so the test cannot pass by the function always
+        # failing: a real host yields events to configure.
+        assert feedback_presets("github")
+
     def test_the_preset_programs_are_the_public_host_clis_only(self) -> None:
         programs = {
             CommandTemplate.parse(argv).program
