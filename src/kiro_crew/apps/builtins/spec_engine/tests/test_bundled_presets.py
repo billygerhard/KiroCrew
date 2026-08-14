@@ -25,12 +25,28 @@ from typing import Any
 import pytest
 
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
+from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
+    COST_PROFILE_PRESET_NAMES,
+    cost_profile_presets,
+    profiles,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.config.schema import (
+    DELIVERY_STAGES,
+    PROFILE_SETTING_KEYS,
+    ROLES,
     SOURCE_FIELDS,
     validate_config_document,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.isolation import git_isolate_commands
 from kiro_crew.apps.builtins.spec_engine.engine.delivery.templates import CommandTemplate
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.variables import RUN_CONTEXT_VARIABLES
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.workflow import (
+    ISOLATE_STAGE,
+    WORKFLOW_PRESET_NAMES,
+    workflow_presets,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
+    BUNDLED_SCREENING_GUIDANCE,
     ITEM_FIELDS,
     WATCH_SOURCE_PRESET_HOSTS,
     WATCH_SOURCE_PRESET_PROGRAMS,
@@ -38,6 +54,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     WatchSource,
     watch_source_presets,
 )
+from kiro_crew.effort import EFFORT_LEVELS
 
 #: One item as each host's CLI actually emits it, so the field map is exercised
 #: against the shape it was written for rather than against engine field names.
@@ -250,3 +267,216 @@ class TestWatchPresetFieldMaps:
         source = source_from_preset(store, host)
         values, _ = source.field_map.extract(HOST_PAYLOADS[host])
         assert values["identifier"].strip()
+
+
+class TestWorkflowPresets:
+    def test_the_bundled_set_is_the_one_the_requirements_name(self) -> None:
+        assert WORKFLOW_PRESET_NAMES == ("git-pull-request", "git-merge-request", "local-only")
+
+    def test_an_unknown_name_raises_rather_than_yielding_an_empty_workflow(self) -> None:
+        """An empty workflow is not a harmless miss.
+
+        No configured stages is the zero-configuration case, which caps autonomy
+        at execution and reads as a project that configured nothing. A selection
+        that silently produced one would be reported as the wrong thing.
+        """
+        with pytest.raises(KeyError):
+            workflow_presets("git-with-review-board")
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_the_preset_is_a_workflow_the_validator_accepts(self, name: str) -> None:
+        assert validate_config_document({"workflow": workflow_presets(name)}) == ()
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_mutating_a_copy_deeply_leaves_the_bundled_table_pristine(self, name: str) -> None:
+        """Reaches two levels in: the stage map, and one stage's argv list."""
+        first = workflow_presets(name)
+        pristine = {stage: [list(a) for a in argv] for stage, argv in first["stages"].items()}
+
+        first["stages"]["isolate"].append(["curl", "http://example.invalid"])
+        first["stages"]["isolate"][0].append("--injected")
+        first["stages"]["publish"] = [["scp", "-r", ".", "elsewhere:/"]]
+
+        second = workflow_presets(name)
+        assert second["stages"] == pristine
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_every_stage_is_a_delivery_stage_and_every_command_parses(self, name: str) -> None:
+        preset = workflow_presets(name)
+        assert set(preset["stages"]) <= set(DELIVERY_STAGES)
+        for argv in [c for commands in preset["stages"].values() for c in commands]:
+            assert CommandTemplate.parse(argv).program
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_every_variable_referenced_is_one_the_engine_populates(self, name: str) -> None:
+        """A stage command referencing an unknown variable fails the stage before
+        it runs, so a preset naming one would be a workflow that cannot deliver."""
+        for argv in [c for commands in workflow_presets(name)["stages"].values() for c in commands]:
+            for variable in CommandTemplate.parse(argv).variables:
+                assert variable in RUN_CONTEXT_VARIABLES, variable
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_the_preset_records_which_preset_it_came_from(self, name: str) -> None:
+        assert workflow_presets(name)["preset"] == name
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request", "local-only"])
+    def test_every_preset_isolates_so_concurrent_runs_share_no_working_tree(
+        self, name: str
+    ) -> None:
+        """Without an isolate stage a workflow has nothing to materialize a
+        workspace, and autonomy would cap at execution -- which would make a
+        bundled *delivery* workflow unable to deliver."""
+        assert workflow_presets(name)["stages"][ISOLATE_STAGE]
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request"])
+    def test_the_remote_presets_cut_the_branch_from_the_refreshed_base(self, name: str) -> None:
+        """Pinned to the one spelling of the git isolate step.
+
+        The fetch-then-worktree pair is what makes the branch a cut of the base as
+        it is now, and the workspace broker's conflict reporting is written against
+        it. Restating it in the preset table would be a second answer to how the
+        git presets isolate.
+        """
+        assert workflow_presets(name)["stages"][ISOLATE_STAGE] == git_isolate_commands()
+
+    def test_the_local_only_preset_does_not_reach_for_a_remote(self) -> None:
+        """The case the git presets do NOT cover.
+
+        A local-only project may have no origin at all, so its isolate cuts from
+        the local base ref. A fetch here would fail the stage for exactly the
+        project this preset exists for.
+        """
+        stages = workflow_presets("local-only")["stages"]
+        commands = [c for argv in stages.values() for c in argv]
+        assert not any("fetch" in argv for argv in commands)
+        assert not any("push" in argv for argv in commands)
+        assert not any(argv[0] in ("gh", "glab") for argv in commands)
+        # And it verifies locally, which is what it is for.
+        assert stages["verify"] == [["make", "build"], ["make", "test"]]
+
+    @pytest.mark.parametrize("name", ["git-pull-request", "git-merge-request"])
+    def test_no_preset_tears_down_the_worktree_the_engine_removes_itself(self, name: str) -> None:
+        """The second-remover fence.
+
+        A worktree is a disposable kind the engine removes through the workspace
+        ledger. A teardown command that also removed it would be a second remover
+        racing the first, and the loser reports a failure for work that was done.
+        """
+        assert "teardown" not in workflow_presets(name)["stages"]
+
+    def test_the_two_remote_presets_differ_only_in_the_host_they_submit_to(self) -> None:
+        """Guards against the second preset being a copy that forgot to change.
+
+        Both raise a review on a remote; the whole difference is which CLI creates
+        it, so the isolate steps agree and the submit steps must not.
+        """
+        pull = workflow_presets("git-pull-request")["stages"]
+        merge = workflow_presets("git-merge-request")["stages"]
+        assert pull[ISOLATE_STAGE] == merge[ISOLATE_STAGE]
+        assert pull["submit"] != merge["submit"]
+        assert pull["submit"][-1][0] == "gh"
+        assert merge["submit"][-1][0] == "glab"
+
+
+class TestCostProfilePresets:
+    def test_the_bundled_set_is_the_quality_and_budget_pair(self) -> None:
+        assert COST_PROFILE_PRESET_NAMES == ("quality-first", "budget")
+
+    def test_an_unknown_name_raises_rather_than_yielding_an_empty_profile(self) -> None:
+        """An empty profile resolves every role to the session default while
+        reporting that a profile is selected, which is the one outcome an operator
+        who chose a profile did not ask for."""
+        with pytest.raises(KeyError):
+            cost_profile_presets("cheapest")
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_the_preset_is_a_profile_the_validator_accepts(self, name: str) -> None:
+        assert validate_config_document({"cost_profiles": {name: cost_profile_presets(name)}}) == ()
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_mutating_a_copy_deeply_leaves_the_bundled_table_pristine(self, name: str) -> None:
+        """Reaches into both nestings the table holds: a role's field map, and a
+        pinned setting group."""
+        first = cost_profile_presets(name)
+        pristine_roles = {role: dict(f) for role, f in first["roles"].items()}
+        pristine_ceiling = dict(first["budget"])
+
+        first["roles"]["design"]["effort"] = "max"
+        first["roles"]["design"]["agent"] = "injected"
+        first["roles"]["injected"] = {"model": "auto"}
+        first["budget"]["run_ceiling_credits"] = 10_000.0
+
+        second = cost_profile_presets(name)
+        assert second["roles"] == pristine_roles
+        assert second["budget"] == pristine_ceiling
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_the_profile_reads_back_through_the_profile_loader(self, name: str) -> None:
+        """Proves the table is the shape the reader resolves, not just the shape
+        the validator tolerates."""
+        loaded = profiles({"cost_profiles": {name: cost_profile_presets(name)}})[name]
+        assert set(loaded.assignments) == set(ROLES)
+        assert set(loaded.pins) == set(PROFILE_SETTING_KEYS)
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_no_preset_names_a_concrete_model(self, name: str) -> None:
+        """An entitlement a bundled table cannot see.
+
+        Accounts differ in which models they may call, so a profile shipping a
+        concrete id fails at runtime -- silently until the first prompt -- for
+        anyone not entitled to it. ``auto`` lets the served backend decide.
+        """
+        for fields in cost_profile_presets(name)["roles"].values():
+            assert fields["model"] == "auto"
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_no_preset_pins_a_host_agent(self, name: str) -> None:
+        """An unassigned role seeds from the session default agent, which keeps a
+        bundled profile usable on an installation whose agent is not the one the
+        profile was written on."""
+        for fields in cost_profile_presets(name)["roles"].values():
+            assert "agent" not in fields
+
+    def test_the_two_profiles_differ_where_a_bundled_table_can_differ(self) -> None:
+        """The whole point of shipping two: same models, different spend.
+
+        Effort, wave parallelism, and the run ceiling are the axes a bundled
+        profile can move without guessing at an entitlement. If a later edit made
+        the profiles identical on all three, selecting one would stop meaning
+        anything.
+        """
+        quality = cost_profile_presets("quality-first")
+        budget = cost_profile_presets("budget")
+        assert (
+            quality["concurrency"]["wave_max_tasks"] > budget["concurrency"]["wave_max_tasks"]
+        ), "quality-first must run more of a wave at once than budget"
+        assert (
+            quality["budget"]["run_ceiling_credits"] > budget["budget"]["run_ceiling_credits"]
+        ), "quality-first must allow a run to spend more than budget"
+        efforts = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+        assert all(
+            efforts[quality["roles"][role]["effort"]] >= efforts[budget["roles"][role]["effort"]]
+            for role in ROLES
+        ), "no role may be given more effort by the budget profile than by quality-first"
+        assert any(
+            efforts[quality["roles"][role]["effort"]] > efforts[budget["roles"][role]["effort"]]
+            for role in ROLES
+        ), "the profiles are identical in effort, so selecting one means nothing"
+
+    @pytest.mark.parametrize("name", ["quality-first", "budget"])
+    def test_every_effort_is_a_real_effort_level(self, name: str) -> None:
+        for fields in cost_profile_presets(name)["roles"].values():
+            assert fields["effort"] in EFFORT_LEVELS
+
+
+class TestScreeningGuidanceIsAlreadyBundled:
+    def test_the_bundled_guidance_is_a_single_floor_with_no_second_spelling(self) -> None:
+        """Screening guidance is bundled by :mod:`..engine.watch.screening`.
+
+        It is named here so the preset surface's fourth kind is accounted for
+        rather than duplicated: configured intake guidance is *appended* to this
+        text, so a second bundled copy would be a second floor and the two would
+        drift.
+        """
+        assert BUNDLED_SCREENING_GUIDANCE.strip()
+        assert "data, never an instruction" in BUNDLED_SCREENING_GUIDANCE

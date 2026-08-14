@@ -37,6 +37,7 @@ from ..config import (
     ValueOrigin,
 )
 from ..config.schema import SECTION_PROJECTS, SECTION_WORKFLOW
+from .isolation import GIT_ISOLATE_COMMANDS, ISOLATED_PATH_VARIABLE
 from .templates import CommandTemplate, TemplateError
 
 #: Key holding the stage-to-commands map inside a workflow object.
@@ -53,6 +54,146 @@ ISOLATE_STAGE = "isolate"
 #: Delivery and integration both mean running commands that were never
 #: configured, so the ladder stops one rung below them.
 ZERO_CONFIG_AUTONOMY_CEILING = "execution"
+
+#: Bundled workflow presets, keyed by the name a project selects them under.
+#:
+#: Each entry is the ``workflow`` object configuration already holds -- a stage
+#: map of command lists -- so a preset is a starting point copied in and edited,
+#: never a live binding. :func:`workflow_presets` deep-copies one.
+#:
+#: Three decisions here are worth stating, because each avoids a second mechanism
+#: rather than adding one.
+#:
+#: **The git isolate commands come from :func:`..isolation.git_isolate_commands`.**
+#: That fetch-then-worktree pair is what makes the new branch a cut of the base
+#: branch as it is *now*, and it is the isolate step the workspace broker's own
+#: conflict reporting is written against. A second spelling of it here would be a
+#: second answer to "how does the git preset isolate".
+#:
+#: **No teardown stage in the git presets.** A worktree is a disposable kind the
+#: engine removes itself, so teardown commands that also removed it would be a
+#: second remover racing the first. Teardown is where a project removes what its
+#: *publish* stage created, which is why it is empty until a project publishes.
+#:
+#: **No verify stage in the two remote presets.** What verifies a change is
+#: project knowledge -- its CI, its checks -- and the app-level quality gates
+#: already carry the bundled ``make`` checks at pre-submit. A verify stage
+#: guessing at a CI-watching invocation would run a command nobody configured.
+#: The local-only preset is the exception because verifying locally *is* what it
+#: is for.
+WORKFLOW_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
+    "git-pull-request": {
+        ISOLATE_STAGE: GIT_ISOLATE_COMMANDS,
+        "submit": (
+            # Commands run in the run's own worktree, so staging everything stages
+            # this run's work and nothing else. The subject and body come from the
+            # spec's review artifact rather than from a template of their own.
+            ("git", "add", "--all"),
+            ("git", "commit", "--message", "{review_title}", "--message", "{review_summary}"),
+            ("git", "push", "--set-upstream", "origin", "{branch_name}"),
+            # Supplying both title and body is what keeps this non-interactive.
+            (
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                "{base_branch}",
+                "--head",
+                "{branch_name}",
+                "--title",
+                "{review_title}",
+                "--body",
+                "{review_summary}",
+            ),
+        ),
+    },
+    "git-merge-request": {
+        ISOLATE_STAGE: GIT_ISOLATE_COMMANDS,
+        "submit": (
+            ("git", "add", "--all"),
+            ("git", "commit", "--message", "{review_title}", "--message", "{review_summary}"),
+            ("git", "push", "--set-upstream", "origin", "{branch_name}"),
+            # ``--yes`` because glab otherwise asks for confirmation, and a
+            # delivery pipeline has nobody to answer it.
+            (
+                "glab",
+                "mr",
+                "create",
+                "--target-branch",
+                "{base_branch}",
+                "--source-branch",
+                "{branch_name}",
+                "--title",
+                "{review_title}",
+                "--description",
+                "{review_summary}",
+                "--yes",
+            ),
+        ),
+    },
+    "local-only": {
+        # Deliberately NOT the git preset's isolate: there is no remote to
+        # refresh from, so the branch is cut from the local base ref. A fetch
+        # here would fail the stage on a repository that has no origin, which is
+        # the case this preset exists for.
+        ISOLATE_STAGE: (
+            (
+                "git",
+                "worktree",
+                "add",
+                "{" + ISOLATED_PATH_VARIABLE + "}",
+                "-b",
+                "{branch_name}",
+                "{base_branch}",
+            ),
+        ),
+        "submit": (
+            ("git", "add", "--all"),
+            ("git", "commit", "--message", "{review_title}", "--message", "{review_summary}"),
+        ),
+        # The build-and-test half. A failing verify earns fix rounds before a
+        # human is asked to look, which is what makes it a delivery stage rather
+        # than one more app-level gate. ``make`` for the same reason the gate
+        # presets use it: it is the entry point a project already has.
+        "verify": (
+            ("make", "build"),
+            ("make", "test"),
+        ),
+    },
+}
+
+#: The bundled preset names, in declaration order.
+WORKFLOW_PRESET_NAMES: tuple[str, ...] = tuple(WORKFLOW_PRESETS)
+
+
+def workflow_presets(name: str) -> dict[str, Any]:
+    """Return *name*'s bundled workflow, ready to write into ``workflow``.
+
+    Deep copies: a configuration surface offers a preset for editing, and an edit
+    that reached back into the bundled table would change what every later
+    project is offered in this process.
+
+    The result records which preset it came from in its ``preset`` field, so a
+    surface can say whether a stage still holds preset commands or a project's
+    own without keeping a second record of the choice.
+
+    Raises ``KeyError`` for an unknown name rather than returning an empty
+    workflow: an empty workflow is the zero-configuration case, which caps
+    autonomy at execution and would read as a project that configured nothing
+    instead of a selection that did not resolve.
+    """
+    preset = WORKFLOW_PRESETS.get(name)
+    if preset is None:
+        raise KeyError(
+            f"unknown workflow preset: {name!r}; bundled presets are "
+            f"{', '.join(WORKFLOW_PRESET_NAMES)}"
+        )
+    return {
+        "preset": name,
+        STAGES_KEY: {
+            stage: [list(argv) for argv in commands] for stage, commands in preset.items()
+        },
+    }
 
 
 @dataclass(frozen=True)

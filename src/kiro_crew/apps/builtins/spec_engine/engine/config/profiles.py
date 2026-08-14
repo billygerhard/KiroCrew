@@ -44,6 +44,95 @@ FIELD_AGENT = "agent"
 FIELD_MODEL = "model"
 FIELD_EFFORT = "effort"
 
+#: The model every bundled preset assigns. Not a placeholder: accounts differ in
+#: entitlement, so a bundled profile naming a concrete model would fail at
+#: runtime -- silently until the first prompt -- for anyone not entitled to it.
+#: ``"auto"`` lets the served backend choose, and a user who wants a specific
+#: model edits their copy, where the choice can be checked against what their
+#: account actually advertises.
+PRESET_MODEL = "auto"
+
+#: Bundled cost profile presets, keyed by the name a project selects them under.
+#:
+#: Each entry is the ``cost_profiles.<name>`` object configuration already holds,
+#: and :func:`cost_profile_presets` deep-copies one for editing.
+#:
+#: **The two profiles differ in effort, parallelism, and ceiling -- not in model.**
+#: That is the only axis a bundled profile can move without guessing at an
+#: entitlement it cannot see (see :data:`PRESET_MODEL`). It is also the axis that
+#: actually separates the two intents: quality-first spends more thinking per unit
+#: of work and runs more of a wave at once, while budget spends the least it can
+#: and holds a run to a small ceiling. A user who wants a cheaper *model* names
+#: one in their copy.
+#:
+#: **Neither pins an agent.** An unassigned role seeds from the session default
+#: agent, so a bundled profile stays usable on an installation whose host agent
+#: is not the one the profile was written on.
+COST_PROFILE_PRESETS: Mapping[str, Mapping[str, Any]] = {
+    "quality-first": {
+        ROLES_KEY: {
+            # Design and review earn the most effort: a flaw admitted at design
+            # or missed at review is re-implemented, while an implementation flaw
+            # is usually caught by the review that follows it.
+            "design": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "high"},
+            "review": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "high"},
+            "implement": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "medium"},
+            "analysis": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "medium"},
+            "setup": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "medium"},
+        },
+        "concurrency": {"wave_max_tasks": 5},
+        "budget": {"run_ceiling_credits": 20.0},
+    },
+    "budget": {
+        ROLES_KEY: {
+            # Review keeps medium effort where everything else drops to low: it is
+            # the one role whose output is a verdict others rely on, and a cheap
+            # wrong approval costs a whole re-run rather than one turn.
+            "design": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "low"},
+            "review": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "medium"},
+            "implement": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "low"},
+            "analysis": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "low"},
+            "setup": {FIELD_MODEL: PRESET_MODEL, FIELD_EFFORT: "low"},
+        },
+        "concurrency": {"wave_max_tasks": 1},
+        "budget": {"run_ceiling_credits": 2.0},
+    },
+}
+
+#: The bundled profile names, in declaration order.
+COST_PROFILE_PRESET_NAMES: tuple[str, ...] = tuple(COST_PROFILE_PRESETS)
+
+
+def cost_profile_presets(name: str) -> dict[str, Any]:
+    """Return *name*'s bundled profile, ready to write into ``cost_profiles``.
+
+    Deep copies through the role assignments and the pinned setting groups, so an
+    edit to one project's copy cannot change what a later project is offered in
+    this process.
+
+    Raises ``KeyError`` for an unknown name rather than returning an empty
+    profile: an empty profile is a selection that resolves every role to the
+    session default while reporting a profile *is* selected, which is the one
+    outcome an operator choosing a profile did not ask for.
+    """
+    preset = COST_PROFILE_PRESETS.get(name)
+    if preset is None:
+        raise KeyError(
+            f"unknown cost profile preset: {name!r}; bundled presets are "
+            f"{', '.join(COST_PROFILE_PRESET_NAMES)}"
+        )
+    built: dict[str, Any] = {}
+    for key, group in preset.items():
+        # Two shapes live side by side: ``roles`` nests one more level (role ->
+        # fields) than a pinned setting group (leaf -> scalar). Copying each inner
+        # mapping and passing scalars through handles both without the table
+        # having to declare which is which.
+        built[key] = {
+            inner: dict(value) if isinstance(value, Mapping) else value
+            for inner, value in group.items()
+        }
+    return built
+
 
 @dataclass(frozen=True)
 class RoleAssignment:

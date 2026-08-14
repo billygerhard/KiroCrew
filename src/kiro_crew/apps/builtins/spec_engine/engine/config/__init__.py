@@ -39,9 +39,12 @@ from .agent_surface import (
 )
 from .effective import EffectiveValue, ValueOrigin, resolve, resolve_all
 from .profiles import (
+    COST_PROFILE_PRESET_NAMES,
+    COST_PROFILE_PRESETS,
     PROJECT_PROFILE_FIELD,
     CostProfile,
     RoleAssignment,
+    cost_profile_presets,
     profile,
     profile_pin,
     profiles,
@@ -112,6 +115,8 @@ __all__ = [
     "PROFILE_SETTING_GROUPS",
     "PROFILE_SETTING_KEYS",
     "PROJECT_FIELDS",
+    "COST_PROFILE_PRESET_NAMES",
+    "COST_PROFILE_PRESETS",
     "PROJECT_PROFILE_FIELD",
     "PUBLIC_SOURCE_AUTONOMY",
     "ROLES",
@@ -150,6 +155,7 @@ __all__ = [
     "disk_lookup",
     "document_warnings",
     "lookup",
+    "cost_profile_presets",
     "profile",
     "profile_pin",
     "profiles",

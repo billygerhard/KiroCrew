@@ -137,10 +137,13 @@ from .workflow import (
     ISOLATE_STAGE,
     STAGES_KEY,
     VARIABLES_KEY,
+    WORKFLOW_PRESET_NAMES,
+    WORKFLOW_PRESETS,
     ZERO_CONFIG_AUTONOMY_CEILING,
     DeliveryWorkflow,
     StageCommands,
     cap_autonomy,
+    workflow_presets,
 )
 
 __all__ = [
@@ -190,6 +193,8 @@ __all__ = [
     "TRUNCATION_NOTICE",
     "UNNAMED_REQUESTER_REASON",
     "VARIABLES_KEY",
+    "WORKFLOW_PRESET_NAMES",
+    "WORKFLOW_PRESETS",
     "VARIABLE_NAME_PATTERN",
     "VERIFY_RETRY_LIMIT_SETTING",
     "VERIFY_STAGE",
@@ -235,6 +240,7 @@ __all__ = [
     "WorkspacePlan",
     "build_variables",
     "cap_autonomy",
+    "workflow_presets",
     "evaluate_integration",
     "gate_presets",
     "git_isolate_commands",
