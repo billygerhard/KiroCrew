@@ -31,10 +31,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .analysis import AnalysisEngine, FindingsSink
+from .analysis import AnalysisEngine, FindingsSink, RecordingFindingsSink
 from .audit import AuditLog
 from .budget.ledger import RunCostSink
-from .capabilities.builtins import ModelResolver, register_builtins
+from .capabilities.builtins import (
+    AUTHORING_PROVIDER,
+    IMPLEMENTATION_PROVIDER,
+    MODEL_CATALOG_PROVIDER,
+    REVIEW_PROVIDER,
+    ModelResolver,
+    register_builtins,
+)
 from .capabilities.registry import CapabilityRegistry
 from .config import ConfigStore
 from .delivery import DeliveryAuthority, WorkspaceJanitor
@@ -50,6 +57,30 @@ from .review_queue import ReviewQueue
 from .roles import SessionDefault
 from .runs import RunMachine
 from .state import SpecRef, StateStore
+
+#: The provider each deeper builtin must resolve to once
+#: :func:`~.capabilities.builtins.register_builtins` has run. Checked on the
+#: constructed graph rather than trusted, because the shipped default answers
+#: the same call with a deterministic no-coverage provider — a graph missing the
+#: registration is complete in shape and mislabels three paths that spend
+#: credits as paths that spend nothing.
+REQUIRED_BUILTINS: dict[str, str] = {
+    "authoring": AUTHORING_PROVIDER,
+    "review": REVIEW_PROVIDER,
+    "implementation": IMPLEMENTATION_PROVIDER,
+    "model_catalog": MODEL_CATALOG_PROVIDER,
+}
+
+
+class IncompleteEngineGraph(ValueError):
+    """A graph that is missing wiring :func:`build_engine` would have performed.
+
+    Raised from :meth:`EngineGraph.__post_init__`, which is the only reason the
+    module's "by construction rather than by convention" claim is true of the
+    code and not only of the factory: a frozen dataclass is constructable
+    directly and, more likely, reachable through :func:`dataclasses.replace`,
+    which an ordinary refactor reaches for and which re-runs ``__post_init__``.
+    """
 
 
 @dataclass(frozen=True)
@@ -80,6 +111,57 @@ class EngineGraph:
     #: they share this one instead of each building another over the same store.
     machine: RunMachine
     review_queue: ReviewQueue
+
+    def __post_init__(self) -> None:
+        """Refuse a partial graph, whatever spelling produced it.
+
+        :func:`build_engine` performs registrations and passes shared
+        collaborators that nothing in the field types requires, so a graph built
+        by any other route — a direct call, or
+        ``dataclasses.replace(graph, registry=...)`` — type-checks while
+        resolving three credit-spending capabilities to the deterministic
+        no-coverage default, attributing spend to memory, and running a second
+        state writer over the same store. Each check below is one of those.
+        """
+        problems: list[str] = []
+
+        for capability, provider_name in REQUIRED_BUILTINS.items():
+            try:
+                resolved = self.registry.builtin(capability).identity.name
+            except Exception as exc:  # noqa: BLE001 - a registry that cannot answer is partial
+                problems.append(f"{capability!r} has no resolvable builtin: {exc}")
+                continue
+            if resolved != provider_name:
+                problems.append(
+                    f"{capability!r} resolves to {resolved!r}, not the engine's "
+                    f"{provider_name!r}: register_builtins did not run over this registry"
+                )
+
+        if not isinstance(self.registry.cost_sink, RunCostSink):
+            problems.append(
+                "the capability registry attributes cost to "
+                f"{type(self.registry.cost_sink).__name__}, not to a durable run row"
+            )
+        if getattr(self.registry, "_audit", None) is not self.audit:
+            problems.append(
+                "the capability registry does not record through this graph's audit log"
+            )
+        if isinstance(self.analysis.findings_sink, RecordingFindingsSink):
+            problems.append("the analysis engine records findings in memory, not to a durable sink")
+        if getattr(self.analysis, "_registry", None) is not self.registry:
+            problems.append("the analysis engine runs over a different capability registry")
+        if self.machine.store is not self.state:
+            problems.append("the run machine writes to a different state store than the graph's")
+        if getattr(self.review_queue, "_machine", None) is not self.machine:
+            problems.append(
+                "the review queue transitions runs through a second machine over this store, "
+                "which would be a second writer of the run's state column"
+            )
+
+        if problems:
+            raise IncompleteEngineGraph(
+                "this engine graph is missing wiring build_engine performs: " + "; ".join(problems)
+            )
 
     def orchestrator(
         self,

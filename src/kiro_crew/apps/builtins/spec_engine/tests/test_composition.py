@@ -9,6 +9,7 @@ these tests are written to fail when a construction is deleted from
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,11 @@ from typing import Any
 import pytest
 
 from kiro_crew.apps.builtins.spec_engine.engine.analysis import (
+    AnalysisEngine,
     AnalysisReport,
     RecordingFindingsSink,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyDecision, AutonomyLevel
 from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunCostSink
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.builtins import (
@@ -26,10 +29,18 @@ from kiro_crew.apps.builtins.spec_engine.engine.capabilities.builtins import (
     IMPLEMENTATION_PROVIDER,
     MODEL_CATALOG_PROVIDER,
     REVIEW_PROVIDER,
+    register_builtins,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import ProviderNature
-from kiro_crew.apps.builtins.spec_engine.engine.capabilities.registry import RecordingCostSink
-from kiro_crew.apps.builtins.spec_engine.engine.composition import EngineGraph, build_engine
+from kiro_crew.apps.builtins.spec_engine.engine.capabilities.registry import (
+    CapabilityRegistry,
+    RecordingCostSink,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.composition import (
+    EngineGraph,
+    IncompleteEngineGraph,
+    build_engine,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import resolve_authority
 from kiro_crew.apps.builtins.spec_engine.engine.notify.routing import HostNotifier
 from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
@@ -39,7 +50,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.roles import Dispatch
 from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine
-from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef
+from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 PROJECT = "acme"
 SOURCE = "manual"
@@ -245,6 +256,104 @@ class TestSharedCollaborators:
         graph = build(tmp_path)
         with pytest.raises(Exception):
             graph.machine = RunMachine(graph.state, graph.config)  # type: ignore[misc]
+
+
+class TestAPartialGraphIsUnconstructable:
+    """The module claims completeness "by construction"; this is what enforces it.
+
+    Both spellings below type-check and both were demonstrated to produce a graph
+    with no builtins registered — one by calling the dataclass, one by the
+    ``replace()`` an ordinary refactor of a frozen dataclass reaches for. The
+    field types cannot tell them apart from a built graph, so the invariant is
+    checked on the instance.
+    """
+
+    def bare_registry(self, graph: EngineGraph) -> CapabilityRegistry:
+        """A registry as valid as the graph's, minus the builtin registration."""
+        return CapabilityRegistry(
+            graph.config,
+            project=graph.project,
+            audit=graph.audit,
+            cost_sink=RunCostSink(graph.state),
+        )
+
+    def test_direct_construction_with_an_unregistered_registry_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        graph = build(tmp_path)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            EngineGraph(
+                project=graph.project,
+                state=graph.state,
+                config=graph.config,
+                audit=graph.audit,
+                registry=self.bare_registry(graph),
+                analysis=graph.analysis,
+                notifier=graph.notifier,
+                machine=graph.machine,
+                review_queue=graph.review_queue,
+            )
+        assert "authoring" in str(caught.value)
+
+    def test_replace_cannot_swap_in_an_unregistered_registry(self, tmp_path: Path) -> None:
+        """``replace()`` re-runs ``__post_init__``, which is why it is caught."""
+        graph = build(tmp_path)
+        with pytest.raises(IncompleteEngineGraph):
+            dataclasses.replace(graph, registry=self.bare_registry(graph))
+
+    def test_replace_cannot_swap_in_a_registry_that_attributes_cost_to_memory(
+        self, tmp_path: Path
+    ) -> None:
+        graph = build(tmp_path)
+        registry = CapabilityRegistry(graph.config, project=graph.project, audit=graph.audit)
+        register_builtins(registry, model_resolver=models)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(graph, registry=registry)
+        assert "durable run row" in str(caught.value)
+
+    def test_replace_cannot_swap_in_a_second_writer_of_the_state_column(
+        self, tmp_path: Path
+    ) -> None:
+        """A second machine over the same store is the invariant's whole point."""
+        graph = build(tmp_path)
+        second = RunMachine(graph.state, graph.config, project=graph.project, audit=graph.audit)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(graph, machine=second)
+        assert "second writer" in str(caught.value)
+
+    def test_replace_cannot_move_the_machine_to_another_store(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+        elsewhere = StateStore(root=tmp_path / "elsewhere")
+        with pytest.raises(IncompleteEngineGraph):
+            dataclasses.replace(
+                graph,
+                machine=RunMachine(elsewhere, graph.config, audit=graph.audit),
+            )
+
+    def test_replace_cannot_route_findings_back_into_memory(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(
+                graph,
+                analysis=AnalysisEngine(graph.registry, findings_sink=RecordingFindingsSink()),
+            )
+        assert "memory" in str(caught.value)
+
+    def test_replace_cannot_detach_the_audit_log_from_the_registry(self, tmp_path: Path) -> None:
+        """A capability call recorded nowhere is the audit seam's default."""
+        graph = build(tmp_path)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(graph, audit=AuditLog(root=tmp_path / "second-audit"))
+        assert "audit log" in str(caught.value)
+
+    def test_the_built_graph_passes_its_own_invariant(self, tmp_path: Path) -> None:
+        """The check is not vacuous in the other direction: replace() still works.
+
+        A ``replace`` that changes nothing the invariant covers has to succeed, or
+        the check would be a ban on ``replace`` rather than on a partial graph.
+        """
+        graph = build(tmp_path)
+        assert dataclasses.replace(graph, project="other").registry is graph.registry
 
 
 def worker(*, task: str, dispatch: Dispatch, context: RunContext) -> TaskResult:
