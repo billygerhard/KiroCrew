@@ -881,6 +881,87 @@ class TestQuarantineAndRelease:
         record = state.get_run(run_id)
         assert record is not None and feedback_quarantined(record) == ()
 
+    def test_a_released_comment_is_gated_again_rather_than_waved_through(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """The second way a comment starts work must pass the same gate.
+
+        A release is not a dispatch: it drops the claim so the next poll decides
+        again. If it were a dispatch, or if the re-entry skipped the checks, the
+        release would be a way past the class gate and the screener -- one
+        guarantee enforced on one of two paths, which is the shape every security
+        defect in this engine has had.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        run_id = "run-1"
+        register_run(state, config, ref)
+        reviser, screener = Reviser(), Screener()
+        under_test = watcher(config, state, reviser=reviser, screener=screener)
+        held = json.dumps([comment_payload("c1", author=STRANGER, association="NONE")])
+
+        under_test.tick(
+            route_of(config),
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=held),
+        )
+        release_quarantined_comment(
+            state, AuditLog(state.root), ref, run_id, "c1", actor="operator"
+        )
+        after = under_test.tick(
+            route_of(config),
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=held),
+        )
+
+        # Nothing about the comment's author changed, so the release re-runs the
+        # decision and reaches the same refusal -- at no cost, again.
+        assert after.dispositions[0].outcome is ReviewFeedbackOutcome.QUARANTINED
+        assert reviser.revisions == []
+        assert screener.calls == []
+        record = state.get_run(run_id)
+        assert record is not None and feedback_quarantined(record) == ("c1",)
+
+    def test_a_released_comment_is_screened_again_before_it_dispatches(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """Screening is not skipped on the release path either.
+
+        A comment screening held once must be screened again when a person
+        releases it: the release re-opens the decision, it does not carry a
+        verdict forward.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        run_id = "run-1"
+        register_run(state, config, ref)
+        screener = Screener(suspected=True)
+        under_test = watcher(config, state, screener=screener)
+        text = json.dumps([comment_payload("c1", body=INJECTION)])
+
+        under_test.tick(
+            route_of(config),
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=text),
+        )
+        release_quarantined_comment(
+            state, AuditLog(state.root), ref, run_id, "c1", actor="operator"
+        )
+        after = under_test.tick(
+            route_of(config),
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=text),
+        )
+
+        assert after.dispositions[0].outcome is ReviewFeedbackOutcome.SCREENED_OUT
+        assert len(screener.calls) == 2
+
     def test_releasing_a_comment_nobody_held_reports_that(
         self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
     ) -> None:
