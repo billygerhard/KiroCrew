@@ -143,6 +143,18 @@ class StdioServer:
         """Invoke one tool and return the raw JSON-RPC reply."""
         return self.request("tools/call", {"name": name, "arguments": arguments})
 
+    def tool_text(self, name: str, arguments: dict[str, Any]) -> str:
+        """Invoke one tool and return its result text, failing on an error reply."""
+        reply = self.call_tool(name, arguments)
+        assert "error" not in reply, f"{name} failed: {reply.get('error')}"
+        content = reply["result"]["content"]
+        assert content and content[0]["type"] == "text", f"{name} returned no text content"
+        return str(content[0]["text"])
+
+    def tool_payload(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Invoke one tool and decode its JSON result."""
+        return json.loads(self.tool_text(name, arguments))
+
     def stderr_text(self) -> str:
         if not self._stderr_path.is_file():  # pragma: no cover - written at spawn
             return ""
