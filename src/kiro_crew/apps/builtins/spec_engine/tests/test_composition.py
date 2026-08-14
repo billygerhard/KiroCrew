@@ -222,6 +222,17 @@ class TestSharedCollaborators:
         assert callable(getattr(graph.notifier, "notify"))
         assert callable(getattr(graph.notifier, "send"))
 
+    def test_the_capability_registry_records_through_the_graphs_audit_log(
+        self, tmp_path: Path
+    ) -> None:
+        """One log, not a second handle: a capability call is auditable evidence.
+
+        The registry's audit seam defaults to ``None``, which records a completed
+        capability call nowhere.
+        """
+        graph = build(tmp_path)
+        assert getattr(graph.registry, "_audit") is graph.audit
+
     def test_the_machine_and_the_audit_log_are_rooted_where_the_state_is(
         self, tmp_path: Path
     ) -> None:
