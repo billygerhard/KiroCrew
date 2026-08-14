@@ -185,6 +185,16 @@ def stdio_server(home: Path) -> Iterator[StdioServer]:
     # snapshots the state tree.
     stderr_path = home.parent / f"{home.name}-server-stderr.log"
     env = dict(os.environ, KIROCREW_HOME=str(home))
+    # Put the repo's source root on the CHILD's path explicitly, derived from this
+    # file's location rather than inherited. `python -m` resolves the server module
+    # against the child's own sys.path, and the in-process tests import it via the
+    # path pytest sets up -- which the child does not get. Inheriting PYTHONPATH
+    # instead made these tests pass only in a shell that happened to export it, so
+    # they were green for whoever wrote them and red everywhere else, which is the
+    # one outcome a conformance test must not have.
+    source_root = Path(__file__).resolve().parents[5]
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{source_root}{os.pathsep}{existing}" if existing else str(source_root)
     with stderr_path.open("w", encoding="utf-8") as errors:
         child = subprocess.Popen(  # nosec B603 - fixed argv, no shell, this package's server
             [sys.executable, "-m", SERVER_MODULE],
