@@ -297,7 +297,7 @@ def _read(source: WatchSource, produced: CommandOutcome, *, duration: float) -> 
         )
 
     try:
-        entries = _decode(produced.stdout)
+        entries = decode_entries(produced.stdout)
     except ValueError as exc:
         return _unhealthy(
             source.name,
@@ -332,12 +332,17 @@ def _read(source: WatchSource, produced: CommandOutcome, *, duration: float) -> 
     )
 
 
-def _decode(stdout: str) -> list[Any]:
+def decode_entries(stdout: str) -> list[Any]:
     """Decode poll output into a list of entries, raising ``ValueError`` when it is not one.
 
     Two shapes are accepted because real tracker clients emit both: one JSON
     array, or one JSON object per line. Nothing at all is not a third shape — a
     command that printed nothing has not told us its backlog is empty.
+
+    Public because the review-feedback watcher reads its own configured poll
+    command's output through it. Two decoders would be two answers to "did this
+    command report an empty list or fail to report", and the distinction is the
+    whole reason this one is careful.
     """
     text = stdout.strip()
     if not text:

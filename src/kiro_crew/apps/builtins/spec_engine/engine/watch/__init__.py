@@ -21,6 +21,9 @@ The module split follows what each part is responsible for:
 * :mod:`.dispatch` — routing a claimed item to a project, a spec type, a trust
   class, and an autonomy level, then seeding the run or refusing to.
 * :mod:`.tick` — the script cron that runs a tick with no model invocation.
+* :mod:`.review_feedback` — the per-project opt-in poll of a run's review
+  artifact, where a reviewer comment becomes fix work only under its own
+  author's class.
 """
 
 from __future__ import annotations
@@ -119,6 +122,30 @@ from .poll import (
     poll_source,
     poll_sources,
 )
+from .review_feedback import (
+    AUDIT_REVIEW_FEEDBACK,
+    AUDIT_REVIEW_FEEDBACK_BOUND,
+    AUDIT_REVIEW_FEEDBACK_RELEASED,
+    CLAIM_REVIEW_COMMENT,
+    COMMENT_FIELDS,
+    DISPATCH_FIELD,
+    REQUIRED_COMMENT_FIELDS,
+    CommentDisposition,
+    CommentPoll,
+    CommentScreener,
+    ReviewComment,
+    ReviewFeedbackBound,
+    ReviewFeedbackOutcome,
+    ReviewFeedbackTick,
+    ReviewFeedbackWatch,
+    ReviewFeedbackWatcher,
+    RevisionDelivery,
+    dispatch_permitted_for,
+    load_watch,
+    poll_comments,
+    release_quarantined_comment,
+    review_feedback_enabled,
+)
 from .screening import (
     AUDIT_INTAKE_SCREENING,
     BUNDLED_SCREENING_GUIDANCE,
@@ -175,8 +202,15 @@ __all__ = [
     "AUDIT_INTAKE_SCREENING",
     "AUDIT_ITEM_EDIT_IGNORED",
     "AUDIT_ITEM_FEEDBACK",
+    "AUDIT_REVIEW_FEEDBACK",
+    "AUDIT_REVIEW_FEEDBACK_BOUND",
+    "AUDIT_REVIEW_FEEDBACK_RELEASED",
     "BUNDLED_SCREENING_GUIDANCE",
     "CLAIM_NAME_TAKEN",
+    "CLAIM_REVIEW_COMMENT",
+    "COMMENT_FIELDS",
+    "DISPATCH_FIELD",
+    "REQUIRED_COMMENT_FIELDS",
     "CLAIM_UNMAPPED",
     "CLOSED_STATES",
     "CONTENT_DIGEST_FIELDS",
@@ -209,6 +243,16 @@ __all__ = [
     "WATCH_SOURCE_PRESET_PROGRAMS",
     "WATCH_SOURCE_PRESETS",
     "Capacity",
+    "CommentDisposition",
+    "CommentPoll",
+    "CommentScreener",
+    "ReviewComment",
+    "ReviewFeedbackBound",
+    "ReviewFeedbackOutcome",
+    "ReviewFeedbackTick",
+    "ReviewFeedbackWatch",
+    "ReviewFeedbackWatcher",
+    "RevisionDelivery",
     "CancelCascade",
     "CascadeResult",
     "CascadeStatus",
@@ -257,6 +301,7 @@ __all__ = [
     "cron_job_name",
     "crons_directory",
     "diff_poll",
+    "dispatch_permitted_for",
     "dispatch_source",
     "dispatch_tick",
     "dispatched_generations",
@@ -270,8 +315,10 @@ __all__ = [
     "install_tick_script",
     "is_open_state",
     "load_route",
+    "load_watch",
     "load_sources",
     "poll",
+    "poll_comments",
     "poll_interval_s",
     "poll_source",
     "poll_sources",
@@ -283,6 +330,8 @@ __all__ = [
     "record_unmapped",
     "recorded_items",
     "release_dispatch_claim",
+    "release_quarantined_comment",
+    "review_feedback_enabled",
     "run_tick_script",
     "screening_enabled_for",
     "source_names",

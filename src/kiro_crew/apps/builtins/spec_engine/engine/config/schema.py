@@ -164,6 +164,18 @@ ITEM_LIFECYCLE_EVENTS: tuple[str, ...] = (
 #: Wildcard key accepted wherever a policy is keyed by class or spec type.
 WILDCARD_KEY = "default"
 
+#: The per-project review-feedback container: the poll command that reads the
+#: run's review artifact and the submitter classes whose comments may drive a fix
+#: dispatch. Named here rather than in the watcher because
+#: :data:`CONFIG_ONLY_PATHS` fences it, and one spelling of a fenced path is what
+#: keeps the fence and the reader talking about the same node.
+REVIEW_FEEDBACK_FIELD = "review_feedback"
+
+#: Fields the review-feedback container may carry. ``poll`` is the argv template
+#: whose output is read as reviewer comments; ``dispatch`` is the per-submitter-class
+#: permission to drive a fix dispatch; ``timeout_s`` bounds the poll.
+REVIEW_FEEDBACK_FIELDS: tuple[str, ...] = ("poll", "dispatch", "timeout_s")
+
 #: Fields a project entry may carry besides setting groups.
 PROJECT_FIELDS: tuple[str, ...] = (
     "path",
@@ -172,6 +184,7 @@ PROJECT_FIELDS: tuple[str, ...] = (
     "protected_branches",
     "variables",
     "intake",
+    "review_feedback",
     SECTION_WORKFLOW,
 )
 
@@ -222,6 +235,17 @@ CONFIG_ONLY_PATHS: tuple[str, ...] = (
     # on the same action stays writable from a surface no operator confirmed.
     "delivery.auto_integrate",
     f"{SECTION_PROJECTS}.*.delivery.auto_integrate",
+    # The review-feedback watcher, in both halves. The container holds argv the
+    # engine runs plus the submitter classes whose comments may spend the run's
+    # budget and change its code, and the switch is what arms the whole channel:
+    # a reviewer comment becomes work here, so a tool that could write either
+    # half could open an instruction channel into an unattended run by writing
+    # configuration. Fenced together, because arming a project that already
+    # carries commands and widening the permitted classes on an armed project
+    # reach the same place from opposite directions.
+    f"{SECTION_PROJECTS}.*.{REVIEW_FEEDBACK_FIELD}",
+    "delivery.review_feedback_enabled",
+    f"{SECTION_PROJECTS}.*.delivery.review_feedback_enabled",
 )
 
 
@@ -630,6 +654,8 @@ def _check_project(errors: list[ConfigError], entry: Mapping[str, Any], path: st
             _check_str_map(errors, value, field_path)
         elif key == "intake":
             _check_intake(errors, value, field_path)
+        elif key == REVIEW_FEEDBACK_FIELD:
+            _check_review_feedback(errors, value, field_path)
         else:
             errors.append(ConfigError(field_path, "unknown project field"))
     # A project must be locatable: every later phase (isolate, stage commands,
@@ -754,6 +780,76 @@ def _check_echo(errors: list[ConfigError], value: Any, path: str) -> None:
                     path,
                     f"{LEAST_TRUSTED_CLASS!r} is never echoable: republishing the least trusted "
                     "class's text under the engine's name is refused however it is configured",
+                )
+            )
+            continue
+        if klass not in SUBMITTER_CLASSES:
+            errors.append(ConfigError(klass_path, "unknown submitter class"))
+            continue
+        if not isinstance(permitted, bool):
+            errors.append(ConfigError(klass_path, "expected true or false"))
+
+
+def _check_review_feedback(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate a project's review-feedback watcher: its poll command and its
+    per-submitter-class permission to drive a fix dispatch.
+
+    The permission map refuses the same two keys its reader refuses, so an
+    operator finds out at write time rather than saving a setting that is
+    silently ignored: the wildcard, which would let one entry hand every class a
+    channel that spends the run's budget and changes its code, and the
+    least-trusted class, which may never drive a dispatch however it is
+    configured. Both are reported against the MAP rather than the key, because
+    each is a property of the map carrying the key -- and because a lost branch
+    would still error one level down as an unknown class, leaving only the
+    wording to tell them apart.
+    """
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object"))
+        return
+    for key, entry in value.items():
+        field_path = f"{path}.{key}"
+        if key not in REVIEW_FEEDBACK_FIELDS:
+            errors.append(ConfigError(field_path, "unknown review feedback field"))
+        elif key == "poll":
+            _check_argv(errors, entry, field_path, required=True)
+        elif key == "timeout_s":
+            _check_positive_int(errors, entry, field_path)
+        else:
+            _check_feedback_dispatch(errors, entry, field_path)
+    if "poll" not in value:
+        errors.append(
+            ConfigError(
+                f"{path}.poll",
+                "review feedback needs a poll command: without one the watcher would "
+                "report no new comments rather than say it cannot read them",
+            )
+        )
+
+
+def _check_feedback_dispatch(errors: list[ConfigError], value: Any, path: str) -> None:
+    if not isinstance(value, Mapping):
+        errors.append(ConfigError(path, "expected an object keyed by submitter class"))
+        return
+    for klass, permitted in value.items():
+        klass_path = f"{path}.{klass}"
+        if klass == WILDCARD_KEY:
+            errors.append(
+                ConfigError(
+                    path,
+                    "review feedback dispatch has no default key: it is permitted per "
+                    "submitter class so that no single setting can let every class "
+                    "dispatch work from a comment",
+                )
+            )
+            continue
+        if klass == LEAST_TRUSTED_CLASS:
+            errors.append(
+                ConfigError(
+                    path,
+                    f"{LEAST_TRUSTED_CLASS!r} may never drive a fix dispatch: a comment "
+                    "from the least trusted class is quarantined for human release "
+                    "however it is configured",
                 )
             )
             continue

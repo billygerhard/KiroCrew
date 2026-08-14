@@ -49,6 +49,8 @@ from .runs import (
     TERMINAL_STATES,
     RunMachine,
     RunState,
+    feedback_needs_human,
+    feedback_quarantined,
     phase_entered_ts,
     revision_cycles,
     revision_exhausted_gates,
@@ -171,6 +173,18 @@ class QueueEntry:
     #: second "needs human" state, so the queue stays the one place a run waits
     #: on a person.
     revision_exhausted: bool = False
+    #: How many reviewer comments on this run's review artifact are held for a
+    #: person to release: refused because the commenter's own submitter class may
+    #: not drive a fix dispatch, or held by screening. A count rather than the ids
+    #: because this projection is what a surface renders; the ids and the release
+    #: live behind the watcher, so a queue row cannot become a place comment text
+    #: is copied to.
+    feedback_quarantined: int = 0
+    #: True when a review-feedback bound -- the cycle limit or the budget ceiling
+    #: -- parked this run for a person. The delivery-review counterpart of
+    #: ``revision_exhausted``, kept separate because they bound different loops
+    #: and a reviewer acting on one is not acting on the other.
+    feedback_needs_human: bool = False
 
     @property
     def ref(self) -> SpecRef:
@@ -191,6 +205,8 @@ class QueueEntry:
             "cost_credits": self.cost_credits,
             "gate": self.gate,
             "revision_exhausted": self.revision_exhausted,
+            "feedback_quarantined": self.feedback_quarantined,
+            "feedback_needs_human": self.feedback_needs_human,
         }
 
 
@@ -534,6 +550,8 @@ class ReviewQueue:
             cost_credits=record.cost_credits,
             gate=gate,
             revision_exhausted=gate is not None and gate in revision_exhausted_gates(record),
+            feedback_quarantined=len(feedback_quarantined(record)),
+            feedback_needs_human=feedback_needs_human(record),
         )
 
     def _outstanding_gate(self, ref: SpecRef) -> str | None:

@@ -296,6 +296,19 @@ DETAIL_REVISION_CYCLES = "revision_cycles"
 #: that gate. A list rather than a flag because a run reviewed across several
 #: gates can exhaust one without the others.
 DETAIL_REVISION_EXHAUSTED = "revision_exhausted"
+#: How many fix rounds the review-feedback watcher has dispatched for this run
+#: from comments on its review artifact. Per run rather than per gate, because a
+#: delivery review is one artifact rather than a sequence of document gates, and
+#: the count is what the retry bound is measured against.
+DETAIL_FEEDBACK_CYCLES = "feedback_cycles"
+#: True once a review-feedback bound was reached -- the cycle limit or the budget
+#: ceiling -- so no further fix is dispatched from a comment until a person acts.
+#: A flag rather than a list because the bound is per run like the count.
+DETAIL_FEEDBACK_NEEDS_HUMAN = "feedback_needs_human"
+#: Reviewer comments held for human release: refused because the commenter's own
+#: submitter class may not drive a dispatch, or because screening held them. Ids
+#: only -- the comment text is never copied into the run row.
+DETAIL_FEEDBACK_QUARANTINED = "feedback_quarantined"
 
 #: Prefix on a generated run identifier, so a run id is recognisable in a
 #: session name, a log line, or a metering record.
@@ -457,6 +470,38 @@ def revision_exhausted_gates(record: RunRecord) -> frozenset[str]:
     if not isinstance(stored, list):
         return frozenset()
     return frozenset(gate for gate in stored if isinstance(gate, str) and gate)
+
+
+def feedback_cycles(record: RunRecord) -> int:
+    """How many review-feedback fix rounds the run has dispatched.
+
+    Read defensively, because the count is what the retry bound is measured
+    against: a bool is not a count (``isinstance(True, int)`` is true, so it is
+    excluded), and a negative or non-integer value reads as none spent rather than
+    being trusted. A foreign value in the shared detail column must not be able to
+    raise the bound.
+    """
+    stored = record.detail.get(DETAIL_FEEDBACK_CYCLES)
+    if isinstance(stored, bool) or not isinstance(stored, int) or stored < 0:
+        return 0
+    return stored
+
+
+def feedback_needs_human(record: RunRecord) -> bool:
+    """Whether a review-feedback bound parked this run for a person.
+
+    Only an explicit boolean true counts. Anything else reads as not parked, so a
+    stray value cannot make a run look attended-to when nothing bounded it.
+    """
+    return record.detail.get(DETAIL_FEEDBACK_NEEDS_HUMAN) is True
+
+
+def feedback_quarantined(record: RunRecord) -> tuple[str, ...]:
+    """Reviewer comment ids held for human release, in the order they were held."""
+    stored = record.detail.get(DETAIL_FEEDBACK_QUARANTINED)
+    if not isinstance(stored, list):
+        return ()
+    return tuple(item for item in stored if isinstance(item, str) and item)
 
 
 def new_run_id() -> str:

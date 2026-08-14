@@ -1270,6 +1270,22 @@ class StateStore:
             )
             return cursor.rowcount == 1
 
+    def release_claims(self, kind: str, scope: str, subject: str) -> int:
+        """Drop every generation of one subject's claim, returning how many went.
+
+        Distinct from :meth:`release_claim`, which names one generation. A caller
+        releasing a subject whose generations it does not know -- a held reviewer
+        comment that may have been claimed at a revision since edited -- needs all
+        of them gone, because one left behind would make the release look applied
+        while the next poll still read the subject as already seen.
+        """
+        with self._write() as conn:
+            cursor = conn.execute(
+                "DELETE FROM claims WHERE kind = ? AND scope = ? AND subject = ?",
+                (kind, scope, subject),
+            )
+            return int(cursor.rowcount)
+
     def list_claims(
         self, *, kind: str | None = None, scope: str | None = None
     ) -> list[ClaimRecord]:
