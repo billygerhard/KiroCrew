@@ -571,6 +571,13 @@ STEP_POOL: tuple[Step, ...] = (
 #: the budget buys ordering coverage rather than volume.
 PROPERTY_EXAMPLES = 8
 
+#: Indexes into the pool, split by whether the operation writes. A generated
+#: sequence always gets one write spliced into it: a probe that dropped the audit
+#: write on the MCP path only was NOT caught while the generator was free to emit
+#: reads alone, because two untouched stores compare equal.
+READ_PICKS = tuple(index for index, step in enumerate(STEP_POOL) if step.tool not in MUTATING)
+WRITE_PICKS = tuple(index for index, step in enumerate(STEP_POOL) if step.tool in MUTATING)
+
 
 @settings(
     max_examples=PROPERTY_EXAMPLES,
@@ -578,15 +585,25 @@ PROPERTY_EXAMPLES = 8
     suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
 )
 @given(
-    picks=st.lists(st.integers(min_value=0, max_value=len(STEP_POOL) - 1), min_size=1, max_size=5)
+    picks=st.lists(st.sampled_from(READ_PICKS + WRITE_PICKS), max_size=4),
+    required=st.sampled_from(WRITE_PICKS),
+    position=st.integers(min_value=0, max_value=4),
 )
 def test_any_order_of_state_operations_leaves_identical_state(
-    tmp_path: Path, picks: list[int]
+    tmp_path: Path, picks: list[int], required: int, position: int
 ) -> None:
-    steps = tuple(STEP_POOL[index] for index in picks)
+    indexes = list(picks)
+    indexes.insert(min(position, len(indexes)), required)
+    steps = tuple(STEP_POOL[index] for index in indexes)
     # A fresh example directory, so an earlier example's rows cannot decide this
     # one's outcome.
     example = tmp_path / uuid.uuid4().hex
     example.mkdir(parents=True)
     mcp_state, library_state = _compare_paths(steps, example, "property")
-    assert mcp_state == library_state, f"{[step.tool for step in steps]} diverged"
+
+    named = [step.tool for step in steps]
+    assert mcp_state == library_state, f"{named} diverged"
+    # Non-vacuity: a generated write can legitimately be refused, but reaching one
+    # at all makes the store aware of the spec, so this comparison is never
+    # between two stores that were left untouched.
+    assert _rows(mcp_state, "specs"), f"{named} left no state to compare"
