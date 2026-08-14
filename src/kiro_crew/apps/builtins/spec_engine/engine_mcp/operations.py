@@ -19,13 +19,14 @@ config-only object to the fence protects this path for free.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from ..engine.audit import AuditLog
-from ..engine.config import ConfigStore, ConfigWriteSurface
+from ..engine.analysis import AnalysisReport
+from ..engine.composition import EngineGraph, build_engine
+from ..engine.config import ConfigWriteSurface
 from ..engine.cross_document import validate_spec as validate_spec_documents
 from ..engine.phases import RunMode, advance, approve, derive_phase
-from ..engine.state import SpecRef, StateStore
+from ..engine.state import SpecRef
 from ..engine.structure import parse_tasks
 
 #: The surface this adapter writes configuration through. It is deliberately not
@@ -36,6 +37,38 @@ from ..engine.structure import parse_tasks
 #: it. Flipping this to confirmed would hand an agent the authority the whole
 #: config-only fence exists to withhold.
 ENGINE_MCP_SURFACE = ConfigWriteSurface("engine-mcp", operator_confirmed=False)
+
+
+def no_host_model_catalog() -> Sequence[str]:
+    """The model identifiers this surface can see, which are none.
+
+    The MCP server runs as its own process with no gateway handle, so it cannot
+    ask the host what it advertises. Reporting an empty catalog is the honest
+    answer and the one the model-catalog builtin is built for ("entitlement
+    unknown"); inventing a model id here would be exactly the static list that
+    capability exists to avoid. It is a *catalog* that is empty, not a skipped
+    registration: the builtins are registered either way, so the three
+    credit-spending capabilities are still labelled model-backed.
+    """
+    return ()
+
+
+class RefusingFindingsSink:
+    """Refuses to record: no analysis path is wired on the MCP surface.
+
+    None of this adapter's operations invokes analysis, so nothing routes a
+    report here. It raises rather than quietly holding rows in memory so that a
+    future tool which does run analysis has to pass the durable sink instead of
+    silently discovering that its findings went nowhere. Not a second spelling of
+    :class:`~..engine.analysis.RecordingFindingsSink` — that one keeps rows for a
+    caller to read, which would make a lost report look handled.
+    """
+
+    def record(self, ref: SpecRef, *, run: str, report: AnalysisReport) -> None:
+        raise NotImplementedError(
+            "the engine-MCP surface has no findings sink wired; a tool that runs "
+            "analysis must build its graph with the durable sink"
+        )
 
 
 def _report_json(report: Any) -> dict[str, Any]:
@@ -59,20 +92,68 @@ def _report_json(report: Any) -> dict[str, Any]:
 class EngineOperations:
     """Adapter binding tool calls to engine library calls.
 
+    Built over the engine's one composition root rather than over collaborators
+    of its own. Today's six operations touch documents, phases, approvals and
+    configuration — no run row and no capability — so a private store and audit
+    log would still *work*; they would also be a second, partial object graph,
+    and the first run-touching or capability-touching tool added here would
+    inherit an unregistered registry, a cost sink in memory, and a second writer
+    of the run's state column. Taking the graph now means that tool has nothing
+    left to get wrong.
+
     Roots are injectable so a test can point the adapter at a temporary state
-    directory; in production every root resolves to the app's own data home.
+    directory; in production every root resolves to the app's own data home. A
+    caller that already holds a graph passes it instead, so a surface inside the
+    gateway (with a real model catalog and a durable findings sink) does not get
+    this process's deliberately empty ones.
     """
 
     def __init__(
         self,
         *,
+        graph: EngineGraph | None = None,
         state_root: str | Path | None = None,
         audit_root: str | Path | None = None,
         config_root: str | Path | None = None,
     ) -> None:
-        self._store = StateStore(root=state_root)
-        self._audit = AuditLog(root=audit_root)
-        self._config_root = Path(config_root) if config_root is not None else None
+        self._graph = (
+            graph if graph is not None else self._build(state_root, audit_root, config_root)
+        )
+        self._store = self._graph.state
+        self._audit = self._graph.audit
+        self._config = self._graph.config
+
+    @staticmethod
+    def _build(
+        state_root: str | Path | None,
+        audit_root: str | Path | None,
+        config_root: str | Path | None,
+    ) -> EngineGraph:
+        """The graph this process can honestly assemble.
+
+        Both host-facing seams are supplied with what a standalone MCP process
+        actually has: no catalog to advertise and no analysis path to record
+        through. Each is a stated value rather than an omission — ``build_engine``
+        has no defaults for them precisely so that a surface which cannot supply
+        one has to say what it is passing instead.
+        """
+        return build_engine(
+            model_resolver=no_host_model_catalog,
+            findings_sink=RefusingFindingsSink(),
+            host_state=None,
+            state_root=state_root,
+            audit_root=audit_root,
+            config_root=config_root,
+        )
+
+    @property
+    def graph(self) -> EngineGraph:
+        """The engine graph this adapter runs over.
+
+        Exposed so a future run-touching tool reaches ``graph.machine`` — the
+        process's one run-state writer — instead of building a second machine.
+        """
+        return self._graph
 
     # --- reads -------------------------------------------------------------
 
@@ -150,6 +231,9 @@ class EngineOperations:
         workflow, and everything else the shared fence guards. No tool is wired
         to this method; it exists so that any configuration this adapter ever
         needs to write cannot escape the fence the rest of the app relies on.
+
+        Writes through the graph's own store, so this adapter reads and writes
+        configuration through one object rather than through a second store whose
+        root could drift from the one everything else resolved.
         """
-        store = ConfigStore(root=self._config_root)
-        return store.write(patch, surface=ENGINE_MCP_SURFACE)
+        return self._config.write(patch, surface=ENGINE_MCP_SURFACE)

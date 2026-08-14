@@ -20,8 +20,16 @@ from typing import Any
 
 import pytest
 
+from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunCostSink
+from kiro_crew.apps.builtins.spec_engine.engine.capabilities.builtins import AUTHORING_PROVIDER
+from kiro_crew.apps.builtins.spec_engine.engine.composition import build_engine
 from kiro_crew.apps.builtins.spec_engine.engine.documents import DocumentKind
-from kiro_crew.apps.builtins.spec_engine.engine_mcp.operations import EngineOperations
+from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef
+from kiro_crew.apps.builtins.spec_engine.engine_mcp.operations import (
+    EngineOperations,
+    RefusingFindingsSink,
+    no_host_model_catalog,
+)
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.server import handle
 
 #: This repository's own spec: its documents are format-clean, so they stand in
@@ -55,8 +63,12 @@ def _ops(tmp_path: Path) -> EngineOperations:
 
 def _call(name: str, arguments: dict[str, Any], ops: EngineOperations) -> dict[str, Any]:
     reply = handle(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-         "params": {"name": name, "arguments": arguments}},
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
         ops=ops,
     )
     assert reply is not None
@@ -105,8 +117,12 @@ def test_stock_agent_completes_the_authoring_flow(tmp_path: Path) -> None:
 
     # 1. Learn the workflow.
     guidance = handle(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-         "params": {"name": "get_authoring_prompt", "arguments": {"spec_type": "feature"}}}
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "get_authoring_prompt", "arguments": {"spec_type": "feature"}},
+        }
     )
     assert guidance is not None and "record_approval" in guidance["result"]["content"][0]["text"]
 
@@ -166,3 +182,95 @@ def test_mcp_and_library_agree_on_validation(tmp_path: Path) -> None:
     via_lib = validate_spec(project / ".kiro" / "specs" / _SPEC_NAME)
     assert via_tool["ok"] == via_lib.ok
     assert len(via_tool["violations"]) == len(via_lib.violations)
+
+
+class TestTheAdapterRunsOverTheCompositionRoot:
+    """The MCP surface takes the engine's one graph, not collaborators of its own.
+
+    Every assertion here fails if ``EngineOperations.__init__`` goes back to
+    building a ``StateStore`` and an ``AuditLog`` directly — which *works* for
+    today's six operations and is exactly why the second graph is worth
+    preventing before a run-touching tool inherits it.
+    """
+
+    def test_the_adapter_reads_and_writes_through_the_graphs_collaborators(
+        self, tmp_path: Path
+    ) -> None:
+        ops = EngineOperations(
+            state_root=tmp_path / "state",
+            audit_root=tmp_path / "audit",
+            config_root=tmp_path / "config",
+        )
+        assert ops._store is ops.graph.state
+        assert ops._audit is ops.graph.audit
+        assert ops._config is ops.graph.config
+
+    def test_the_graph_the_adapter_built_has_the_builtins_registered(self, tmp_path: Path) -> None:
+        """A private StateStore would leave this registry unbuilt entirely."""
+        ops = EngineOperations(
+            state_root=tmp_path / "state",
+            audit_root=tmp_path / "audit",
+            config_root=tmp_path / "config",
+        )
+        assert ops.graph.registry.builtin("authoring").identity.name == AUTHORING_PROVIDER
+        assert isinstance(ops.graph.registry.cost_sink, RunCostSink)
+
+    def test_the_run_state_writer_is_the_graphs_one_machine(self, tmp_path: Path) -> None:
+        """What the first run-touching tool will reach for, already correct."""
+        ops = EngineOperations(
+            state_root=tmp_path / "state",
+            audit_root=tmp_path / "audit",
+            config_root=tmp_path / "config",
+        )
+        assert ops.graph.machine.store is ops.graph.state
+        assert getattr(ops.graph.review_queue, "_machine") is ops.graph.machine
+
+    def test_a_supplied_graph_is_the_one_used(self, tmp_path: Path) -> None:
+        """A gateway-side caller's graph is not duplicated by this adapter.
+
+        The point of accepting one: inside the gateway the model catalog and the
+        findings sink are real, and a second graph built here would quietly run
+        the same surface over empty ones.
+        """
+        graph = build_engine(
+            model_resolver=lambda: ("host-model",),
+            findings_sink=_CollectingSink(),
+            host_state=None,
+            state_root=tmp_path / "given-state",
+            audit_root=tmp_path / "given-audit",
+            config_root=tmp_path / "given-config",
+        )
+        ops = EngineOperations(graph=graph)
+        assert ops.graph is graph
+        assert ops._store is graph.state
+        assert ops._audit is graph.audit
+
+    def test_this_surfaces_findings_sink_refuses_rather_than_dropping_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The empty seams are stated, and the analysis one fails loud if used.
+
+        A memory sink here would let a future analysis tool look wired while its
+        findings died with the process; this raises so it has to pass a durable
+        sink instead.
+        """
+        ops = EngineOperations(
+            state_root=tmp_path / "state",
+            audit_root=tmp_path / "audit",
+            config_root=tmp_path / "config",
+        )
+        sink = ops.graph.analysis.findings_sink
+        assert isinstance(sink, RefusingFindingsSink)
+        assert tuple(no_host_model_catalog()) == ()
+        with pytest.raises(NotImplementedError):
+            sink.record(SpecRef.of(str(tmp_path / "p"), "s"), run="r", report=None)  # type: ignore[arg-type]
+
+
+class _CollectingSink:
+    """A durable sink stands here; what matters is that it is the one carried."""
+
+    def __init__(self) -> None:
+        self.rows: list[str] = []
+
+    def record(self, ref: SpecRef, *, run: str, report: Any) -> None:
+        self.rows.append(run)
