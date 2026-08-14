@@ -16,7 +16,12 @@ import pytest
 
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AUTONOMY_FIELD, AutonomyLevel
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import Untrusted
-from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
+from kiro_crew.apps.builtins.spec_engine.engine.config import (
+    CURRENT_VERSION,
+    VERSION_KEY,
+    ConfigStore,
+    ConfigValidationError,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
     COST_PROFILE_PRESET_NAMES,
     PROJECT_PROFILE_FIELD,
@@ -355,6 +360,11 @@ class TestValidatedWritePath:
         assert store.validate() == ()
         saved = json.loads(store.path.read_text(encoding="utf-8"))
         assert saved == dict(result.document)
+        # The version stamp is added by ConfigStore.write and by nothing else, so
+        # its presence is the evidence that the validated door was the door used.
+        # Without this, a hand-rolled writer that happened to emit a valid
+        # document would pass every other assertion here.
+        assert saved[VERSION_KEY] == CURRENT_VERSION
         project = saved[SECTION_PROJECTS]["acme"]
         assert project[PROJECT_PROFILE_FIELD] == "quality-first"
         assert project[SECTION_WORKFLOW][WORKFLOW_PRESET_KEY] == "git-pull-request"
@@ -396,6 +406,26 @@ class TestValidatedWritePath:
                     watch_source="github",
                 ),
                 surface=UNCONFIRMED_SURFACE,
+            )
+        assert store.document() == {}
+
+    def test_a_document_the_schema_would_reject_never_lands(
+        self, store: ConfigStore, github_project: Path
+    ):
+        # The validators run on the merged result, so a project name the schema
+        # refuses -- a name that is only whitespace -- must stop the write rather
+        # than be persisted and reported later. A writer that assembled its own
+        # document would leave this on disk.
+        plan = propose_setup(github_project, project="   ", which=all_programs)
+        with pytest.raises(ConfigValidationError):
+            apply_setup(
+                store,
+                plan,
+                SetupAnswers(
+                    cost_profile="budget",
+                    confirmations=declined(),
+                    approved_subjects=frozenset(item.subject for item in plan.inferences),
+                ),
             )
         assert store.document() == {}
 
@@ -539,6 +569,12 @@ class TestPrerequisiteReporting:
         phases = {check.phase for check in offer.prerequisites.checks}
         assert AutonomyLevel.DELIVERY in phases
         assert AutonomyLevel.EXECUTION in phases
+        # Named against this offer specifically, not against the whole report: the
+        # watch source offer also needs 'gh', so a report-wide assertion would stay
+        # green with the workflow programs dropped entirely.
+        named = {check.missing for check in offer.prerequisites.unmet}
+        assert any("'gh'" in item for item in named)
+        assert any("'git'" in item for item in named)
 
 
 class TestProjectFilesAlone:
