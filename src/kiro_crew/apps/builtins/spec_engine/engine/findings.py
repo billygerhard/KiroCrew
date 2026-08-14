@@ -25,6 +25,23 @@ class Severity(str, Enum):
     ERROR = "error"
     WARNING = "warning"
 
+    @property
+    def blocking(self) -> bool:
+        """Whether a gate depending on this result must refuse.
+
+        The one spelling of the blocking-versus-advisory distinction the
+        diagnostic reports and the gates enforce. A second enum for the same
+        partition would let a finding read blocking on a panel and advisory at
+        the gate, so the distinction is a property of this vocabulary rather than
+        a vocabulary of its own.
+        """
+        return self is Severity.ERROR
+
+    @property
+    def advisory(self) -> bool:
+        """Whether this result is worth showing but stops nothing."""
+        return not self.blocking
+
 
 @dataclass(frozen=True, order=True)
 class Location:
