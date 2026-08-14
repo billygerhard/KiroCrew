@@ -59,6 +59,7 @@ from typing import Any, Protocol
 from kiro_crew.atomic_write import atomic_write
 
 from .autonomy import AutonomyLevel
+from .budget.ceiling import DispatchOutcome
 from .budget.switch import KillSwitch, KillSwitchState
 from .capabilities.contracts import Degradation, Untrusted, sanitized
 from .config import ConfigStore
@@ -70,6 +71,7 @@ from .prerequisites import (
     CheckName,
     Prerequisite,
     ProgramResolver,
+    RunRefusal,
     check_project,
     check_source,
 )
@@ -94,6 +96,7 @@ __all__ = [
     "CHECK_PROVIDERS",
     "CHECK_REVIEW_QUEUE",
     "CHECK_SOURCE_HEALTH",
+    "DISPATCH_FINDINGS",
     "DOCTOR_HISTORY_FILENAME",
     "FINDING_CHECK_FAILED_PREFIX",
     "FINDING_CONFIG_INVALID",
@@ -120,9 +123,11 @@ __all__ = [
     "QueueProjection",
     "VersionReader",
     "check_failed_finding_id",
+    "dispatch_finding_id",
     "health_finding_id",
     "prerequisite_finding_id",
     "parse_version",
+    "refusal_finding_ids",
     "runs_waiting_finding_id",
     "scoped_finding_id",
     "version_satisfies",
@@ -213,6 +218,20 @@ WAITING_SEVERITIES: Mapping[WaitingOn, Severity] = {
     WaitingOn.STALL: Severity.ERROR,
 }
 
+#: A blocked dispatch's Finding identifier, per budget outcome.
+#:
+#: The requirement is that a blocked dispatch quotes the identifier the doctor
+#: reports for the same condition. A halted run and an unbounded headless run are
+#: the ceiling condition the ``budget_ceiling`` prerequisite names; a stopped one
+#: is the kill switch. ``ALLOWED`` has no identifier because nothing is wrong, and
+#: is absent rather than mapped to an empty string so a caller cannot quote
+#: "nothing" as a reason.
+DISPATCH_FINDINGS: Mapping[DispatchOutcome, str] = {
+    DispatchOutcome.HALTED: FINDING_PREREQUISITE_PREFIX + CheckName.BUDGET_CEILING.value,
+    DispatchOutcome.UNBOUNDED: FINDING_PREREQUISITE_PREFIX + CheckName.BUDGET_CEILING.value,
+    DispatchOutcome.STOPPED: FINDING_KILL_SWITCH_ENGAGED,
+}
+
 # --- check names ------------------------------------------------------------
 
 CHECK_CONFIGURATION = "configuration"
@@ -283,6 +302,26 @@ def runs_waiting_finding_id(waiting_on: WaitingOn) -> str:
 def check_failed_finding_id(check: str) -> str:
     """The Finding identifier for a check that could not complete."""
     return FINDING_CHECK_FAILED_PREFIX + sanitized(check, limit=_SUBJECT_LIMIT)
+
+
+def refusal_finding_ids(refusal: RunRefusal) -> tuple[str, ...]:
+    """The Finding identifiers a run refusal names, deduplicated, in refusal order.
+
+    The seam that makes "run refused" and "doctor says" one sentence. A refusal
+    already carries the unmet prerequisites, so the identifier is *derived* from
+    the same :class:`~.prerequisites.CheckName` the doctor derives it from rather
+    than restated beside it -- there is no second list to fall out of step. A
+    surface reporting a refusal quotes these.
+    """
+    seen: dict[str, None] = {}
+    for check in refusal.unmet:
+        seen.setdefault(prerequisite_finding_id(check.check, source=check.source), None)
+    return tuple(seen)
+
+
+def dispatch_finding_id(outcome: DispatchOutcome) -> str:
+    """The Finding identifier a blocked dispatch quotes, empty when it is allowed."""
+    return DISPATCH_FINDINGS.get(outcome, "")
 
 
 # --- the finding ------------------------------------------------------------

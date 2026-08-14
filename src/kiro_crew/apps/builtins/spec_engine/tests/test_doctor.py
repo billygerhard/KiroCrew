@@ -37,7 +37,9 @@ import pytest
 
 from kiro_crew.apps.builtins.spec_engine.engine import doctor as doctor_module
 from kiro_crew.apps.builtins.spec_engine.engine import findings as findings_module
+from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyLevel
+from kiro_crew.apps.builtins.spec_engine.engine.budget.ceiling import DispatchOutcome
 from kiro_crew.apps.builtins.spec_engine.engine.budget.switch import KillSwitch
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import (
     FINDING_PROVIDER_TIMEOUT,
@@ -61,6 +63,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.doctor import (
     CHECK_PROGRAM_VERSIONS,
     CHECK_REVIEW_QUEUE,
     CHECK_SOURCE_HEALTH,
+    DISPATCH_FINDINGS,
     FINDING_CONFIG_INVALID,
     FINDING_HISTORY_UNWRITABLE,
     FINDING_KILL_SWITCH_ENGAGED,
@@ -76,9 +79,11 @@ from kiro_crew.apps.builtins.spec_engine.engine.doctor import (
     DoctorHistory,
     Finding,
     check_failed_finding_id,
+    dispatch_finding_id,
     health_finding_id,
     parse_version,
     prerequisite_finding_id,
+    refusal_finding_ids,
     runs_waiting_finding_id,
     scoped_finding_id,
     version_satisfies,
@@ -87,6 +92,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.findings import Severity
 from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import (
     CheckName,
     check_source,
+    gate_run,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.review_queue import (
     QueueEntry,
@@ -94,7 +100,10 @@ from kiro_crew.apps.builtins.spec_engine.engine.review_queue import (
     WaitingOn,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.runs import RunState
-from kiro_crew.apps.builtins.spec_engine.engine.state import StatePersistenceError
+from kiro_crew.apps.builtins.spec_engine.engine.state import (
+    SpecRef,
+    StatePersistenceError,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     HealthReason,
     PollStatus,
@@ -708,6 +717,74 @@ class RefusingStore(ConfigStore):
     def write(self, *args: Any, **kwargs: Any) -> Any:
         self.write_attempts += 1
         raise AssertionError("the doctor must not write configuration")
+
+
+class TestARefusalAndTheDoctorAreOneSentence:
+    def test_a_refusal_quotes_the_identifiers_the_doctor_reports_for_that_state(
+        self, config: ConfigStore, tmp_path: Path
+    ) -> None:
+        configure(
+            config,
+            {
+                "workflow": {"stages": {"submit": [[ABSENT_PROGRAM, "pr"]]}},
+                "projects": {"proj": {"path": "/w/proj", "base_branch": "main"}},
+                "sources": {"upstream": {"poll": [ABSENT_PROGRAM], "enabled": True}},
+            },
+        )
+        audit = AuditLog(tmp_path / "audit")
+        ref = SpecRef.of(tmp_path / "proj", "spec-one")
+
+        refusal = gate_run(
+            config,
+            AutonomyLevel.DELIVERY,
+            audit,
+            ref,
+            project="proj",
+            which=no_programs,
+            branch_exists=lambda branch: True,
+        )
+        report = Doctor(config=config, project="proj", which=no_programs).run()
+
+        assert refusal is not None
+        quoted = refusal_finding_ids(refusal)
+        assert quoted
+        # Derived from the prerequisite's own CheckName on both sides, so the
+        # refusal cannot name a condition the doctor spells differently.
+        assert set(quoted) <= set(report.identifiers)
+
+    @pytest.mark.parametrize(
+        "outcome,expected",
+        [
+            (DispatchOutcome.STOPPED, FINDING_KILL_SWITCH_ENGAGED),
+            (
+                DispatchOutcome.HALTED,
+                prerequisite_finding_id(CheckName.BUDGET_CEILING),
+            ),
+            (
+                DispatchOutcome.UNBOUNDED,
+                prerequisite_finding_id(CheckName.BUDGET_CEILING),
+            ),
+        ],
+    )
+    def test_a_blocked_dispatch_quotes_the_doctors_identifier(
+        self, outcome: DispatchOutcome, expected: str
+    ) -> None:
+        assert dispatch_finding_id(outcome) == expected
+
+    def test_an_allowed_dispatch_quotes_nothing(self) -> None:
+        # Absent rather than mapped to a placeholder: a caller must not be able to
+        # quote "nothing is wrong" as the reason a dispatch was blocked.
+        assert dispatch_finding_id(DispatchOutcome.ALLOWED) == ""
+        assert DispatchOutcome.ALLOWED not in DISPATCH_FINDINGS
+
+    def test_a_degradation_identifier_needs_no_translation(self) -> None:
+        degradation = Degradation(
+            finding_id=FINDING_PROVIDER_TIMEOUT, reason="slow", transport="mcp"
+        )
+
+        # The degraded mark and the doctor Finding are the same string, with no
+        # mapping in between that could grow a second spelling.
+        assert degradation.finding_id == FINDING_PROVIDER_TIMEOUT
 
 
 class TestARegressionIsNotAFirstFailure:
