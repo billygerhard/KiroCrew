@@ -53,6 +53,13 @@ the one entry point an autonomous run and a human request both use -- so a fix
 dispatched from a comment runs the project's configured stages, gates, retry
 ceiling and integration floor, and there is no second way to run a stage command
 here.
+
+Nothing in production constructs :class:`ReviewFeedbackWatcher` yet: the engine's
+composition root owns which stores, screener, reviser and pipeline a watcher is
+built from, and the tick that would call it belongs to the same wiring task. The
+mechanism lands ahead of its caller for the reason the echo gate did -- a gate no
+caller consults still has to exist and be correct before one does, and folding it
+into the wiring would leave the decisions here untested until then.
 """
 
 from __future__ import annotations
