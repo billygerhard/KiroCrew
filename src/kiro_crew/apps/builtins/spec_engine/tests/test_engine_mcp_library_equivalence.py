@@ -34,12 +34,15 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog, audit_root
@@ -429,9 +432,15 @@ def _compare_paths(
 
     for step, payload, result in zip(steps, mcp_payloads, library_results):
         operation = OPERATIONS[step.tool]
-        assert operation.observe(payload) == operation.expect(result), (
-            f"{step.tool} returned different results over MCP and over the library"
-        )
+        # Normalised the same way the state dump is: a result carries the wall
+        # clock (`approved_ts`), which differs between two sequential runs by
+        # design. Presence is still compared, so a path that stopped recording a
+        # timestamp at all still fails here.
+        observed = _normalise(operation.observe(payload))
+        expected = _normalise(operation.expect(result))
+        assert (
+            observed == expected
+        ), f"{step.tool} returned different results over MCP and over the library"
 
     return _dump_state(mcp_home), _dump_state(library_home)
 
@@ -539,3 +548,45 @@ def test_the_full_gate_walk_leaves_identical_state(
         "tasks",
     }
     assert _rows(mcp_state, "specs")[0]["phase"] not in (None, "requirements")
+
+
+# --- the property: any order of operations, not just the ones chosen here ---
+
+#: The operations a generated sequence draws from, including the out-of-order and
+#: repeated calls a hand-written case would not think to try (advancing before
+#: approving, approving the same gate twice, approving a later gate first). A
+#: refusal is a legitimate outcome; what the property claims is that both paths
+#: reach the SAME outcome and the same state.
+STEP_POOL: tuple[Step, ...] = (
+    Step("validate_spec"),
+    Step("get_phase"),
+    Step("list_tasks"),
+    _approve("requirements"),
+    _advance("requirements"),
+    _approve("design"),
+    _advance("design"),
+)
+
+#: Small on purpose: every example starts a server child and walks a real spec, so
+#: the budget buys ordering coverage rather than volume.
+PROPERTY_EXAMPLES = 8
+
+
+@settings(
+    max_examples=PROPERTY_EXAMPLES,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+)
+@given(
+    picks=st.lists(st.integers(min_value=0, max_value=len(STEP_POOL) - 1), min_size=1, max_size=5)
+)
+def test_any_order_of_state_operations_leaves_identical_state(
+    tmp_path: Path, picks: list[int]
+) -> None:
+    steps = tuple(STEP_POOL[index] for index in picks)
+    # A fresh example directory, so an earlier example's rows cannot decide this
+    # one's outcome.
+    example = tmp_path / uuid.uuid4().hex
+    example.mkdir(parents=True)
+    mcp_state, library_state = _compare_paths(steps, example, "property")
+    assert mcp_state == library_state, f"{[step.tool for step in steps]} diverged"
