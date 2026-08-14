@@ -6897,3 +6897,119 @@ def test_every_handler_that_returns_settings_redacts_it():
         "these handlers return agent-writable settings without _redact, so a "
         f"credential in the file reaches the dashboard raw: {offenders}"
     )
+
+
+# ── the engine is the only source of phase, plan and validity ────────────────
+#
+# These pin the OBSERVABLE contract of the routes -- given these documents on
+# disk, the list and detail endpoints report this phase -- so that moving the
+# derivation into the shared engine is provably behaviour-preserving rather than
+# hopefully so. They were written and committed against the app's own copy of the
+# logic before any of it was replaced.
+
+
+def _seed_spec(state_dir: Path, project: Path, name: str, spec_type: str, docs: dict[str, str]):
+    """Write a spec directory plus the index entry that makes it addressable."""
+    spec_dir = project / ".kiro" / "specs" / name
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    for fname, text in docs.items():
+        (spec_dir / fname).write_text(text, encoding="utf-8")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    index_path = routes._INDEX_PATH
+    index = json.loads(index_path.read_text()) if index_path.is_file() else {}
+    index[name] = {
+        "spec_dir": str(spec_dir),
+        "working_dir": str(project),
+        "spec_type": spec_type,
+        "created_at": 1.0,
+        "updated_at": 2.0,
+    }
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    return spec_dir
+
+
+#: Documents on disk -> the phase the routes have always reported for them.
+#: ``new`` when nothing is drafted, otherwise the furthest document written.
+_PHASE_CASES = [
+    ({}, "new"),
+    ({"requirements.md": "# R\n"}, "requirements"),
+    ({"requirements.md": "# R\n", "design.md": "# D\n"}, "design"),
+    ({"requirements.md": "# R\n", "design.md": "# D\n", "tasks.md": "# T\n"}, "tasks"),
+    # A later document alone still reports that document: the app reports the
+    # furthest one present, it does not require the earlier ones.
+    ({"tasks.md": "# T\n"}, "tasks"),
+]
+
+
+@pytest.mark.parametrize("docs,expected", _PHASE_CASES)
+def test_pin_phase_reported_for_documents_on_disk(tmp_path, monkeypatch, docs, expected):
+    state_dir = _redirect_state(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    _seed_spec(state_dir, project, "thing", "feature", docs)
+
+    assert routes._derive_phase(project / ".kiro" / "specs" / "thing") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("docs,expected", _PHASE_CASES)
+async def test_pin_list_and_detail_report_the_same_phase(tmp_path, monkeypatch, docs, expected):
+    client = _make_client(monkeypatch, tmp_path)
+    state_dir = tmp_path / "spec-builder"
+    project = tmp_path / "proj"
+    _seed_spec(state_dir, project, "thing", "feature", docs)
+    try:
+        await client.start_server()
+        listed = await (await client.get(f"{_BASE}/specs")).json()
+        detail = await (await client.get(f"{_BASE}/specs/thing")).json()
+    finally:
+        await client.close()
+
+    entry = next(s for s in listed["specs"] if s["name"] == "thing")
+    assert entry["phase"] == expected, "list endpoint changed its reported phase"
+    assert detail["phase"] == expected, "detail endpoint changed its reported phase"
+    # The two endpoints must never disagree: they are the same question asked
+    # twice, and the rail and the detail pill are read side by side.
+    assert entry["phase"] == detail["phase"]
+
+
+@pytest.mark.asyncio
+async def test_pin_detail_returns_every_planned_document_slot(tmp_path, monkeypatch):
+    """The detail payload keys ``files`` by filename, with ``None`` for absent.
+
+    The SPA's tab set is driven off these keys, so dropping one blanks a tab.
+    """
+    client = _make_client(monkeypatch, tmp_path)
+    state_dir = tmp_path / "spec-builder"
+    project = tmp_path / "proj"
+    _seed_spec(state_dir, project, "thing", "feature", {"requirements.md": "# R\n"})
+    try:
+        await client.start_server()
+        detail = await (await client.get(f"{_BASE}/specs/thing")).json()
+    finally:
+        await client.close()
+
+    assert set(detail["files"]) == {"requirements.md", "design.md", "tasks.md"}
+    assert detail["files"]["requirements.md"] == "# R\n"
+    assert detail["files"]["design.md"] is None
+    assert detail["files"]["tasks.md"] is None
+
+
+#: Spec type -> the deliverables its seed prompt names, in order. ``quick`` has
+#: no design document; an unrecognised type falls back to the feature plan.
+_PLAN_CASES = [
+    ("feature", ("requirements.md", "design.md", "tasks.md")),
+    ("bug", ("requirements.md", "design.md", "tasks.md")),
+    ("quick", ("requirements.md", "tasks.md")),
+    ("weird", ("requirements.md", "design.md", "tasks.md")),
+]
+
+
+@pytest.mark.parametrize("spec_type,expected", _PLAN_CASES)
+def test_pin_seed_prompt_names_exactly_the_planned_documents(spec_type, expected):
+    spec_dir = Path("/w/.kiro/specs/thing")
+    prompt = routes._seed_prompt(spec_type, "thing", spec_dir, "/w", "")
+
+    listed = [f for f in ("requirements.md", "design.md", "tasks.md") if f"{spec_dir / f}" in prompt]
+    assert tuple(listed) == expected, f"{spec_type} seed no longer names its plan"
+    # The first deliverable is the one the agent is told to begin with.
+    assert f"Begin with {expected[0]}" in prompt
