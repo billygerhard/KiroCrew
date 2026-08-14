@@ -536,6 +536,31 @@ class TestBundledDefinitionsStayReadOnly:
         DeliveryWorkflow.load(store).configured_stages()
         assert {name: dict(preset) for name, preset in WORKFLOW_PRESETS.items()} == before
 
+    def test_one_projects_override_does_not_change_what_another_project_gets(
+        self, store: ConfigStore
+    ) -> None:
+        """The override mechanism is the read-only boundary working as intended:
+        a project rewrites a stage of its own workflow, not the definition. Two
+        projects selecting the same preset are the case that would expose a
+        definition edited in place."""
+        configure(
+            store,
+            {
+                "workflow": {"preset": "git-pull-request"},
+                "projects": {
+                    "acme": {
+                        "path": "/acme",
+                        "workflow": {"stages": {"submit": [["org-review", "create"]]}},
+                    },
+                    "widgets": {"path": "/widgets"},
+                },
+            },
+        )
+        acme = DeliveryWorkflow.load(store, project="acme")
+        widgets = DeliveryWorkflow.load(store, project="widgets")
+        assert argv_of(acme, "submit") == [["org-review", "create"]]
+        assert argv_of(widgets, "submit") == bundled_argv("git-pull-request", "submit")
+
     @pytest.mark.parametrize("name", WORKFLOW_PRESET_NAMES)
     def test_the_table_itself_holds_nothing_mutable_in_place(self, name: str) -> None:
         """Structural, rather than by convention: there is no list to append to
