@@ -74,6 +74,19 @@ from .test_phases import SPEC_NAME, write_spec
 #: :func:`test_guidance_tools_write_no_state`.
 GUIDANCE_ONLY = ("get_authoring_prompt", "get_orchestrator_prompt", "get_review_prompt")
 
+#: Tools that only diagnose. They reach neither the engine adapter nor the state
+#: store: the Doctor and the run gate are read-only aggregations over
+#: configuration and the environment, so they have no library spelling to compare
+#: resulting state against -- what they must prove instead is that they leave the
+#: state untouched, which ``test_diagnostic_tools_write_no_state`` does.
+DIAGNOSTIC_ONLY = ("run_doctor", "check_run_prerequisites")
+
+#: Arguments for the diagnostic tools, so the no-state proof can call them.
+DIAGNOSTIC_ARGUMENTS: dict[str, dict[str, Any]] = {
+    "run_doctor": {},
+    "check_run_prerequisites": {"autonomy": "authoring"},
+}
+
 #: Arguments for the guidance tools, so the no-state proof can actually call them.
 GUIDANCE_ARGUMENTS: dict[str, dict[str, Any]] = {
     "get_authoring_prompt": {"spec_type": "feature"},
@@ -485,8 +498,9 @@ def test_every_tool_is_a_state_operation_or_guidance() -> None:
     # a new guidance tool has to be declared as one.
     state_tools = {name for name, spec in TOOLS.items() if spec.needs_ops}
     assert state_tools == set(OPERATIONS), "a state operation has no library spelling here"
-    assert set(TOOLS) == set(OPERATIONS) | set(GUIDANCE_ONLY)
+    assert set(TOOLS) == set(OPERATIONS) | set(GUIDANCE_ONLY) | set(DIAGNOSTIC_ONLY)
     assert set(GUIDANCE_ARGUMENTS) == set(GUIDANCE_ONLY)
+    assert set(DIAGNOSTIC_ARGUMENTS) == set(DIAGNOSTIC_ONLY)
     assert set(SEQUENCES) == set(OPERATIONS), "a state operation has no sequence"
 
 
@@ -499,6 +513,19 @@ def test_guidance_tools_write_no_state(tmp_path: Path, baseline: dict[str, Any])
         for name in GUIDANCE_ONLY:
             text = running.tool_text(name, GUIDANCE_ARGUMENTS[name])
             assert text.strip(), f"{name} returned no guidance"
+    assert _dump_state(home) == baseline
+
+
+def test_diagnostic_tools_write_no_state(tmp_path: Path, baseline: dict[str, Any]) -> None:
+    # A diagnostic exists to be safe to run on a broken host, so "read-only" is
+    # proven by bytes rather than by inspection: the tools are called through the
+    # real child server and the state tree afterwards is the untouched baseline.
+    home = tmp_path / "diagnostic-home"
+    with stdio_server(home) as running:
+        running.initialize()
+        for name in DIAGNOSTIC_ONLY:
+            payload = running.tool_payload(name, DIAGNOSTIC_ARGUMENTS[name])
+            assert isinstance(payload, dict) and payload, f"{name} returned nothing"
     assert _dump_state(home) == baseline
 
 

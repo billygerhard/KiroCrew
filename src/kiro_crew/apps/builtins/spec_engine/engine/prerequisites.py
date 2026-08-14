@@ -46,6 +46,8 @@ from .capabilities.registry import Binding, resolve_bindings
 from .config import ConfigStore
 from .config.schema import (
     DELIVERY_STAGES,
+    PROGRAM_MIN_VERSION_KEY,
+    SECTION_PROGRAMS,
     SECTION_QUALITY_GATES,
     SECTION_SOURCES,
     ConfigValidationError,
@@ -64,6 +66,7 @@ __all__ = [
     "RunRefusal",
     "check_project",
     "check_source",
+    "declared_minimum_versions",
     "gate_run",
     "stage_phase",
 ]
@@ -297,6 +300,35 @@ def check_project(
     checks.append(_channel_check(config, project))
     checks.extend(_ceiling_checks(config, project, budget))
     return PrerequisiteReport(checks=tuple(checks))
+
+
+def declared_minimum_versions(config: ConfigStore) -> dict[str, str]:
+    """The minimum version declared for each program, keyed by program name.
+
+    The populator behind the version check. Without one the check iterates an
+    empty mapping: it reports no findings and verifies nothing, which reads as a
+    host that satisfies every minimum rather than as a host nobody asked about.
+
+    Read straight off the document rather than through a resolved view, because a
+    minimum is a fact about this installation and has no per-project override to
+    merge. An entry too malformed to read is skipped rather than raised on: the
+    schema already rejects it as a validation error the Doctor reports under its
+    own identifier, and raising here would take the whole diagnostic down with the
+    one bad entry.
+    """
+    node = config.document().get(SECTION_PROGRAMS)
+    if not isinstance(node, Mapping):
+        return {}
+    declared: dict[str, str] = {}
+    for program, entry in node.items():
+        if not isinstance(program, str) or not program.strip():
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        minimum = entry.get(PROGRAM_MIN_VERSION_KEY)
+        if isinstance(minimum, str) and minimum.strip():
+            declared[program] = minimum.strip()
+    return declared
 
 
 def check_source(
@@ -582,9 +614,7 @@ def _provider_checks(config: ConfigStore, which: ProgramResolver) -> list[Prereq
                 )
             )
             continue
-        checks.append(
-            _provider_check(capability, binding, which)
-        )
+        checks.append(_provider_check(capability, binding, which))
     return checks
 
 
@@ -632,9 +662,7 @@ def _branch_checks(
     # touches -- and a check that passes on the wrong branch is worse than one
     # that is missing, because it reports readiness it did not establish.
     base = supplied_base.strip() or _base_branch(config, project)
-    protected = resolve_protected_branches(
-        config.document(), project=project, base_branch=base
-    )
+    protected = resolve_protected_branches(config.document(), project=project, base_branch=base)
     branches = tuple(protected.branches)
     checks.append(
         Prerequisite(
@@ -666,13 +694,9 @@ def _branch_checks(
             met=present,
             missing="" if present else f"base branch {base!r} does not exist in the project",
             action=(
-                ""
-                if present
-                else f"create {base!r}, or point the base branch at one that exists"
+                "" if present else f"create {base!r}, or point the base branch at one that exists"
             ),
-            declared_at=(
-                f"projects.{project}.base_branch" if project else "base_branch"
-            ),
+            declared_at=(f"projects.{project}.base_branch" if project else "base_branch"),
         )
     )
     return checks

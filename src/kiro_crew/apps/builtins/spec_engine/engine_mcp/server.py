@@ -136,6 +136,45 @@ def _tool_advance_phase(args: dict[str, Any], ops: EngineOperations | None) -> d
     )
 
 
+def _tool_run_doctor(args: dict[str, Any], _ops: EngineOperations | None) -> dict[str, Any]:
+    """Every Finding the Doctor found, as the UI panel's own path returns them.
+
+    Delegates to the app-side surface rather than assembling a diagnostic here.
+    That is the requirement, not tidiness: a tool that built its own aggregation
+    would pick its own collaborators, and a panel and a tool disagreeing about
+    whether a host is ready is worse than either alone. Read-only and free -- no
+    model turn, and the one subprocess in the path is a ``--version`` probe.
+    """
+    from ..diagnostics import doctor_payload
+
+    project = args.get("project")
+    return doctor_payload(project=str(project) if project else None)
+
+
+def _tool_check_run_prerequisites(
+    args: dict[str, Any], _ops: EngineOperations | None
+) -> dict[str, Any]:
+    """Whether a run at an autonomy level may start, before any credit is spent.
+
+    Quotes the same Finding identifiers the Doctor panel shows for the conditions
+    that would refuse it, so an agent told "may not start" and an operator reading
+    the panel are reading one sentence about one host.
+    """
+    from ..engine.autonomy import AutonomyLevel
+    from ..engine.config import ConfigStore
+    from ..engine.diagnosis import run_gate_report
+
+    raw = str(args.get("autonomy") or "").strip().lower()
+    try:
+        level = AutonomyLevel(raw)
+    except ValueError:
+        raise ValueError(
+            "autonomy must be one of: " + ", ".join(member.value for member in AutonomyLevel)
+        ) from None
+    project = args.get("project")
+    return run_gate_report(ConfigStore(), level, project=str(project) if project else None)
+
+
 #: The registered tool surface. A stock Host_Agent holding only this server
 #: reads the guidance tools to learn the workflow, then drives it through the
 #: operational tools. There is deliberately no tool that writes the Autonomy_
@@ -195,7 +234,10 @@ TOOLS: dict[str, ToolSpec] = {
         {
             "project": {**_STRING, "description": "Path to the project holding the spec."},
             "spec": {**_STRING, "description": "The spec directory name."},
-            "gate": {**_STRING, "description": "The gate to approve (requirements, design, tasks)."},
+            "gate": {
+                **_STRING,
+                "description": "The gate to approve (requirements, design, tasks).",
+            },
             "actor": {**_STRING, "description": "The approver's identity."},
         },
         ("project", "spec", "gate", "actor"),
@@ -209,10 +251,40 @@ TOOLS: dict[str, ToolSpec] = {
             "project": {**_STRING, "description": "Path to the project holding the spec."},
             "spec": {**_STRING, "description": "The spec directory name."},
             "actor": {**_STRING, "description": "The initiator's identity."},
-            "gate": {**_STRING, "description": "The gate being left (optional; defaults to the last written)."},
+            "gate": {
+                **_STRING,
+                "description": "The gate being left (optional; defaults to the last written).",
+            },
         },
         ("project", "spec", "actor"),
         needs_ops=True,
+    ),
+    "run_doctor": ToolSpec(
+        _tool_run_doctor,
+        "Diagnose why spec runs are not working: prerequisite checks grouped by phase, "
+        "watch source health, provider degradation, configuration errors, budget and "
+        "kill switch state, runs waiting on a person, and whether this app's skill and "
+        "MCP server reached agent sessions. Read-only and spends nothing.",
+        {
+            "project": {
+                **_STRING,
+                "description": "Limit project-scoped checks to this project (optional).",
+            }
+        },
+    ),
+    "check_run_prerequisites": ToolSpec(
+        _tool_check_run_prerequisites,
+        "Ask whether a run at an autonomy level may start. Returns every unmet "
+        "prerequisite with the action that resolves it, and the Doctor Finding "
+        "identifiers a refusal would quote. Read-only and spends nothing.",
+        {
+            "autonomy": {
+                **_STRING,
+                "description": "The autonomy level the run would reach.",
+            },
+            "project": {**_STRING, "description": "The project the run is for (optional)."},
+        },
+        ("autonomy",),
     ),
 }
 

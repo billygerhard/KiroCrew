@@ -38,6 +38,8 @@ _EXPECTED_TOOLS = {
     "list_tasks",
     "record_approval",
     "advance_phase",
+    "run_doctor",
+    "check_run_prerequisites",
 }
 
 

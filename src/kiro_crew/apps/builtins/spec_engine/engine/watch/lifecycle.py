@@ -57,6 +57,8 @@ nothing here executes, expands, or interprets any of it.
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
@@ -127,6 +129,52 @@ class Transition(str, Enum):
 #: Transitions that make an item a dispatch candidate. Both are "there is work
 #: here that no run has taken", which is the only thing that justifies spending.
 DISPATCHING_TRANSITIONS: tuple[Transition, ...] = (Transition.NEW, Transition.REOPENED)
+
+
+#: Evidence in a poll argv that the command asks for more than open items.
+#:
+#: Matched against the argv joined with spaces, so a flag written as one token
+#: (``--state=all``) and as two (``--state all``) read the same. The vocabulary is
+#: the closed-or-everything half of a state filter: naming ``all``, ``any`` or a
+#: member of :data:`CLOSED_STATES` is what makes a closure something the poll can
+#: report, and :func:`diff_poll` derives a cancellation only from a closure a poll
+#: reports.
+_STATE_WIDENING = re.compile(
+    r"(?:state|status)[=:\s]+(?P<value>[a-z ]+)|--(?P<flag>all|state-all|include-closed|closed)\b",
+    re.IGNORECASE,
+)
+
+#: State values that admit a closed item, beside the closed vocabulary itself.
+_WIDENING_VALUES: frozenset[str] = frozenset({"all", "any", "*"})
+
+
+def poll_reports_closed_items(argv: Sequence[str]) -> bool:
+    """Whether *argv* looks like a poll that can report a closed item.
+
+    A **heuristic on the configured argv**, and deliberately only used to advise.
+    The engine cannot ask a tracker CLI what its default filter is, so the one
+    thing it can read is what the operator wrote; a source whose command lists
+    only open items can never produce the closure :func:`diff_poll` derives a
+    cancellation from, and the run for an item somebody closed keeps going with
+    nothing to stop it.
+
+    False is therefore "no widening is visible here", not "this source is broken":
+    a wrapper script or a tracker whose default is already everything reads as
+    narrow and is advised about, which is why the finding this feeds is advisory
+    rather than blocking. It never widens a command on an operator's behalf --
+    guessing a flag a real CLI rejects fails every poll instead of degrading one.
+    """
+    joined = " ".join(str(token) for token in argv)
+    for match in _STATE_WIDENING.finditer(joined):
+        if match.group("flag"):
+            return True
+        value = (match.group("value") or "").strip().lower()
+        # Only the first word of the value: `--state all --limit 50` joins the
+        # following flag into the same run of letters.
+        first = value.split(" ")[0] if value else ""
+        if first in _WIDENING_VALUES or first in CLOSED_STATES:
+            return True
+    return False
 
 
 def generation_key(generation: int) -> str:

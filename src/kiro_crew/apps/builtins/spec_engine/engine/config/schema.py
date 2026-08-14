@@ -24,6 +24,7 @@ patch touches so the write path can require an operator-confirmed surface.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -41,6 +42,17 @@ SECTION_COST_PROFILES = "cost_profiles"
 SECTION_PROJECTS = "projects"
 SECTION_SOURCES = "sources"
 SECTION_WORKFLOW = "workflow"
+
+#: Where a minimum version for a required program is declared, keyed by the
+#: program name as PATH resolves it. App level only, and deliberately not inside a
+#: workflow preset: a preset is a stage list every project that selects it shares,
+#: while "this host needs at least this version of ``gh``" is a fact about the
+#: installation. A per-preset copy would give one program two possible minimums
+#: whenever two selected presets named it, and the reader would have to pick one.
+SECTION_PROGRAMS = "programs"
+
+#: Key holding the declared minimum inside a program entry.
+PROGRAM_MIN_VERSION_KEY = "min_version"
 
 #: Key naming the workflow preset a layer selects, inside a workflow object.
 WORKFLOW_PRESET_KEY = "preset"
@@ -223,6 +235,12 @@ CONFIG_ONLY_PATHS: tuple[str, ...] = (
     # Declared advisory it would run and stop nothing, so the run still reports
     # passed.
     SECTION_QUALITY_GATES,
+    # A declared program minimum is an assertion about this host that the Doctor
+    # reports an ERROR against. Lowering it does not grant an execution a tool did
+    # not already have, but it turns that ERROR into a pass -- the same shape as a
+    # blocking gate rewritten advisory just above, where the run still reports
+    # passed while nothing stops it. Declared in configuration, checked everywhere.
+    SECTION_PROGRAMS,
     # Intake guidance is text the engine puts in a headless run's seed beside the
     # watched item, so a tool that could write it could write the run's own
     # instructions. The source-level copy is already covered by the whole
@@ -317,6 +335,8 @@ def validate_config_document(doc: Any) -> tuple[ConfigError, ...]:
             _check_named(errors, value, key, _check_project)
         elif key == SECTION_SOURCES:
             _check_named(errors, value, key, _check_source)
+        elif key == SECTION_PROGRAMS:
+            _check_named(errors, value, key, _check_program)
         else:
             errors.append(ConfigError(key, "unknown configuration key"))
     return tuple(errors)
@@ -1001,6 +1021,35 @@ def _check_argv(errors: list[ConfigError], value: Any, path: str, *, required: b
     for index, argument in enumerate(value):
         if not isinstance(argument, str) or not argument:
             errors.append(ConfigError(f"{path}[{index}]", "expected a non-empty string"))
+
+
+def _check_program(errors: list[ConfigError], entry: Mapping[str, Any], path: str) -> None:
+    """Validate one declared program minimum.
+
+    A minimum that does not parse as a dotted number is rejected here rather than
+    ignored downstream: an unreadable minimum would make the version check report
+    nothing while appearing to be in force, which is the one outcome worse than
+    declaring no minimum at all.
+    """
+    for key, value in entry.items():
+        if key != PROGRAM_MIN_VERSION_KEY:
+            errors.append(
+                ConfigError(
+                    f"{path}.{key}", f"a program entry holds only {PROGRAM_MIN_VERSION_KEY}"
+                )
+            )
+        elif not isinstance(value, str) or not _DOTTED_VERSION.fullmatch(value.strip()):
+            errors.append(
+                ConfigError(f"{path}.{key}", "expected a dotted version such as '2.40.0'")
+            )
+    if PROGRAM_MIN_VERSION_KEY not in entry:
+        errors.append(ConfigError(path, f"a program entry must declare {PROGRAM_MIN_VERSION_KEY}"))
+
+
+#: A declared minimum, as authored. Only a dotted number: the comparison the check
+#: performs is numeric, so a range or a constraint expression would be accepted
+#: here and silently compared as its leading number.
+_DOTTED_VERSION = re.compile(r"\d+(?:\.\d+)*")
 
 
 def _check_str_list(errors: list[ConfigError], value: Any, path: str) -> None:

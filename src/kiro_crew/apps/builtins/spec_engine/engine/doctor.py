@@ -67,6 +67,7 @@ from .config.advisories import ConfigWarning, document_warnings
 from .config.agent_surface import AgentSurfaceLookup
 from .findings import Severity
 from .prerequisites import (
+    POLL_FIELD,
     BranchResolver,
     CheckName,
     Prerequisite,
@@ -82,8 +83,9 @@ from .state import (
     state_root,
     utc_now_iso,
 )
+from .watch.lifecycle import poll_reports_closed_items
 from .watch.poll import HealthReason, PollOutcome
-from .watch.sources import source_names
+from .watch.sources import load_sources, source_names
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +96,10 @@ __all__ = [
     "CHECK_PREREQUISITES",
     "CHECK_PROGRAM_VERSIONS",
     "CHECK_PROVIDERS",
+    "CHECK_REGISTRATION",
     "CHECK_REVIEW_QUEUE",
     "CHECK_SOURCE_HEALTH",
+    "CHECK_WATCH_LIFECYCLE",
     "DISPATCH_FINDINGS",
     "DOCTOR_HISTORY_FILENAME",
     "FINDING_CHECK_FAILED_PREFIX",
@@ -104,7 +108,9 @@ __all__ = [
     "FINDING_KILL_SWITCH_ENGAGED",
     "FINDING_KILL_SWITCH_UNREADABLE",
     "FINDING_PROGRAM_VERSION",
+    "FINDING_REGISTRATION_INCOMPLETE",
     "FINDING_RUNS_WAITING_PREFIX",
+    "FINDING_WATCH_CANNOT_CANCEL",
     "HEALTH_REASON_FINDINGS",
     "SURFACE_AGENT",
     "SURFACE_BUDGET",
@@ -121,6 +127,7 @@ __all__ = [
     "DoctorReport",
     "Finding",
     "QueueProjection",
+    "RegistrationState",
     "VersionReader",
     "check_failed_finding_id",
     "dispatch_finding_id",
@@ -176,6 +183,23 @@ FINDING_KILL_SWITCH_UNREADABLE = "budget.kill_switch_unreadable"
 #: :class:`~.review_queue.WaitingOn` value so the three reasons stay three
 #: identifiers.
 FINDING_RUNS_WAITING_PREFIX = "runs.waiting_"
+
+#: The app's declared skill or MCP server did not reach Host_Agent sessions.
+#:
+#: Deliberately one identifier for every way registration can be incomplete,
+#: including "nobody has assessed it". The reasons ride in the cause, because the
+#: resolving action is the same for all of them -- reinstall or re-enable the app
+#: so registration runs again -- and a second identifier per reason would let the
+#: notify-once rule announce the same broken install twice as it discovers each
+#: missing resource. Blocking: an app whose tools never arrived cannot run a spec,
+#: and the one thing it must not do is look operational.
+FINDING_REGISTRATION_INCOMPLETE = "agent.registration_incomplete"
+
+#: A watch source whose poll asks for open items only, so no closure can be
+#: reported and no cancellation derived. Advisory: the evidence is the argv an
+#: operator wrote, not an answer from the tracker, so a false read must not stop
+#: a run.
+FINDING_WATCH_CANNOT_CANCEL = "watch.cannot_derive_cancellation"
 
 #: Prefix for a check that could not complete, completed with the check's name.
 #: One identifier per check rather than one shared identifier, so the notify-once
@@ -242,6 +266,8 @@ CHECK_PROGRAM_VERSIONS = "program_versions"
 CHECK_BUDGET = "budget"
 CHECK_REVIEW_QUEUE = "review_queue"
 CHECK_PROVIDERS = "providers"
+CHECK_REGISTRATION = "registration"
+CHECK_WATCH_LIFECYCLE = "watch_lifecycle"
 
 #: File under the state root holding the last known result per identifier.
 DOCTOR_HISTORY_FILENAME = "doctor_history.json"
@@ -656,6 +682,27 @@ class QueueProjection(Protocol):
     def snapshot(self, *, project: str | None = None) -> QueueSnapshot: ...
 
 
+class RegistrationState(Protocol):
+    """Whether this app's declared skill and MCP server reached agent sessions.
+
+    Structural on purpose. The state is assessed and recorded by the *app*, which
+    knows its manifest and the host's registration destinations; the engine must
+    not import the app root to read it, so the shape is declared here and the
+    concrete state is passed in -- the same handling ``minimum_versions`` gets.
+
+    Read-only members, so nothing the doctor holds can mark an app ready.
+    """
+
+    @property
+    def ready(self) -> bool: ...
+
+    @property
+    def reasons(self) -> Sequence[str]: ...
+
+    @property
+    def checked_at(self) -> str: ...
+
+
 #: Reads a program's self-reported version, given its resolved path. Injectable so
 #: a test describes a host rather than arranging one, and so the one thing the
 #: doctor executes is replaceable at the boundary.
@@ -741,6 +788,13 @@ class Doctor:
     #: Poll outcomes already recorded by a watch tick, when the caller has them.
     poll_outcomes: Sequence[PollOutcome] = ()
     agents: AgentSurfaceLookup | None = None
+    #: Whether this app's own skill and MCP server registered. ``None`` means no
+    #: state was supplied, which contributes nothing rather than a pass: the
+    #: single operation every surface calls -- :func:`~.diagnosis.diagnose` --
+    #: requires one, so a surface cannot reach this field empty by forgetting it,
+    #: and a direct constructor call in a test that is about another check does
+    #: not have to describe an app's registration.
+    registration: RegistrationState | None = None
     #: Declared minimum versions, keyed by program name. Supplied by the caller
     #: that resolved the workflow preset or configuration declaring them.
     minimum_versions: Mapping[str, str] = field(default_factory=dict)
@@ -774,8 +828,10 @@ class Doctor:
         return (
             DoctorCheck(CHECK_CONFIGURATION, self._configuration),
             DoctorCheck(CHECK_ADVISORIES, self._advisories),
+            DoctorCheck(CHECK_REGISTRATION, self._registration),
             DoctorCheck(CHECK_PREREQUISITES, self._prerequisites),
             DoctorCheck(CHECK_SOURCE_HEALTH, self._source_health),
+            DoctorCheck(CHECK_WATCH_LIFECYCLE, self._watch_lifecycle),
             DoctorCheck(CHECK_PROGRAM_VERSIONS, self._program_versions),
             DoctorCheck(CHECK_BUDGET, self._budget),
             DoctorCheck(CHECK_REVIEW_QUEUE, self._review_queue),
@@ -828,6 +884,77 @@ class Doctor:
             declared_at=warning.path,
             subject=warning.project or "",
         )
+
+    def _registration(self) -> CheckOutcome:
+        """Whether this app's skill and MCP server reached Host_Agent sessions.
+
+        The reader the recorded readiness state never had. Registration is
+        best-effort per resource, so a half-registered app differs from a whole one
+        only in a log line and in this state; without something reading it, the app
+        is indistinguishable from operational on every surface a user looks at,
+        which is the failure the state was recorded to end.
+        """
+        state = self.registration
+        if state is None:
+            return CheckOutcome()
+        if state.ready:
+            return CheckOutcome(passing=(FINDING_REGISTRATION_INCOMPLETE,))
+        reasons = [str(reason) for reason in state.reasons if str(reason).strip()]
+        detail = "; ".join(reasons) or "registration readiness could not be established"
+        return CheckOutcome(
+            findings=(
+                Finding(
+                    identifier=FINDING_REGISTRATION_INCOMPLETE,
+                    severity=Severity.ERROR,
+                    surface=SURFACE_AGENT,
+                    cause=Untrusted(detail),
+                    action=Untrusted(
+                        "re-enable the app so registration runs again, then re-run the "
+                        "doctor; until it registers, no session can see the engine's tools"
+                    ),
+                    evidence=Untrusted(detail),
+                ),
+            )
+        )
+
+    def _watch_lifecycle(self) -> CheckOutcome:
+        """Advise on a watch source that could never derive a cancellation.
+
+        A closure is something a poll has to *report*: an item's absence reads as a
+        narrowed filter, not as a closure, so a command that lists open items only
+        leaves the run for a closed item going with nothing to stop it. The
+        evidence is the configured argv, so this advises rather than blocks -- and
+        a user-written source has the same trap with no reviewer looking at it.
+        """
+        findings: list[Finding] = []
+        passing: list[str] = []
+        for source in load_sources(self.config):
+            argv = source.poll.source
+            identifier = scoped_finding_id(FINDING_WATCH_CANNOT_CANCEL, source.name)
+            if poll_reports_closed_items(argv):
+                passing.append(identifier)
+                continue
+            findings.append(
+                Finding(
+                    identifier=identifier,
+                    severity=Severity.WARNING,
+                    surface=SURFACE_WATCH,
+                    cause=Untrusted(
+                        f"the poll command for watch source {source.name!r} shows no state "
+                        f"filter that admits a closed item, so a closure can never be "
+                        f"reported and a run for an item somebody closed keeps going"
+                    ),
+                    action=Untrusted(
+                        f"widen {source.declared_at}.{POLL_FIELD} to list closed items too, "
+                        f"using the flag this program documents; ignore this if the command "
+                        f"already reports them"
+                    ),
+                    declared_at=f"{source.declared_at}.{POLL_FIELD}",
+                    subject=source.name,
+                    evidence=Untrusted(" ".join(argv)),
+                )
+            )
+        return CheckOutcome(findings=tuple(findings), passing=tuple(passing))
 
     def _prerequisites(self) -> CheckOutcome:
         report = check_project(

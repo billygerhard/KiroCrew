@@ -189,6 +189,8 @@ class TestToolSurfaceIsInvariantAcrossBindings:
                 "list_tasks",
                 "record_approval",
                 "advance_phase",
+                "run_doctor",
+                "check_run_prerequisites",
             }
         )
 
@@ -302,6 +304,7 @@ class TestDefaultBindingsResolveToBundledProviders:
             model_resolver=lambda: ("auto",),
             findings_sink=_NullFindingsSink(),
             host_state=None,
+            session_opener=_NoSessionOpener(),
             state_root=tmp_path / "state",
             audit_root=tmp_path / "audit",
             config_root=tmp_path / "config",
@@ -323,6 +326,13 @@ class TestDefaultBindingsResolveToBundledProviders:
         # whoever added it past the assertions above.
         assert TRANSPORT_BUILTIN in TRANSPORTS
         assert set(EXTERNAL_TRANSPORTS) == {TRANSPORT_MCP, TRANSPORT_COMMAND}
+
+
+class _NoSessionOpener:
+    """An opener no test reaches: nothing here seeds a run, so it refuses."""
+
+    def __call__(self, request: Any) -> Any:
+        raise AssertionError("no test in this module opens a session")
 
 
 class _NullFindingsSink:
@@ -395,6 +405,7 @@ class TestDefaultSpecProcessingIsLocal:
                 model_resolver=lambda: ("auto",),
                 findings_sink=_NullFindingsSink(),
                 host_state=None,
+                session_opener=_NoSessionOpener(),
                 state_root=tmp_path / "state",
                 audit_root=tmp_path / "audit",
                 config_root=tmp_path / "config",
