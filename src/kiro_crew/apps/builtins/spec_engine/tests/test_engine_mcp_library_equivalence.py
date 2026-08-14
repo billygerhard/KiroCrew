@@ -32,6 +32,7 @@ assert about nothing:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -377,11 +378,41 @@ def _dump_audit(root: Path) -> dict[str, list[Any]]:
     return logs
 
 
+def _dump_files(home: Path) -> dict[str, str]:
+    """Every OTHER file under *home*, as a path-to-content-hash inventory.
+
+    The row and audit dumps read the two places state is written today, which is
+    why a review demonstrated a hole in them: an operation writing a sidecar file
+    on ONE path only left every comparison green. That is precisely the invisible
+    second path this whole module exists to fence, so the dump has to cover the
+    home rather than the two stores anyone thought of.
+
+    The database and the audit logs are skipped because they are compared
+    structurally above -- hashing them here would make every row difference show
+    up twice, once uselessly. Content is hashed rather than kept so a large file
+    costs nothing and a diff still shows up.
+    """
+    root = home
+    inventory: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative.endswith(DB_FILENAME) or "/audit/" in f"/{relative}":
+            continue
+        inventory[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return inventory
+
+
 def _dump_state(home: Path) -> dict[str, Any]:
-    """The whole resulting state under *home*: rows plus audit records."""
+    """The whole resulting state under *home*: rows, audit records, and files."""
     with _pinned_home(home):
         root = state_root()
-    return {"tables": _dump_tables(root / DB_FILENAME), "audit": _dump_audit(root)}
+    return {
+        "tables": _dump_tables(root / DB_FILENAME),
+        "audit": _dump_audit(root),
+        "files": _dump_files(home),
+    }
 
 
 def _rows(dump: dict[str, Any], table: str) -> list[Any]:

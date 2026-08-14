@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+import kiro_crew
 from kiro_crew.apps.builtins.spec_engine.engine_mcp import server
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.server import TOOLS, handle
 
@@ -185,14 +186,17 @@ def stdio_server(home: Path) -> Iterator[StdioServer]:
     # snapshots the state tree.
     stderr_path = home.parent / f"{home.name}-server-stderr.log"
     env = dict(os.environ, KIROCREW_HOME=str(home))
-    # Put the repo's source root on the CHILD's path explicitly, derived from this
-    # file's location rather than inherited. `python -m` resolves the server module
-    # against the child's own sys.path, and the in-process tests import it via the
-    # path pytest sets up -- which the child does not get. Inheriting PYTHONPATH
-    # instead made these tests pass only in a shell that happened to export it, so
-    # they were green for whoever wrote them and red everywhere else, which is the
-    # one outcome a conformance test must not have.
-    source_root = Path(__file__).resolve().parents[5]
+    # Put the repo's source root on the CHILD's path explicitly, derived from the
+    # PACKAGE this process imported rather than from a parent-count off this file.
+    # `python -m` resolves the server module against the child's own sys.path, and
+    # the in-process tests import it via the path pytest sets up -- which the child
+    # does not get. Inheriting PYTHONPATH instead made these tests pass only in a
+    # shell that happened to export it, so they were green for whoever wrote them
+    # and red everywhere else, which is the one outcome a conformance test must not
+    # have. Deriving from the package rather than counting directories also means
+    # the child imports the SAME code the in-process tests did, and nothing breaks
+    # silently if this file moves.
+    source_root = Path(kiro_crew.__file__).resolve().parent.parent
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{source_root}{os.pathsep}{existing}" if existing else str(source_root)
     with stderr_path.open("w", encoding="utf-8") as errors:
