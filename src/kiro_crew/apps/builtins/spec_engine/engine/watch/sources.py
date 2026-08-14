@@ -27,6 +27,7 @@ interpreter for text a stranger wrote.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence, Union
 
 from ..config import ConfigError, ConfigStore, ConfigValidationError
@@ -79,6 +80,12 @@ PathSegment = Union[str, int]
 #: is answered once, by :data:`.poll.HealthReason.PROGRAM_UNAVAILABLE` and
 #: :func:`..prerequisites.check_source`. A preset that reported its own
 #: unhealthiness would be a second answer to that one question.
+#:
+#: Each ``field_map`` is a read-only view, matching the tuples the sibling preset
+#: tables use for their inner containers. The accessor already deep-copies on the
+#: way out, but a direct importer bypasses the accessor, and one project mutating
+#: this table in place would change what every later project in the process is
+#: offered.
 WATCH_SOURCE_PRESETS: Mapping[str, Mapping[str, Any]] = {
     "github": {
         # ``gh issue list --json`` cannot report an author association at all --
@@ -104,18 +111,20 @@ WATCH_SOURCE_PRESETS: Mapping[str, Mapping[str, Any]] = {
             "--jq",
             "map(select(.pull_request == null))",
         ),
-        "field_map": {
-            "identifier": "number",
-            "title": "title",
-            "body": "body",
-            "state": "state",
-            "address": "html_url",
-            # The first label is the classification a spec-type mapping reads. A
-            # repository that classifies differently retargets this one path.
-            "classification": "labels.0.name",
-            "submitter": "user.login",
-            "association": "author_association",
-        },
+        "field_map": MappingProxyType(
+            {
+                "identifier": "number",
+                "title": "title",
+                "body": "body",
+                "state": "state",
+                "address": "html_url",
+                # The first label is the classification a spec-type mapping reads.
+                # A repository that classifies differently retargets this one path.
+                "classification": "labels.0.name",
+                "submitter": "user.login",
+                "association": "author_association",
+            }
+        ),
     },
     "gitlab": {
         "poll": (
@@ -127,21 +136,23 @@ WATCH_SOURCE_PRESETS: Mapping[str, Mapping[str, Any]] = {
             "--output",
             "json",
         ),
-        "field_map": {
-            "identifier": "iid",
-            "title": "title",
-            "body": "description",
-            "state": "state",
-            "address": "web_url",
-            # GitLab labels are bare strings, so the path stops at the index.
-            "classification": "labels.0",
-            "submitter": "author.username",
-            # No association: GitLab reports no equivalent of GitHub's author
-            # association, and an unmapped field resolves to empty, which the
-            # submitter classification reads as undetermined and therefore
-            # least-trusted. Mapping it at something that is not an association
-            # would trade that safe default for a wrong answer.
-        },
+        "field_map": MappingProxyType(
+            {
+                "identifier": "iid",
+                "title": "title",
+                "body": "description",
+                "state": "state",
+                "address": "web_url",
+                # GitLab labels are bare strings, so the path stops at the index.
+                "classification": "labels.0",
+                "submitter": "author.username",
+                # No association: GitLab reports no equivalent of GitHub's author
+                # association, and an unmapped field resolves to empty, which the
+                # submitter classification reads as undetermined and therefore
+                # least-trusted. Mapping it at something that is not an association
+                # would trade that safe default for a wrong answer.
+            }
+        ),
     },
 }
 

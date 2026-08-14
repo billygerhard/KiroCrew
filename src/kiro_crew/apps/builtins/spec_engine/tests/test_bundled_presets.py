@@ -327,7 +327,43 @@ class TestWatchPresetFieldMaps:
         argv = list(WATCH_SOURCE_PRESETS["github"]["poll"])
         assert any("state=all" in part for part in argv), argv
 
+    def test_the_bundled_table_itself_refuses_an_in_place_edit(self) -> None:
+        """The accessor's deep copy protects callers who go through it. A direct
+        importer does not, and one project mutating this table in place would
+        change what every later project in the process is offered -- so the inner
+        mapping is a read-only view rather than a dict trusted not to be written.
+        """
+        for host in WATCH_SOURCE_PRESET_HOSTS:
+            with pytest.raises(TypeError):
+                WATCH_SOURCE_PRESETS[host]["field_map"]["submitter"] = "attacker"  # type: ignore[index]  # noqa: E501
+
+    def test_only_github_can_derive_a_cancellation_and_that_asymmetry_is_deliberate(
+        self,
+    ) -> None:
+        """An honest record of a gap rather than a guessed fix.
+
+        Lifecycle derives a cancellation only from a closure a poll REPORTS. The
+        GitHub preset asks for ``state=all`` and so can report one. The GitLab
+        preset cannot: ``glab issue list`` defaults to open items, and the flag
+        that widens it could not be verified here because ``glab`` is not
+        installed on this machine. Guessing one is precisely the defect this
+        preset table already shipped once -- a plausible flag that the real CLI
+        rejects, which failed every poll rather than degrading.
+
+        So the asymmetry is pinned instead: a GitLab source cannot cancel a run
+        whose issue was closed, and this test fails the day the GitLab argv gains
+        a state filter, at which point the claim above is what to correct.
+        """
+        github = list(WATCH_SOURCE_PRESETS["github"]["poll"])
+        gitlab = list(WATCH_SOURCE_PRESETS["gitlab"]["poll"])
+        assert any("state=all" in part for part in github)
+        assert not any("state" in part for part in gitlab), (
+            "the GitLab preset gained a state filter -- verify it against a real "
+            "glab before claiming cancellation works for GitLab"
+        )
+
     def test_the_gitlab_map_reads_a_real_glab_issue(self, store: ConfigStore) -> None:
+
         """GitLab's shapes differ from GitHub's in three places at once: the
         identifier is ``iid``, the body is ``description``, and labels are bare
         strings rather than objects. Reading them through the same extractor is

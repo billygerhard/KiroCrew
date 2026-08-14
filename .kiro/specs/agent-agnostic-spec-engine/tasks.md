@@ -182,12 +182,12 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Test quality findings recorded in the audit log
     - _Requirements: 30.1, 30.2, 30.3, 30.4_
 
-- [ ] 10. Engine MCP server
+- [x] 10. Engine MCP server
   - [x] 10.1 Tool surface and JSON-RPC conformance
     - Expose engine operations as tools with prompt-as-tool-result authoring/orchestration guidance; a stock agent with only this server completes the workflow, without excluding agents holding other spec tools
     - Conformant prompts/resources/unknown-method handling; unavailable guidance returns an error, never partial text; no tool mutates the Autonomy_Policy or Delivery_Workflow
     - _Requirements: 3.1, 3.2, 3.3, 3.5, 13.12_
-  - [ ] 10.2 MCP-library state equivalence tests
+  - [x] 10.2 MCP-library state equivalence tests
     - Drive the server over stdio with the kiro-cli init sequence; assert identical resulting state for every state operation invoked via MCP and via the library
     - _Requirements: 3.4_
 
@@ -222,7 +222,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 12.6_
 
 - [ ] 13. App packaging and providers
-  - [ ] 13.1 Manifest, discovery skill, and registration
+  - [x] 13.1 Manifest, discovery skill, and registration
     - app.json declaring the MCP server and skill; trigger phrases for natural spec requests; skill directs agents to obtain instructions from the tools before any spec operation
     - Report a not-ready state when registration of either the discovery skill or the Engine_MCP_Server fails, naming the failure reason, and do not present the app as operational. Installation still completes. A half-registered app that claims to work is worse than one that admits it did not, because the first symptom a user meets is then a spec operation whose tools are missing, with nothing connecting that to the failed registration. Requirement 4.4 was claimed by NO task until this split found it unowned
     - The engine WIRING obligations that accumulated on this task are now section 20. Eleven of them landed here as wave-4 reviews found inert seams, and NONE was covered by this task's requirements -- Requirement 4 is discovery only -- so a reviewer validating 13.1 against its own criteria could have approved it having built just the manifest, with every wiring obligation passing unexamined. That is the same inert-library shape the obligations themselves were recorded to prevent
@@ -235,7 +235,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Named bundled Workflow_Presets (git + pull request, git + merge request, local-only) and matching public watch sources, treated as read-only; project selects a preset and overrides individual stage commands; user-defined named presets selectable identically; no preset for a non-public review or tracking system ships
     - _Requirements: 33.1, 33.2, 33.3, 33.4, 33.5_
 
-  - [ ] 13.3 Provider_Interface and public build posture
+  - [x] 13.3 Provider_Interface and public build posture
     - Pluggable requirements analysis, model catalog, review policy, and watch sources with bundled local defaults; enhanced providers surface degraded status without changing the tool surface
     - No internal dependencies in the default build; all spec processing local; telemetry off by default and content-free when enabled
     - _Requirements: 11.1, 11.2, 11.3, 11.4, 11.5_
@@ -302,6 +302,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Equivalence test: the tool and the UI path return identical Findings for the same state
     - Give `refusal_finding_ids` and `dispatch_finding_id` their call sites, and populate the doctor's `minimum_versions`. Task 19.1 built all three and its review found the handoff had been REPORTED as recorded here while nothing was written -- so this entry exists because a claimed recording is worth no more than an unclaimed one. Requirement 34.6 wants an engine refusal, a blocked dispatch and a degraded mark to quote the same Finding identifier a Doctor panel shows; 19.1 built the two translators and nothing calls them, so today a refusal and a panel can name the same condition differently. And `Doctor.minimum_versions` is a caller-supplied mapping with no populator, which makes requirement 34.11 pass VACUOUSLY -- the version check verifies nothing while reporting no findings, which is the worst of both. 19.1 could not close either: no config key for a program minimum exists and `workflow.stages[].preset` expansion did not exist when it ran. Whoever populates it decides where a minimum is declared
     - Give the app's readiness state a READER, because requirement 4.4's third clause is satisfied only on paper without one. Task 13.1 built `readiness.py` -- a persistent, fail-closed not-ready state naming why registration failed -- and its review found NOTHING in the tree reads it: `on_gateway_startup` discards the AppContext so `ctx.health.mark_error` evaporates on the boot path, `GET /api/apps` carries no health field, and the Doctor check that WOULD read it does not exist. So after the one-shot enable response scrolls away, a half-registered app is indistinguishable from a whole one on every surface a user looks at, which is verbatim the failure 4.4 exists to end. Two readiness sources also coexist unreconciled: the host's `RegistrationResult`, fresh only at enable time, and the app's, fresh at every boot and read by no one. NOTE A DISAGREEMENT TO SETTLE RATHER THAN INHERIT: task 19.1 reported that skill/MCP-server reach was already covered through the config advisories' `AGENT_NOT_INSTALLED` / `AGENT_MISSING_ENGINE_TOOLS` codes, while 13.1's reviewer read the check catalog and found no registration check at all. Those answer different questions -- whether an agent can see the engine's tools, versus whether THIS app's registration landed -- so decide which requirement 34.1's "skill/MCP registration reach" means before building. The doctor must not import the app root to get this: pass the state in, the way `minimum_versions` is passed, and populate it here rather than leaving a second unpopulated seam
+    - Warn at configuration time when a watch source polls open items only, because such a source can never derive a cancellation and the run for a closed item keeps going. `engine/watch/lifecycle.py` derives a cancellation only from a closure a poll REPORTS, reading an item's absence as a narrowed filter — so the filter in the poll command decides whether requirement 10.9 is reachable at all. Task 13.2's review found both bundled presets had this shape. The GitHub one is fixed (it now asks `state=all`); the GitLab one is NOT, deliberately: `glab` is not installed on this machine, so the flag that widens `glab issue list` past open items could not be verified, and guessing one is precisely the defect 13.2 shipped — a plausible flag the real CLI rejects, which failed every poll rather than degrading. `test_only_github_can_derive_a_cancellation_and_that_asymmetry_is_deliberate` pins the asymmetry and fails the day the GitLab argv gains a state filter. Whoever has a real `glab` verifies the flag and fixes the preset; the advisory is worth building regardless, because a user-written source has the same trap and no reviewer looking at it
     - _Requirements: 34.3, 32.2_
 
   - [x] 17.6 Semantic builtin and the async analysis job shape
