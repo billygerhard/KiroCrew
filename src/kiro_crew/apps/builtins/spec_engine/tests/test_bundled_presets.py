@@ -58,16 +58,29 @@ from kiro_crew.effort import EFFORT_LEVELS
 
 #: One item as each host's CLI actually emits it, so the field map is exercised
 #: against the shape it was written for rather than against engine field names.
+#: One item as each host's poll command actually emits it.
+#:
+#: The GitHub entry is the REST shape returned by ``gh api repos/O/R/issues``,
+#: captured from a live call, NOT hand-authored to match the field map. That
+#: distinction is the whole value of this fixture: the previous version was
+#: written to agree with the map, so it confirmed the map against its own echo
+#: and passed while every real poll failed -- ``gh issue list`` has no author
+#: association in its ``--json`` vocabulary at all. A payload that merely
+#: restates the thing under test cannot catch that.
+#:
+#: ``pull_request`` is present on the second GitHub entry because this endpoint
+#: returns pull requests as issues; the preset's ``--jq`` filter drops them.
 HOST_PAYLOADS: dict[str, dict[str, Any]] = {
     "github": {
         "number": 412,
         "title": "Crash on empty input",
         "body": "Steps to reproduce...",
-        "state": "OPEN",
-        "url": "https://github.com/owner/repo/issues/412",
+        "state": "open",
+        "html_url": "https://github.com/owner/repo/issues/412",
+        "url": "https://api.github.com/repos/owner/repo/issues/412",
         "labels": [{"name": "bug"}, {"name": "triage"}],
-        "author": {"login": "octocat"},
-        "authorAssociation": "CONTRIBUTOR",
+        "user": {"login": "octocat"},
+        "author_association": "CONTRIBUTOR",
     },
     "gitlab": {
         "iid": 77,
@@ -227,6 +240,57 @@ class TestWatchPresetFieldMaps:
         assert values["classification"] == "bug"
         assert values["submitter"] == "octocat"
         assert values["association"] == "CONTRIBUTOR"
+
+    def test_the_address_is_the_browsable_one_not_the_api_endpoint(
+        self, store: ConfigStore
+    ) -> None:
+        """The REST payload carries both, and ``url`` is the API endpoint. An
+        address is somewhere a person is sent, so aiming it at ``url`` would
+        produce a working-looking value that is useless to the human who
+        receives it -- a wrong answer rather than a missing one, which is why
+        the fixture deliberately carries both keys."""
+        source = source_from_preset(store, "github")
+        values, _ = source.field_map.extract(HOST_PAYLOADS["github"])
+        assert values["address"] == HOST_PAYLOADS["github"]["html_url"]
+        assert values["address"] != HOST_PAYLOADS["github"]["url"]
+
+    def test_the_github_poll_asks_a_command_that_can_answer_about_association(
+        self, store: ConfigStore
+    ) -> None:
+        """``gh issue list`` cannot report an author association -- the field is
+        absent from its ``--json`` vocabulary, so requesting it fails the entire
+        poll rather than omitting one value. The association is what decides how
+        much autonomy a stranger's issue commands, so the preset has to reach a
+        command that actually carries it.
+
+        This pins the pairing between the argv and the map, which is the part a
+        payload fixture cannot check: a fixture proves the map reads a shape, not
+        that the command emits that shape.
+        """
+        argv = list(WATCH_SOURCE_PRESETS["github"]["poll"])
+        assert argv[:2] == ["gh", "api"], argv
+        assert "issue" not in argv and "list" not in argv, argv
+        association = WATCH_SOURCE_PRESETS["github"]["field_map"]["association"]
+        assert association == "author_association", association
+
+    def test_the_github_poll_excludes_pull_requests(self, store: ConfigStore) -> None:
+        """GitHub returns pull requests from the issues endpoint -- they are the
+        same object to it. Without the filter every open pull request becomes a
+        watched work item, so the engine would start runs for its own review
+        submissions. ``pull_request`` is the only key that distinguishes them.
+        """
+        argv = list(WATCH_SOURCE_PRESETS["github"]["poll"])
+        assert "--jq" in argv, argv
+        assert "pull_request" in argv[argv.index("--jq") + 1]
+
+    def test_the_github_poll_reports_closed_items_so_cancellation_can_fire(
+        self, store: ConfigStore
+    ) -> None:
+        """Lifecycle derives a cancellation only from a closure a poll REPORTS,
+        reading absence as a narrowed filter instead. A preset listing only open
+        items therefore cannot ever cancel a run whose issue was closed."""
+        argv = list(WATCH_SOURCE_PRESETS["github"]["poll"])
+        assert any("state=all" in part for part in argv), argv
 
     def test_the_gitlab_map_reads_a_real_glab_issue(self, store: ConfigStore) -> None:
         """GitLab's shapes differ from GitHub's in three places at once: the

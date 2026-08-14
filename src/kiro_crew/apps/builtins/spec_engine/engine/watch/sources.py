@@ -81,28 +81,40 @@ PathSegment = Union[str, int]
 #: unhealthiness would be a second answer to that one question.
 WATCH_SOURCE_PRESETS: Mapping[str, Mapping[str, Any]] = {
     "github": {
+        # ``gh issue list --json`` cannot report an author association at all --
+        # the field does not exist in its vocabulary, so asking for it fails the
+        # whole poll. The REST payload does carry ``author_association``, so the
+        # preset goes through ``gh api``, which costs two corrections the list
+        # command hid: the submitter is ``user.login`` rather than ``author.login``,
+        # and the browsable address is ``html_url`` -- REST's ``url`` is the API
+        # endpoint, which is not a place a person can be sent.
+        #
+        # ``state=all`` because a poll that lists only open items can never derive
+        # a cancellation: :mod:`.lifecycle` requires a closure to be *reported*,
+        # and reads an item's absence as a narrowed filter rather than a closure.
+        #
+        # The ``--jq`` filter is load-bearing, not a convenience. This endpoint
+        # returns pull requests alongside issues -- they are the same object to
+        # GitHub -- and every one of them would otherwise become a watched work
+        # item. A pull request is the only kind that carries ``pull_request``.
         "poll": (
             "gh",
-            "issue",
-            "list",
-            "--repo",
-            "OWNER/REPO",
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,state,url,labels,author,authorAssociation",
+            "api",
+            "repos/OWNER/REPO/issues?state=all&per_page=100",
+            "--jq",
+            "map(select(.pull_request == null))",
         ),
         "field_map": {
             "identifier": "number",
             "title": "title",
             "body": "body",
             "state": "state",
-            "address": "url",
+            "address": "html_url",
             # The first label is the classification a spec-type mapping reads. A
             # repository that classifies differently retargets this one path.
             "classification": "labels.0.name",
-            "submitter": "author.login",
-            "association": "authorAssociation",
+            "submitter": "user.login",
+            "association": "author_association",
         },
     },
     "gitlab": {
