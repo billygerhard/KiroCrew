@@ -210,3 +210,170 @@ def test_a_state_root_anywhere_inside_a_spec_tree_is_refused(tmp_path: Path, seg
     with pytest.raises(StatePersistenceError) as raised:
         StateStore(root=tmp_path / segment / "state")
     assert "spec tree" in str(raised.value)
+
+
+#: The key pool a claim trace runs over: two subjects of one scope, each with two
+#: generations. Deliberately tiny -- four keys against a thirty-step trace, so a
+#: claim/release/re-claim cycle on one key and a bulk release of a subject holding
+#: two generations both happen constantly instead of by luck. The kind, scope and
+#: subject dimensions are already swept by the at-most-once property above; what
+#: this trace needs is repetition, not variety.
+_TRACE_SUBJECTS = ("17", "18")
+_TRACE_GENERATIONS = ("", "1")
+
+#: One step of a claim trace. ``release`` names a generation; ``release_all``
+#: drops every generation of a subject without knowing them, which is the
+#: override a held reviewer comment needs.
+_CLAIM_STEPS = st.lists(
+    st.tuples(
+        st.sampled_from(["claim", "claim", "release", "release_all"]),
+        st.just(CLAIM_DISPATCH),
+        st.just("github"),
+        st.sampled_from(_TRACE_SUBJECTS),
+        st.sampled_from(_TRACE_GENERATIONS),
+    ),
+    min_size=1,
+    max_size=30,
+)
+
+
+class TestClaimExactlyOnceUnderInterleaving:
+    """Exactly-once across arbitrary claim/release/re-claim interleavings.
+
+    The properties above cover claims arriving repeatedly, and one bulk
+    release-then-reclaim pass. Neither reaches the ordering this ledger is
+    actually asked to survive: a release landing between two polls, a release of
+    a generation nobody claimed, and a subject released by every generation at
+    once while another generation of the same subject is still held. That last
+    one is the engine's own named failure -- one generation left behind makes a
+    release look applied while the next poll still reads the subject as already
+    seen -- and it is reachable only from a trace, never from a single call.
+
+    The expected answer comes from a shadow model of which keys are held,
+    maintained alongside the trace. Asking the store what it holds and comparing
+    it against itself would confirm the store against its own echo.
+    """
+
+    @settings(
+        max_examples=MAX_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(steps=_CLAIM_STEPS)
+    def test_work_starts_exactly_once_per_generation_between_releases(
+        self, tmp_path: Path, steps: list[tuple[str, str, str, str, str]]
+    ) -> None:
+        store = StateStore(root=tmp_path / uuid.uuid4().hex)
+        #: Keys the ledger should be holding, per the trace so far.
+        held: set[tuple[str, str, str, str]] = set()
+        #: How many times each key was granted, and how many times released.
+        grants: dict[tuple[str, str, str, str], int] = {}
+        releases: dict[tuple[str, str, str, str], int] = {}
+        try:
+            for action, kind, scope, subject, generation in steps:
+                key = (kind, scope, subject, generation)
+                if action == "claim":
+                    won = store.claim(kind, scope, subject, generation=generation)
+                    # A claim is granted exactly when the ledger is not already
+                    # holding that generation. This is the whole guarantee: a
+                    # duplicate dispatch is a second grant.
+                    assert won is (key not in held)
+                    if won:
+                        held.add(key)
+                        grants[key] = grants.get(key, 0) + 1
+                elif action == "release":
+                    dropped = store.release_claim(kind, scope, subject, generation=generation)
+                    # Releasing a generation nobody claimed reports that it
+                    # dropped nothing, rather than reporting success for a
+                    # release that changed no state.
+                    assert dropped is (key in held)
+                    if dropped:
+                        held.discard(key)
+                        releases[key] = releases.get(key, 0) + 1
+                else:
+                    expected = {item for item in held if item[:3] == (kind, scope, subject)}
+                    dropped_count = store.release_claims(kind, scope, subject)
+                    # Every generation goes, counted. One left behind is the
+                    # defect this method exists to prevent.
+                    assert dropped_count == len(expected)
+                    for item in expected:
+                        held.discard(item)
+                        releases[item] = releases.get(item, 0) + 1
+
+                # After every step the ledger holds exactly what the trace says.
+                recorded = {
+                    (claim.kind, claim.scope, claim.subject, claim.generation)
+                    for claim in store.list_claims()
+                }
+                assert recorded == held
+
+            # Work started once per claim/release cycle and never twice within
+            # one: a key granted more often than it was released plus once has
+            # started work it was not entitled to start.
+            for key, count in grants.items():
+                assert count == releases.get(key, 0) + (1 if key in held else 0)
+        finally:
+            store.close()
+
+    @settings(
+        max_examples=MAX_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        generations=st.lists(st.sampled_from(["", "1", "2", "3"]), min_size=1, unique=True),
+        target=st.sampled_from(["", "1", "2", "3"]),
+    )
+    def test_a_bulk_release_leaves_no_generation_of_the_subject_behind(
+        self, tmp_path: Path, generations: list[str], target: str
+    ) -> None:
+        """The named bug class, stated directly.
+
+        A subject claimed at several generations and then released wholesale must
+        be claimable again at *every* generation, including one this run never
+        claimed. A single row surviving would make the next poll read the subject
+        as already seen while the operator was told the release applied.
+        """
+        store = StateStore(root=tmp_path / uuid.uuid4().hex)
+        try:
+            for generation in generations:
+                assert store.claim(CLAIM_DISPATCH, "github", "17", generation=generation) is True
+
+            assert store.release_claims(CLAIM_DISPATCH, "github", "17") == len(generations)
+            assert store.list_claims(kind=CLAIM_DISPATCH, scope="github") == []
+            # Re-claimable once, at any generation, whether or not that
+            # generation was among the released ones.
+            assert store.claim(CLAIM_DISPATCH, "github", "17", generation=target) is True
+            assert store.claim(CLAIM_DISPATCH, "github", "17", generation=target) is False
+        finally:
+            store.close()
+
+    @settings(
+        max_examples=MAX_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        held=st.sampled_from(["", "1", "2"]),
+        released=st.sampled_from(["", "1", "2"]),
+    )
+    def test_releasing_one_generation_never_frees_another(
+        self, tmp_path: Path, held: str, released: str
+    ) -> None:
+        """Generations are independent subjects of the same claim.
+
+        Releasing one must not make a sibling claimable, and must not report
+        success for a generation that was never claimed.
+        """
+        store = StateStore(root=tmp_path / uuid.uuid4().hex)
+        try:
+            assert store.claim(CLAIM_DISPATCH, "github", "17", generation=held) is True
+
+            dropped = store.release_claim(CLAIM_DISPATCH, "github", "17", generation=released)
+            assert dropped is (released == held)
+
+            still_claimed = store.claim(CLAIM_DISPATCH, "github", "17", generation=held)
+            # The held generation is re-grantable only if it was the one released.
+            assert still_claimed is (released == held)
+        finally:
+            store.close()
