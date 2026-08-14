@@ -656,10 +656,11 @@ class TestTheDoctorModifiesNothingItDiagnoses:
         )
         switch = KillSwitch(tmp_path / "state")
         switch.engage(initiator="operator")
+        store = RefusingStore(config)
         before = config.path.read_bytes()
 
         report = Doctor(
-            config=RefusingStore(config),
+            config=store,
             which=no_programs,
             branch_exists=lambda branch: False,
             kill_switch=switch,
@@ -675,8 +676,12 @@ class TestTheDoctorModifiesNothingItDiagnoses:
 
         # Read-only asserted by bytes rather than by inspection: the autonomy
         # policy and the delivery workflow live in this document, so byte equality
-        # covers both of the objects the requirement names.
+        # covers both of the objects the requirement names. The attempt counter is
+        # asserted beside the bytes because the aggregation turns a raising check
+        # into a Finding -- so a refused write would otherwise leave the bytes
+        # equal and the violation invisible.
         assert config.path.read_bytes() == before
+        assert store.write_attempts == 0
         assert report.blocking, "the state under test has to actually be broken"
 
     def test_the_doctor_never_calls_a_config_write(
