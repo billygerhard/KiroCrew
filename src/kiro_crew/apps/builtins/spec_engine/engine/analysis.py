@@ -69,7 +69,7 @@ from .capabilities.schemas import SchemaError, validate_response
 from .config import ConfigStore
 from .documents import DocumentKind
 from .roles import RolePlan, SessionDefault, WorkKind
-from .state import SpecRef
+from .state import SpecRef, StateStore
 from .structure import parse_requirements
 
 logger = logging.getLogger(__name__)
@@ -286,6 +286,24 @@ class RecordingFindingsSink:
     def rows_for(self, run: str) -> tuple[dict[str, Any], ...]:
         """Every recorded row belonging to *run*."""
         return tuple(row for row in self.recorded if row.get("run") == run)
+
+
+class StateFindingsSink:
+    """The durable :class:`FindingsSink`: rows land in the engine's state store.
+
+    The whole implementation is one call, in the same shape as
+    :class:`~.budget.ledger.RunCostSink`: the engine has already decided what a
+    row is, so a sink's only job is to hand it to the store. Every table decision
+    that matters — the columns, the nullable criterion, the replace-not-append
+    write — lives in :meth:`~.state.StateStore.replace_analysis_findings`, so a
+    second sink cannot record findings a different way.
+    """
+
+    def __init__(self, state: StateStore) -> None:
+        self._state = state
+
+    def record(self, ref: SpecRef, *, run: str, report: "AnalysisReport") -> None:
+        self._state.replace_analysis_findings(ref, run=run, rows=list(report.review_rows(run)))
 
 
 def declared_criteria(ref: SpecRef) -> frozenset[str]:

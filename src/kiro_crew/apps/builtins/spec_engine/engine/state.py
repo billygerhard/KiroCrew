@@ -217,6 +217,42 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (scope, kind, element_id)
     )
     """,
+    # One row per analysis finding, so the report a provider produced outlives the
+    # process that received it. Without this a routed report was recorded in
+    # memory and dropped at exit, which is not an account of what an analyzer
+    # found.
+    #
+    # The payload columns are exactly the keys of ``AnalysisReport.review_rows``:
+    # run, criterion, keyed, provider, degraded, finding. Reading a row therefore
+    # reconstructs the row the engine emitted rather than a second, store-shaped
+    # spelling of it that a surface would have to translate back. ``spec_key`` and
+    # ``recorded_ts`` are the store's own attribution, not part of that payload.
+    #
+    # ``criterion`` is NULLABLE on purpose: a finding whose references resolved to
+    # no criterion the requirements declare is still a finding a reviewer must see,
+    # so it is stored unkeyed rather than dropped or filed under an identifier the
+    # document does not contain.
+    #
+    # There is deliberately no unique constraint over (run, criterion): several
+    # findings legitimately concern one criterion, and a key that collapsed them
+    # would silently keep only the last. A run's rows are REPLACED wholesale by
+    # ``replace_analysis_findings``, so a re-analysis supersedes its predecessor
+    # rather than accumulating beside it. ``seq`` preserves the order the engine
+    # emitted them in, which is the order a surface renders.
+    """
+    CREATE TABLE IF NOT EXISTS analysis_findings (
+        seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+        run         TEXT NOT NULL,
+        spec_key    TEXT NOT NULL,
+        criterion   TEXT,
+        keyed       INTEGER NOT NULL DEFAULT 0,
+        provider    TEXT NOT NULL DEFAULT '',
+        degraded    INTEGER NOT NULL DEFAULT 0,
+        finding     TEXT NOT NULL,
+        recorded_ts TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS analysis_findings_run_idx ON analysis_findings (run, criterion)",
     """
     CREATE TABLE IF NOT EXISTS workspaces (
         workspace_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -481,6 +517,43 @@ class ElementTrustRecord:
 
 
 @dataclass(frozen=True)
+class AnalysisFindingRecord:
+    """One stored analysis finding, as it was emitted and as it is rendered.
+
+    :meth:`to_review_row` returns exactly the row
+    ``AnalysisReport.review_rows`` produced, so the projection a surface reads
+    from the store is the projection the engine wrote and not a second spelling
+    that could drift from it. The finding body was already put through the
+    display contract before it was stored — prose through ``for_display``,
+    identifier-shaped fields through ``sanitized`` — so nothing here re-renders
+    it: a second treatment on the way out would be a second answer to how
+    provider text is made safe.
+    """
+
+    seq: int
+    run: str
+    spec_key: str
+    #: The acceptance criterion this finding concerns, or ``None`` when the
+    #: provider's references resolved to no criterion the document declares.
+    criterion: str | None
+    keyed: bool
+    provider: str
+    degraded: bool
+    finding: dict[str, Any]
+    recorded_ts: str
+
+    def to_review_row(self) -> dict[str, Any]:
+        return {
+            "run": self.run,
+            "criterion": self.criterion,
+            "keyed": self.keyed,
+            "provider": self.provider,
+            "degraded": self.degraded,
+            "finding": self.finding,
+        }
+
+
+@dataclass(frozen=True)
 class WorkspaceRecord:
     workspace_id: int
     run_id: str
@@ -594,6 +667,20 @@ def _element_trust_record(row: sqlite3.Row) -> ElementTrustRecord:
         evidence=row["evidence"],
         derived_ts=row["derived_ts"],
         pending_reapply=bool(row["pending_reapply"]),
+    )
+
+
+def _analysis_finding_record(row: sqlite3.Row) -> AnalysisFindingRecord:
+    return AnalysisFindingRecord(
+        seq=int(row["seq"]),
+        run=row["run"],
+        spec_key=row["spec_key"],
+        criterion=row["criterion"],
+        keyed=bool(row["keyed"]),
+        provider=row["provider"],
+        degraded=bool(row["degraded"]),
+        finding=_decode_json_object(row["finding"]),
+        recorded_ts=row["recorded_ts"],
     )
 
 
@@ -1475,6 +1562,75 @@ class StateStore:
             "SELECT * FROM element_trust WHERE scope = ? ORDER BY kind, element_id", (scope,)
         )
         return [_element_trust_record(row) for row in rows]
+
+    # -------------------------------------------------- analysis findings
+
+    def replace_analysis_findings(
+        self,
+        ref: SpecRef,
+        *,
+        run: str,
+        rows: Sequence[dict[str, Any]],
+    ) -> int:
+        """Make *rows* the complete set of analysis findings for *run*.
+
+        REPLACES rather than appends, in one transaction: an analysis is a verdict
+        on the documents as they stand, so a re-analysis supersedes the previous
+        one. An appending writer would leave a reviewer reading a pile that mixes
+        findings about the current documents with findings about the draft that was
+        revised away, and nothing on a row says which is which — the first
+        re-analysis would double the list.
+
+        An empty *rows* is a real answer and clears the run's rows: an analysis
+        that found nothing is not the same as an analysis that never ran, and
+        leaving the previous findings standing would report the older verdict as
+        current.
+
+        Rows are taken as the engine emitted them (``AnalysisReport.review_rows``)
+        and stored column-for-column. Nothing here re-renders the finding body:
+        it already went through the display contract on the way out of the report,
+        and a second treatment would be a second answer to how provider text is
+        made safe.
+        """
+        if not run:
+            raise ValueError("analysis findings need the run they belong to")
+        now = utc_now_iso()
+        with self._write() as conn:
+            self._insert_spec_row(conn, ref, now)
+            conn.execute("DELETE FROM analysis_findings WHERE run = ?", (run,))
+            for row in rows:
+                criterion = row.get("criterion")
+                conn.execute(
+                    "INSERT INTO analysis_findings (run, spec_key, criterion, keyed, "
+                    "provider, degraded, finding, recorded_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run,
+                        ref.key,
+                        str(criterion) if criterion is not None else None,
+                        1 if row.get("keyed") else 0,
+                        str(row.get("provider") or ""),
+                        1 if row.get("degraded") else 0,
+                        json.dumps(row.get("finding") or {}),
+                        now,
+                    ),
+                )
+        return len(rows)
+
+    def list_analysis_findings(
+        self, *, run: str | None = None, ref: SpecRef | None = None
+    ) -> list[AnalysisFindingRecord]:
+        """Stored analysis findings, in the order the engine emitted them."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run is not None:
+            clauses.append("run = ?")
+            params.append(run)
+        if ref is not None:
+            clauses.append("spec_key = ?")
+            params.append(ref.key)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._query(f"SELECT * FROM analysis_findings{where} ORDER BY seq", params)
+        return [_analysis_finding_record(row) for row in rows]
 
     # -------------------------------------------------------------- workspaces
 

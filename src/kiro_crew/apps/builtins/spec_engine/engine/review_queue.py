@@ -143,6 +143,32 @@ class ArchivalRefused(Exception):
 
 
 @dataclass(frozen=True)
+class CriterionFindings:
+    """The stored analysis findings that concern one acceptance criterion.
+
+    ``criterion`` is ``None`` for the group holding findings whose references
+    resolved to no criterion the requirements declare. They are a group rather
+    than a separate list because a reviewer reads them the same way, and a second
+    list would be a second place a surface has to remember to render.
+
+    Each finding is the body the engine stored, already through the display
+    contract: prose through ``Untrusted.for_display`` (which keeps the line breaks
+    prose is entitled to, so a surface that lays them out must expect them) and
+    identifier-shaped fields through ``sanitized``. Nothing here renders it again.
+    """
+
+    criterion: str | None
+    findings: tuple[Mapping[str, Any], ...]
+
+    def to_json_object(self) -> dict[str, Any]:
+        return {
+            "criterion": self.criterion,
+            "keyed": self.criterion is not None,
+            "findings": [dict(finding) for finding in self.findings],
+        }
+
+
+@dataclass(frozen=True)
 class QueueEntry:
     """One run waiting on a person, flattened for any driver to render.
 
@@ -185,6 +211,15 @@ class QueueEntry:
     #: ``revision_exhausted``, kept separate because they bound different loops
     #: and a reviewer acting on one is not acting on the other.
     feedback_needs_human: bool = False
+    #: The run's stored analysis findings, grouped by the criterion they concern.
+    #: Carried here rather than in a parallel findings list because this entry
+    #: already IS the run's projection for a reviewer: a second surface keyed on
+    #: the same run would be a second spelling of one projection, and the two
+    #: would drift the first time only one of them was updated. Empty when no
+    #: analysis has been recorded for the run, which is not the same as an
+    #: analysis that found nothing -- that one records zero rows and so also
+    #: reads empty here, and the audit trail is where the two are told apart.
+    analysis: tuple[CriterionFindings, ...] = ()
 
     @property
     def ref(self) -> SpecRef:
@@ -207,6 +242,7 @@ class QueueEntry:
             "revision_exhausted": self.revision_exhausted,
             "feedback_quarantined": self.feedback_quarantined,
             "feedback_needs_human": self.feedback_needs_human,
+            "analysis": [group.to_json_object() for group in self.analysis],
         }
 
 
@@ -552,6 +588,29 @@ class ReviewQueue:
             revision_exhausted=gate is not None and gate in revision_exhausted_gates(record),
             feedback_quarantined=len(feedback_quarantined(record)),
             feedback_needs_human=feedback_needs_human(record),
+            analysis=self.analysis_for(record.run_id),
+        )
+
+    def analysis_for(self, run_id: str) -> tuple[CriterionFindings, ...]:
+        """The run's stored analysis findings, grouped by criterion.
+
+        Read from the state store on every call, like every other field of this
+        projection: the queue is derived, and a cached copy of the findings would
+        be the one part of an entry that could report a superseded analysis.
+
+        Keyed criteria come first in the store's own emitted order — which is the
+        report's criterion order — and the unkeyed group last, because a reviewer
+        works down the document and then reads what could not be placed in it.
+        """
+        grouped: dict[str | None, list[Mapping[str, Any]]] = {}
+        for record in self._store.list_analysis_findings(run=run_id):
+            grouped.setdefault(record.criterion, []).append(record.finding)
+        keyed = [key for key in grouped if key is not None]
+        ordered: list[str | None] = list(keyed)
+        if None in grouped:
+            ordered.append(None)
+        return tuple(
+            CriterionFindings(criterion=key, findings=tuple(grouped[key])) for key in ordered
         )
 
     def _outstanding_gate(self, ref: SpecRef) -> str | None:
