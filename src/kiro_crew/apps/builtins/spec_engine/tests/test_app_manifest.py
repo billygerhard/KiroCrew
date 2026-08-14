@@ -171,9 +171,12 @@ class TestDiscoverySkill:
         A restated format rule becomes a second spelling that drifts from the
         engine that enforces it, and nothing notices. Overlapping prose is the
         observable form of that copy.
+
+        Scanned over the whole skill rather than the body alone: a rule placed in
+        the frontmatter description escaped a body-only scan by construction, and
+        a review demonstrated it.
         """
-        body = _frontmatter_and_body(_skill_text())[1]
-        shared = _ngrams(body) & _guidance_ngrams()
+        shared = _ngrams(_skill_text()) & _guidance_ngrams()
         assert not shared, "skill body repeats engine guidance prose: " + "; ".join(
             " ".join(gram) for gram in sorted(shared)[:5]
         )
@@ -197,8 +200,16 @@ class TestDiscoverySkill:
 
         The tokens are EXTRACTED from the guidance rather than typed here, so the
         list cannot fall behind what the engine actually says.
+
+        Scanned over the WHOLE skill, frontmatter included. A review demonstrated
+        both escapes this once had: a rule placed in the frontmatter description
+        slipped past a body-only scan by construction, and a PARAPHRASED rule
+        ("each acceptance criterion should be exactly one testable EARS-shaped
+        sentence") passed every check, because the n-gram test catches copies and
+        the extracted tokens did not include the format's own vocabulary. A
+        paraphrase is the realistic drift; a copy is the easy case.
         """
-        body = _frontmatter_and_body(_skill_text())[1]
+        whole = _skill_text()
         tokens: set[str] = set()
         for flow_text in GUIDANCE.values():
             for line in flow_text.splitlines():
@@ -212,9 +223,14 @@ class TestDiscoverySkill:
                         tokens.add(word.strip("`,."))
                     if word.strip("`,.") in {"requirements.md", "design.md", "tasks.md"}:
                         tokens.add(word.strip("`,."))
+        # The naming vocabulary of the format itself, which a paraphrase reaches
+        # for even when it borrows no phrasing. Typed rather than extracted on
+        # purpose: these are the words that identify the SUBJECT a router must not
+        # explain, and the extraction above only finds the guidance's own spelling.
+        tokens.update({"EARS", "acceptance criterion", "acceptance criteria"})
         # Non-vacuity: an extraction that produced nothing would leak nothing.
         assert "SHALL" in tokens and "requirements.md" in tokens
-        leaked = sorted(t for t in tokens if t and t in body)
+        leaked = sorted(t for t in tokens if t and t in whole)
         assert not leaked, f"skill body states guidance-owned format tokens: {leaked}"
 
 
