@@ -114,7 +114,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Property test: for a config whose delivery-phase program is absent, no run starts and no model credits are consumed
     - _Requirements: 32.1, 32.3, 32.4, 32.5, 32.6_
 
-- [ ] 8. Watchers and dispatch
+- [x] 8. Watchers and dispatch
   - [x] 8.1 Command-based watch sources and zero-token polling
     - Sources defined as poll command plus field mapping (identifier, title, body, state, address, classification, submitter); disabled by default with per-source enablement
     - Poll tick runs from a script cron with zero model invocations while idle
@@ -134,7 +134,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Wire `watch/feedback.py:post_feedback` at the lifecycle points, which is what makes requirement 10.10 true of a running engine rather than of a library: `claimed` from the dispatcher beside the claim, `awaiting_review` / `completed` / `failed` / `refused` from the run lifecycle transitions, `delivery_submitted` from the delivery flow after submit. The mechanism, its at-most-once ledger claim and its recorded-not-fatal failure are built and tested; nothing constructs it. Do not check this task off while that holds
     - Give the `writeback` claim kind an operator surface. A failed post deliberately keeps its claim, because retrying a command that may already have commented is how one event becomes two — but that permanently suppresses the event for the run, and the only release path today is hand-written Python against the store. Add a `release_writeback_claim` twin of `release_dispatch_claim`, and say in the FAILED report and audit detail that the event is now suppressed and which ledger row clears it
     - _Requirements: 10.10, 21.2, 21.3, 21.4_
-  - [ ] 8.5 Public-source autonomy warning
+  - [x] 8.5 Public-source autonomy warning
     - Enabling execution-or-higher autonomy on a publicly submittable source warns and records the acknowledgment
     - _Requirements: 10.11_
   - [x] 8.6 Intake injection screening
@@ -183,7 +183,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - _Requirements: 30.1, 30.2, 30.3, 30.4_
 
 - [ ] 10. Engine MCP server
-  - [ ] 10.1 Tool surface and JSON-RPC conformance
+  - [x] 10.1 Tool surface and JSON-RPC conformance
     - Expose engine operations as tools with prompt-as-tool-result authoring/orchestration guidance; a stock agent with only this server completes the workflow, without excluding agents holding other spec tools
     - Conformant prompts/resources/unknown-method handling; unavailable guidance returns an error, never partial text; no tool mutates the Autonomy_Policy or Delivery_Workflow
     - _Requirements: 3.1, 3.2, 3.3, 3.5, 13.12_
@@ -254,8 +254,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Write through the validated config path on approval; ask (never infer) the Cost_Profile; per-level confirmation for execution, delivery, and integration; offer applicable Workflow_Presets and run the prerequisite checks, reporting each unmet check with its resolving action
     - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7, 15.7_
 
-- [ ] 15. Headless run driver and notifications
-  - [ ] 15.1 Session seeder
+- [x] 15. Headless run driver and notifications
+  - [x] 15.1 Session seeder
     - Seed ordinary agent sessions with the granted approval posture applied and the run identifier stamped; posture recorded in the audit log; runs appear in the dashboard session list; human-reserved gates notify that the run waits for review
     - _Requirements: 7.3, 6.3_
   - [x] 15.2 Notification routing
