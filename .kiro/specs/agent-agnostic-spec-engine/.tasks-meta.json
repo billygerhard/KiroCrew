@@ -33,7 +33,7 @@
     "10.2": "queued",
     "11.1": "completed",
     "11.2": "queued",
-    "12.1": "queued",
+    "12.1": "completed",
     "12.2": "queued",
     "12.3": "queued",
     "12.4": "queued",
@@ -61,7 +61,7 @@
     "19.2": "queued",
     "17.6": "completed",
     "18.1": "queued",
-    "20.1": "queued",
+    "20.1": "completed",
     "20.2": "queued",
     "20.3": "queued",
     "20.4": "queued",
@@ -461,6 +461,16 @@
       "ts": "2026-08-14T11:51:44",
       "taskId": "20.6",
       "status": "queued"
+    },
+    {
+      "ts": "2026-08-14T17:11:44",
+      "taskId": "20.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-14T17:11:48",
+      "taskId": "12.1",
+      "status": "completed"
     }
   ]
 }
