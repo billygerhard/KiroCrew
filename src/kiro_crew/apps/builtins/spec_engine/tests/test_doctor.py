@@ -859,6 +859,40 @@ class TestARegressionIsNotAFirstFailure:
         assert third.to_notify == ()
         assert second.regressions and third.regressions
 
+    def test_a_partial_pass_does_not_clear_the_failure_it_shares_an_id_with(
+        self, config: ConfigStore, history: DoctorHistory
+    ) -> None:
+        """One identifier reported both passing and failing must read as failing.
+
+        This is the most ordinary broken state there is -- several declared
+        programs, one of them missing -- and it puts a single identifier in the
+        findings AND in the passing set of the same report. If the passing read
+        won, the history would flip to passing, so the NEXT run would see a
+        previously-passing check now failing, call it a regression, and notify
+        again. Every run. Notify-once becomes notify-always, and nothing about the
+        report looks wrong while it happens, which is why this needs a test rather
+        than a reading.
+        """
+        present = "kirocrew-present-doctor-cli"
+        configure(
+            config,
+            {"workflow": {"stages": {"submit": [[present, "one"], [ABSENT_PROGRAM, "two"]]}}},
+        )
+        # Only the first program resolves, so one check reports the same identifier
+        # on both sides of the same run.
+        partial = Doctor(
+            config=config, which=resolver(present), history=history, clock=lambda: self.now
+        )
+
+        first = partial.run()
+        second = partial.run()
+
+        shared = "prerequisite.programs"
+        assert shared in {finding.identifier for finding in first.findings}
+        assert shared in first.passing, "the state under test needs both reads present"
+        # The repeat run has nothing new to say, so it says nothing.
+        assert second.to_notify == ()
+
     def test_a_condition_that_clears_and_returns_notifies_again(
         self, config: ConfigStore, history: DoctorHistory
     ) -> None:
