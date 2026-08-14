@@ -39,6 +39,10 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 
+from ...spec_engine.engine import documents as engine_documents
+from ...spec_engine.engine import phases as engine_phases
+from ...spec_engine.engine import spec_types as engine_spec_types
+
 try:
     from kiro_crew.security import (
         is_sensitive_path,
@@ -139,7 +143,21 @@ def _settings_path() -> Path:
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-_VALID_TYPES = ("feature", "bug", "quick")
+#: This app's wire names for the engine's spec types, and the ONLY place the two
+#: vocabularies are bridged. The dashboard and every stored index entry have said
+#: ``bug`` since before the engine existed, so the wire keeps that name while the
+#: engine keeps ``bugfix``. Everything else about a type -- which documents it
+#: owes, in what order, whether it is a type at all -- is asked of the engine, so
+#: this table cannot drift into a second definition of a spec type. It is keyed by
+#: the engine's enum members rather than by strings so that removing a type from
+#: the engine breaks this import instead of silently leaving a name behind.
+_SPEC_TYPE_WIRE_NAMES: dict[str, engine_spec_types.SpecType] = {
+    "feature": engine_spec_types.SpecType.FEATURE,
+    "bug": engine_spec_types.SpecType.BUGFIX,
+    "quick": engine_spec_types.SpecType.QUICK,
+}
+
+_VALID_TYPES = tuple(_SPEC_TYPE_WIRE_NAMES)
 
 #: Every status this app can be in. index.json is agent-writable, so the stored
 #: value is untrusted: an unrecognised one is reported as "planning" rather than
@@ -846,7 +864,41 @@ def _new_slot_key(name: str) -> str:
     return f"spec-builder-{name}-{uuid.uuid4().hex[:8]}"
 
 
-_PHASE_FILES = [("tasks", "tasks.md"), ("design", "design.md"), ("requirements", "requirements.md")]
+def _engine_spec_type(spec_type: object) -> engine_spec_types.SpecType:
+    """The engine spec type this app's *spec_type* wire name refers to.
+
+    Falls back to the feature type for any value no wire name covers. index.json
+    is agent-writable, so the stored type is untrusted input; the widest plan is
+    the honest reading of an unrecognised one, because it names every document the
+    app can serve rather than silently dropping a tab from the UI.
+    """
+    if isinstance(spec_type, engine_spec_types.SpecType):
+        return spec_type
+    name = spec_type.strip().casefold() if isinstance(spec_type, str) else ""
+    return _SPEC_TYPE_WIRE_NAMES.get(name, engine_spec_types.SpecType.FEATURE)
+
+
+def _plan_kinds(spec_type: object) -> tuple[engine_documents.DocumentKind, ...]:
+    """The documents *spec_type* owes, in plan order, as the engine defines them.
+
+    The single spelling of "what does this spec type owe" in this app. Asked of
+    the phase machine's own accessor so the plan the UI shows is the plan the
+    engine gates on.
+    """
+    return engine_phases.document_plan(_engine_spec_type(spec_type).value)
+
+
+def _plan_filenames(spec_type: object) -> tuple[str, ...]:
+    return tuple(kind.filename for kind in _plan_kinds(spec_type))
+
+
+#: Every document a spec can hold, furthest-first, taken from the engine's own
+#: document vocabulary rather than restated here -- a document the engine adds is
+#: one this app reads and serves without a second edit. Furthest-first because the
+#: phase this app reports is the furthest document drafted (see ``_derive_phase``).
+_PHASE_FILES = [
+    (kind.value, kind.filename) for kind in reversed(list(engine_documents.DocumentKind))
+]
 
 
 def _spec_file(spec_dir: Path, fname: str) -> Path | None:
@@ -909,7 +961,7 @@ def _read_spec_text(spec_dir: Path, fname: str) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
+def _collect_spec_documents(spec_dir: Path, spec_type: object = None) -> tuple[_PhaseView, dict, dict | None]:
     """Gather everything the detail endpoint needs off the filesystem.
 
     BLOCKING — call via ``asyncio.to_thread``. Bundled into one function so the
@@ -917,7 +969,7 @@ def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
     edit can reintroduce an inline read: derive the phase, read the three spec
     documents, and read + normalize the agent-authored state file.
     """
-    phase = _derive_phase(spec_dir)
+    phase = _derive_phase(spec_dir, spec_type)
     files = _read_spec_files(spec_dir)
     state: dict | None = None
     raw_text = _read_spec_text(spec_dir, ".spec-state.json")
@@ -1795,11 +1847,91 @@ async def _halt_active_turn(state: Any, name: str, *, only_slot: Any = _UNPINNED
     return True
 
 
-def _derive_phase(spec_dir: Path) -> str:
-    for phase, fname in _PHASE_FILES:
-        if _spec_file(spec_dir, fname) is not None and (spec_dir / fname).is_file():
-            return phase
-    return "new"
+class _PhaseView(NamedTuple):
+    """The phase the UI shows, and whether it is the engine's current answer.
+
+    ``stale`` is not decoration. A failed engine read must neither blank the UI
+    (which loses the user's context) nor present the previous answer as current
+    (which is worse, because it looks authoritative). Carrying both the retained
+    phase and the flag is what keeps those two apart.
+    """
+
+    phase: str
+    stale: bool
+
+
+#: Last phase the engine successfully reported, per spec directory, so a failed
+#: read can retain it. Bounded: the index is agent-writable and can name an
+#: unbounded number of directories, and an unbounded cache in a long-lived gateway
+#: is a leak. Insertion-ordered, so the oldest entry is the one evicted.
+_LAST_PHASE: dict[str, str] = {}
+_LAST_PHASE_LOCK = threading.Lock()
+_LAST_PHASE_MAX = 512
+
+#: The unknown phase. Reported only when the engine read failed AND nothing was
+#: ever retained for this spec, so there is genuinely no last known state.
+_PHASE_UNKNOWN = "unknown"
+
+#: The answer for a spec the phase pass did not cover. Deliberately not "new":
+#: no engine answer was obtained for it, and reporting it as undrafted would be
+#: this app inventing a phase the engine never gave.
+_MISSING_PHASE = _PhaseView(_PHASE_UNKNOWN, True)
+
+
+def _remember_phase(key: str, phase: str) -> None:
+    with _LAST_PHASE_LOCK:
+        _LAST_PHASE.pop(key, None)
+        _LAST_PHASE[key] = phase
+        while len(_LAST_PHASE) > _LAST_PHASE_MAX:
+            del _LAST_PHASE[next(iter(_LAST_PHASE))]
+
+
+def _retained_phase(key: str) -> _PhaseView:
+    """The last phase the engine reported for *key*, marked stale."""
+    with _LAST_PHASE_LOCK:
+        return _PhaseView(_LAST_PHASE.get(key, _PHASE_UNKNOWN), True)
+
+
+def _derive_phase(spec_dir: Path, spec_type: object = None) -> _PhaseView:
+    """Where the spec sits, decided entirely by the engine.
+
+    BLOCKING -- call via ``asyncio.to_thread``: it reads every document the plan
+    names.
+
+    Three questions decide a phase and the engine answers all three: which
+    documents this spec type owes and in what order (``DocumentPlan``), whether a
+    document counts as drafted (``read_document``, which treats a whitespace-only
+    file as absent), and what the phases are called (``DocumentKind``). What is
+    left here is the projection onto the answer this app's UI asks for -- the
+    furthest document drafted -- which the engine has no term for, because its own
+    ``PhaseState.phase`` names the gate a spec is *waiting at* and is approval-
+    gated. This app records no approvals with the engine, so that phase would read
+    ``requirements`` for every spec forever and the rail's advance control would
+    never unlock. The projection stands on engine answers only, so there is no
+    second rule to disagree with.
+
+    Each candidate is filtered through ``_spec_file`` FIRST. The engine reads a
+    document with a plain open, which follows a symlink; this app refuses one, and
+    a planted ``design.md -> ~/.aws/credentials`` must not be read at all, let
+    alone counted as a drafted design.
+
+    Never raises. An engine that cannot answer yields the last answer it gave,
+    flagged stale: a blank spec list loses the user's context, and presenting a
+    previous answer as current is worse, so the flag is what keeps them apart.
+    """
+    key = str(spec_dir)
+    try:
+        phase = "new"
+        for kind in _plan_kinds(spec_type):
+            if _spec_file(spec_dir, kind.filename) is None:
+                continue
+            if engine_phases.read_document(spec_dir, kind) is not None:
+                phase = kind.value
+    except Exception:
+        logger.warning("engine could not report the phase of %s", _redact(key), exc_info=True)
+        return _retained_phase(key)
+    _remember_phase(key, phase)
+    return _PhaseView(phase, False)
 
 
 def _read_spec_files(spec_dir: Path) -> dict:
@@ -1838,15 +1970,6 @@ def _valid_name(name: str) -> bool:
 # ── seed / execution prompts ─────────────────────────────────────────────────
 
 
-#: Per-type deliverables. `quick` deliberately skips design.md: the previous seed
-#: demanded all three documents for every type, which contradicted the spec type
-#: the user had chosen.
-_TYPE_PLAN: dict[str, tuple[str, ...]] = {
-    "feature": ("requirements.md", "design.md", "tasks.md"),
-    "bug": ("requirements.md", "design.md", "tasks.md"),
-    "quick": ("requirements.md", "tasks.md"),
-}
-
 _TYPE_GUIDANCE: dict[str, str] = {
     "feature": (
         "FEATURE spec: full Requirements -> Design -> Tasks. requirements.md states "
@@ -1878,7 +2001,10 @@ def _seed_prompt(spec_type: str, name: str, spec_dir: Path, working_dir: str, de
     documents the chosen spec type actually calls for.
     """
     desc = f"\n\nThe user's initial description:\n{description.strip()}" if description.strip() else ""
-    files = _TYPE_PLAN.get(spec_type, _TYPE_PLAN["feature"])
+    # The deliverables are the engine's document plan for this type, never a list
+    # kept here: a seed that named a document the engine does not gate, or omitted
+    # one it does, would send the agent to write the wrong set of files.
+    files = _plan_filenames(spec_type)
     guidance = _TYPE_GUIDANCE.get(spec_type, _TYPE_GUIDANCE["feature"])
     paths = "\n".join(f"  - {spec_dir / f}" for f in files)
     return (
@@ -2461,21 +2587,24 @@ def _prepare_spec_dir(
     return spec_dir, ""
 
 
-def _load_index_with_discovery() -> tuple[dict, dict[str, str]]:
+def _load_index_with_discovery() -> tuple[dict, dict[str, _PhaseView]]:
     """Load the index, fold in specs found on disk, and derive every phase --
     all in ONE thread hop, under the index lock.
 
     BLOCKING -- call via ``asyncio.to_thread``. The list endpoint is polled every
     15s, so none of this may run on the event loop: discovery walks every known
-    project root's ``.kiro/specs``, and ``_derive_phase`` stats up to three files
-    PER SPEC (the response loop used to do that inline, so a large index froze
-    the loop on every poll). Returns ``(index, {name: phase})``.
+    project root's ``.kiro/specs``, and ``_derive_phase`` reads every document a
+    spec's plan names PER SPEC (the response loop used to do that inline, so a
+    large index froze the loop on every poll). Returns ``(index, {name: phase})``.
     """
     with _INDEX_LOCK:
         index = _load_index()
         if _discover_folder_specs(index):
             _save_index(index)
-    phases = {name: _derive_phase(Path(m.get("spec_dir", ""))) for name, m in index.items()}
+    phases = {
+        name: _derive_phase(Path(m.get("spec_dir", "")), m.get("spec_type"))
+        for name, m in index.items()
+    }
     return index, phases
 
 
@@ -2504,7 +2633,10 @@ async def _handle_list(request: web.Request) -> web.Response:
                 # Reconciled, not raw: a capped nudge loop that ran out of cycles
                 # leaves "executing" in the index forever (see _effective_status).
                 "status": await _effective_status(name, meta, slot),
-                "phase": phases.get(name, "new"),
+                "phase": phases.get(name, _MISSING_PHASE).phase,
+                # See the note on the detail payload: a retained phase is flagged,
+                # never presented as the engine's current answer.
+                "phase_stale": phases.get(name, _MISSING_PHASE).stale,
                 "running": bool(getattr(slot, "running", False)),
                 # Validated, not passed through: see _numeric.
                 "created_at": _numeric(meta.get("created_at")),
@@ -2801,7 +2933,11 @@ async def _handle_get(request: web.Request) -> web.Response:
     # and reading .spec-state.json. The UI polls this endpoint every 2.5s while a
     # build runs, so doing it inline froze the gateway's event loop — chat
     # streaming and heartbeats included — for the duration of every poll.
-    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir)
+    # The stored type decides which documents the plan names, so the phase pass
+    # needs it: a quick spec owes no design document and must not be reported as
+    # sitting in a design phase because a stray file exists.
+    spec_type = meta.get("spec_type")
+    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir, spec_type)
 
     # Live context counters from the worker slot's transcript. The slot is
     # CREATED here if it does not exist yet (see _ensure_worker_slot): a spec
@@ -2861,7 +2997,11 @@ async def _handle_get(request: web.Request) -> web.Response:
             # already returns it -- omitting it here left every one of those dead
             # for the SELECTED spec, which is the only place they matter.
             "running": bool(getattr(slot, "running", False)) if slot is not None else False,
-            "phase": phase,
+            "phase": phase.phase,
+            # True when the engine could not be asked and the phase above is the
+            # last answer it gave. The SPA shows a staleness indicator rather than
+            # presenting a retained phase as the current one.
+            "phase_stale": phase.stale,
             "files": files,
             "state": spec_state,
             "context": {

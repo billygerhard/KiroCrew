@@ -700,7 +700,8 @@ def test_collect_spec_documents_returns_the_detail_triple(tmp_path):
     (spec_dir / ".spec-state.json").write_text(json.dumps({"blocking": "waiting on you"}))
 
     phase, files, state = routes._collect_spec_documents(spec_dir)
-    assert phase == "design"                      # newest present phase file wins
+    assert phase.phase == "design"                 # furthest drafted document wins
+    assert phase.stale is False                    # the engine answered, so not retained
     assert files["requirements.md"] == "# reqs"
     assert state is not None and state["blocking"] == "waiting on you"
 
@@ -1154,7 +1155,7 @@ def test_list_handler_derives_phases_off_the_loop(tmp_path, monkeypatch):
     (spec_dir / "design.md").write_text("# d")
     routes._save_index({"s1": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}})
     _index, phases = routes._load_index_with_discovery()
-    assert phases["s1"] == "design"
+    assert phases["s1"].phase == "design"
 
 
 def test_gateway_helpers_are_imported_at_module_scope():
@@ -2166,12 +2167,12 @@ async def test_detail_refuses_when_the_spec_is_recreated_mid_request(tmp_path, m
 
     real_collect = routes._collect_spec_documents
 
-    def _collect_then_recreate(spec_dir):
+    def _collect_then_recreate(spec_dir, spec_type=None):
         # Stand in for the concurrent delete+recreate landing during the hop.
         routes._save_index(
             {"moved": {"spec_dir": str(new_dir), "working_dir": str(tmp_path / "new")}}
         )
-        return real_collect(spec_dir)
+        return real_collect(spec_dir, spec_type)
 
     monkeypatch.setattr(routes, "_collect_spec_documents", _collect_then_recreate)
 
@@ -6915,8 +6916,7 @@ def _seed_spec(state_dir: Path, project: Path, name: str, spec_type: str, docs: 
     for fname, text in docs.items():
         (spec_dir / fname).write_text(text, encoding="utf-8")
     state_dir.mkdir(parents=True, exist_ok=True)
-    index_path = routes._INDEX_PATH
-    index = json.loads(index_path.read_text()) if index_path.is_file() else {}
+    index = routes._load_index()
     index[name] = {
         "spec_dir": str(spec_dir),
         "working_dir": str(project),
@@ -6924,7 +6924,7 @@ def _seed_spec(state_dir: Path, project: Path, name: str, spec_type: str, docs: 
         "created_at": 1.0,
         "updated_at": 2.0,
     }
-    index_path.write_text(json.dumps(index), encoding="utf-8")
+    routes._save_index(index)
     return spec_dir
 
 
@@ -6947,7 +6947,7 @@ def test_pin_phase_reported_for_documents_on_disk(tmp_path, monkeypatch, docs, e
     project = tmp_path / "proj"
     _seed_spec(state_dir, project, "thing", "feature", docs)
 
-    assert routes._derive_phase(project / ".kiro" / "specs" / "thing") == expected
+    assert routes._derive_phase(project / ".kiro" / "specs" / "thing").phase == expected
 
 
 @pytest.mark.asyncio
