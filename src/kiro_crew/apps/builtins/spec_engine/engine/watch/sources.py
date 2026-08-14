@@ -55,6 +55,129 @@ PATH_SEPARATOR = "."
 #: One step of a field path: a mapping key, or a list index.
 PathSegment = Union[str, int]
 
+#: Bundled watch source definitions, keyed by the public host they poll.
+#:
+#: A preset is a shape, not a mechanism: each entry is the poll argv and the field
+#: map a source of that host needs, which is exactly what configuration already
+#: holds. :func:`watch_source_presets` deep-copies one into the form
+#: ``sources.<name>`` takes, and the project edits it from there -- most often the
+#: ``OWNER/REPO`` placeholder in the poll argv, which is a literal precisely so the
+#: copied command is refused loudly rather than polling somewhere unintended.
+#:
+#: **Public hosts only, structurally.** Like :data:`.feedback.FEEDBACK_PRESETS`,
+#: this is a closed literal of the public hosts and the accessor raises for any
+#: other name. There is no registration path, so no configured name can yield a
+#: preset for a private tracker; an organization's own tracker is served by
+#: writing that source's ``poll`` and ``field_map`` directly, which is
+#: configuration rather than a bundled preset.
+#:
+#: **No variables in a poll argv.** A poll has no run context to substitute from,
+#: so :mod:`.poll` refuses a poll command that references one. Every ``{}``-free
+#: argument here is therefore load-bearing, not a style choice.
+#:
+#: **Health is not answered here.** Whether ``gh`` or ``glab`` is actually on PATH
+#: is answered once, by :data:`.poll.HealthReason.PROGRAM_UNAVAILABLE` and
+#: :func:`..prerequisites.check_source`. A preset that reported its own
+#: unhealthiness would be a second answer to that one question.
+WATCH_SOURCE_PRESETS: Mapping[str, Mapping[str, Any]] = {
+    "github": {
+        "poll": (
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            "OWNER/REPO",
+            "--state",
+            "open",
+            "--json",
+            "number,title,body,state,url,labels,author,authorAssociation",
+        ),
+        "field_map": {
+            "identifier": "number",
+            "title": "title",
+            "body": "body",
+            "state": "state",
+            "address": "url",
+            # The first label is the classification a spec-type mapping reads. A
+            # repository that classifies differently retargets this one path.
+            "classification": "labels.0.name",
+            "submitter": "author.login",
+            "association": "authorAssociation",
+        },
+    },
+    "gitlab": {
+        "poll": (
+            "glab",
+            "issue",
+            "list",
+            "--repo",
+            "OWNER/REPO",
+            "--output",
+            "json",
+        ),
+        "field_map": {
+            "identifier": "iid",
+            "title": "title",
+            "body": "description",
+            "state": "state",
+            "address": "web_url",
+            # GitLab labels are bare strings, so the path stops at the index.
+            "classification": "labels.0",
+            "submitter": "author.username",
+            # No association: GitLab reports no equivalent of GitHub's author
+            # association, and an unmapped field resolves to empty, which the
+            # submitter classification reads as undetermined and therefore
+            # least-trusted. Mapping it at something that is not an association
+            # would trade that safe default for a wrong answer.
+        },
+    },
+}
+
+#: The public hosts a bundled watch source preset exists for, declaration order.
+WATCH_SOURCE_PRESET_HOSTS: tuple[str, ...] = tuple(WATCH_SOURCE_PRESETS)
+
+#: The program each preset's poll command runs, for a surface that has to say
+#: which tool a host needs before anything is copied into configuration. Derived
+#: from the argv rather than written beside it: two spellings of one program name
+#: is how a preset comes to advertise a tool its own command does not run.
+WATCH_SOURCE_PRESET_PROGRAMS: Mapping[str, str] = {
+    host: str(preset["poll"][0]) for host, preset in WATCH_SOURCE_PRESETS.items()
+}
+
+
+def watch_source_presets(host: str) -> dict[str, Any]:
+    """Return *host*'s bundled source definition, ready to write into ``sources``.
+
+    Deep copies, all the way down: a configuration surface offers a preset for
+    editing, and an edit that reached back into the bundled table would change
+    what every later source is offered in this process.
+
+    The result carries no ``enabled`` key on purpose. Enablement is opt-in per
+    source because polling is the step that decides an unattended run may start
+    at all, so a freshly copied preset -- whose repository placeholder is still a
+    placeholder -- must be inert until an operator says otherwise.
+
+    ``public`` is declared true: these are hosts where anyone may open an issue,
+    and it is what earns the public-source advisory when unattended execution is
+    armed on the source. A project whose repository is in fact private turns it
+    off knowingly, which is the safe direction for that edit to run in.
+
+    Raises ``KeyError`` for any host that is not a bundled public one.
+    """
+    preset = WATCH_SOURCE_PRESETS.get(host)
+    if preset is None:
+        raise KeyError(
+            f"no bundled watch source preset for {host!r}; bundled presets exist only for the "
+            f"public hosts {', '.join(WATCH_SOURCE_PRESET_HOSTS)}, and an organization's own "
+            "tracker is served by writing that source's poll command and field map"
+        )
+    return {
+        PRESET_KEY: host,
+        "public": True,
+        POLL_KEY: [str(argument) for argument in preset["poll"]],
+        FIELD_MAP_KEY: dict(preset["field_map"]),
+    }
+
 
 def source_names(store: ConfigStore) -> tuple[str, ...]:
     """Return every declared source name, in the order the document holds them.
