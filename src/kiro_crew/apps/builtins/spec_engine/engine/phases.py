@@ -68,6 +68,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -199,10 +200,36 @@ def read_document(spec_dir: Path, kind: DocumentKind) -> str | None:
     A file that exists but holds only whitespace counts as absent. A touched
     placeholder is not a drafted document, and treating it as one would derive a
     phase past work that has not happened.
+
+    A document reached through a SYMLINK is refused, and refused here because this
+    is the one place every caller reads a document through -- the phase derivation,
+    gate validation, the tasks plan, analysis, the orchestrator and the run
+    lifecycle all arrive at this function. A spec directory is agent-writable, so
+    a planted ``design.md`` pointing at a credential file would otherwise be read,
+    hashed as a drafted document, and validated -- and a validation violation may
+    quote the content it rejected, which turns a phase check into a way to read a
+    file the engine was never meant to open.
+
+    Refusal is atomic rather than a check followed by a read: ``O_NOFOLLOW`` fails
+    the open itself, so there is no window in which the path is replaced between
+    the two. Where the platform has no such flag the pre-check is the best
+    available, and it is strictly better than nothing.
+
+    Refused reads as ABSENT, which is the safe direction: a document the engine
+    declines to open is not a document it counts as drafted.
     """
     path = spec_dir / kind.filename
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        text = path.read_text(encoding="utf-8")
+        if not no_follow and path.is_symlink():
+            raise OSError(f"{path} is a symbolic link")
+        descriptor = os.open(path, os.O_RDONLY | no_follow)
+    except OSError as exc:
+        logger.warning("could not open %s: %s", path, exc)
+        return None
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            text = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         # Unreadable and absent lead to the same refusal, so a gate is not
         # weakened by conflating them; the log preserves the difference for

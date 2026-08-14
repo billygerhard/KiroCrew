@@ -197,6 +197,35 @@ def test_an_unwritten_document_holds_the_phase_at_its_own_gate(tmp_path, live_st
     assert design.content_hash is None
 
 
+def test_a_document_planted_as_a_symlink_is_never_read(live_project, live_store, live_ref, tmp_path):
+    """A spec directory is agent-writable, so a document may be a planted link.
+
+    Reading it would hash a file the engine was never meant to open and count it as
+    a drafted document -- and a validation violation may quote the content it
+    rejected, which turns a phase check into a way to read that file. The refusal
+    reads as ABSENT, the safe direction, so the gate stays unsatisfied.
+
+    The secret's text is asserted absent from what the engine returns rather than
+    only asserting None: a future change that returned the content on some other
+    path would still fail here.
+    """
+    secret = tmp_path / "credentials"
+    secret.write_text("aws_secret_access_key = SENTINEL-DO-NOT-READ\n", encoding="utf-8")
+    spec_dir = live_project / ".kiro" / "specs" / SPEC_NAME
+    planted = spec_dir / DocumentKind.DESIGN.filename
+    # Replacing an existing document is the realistic shape: the directory is
+    # agent-writable, so the link arrives where a real document already sat.
+    planted.unlink(missing_ok=True)
+    planted.symlink_to(secret)
+
+    assert read_document(spec_dir, DocumentKind.DESIGN) is None
+    design = derive_phase(live_store, live_ref).gate_named("design")
+    assert design is not None and not design.present
+    assert design.content_hash is None
+    # The gate carries nothing derived from the secret, on any field.
+    assert "SENTINEL-DO-NOT-READ" not in repr(design)
+
+
 def test_a_whitespace_only_document_counts_as_unwritten(live_project, live_store, live_ref):
     """A touched placeholder is not a drafted document."""
     path = live_project / ".kiro" / "specs" / SPEC_NAME / DocumentKind.DESIGN.filename
