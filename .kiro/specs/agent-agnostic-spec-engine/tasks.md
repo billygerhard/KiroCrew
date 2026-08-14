@@ -191,11 +191,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Drive the server over stdio with the kiro-cli init sequence; assert identical resulting state for every state operation invoked via MCP and via the library
     - _Requirements: 3.4_
 
-- [ ] 11. Feedback loops
+- [x] 11. Feedback loops
   - [x] 11.1 Spec review revision cycle
     - Request-changes records comments, returns the run to authoring, and dispatches a revision turn with comments as quoted data; revisions validate under original rules and re-enter the queue; per-gate cycle limit marks needs-human
     - _Requirements: 22.2, 22.3, 22.4_
-  - [ ] 11.2 Delivery review feedback watcher
+  - [x] 11.2 Delivery review feedback watcher
     - Per-project opt-in (default off) polling of the review artifact via configured commands, zero credits while idle; new comments dispatch fix tasks through the same delivery stages, bounded by retry limit and budget ceiling with needs-human on the bound
     - Comment-driven dispatch gated on the commenter's own submitter class; a class not permitted to drive dispatch is quarantined in the Review_Queue for human release, consuming no credits; dispatching comments screened for embedded instructions on watched-item terms
     - _Requirements: 23.1, 23.2, 23.3, 23.4, 23.5, 23.6, 23.7, 23.8_
