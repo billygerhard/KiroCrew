@@ -21,6 +21,7 @@ anything:
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -38,6 +39,8 @@ from kiro_crew.apps.builtins.spec_engine.engine.config.schema import (
     WORKFLOW_PRESETS_KEY,
     validate_config_document,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.stages import StageExecutor, StageOutcome
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.variables import RunContext
 from kiro_crew.apps.builtins.spec_engine.engine.delivery.workflow import (
     ISOLATE_STAGE,
     WORKFLOW_PRESET_NAMES,
@@ -556,3 +559,83 @@ class TestBundledDefinitionsStayReadOnly:
 
 #: A surface standing in for any caller that is not a human at a config panel.
 _TOOL_SURFACE = type(DASHBOARD_SURFACE)("test-tool", operator_confirmed=False)
+
+
+class TestThroughTheProductionCaller:
+    """The selection reader is reached by the executor the pipeline already runs.
+
+    Nothing new constructs a workflow: ``StageExecutor``, the delivery flow,
+    integration, and the prerequisite checks all resolve a stage through
+    ``DeliveryWorkflow.stage``, which is where the preset became the widest
+    layer. These tests run the executor rather than the reader, so a preset that
+    resolved only in the library would show up here as a stage that did nothing.
+    """
+
+    @pytest.fixture()
+    def marker(self, tmp_path: Any) -> Any:
+        return tmp_path / "ran.txt"
+
+    def preset_writing(self, marker: Any) -> dict[str, Any]:
+        """A user-defined preset whose verify stage leaves evidence it ran."""
+        return {
+            "stages": {
+                "verify": [[sys.executable, "-c", f"open({str(marker)!r}, 'w').write('preset')"]]
+            }
+        }
+
+    def test_a_selected_presets_command_reaches_the_process_boundary(
+        self, store: ConfigStore, tmp_path: Any, marker: Any
+    ) -> None:
+        configure(
+            store,
+            {
+                "workflow": {
+                    "preset": "org-verify",
+                    WORKFLOW_PRESETS_KEY: {"org-verify": self.preset_writing(marker)},
+                }
+            },
+        )
+        result = StageExecutor(store).run(
+            "verify",
+            RunContext(spec_name="example", spec_type="feature", workspace_path=str(tmp_path)),
+        )
+        assert result.outcome is StageOutcome.PASSED
+        assert marker.read_text(encoding="utf-8") == "preset"
+
+    def test_an_override_replaces_the_presets_command_at_the_boundary(
+        self, store: ConfigStore, tmp_path: Any, marker: Any
+    ) -> None:
+        configure(
+            store,
+            {
+                "workflow": {
+                    "preset": "org-verify",
+                    WORKFLOW_PRESETS_KEY: {"org-verify": self.preset_writing(marker)},
+                    "stages": {
+                        "verify": [
+                            [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('override')"]
+                        ]
+                    },
+                }
+            },
+        )
+        result = StageExecutor(store).run(
+            "verify",
+            RunContext(spec_name="example", spec_type="feature", workspace_path=str(tmp_path)),
+        )
+        assert result.outcome is StageOutcome.PASSED
+        assert marker.read_text(encoding="utf-8") == "override"
+
+    def test_an_unresolvable_selection_refuses_the_stage_rather_than_skipping_it(
+        self, store: ConfigStore, tmp_path: Any
+    ) -> None:
+        """Skipping is the outcome for a stage nobody configured. A stage whose
+        preset did not resolve was configured -- by a name that means nothing --
+        so it must refuse and say so, not report the run as complete."""
+        configure(store, {"workflow": {"preset": "no-such-preset"}})
+        result = StageExecutor(store).run(
+            "verify",
+            RunContext(spec_name="example", spec_type="feature", workspace_path=str(tmp_path)),
+        )
+        assert result.outcome is StageOutcome.REFUSED
+        assert "no-such-preset" in (result.reason or "")

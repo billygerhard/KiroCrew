@@ -141,8 +141,10 @@ from .workflow import (
     WORKFLOW_PRESETS,
     ZERO_CONFIG_AUTONOMY_CEILING,
     DeliveryWorkflow,
+    PresetSelection,
     StageCommands,
     cap_autonomy,
+    workflow_preset_definition,
     workflow_presets,
 )
 
@@ -222,6 +224,7 @@ __all__ = [
     "ProtectedBranches",
     "QualityGate",
     "RunContext",
+    "PresetSelection",
     "StageCommands",
     "StageExecutor",
     "StageOutcome",
@@ -240,6 +243,7 @@ __all__ = [
     "WorkspacePlan",
     "build_variables",
     "cap_autonomy",
+    "workflow_preset_definition",
     "workflow_presets",
     "evaluate_integration",
     "gate_presets",
