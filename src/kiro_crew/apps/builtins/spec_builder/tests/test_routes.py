@@ -7013,3 +7013,234 @@ def test_pin_seed_prompt_names_exactly_the_planned_documents(spec_type, expected
     assert tuple(listed) == expected, f"{spec_type} seed no longer names its plan"
     # The first deliverable is the one the agent is told to begin with.
     assert f"Begin with {expected[0]}" in prompt
+
+
+def test_no_second_definition_of_the_document_plan_survives():
+    """Source guard: the plan, the phase names and the spec types are the
+    engine's, and this app must not restate any of them.
+
+    Two implementations of "which documents does this spec type owe" disagree the
+    day one of them changes. The app is allowed to name a document in PROSE (the
+    seed and execution prompts are English addressed to an agent) and in a comment;
+    it is not allowed to make a decision from a list of its own.
+    """
+    src = inspect.getsource(routes)
+    tree = ast.parse(src)
+
+    # Every collection literal in the module that is a set/tuple/list of spec
+    # document filenames. One of those was the discovery gate's own plan.
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            continue
+        values = [e.value for e in node.elts if isinstance(e, ast.Constant)]
+        if not values or not all(isinstance(v, str) for v in values):
+            continue
+        if any(str(v).endswith(".md") for v in values):
+            offenders.append((node.lineno, values))
+    assert not offenders, (
+        "a document list is spelled out in routes.py; ask the engine for the plan "
+        f"instead: {offenders}"
+    )
+
+    # The spec type vocabulary is bridged in exactly one table.
+    assert src.count("SpecType.BUGFIX") == 1, (
+        "the engine's bugfix type is named in more than one place, so the app's "
+        "'bug' wire name is translated in more than one place"
+    )
+
+
+def test_spec_type_wire_names_cover_every_engine_type():
+    """The bridge table must be total.
+
+    A type the engine defines and this table omits is a type the app would report
+    as a feature -- the wrong plan, and with it the wrong phase.
+    """
+    from kiro_crew.apps.builtins.spec_engine.engine import spec_types as engine_spec_types
+
+    assert set(routes._SPEC_TYPE_WIRE_NAMES.values()) == set(engine_spec_types.SpecType)
+    # And round-trip: every wire name maps back to itself.
+    for wire, engine_type in routes._SPEC_TYPE_WIRE_NAMES.items():
+        assert routes._WIRE_NAME_BY_SPEC_TYPE[engine_type] == wire
+
+
+def test_plan_comes_from_the_engine_not_a_local_table():
+    """Non-vacuous: the app's plan answers ARE the engine's plan answers."""
+    for wire, engine_type in routes._SPEC_TYPE_WIRE_NAMES.items():
+        assert routes._plan_filenames(wire) == engine_type.plan.filenames
+    # quick owes no design document, and that is the engine's decision.
+    assert "design.md" not in routes._plan_filenames("quick")
+    # An unrecognised stored type falls back to the widest plan, never to nothing:
+    # index.json is agent-writable, so this is untrusted input.
+    assert routes._plan_filenames("nonsense") == routes._plan_filenames("feature")
+
+
+def test_quick_spec_is_not_reported_as_sitting_in_a_design_phase(tmp_path, monkeypatch):
+    """The plan decides which documents count, so a document off-plan does not
+    move the phase. A stray design.md in a quick spec is not a design phase."""
+    state_dir = _redirect_state(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    spec_dir = _seed_spec(
+        state_dir,
+        project,
+        "q",
+        "quick",
+        {"requirements.md": "# R\n", "design.md": "# stray\n"},
+    )
+
+    assert routes._derive_phase(spec_dir, "quick").phase == "requirements"
+    # Same documents under the feature plan DO reach design -- proving the answer
+    # tracks the plan rather than being hardcoded either way.
+    assert routes._derive_phase(spec_dir, "feature").phase == "design"
+
+
+def test_a_whitespace_only_document_is_not_a_drafted_one(tmp_path, monkeypatch):
+    """A touched placeholder is not a drafted document. This is the engine's rule
+    (``read_document``), and taking it from there is why the app no longer decides
+    presence with ``is_file()``."""
+    state_dir = _redirect_state(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    spec_dir = _seed_spec(
+        state_dir, project, "ws", "feature", {"requirements.md": "# R\n", "design.md": "   \n\n"}
+    )
+
+    assert routes._derive_phase(spec_dir, "feature").phase == "requirements"
+
+
+def test_a_symlinked_document_is_never_read_or_counted(tmp_path, monkeypatch):
+    """The engine opens a document with a plain read, which follows a symlink.
+    This app refuses one, so a planted design.md pointing at a credential file is
+    neither read nor allowed to advance the phase."""
+    state_dir = _redirect_state(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    spec_dir = _seed_spec(state_dir, project, "link", "feature", {"requirements.md": "# R\n"})
+    secret = tmp_path / "creds"
+    secret.write_text("[default]\naws_secret_access_key = AKIAIOSFODNN7EXAMPLE\n")
+    try:
+        (spec_dir / "design.md").symlink_to(secret)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
+        pytest.skip("symlinks unavailable")
+
+    reads: list[Path] = []
+    real_read = routes.engine_phases.read_document
+
+    def _tracking_read(spec_dir_arg, kind):
+        reads.append(Path(spec_dir_arg) / kind.filename)
+        return real_read(spec_dir_arg, kind)
+
+    monkeypatch.setattr(routes.engine_phases, "read_document", _tracking_read)
+
+    assert routes._derive_phase(spec_dir, "feature").phase == "requirements"
+    assert (spec_dir / "design.md") not in reads, "the planted symlink was opened"
+
+
+# ── a failed refresh retains the last state and says that it is stale ─────────
+
+
+def test_a_failed_engine_read_retains_the_last_phase_and_flags_it(tmp_path, monkeypatch):
+    """Both failure directions are defects: blanking the phase loses the user's
+    context, and serving the previous phase as current looks authoritative when it
+    is not. The flag is what keeps them apart."""
+    state_dir = _redirect_state(monkeypatch, tmp_path)
+    project = tmp_path / "proj"
+    spec_dir = _seed_spec(
+        state_dir, project, "thing", "feature", {"requirements.md": "# R\n", "design.md": "# D\n"}
+    )
+
+    fresh = routes._derive_phase(spec_dir, "feature")
+    assert (fresh.phase, fresh.stale) == ("design", False)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("engine unavailable")
+
+    monkeypatch.setattr(routes.engine_phases, "read_document", _boom)
+    retained = routes._derive_phase(spec_dir, "feature")
+
+    assert retained.phase == "design", "the last known phase was not retained"
+    assert retained.stale is True, "a retained phase was presented as the current one"
+
+
+def test_a_failed_engine_read_with_nothing_retained_is_unknown_not_new(tmp_path, monkeypatch):
+    """With no last known state there is nothing to retain, and reporting "new"
+    would be the app inventing a phase: "new" means the agent has written nothing,
+    which is a claim the failed read cannot support."""
+    _redirect_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(routes, "_LAST_PHASE", {})
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("engine unavailable")
+
+    monkeypatch.setattr(routes.engine_phases, "read_document", _boom)
+    view = routes._derive_phase(tmp_path / "proj" / ".kiro" / "specs" / "never-seen", "feature")
+
+    assert view.phase == routes._PHASE_UNKNOWN
+    assert view.phase != "new"
+    assert view.stale is True
+
+
+@pytest.mark.asyncio
+async def test_both_endpoints_publish_the_staleness_flag(tmp_path, monkeypatch):
+    """The flag has to reach the browser on both polled endpoints, or the UI
+    cannot show an indicator on the surface the user is looking at."""
+    client = _make_client(monkeypatch, tmp_path)
+    state_dir = tmp_path / "spec-builder"
+    project = tmp_path / "proj"
+    _seed_spec(state_dir, project, "thing", "feature", {"requirements.md": "# R\n"})
+    try:
+        await client.start_server()
+        listed = await (await client.get(f"{_BASE}/specs")).json()
+        detail = await (await client.get(f"{_BASE}/specs/thing")).json()
+        entry = next(s for s in listed["specs"] if s["name"] == "thing")
+        assert (entry["phase"], entry["phase_stale"]) == ("requirements", False)
+        assert (detail["phase"], detail["phase_stale"]) == ("requirements", False)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("engine unavailable")
+
+        monkeypatch.setattr(routes.engine_phases, "read_document", _boom)
+        listed = await (await client.get(f"{_BASE}/specs")).json()
+        detail = await (await client.get(f"{_BASE}/specs/thing")).json()
+    finally:
+        await client.close()
+
+    entry = next(s for s in listed["specs"] if s["name"] == "thing")
+    # Retained, not blanked, and flagged on BOTH surfaces.
+    assert (entry["phase"], entry["phase_stale"]) == ("requirements", True)
+    assert (detail["phase"], detail["phase_stale"]) == ("requirements", True)
+
+
+def test_the_retained_phase_cache_is_bounded(tmp_path, monkeypatch):
+    """index.json is agent-writable and can name an unbounded number of spec
+    directories; an unbounded cache in a long-lived gateway is a leak."""
+    _redirect_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(routes, "_LAST_PHASE", {})
+    monkeypatch.setattr(routes, "_LAST_PHASE_MAX", 4)
+
+    for i in range(20):
+        routes._remember_phase(f"/spec/{i}", "requirements")
+
+    assert len(routes._LAST_PHASE) == 4
+    # The oldest entries are the ones dropped.
+    assert set(routes._LAST_PHASE) == {"/spec/16", "/spec/17", "/spec/18", "/spec/19"}
+
+
+def test_discovery_reads_the_recorded_type_rather_than_assuming_feature(tmp_path, monkeypatch):
+    """A spec written by the IDE, CLI or engine records its own type. Adopting a
+    bugfix spec as a feature would show it the wrong plan and derive its phase
+    against a gate it does not owe."""
+    from kiro_crew.apps.builtins.spec_engine.engine import spec_types as engine_spec_types
+
+    _redirect_state(monkeypatch, tmp_path)
+    spec_dir = tmp_path / "proj" / ".kiro" / "specs" / "adopted"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "requirements.md").write_text("# R\n")
+
+    # No record yet: the widest plan, so no document is hidden.
+    assert routes._discovered_spec_type(spec_dir) == "feature"
+
+    engine_spec_types.write_sidecar(spec_dir, engine_spec_types.SpecType.BUGFIX)
+    # Reported in the app's wire vocabulary, which has always said "bug".
+    assert routes._discovered_spec_type(spec_dir) == "bug"
+    assert routes._plan_filenames(routes._discovered_spec_type(spec_dir)) == (
+        engine_spec_types.SpecType.BUGFIX.plan.filenames
+    )

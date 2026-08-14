@@ -892,6 +892,43 @@ def _plan_filenames(spec_type: object) -> tuple[str, ...]:
     return tuple(kind.filename for kind in _plan_kinds(spec_type))
 
 
+#: This app's wire name for each engine spec type, so a type read off disk can be
+#: reported in the vocabulary the dashboard and index.json already use. Inverted
+#: from the forward table rather than written out again.
+_WIRE_NAME_BY_SPEC_TYPE: dict[engine_spec_types.SpecType, str] = {
+    engine_type: wire for wire, engine_type in _SPEC_TYPE_WIRE_NAMES.items()
+}
+
+
+def _looks_like_a_spec(spec_dir: Path) -> bool:
+    """Whether *spec_dir* holds any document a spec is made of.
+
+    The document set is the engine's, not a list kept here: a directory holding
+    only a document type the engine added later would otherwise be invisible to
+    discovery while being a perfectly good spec everywhere else.
+    """
+    return any((spec_dir / kind.filename).is_file() for kind in engine_documents.DocumentKind)
+
+
+def _discovered_spec_type(spec_dir: Path) -> str:
+    """The type of a spec found on disk, read from the record the IDE writes.
+
+    A discovered spec was created by something else -- the IDE, the CLI, or the
+    engine -- and that writer records the type in the native sidecar. Reading it
+    beats defaulting: a bugfix spec adopted as a feature would be shown the wrong
+    plan, and the phase derived against it would name a gate the spec does not owe.
+    Falls back to the feature wire name when nothing recorded a type, which is the
+    widest plan and so hides no document.
+    """
+    try:
+        recorded = engine_spec_types.recorded_spec_type(spec_dir)
+    except engine_spec_types.SpecTypeError:
+        return _WIRE_NAME_BY_SPEC_TYPE[engine_spec_types.SpecType.FEATURE]
+    return _WIRE_NAME_BY_SPEC_TYPE.get(
+        recorded, _WIRE_NAME_BY_SPEC_TYPE[engine_spec_types.SpecType.FEATURE]
+    )
+
+
 #: Every document a spec can hold, furthest-first, taken from the engine's own
 #: document vocabulary rather than restated here -- a document the engine adds is
 #: one this app reads and serves without a second edit. Furthest-first because the
@@ -1205,7 +1242,7 @@ def _prepare_handoff(
     # run then edited the link target outside the spec directory. _spec_file
     # refuses a symlink, a realpath that escapes the spec dir, and a sensitive
     # target; the extra is_file() keeps the "not written yet" case honest.
-    tasks = _spec_file(spec_dir, "tasks.md")
+    tasks = _spec_file(spec_dir, engine_documents.DocumentKind.TASKS.filename)
     ready = tasks is not None and tasks.is_file()
     return ready, sentinel
 
@@ -2516,7 +2553,7 @@ def _discover_folder_specs(index: dict) -> bool:
         for child in children:
             if not child.is_dir() or str(child) in known_dirs:
                 continue
-            if not any((child / f).is_file() for f in ("requirements.md", "design.md", "tasks.md")):
+            if not _looks_like_a_spec(child):
                 continue
             name = child.name
             # _usable_name for the same reason as create: discovery WRITES
@@ -2531,7 +2568,7 @@ def _discover_folder_specs(index: dict) -> bool:
             index[name] = {
                 "working_dir": root,
                 "spec_dir": str(child),
-                "spec_type": "feature",
+                "spec_type": _discovered_spec_type(child),
                 "status": "planning",
                 "slot_key": _new_slot_key(name),
                 "worktree_branch": "",
