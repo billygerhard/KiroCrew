@@ -42,6 +42,21 @@ SECTION_PROJECTS = "projects"
 SECTION_SOURCES = "sources"
 SECTION_WORKFLOW = "workflow"
 
+#: Key naming the workflow preset a layer selects, inside a workflow object.
+WORKFLOW_PRESET_KEY = "preset"
+
+#: Key holding the stage-to-commands map inside a workflow object. Re-exported
+#: from the delivery package as ``STAGES_KEY``; defined here because the
+#: validator and the reader must agree on it.
+WORKFLOW_STAGES_KEY = "stages"
+
+#: Key holding user-defined named workflow presets. App level only: a preset is
+#: a definition an installation offers, while selecting one and overriding a
+#: stage of it is what a project does. Allowing a project to define presets too
+#: would give a name two possible definitions, and the reader would have to pick
+#: one -- the ambiguity being the whole reason bundled names are reserved below.
+WORKFLOW_PRESETS_KEY = "presets"
+
 SECTIONS: tuple[str, ...] = (
     SECTION_CAPABILITIES,
     SECTION_QUALITY_GATES,
@@ -273,7 +288,7 @@ def validate_config_document(doc: Any) -> tuple[ConfigError, ...]:
         elif key == SECTION_COST_PROFILES:
             _check_cost_profiles(errors, value, key)
         elif key == SECTION_WORKFLOW:
-            _check_workflow(errors, value, key)
+            _check_workflow(errors, value, key, definitions=True)
         elif key == SECTION_PROJECTS:
             _check_named(errors, value, key, _check_project)
         elif key == SECTION_SOURCES:
@@ -484,27 +499,99 @@ def _check_profile_settings(errors: list[ConfigError], group: str, value: Any, p
             errors.append(ConfigError(leaf_path, str(exc)))
 
 
-def _check_workflow(errors: list[ConfigError], value: Any, path: str) -> None:
+def _check_workflow(
+    errors: list[ConfigError],
+    value: Any,
+    path: str,
+    *,
+    definitions: bool = False,
+) -> None:
+    """Validate one workflow object.
+
+    *definitions* admits the app-level ``presets`` map. A project workflow object
+    selects and overrides; it does not define, so the key is unknown there.
+    """
     if not isinstance(value, Mapping):
         errors.append(ConfigError(path, "expected an object"))
         return
+    known: tuple[str, ...] = (WORKFLOW_PRESET_KEY, WORKFLOW_STAGES_KEY)
+    if definitions:
+        known += (WORKFLOW_PRESETS_KEY,)
     for key in value:
-        if key not in ("preset", "stages"):
+        if key not in known:
             errors.append(ConfigError(f"{path}.{key}", "unknown workflow field"))
-    if "preset" in value and not isinstance(value["preset"], str):
-        errors.append(ConfigError(f"{path}.preset", "expected a string"))
-    stages = value.get("stages")
+    if WORKFLOW_PRESET_KEY in value and not isinstance(value[WORKFLOW_PRESET_KEY], str):
+        errors.append(ConfigError(f"{path}.{WORKFLOW_PRESET_KEY}", "expected a string"))
+    if definitions and WORKFLOW_PRESETS_KEY in value:
+        _check_workflow_presets(
+            errors, value[WORKFLOW_PRESETS_KEY], f"{path}.{WORKFLOW_PRESETS_KEY}"
+        )
+    stages = value.get(WORKFLOW_STAGES_KEY)
     if stages is None:
         return
+    _check_stage_map(errors, stages, f"{path}.{WORKFLOW_STAGES_KEY}")
+
+
+def _check_stage_map(errors: list[ConfigError], stages: Any, path: str) -> None:
+    """Validate a stage-to-commands map, wherever it appears."""
     if not isinstance(stages, Mapping):
-        errors.append(ConfigError(f"{path}.stages", "expected an object keyed by stage"))
+        errors.append(ConfigError(path, "expected an object keyed by stage"))
         return
     for stage, commands in stages.items():
-        stage_path = f"{path}.stages.{stage}"
+        stage_path = f"{path}.{stage}"
         if stage not in DELIVERY_STAGES:
             errors.append(ConfigError(stage_path, _one_of_message(DELIVERY_STAGES)))
             continue
         _check_command_list(errors, commands, stage_path)
+
+
+def _check_workflow_presets(errors: list[ConfigError], value: Any, path: str) -> None:
+    """Validate the user-defined preset definitions and their names.
+
+    A bundled name is refused rather than shadowed. ``git-pull-request`` names an
+    engine-authored workflow that an operator reading the configuration, and a
+    reviewer reading a run's audit trail, take to mean those commands; a
+    definition allowed to redefine it would leave the recorded selection naming
+    something other than what ran. Refusing at the write path also means the
+    operator hears about it, where quietly preferring the bundled definition
+    would leave a preset the author believes is in force.
+    """
+    _check_named(errors, value, path, _check_workflow_preset)
+    if not isinstance(value, Mapping):
+        return
+    # Imported here because the bundled table lives in the delivery package,
+    # which reads configuration: at module scope this would be a cycle. One
+    # spelling of the reserved names is worth the late import -- a copy here
+    # would drift the moment a preset is added.
+    from ..delivery.workflow import WORKFLOW_PRESET_NAMES
+
+    for name in value:
+        if isinstance(name, str) and name in WORKFLOW_PRESET_NAMES:
+            errors.append(
+                ConfigError(
+                    f"{path}.{name}",
+                    f"{name!r} is a bundled preset name and cannot be redefined; "
+                    "copy it under a name of your own instead",
+                )
+            )
+
+
+def _check_workflow_preset(errors: list[ConfigError], entry: Mapping[str, Any], path: str) -> None:
+    for key in entry:
+        if key != WORKFLOW_STAGES_KEY:
+            errors.append(ConfigError(f"{path}.{key}", "a workflow preset holds only stages"))
+    stages = entry.get(WORKFLOW_STAGES_KEY)
+    # A preset with no stages resolves to nothing, which reads as a project that
+    # configured no workflow at all rather than as a selection that came up
+    # empty. Refusing the definition keeps that state unreachable.
+    if not isinstance(stages, Mapping) or not stages:
+        errors.append(
+            ConfigError(
+                f"{path}.{WORKFLOW_STAGES_KEY}", "expected an object with at least one stage"
+            )
+        )
+        return
+    _check_stage_map(errors, stages, f"{path}.{WORKFLOW_STAGES_KEY}")
 
 
 def _check_named(

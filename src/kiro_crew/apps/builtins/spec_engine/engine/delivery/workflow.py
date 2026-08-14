@@ -36,12 +36,15 @@ from ..config import (
     ConfigValidationError,
     ValueOrigin,
 )
-from ..config.schema import SECTION_PROJECTS, SECTION_WORKFLOW
+from ..config.schema import (
+    SECTION_PROJECTS,
+    SECTION_WORKFLOW,
+    WORKFLOW_PRESET_KEY,
+    WORKFLOW_PRESETS_KEY,
+)
+from ..config.schema import WORKFLOW_STAGES_KEY as STAGES_KEY
 from .isolation import GIT_ISOLATE_COMMANDS, ISOLATED_PATH_VARIABLE
 from .templates import CommandTemplate, TemplateError
-
-#: Key holding the stage-to-commands map inside a workflow object.
-STAGES_KEY = "stages"
 
 #: Key holding a project's custom stage command variables.
 VARIABLES_KEY = "variables"
@@ -189,11 +192,40 @@ def workflow_presets(name: str) -> dict[str, Any]:
             f"{', '.join(WORKFLOW_PRESET_NAMES)}"
         )
     return {
-        "preset": name,
+        WORKFLOW_PRESET_KEY: name,
         STAGES_KEY: {
             stage: [list(argv) for argv in commands] for stage, commands in preset.items()
         },
     }
+
+
+def workflow_preset_definition(bundled: str) -> dict[str, Any]:
+    """Return *bundled* as a user-defined preset definition, ready to name and edit.
+
+    The copy path for a bundled preset an organization wants to change wholesale
+    rather than one stage at a time: the caller writes the result under a name of
+    its own in ``workflow.presets``, and that definition is then editable like any
+    other configuration. Delegates to :func:`workflow_presets` so there is one
+    copier and one place an unknown name is refused; drops the ``preset`` field,
+    which records a *selection* and would name the bundled preset the definition
+    stopped being a copy of at the first edit.
+    """
+    return {STAGES_KEY: workflow_presets(bundled)[STAGES_KEY]}
+
+
+@dataclass(frozen=True)
+class PresetSelection:
+    """The workflow preset in force for a project, and where it was selected."""
+
+    name: str
+    #: Configuration layer that selected it, project narrowing over app.
+    origin: ValueOrigin
+    #: Dotted path of the selection.
+    declared_at: str
+    #: Whether the definition is the engine's own rather than the document's.
+    bundled: bool
+    #: The preset's stages, as command lists. Bundled definitions are copies.
+    stages: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -205,6 +237,17 @@ class StageCommands:
     origin: ValueOrigin
     #: Dotted path of the declaration, for reporting and for the config surface.
     declared_at: str
+    #: Name of the preset these commands came from, ``None`` when the layer named
+    #: in ``origin`` declared them itself. This is what lets a surface say
+    #: "preset" or "project override" per stage without a second record of the
+    #: selection: the selection stays the one ``preset`` field in configuration,
+    #: and this is derived from it at read time.
+    preset: str | None = None
+
+    @property
+    def from_preset(self) -> bool:
+        """Whether the selected preset supplied these commands."""
+        return self.preset is not None
 
     @property
     def variables(self) -> tuple[str, ...]:
@@ -216,12 +259,22 @@ class StageCommands:
         return tuple(seen)
 
 
+class _Unresolved:
+    """Sentinel type: the selection has not been read yet, distinct from none."""
+
+
+_UNRESOLVED = _Unresolved()
+
+
 class DeliveryWorkflow:
     """The stage-to-commands configuration in force for one project."""
 
     def __init__(self, document: Mapping[str, Any], *, project: str | None = None) -> None:
         self._document = document
         self._project = project
+        # Resolved once per instance, like the document itself: a preset copy per
+        # stage query would hand each stage its own copy of the same definition.
+        self._selection: PresetSelection | None | _Unresolved = _UNRESOLVED
 
     @classmethod
     def load(cls, store: ConfigStore, *, project: str | None = None) -> "DeliveryWorkflow":
@@ -235,13 +288,15 @@ class DeliveryWorkflow:
     def stage(self, stage: str) -> StageCommands | None:
         """Return *stage*'s commands, or ``None`` when the stage is unconfigured.
 
-        A project declaration replaces the app-wide one for that stage, so an
-        organization overrides the one stage that differs rather than restating a
-        whole workflow.
+        A project declaration replaces the app-wide one for that stage, and both
+        replace the selected preset's, so an organization selects a preset and
+        overrides the one stage that differs rather than restating a whole
+        workflow. Layering is per stage: overriding ``submit`` leaves every other
+        stage the preset's.
         """
         if stage not in DELIVERY_STAGES:
             raise ValueError(f"unknown delivery stage: {stage!r}")
-        for origin, path, node in self._stage_declarations(stage):
+        for origin, path, node, preset in self._stage_declarations(stage):
             if node is None:
                 continue
             return StageCommands(
@@ -249,6 +304,7 @@ class DeliveryWorkflow:
                 commands=_parse_commands(node, path),
                 origin=origin,
                 declared_at=path,
+                preset=preset,
             )
         return None
 
@@ -260,11 +316,11 @@ class DeliveryWorkflow:
     def configured(self) -> bool:
         """Whether any stage resolves to commands for this project.
 
-        Selecting a named preset is not counted here. A preset that has not been
-        expanded into stage commands would authorize delivery for a pipeline
-        whose every stage then skips, which reports success for work nobody did.
-        When preset expansion lands it feeds this same resolution, so this stays
-        the one place the question is answered.
+        A selected preset counts, because its stages resolve here like any other
+        declaration: the project has said how a run isolates and how a change is
+        submitted, and it said so by naming a definition rather than restating
+        one. A name that does not resolve is refused before reaching this
+        question, so no selection produces the zero-configuration answer.
         """
         return bool(self.configured_stages())
 
@@ -298,23 +354,145 @@ class DeliveryWorkflow:
 
     # --- resolution order --------------------------------------------------
 
-    def _stage_declarations(self, stage: str) -> tuple[tuple[ValueOrigin, str, Any], ...]:
-        """Candidate declarations for *stage*, narrowest configuration layer first."""
+    def _stage_declarations(
+        self, stage: str
+    ) -> tuple[tuple[ValueOrigin, str, Any, str | None], ...]:
+        """Candidate declarations for *stage*, narrowest configuration layer first.
+
+        Each candidate carries the preset it came from, or ``None`` when the layer
+        declared the stage itself. The selected preset is the widest candidate, so
+        it supplies the stages nobody overrode and never the ones somebody did.
+        """
         project_stages = self._stages_node(self._project_entry())
         app_stages = self._stages_node(self._document)
         project_prefix = f"{SECTION_PROJECTS}.{self._project}.{SECTION_WORKFLOW}.{STAGES_KEY}"
-        return (
+        candidates: list[tuple[ValueOrigin, str, Any, str | None]] = [
             (
                 ValueOrigin.PROJECT_CONFIG,
                 f"{project_prefix}.{stage}",
                 project_stages.get(stage) if project_stages is not None else None,
+                None,
             ),
             (
                 ValueOrigin.APP_CONFIG,
                 f"{SECTION_WORKFLOW}.{STAGES_KEY}.{stage}",
                 app_stages.get(stage) if app_stages is not None else None,
+                None,
+            ),
+        ]
+        selection = self.selected_preset()
+        if selection is not None:
+            candidates.append(
+                (
+                    # A bundled definition is the engine's, not any layer's, so it
+                    # reports as a bundled default however it was selected. A
+                    # user-defined one is a declaration in the app-level document,
+                    # so it reports as one, at the path an operator edits.
+                    ValueOrigin.BUNDLED_DEFAULT if selection.bundled else ValueOrigin.APP_CONFIG,
+                    (
+                        selection.declared_at
+                        if selection.bundled
+                        else f"{SECTION_WORKFLOW}.{WORKFLOW_PRESETS_KEY}"
+                        f".{selection.name}.{STAGES_KEY}.{stage}"
+                    ),
+                    selection.stages.get(stage),
+                    selection.name,
+                )
+            )
+        return tuple(candidates)
+
+    def selected_preset(self) -> PresetSelection | None:
+        """The preset in force for this project, or ``None`` when none is selected.
+
+        The selection resolves like a stage does: a project's ``preset`` replaces
+        the app-wide one rather than merging with it, because two presets in force
+        at once would need a rule for which stage came from which.
+
+        Raises ``ConfigValidationError`` naming the selection's path when the name
+        is neither a bundled preset nor a user-defined one. A selection that
+        resolved to nothing would leave the project running whatever it had
+        configured otherwise -- for a project that configured nothing, the
+        zero-configuration workflow -- while its configuration says it selected
+        one.
+        """
+        if self._selection is _UNRESOLVED:
+            self._selection = self._resolve_selection()
+        assert not isinstance(self._selection, _Unresolved)  # narrowed by the line above
+        return self._selection
+
+    def _resolve_selection(self) -> PresetSelection | None:
+        for origin, path, name in self._selection_declarations():
+            if name is None:
+                continue
+            if not isinstance(name, str) or not name.strip():
+                raise ConfigValidationError([ConfigError(path, "expected a preset name")])
+            return PresetSelection(
+                name=name,
+                origin=origin,
+                declared_at=path,
+                bundled=name in WORKFLOW_PRESETS,
+                stages=self._preset_stages(name, path),
+            )
+        return None
+
+    def _selection_declarations(self) -> tuple[tuple[ValueOrigin, str, Any], ...]:
+        project_workflow = self._workflow_node(self._project_entry())
+        app_workflow = self._workflow_node(self._document)
+        return (
+            (
+                ValueOrigin.PROJECT_CONFIG,
+                f"{SECTION_PROJECTS}.{self._project}.{SECTION_WORKFLOW}.{WORKFLOW_PRESET_KEY}",
+                project_workflow.get(WORKFLOW_PRESET_KEY) if project_workflow else None,
+            ),
+            (
+                ValueOrigin.APP_CONFIG,
+                f"{SECTION_WORKFLOW}.{WORKFLOW_PRESET_KEY}",
+                app_workflow.get(WORKFLOW_PRESET_KEY) if app_workflow else None,
             ),
         )
+
+    def _preset_stages(self, name: str, path: str) -> Mapping[str, Any]:
+        """The stages *name* defines, bundled definitions taking precedence.
+
+        Bundled first is what makes a bundled name unshadowable: the write path
+        refuses a definition that reuses one, and a document that reached the
+        reader without passing it still cannot redirect ``git-pull-request`` at
+        commands of its own.
+
+        Resolution goes through :func:`workflow_presets`, so an unknown name is
+        refused by the one accessor that knows the bundled set, and no name
+        outside it can be reached by adding a definition the engine did not ship.
+        """
+        if name in WORKFLOW_PRESETS:
+            return workflow_presets(name)[STAGES_KEY]
+        definition = self._preset_definitions().get(name)
+        if isinstance(definition, Mapping):
+            stages = definition.get(STAGES_KEY)
+            if isinstance(stages, Mapping) and stages:
+                return stages
+            raise ConfigValidationError(
+                [
+                    ConfigError(
+                        f"{SECTION_WORKFLOW}.{WORKFLOW_PRESETS_KEY}.{name}.{STAGES_KEY}",
+                        "expected an object with at least one stage",
+                    )
+                ]
+            )
+        try:
+            workflow_presets(name)
+        except KeyError as exc:
+            defined = tuple(self._preset_definitions())
+            detail = str(exc.args[0] if exc.args else exc)
+            if defined:
+                detail += f"; user-defined presets are {', '.join(sorted(defined))}"
+            raise ConfigValidationError([ConfigError(path, detail)]) from exc
+        raise AssertionError("unreachable: a bundled name resolves above")  # pragma: no cover
+
+    def _preset_definitions(self) -> Mapping[str, Any]:
+        """The user-defined preset definitions, app level only."""
+        workflow = self._workflow_node(self._document)
+        definitions = workflow.get(WORKFLOW_PRESETS_KEY) if workflow else None
+        return definitions if isinstance(definitions, Mapping) else {}
 
     def _project_entry(self) -> Mapping[str, Any]:
         if self._project is None:
@@ -326,9 +504,14 @@ class DeliveryWorkflow:
         return entry if isinstance(entry, Mapping) else {}
 
     @staticmethod
-    def _stages_node(container: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    def _workflow_node(container: Mapping[str, Any]) -> Mapping[str, Any] | None:
         workflow = container.get(SECTION_WORKFLOW)
-        if not isinstance(workflow, Mapping):
+        return workflow if isinstance(workflow, Mapping) else None
+
+    @classmethod
+    def _stages_node(cls, container: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        workflow = cls._workflow_node(container)
+        if workflow is None:
             return None
         stages = workflow.get(STAGES_KEY)
         return stages if isinstance(stages, Mapping) else None

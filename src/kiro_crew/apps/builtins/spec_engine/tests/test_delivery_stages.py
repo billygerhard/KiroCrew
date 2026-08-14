@@ -25,6 +25,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     DASHBOARD_SURFACE,
     DELIVERY_STAGES,
     ConfigStore,
+    ConfigValidationError,
     ValueOrigin,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
@@ -564,11 +565,20 @@ class TestZeroConfiguration:
         assert not workflow.configured
         assert workflow.configured_stages() == ()
 
-    def test_selecting_a_preset_without_stages_is_still_unconfigured(
+    def test_selecting_a_preset_the_engine_does_not_bundle_is_refused(
         self, store: ConfigStore
     ) -> None:
+        """Not silently unconfigured: a selection that resolved to nothing would
+        run the zero-configuration workflow while configuration named one."""
         configure(store, {"workflow": {"preset": "local-build"}})
-        assert not DeliveryWorkflow.load(store).configured
+        with pytest.raises(ConfigValidationError):
+            DeliveryWorkflow.load(store).configured
+
+    def test_selecting_a_bundled_preset_configures_the_workflow(self, store: ConfigStore) -> None:
+        configure(store, {"workflow": {"preset": "local-only"}})
+        workflow = DeliveryWorkflow.load(store)
+        assert workflow.configured
+        assert workflow.isolates
 
     def test_one_configured_stage_makes_the_workflow_configured(self, store: ConfigStore) -> None:
         configure(store, {"workflow": {"stages": {"verify": [["make", "test"]]}}})
