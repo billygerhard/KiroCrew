@@ -58,12 +58,28 @@ PRESET_MODEL = "auto"
 #: and :func:`cost_profile_presets` deep-copies one for editing.
 #:
 #: **The two profiles differ in effort, parallelism, and ceiling -- not in model.**
-#: That is the only axis a bundled profile can move without guessing at an
-#: entitlement it cannot see (see :data:`PRESET_MODEL`). It is also the axis that
-#: actually separates the two intents: quality-first spends more thinking per unit
-#: of work and runs more of a wave at once, while budget spends the least it can
-#: and holds a run to a small ceiling. A user who wants a cheaper *model* names
-#: one in their copy.
+#: Those are the only axes a bundled profile can move without guessing at an
+#: entitlement it cannot see (see :data:`PRESET_MODEL`). Parallelism and ceiling
+#: separate the two intents on their own: quality-first runs more of a wave at
+#: once and allows a run twenty credits, while budget runs one task at a time and
+#: holds a run to two.
+#:
+#: **The effort pins are declared but inert until a concrete model is named, and
+#: that is a constraint rather than a preference.** Requirement 15.1 has every
+#: role assign a model *and* an effort, so both fields belong here; kiro-cli in
+#: turn accepts no reasoning effort on ``auto`` ("Effort configuration is
+#: currently not available on auto"). So while the model stays ``auto`` the
+#: resolver drops each effort below and reports having done so, and the two
+#: profiles differ in practice by parallelism and ceiling alone. Naming a
+#: concrete model in a copied profile is what activates the effort axis -- which
+#: is the same edit a user makes to pick a cheaper model, so the axis is one step
+#: away rather than unavailable.
+#:
+#: Do not read the efforts here as a live difference without checking the
+#: resolved role: ``test_the_two_profiles_effort_pins_are_inert_on_auto`` and
+#: ``test_a_concrete_model_activates_the_effort_axis`` pin both halves, because a
+#: test comparing the two tables' text would pass whether or not either value
+#: ever reached a dispatch.
 #:
 #: **Neither pins an agent.** An unassigned role seeds from the session default
 #: agent, so a bundled profile stays usable on an installation whose host agent

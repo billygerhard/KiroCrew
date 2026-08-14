@@ -45,6 +45,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.delivery.workflow import (
     WORKFLOW_PRESET_NAMES,
     workflow_presets,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.roles import (
+    Dispatch,
+    RolePlan,
+    SessionDefault,
+    WorkKind,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     BUNDLED_SCREENING_GUIDANCE,
     ITEM_FIELDS,
@@ -55,6 +61,35 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     watch_source_presets,
 )
 from kiro_crew.effort import EFFORT_LEVELS
+
+#: A model that accepts a reasoning effort, for the tests that ask what a bundled
+#: preset's effort pin actually does. Concrete ids appear only in test data.
+EFFORT_CAPABLE_MODEL = "claude-sonnet-4.6"
+
+
+def resolve_from_preset(name: str, kind: WorkKind, *, model: str) -> Dispatch:
+    """Resolve one dispatch from a bundled preset through the real resolver.
+
+    The preset is written into a document as a project's selected profile and
+    read back, so what is measured is what a run would actually be dispatched
+    with -- not what the table says. *model* stands in for the role's model,
+    which is how these tests separate "the pin is declared" from "the pin
+    reaches the wire".
+    """
+    preset = cost_profile_presets(name)
+    for assignment in preset["roles"].values():
+        assignment["model"] = model
+    document = {
+        "cost_profiles": {name: preset},
+        "projects": {"acme": {"path": "/acme", "cost_profile": name}},
+    }
+    plan = RolePlan.from_document(
+        document,
+        project="acme",
+        session_default=SessionDefault(agent="session-agent", model="auto"),
+    )
+    return plan.dispatch(kind)
+
 
 #: One item as each host's CLI actually emits it, so the field map is exercised
 #: against the shape it was written for rather than against engine field names.
@@ -504,10 +539,15 @@ class TestCostProfilePresets:
     def test_the_two_profiles_differ_where_a_bundled_table_can_differ(self) -> None:
         """The whole point of shipping two: same models, different spend.
 
-        Effort, wave parallelism, and the run ceiling are the axes a bundled
-        profile can move without guessing at an entitlement. If a later edit made
-        the profiles identical on all three, selecting one would stop meaning
-        anything.
+        Wave parallelism and the run ceiling are the axes a bundled profile can
+        move without guessing at an entitlement. If a later edit made the profiles
+        identical on both, selecting one would stop meaning anything.
+
+        The effort ordering is asserted here as a property of the TABLE only --
+        that no role is given more effort by budget than by quality-first. What
+        those pins actually do at dispatch is a separate question, and the two
+        tests below answer it, because this assertion would hold just as well if
+        neither value ever reached a subagent.
         """
         quality = cost_profile_presets("quality-first")
         budget = cost_profile_presets("budget")
@@ -526,6 +566,45 @@ class TestCostProfilePresets:
             efforts[quality["roles"][role]["effort"]] > efforts[budget["roles"][role]["effort"]]
             for role in ROLES
         ), "the profiles are identical in effort, so selecting one means nothing"
+
+    def test_the_two_profiles_effort_pins_are_inert_on_auto(self) -> None:
+        """As bundled, the effort axis does not reach a dispatch -- and saying so
+        in a test is the point.
+
+        Requirement 15.1 has every role assign a model as well as an effort, and
+        the only model a bundled table can name without guessing at an
+        entitlement is ``auto``. kiro-cli accepts no reasoning effort on ``auto``,
+        so the resolver drops each pin and reports it. Two profiles that read as
+        differing in effort therefore differ, as shipped, only by parallelism and
+        ceiling.
+
+        This is pinned rather than fixed because both halves are required: the
+        model field by the spec, the drop by the CLI. If a future kiro-cli accepts
+        effort on ``auto``, this test fails and the docstring above it becomes the
+        thing to correct.
+        """
+        for name in COST_PROFILE_PRESET_NAMES:
+            dispatch = resolve_from_preset(name, WorkKind.TASK_IMPLEMENTATION, model="auto")
+            assert dispatch.model == "auto"
+            assert dispatch.effort == "", f"{name} unexpectedly sent an effort on auto"
+            assert dispatch.resolved.dropped_effort != ""
+            assert "does not accept" in dispatch.report
+
+    def test_a_concrete_model_activates_the_effort_axis(self) -> None:
+        """The axis is one edit away rather than unavailable: naming a concrete
+        model -- the same edit a user makes to choose a cheaper one -- makes the
+        pins live, and the two profiles then differ where they claim to.
+        """
+        quality = resolve_from_preset(
+            "quality-first", WorkKind.TASK_IMPLEMENTATION, model=EFFORT_CAPABLE_MODEL
+        )
+        thrift = resolve_from_preset(
+            "budget", WorkKind.TASK_IMPLEMENTATION, model=EFFORT_CAPABLE_MODEL
+        )
+        assert quality.effort == "medium"
+        assert thrift.effort == "low"
+        assert quality.resolved.dropped_effort == ""
+        assert thrift.resolved.dropped_effort == ""
 
     @pytest.mark.parametrize("name", ["quality-first", "budget"])
     def test_every_effort_is_a_real_effort_level(self, name: str) -> None:
