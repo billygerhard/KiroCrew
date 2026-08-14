@@ -1338,6 +1338,115 @@ class TestBothBoundsPark:
         record = state.get_run(run_id)
         assert record is not None and feedback_cycles(record) == 0
 
+    def test_an_armed_project_with_an_unusable_command_is_unhealthy_not_disabled(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """The status has to say which of two things went wrong.
+
+        Both a disarmed project and an armed one whose definition cannot be used
+        produce no comments, but only one of them is the operator's switch. Calling
+        the second "not enabled" sends them to look at a switch they already turned
+        on, while the real fault sits in a log line they have no reason to read.
+        """
+        config = write_config(
+            tmp_path, tree, dispatch={"maintainer": True}, poll=[POLL_PROGRAM, "{no_such_thing}"]
+        )
+        run_id = "run-1"
+        register_run(state, config, ref)
+
+        tick = watcher(config, state).tick(
+            route_of(config),
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1")])),
+        )
+
+        assert tick.poll.status is PollStatus.UNHEALTHY
+        assert tick.poll.reason is HealthReason.CONFIG_INVALID
+        assert not tick.poll.healthy
+        assert "not enabled" not in tick.poll.describe()
+        assert tick.dispositions == ()
+
+    def test_a_failed_dispatch_is_actually_retried_on_the_next_tick(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """The promise this module makes twice in prose, now held by a test.
+
+        The claim is taken before the dispatch attempt, so a failure that merely
+        returned left the comment claimed: the next poll called it already seen,
+        the human release did not find it in the held list, and one transient host
+        failure lost a reviewer's comment for good. Asserting the cycle was not
+        burned -- which the neighbouring test does -- is satisfied by exactly that
+        broken behaviour, because a comment nobody retries burns no cycles either.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        run_id = "run-1"
+        register_run(state, config, ref)
+        payload = Runner(stdout=json.dumps([comment_payload("c1")]))
+        route = route_of(config)
+
+        broken = watcher(config, state, reviser=Reviser(fail=True), delivery=Delivery())
+        first = broken.tick(
+            route, run_id=run_id, ref=ref, context=context(tree), runner=payload
+        )
+        assert first.dispositions[0].outcome is ReviewFeedbackOutcome.FAILED
+
+        delivery = Delivery()
+        healed = watcher(config, state, reviser=Reviser(), delivery=delivery)
+        second = healed.tick(
+            route,
+            run_id=run_id,
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1")])),
+        )
+
+        assert second.dispositions[0].outcome is ReviewFeedbackOutcome.DISPATCHED
+        assert delivery.contexts != [], "the retry authored no fix round"
+        record = state.get_run(run_id)
+        assert record is not None and feedback_cycles(record) == 1
+
+    def test_repeated_failures_hold_the_comment_instead_of_retrying_forever(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """A retry is not free, so it is bounded.
+
+        Each retry re-runs screening, which is a model turn, and the trigger is a
+        comment someone else wrote -- so a host that always fails would spend one
+        turn per tick on an external party's schedule. At the same limit that
+        bounds successful rounds the comment is held instead: visible in the
+        Review_Queue, recoverable by the release a person already has, and no
+        longer retried behind their back.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        config.write({"limits": {"revision_cycle_limit": 2}}, surface=DASHBOARD_SURFACE)
+        run_id = "run-1"
+        register_run(state, config, ref)
+        route = route_of(config)
+        under_test = watcher(config, state, reviser=Reviser(fail=True), delivery=Delivery())
+
+        outcomes = []
+        for _ in range(3):
+            tick = under_test.tick(
+                route,
+                run_id=run_id,
+                ref=ref,
+                context=context(tree),
+                runner=Runner(stdout=json.dumps([comment_payload("c1")])),
+            )
+            outcomes.append(tick.dispositions[0].outcome)
+
+        assert outcomes[:2] == [
+            ReviewFeedbackOutcome.FAILED,
+            ReviewFeedbackOutcome.FAILED,
+        ]
+        record = state.get_run(run_id)
+        assert record is not None
+        assert "c1" in feedback_quarantined(record), "the comment was not held"
+        assert feedback_needs_human(record) is True
+        assert outcomes[2] is ReviewFeedbackOutcome.ALREADY_SEEN
+
 
 # --- the same delivery stages ---------------------------------------------
 

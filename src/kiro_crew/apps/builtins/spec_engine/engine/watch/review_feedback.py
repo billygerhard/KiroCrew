@@ -89,9 +89,11 @@ from ..delivery.templates import CommandTemplate, TemplateError
 from ..delivery.variables import RunContext, build_variables
 from ..runs import (
     DETAIL_FEEDBACK_CYCLES,
+    DETAIL_FEEDBACK_FAILURES,
     DETAIL_FEEDBACK_NEEDS_HUMAN,
     DETAIL_FEEDBACK_QUARANTINED,
     feedback_cycles,
+    feedback_failures,
     feedback_quarantined,
 )
 from ..state import SpecRef, StateStore
@@ -838,8 +840,18 @@ class ReviewFeedbackWatcher:
 
         A tick that finds no new comment dispatches nothing and spends nothing.
         """
-        watch = self._watch(route.project)
+        watch, invalid = self._watch(route.project)
         if watch is None:
+            if invalid:
+                return ReviewFeedbackTick(
+                    run_id=run_id,
+                    poll=CommentPoll(
+                        run_id=run_id,
+                        status=PollStatus.UNHEALTHY,
+                        reason=HealthReason.CONFIG_INVALID,
+                        detail=invalid,
+                    ),
+                )
             return ReviewFeedbackTick(
                 run_id=run_id, poll=CommentPoll(run_id=run_id, status=PollStatus.DISABLED)
             )
@@ -862,16 +874,20 @@ class ReviewFeedbackWatcher:
         )
         return ReviewFeedbackTick(run_id=run_id, poll=polled, dispositions=dispositions)
 
-    def _watch(self, project: str) -> ReviewFeedbackWatch | None:
+    def _watch(self, project: str) -> tuple[ReviewFeedbackWatch | None, str]:
+        """The project's armed watch, plus the reason it is unusable if it is."""
         try:
-            return load_watch(self._config, project)
+            return load_watch(self._config, project), ""
         except ConfigValidationError as exc:
-            # An armed project with an unusable command is a configuration problem
-            # to surface, not a review with no comments. Reported as disabled by
-            # the caller's outcome and logged with the path, because the tick has
-            # no place to put an error and a raise would stop the other runs.
+            # Two different answers otherwise share one None: a project that is
+            # not armed, and a project that IS armed but whose definition cannot
+            # be used. The reason separates them, because reporting the second as
+            # "not enabled" sends the operator to look at a switch they already
+            # turned on. Raising is not an option -- one project's bad
+            # configuration must not stop the tick covering the other runs -- so
+            # it travels back as a value.
             logger.warning("review feedback for project %r cannot be polled: %s", project, exc)
-            return None
+            return None, str(exc)
 
     # ------------------------------------------------------------ one comment
 
@@ -1079,15 +1095,30 @@ class ReviewFeedbackWatcher:
     ) -> CommentDisposition:
         """Mark the run as needing human attention and dispatch nothing.
 
-        The mark is what suppresses further cycles and what the Review_Queue
-        surfaces, so the run waits on a person in the one place a person already
-        looks rather than in a state of its own. The notice is required by the
-        same requirement as the bound: a loop that stopped silently would look
-        exactly like a reviewer who stopped commenting.
+        The mark is what the Review_Queue surfaces, so the run waits on a person
+        in the one place a person already looks rather than in a state of its own.
+        It is NOT what stops further cycles: nothing reads it back in
+        :meth:`_bound`. Suppression comes from the two conditions themselves
+        persisting -- the cycle count never decreases, and the budget guard leaves
+        the run parked, so a later tick re-derives the same bound. Said plainly
+        because a future change that relied on the mark to hold the loop closed
+        would find nothing enforcing it. The notice is required by the same
+        requirement as the bound: a loop that stopped silently would look exactly
+        like a reviewer who stopped commenting.
         """
         record = self._state.get_run(run_id)
         spent = feedback_cycles(record) if record is not None else 0
         self._mark(run_id, {DETAIL_FEEDBACK_NEEDS_HUMAN: True})
+        # The comment that tripped the bound joins the held list rather than
+        # staying merely claimed. Otherwise raising the limit or the ceiling --
+        # the very thing a person does in response to this notice -- would not
+        # bring the comment back, because it is claimed and absent from the list
+        # the release reads: the one comment the human was told about would be the
+        # one they could not act on, unless its author happened to edit it.
+        self._mark(
+            run_id,
+            {DETAIL_FEEDBACK_QUARANTINED: self._held(run_id, comment.identifier)},
+        )
         detail = (
             f"the {bound.value} bound was reached after {spent} feedback cycle(s); no further "
             "fix is dispatched for this run until a person acts"
@@ -1167,21 +1198,7 @@ class ReviewFeedbackWatcher:
         try:
             self._reviser(revision)
         except Exception as exc:  # a host seam can fail for its own reasons
-            detail = f"the fix round could not be started: {exc}"
-            self._record(ref, run_id, ReviewFeedbackOutcome.FAILED, trust, detail=detail)
-            logger.warning(
-                "a fix round for comment %r on run %s could not be dispatched: %s",
-                comment.identifier,
-                run_id,
-                exc,
-            )
-            return CommentDisposition(
-                comment_id=comment.identifier,
-                outcome=ReviewFeedbackOutcome.FAILED,
-                submitter_class=trust.class_name,
-                content_revision=trust.revision,
-                detail=detail,
-            )
+            return self._failed(ref, run_id, comment, trust, exc)
         self._mark(run_id, {DETAIL_FEEDBACK_CYCLES: cycle})
         delivered = self._delivery.deliver(context)
         detail = f"cycle {cycle} delivered: {getattr(delivered, 'outcome', '')}"
@@ -1226,6 +1243,92 @@ class ReviewFeedbackWatcher:
             run=run_id,
             detail={"outcome": outcome.value, "cycle": cycle, "reason": detail},
         )
+
+    def _failed(
+        self,
+        ref: SpecRef,
+        run_id: str,
+        comment: ReviewComment,
+        trust: ElementTrust,
+        exc: Exception,
+    ) -> CommentDisposition:
+        """A fix round the host could not start: retry it, but not forever.
+
+        The claim is taken before the attempt, so a failure that simply returned
+        would leave the comment claimed and permanently unreadable -- the next
+        poll would call it already seen, the human release path would not find it
+        in the held list, and a reviewer's comment would be lost to one transient
+        host failure. So the claim is dropped here and the next tick re-enters the
+        same gate, which is what this module documents.
+
+        The retry is counted, because the failure could equally be permanent and
+        an unbounded retry is not free: a retry re-runs screening, which is a
+        model turn, so a host that always fails would spend one per tick on an
+        external trigger. Once the failures reach the same revision-cycle limit
+        that bounds successful rounds, the comment is held instead -- visible in
+        the Review_Queue and recoverable by the release a person already has --
+        and the claim is kept so nothing retries behind their back.
+        """
+        failures = self._failures(run_id, comment.identifier) + 1
+        limit = self._cycle_limit()
+        exhausted = limit > 0 and failures >= limit
+        detail = f"the fix round could not be started: {exc}"
+        if exhausted:
+            detail = (
+                f"{detail} (attempt {failures} of {limit}; held for release rather "
+                "than retried again)"
+            )
+            self._mark(
+                run_id,
+                {
+                    DETAIL_FEEDBACK_QUARANTINED: self._held(run_id, comment.identifier),
+                    DETAIL_FEEDBACK_NEEDS_HUMAN: True,
+                    DETAIL_FEEDBACK_FAILURES: self._failure_map(run_id, comment.identifier, 0),
+                },
+            )
+        else:
+            self._mark(
+                run_id,
+                {DETAIL_FEEDBACK_FAILURES: self._failure_map(run_id, comment.identifier, failures)},
+            )
+            self._state.release_claims(CLAIM_REVIEW_COMMENT, run_id, comment.identifier)
+        self._record(ref, run_id, ReviewFeedbackOutcome.FAILED, trust, detail=detail)
+        logger.warning(
+            "a fix round for comment %r on run %s could not be dispatched: %s",
+            comment.identifier,
+            run_id,
+            exc,
+        )
+        if exhausted:
+            self._notify(
+                "A reviewer comment could not be acted on",
+                f"Comment {comment.identifier!r} on run {run_id} failed to dispatch "
+                f"{failures} times and is now held. Release it from the Review Queue "
+                "to try again.",
+                detail={"run": run_id, "spec": ref.name, "comment": comment.identifier},
+            )
+        return CommentDisposition(
+            comment_id=comment.identifier,
+            outcome=ReviewFeedbackOutcome.FAILED,
+            submitter_class=trust.class_name,
+            content_revision=trust.revision,
+            detail=detail,
+        )
+
+    def _failures(self, run_id: str, comment_id: str) -> int:
+        """How many times dispatching *comment_id* has failed for this run."""
+        record = self._state.get_run(run_id)
+        return int(feedback_failures(record).get(comment_id, 0)) if record is not None else 0
+
+    def _failure_map(self, run_id: str, comment_id: str, count: int) -> dict[str, int]:
+        """The run's failure counts with *comment_id* set to *count*, zero removing."""
+        record = self._state.get_run(run_id)
+        counts = dict(feedback_failures(record)) if record is not None else {}
+        if count <= 0:
+            counts.pop(comment_id, None)
+        else:
+            counts[comment_id] = count
+        return counts
 
     def _held(self, run_id: str, comment_id: str) -> list[str]:
         """The run's quarantined comment ids with *comment_id* added, deduplicated."""

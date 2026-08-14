@@ -309,6 +309,12 @@ DETAIL_FEEDBACK_NEEDS_HUMAN = "feedback_needs_human"
 #: submitter class may not drive a dispatch, or because screening held them. Ids
 #: only -- the comment text is never copied into the run row.
 DETAIL_FEEDBACK_QUARANTINED = "feedback_quarantined"
+#: Consecutive failed dispatch attempts per reviewer comment id, for the comments
+#: a host seam could not start a fix round for. A count here is why a comment is
+#: retried on a later tick rather than treated as already handled; it is cleared
+#: when the comment is finally held for a person, so a held comment carries no
+#: stale count to resume from. Ids and integers only -- never comment text.
+DETAIL_FEEDBACK_FAILURES = "feedback_failures"
 
 #: Prefix on a generated run identifier, so a run id is recognisable in a
 #: session name, a log line, or a metering record.
@@ -502,6 +508,23 @@ def feedback_quarantined(record: RunRecord) -> tuple[str, ...]:
     if not isinstance(stored, list):
         return ()
     return tuple(item for item in stored if isinstance(item, str) and item)
+
+
+def feedback_failures(record: RunRecord) -> dict[str, int]:
+    """Consecutive failed dispatch attempts per reviewer comment id.
+
+    Filtered on the way out rather than trusted: a run row is merged into by
+    several writers, so a malformed or hand-edited value reads as no failures --
+    which retries once more, the safe direction, instead of raising inside a poll.
+    """
+    stored = record.detail.get(DETAIL_FEEDBACK_FAILURES)
+    if not isinstance(stored, dict):
+        return {}
+    return {
+        key: int(value)
+        for key, value in stored.items()
+        if isinstance(key, str) and key and isinstance(value, int) and value > 0
+    }
 
 
 def new_run_id() -> str:
