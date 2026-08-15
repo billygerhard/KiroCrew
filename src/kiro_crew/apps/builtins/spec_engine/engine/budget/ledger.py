@@ -303,6 +303,70 @@ class RunSessions:
         )
 
 
+class DispatchStamp:
+    """Stamps a turn's host session to its run at the moment the session exists.
+
+    A stamp handed *to* the code that opens the session, rather than performed by
+    the caller once that code returns. The difference is a window, not
+    bookkeeping: a turn that runs for minutes before its session is stamped spends
+    minutes that :meth:`RunAccounting.spend` cannot see, so the run's ceiling
+    cannot compare them and the kill switch has nothing to preempt. Stamping on
+    dispatch closes that window wherever the host session key is knowable before
+    the turn completes — which it is for any seam that opens a session and then
+    runs a turn in it, because the key exists after the first step.
+
+    Idempotent through :meth:`RunSessions.stamp`, so a provider that stamps and an
+    engine that stamps again as a backstop produce one claim, and a second run
+    reaching for the same session still fails loudly.
+
+    :attr:`stamped` is what makes a provider that never called this observable: the
+    engine can record that a turn was attributed after the fact rather than on
+    dispatch, instead of the late attribution looking identical to a timely one.
+    """
+
+    def __init__(self, accounting: "RunAccounting", run_id: str) -> None:
+        self._accounting = accounting
+        self._run_id = run_id
+        self._stamped: list[str] = []
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def stamped(self) -> tuple[str, ...]:
+        """Every session key this stamp attributed, in call order."""
+        return tuple(self._stamped)
+
+    def holds(self, session_key: str) -> bool:
+        """Whether *session_key* was stamped through this stamp."""
+        return session_key in self._stamped
+
+    def __call__(self, session_key: str) -> None:
+        """Attribute *session_key* to the run. A no-op without a run or a key.
+
+        An empty run identifier means nothing dispatched this turn on a run's
+        behalf — an ad-hoc analysis outside any run — and there is no ceiling for
+        it to escape. An empty session key means the caller has no session to
+        stamp yet, which is a caller bug rather than an attribution to invent, so
+        it is logged rather than raised: refusing here would fail a turn that has
+        already been dispatched, which loses the work without recovering the
+        attribution.
+        """
+        if not self._run_id:
+            return
+        if not session_key:
+            logger.warning(
+                "a dispatch stamp for run %s was called with no session key; the turn's "
+                "spend will not be attributed until a key is known",
+                self._run_id,
+            )
+            return
+        self._accounting.stamp(self._run_id, session_key)
+        if session_key not in self._stamped:
+            self._stamped.append(session_key)
+
+
 class RunCostSink:
     """Where a capability provider's declared cost lands.
 
@@ -423,6 +487,15 @@ class RunAccounting:
     def stamp(self, run_id: str, session_key: str) -> bool:
         """Attribute a session to a run. See :meth:`RunSessions.stamp`."""
         return self._sessions.stamp(run_id, session_key)
+
+    def dispatch_stamp(self, run_id: str) -> DispatchStamp:
+        """A stamp to hand the code that opens a turn's session.
+
+        The one construction point for :class:`DispatchStamp`, so a caller that
+        wants attribution to happen on dispatch does not build its own binding of
+        run to accounting and get the ordering subtly different.
+        """
+        return DispatchStamp(self, run_id)
 
     def sessions_for(self, run_id: str) -> tuple[str, ...]:
         return self._sessions.sessions_for(run_id)

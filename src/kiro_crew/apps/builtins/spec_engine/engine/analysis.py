@@ -50,9 +50,11 @@ from typing import Any, Callable, Mapping, Protocol
 
 from . import local_analyzer, phases, spec_types
 from .audit import AuditLog
-from .budget.ledger import RunAccounting
+from .budget.ledger import DispatchStamp, RunAccounting
 from .capabilities.contracts import (
+    FINDING_PROVIDER_UNAVAILABLE,
     NATIVE_FORMAT_VERSION,
+    TRANSPORT_BUILTIN,
     ArtifactRef,
     CapabilityRequest,
     CapabilityResult,
@@ -436,6 +438,7 @@ class AnalysisEngine:
         run: str = "",
         initiator: str | None = None,
         parameters: Mapping[str, Any] | None = None,
+        degradation: Degradation | None = None,
     ) -> AnalysisReport:
         """Analyze *ref* through the bound provider and key the findings.
 
@@ -443,6 +446,16 @@ class AnalysisEngine:
         run, records the call in the audit log, and degrades to the bound builtin
         — the analyzer — on any provider failure. The criteria are read before
         the call so the keys come from the document the request described.
+
+        *degradation* is for a caller that already lost depth before this call:
+        the semantic tier asking for a structural fallback because its turn could
+        not run. It is attached to the result *before* the report is routed and
+        recorded, so the rows a surface renders and the report the caller receives
+        agree about having degraded — a report that degraded on the way in but
+        recorded rows that say otherwise is how a fallback becomes invisible. When
+        the registry itself also degraded, its own degradation is the more
+        proximate failure and is kept; both are then logged, because one record
+        cannot honestly name two transports.
 
         The routed report is handed to the findings sink before it is returned,
         which is what gives it a consumer rather than leaving it a value the
@@ -452,6 +465,16 @@ class AnalysisEngine:
         request = self.build_request(ref, run=run, parameters=parameters)
         criteria = declared_criteria(ref)
         result = self._registry.invoke(request, ref=ref, initiator=initiator)
+        if degradation is not None:
+            if result.degradation is None:
+                result = replace(result, degradation=degradation)
+            else:
+                logger.warning(
+                    "analysis for %s degraded twice: %s, and then %s",
+                    ref.name,
+                    degradation.reason,
+                    result.degradation.reason,
+                )
         report = route_findings(result, criteria)
         self._findings_sink.record(ref, run=run, report=report)
         return report
@@ -488,6 +511,14 @@ def _sidecar_artifact(spec_dir: Path) -> ArtifactRef | None:
 # which is the defect that moved analysis onto a dispatched turn in the first
 # place. The turn runs in a host session stamped to the run, so its spend counts
 # against the ceiling and the kill switch like every other turn.
+#
+# The stamp happens ON DISPATCH, not on return. The provider is handed a
+# DispatchStamp and calls it the moment the host session key exists, which is
+# before the turn runs: a session stamped only once the turn returned would leave
+# the turn's entire duration — minutes, for the deepest role — outside the run's
+# total, so the ceiling could not compare it and the kill switch would have
+# nothing to preempt. Attribution that arrives after the spend is not the same
+# bound as one that holds during it.
 
 #: The depth a semantic pass declares. Recorded authoritatively by the engine
 #: rather than trusted from the turn's output, so a model cannot report a clean
@@ -562,6 +593,38 @@ class SemanticAnalysisInvalid(AnalysisError):
         )
 
 
+#: Reason recorded when a semantic pass is requested in a process that has no
+#: semantic analyzer at all. Named once, because it is reported both as the job's
+#: progress detail and inside the degradation, and two spellings of it would drift.
+_NO_SEMANTIC_TIER = (
+    "no semantic analyzer is wired in this process, so nothing could dispatch an " "analysis turn"
+)
+
+
+def semantic_degradation(reason: str) -> Degradation:
+    """The degradation record for a semantic tier that could not run.
+
+    Built here so the one place that reports lost analysis depth is the module
+    that owns the depth ladder, and spelled as the registry's own
+    :class:`~.contracts.Degradation` rather than as a new field: every surface
+    that already renders a degraded capability call renders this one too, and a
+    report either degraded or it did not — there is no second way to ask.
+
+    The transport is the builtin one because the semantic tier *is* an engine
+    path; nothing external was bound or failed. The reason is engine-authored, and
+    the provider text it quotes is the engine's own exception message rather than
+    model output.
+    """
+    return Degradation(
+        finding_id=FINDING_PROVIDER_UNAVAILABLE,
+        reason=(
+            "semantic analysis was requested but its dispatched turn could not run, so this "
+            f"answer is structural depth only: {reason}"
+        ),
+        transport=TRANSPORT_BUILTIN,
+    )
+
+
 @dataclass(frozen=True)
 class SemanticTurnRequest:
     """One document set handed to a turn to analyse for meaning.
@@ -572,6 +635,15 @@ class SemanticTurnRequest:
     so the turn runs where the Cost_Profile dialled it. *deadline_s* is the job's
     wall-clock deadline: the turn is the engine's own path, so the same deadline
     the transports apply to an external child bounds it here.
+
+    *stamp* is the run attribution, handed to the provider rather than performed
+    after it returns. A provider MUST call it with the host session key as soon as
+    that key exists and before the turn runs, because a turn whose session is
+    stamped only once the turn completes spends its whole duration outside the
+    run's total: the ceiling cannot compare spend it cannot see, and the kill
+    switch cannot preempt a turn nothing attributes. It is a required field for
+    the same reason :func:`~.composition.build_engine`'s seams are required — a
+    default could only mean "attribute nothing".
     """
 
     run: str
@@ -582,6 +654,7 @@ class SemanticTurnRequest:
     documents: tuple[tuple[str, str], ...]
     turn_options: Mapping[str, str]
     deadline_s: int
+    stamp: DispatchStamp
 
 
 @dataclass(frozen=True)
@@ -594,10 +667,18 @@ class SemanticTurnResponse:
     names the host session the turn ran in; the engine stamps it to the run so the
     turn's spend counts against the run's ceiling and the kill switch. A provider
     that ran no host session leaves it empty and nothing is stamped.
+
+    *model* and *effort* are what the host actually applied to the turn, which is
+    not always what the role table asked for: an effort pinned onto an unpinned
+    model is dropped before the wire, so a provider reporting the table's values
+    would record a turn that never ran that way. Empty means the provider could not
+    tell, which is reported as unknown rather than filled in from the request.
     """
 
     payload: Mapping[str, Any]
     session_key: str = ""
+    model: str = ""
+    effort: str = ""
 
 
 class SemanticTurnProvider(Protocol):
@@ -670,6 +751,12 @@ class SemanticAnalyzer:
         spec_type = phases.recorded_spec_type(ref)
         if spec_type is None:
             raise SpecTypeUnrecorded(ref)
+        # Built before the dispatch and handed to the provider, so the run is
+        # attributed to the session at the moment the session exists rather than
+        # when the turn finishes. The window between those two is the whole
+        # duration of a semantic turn, and spend inside it is invisible to the
+        # ceiling and unreachable by the kill switch.
+        stamp = self._accounting.dispatch_stamp(run)
         request = SemanticTurnRequest(
             run=run,
             ref=ref,
@@ -679,6 +766,7 @@ class SemanticAnalyzer:
             documents=self._documents(ref),
             turn_options=self._turn_options(),
             deadline_s=deadline_s,
+            stamp=stamp,
         )
         try:
             response = self._provider.analyze(request)
@@ -692,16 +780,26 @@ class SemanticAnalyzer:
             raise SemanticAnalysisUnavailable(
                 f"the semantic analysis provider failed with {type(exc).__name__}: {exc}"
             ) from exc
-        # Stamp first, whatever the output turns out to be: the turn ran and may
-        # have spent before producing an unusable answer, and a total that omitted
-        # that spend would authorise turns the run has already paid for.
-        if response.session_key:
+        # The backstop, not the mechanism. A provider that honoured the stamp has
+        # already attributed this session and this call is the idempotent no-op
+        # RunSessions.stamp promises; one that did not gets attributed late, which
+        # is better than not at all and is recorded as late rather than passing for
+        # timely attribution.
+        on_dispatch = stamp.holds(response.session_key)
+        if response.session_key and not on_dispatch:
             self._accounting.stamp(run, response.session_key)
+            logger.warning(
+                "the semantic analysis provider %s returned session %s without stamping it on "
+                "dispatch; that turn's spend was outside run %s's total while it ran",
+                type(self._provider).__name__,
+                response.session_key,
+                run or "(none)",
+            )
         errors = validate_response(ANALYSIS_CAPABILITY, response.payload)
         if errors:
             raise SemanticAnalysisInvalid(errors)
         report = self._route(ref, run, spec_type, deadline_s, response.payload)
-        self._record(ref, run, initiator, report)
+        self._record(ref, run, initiator, report, response, on_dispatch=on_dispatch)
         return report
 
     def _route(
@@ -745,8 +843,19 @@ class SemanticAnalyzer:
         run: str,
         initiator: str | None,
         report: AnalysisReport,
+        response: SemanticTurnResponse,
+        *,
+        on_dispatch: bool,
     ) -> None:
-        """Audit the turn with its depth, provider, coverage, and finding count."""
+        """Audit the turn with its depth, provider, coverage, and finding count.
+
+        ``ran_on`` is what the host applied to the turn rather than what the role
+        table asked for, because an effort pinned onto an unpinned model is dropped
+        before the wire: recording the table's values would claim a turn ran at an
+        effort no turn ever ran at. ``stamped_on_dispatch`` records whether the
+        turn's spend was attributed while it ran or only after it returned, so late
+        attribution is visible instead of indistinguishable from timely.
+        """
         if self._audit is None:
             return
         self._audit.append(
@@ -760,6 +869,9 @@ class SemanticAnalyzer:
                 "depth": DEPTH_SEMANTIC,
                 "coverage": report.coverage.to_json_object(),
                 "findings": len(report.findings),
+                "session": response.session_key,
+                "stamped_on_dispatch": on_dispatch,
+                "ran_on": {"model": response.model, "effort": response.effort},
             },
         )
 
@@ -946,15 +1058,14 @@ class AnalysisJobs:
         job_id = uuid.uuid4().hex
         progress = JobProgress(stage="running")
         started_at = self._clock()
-        want_semantic = semantic and self._semantic is not None
         future = self._executor.submit(
-            self._work, ref, run, initiator, want_semantic, deadline_s, progress
+            self._work, ref, run, initiator, semantic, deadline_s, progress
         )
         self._jobs[job_id] = _Job(
             job_id=job_id,
             ref=ref,
             run=run,
-            semantic=want_semantic,
+            semantic=semantic,
             started_at=started_at,
             deadline_s=deadline_s,
             future=future,
@@ -1036,6 +1147,13 @@ class AnalysisJobs:
             status=JobStatus.DONE,
             elapsed_s=elapsed,
             stage="done",
+            # Carried rather than cleared. A job asked for semantic depth that
+            # answered at structural is a completed job with a degradation, and a
+            # DONE view that dropped the reason would be the vacuous pass this tier
+            # is most likely to produce: the depth would read "structural", nothing
+            # would read as failed, and the operator who configured semantic
+            # analysis would have no way to see that it never ran.
+            detail=job.progress.detail,
             depth=depth,
             provider=report.provider.name,
             report=report,
@@ -1054,10 +1172,31 @@ class AnalysisJobs:
 
         The semantic tier dispatches a turn and, on success, records its report
         through the engine's one findings sink. A turn that cannot run degrades to
-        the structural analyzer rather than blocking; a turn that runs but answers
-        unusably raises, which fails the job with nothing recorded. The structural
-        and external tiers run through the engine, which records the report itself.
+        the structural analyzer rather than blocking, and the fallback is reported
+        as a degradation rather than returned as though structural was what the
+        caller asked for: absence of findings at one depth is not correctness at a
+        greater one, so a job asked for semantic depth that answered at structural
+        must say so. A turn that runs but answers unusably raises, which fails the
+        job with nothing recorded. The structural and external tiers run through the
+        engine, which records the report itself.
+
+        *semantic* is what the caller ASKED FOR, not what this manager can do. A
+        request for a depth this process has no analyzer for degrades and reports
+        it, for the same reason: a manager built with no semantic tier that
+        answered a semantic request with a plain structural job would make the
+        tier's total absence indistinguishable from a clean deep pass — which is
+        the state this engine was actually in while the tier had no implementation
+        at all.
         """
+        if semantic and self._semantic is None:
+            progress.stage = "structural_fallback"
+            progress.detail = _NO_SEMANTIC_TIER
+            return self._engine.analyze(
+                ref,
+                run=run,
+                initiator=initiator,
+                degradation=semantic_degradation(_NO_SEMANTIC_TIER),
+            )
         if semantic and self._semantic is not None:
             progress.stage = "semantic_dispatch"
             try:
@@ -1067,7 +1206,12 @@ class AnalysisJobs:
             except SemanticAnalysisUnavailable as exc:
                 progress.stage = "structural_fallback"
                 progress.detail = str(exc)
-                return self._engine.analyze(ref, run=run, initiator=initiator)
+                return self._engine.analyze(
+                    ref,
+                    run=run,
+                    initiator=initiator,
+                    degradation=semantic_degradation(str(exc)),
+                )
             progress.stage = "recording"
             self._engine.findings_sink.record(ref, run=run, report=report)
             progress.stage = "done"
