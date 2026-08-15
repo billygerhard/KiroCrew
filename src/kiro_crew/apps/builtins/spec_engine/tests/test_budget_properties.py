@@ -166,8 +166,7 @@ _ROLE_SPEND = st.lists(
 )
 
 #: Days before the run row that a shard can carry turns for. Kept inside the
-#: scan window so this property measures attribution rather than the window; the
-#: window itself is the subject of the xfail below.
+#: scan window so this property measures attribution rather than the window.
 _TODAY_ONLY = 0
 
 

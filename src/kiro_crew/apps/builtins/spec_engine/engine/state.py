@@ -355,10 +355,16 @@ def reject_spec_tree_path(path: Path) -> None:
     candidates = [path]
     try:
         candidates.append(path.resolve())
-    except OSError:
+    except (OSError, RuntimeError):
         # A path the OS cannot resolve (a loop, or a parent we may not stat) is
         # still checked in its literal form rather than skipped: failing to
         # resolve is not evidence the path is outside the tree.
+        #
+        # RuntimeError is in the tuple because a self-referencing symlink is the
+        # likeliest way to reach here and non-strict resolve() reports that loop
+        # as RuntimeError, not OSError. Catching only OSError let it escape this
+        # function entirely, so a caller got a raw RuntimeError from the fence
+        # instead of either the literal-form check or a StatePersistenceError.
         pass
     for candidate in candidates:
         parts = tuple(segment.casefold() for segment in candidate.parts)

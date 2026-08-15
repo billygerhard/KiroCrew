@@ -246,13 +246,6 @@ _NORMALISING_SPELLINGS = st.sampled_from(
 )
 
 
-def _case_insensitive(root: Path) -> bool:
-    """Whether *root*'s filesystem treats two spellings as one directory."""
-    probe = root / "CaseProbe"
-    probe.mkdir(exist_ok=True)
-    return (root / "caseprobe").is_dir()
-
-
 @settings(
     max_examples=MAX_EXAMPLES,
     deadline=None,
@@ -269,22 +262,45 @@ def test_a_normalised_spelling_of_a_spec_tree_is_refused(tmp_path: Path, spellin
     assert "spec tree" in str(raised.value)
 
 
-def test_a_case_spelled_spec_tree_is_refused_where_case_does_not_distinguish(
+def test_a_case_spelled_spec_tree_is_refused_on_every_filesystem(
     tmp_path: Path,
 ) -> None:
-    """On a case-insensitive filesystem, two spellings are one directory.
+    """``.KIRO/SPECS`` is refused everywhere, and that is deliberate.
 
-    Skipped where case distinguishes directories, because there ``.KIRO/SPECS``
-    is genuinely somewhere else and storing state in it is allowed. Asserting a
-    refusal there would be asserting the wrong thing rather than finding a defect.
+    On a case-insensitive filesystem -- the macOS and Windows default -- it is
+    the SAME directory as ``.kiro/specs``, so refusing it is the whole point. On
+    a case-sensitive one it is a genuinely different directory, and the fence
+    refuses it anyway: an oddly-cased path costs an operator one clear error,
+    while admitting one on the filesystems where it aliases would put engine
+    state inside the interop contract. Asserting unconditionally is what keeps
+    that branch covered on a case-sensitive CI runner, which a skip left blind.
     """
-    if not _case_insensitive(tmp_path):
-        pytest.skip("filesystem is case-sensitive, so .KIRO/SPECS is a different directory")
     project = tmp_path / "project"
     (project / ".kiro" / "specs" / "example").mkdir(parents=True)
 
     with pytest.raises(StatePersistenceError):
         StateStore(root=project / ".KIRO" / "SPECS" / "state")
+
+
+def test_a_path_whose_resolution_loops_is_still_refused_by_its_literal_form(
+    tmp_path: Path,
+) -> None:
+    """A path the OS cannot resolve must not escape the fence as a raw error.
+
+    A self-referencing symlink is the likeliest unresolvable path, and non-strict
+    ``resolve()`` reports that loop as ``RuntimeError`` rather than ``OSError`` --
+    so catching only the latter let it propagate out of the fence, and a caller
+    got neither the literal-form check nor a ``StatePersistenceError``. The
+    literal parts still name a spec tree, so the refusal is the right answer.
+    """
+    loop = tmp_path / "loop"
+    try:
+        loop.symlink_to(loop)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform bound
+        pytest.skip("this filesystem does not support creating a symlink loop")
+
+    with pytest.raises(StatePersistenceError):
+        StateStore(root=loop / ".kiro" / "specs" / "state")
 
 
 def test_a_state_root_reached_through_a_symlink_into_a_spec_tree_is_refused(
