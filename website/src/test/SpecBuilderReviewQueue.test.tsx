@@ -107,14 +107,23 @@ describe('ReviewQueuePanel', () => {
   })
 
   it('reads the grouping the engine sent rather than re-grouping the flat list', async () => {
-    // ``entries`` says nothing about groups. A panel that grouped the flat list
-    // itself would render this run under a heading of its own choosing; one that
-    // renders ``grouped`` renders nothing at all, because the engine sent none.
-    harness({ entries: [HELD_ROW, BUDGET_ROW], total_credits: 11 })
+    // Two runs in ``entries``, but the engine grouped only one of them. That
+    // asymmetry is what makes the assertion mean something, and it separates all
+    // three outcomes: a panel reading ``grouped`` renders exactly one section, a
+    // panel re-grouping ``entries`` renders two, and a panel rendering nothing
+    // renders none. An earlier version asserted only the empty state, which the
+    // loading frame satisfies before any data arrives -- so it passed while the
+    // panel re-grouped the list, and while the panel was blank.
+    harness({
+      entries: [HELD_ROW, BUDGET_ROW],
+      grouped: { awaiting_review: [HELD_ROW] },
+      total: 2,
+      total_credits: 11,
+    })
     mount()
 
-    await waitFor(() => screen.getByText(/Nothing is waiting on a person/i))
-    expect(screen.queryByRole('region', { name: /Waiting for review/i })).toBeNull()
+    await waitFor(() => screen.getByRole('region', { name: /Waiting for review/i }))
+    expect(screen.queryByRole('region', { name: /Stopped by the budget/i })).toBeNull()
   })
 
   it('names a run state it has no phrase for verbatim instead of dropping the group', async () => {
@@ -197,6 +206,35 @@ describe('ReviewQueuePanel', () => {
     expect(calls[0].url).toContain('/engine/queue/teardown')
     // The second row's run, so the action acts on the row it was clicked from.
     expect(calls[0].body).toEqual({ run_id: 'run-b' })
+  })
+
+  it('reports an incomplete teardown as incomplete and shows the ids a retry needs', async () => {
+    // The failure the cleanup control exists for. Reporting it as done, and
+    // discarding the kept rows, left the panel telling the operator to take an
+    // id from a teardown report it never displayed.
+    harness(
+      QUEUE,
+      JSON.stringify({
+        ok: true,
+        complete: false,
+        report: {
+          run_id: 'run-b',
+          kept: [
+            { workspace_id: 12, run_id: 'run-b', kind: 'worktree', location: '/w/12', removed: false, reason: 'a deployment still points at it' },
+          ],
+          removed: [],
+        },
+      }),
+    )
+    mount()
+
+    const buttons = await waitFor(() => screen.getAllByRole('button', { name: /Tear down workspaces/i }))
+    fireEvent.click(buttons[1])
+
+    await waitFor(() => screen.getByText(/could not remove every workspace/i))
+    // The id is the retry key, so it has to be on screen, not just in the response.
+    screen.getByText(/12/)
+    expect(screen.queryByText(/^Done\.$/)).toBeNull()
   })
 
   it('cleans a workspace row by ledger id, which no queue row carries', async () => {

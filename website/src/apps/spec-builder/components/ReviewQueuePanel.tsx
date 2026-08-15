@@ -23,7 +23,13 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Send, Trash2, Unlock } from 'lucide-react'
-import { engineApi, queueStateLabel, type QueueActionResponse, type QueueRow } from '../api'
+import {
+  engineApi,
+  queueStateLabel,
+  type QueueActionResponse,
+  type QueueRow,
+  type WorkspaceCleanupRow,
+} from '../api'
 import { Btn } from './shared'
 import { Input } from '../../../components/ui'
 import Modal from '../../../components/Modal'
@@ -43,6 +49,9 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
   const [generations, setGenerations] = useState<Record<string, string>>({})
   const [workspaceId, setWorkspaceId] = useState('')
   const [outcome, setOutcome] = useState('')
+  // Rows a teardown reported as kept. Held because the engine returns them once,
+  // on the action's response, and they are what the cleanup retry acts on.
+  const [kept, setKept] = useState<WorkspaceCleanupRow[]>([])
 
   // The SAME query key the spend table reads, so both surfaces render one
   // snapshot rather than two fetches that can disagree about a run.
@@ -77,7 +86,26 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
   })
   const teardownMutation = useMutation({
     mutationFn: (row: QueueRow) => engineApi.teardownRunWorkspaces(row.run_id),
-    onSuccess: () => settled(undefined),
+    onSuccess: (result: QueueActionResponse) => {
+      // A teardown that kept rows is the case the cleanup control exists for, so
+      // it must not read as success. The kept rows carry the very workspace ids
+      // that retry needs, and the note beside the cleanup field tells the
+      // operator to take one from a teardown report -- so show the report here
+      // rather than discarding it and leaving that instruction unfollowable.
+      const incomplete = result.complete === false
+      const rows = incomplete ? result.report?.kept ?? [] : []
+      setKept(rows)
+      // Not settled(): its vocabulary is "changed" versus "matched nothing",
+      // and an incomplete teardown is neither -- work was done and some of it
+      // could not be. No count in the line: the kept rows are listed with their
+      // ids just below, which is both the number and the thing to act on.
+      setOutcome(
+        incomplete
+          ? i18nT('apps.specBuilder.reviewQueue.teardown_incomplete')
+          : i18nT('apps.specBuilder.reviewQueue.done'),
+      )
+      void qc.invalidateQueries({ queryKey: ['spec-builder', 'engine-queue'] })
+    },
     onError: (e: Error) => setErr(e.message),
   })
   const cleanMutation = useMutation({
@@ -247,6 +275,24 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
             {i18nT('apps.specBuilder.reviewQueue.cleanup_section')}
           </h3>
           <p style={{ margin: '0 0 8px' }}>{i18nT('apps.specBuilder.reviewQueue.cleanup_note')}</p>
+          {kept.length > 0 && (
+            <div style={{ margin: '0 0 8px' }}>
+              <p style={{ margin: '0 0 4px' }}>
+                {i18nT('apps.specBuilder.reviewQueue.kept_heading')}
+              </p>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {kept.map((row) => (
+                  <li key={row.workspace_id}>
+                    {i18nT('apps.specBuilder.reviewQueue.kept_row', {
+                      id: row.workspace_id,
+                      kind: row.kind,
+                      reason: row.reason || '',
+                    })}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <Input
             value={workspaceId}
             onChange={(e) => setWorkspaceId(e.target.value)}

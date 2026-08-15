@@ -3725,6 +3725,8 @@
         "generation": "条目世代",
         "held_comments": "有 {{held}} 条评审意见被扣留，等待放行。",
         "held_ids_not_listed": "队列只报告被扣留的意见数量，不报告具体是哪几条。请从审计记录中获取其 ID。",
+        "kept_heading": "本次清理保留了以下工作区。可用下面的 ID 单独删除。",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "修订轮次已用完，因此不会再自动执行修订。",
         "no_change": "没有匹配项，因此没有任何变化。",
         "redispatch": "重新派发条目",
@@ -3733,6 +3735,7 @@
         "state_halted_budget": "因预算而停止",
         "state_stalled": "停滞",
         "teardown": "拆除工作区",
+        "teardown_incomplete": "本次清理未能删除所有工作区。保留下来的列在下方。",
         "title": "评审队列",
         "workspace_id": "工作区行 ID"
       }

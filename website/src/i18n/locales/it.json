@@ -3847,6 +3847,8 @@
         "generation": "Generazione dell’elemento",
         "held_comments": "{{held}} commento/i di revisione sono trattenuti in attesa di rilascio.",
         "held_ids_not_listed": "La coda indica quanti commenti sono trattenuti, non quali. Prendi l’identificatore dal registro di audit.",
+        "kept_heading": "Lo smantellamento ha mantenuto questi spazi di lavoro. Usa un id qui sotto per rimuoverne uno.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "I cicli di revisione sono esauriti, quindi nessun’altra revisione partirà da sola.",
         "no_change": "Nulla corrispondeva, quindi nulla è cambiato.",
         "redispatch": "Reinvia l’elemento",
@@ -3855,6 +3857,7 @@
         "state_halted_budget": "Fermato dal budget",
         "state_stalled": "In stallo",
         "teardown": "Smonta gli spazi di lavoro",
+        "teardown_incomplete": "Lo smantellamento non ha potuto rimuovere tutti gli spazi di lavoro. Quelli mantenuti sono elencati sotto.",
         "title": "Coda di revisione",
         "workspace_id": "Identificatore di riga dello spazio di lavoro"
       }

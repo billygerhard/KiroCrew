@@ -3847,6 +3847,8 @@
         "generation": "Génération de l’élément",
         "held_comments": "{{held}} commentaire(s) de revue sont retenus en attente de libération.",
         "held_ids_not_listed": "La file indique combien de commentaires sont retenus, pas lesquels. Prenez l’identifiant dans le journal d’audit.",
+        "kept_heading": "Le démontage a conservé ces espaces de travail. Utilisez un id ci-dessous pour en supprimer un.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "Les cycles de révision sont épuisés, aucune autre révision ne se lancera d’elle-même.",
         "no_change": "Rien ne correspondait, donc rien n’a changé.",
         "redispatch": "Réenvoyer l’élément",
@@ -3855,6 +3857,7 @@
         "state_halted_budget": "Arrêté par le budget",
         "state_stalled": "Bloqué",
         "teardown": "Démonter les espaces de travail",
+        "teardown_incomplete": "Le démontage n'a pas pu supprimer tous les espaces de travail. Ceux qui ont été conservés sont listés ci-dessous.",
         "title": "File de revue",
         "workspace_id": "Identifiant de ligne d’espace de travail"
       }

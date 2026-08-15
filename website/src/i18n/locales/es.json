@@ -3847,6 +3847,8 @@
         "generation": "Generación del elemento",
         "held_comments": "{{held}} comentario(s) de revisión están retenidos para su liberación.",
         "held_ids_not_listed": "La cola informa cuántos comentarios están retenidos, no cuáles. Toma el identificador del registro de auditoría.",
+        "kept_heading": "El desmontaje conservó estos espacios de trabajo. Use un id de abajo para eliminar uno.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "Los ciclos de revisión se han agotado, así que no se ejecutará ninguna revisión más por su cuenta.",
         "no_change": "Nada coincidió, así que nada cambió.",
         "redispatch": "Reenviar elemento",
@@ -3855,6 +3857,7 @@
         "state_halted_budget": "Detenido por el presupuesto",
         "state_stalled": "Estancado",
         "teardown": "Desmontar espacios de trabajo",
+        "teardown_incomplete": "El desmontaje no pudo eliminar todos los espacios de trabajo. Los conservados se enumeran abajo.",
         "title": "Cola de revisión",
         "workspace_id": "Identificador de fila del espacio de trabajo"
       }

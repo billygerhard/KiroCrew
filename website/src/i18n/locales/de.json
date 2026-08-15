@@ -3786,6 +3786,8 @@
         "generation": "Generation des Elements",
         "held_comments": "{{held}} Prüfkommentar(e) warten auf Freigabe.",
         "held_ids_not_listed": "Die Warteschlange nennt die Anzahl der zurückgehaltenen Kommentare, nicht welche. Nehmen Sie die ID aus dem Audit-Protokoll.",
+        "kept_heading": "Der Abbau hat diese Arbeitsbereiche behalten. Verwenden Sie unten eine ID, um einen zu entfernen.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "Die Überarbeitungszyklen sind aufgebraucht, daher läuft keine weitere Überarbeitung von selbst.",
         "no_change": "Nichts passte, also hat sich nichts geändert.",
         "redispatch": "Element erneut zuweisen",
@@ -3794,6 +3796,7 @@
         "state_halted_budget": "Durch das Budget gestoppt",
         "state_stalled": "Hängt",
         "teardown": "Arbeitsbereiche abbauen",
+        "teardown_incomplete": "Der Abbau konnte nicht jeden Arbeitsbereich entfernen. Die behaltenen sind unten aufgeführt.",
         "title": "Prüfwarteschlange",
         "workspace_id": "Arbeitsbereichs-Zeilen-ID"
       }

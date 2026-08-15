@@ -3847,6 +3847,8 @@
         "generation": "Geração do item",
         "held_comments": "{{held}} comentário(s) de revisão estão retidos para liberação.",
         "held_ids_not_listed": "A fila informa quantos comentários estão retidos, não quais. Pegue o identificador na trilha de auditoria.",
+        "kept_heading": "A desmontagem manteve estes espaços de trabalho. Use um id abaixo para remover um.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "Os ciclos de revisão foram esgotados, então nenhuma outra revisão será executada por conta própria.",
         "no_change": "Nada correspondeu, então nada mudou.",
         "redispatch": "Reenviar item",
@@ -3855,6 +3857,7 @@
         "state_halted_budget": "Interrompido pelo orçamento",
         "state_stalled": "Parado",
         "teardown": "Desmontar espaços de trabalho",
+        "teardown_incomplete": "A desmontagem não conseguiu remover todos os espaços de trabalho. Os mantidos estão listados abaixo.",
         "title": "Fila de revisão",
         "workspace_id": "Identificador de linha do espaço de trabalho"
       }

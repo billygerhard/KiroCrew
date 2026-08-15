@@ -444,12 +444,33 @@ export interface EngineQueueResponse {
 /** What one queue action did. Each flag is the ENGINE's answer to "did anything
  *  actually change", so a click on a stale row reads as "nothing to do" rather
  *  than as a change that did not happen. */
+/** One workspace row a teardown either removed or deliberately kept. */
+export interface WorkspaceCleanupRow {
+  workspace_id: number
+  run_id: string
+  kind: string
+  location: string
+  removed: boolean
+  reason?: string
+}
+
+/** What a teardown did, per workspace. `kept` carries the ids a retry needs. */
+export interface TeardownReportBody {
+  run_id?: string
+  forced?: boolean
+  removed?: WorkspaceCleanupRow[]
+  kept?: WorkspaceCleanupRow[]
+  stage?: string | null
+  stage_reason?: string | null
+}
+
 export interface QueueActionResponse {
   ok?: boolean
   released?: boolean
   lifted?: boolean
   removed?: boolean
   complete?: boolean
+  report?: TeardownReportBody
 }
 
 export const engineApi = {

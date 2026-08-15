@@ -3725,6 +3725,8 @@
         "generation": "항목 세대",
         "held_comments": "검토 의견 {{held}}건이 해제를 기다리며 보류되어 있습니다.",
         "held_ids_not_listed": "대기열은 보류된 의견의 개수만 알려 주며 어떤 것인지는 알려 주지 않습니다. ID는 감사 기록에서 확인하세요.",
+        "kept_heading": "정리 과정에서 다음 워크스페이스가 남았습니다. 아래 ID로 하나씩 제거할 수 있습니다.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "수정 주기를 모두 사용했으므로 더 이상 자동으로 수정이 실행되지 않습니다.",
         "no_change": "일치하는 항목이 없어 변경된 것이 없습니다.",
         "redispatch": "항목 재전송",
@@ -3733,6 +3735,7 @@
         "state_halted_budget": "예산으로 중단됨",
         "state_stalled": "정체됨",
         "teardown": "작업 공간 해체",
+        "teardown_incomplete": "정리 과정에서 모든 워크스페이스를 제거하지 못했습니다. 남은 항목은 아래에 나열됩니다.",
         "title": "검토 대기열",
         "workspace_id": "작업 공간 행 ID"
       }

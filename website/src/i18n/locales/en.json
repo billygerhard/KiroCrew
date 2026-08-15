@@ -3103,6 +3103,8 @@
         "generation": "Item generation",
         "held_comments": "{{held}} reviewer comment(s) are held for release.",
         "held_ids_not_listed": "The queue reports how many comments are held, not which ones. Take the id from the audit trail.",
+        "kept_heading": "The teardown kept these workspaces. Use an id below to remove one.",
+        "kept_row": "{{id}} — {{kind}} — {{reason}}",
         "needs_human": "Revision cycles are used up, so no further revision runs on its own.",
         "no_change": "Nothing matched, so nothing changed.",
         "redispatch": "Re-dispatch item",
@@ -3111,6 +3113,7 @@
         "state_halted_budget": "Stopped by the budget",
         "state_stalled": "Stalled",
         "teardown": "Tear down workspaces",
+        "teardown_incomplete": "The teardown could not remove every workspace. The ones it kept are listed below.",
         "title": "Review queue",
         "workspace_id": "Workspace row id"
       }
