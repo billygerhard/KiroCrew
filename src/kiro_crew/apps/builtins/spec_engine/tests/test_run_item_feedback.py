@@ -118,7 +118,7 @@ def make_run(
         detail={
             "spec_type": "bugfix",
             "working_tree": str(project),
-            "item_url": "https://tracker/42",
+            "item_url": "https://tracker.invalid/42",
         },
     )
     return record.run_id
