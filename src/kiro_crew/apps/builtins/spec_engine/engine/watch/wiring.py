@@ -532,3 +532,42 @@ def watch_job_names(store: ConfigStore | None = None) -> tuple[str, ...]:
     if review_feedback_armed(resolved):
         names.append(REVIEW_FEEDBACK_JOB)
     return tuple(names)
+
+
+def run_review_feedback_script(ctx: Any) -> None:
+    """Scheduler entry point for the review-feedback poll.
+
+    Costs nothing on every path it can take today. A project that armed nothing
+    is skipped without reading a tracker, and an armed project is skipped *before*
+    the poll because the two seams a fix round needs are not constructible in this
+    process:
+
+    * the **fix-round reviser**, which authors the change a comment asks for. It
+      is a tool-enabled turn in the run's own host session, and the host bridge
+      that opens one — a ``SessionOpener``/``TurnHost`` over the gateway's session
+      manager — does not exist yet. ``SessionManager.get_or_create`` is async and
+      returns no session key and no applied posture, so there is nothing here to
+      build one from without inventing a posture read.
+    * the **delivery pipeline**, which carries the fix through the project's
+      configured stages.
+
+    :func:`build_review_feedback_watcher` takes both, so the day either arrives
+    this function constructs the watcher and ticks it — that is the only change
+    needed, and the schedule is already in place. Until then the refusal is a log
+    line rather than a delivered message: an operator does not need the same
+    notice every five minutes, and the state is visible in the app's own surfaces.
+
+    Raises the scheduler's control exceptions, imported here rather than at module
+    scope so the engine stays importable without the host's cron subsystem.
+    """
+    from kiro_crew.cron_script import Skip
+
+    armed = review_feedback_armed()
+    if not armed:
+        raise Skip()
+    logger.info(
+        "review feedback is armed for %s but no fix-round reviser or delivery pipeline is "
+        "constructible in this process, so nothing was polled and nothing was spent",
+        ", ".join(armed),
+    )
+    raise Skip()

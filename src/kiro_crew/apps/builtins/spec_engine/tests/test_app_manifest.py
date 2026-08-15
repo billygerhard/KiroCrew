@@ -19,13 +19,16 @@ Three claims live here, and each has a way to fail loudly:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from kiro_crew.apps.builtins.spec_engine import readiness
+from kiro_crew.apps.builtins.spec_engine import readiness, startup
 from kiro_crew.apps.builtins.spec_engine.engine_mcp import TOOLS
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.guidance import GUIDANCE
 from kiro_crew.apps.discovery import discover_builtin_apps
@@ -125,14 +128,27 @@ class TestManifest:
         for cfg in manifest_data["mcpServers"].values():
             assert "autoApprove" not in cfg
 
-    def test_startup_hook_resolves_to_the_readiness_reporter(self, manifest: AppManifest):
+    def test_startup_hook_resolves_to_the_apps_startup_composition(self, manifest: AppManifest):
         # The manifest names a hook as a string; this is the host resolver that
         # turns that string into a callable for a builtin. A typo here means the
-        # readiness state is never assessed and nothing says so.
+        # readiness state is never assessed, the watcher is never scheduled, and
+        # nothing says so.
         hook = manifest.backend.hooks.on_startup
-        assert hook, "the app must declare a startup hook to assess readiness"
+        assert hook, "the app must declare a startup hook"
         resolved = LifecycleDispatcher._resolve_hook(APP_NAME, hook)
-        assert resolved is readiness.on_startup
+        assert resolved is startup.on_startup
+
+    def test_the_startup_hook_still_assesses_readiness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Readiness moved behind the composition hook rather than away: an app
+        # whose skill or server never registered must still report why.
+        assessed: list[Any] = []
+        monkeypatch.setattr(readiness, "on_startup", lambda ctx: assessed.append(ctx))
+
+        asyncio.run(startup.on_startup(SimpleNamespace(data_dir=tmp_path, cron=None)))
+
+        assert len(assessed) == 1
 
 
 class TestDiscoverySkill:
@@ -288,7 +304,7 @@ class TestBothRegistrationPaths:
         snapshot = discovered[APP_NAME]
         assert snapshot["skills"] == ["skills/spec-engine-discovery"]
         assert list(snapshot["mcpServers"]) == ["spec-engine"]
-        assert snapshot["backend"]["hooks"]["on_startup"] == "readiness:on_startup"
+        assert snapshot["backend"]["hooks"]["on_startup"] == "startup:on_startup"
 
     def test_installed_path_places_both_resources(self, app_home, tmp_path):
         # The installed path registers from the app's own snapshot directory. Same

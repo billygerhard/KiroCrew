@@ -78,17 +78,24 @@ HOST_SCRIPT_TIMEOUT_S = 30
 #: command's timeout is the only ceiling that can actually fire.
 CRON_TIMEOUT_MARGIN_S = 15
 
-_SHIM_SOURCE = '''"""Watch poll tick for the spec engine app.
+_SHIM_SOURCE = '''"""Watch schedules for the spec engine app.
 
 Generated file. The scheduler may only run scripts from this directory, so this
-shim is how the engine's tick is reachable; the logic lives in the app.
+shim is how the engine's ticks are reachable; the logic lives in the app.
 """
 
 from kiro_crew.apps.builtins.spec_engine.engine.watch import run_tick_script
+from kiro_crew.apps.builtins.spec_engine.engine.watch.wiring import (
+    run_review_feedback_script,
+)
 
 
 def run(ctx):
     return run_tick_script(ctx)
+
+
+def review_feedback(ctx):
+    return run_review_feedback_script(ctx)
 '''
 
 

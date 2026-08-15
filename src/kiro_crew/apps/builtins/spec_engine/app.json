@@ -25,7 +25,7 @@
   },
   "backend": {
     "hooks": {
-      "on_startup": "readiness:on_startup"
+      "on_startup": "startup:on_startup"
     }
   }
 }
