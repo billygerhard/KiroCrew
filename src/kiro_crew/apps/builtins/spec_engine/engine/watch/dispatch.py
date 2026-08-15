@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from ..audit import AuditLog
-from ..autonomy import AutonomyDecision, AutonomyPolicy
+from ..autonomy import AutonomyDecision, AutonomyLevel, AutonomyPolicy
 from ..budget.caps import caps_for
 from ..config import ConfigStore
 from ..config.schema import (
@@ -430,6 +430,127 @@ class RunStarter(Protocol):
     def __call__(self, seed: RunSeed) -> None: ...
 
 
+class UngatedStarter(RuntimeError):
+    """A dispatch entry point was handed a starter that opens host sessions
+    without the prerequisite gate in front of it.
+
+    The engine's starter is :class:`~..seeder.SessionSeeder`, and it is publicly
+    constructible: a surface can build one and pass it straight to ``start=``,
+    which would open sessions and spend credits for a run whose prerequisites
+    were never checked. ``EngineGraph.begin_run`` is the one door that gates, so
+    the seeder reaches a dispatch entry point only inside a :class:`GatedStarter`
+    and a bare one is refused here rather than trusted to have come from there.
+    """
+
+
+class RunGate(Protocol):
+    """The engine's one door onto starting runs, as :class:`GatedStarter` needs it.
+
+    Structural rather than an import of ``EngineGraph``: the composition root
+    imports this module, so depending on it here would be a cycle. Satisfied by
+    :meth:`~..composition.EngineGraph.begin_run`, which evaluates the run gate
+    and raises rather than returning a starter when a prerequisite is unmet.
+    """
+
+    def begin_run(
+        self,
+        ref: SpecRef,
+        level: AutonomyLevel,
+        *,
+        base_branch: str = ...,
+        run: str | None = ...,
+    ) -> RunStarter: ...
+
+
+class GatedStarter:
+    """The only starter a dispatch entry point accepts over a session seeder.
+
+    Wraps the gate rather than the seeder: it holds no starter of its own and
+    obtains one per seed from :meth:`RunGate.begin_run`, so the prerequisite check
+    happens for *this* run — attributed to its spec and run id in the audit log —
+    immediately before the session that would spend on it is opened.
+
+    A refusal propagates as ``RunPrevented``. Swallowing it would leave a run row
+    that reports as dispatched with no session behind it; letting it out means
+    :func:`dispatch_source` records the item as ``START_FAILED`` — refused, with
+    the reason, and with the rest of the batch still dispatched — which is the
+    disposition an unmet prerequisite deserves and is already how a starter that
+    raises is handled on this path.
+    """
+
+    def __init__(self, gate: RunGate) -> None:
+        self._gate = gate
+
+    def __call__(self, seed: RunSeed) -> None:
+        starter = self._gate.begin_run(
+            seed.ref,
+            seed.autonomy.level,
+            base_branch=seed.base_branch,
+            run=seed.run_id,
+        )
+        starter(seed)
+
+
+def _seeder_behind(start: object, depth: int = 0) -> object | None:
+    """The session seeder *start* would reach, through the obvious wrappings.
+
+    A bare seeder is the shape a surface actually produces, but a bound
+    ``seeder.__call__``, a ``functools.partial`` over one, and a one-line lambda
+    closing over one are the same starter under different spellings — and "a
+    guarantee at one spelling while an equivalent second exists" is the defect
+    class this check exists to close. Bounded in depth because the input is
+    arbitrary and a wrapper chain is not worth unbounded recursion.
+    """
+    from ..seeder import SessionSeeder
+
+    if depth > 3 or start is None:
+        return None
+    if isinstance(start, SessionSeeder):
+        return start
+    candidates: list[object] = []
+    bound = getattr(start, "__self__", None)  # seeder.__call__ / seeder.seed
+    if bound is not None:
+        candidates.append(bound)
+    wrapped = getattr(start, "func", None)  # functools.partial
+    if wrapped is not None:
+        candidates.append(wrapped)
+        candidates.extend(getattr(start, "args", ()) or ())
+        candidates.extend((getattr(start, "keywords", None) or {}).values())
+    for cell in getattr(start, "__closure__", None) or ():  # a lambda over one
+        try:
+            candidates.append(cell.cell_contents)
+        except ValueError:  # pragma: no cover - an empty cell holds nothing
+            continue
+    for candidate in candidates:
+        found = _seeder_behind(candidate, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _vet_starter(start: RunStarter) -> RunStarter:
+    """Refuse a session-opening starter that did not come through the gate.
+
+    Deliberately asymmetric: a :class:`GatedStarter` is accepted, anything that
+    reaches a :class:`~..seeder.SessionSeeder` by another route is refused, and
+    every other callable is left alone. Checking the *dangerous* object rather
+    than requiring a blessed type is what keeps this from being a type check a
+    test double has to satisfy — nothing but the seeder opens a host session, so
+    nothing but the seeder needs the gate in front of it.
+    """
+    if isinstance(start, GatedStarter):
+        return start
+    seeder = _seeder_behind(start)
+    if seeder is not None:
+        raise UngatedStarter(
+            "this dispatch entry point was handed the engine's session seeder "
+            f"({type(seeder).__name__}) directly, so runs would open sessions and spend "
+            "credits without the prerequisite gate. Obtain the starter from "
+            "EngineGraph.begin_run and pass it as GatedStarter(graph)."
+        )
+    return start
+
+
 class SeedScreener(Protocol):
     """Screens a seed's untrusted content before the run proceeds past intake.
 
@@ -758,6 +879,7 @@ def dispatch_source(
     present it is the same poster the run lifecycle and the delivery flow use, so
     all three sites take the one writeback claim and post by the one route.
     """
+    _vet_starter(start)
     route = load_route(config, outcome.source)
     if not route.routable:
         # Before the claim and before the snapshot: a misconfigured source must
@@ -932,6 +1054,7 @@ def dispatch_tick(
     the run being torn down started before the route broke, and it must not
     outlive the withdrawal just because new work has nowhere to go.
     """
+    _vet_starter(start)
     resolved = gate if gate is not None else caps_for(state, config)
     reports: list[DispatchReport] = []
     for outcome in report.polled:
@@ -994,6 +1117,7 @@ def drain_queue(
     sequence check afterwards is what keeps a concurrent drainer from turning a
     decision about one item into a start of another.
     """
+    _vet_starter(start)
     results: list[QueueDispatch] = []
     policy = AutonomyPolicy.from_store(config)
     for project_path in _queued_projects(state):
