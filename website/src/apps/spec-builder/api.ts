@@ -183,8 +183,7 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 const enc = (name: string) => encodeURIComponent(name)
 
 export const specApi = {
-  list: () => req<SpecListResponse>('/specs'),
-  create: (body: CreateSpecBody) => req<{ name?: string }>('/specs', { method: 'POST', body: JSON.stringify(body) }),
+  list: () => req<SpecListResponse>('/specs'),  create: (body: CreateSpecBody) => req<{ name?: string }>('/specs', { method: 'POST', body: JSON.stringify(body) }),
   get: (name: string) => req<SpecDetail>('/specs/' + enc(name)),
   // specDir is the identity the CLIENT rendered: the backend compares it against
   // the live index so a stale tab cannot drive a same-name spec that was deleted
@@ -329,4 +328,136 @@ export function phaseLabel(phase: string): string {
   return Object.prototype.hasOwnProperty.call(PHASE_LABEL_KEY, phase)
     ? i18nT(PHASE_LABEL_KEY[phase])
     : phase
+}
+
+// ── the engine's operator surfaces ──────────────────────────────────────────
+//
+// Configuration, per-run spend, and the stop control. Every value here is
+// resolved by the ENGINE and relayed by the backend: this client renders what it
+// is handed and derives nothing. In particular it does NOT decide which layer a
+// setting's value came from -- `origin` is the engine's answer, and a second
+// precedence implementation in the browser that disagreed with it would show an
+// operator a value the engine does not use.
+
+/** One setting: the value in force, where it came from, and what a write may set. */
+export interface EffectiveSetting {
+  key: string
+  value: number | string | boolean
+  /** bundled_default | app_config | cost_profile | project_config | source_config */
+  origin: string
+  /** Dotted path of the explicit declaration; empty for a bundled default. */
+  declared_at: string
+  is_default: boolean
+  default?: number | string | boolean
+  summary?: string
+  kind?: string
+  /** Scopes a write would be accepted at, so the form cannot offer a field the
+   *  engine's write path then refuses. */
+  scopes?: string[]
+  minimum?: number | null
+  maximum?: number | null
+  choices?: string[]
+}
+
+export interface EngineConfigResponse {
+  scope: { project: string | null; source: string | null }
+  settings: Record<string, EffectiveSetting>
+  /** Container sections as stored. These are not registry settings, so what is
+   *  stored IS what applies and there is no origin to report for them. */
+  domains: Record<string, Record<string, unknown>>
+  /** Every domain this surface knows, so an absent one reads as "none
+   *  configured" rather than as a domain that does not exist. */
+  domain_sections: string[]
+}
+
+export interface KillSwitchView {
+  engaged: boolean
+  initiator: string
+  reason: string
+  engaged_ts: string
+  /** The flag is in force because its record could not be read, not because an
+   *  operator threw it. Releasing that is a repair, not a decision. */
+  unreadable: boolean
+  description: string
+}
+
+export interface KillSwitchResponse {
+  switch: KillSwitchView
+  stoppable: { run_id: string; spec_key: string; source: string | null; state: string; cost_credits: number }[]
+  stoppable_credits: number
+}
+
+export interface KillSwitchActionResponse {
+  ok?: boolean
+  action: string
+  already_engaged?: boolean
+  changed?: boolean
+  switch: KillSwitchView
+  halted?: { run_id: string; parked: boolean; cost_credits: number }[]
+  total_credits?: number
+  /** Always empty on a release: releasing lets new work start and resumes
+   *  nothing that was parked. */
+  resumed?: string[]
+}
+
+export interface QueueRow {
+  run_id: string
+  project: string
+  spec: string
+  state: string
+  waiting_on: string
+  waiting_s: number
+  /** Credits this run consumed, the same number the ceiling accounts against. */
+  cost_credits: number
+  gate: string | null
+}
+
+export interface EngineQueueResponse {
+  entries: QueueRow[]
+  total_credits: number
+}
+
+export const engineApi = {
+  getConfig: (scope?: { project?: string; source?: string }) => {
+    const q = new URLSearchParams()
+    if (scope?.project) q.set('project', scope.project)
+    if (scope?.source) q.set('source', scope.source)
+    const suffix = q.toString() ? '?' + q.toString() : ''
+    return req<EngineConfigResponse>('/engine/config' + suffix)
+  },
+  putConfig: (patch: Record<string, unknown>) =>
+    req<{ ok?: boolean }>('/engine/config', { method: 'PUT', body: JSON.stringify({ patch }) }),
+  getKillSwitch: () => req<KillSwitchResponse>('/engine/kill-switch'),
+  setKillSwitch: (action: 'engage' | 'release', reason?: string) =>
+    req<KillSwitchActionResponse>('/engine/kill-switch', {
+      method: 'POST',
+      body: JSON.stringify({ action, reason: reason || '' }),
+    }),
+  getQueue: (project?: string) =>
+    req<EngineQueueResponse>('/engine/queue' + (project ? '?project=' + enc(project) : '')),
+}
+
+/**
+ * Catalog key per value origin. A literal Record is the only shape
+ * ``scripts/check-i18n-keys.mjs`` resolves statically, and the labels are the
+ * whole point of the origin: "4" tells an operator nothing that "4 (shipped
+ * default)" and "4 (this project)" do not.
+ */
+const ORIGIN_LABEL_KEY: Record<string, string> = {
+  bundled_default: 'apps.specBuilder.engineOps.origin_bundled_default',
+  app_config: 'apps.specBuilder.engineOps.origin_app_config',
+  cost_profile: 'apps.specBuilder.engineOps.origin_cost_profile',
+  project_config: 'apps.specBuilder.engineOps.origin_project_config',
+  source_config: 'apps.specBuilder.engineOps.origin_source_config',
+}
+
+/**
+ * Localised label for a value's origin, or the origin id VERBATIM when the
+ * engine reports one this table does not know — better than fabricating copy
+ * that claims the wrong layer.
+ */
+export function originLabel(origin: string): string {
+  return Object.prototype.hasOwnProperty.call(ORIGIN_LABEL_KEY, origin)
+    ? i18nT(ORIGIN_LABEL_KEY[origin])
+    : origin
 }

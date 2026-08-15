@@ -11,13 +11,14 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { X } from 'lucide-react'
+import { Gauge, X } from 'lucide-react'
 import { AppApiProvider } from '../../app-sdk'
 import { specApi, LS, type SpecSummary } from './api'
 import { Btn } from './components/shared'
 import Workspace from './components/Workspace'
 import NewSpecView from './components/NewSpecView'
 import SettingsModal from './components/SettingsModal'
+import EngineOpsPanel from './components/EngineOpsPanel'
 
 import { i18nT } from '../../i18n/t'
 // ChatEmbed only needs the chat endpoints; scope the provider tightly.
@@ -43,6 +44,7 @@ function SpecBuilderInner() {
   }, [])
   const [creating, setCreating] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [showEngineOps, setShowEngineOps] = useState(false)
   const [err, setErr] = useState('')
 
   // React Query rather than useState + setInterval. Two overlapping manual
@@ -94,6 +96,22 @@ function SpecBuilderInner() {
         </div>
       )}
 
+      {/* The engine's operator controls. Reachable from the shell rather than from
+          a spec's own view, because the stop control is engine-wide: an operator
+          reaching for it during a runaway should not have to select a spec first. */}
+      <div className="flex justify-end px-3.5 py-1 shrink-0">
+        <Btn
+          label={
+            <>
+              <Gauge className="lucide-inline" aria-hidden="true" />
+              {i18nT('apps.specBuilder.engineOps.title')}
+            </>
+          }
+          ariaLabel={i18nT('apps.specBuilder.engineOps.title')}
+          onClick={() => setShowEngineOps(true)}
+        />
+      </div>
+
       {err && (
         <div role="alert" aria-live="assertive" className="bg-danger-subtle text-danger px-3.5 py-2 text-[12px] shrink-0 flex justify-between items-center border-b border-border">
           <span>{err}</span>
@@ -121,6 +139,7 @@ function SpecBuilderInner() {
       )}
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} setErr={setErr} />}
+      {showEngineOps && <EngineOpsPanel onClose={() => setShowEngineOps(false)} setErr={setErr} />}
     </div>
   )
 }
