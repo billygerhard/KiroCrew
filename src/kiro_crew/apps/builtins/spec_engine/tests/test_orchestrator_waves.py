@@ -950,6 +950,26 @@ class TestTheBudgetStopsDispatch:
         assert harness.detail_statuses() == {"1.1": TaskStatus.COMPLETE}
         assert harness.machine.state_of(RUN) is RunState.HALTED_BUDGET
 
+    def test_a_halted_run_quotes_the_doctors_finding_identifier(self, harness: Harness) -> None:
+        """A halt reported to a person names the condition the way the panel does.
+
+        The identifier comes from the dispatch decision's own outcome, so a halted
+        run and a Doctor panel cannot spell one condition two ways -- which is the
+        whole point of having one identifier vocabulary.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.budget.ceiling import DispatchOutcome
+        from kiro_crew.apps.builtins.spec_engine.engine.doctor import dispatch_finding_id
+
+        harness.start_run()
+        harness.spend(9.0)
+
+        report = runner_for(harness, Worker()).execute(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.HALTED
+        assert report.finding_id == dispatch_finding_id(DispatchOutcome.HALTED)
+        assert report.finding_id, "a halt quoted no identifier"
+        assert report.detail()["finding_id"] == report.finding_id
+
     def test_a_run_parked_for_budget_is_not_reported_as_finished(self, harness: Harness) -> None:
         """A halted run is resumable, so it has not ended.
 

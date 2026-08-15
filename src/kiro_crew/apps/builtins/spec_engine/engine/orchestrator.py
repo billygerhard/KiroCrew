@@ -99,6 +99,7 @@ from .delivery import (
     WorkspaceBroker,
     WorkspaceJanitor,
 )
+from .doctor import dispatch_finding_id
 from .documents import DocumentKind
 from .review_criteria import TestQualityAssessment, TestQualityFinding
 from .roles import Dispatch, RolePlan, SessionDefault, WorkKind
@@ -483,6 +484,12 @@ class ExecutionReport:
     #: Waves the loop never reached, so "not run" is distinguishable from "passed".
     not_reached: tuple[int, ...] = ()
     reason: str = ""
+    #: The Doctor Finding identifier for the condition that stopped the run, empty
+    #: when nothing stopped it. A halted run is reported to a person, and the
+    #: identifier is what makes "this run stopped" and "the doctor says the ceiling
+    #: is reached" one sentence about one condition rather than two spellings a
+    #: reader has to connect.
+    finding_id: str = ""
     #: Set once the run has been ended and its consumption reported.
     completion: RunCompletion | None = None
 
@@ -512,6 +519,7 @@ class ExecutionReport:
             ],
             "not_reached": list(self.not_reached),
             "reason": self.reason,
+            "finding_id": self.finding_id,
         }
 
 
@@ -648,6 +656,10 @@ class WaveRunner:
                             later.identifier for later in schedule.waves[index + 1 :]
                         ),
                         reason=halt.message,
+                        # Derived from the decision's own outcome rather than
+                        # restated here, so a halt and a Doctor panel cannot name
+                        # one condition two ways.
+                        finding_id=dispatch_finding_id(halt.outcome),
                     )
                 )
         failed = tuple(task for report in reports for task in report.failed)
