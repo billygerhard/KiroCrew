@@ -31,6 +31,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.apps.builtins.spec_builder.backend import routes
+from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 from .test_routes import (
@@ -74,6 +75,17 @@ def _engine_approvals(tmp_path: Path, name: str) -> dict[str, str]:
         return {record.gate: record.actor for record in store.list_approvals(ref)}
     finally:
         store.close()
+
+
+def _engine_audit(tmp_path: Path, name: str) -> list:
+    """The engine's audit events for this spec, read from its own log.
+
+    Named event constants are deliberately compared as the literals the engine
+    publishes, so a rename that changed what is recorded fails a test rather than
+    moving with it.
+    """
+    log = AuditLog(root=routes._ENGINE_STATE_ROOT)
+    return log.read(SpecRef.of(tmp_path / "wd", name))
 
 
 class TestTheApprovalPathExists:
@@ -443,6 +455,34 @@ class TestTransitionsComeFromTheEngine:
         assert resp.status == 409
         assert body["code"] == "approval_refused"
         assert _engine_approvals(tmp_path, "s") == {}
+
+    @pytest.mark.asyncio
+    async def test_a_refused_approval_does_not_even_attempt_the_transition(
+        self, tmp_path, monkeypatch
+    ):
+        """Approve first, and only then transition -- checked by what was tried.
+
+        The response code alone does not pin this: an implementation that called
+        ``advance`` anyway would have it refuse for the missing approval and would
+        still answer with a refusal. The engine's audit log is where the difference
+        shows, because an attempted advance records its own refusal there.
+        """
+        client = _make_client(monkeypatch, tmp_path)
+        spec_dir = _index(tmp_path, "s")
+        (spec_dir / "requirements.md").write_text("# Requirements Document\n", encoding="utf-8")
+
+        await client.start_server()
+        try:
+            resp = await client.post(f"{_BASE}/specs/s/advance", json={"gate": "requirements"})
+        finally:
+            await client.close()
+
+        assert resp.status == 409
+        events = [event.event for event in _engine_audit(tmp_path, "s")]
+        assert "spec.gate.approval-refused" in events
+        assert "spec.phase.advance-refused" not in events, (
+            "the transition was attempted after the approval was refused"
+        )
 
     @pytest.mark.asyncio
     async def test_advancing_past_the_last_gate_is_the_engines_refusal(
