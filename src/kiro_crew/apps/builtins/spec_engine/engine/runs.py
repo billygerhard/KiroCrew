@@ -333,6 +333,15 @@ RUN_RESUMED_EVENT = "spec.run.resumed"
 #: Recorded when a stall notification could not be delivered. The run stays
 #: stalled: state is primary, delivery is best-effort.
 RUN_NOTIFY_FAILED_EVENT = "spec.run.notification-failed"
+#: Recorded when the awaiting-review announcement failed *inside the announcer*,
+#: before it could report an outcome of its own. Deliberately not the seeder's
+#: ``AWAITING_REVIEW_NOTIFY_FAILED_EVENT``: that one says a notice was composed
+#: and a channel would not take it, which the seeder records itself. This one says
+#: the announcement never got that far — the notifier could not be constructed,
+#: the channel could not be resolved, or the seeder's own audit append raised — so
+#: the seeder recorded nothing and the park would otherwise appear in the trail
+#: with no notice beside it and no reason why.
+RUN_ANNOUNCE_FAILED_EVENT = "spec.run.awaiting-review-announce-failed"
 
 
 def lifecycle_event_for(from_state: RunState, to_state: RunState) -> str | None:
@@ -1294,6 +1303,11 @@ class RunMachine:
         alternative is worse in a way that is hard to recover from: an exception
         here unwinds a caller whose state change is ALREADY durable, so the run is
         parked while its driver believes the transition failed.
+
+        Swallowed is not unrecorded. The failure is appended to the run's audit
+        log, because a park that told nobody is the state requirement 6.3 makes
+        legible and an operator reading the trail must see the gap rather than
+        infer it from a notice that is not there.
         """
         if to_state is not RunState.AWAITING_REVIEW or self._review_announcer is None:
             return
@@ -1304,6 +1318,44 @@ class RunMachine:
         except Exception as exc:  # noqa: BLE001 - a lost notice must not unwind a move
             logger.warning(
                 "run %s parked for review but could not be announced: %s", record.run_id, exc
+            )
+            self._audit_announce_failure(ref, record.run_id, exc)
+
+    def _audit_announce_failure(self, ref: SpecRef, run_id: str, exc: BaseException) -> None:
+        """Record that a park went unannounced, from inside the swallowing catch.
+
+        The failure class this covers is narrow and is the one nothing else sees.
+        A channel that will not take the notice is already recorded by the
+        announcer itself: :meth:`~.notify.routing.HostNotifier.send` raises
+        ``NotificationUndelivered`` and the seeder appends its own
+        ``AWAITING_REVIEW_NOTIFY_FAILED_EVENT`` before returning normally, so that
+        never reaches the caller's ``except`` at all. What does reach it is an
+        announcer-INTERNAL fault — constructing the notifier, resolving the
+        channel, the seeder's own audit append raising — where the seeder recorded
+        nothing.
+
+        The nested catch is load-bearing rather than defensive habit.
+        :meth:`append_audit` deliberately lets a failure surface, and this runs
+        inside an ``except`` block: an unwritable audit log would replace the
+        swallowed notice failure with a raised one and unwind a transition that is
+        already durable, which is precisely what the outer swallow exists to
+        prevent. It is broad because the thing it absorbs is the log itself, and a
+        narrower tuple would be a claim about which errors a file write can
+        produce rather than a guarantee about this method.
+        """
+        try:
+            self.append_audit(
+                ref,
+                RUN_ANNOUNCE_FAILED_EVENT,
+                run=run_id,
+                detail={"error": f"{type(exc).__name__}: {exc}"},
+            )
+        except Exception:  # noqa: BLE001 - see the docstring: this must not raise
+            logger.warning(
+                "run %s parked for review, was not announced, and the failure could not be "
+                "recorded either",
+                run_id,
+                exc_info=True,
             )
 
     def _outstanding_gate(self, ref: SpecRef) -> str:

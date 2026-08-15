@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .analysis import AnalysisEngine, FindingsSink, RecordingFindingsSink
+from .analysis import AnalysisEngine, FindingsSink, RecordingFindingsSink, StateFindingsSink
 from .audit import AuditLog
 from .autonomy import AutonomyLevel
 from .budget.ledger import RunAccounting, RunCostSink
@@ -86,6 +86,38 @@ class IncompleteEngineGraph(ValueError):
     directly and, more likely, reachable through :func:`dataclasses.replace`,
     which an ordinary refactor reaches for and which re-runs ``__post_init__``.
     """
+
+
+#: Sentinel for a collaborator that names no project scope at all, so an absent
+#: attribute is not mistaken for the unscoped ``None`` a coherent graph may hold.
+_UNKNOWN_SCOPE = object()
+
+
+class DurableFindings:
+    """Marker asking :func:`build_engine` for the durable sink over its OWN store.
+
+    Not a sink and never called: it carries no ``record``, so a graph cannot end
+    up holding one of these by accident. It exists because
+    :class:`~.analysis.StateFindingsSink` needs the :class:`~.state.StateStore`
+    that :func:`build_engine` is about to build, and a caller constructing the
+    sink first would have to open a *second* store over the same database — two
+    connections, and two ideas of where a run's rows live. Passing this instead
+    means the sink is built from the one store the graph uses.
+
+    It is also the shape of the answer to a subtler risk. The only non-test
+    ``build_engine`` caller today is the engine-MCP surface, which passes a sink
+    that *refuses* to record — correct there, because none of its operations
+    touches a run. Whoever built the first run-driving graph by copying that
+    spelling would get a graph that satisfies every wiring check and records
+    nothing at all. :func:`build_run_engine` takes no sink argument, so the run
+    path has nothing to copy.
+    """
+
+
+#: The one value that means "durable, over this graph's store". A module-level
+#: singleton rather than a fresh instance per call so the marker compares
+#: identically wherever it is passed.
+DURABLE_FINDINGS = DurableFindings()
 
 
 class RunPrevented(RuntimeError):
@@ -198,6 +230,27 @@ class EngineGraph:
                 "the run machine announces a run parked for review through something "
                 "other than this graph's seeder, so a parked run may tell nobody"
             )
+
+        # Project coherence. The graph's own ``project`` is what
+        # prerequisite_refusal and notify_awaiting_review pass down, while the
+        # machine, registry and notifier each baked one in when they were built.
+        # ``replace(graph, project=...)`` rebuilds none of them, so a graph can
+        # gate under one project and audit, meter and notify under another —
+        # settings are resolved per project, so that is two different effective
+        # configurations for one run rather than a cosmetic mismatch.
+        for label, collaborator in (
+            ("run machine", self.machine),
+            ("capability registry", self.registry),
+            ("host notifier", self.notifier),
+        ):
+            scope = getattr(collaborator, "project", _UNKNOWN_SCOPE)
+            if scope is _UNKNOWN_SCOPE:
+                scope = getattr(collaborator, "_project", _UNKNOWN_SCOPE)
+            if scope is not _UNKNOWN_SCOPE and scope != self.project:
+                problems.append(
+                    f"the {label} resolves settings under project {scope!r}, not this "
+                    f"graph's {self.project!r}"
+                )
 
         if problems:
             raise IncompleteEngineGraph(
@@ -376,7 +429,7 @@ class EngineGraph:
 def build_engine(
     *,
     model_resolver: ModelResolver,
-    findings_sink: FindingsSink,
+    findings_sink: FindingsSink | DurableFindings,
     host_state: Any,
     session_opener: SessionOpener,
     project: str | None = None,
@@ -398,7 +451,9 @@ def build_engine(
     * *findings_sink* is where a routed analysis report is recorded. Defaulting
       it lands every report in :class:`~.analysis.RecordingFindingsSink`, whose
       rows die with the process; requiring it means the durable sink has exactly
-      one place to be passed and no silent fallback to memory.
+      one place to be passed and no silent fallback to memory. A graph that
+      drives runs passes :data:`DURABLE_FINDINGS` — or, better, is built by
+      :func:`build_run_engine`, which passes it for the caller.
     * *host_state* is the gateway state the notifier resolves its bus from.
       ``None`` is a legitimate value — a process with no bus cannot deliver, and
       the notifier reports that through :attr:`HostNotifier.available` — but it
@@ -438,7 +493,17 @@ def build_engine(
     # call the graph is complete in shape and empty in effect.
     register_builtins(registry, model_resolver=model_resolver)
 
-    analysis = AnalysisEngine(registry, findings_sink=findings_sink)
+    analysis = AnalysisEngine(
+        registry,
+        # The marker is resolved here and only here, because this is the first
+        # moment the store exists: a caller resolving it earlier would have had to
+        # open a second store over the same database.
+        findings_sink=(
+            StateFindingsSink(state)
+            if isinstance(findings_sink, DurableFindings)
+            else findings_sink
+        ),
+    )
     notifier = HostNotifier(config, project=project, state=host_state)
     seeder = SessionSeeder(
         config,
@@ -481,4 +546,46 @@ def build_engine(
         machine=machine,
         review_queue=review_queue,
         _seeder=seeder,
+    )
+
+
+def build_run_engine(
+    *,
+    model_resolver: ModelResolver,
+    host_state: Any,
+    session_opener: SessionOpener,
+    project: str | None = None,
+    state_root: str | Path | None = None,
+    audit_root: str | Path | None = None,
+    config_root: str | Path | None = None,
+) -> EngineGraph:
+    """Assemble the engine for a surface that DRIVES RUNS. No sink to choose.
+
+    The same graph :func:`build_engine` builds, with one seam settled rather than
+    offered: analysis findings land in the durable store, keyed to the run they
+    were found for. That is not a convenience. A run's findings are read back by a
+    reviewer — the Review_Queue projects them onto the run's entry — so a run-path
+    graph holding an in-memory sink loses the analyzer's verdict at process exit,
+    and one holding the MCP surface's refusing sink loses it louder and no less
+    completely.
+
+    There is deliberately no ``findings_sink`` parameter here. The alternatives a
+    caller could otherwise pass are all wrong on this path and two of them look
+    right: :class:`~.analysis.RecordingFindingsSink` is what ``AnalysisEngine``
+    itself defaults to, and the engine-MCP surface's refusing sink is the spelling
+    a reader is most likely to copy, because it is the only non-test
+    ``build_engine`` call in the tree. Removing the parameter removes the choice.
+
+    Everything else — the required host seams, the roots defaulting to the app's
+    real data home — is :func:`build_engine`'s, unchanged.
+    """
+    return build_engine(
+        model_resolver=model_resolver,
+        findings_sink=DURABLE_FINDINGS,
+        host_state=host_state,
+        session_opener=session_opener,
+        project=project,
+        state_root=state_root,
+        audit_root=audit_root,
+        config_root=config_root,
     )

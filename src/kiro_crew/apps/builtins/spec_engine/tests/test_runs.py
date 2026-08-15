@@ -955,6 +955,30 @@ class RecordingAnnouncer:
         return object()
 
 
+class RefusingAuditLog(AuditLog):
+    """An audit log that refuses one event and records the rest.
+
+    Narrow on purpose. A log that refused everything would fail the transition's
+    own append, which is documented to surface, and the run would never reach the
+    park this is about.
+    """
+
+    def __init__(self, *, root: Path, refuse: str) -> None:
+        super().__init__(root=root)
+        self._refuse = refuse
+        self.refused = 0
+
+    def append(self, ref: SpecRef, event: str, **kwargs: Any) -> Any:
+        if event == self._refuse:
+            self.refused += 1
+            # What the real log raises when it cannot write: an OSError on the
+            # append is wrapped into StatePersistenceError. (A chmod after a
+            # successful write can still surface a bare OSError, which is why the
+            # catch under test is by class rather than by tuple.)
+            raise StatePersistenceError("the audit log is not writable")
+        return super().append(ref, event, **kwargs)
+
+
 class TestAwaitingReviewIsAnnounced:
     """A run that parks on a person says so, and cannot be parked silently.
 
@@ -1018,3 +1042,58 @@ class TestAwaitingReviewIsAnnounced:
         machine.transition(ref, "run-3", RunState.AUTHORING)
         machine.transition(ref, "run-3", RunState.AWAITING_REVIEW)
         assert machine.state_of("run-3") is RunState.AWAITING_REVIEW
+
+    def test_a_failing_announcer_leaves_the_failure_on_the_runs_audit_trail(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        """Swallowed is not unrecorded.
+
+        The seeder records its own delivery failure, because a channel that will
+        not take the notice arrives as ``NotificationUndelivered`` and never
+        reaches this catch. What does reach it is a fault inside the announcer —
+        the notifier's construction, the channel resolution, the seeder's own audit
+        append — and that used to produce a log line and nothing else, leaving an
+        operator reading the trail with a park, no notice, and no reason.
+        """
+        announcer = RecordingAnnouncer(fail=True)
+        machine = self.parked(store, config, audit, ref, announcer)
+
+        failures = [
+            entry for entry in audit.read(ref) if entry.event == runs.RUN_ANNOUNCE_FAILED_EVENT
+        ]
+
+        assert len(failures) == 1
+        assert failures[0].run == "run-1"
+        assert failures[0].detail is not None
+        # The class and the message, so the trail distinguishes a channel outage
+        # from a bug in the announcer without anyone reading the gateway log.
+        assert "RuntimeError" in failures[0].detail["error"]
+        assert machine.state_of("run-1") is RunState.AWAITING_REVIEW
+
+    def test_a_successful_announcement_records_no_failure(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        # The non-vacuity half: the event is written by the catch, not by the park.
+        self.parked(store, config, audit, ref, RecordingAnnouncer())
+
+        events = [entry.event for entry in audit.read(ref)]
+
+        assert runs.RUN_ANNOUNCE_FAILED_EVENT not in events
+
+    def test_an_audit_log_that_cannot_record_the_failure_still_does_not_unwind(
+        self, store: StateStore, config: ConfigStore, state_dir: Path, ref: SpecRef
+    ) -> None:
+        """The nested catch, exercised by the thing it exists for.
+
+        ``append_audit`` deliberately lets a failure surface, and the new append
+        runs inside an ``except`` block — so an unwritable audit log would replace
+        the swallowed notice failure with a raised one and unwind a transition that
+        is already durable. This log refuses only the failure event, so the
+        transition's own record still lands and the park is reached the way a real
+        run reaches it.
+        """
+        log = RefusingAuditLog(root=state_dir, refuse=runs.RUN_ANNOUNCE_FAILED_EVENT)
+        machine = self.parked(store, config, log, ref, RecordingAnnouncer(fail=True))
+
+        assert log.refused == 1, "the failure append was never attempted"
+        assert machine.state_of("run-1") is RunState.AWAITING_REVIEW

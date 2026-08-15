@@ -79,7 +79,9 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch.dispatch import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.watch.items import WatchedItem
 
-from .test_intake_screening import INJECTION_BODY
+from .test_intake_screening import (
+    INJECTION_BODY,
+)
 from .test_intake_screening import SOURCE as SCREENED_SOURCE
 from .test_intake_screening import (
     SuspectProvider,

@@ -21,6 +21,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.analysis import (
     AnalysisEngine,
     AnalysisReport,
     RecordingFindingsSink,
+    StateFindingsSink,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyDecision, AutonomyLevel
@@ -39,10 +40,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.capabilities.registry import (
     RecordingCostSink,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.composition import (
+    DURABLE_FINDINGS,
     EngineGraph,
     IncompleteEngineGraph,
     RunPrevented,
     build_engine,
+    build_run_engine,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import resolve_authority
@@ -66,6 +69,8 @@ from kiro_crew.apps.builtins.spec_engine.engine.seeder import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
+from .test_analysis_wiring import author_spec
+
 PROJECT = "acme"
 SOURCE = "manual"
 MODELS = ("host-model-a", "host-model-b")
@@ -88,6 +93,18 @@ class CountingFindingsSink:
 
 def models() -> tuple[str, ...]:
     return MODELS
+
+
+def analysable_spec(tmp_path: Path) -> SpecRef:
+    """A spec the bundled analyzer has something to report about.
+
+    Its tasks document claims no requirement, so the structural analyzer returns
+    the uncovered criteria. That matters for the durability assertion: an analysis
+    that found nothing would agree with a sink that recorded nothing.
+    """
+    project = tmp_path / "analysed"
+    author_spec(project / ".kiro" / "specs" / "example")
+    return SpecRef.of(project, "example")
 
 
 class RecordingOpener:
@@ -191,12 +208,12 @@ class TestBuiltinsAreRegistered:
 
 
 class TestFindingsSinkIsRequired:
-    """The seam that has no durable implementation yet, kept from defaulting.
+    """The seam a caller must state, and the one a run path is not asked about.
 
-    The durable ``analysis_findings`` table is not built, so the graph cannot
-    hand :class:`AnalysisEngine` a durable sink today. What it can do is refuse
-    to choose one silently, so that when the table lands there is exactly one
-    place to pass it.
+    ``build_engine`` refuses to choose a sink silently, so the durable one has
+    exactly one place to be passed. ``build_run_engine`` goes further and removes
+    the choice, which is the subject of
+    :class:`TestARunPathGraphRecordsFindingsDurably`.
     """
 
     def test_the_supplied_sink_is_the_one_the_analysis_engine_holds(self, tmp_path: Path) -> None:
@@ -215,6 +232,70 @@ class TestFindingsSinkIsRequired:
         """An untyped caller passing ``None`` must not land on the memory default."""
         with pytest.raises(ValueError):
             build(tmp_path, findings_sink=None)
+
+
+class TestARunPathGraphRecordsFindingsDurably:
+    """The construction obligation for the first graph that drives runs.
+
+    Nothing here is a repair: ``build_engine`` already requires the sink and the
+    graph invariant already refuses the in-memory one by type. What was missing was
+    the *construction* — a run path with the durable sink actually passed — and a
+    test that fails if a later change swaps it for either of the two sinks that
+    look plausible on that path: ``RecordingFindingsSink``, which is what
+    ``AnalysisEngine`` defaults to, and the engine-MCP surface's refusing sink,
+    which is the only non-test spelling in the tree and therefore the one a reader
+    copies.
+
+    The durability claim is stated the way the in-memory sink cannot satisfy it: a
+    second store opened over the same database reads the rows back. The report is
+    asserted non-empty first, because an analysis that found nothing would agree
+    with a sink that recorded nothing.
+    """
+
+    def run_graph(self, tmp_path: Path) -> EngineGraph:
+        return build_run_engine(
+            model_resolver=models,
+            host_state=None,
+            session_opener=RecordingOpener(),
+            project=PROJECT,
+            state_root=tmp_path / "state",
+            audit_root=tmp_path / "audit",
+            config_root=tmp_path / "config",
+        )
+
+    def test_the_run_path_graph_holds_the_durable_sink_over_its_own_store(
+        self, tmp_path: Path
+    ) -> None:
+        graph = self.run_graph(tmp_path)
+
+        sink = graph.analysis.findings_sink
+        assert isinstance(sink, StateFindingsSink)
+        # Over the graph's OWN store, not a second one opened on the same path: two
+        # stores is two connections and two ideas of where a run's rows live.
+        assert getattr(sink, "_state") is graph.state
+
+    def test_the_findings_a_run_path_graph_records_survive_a_reopened_store(
+        self, tmp_path: Path
+    ) -> None:
+        graph = self.run_graph(tmp_path)
+        ref = analysable_spec(tmp_path)
+
+        report = graph.analysis.analyze(ref, run="run-1")
+
+        assert report.result.findings, "the analyzer found nothing, so nothing was recorded"
+        reopened = StateStore(root=graph.state.root)
+        stored = reopened.list_analysis_findings(run="run-1")
+        assert [record.to_review_row() for record in stored] == list(report.review_rows("run-1"))
+
+    def test_the_run_path_construction_offers_no_sink_to_get_wrong(self) -> None:
+        """The parameter is absent, not defaulted: there is nothing to pass."""
+        assert "findings_sink" not in inspect.signature(build_run_engine).parameters
+
+    def test_the_marker_is_not_itself_a_sink(self) -> None:
+        # If the marker ever grew a ``record`` it could be mistaken for a sink and
+        # travel into a graph, which would record nothing while type-checking.
+        assert not hasattr(DURABLE_FINDINGS, "record")
+        assert not isinstance(DURABLE_FINDINGS, RecordingFindingsSink)
 
 
 class TestCostAttributionIsDurable:
@@ -650,14 +731,35 @@ class TestAPartialGraphIsUnconstructable:
             dataclasses.replace(graph, audit=AuditLog(root=tmp_path / "second-audit"))
         assert "audit log" in str(caught.value)
 
+    def test_replace_cannot_leave_the_graph_scoped_to_another_project(
+        self, tmp_path: Path
+    ) -> None:
+        """A graph's project has to agree with the one its collaborators baked in.
+
+        ``replace(graph, project=...)`` rebuilds nothing: the machine, registry and
+        notifier keep the project they were constructed with. The result gates and
+        notifies under one project while auditing and metering under another, and
+        because every setting is resolved per project that is two effective
+        configurations for one run.
+        """
+        graph = build(tmp_path)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(graph, project="other")
+        assert "not this graph's" in str(caught.value)
+
     def test_the_built_graph_passes_its_own_invariant(self, tmp_path: Path) -> None:
         """The check is not vacuous in the other direction: replace() still works.
 
         A ``replace`` that changes nothing the invariant covers has to succeed, or
-        the check would be a ban on ``replace`` rather than on a partial graph.
+        the check would be a ban on ``replace`` rather than on a partial graph. The
+        control passes the values already in place — previously it passed a
+        different ``project``, which is not a no-op at all but the incoherent graph
+        the test above now pins.
         """
         graph = build(tmp_path)
-        assert dataclasses.replace(graph, project="other").registry is graph.registry
+        unchanged = dataclasses.replace(graph, project=graph.project, state=graph.state)
+        assert unchanged.registry is graph.registry
+        assert unchanged.machine is graph.machine
 
 
 def worker(*, task: str, dispatch: Dispatch, context: RunContext) -> TaskResult:
