@@ -3847,6 +3847,7 @@
         "release": "Autoriser à nouveau le travail non supervisé",
         "release_resumes_nothing": "La libération permet de démarrer de nouveaux travaux. Elle ne reprend rien de ce qui a été mis en pause.",
         "reset": "Réinitialiser",
+        "reset_role": "Ne plus imposer {{setting}}, afin que le rôle hérite",
         "reset_setting": "Ramener {{setting}} à sa valeur par défaut livrée",
         "role_effort": "Effort",
         "role_model": "Modèle",

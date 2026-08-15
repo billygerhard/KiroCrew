@@ -3847,6 +3847,7 @@
         "release": "Permitir de nuevo el trabajo desatendido",
         "release_resumes_nothing": "Liberar permite que empiece trabajo nuevo. No reanuda nada que se haya aparcado.",
         "reset": "Restablecer",
+        "reset_role": "Dejar de fijar {{setting}} para que el rol herede",
         "reset_setting": "Devolver {{setting}} a su valor predeterminado de fábrica",
         "role_effort": "Esfuerzo",
         "role_model": "Modelo",

@@ -3786,6 +3786,7 @@
         "release": "Unbeaufsichtigte Arbeit wieder zulassen",
         "release_resumes_nothing": "Die Freigabe erlaubt neue Arbeit. Sie setzt nichts fort, was geparkt wurde.",
         "reset": "Zurücksetzen",
+        "reset_role": "Festlegung von {{setting}} aufheben, damit die Rolle erbt",
         "reset_setting": "{{setting}} auf den mitgelieferten Standard zurücksetzen",
         "role_effort": "Aufwand",
         "role_model": "Modell",

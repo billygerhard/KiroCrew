@@ -448,7 +448,7 @@ describe('EngineConfigEditor', () => {
     expect(screen.getByRole('button', { name: 'Save configuration' })).toBeDisabled()
 
     await userEvent.click(
-      screen.getByRole('button', { name: 'Return thrifty.review to its shipped default' }),
+      screen.getByRole('button', { name: 'Stop pinning thrifty.review, so the role inherits' }),
     )
     await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }))
 

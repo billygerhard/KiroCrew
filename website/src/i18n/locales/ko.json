@@ -3725,6 +3725,7 @@
         "release": "무인 작업 다시 허용",
         "release_resumes_nothing": "해제하면 새 작업을 시작할 수 있습니다. 중지된 작업은 재개되지 않습니다.",
         "reset": "초기화",
+        "reset_role": "{{setting}} 고정을 해제하여 역할이 상속하도록 합니다",
         "reset_setting": "{{setting}}을(를) 기본값으로 되돌리기",
         "role_effort": "노력 수준",
         "role_model": "모델",

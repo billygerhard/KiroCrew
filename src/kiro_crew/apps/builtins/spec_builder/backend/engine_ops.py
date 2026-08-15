@@ -234,8 +234,16 @@ async def handle_get_config(request: web.Request) -> web.Response:
     source = request.query.get("source") or None
     store = _config_store()
     try:
-        resolved = store.effective_settings(project=project, source=source)
-        document = store.document()
+        # Off the loop like the write below it: these read the config document and
+        # the state store from disk, so they are I/O on a thread that must not
+        # block. Cheaper than the write -- no exclusive lock -- but the convention
+        # is the convention.
+        resolved, document = await asyncio.to_thread(
+            lambda: (
+                store.effective_settings(project=project, source=source),
+                store.document(),
+            )
+        )
     except ConfigValidationError as exc:
         # A stored value the registry refuses. Reported rather than silently
         # replaced by the default: the operator who hand-edited an out-of-range
@@ -320,7 +328,13 @@ async def handle_put_config(request: web.Request) -> web.Response:
         return _bad_request("bad_patch", "patch must be a JSON object")
     actor = str(request.get("user") or "")
     try:
-        document = _config_store().write(patch, surface=DASHBOARD_SURFACE)
+        # Off the loop: this write takes a blocking EXCLUSIVE inter-process lock
+        # and then does mkdir/chmod/atomic-write, so on the loop a lock held by
+        # anything else stalls every session, app and heartbeat in the process --
+        # not just this request. Same convention the kill-switch handlers follow.
+        document = await asyncio.to_thread(
+            lambda: _config_store().write(patch, surface=DASHBOARD_SURFACE)
+        )
     except ConfigValidationError as exc:
         return _bad_request(
             "config_invalid",
@@ -356,9 +370,7 @@ async def handle_get_workflow_origins(request: web.Request) -> web.Response:
     project = request.query.get("project") or None
     store = _config_store()
     try:
-        workflow = DeliveryWorkflow.load(store, project=project)
-        selection = workflow.selected_preset()
-        rows = [origin.to_json_object() for origin in stage_origins(workflow)]
+        workflow, selection, rows = await asyncio.to_thread(_workflow_origin_rows, store, project)
     except ConfigValidationError as exc:
         # A selected preset that resolves to nothing, most often. Reported as the
         # engine's refusal rather than as an empty workflow: "no stages" and "the
@@ -418,6 +430,23 @@ async def handle_get_run_spend(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+def _workflow_origin_rows(
+    store: Any, project: str | None
+) -> tuple[DeliveryWorkflow, Any, list[dict[str, Any]]]:
+    """Load the workflow and project its per-stage origins, off the event loop.
+
+    One function because the three steps are one disk read followed by pure
+    derivation, and splitting them would put the load on a thread and the
+    derivation back on the loop for no gain.
+    """
+    workflow = DeliveryWorkflow.load(store, project=project)
+    return (
+        workflow,
+        workflow.selected_preset(),
+        [origin.to_json_object() for origin in stage_origins(workflow)],
+    )
+
+
 def _run_spend_payload(store: engine_state.StateStore, run_id: str) -> dict[str, Any] | None:
     """BLOCKING -- one run's attributed spend and the ceiling in force for it."""
     record = store.get_run(run_id)
@@ -465,8 +494,10 @@ async def handle_get_kill_switch(request: web.Request) -> web.Response:
     from . import routes
 
     store, _audit_log = routes._engine_store()
-    switch = engine_switch.KillSwitch(store.root)
-    records = stoppable_runs(store)
+    # Off the loop: a file read plus a database query, small but still I/O.
+    switch, records = await asyncio.to_thread(
+        lambda: (engine_switch.KillSwitch(store.root), stoppable_runs(store))
+    )
     rows = [
         {
             "run_id": record.run_id,
@@ -621,7 +652,11 @@ async def handle_get_queue(request: web.Request) -> web.Response:
     store, audit_log = routes._engine_store()
     project = request.query.get("project") or None
     machine = engine_runs.RunMachine(store, _config_store(), audit=audit_log)
-    snapshot = engine_review_queue.ReviewQueue(machine).snapshot(project=project)
+    # Off the loop: the snapshot walks every run row and reads each one's stored
+    # analysis findings, so it is the heaviest read on this surface.
+    snapshot = await asyncio.to_thread(
+        lambda: engine_review_queue.ReviewQueue(machine).snapshot(project=project)
+    )
     payload = snapshot.to_json_object()
     payload["total_credits"] = round(sum(entry.cost_credits for entry in snapshot), 4)
     return web.json_response(payload)

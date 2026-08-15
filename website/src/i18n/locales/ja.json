@@ -3725,6 +3725,7 @@
         "release": "無人実行を再び許可",
         "release_resumes_nothing": "解除すると新しい作業を開始できます。停止された作業は再開されません。",
         "reset": "リセット",
+        "reset_role": "{{setting}} の固定をやめ、ロールに継承させる",
         "reset_setting": "{{setting}} を出荷時の既定値に戻す",
         "role_effort": "労力",
         "role_model": "モデル",

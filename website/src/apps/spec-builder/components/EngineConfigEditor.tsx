@@ -163,10 +163,16 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
       // model emptied and then reset away would leave the blank edit pending, and
       // the blank-model guard would keep blocking a save the operator had already
       // resolved -- the guard's own advice made unfollowable by bookkeeping.
+      //
+      // Compared SEGMENT BY SEGMENT rather than by dotted prefix: nothing forbids
+      // a dot inside a profile name, so a string prefix could match a sibling
+      // that merely reads like a descendant and silently drop its edit.
       if (value === null) {
-        const prefix = editKey(path)
-        for (const key of [...next.keys()]) {
-          if (key !== prefix && key.startsWith(`${prefix}.`)) next.delete(key)
+        for (const [key, edit] of [...next.entries()]) {
+          const inside =
+            edit.path.length > path.length &&
+            path.every((segment, index) => edit.path[index] === segment)
+          if (inside) next.delete(key)
         }
       }
       next.set(editKey(path), { path, value })
@@ -423,7 +429,7 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
                           {i18nT('apps.specBuilder.engineOps.reset')}
                         </>
                       }
-                      ariaLabel={i18nT('apps.specBuilder.engineOps.reset_setting', {
+                      ariaLabel={i18nT('apps.specBuilder.engineOps.reset_role', {
                         setting: `${profileName}.${role}`,
                       })}
                       onClick={() =>

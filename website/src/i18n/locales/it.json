@@ -3847,6 +3847,7 @@
         "release": "Consenti di nuovo il lavoro non presidiato",
         "release_resumes_nothing": "Il rilascio consente l'avvio di nuovo lavoro. Non riprende nulla di ciò che è stato messo in pausa.",
         "reset": "Reimposta",
+        "reset_role": "Non fissare più {{setting}}, così il ruolo eredita",
         "reset_setting": "Riporta {{setting}} al valore predefinito di fabbrica",
         "role_effort": "Impegno",
         "role_model": "Modello",

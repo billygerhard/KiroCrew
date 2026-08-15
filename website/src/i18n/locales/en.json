@@ -3115,6 +3115,7 @@
         "bool_true": "Enabled",
         "bool_false": "Disabled",
         "reset": "Reset",
+        "reset_role": "Stop pinning {{setting}}, so the role inherits",
         "reset_setting": "Return {{setting}} to its shipped default",
         "save": "Save configuration",
         "unsaved": "Unsaved edits are pending.",
