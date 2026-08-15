@@ -463,7 +463,7 @@ class TestTheAuthorityRendersForASurface:
         authority = authority_for(admit(store, ref, level="execution"))
 
         with pytest.raises(Exception):
-            authority.decision = None  # type: ignore[misc]
+            authority.decision = None  # type: ignore[assignment,misc]
         assert isinstance(authority, ResumeAuthority)
 
 
