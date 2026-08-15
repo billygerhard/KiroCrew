@@ -52,6 +52,9 @@ class MockCronJob:
     user_paused: bool = False
     every_secs: int | None = None
     cron_expr: str | None = None
+    # Per-job script/command ceiling, as CronService.add_job takes it: 0 means
+    # the host default. Mirrored here so the SDK's pass-through is exercised.
+    timeout: int = 0
 
 
 class MockCronService:

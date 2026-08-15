@@ -205,6 +205,7 @@ class CronSDK:
         silent: bool,
         enabled: bool,
         approval_mode: str = "",
+        timeout: int = 0,
     ) -> dict[str, Any]:
         """Build the kwargs common to the sync/async ``CronService.add_job``.
 
@@ -231,6 +232,11 @@ class CronSDK:
             silent=silent,
             enabled=enabled,
             approval_mode=clamp_posture(self._app_name, approval_mode),
+            # Per-job script/command ceiling. 0 keeps the host default, which is
+            # shorter than a configured poll command may legitimately take: a job
+            # left at the default would be killed mid-run and recorded as a
+            # failure of the work rather than of the schedule.
+            timeout=timeout,
             created_by=self._owner_prefix,
         )
 
@@ -252,6 +258,7 @@ class CronSDK:
         silent: bool = False,
         enabled: bool = True,
         approval_mode: str = "",
+        timeout: int = 0,
     ) -> Any:
         """Create a cron job owned by this app. **Synchronous** (preserves the
         published SDK contract). See :meth:`add_job_async` for the loop-native
@@ -271,7 +278,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled, approval_mode=approval_mode,
+                enabled=enabled, approval_mode=approval_mode, timeout=timeout,
             ),
         )
         self._audit_add(job)
@@ -293,6 +300,7 @@ class CronSDK:
         silent: bool = False,
         enabled: bool = True,
         approval_mode: str = "",
+        timeout: int = 0,
     ) -> Any:
         """Event-loop-native :meth:`add_job`: routes through
         ``CronService.add_job_async`` (bounded store-lock spin offloaded to a
@@ -306,7 +314,7 @@ class CronSDK:
                 every_secs=every_secs, cron_expr=cron_expr, agent=agent,
                 command=command, script=script, agent_sequence=agent_sequence,
                 env=env, persistent_session=persistent_session, silent=silent,
-                enabled=enabled, approval_mode=approval_mode,
+                enabled=enabled, approval_mode=approval_mode, timeout=timeout,
             ),
         )
         self._audit_add(job)
