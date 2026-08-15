@@ -44,6 +44,7 @@ from ...spec_engine.engine import documents as engine_documents
 from ...spec_engine.engine import phases as engine_phases
 from ...spec_engine.engine import spec_types as engine_spec_types
 from ...spec_engine.engine import state as engine_state
+from . import engine_ops
 
 try:
     from kiro_crew.security import (
@@ -4117,4 +4118,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post(f"{base}/specs/{{name}}/execute", _require_enabled(_handle_handoff))
     app.router.add_post(f"{base}/specs/{{name}}/stop", _require_enabled(_handle_stop_execution))
     app.router.add_delete(f"{base}/specs/{{name}}", _require_enabled(_handle_delete))
+    # The operator surfaces: effective configuration, per-run spend, and the stop
+    # control. Registered from their own module and handed this app's
+    # ``_require_enabled`` so they sit behind the one enablement gate rather than
+    # a second spelling of it.
+    engine_ops.register_engine_routes(app, base, _require_enabled)
     logger.info("spec-builder: registered app routes under %s", base)
