@@ -18,12 +18,20 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
+from kiro_crew.apps.builtins.spec_engine.engine.config import (
+    CONFIG_ONLY_PATHS,
+    ConfigStore,
+    ConfigWriteRefused,
+    ConfigWriteSurface,
+    config_only_paths,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.state import (
     CLAIM_DISPATCH,
     CLAIM_WRITEBACK,
@@ -34,6 +42,10 @@ from kiro_crew.apps.builtins.spec_engine.engine.state import (
 )
 
 from .conftest import NATIVE_SPEC_FILES, make_spec_dir, spec_dir_snapshot
+
+#: A surface no operator confirmed: what an MCP tool call writes through. The
+#: fenced sections exist to be unreachable from here.
+TOOL_SURFACE = ConfigWriteSurface("mcp-tool")
 
 #: Hypothesis examples per property. Each example runs several SQLite
 #: transactions, so this trades a little coverage for a suite that stays fast
@@ -210,6 +222,160 @@ def test_a_state_root_anywhere_inside_a_spec_tree_is_refused(tmp_path: Path, seg
     with pytest.raises(StatePersistenceError) as raised:
         StateStore(root=tmp_path / segment / "state")
     assert "spec tree" in str(raised.value)
+
+
+# --- The spec-tree fence under a second spelling ----------------------------
+#
+# The parametrized case above spells the spec tree the obvious way. A path is
+# not its spelling: the same directory is reachable through a dot segment, a
+# doubled slash, a parent traversal, a different case on a case-insensitive
+# filesystem, and a symlink. The fence is what keeps engine state out of the
+# interop contract, so it has to hold for every spelling of the same place, and
+# this engine has already shipped a defect in exactly this area.
+
+#: Spellings that name the spec tree without spelling it literally, and that
+#: ``PurePath`` normalisation collapses back to it.
+_NORMALISING_SPELLINGS = st.sampled_from(
+    [
+        ".kiro/specs/./state",
+        ".kiro/specs//state",
+        ".kiro/specs/example/../state",
+        ".kiro/./specs/state",
+        ".kiro/specs/example/./deeper/../state",
+    ]
+)
+
+
+def _case_insensitive(root: Path) -> bool:
+    """Whether *root*'s filesystem treats two spellings as one directory."""
+    probe = root / "CaseProbe"
+    probe.mkdir(exist_ok=True)
+    return (root / "caseprobe").is_dir()
+
+
+@settings(
+    max_examples=MAX_EXAMPLES,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(spelling=_NORMALISING_SPELLINGS)
+def test_a_normalised_spelling_of_a_spec_tree_is_refused(tmp_path: Path, spelling: str) -> None:
+    """A dot segment, a doubled slash or a traversal does not evade the fence."""
+    example = tmp_path / uuid.uuid4().hex
+    example.mkdir()
+
+    with pytest.raises(StatePersistenceError) as raised:
+        StateStore(root=Path(str(example) + "/" + spelling))
+    assert "spec tree" in str(raised.value)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect: reject_spec_tree_path compares path parts against the "
+        "lowercase literals ('.kiro', 'specs'), so on a case-insensitive "
+        "filesystem -- macOS and Windows defaults -- a state root spelled "
+        "'.KIRO/SPECS' passes the fence while being the same directory as "
+        "'.kiro/specs'. Verified: state.db lands at .kiro/specs/state/state.db, "
+        "inside the interop contract. Reported, not fixed: engine/state.py "
+        "belongs to another task."
+    ),
+)
+def test_a_case_spelled_spec_tree_is_refused_where_case_does_not_distinguish(
+    tmp_path: Path,
+) -> None:
+    """On a case-insensitive filesystem, two spellings are one directory.
+
+    Skipped where case distinguishes directories, because there ``.KIRO/SPECS``
+    is genuinely somewhere else and storing state in it is allowed. Asserting a
+    refusal there would be asserting the wrong thing rather than finding a defect.
+    """
+    if not _case_insensitive(tmp_path):
+        pytest.skip("filesystem is case-sensitive, so .KIRO/SPECS is a different directory")
+    project = tmp_path / "project"
+    (project / ".kiro" / "specs" / "example").mkdir(parents=True)
+
+    with pytest.raises(StatePersistenceError):
+        StateStore(root=project / ".KIRO" / "SPECS" / "state")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect: the fence matches lexical path parts and does not resolve "
+        "symlinks, so a state root whose parent is a symlink into a spec tree is "
+        "accepted. Verified: state.db lands at .kiro/specs/state/state.db through "
+        "the link. Reported, not fixed: engine/state.py belongs to another task."
+    ),
+)
+def test_a_state_root_reached_through_a_symlink_into_a_spec_tree_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A link is a second spelling of its target."""
+    project = tmp_path / "project"
+    specs = project / ".kiro" / "specs"
+    specs.mkdir(parents=True)
+    link = tmp_path / "linked-state"
+    try:
+        link.symlink_to(specs, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - unprivileged Windows
+        pytest.skip("this platform does not allow creating a directory symlink")
+
+    with pytest.raises(StatePersistenceError):
+        StateStore(root=link / "state")
+
+
+# --- The config-only fence, for any patch shape -----------------------------
+
+#: A project or source name a generated patch can be keyed by, including one that
+#: differs from another only by case: the fence's wildcard matches a key by
+#: identity, so a second spelling of a NAME must still be reported.
+_ENTRY_NAMES = st.sampled_from(["acme", "Acme", "acme ", "a.b", "*"])
+
+
+def _fenced_patch(path: str, name: str) -> dict[str, Any]:
+    """A patch that writes exactly *path*, expanding a ``*`` segment to *name*."""
+    node: Any = {"written": True}
+    for segment in reversed(path.split(".")):
+        node = {name if segment == "*" else segment: node}
+    return dict(node)
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(path=st.sampled_from(CONFIG_ONLY_PATHS), name=_ENTRY_NAMES)
+def test_every_fenced_path_is_reported_whatever_the_patch_is_keyed_by(path: str, name: str) -> None:
+    """A patch writing a fenced path is reported as writing it.
+
+    Generated over every fenced path rather than the handful a scripted case
+    lists, and over entry names including a case variant and one carrying
+    whitespace, because the wildcard segment matches whatever key is there and a
+    fence that only recognised tidy names would be a fence with a spelling.
+    """
+    reported = config_only_paths(_fenced_patch(path, name))
+
+    assert reported, f"{path} keyed by {name!r} was not reported as config-only"
+    expected = path.replace("*", name)
+    assert expected in reported
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(path=st.sampled_from(CONFIG_ONLY_PATHS), name=_ENTRY_NAMES)
+def test_a_fenced_patch_is_refused_from_a_surface_no_operator_confirmed(
+    tmp_path_factory: pytest.TempPathFactory, path: str, name: str
+) -> None:
+    """The report is enforced, not merely produced.
+
+    A path reported as config-only and then written anyway would be a fence that
+    describes itself accurately and stops nothing.
+    """
+    store = ConfigStore(tmp_path_factory.mktemp("fence") / "config")
+    patch = _fenced_patch(path, name)
+
+    with pytest.raises(ConfigWriteRefused) as raised:
+        store.write(patch, surface=TOOL_SURFACE)
+    assert set(raised.value.paths) == set(config_only_paths(patch))
+    # Nothing was written, so a refused write cannot have left a partial document.
+    assert not store.path.exists() or store.document().get(path.split(".")[0]) is None
 
 
 #: The key pool a claim trace runs over: two subjects of one scope, each with two
