@@ -158,7 +158,7 @@ def _plans(draw: st.DrawFn, *, sound: bool) -> tuple[str, dict[str, tuple[str, .
 @settings(max_examples=MAX_EXAMPLES, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(_plans(sound=True))
 def test_an_accepted_plan_never_makes_a_task_ready_before_its_dependencies(
-    plan: tuple[str, dict[str, tuple[str, ...]], list[str]]
+    plan: tuple[str, dict[str, tuple[str, ...]], list[str]],
 ) -> None:
     text, dependencies, _ = plan
     parsed = parse_tasks(text)
@@ -169,9 +169,7 @@ def test_an_accepted_plan_never_makes_a_task_ready_before_its_dependencies(
 
     schedule = schedule_of(parsed)
     assert schedule.usable, schedule.reason
-    position = {
-        task: index for index, wave in enumerate(schedule.waves) for task in wave.tasks
-    }
+    position = {task: index for index, wave in enumerate(schedule.waves) for task in wave.tasks}
 
     # Every declared edge crosses a wave boundary in the right direction, so
     # dispatching by wave satisfies it without the loop reading the edges.
@@ -193,7 +191,7 @@ def test_an_accepted_plan_never_makes_a_task_ready_before_its_dependencies(
 @settings(max_examples=MAX_EXAMPLES, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(_plans(sound=False))
 def test_a_plan_whose_edges_outrun_its_waves_is_refused(
-    plan: tuple[str, dict[str, tuple[str, ...]], list[str]]
+    plan: tuple[str, dict[str, tuple[str, ...]], list[str]],
 ) -> None:
     text, dependencies, _ = plan
     parsed = parse_tasks(text)
@@ -211,7 +209,7 @@ def test_a_plan_whose_edges_outrun_its_waves_is_refused(
 @settings(max_examples=MAX_EXAMPLES, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(_plans(sound=True))
 def test_the_schedule_holds_every_unfinished_leaf_exactly_once(
-    plan: tuple[str, dict[str, tuple[str, ...]], list[str]]
+    plan: tuple[str, dict[str, tuple[str, ...]], list[str]],
 ) -> None:
     """No task is silently dropped from, or duplicated in, the dispatch order."""
     text, _dependencies, expected = plan
