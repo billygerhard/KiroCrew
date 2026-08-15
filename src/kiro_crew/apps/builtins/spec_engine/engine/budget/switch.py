@@ -28,6 +28,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from kiro_crew.atomic_write import atomic_write
 
@@ -72,6 +73,24 @@ class KillSwitchState:
         who = self.initiator or "an operator"
         because = f": {self.reason}" if self.reason else ""
         return f"kill switch: engaged by {who} at {self.engaged_ts}{because}"
+
+    def to_json_object(self) -> dict[str, Any]:
+        """Shape the record for a surface that renders the stop control.
+
+        ``unreadable`` is carried rather than folded into ``engaged``, because a
+        surface offering a release has to distinguish the two: releasing an
+        operator's deliberate stop is a decision, while releasing a stop that is
+        in force because the record could not be parsed is a repair. Both read
+        engaged, which is the fail-closed direction and stays that way here.
+        """
+        return {
+            "engaged": self.engaged,
+            "initiator": self.initiator,
+            "reason": self.reason,
+            "engaged_ts": self.engaged_ts,
+            "unreadable": self.unreadable,
+            "description": self.describe(),
+        }
 
 
 class KillSwitch:

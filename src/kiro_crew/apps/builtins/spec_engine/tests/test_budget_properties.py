@@ -245,19 +245,6 @@ def test_an_unstamped_session_is_attributed_to_no_run_at_all(
         assert RunSessions(store).run_for(f"nobody-{role}") is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect: RunAccounting.spend bounds the shard scan at the run row's "
-        "creation date minus one day, so a session that recorded turns before that "
-        "window has its credits dropped from the run's total and they never count "
-        "against a ceiling. Shards are named by LOCAL date while created_ts is UTC, "
-        "so the one-day margin is also consumed entirely by the skew in a "
-        "negative-offset timezone during the evening -- the case the margin exists "
-        "for. Reported, not fixed: this property belongs to the test task and "
-        "engine/budget/ledger.py belongs to another."
-    ),
-)
 @_SETTINGS
 @given(credits=st.floats(min_value=0.5, max_value=10.0), days_back=st.integers(2, 6))
 def test_spend_recorded_before_the_run_row_existed_is_still_attributed(

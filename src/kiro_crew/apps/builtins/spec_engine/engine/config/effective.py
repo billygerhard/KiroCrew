@@ -64,6 +64,41 @@ class EffectiveValue:
         """Whether this value is the bundled default rather than a configured one."""
         return self.origin is ValueOrigin.BUNDLED_DEFAULT
 
+    def to_json_object(self) -> dict[str, Any]:
+        """Shape this value for a surface that has to show it and say where it came from.
+
+        Carries the registry's own description of the setting alongside the
+        resolved value: a surface rendering "4 (bundled default)" beside a
+        writable field needs the default, the bounds, and the scopes a write
+        would be accepted at, and every one of those is registry data. Joined
+        here rather than looked up again by each caller, so no surface grows a
+        second opinion about what this setting is -- and deliberately NOT a
+        second resolver: ``value``, ``origin`` and ``declared_at`` are passed
+        through from whatever :func:`resolve` decided, never recomputed.
+        """
+        setting = SETTINGS.get(self.key)
+        payload: dict[str, Any] = {
+            "key": self.key,
+            "value": self.value,
+            "origin": self.origin.value,
+            "declared_at": self.declared_at,
+            "is_default": self.is_default,
+        }
+        if setting is None:  # pragma: no cover - a value only exists for a registered key
+            return payload
+        payload.update(
+            {
+                "default": setting.default,
+                "summary": setting.summary,
+                "kind": setting.kind.__name__,
+                "scopes": sorted(scope.value for scope in setting.scopes),
+                "minimum": setting.minimum,
+                "maximum": setting.maximum,
+                "choices": list(setting.choices),
+            }
+        )
+        return payload
+
 
 def resolve(
     doc: Mapping[str, Any],

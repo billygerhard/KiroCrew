@@ -430,14 +430,28 @@ class RunAccounting:
     def spend(self, run_id: str) -> RunSpend:
         """Sum *run_id*'s consumption across every session it created.
 
-        The scan starts at the run's creation date, so an install with years of
-        shards is not re-read to answer for a run that started today. The bound
-        reaches back one day past the run's own date because shards are named for
-        the local day while run timestamps are UTC, and a run created either side
-        of local midnight would otherwise miss its first turns.
+        Every shard is scanned, deliberately, because the sessions are already
+        filtered by ownership and a date bound on top of that could only ever
+        subtract credits the run really spent.
+
+        There was such a bound -- the run row's date less one day -- and it was
+        unsound in two independent ways. A session can predate the run row it
+        belongs to by more than a day (an authoring session is open before the
+        run is created), and shards are named for the LOCAL day while the run
+        timestamp is UTC, so in a negative-offset timezone during the evening the
+        skew consumed the whole margin: exactly the case the margin existed for.
+        Either way the dropped credits never counted against the ceiling, which
+        turns a hard spend limit into one an unlucky clock can evade.
+
+        The cost is a wider read on an install with a long history. That is the
+        right trade for this particular number: it is the one the kill switch and
+        the run ceiling are enforced from, so it has to be complete rather than
+        cheap. If the read ever needs bounding again, bound it by something that
+        cannot be wrong -- a recorded timestamp on the session stamp itself --
+        rather than by inference from the run row's date.
         """
         sessions = self._sessions.sessions_for(run_id)
-        total = self._ledger.total_for(sessions, since=self._since(run_id))
+        total = self._ledger.total_for(sessions)
         return RunSpend(
             run_id=run_id,
             metered_credits=total.credits,
@@ -447,13 +461,3 @@ class RunAccounting:
             metered_sessions=total.sessions,
             records=total.records,
         )
-
-    def _since(self, run_id: str) -> date | None:
-        record = self._state.get_run(run_id)
-        if record is None:
-            return None
-        try:
-            created = datetime.fromisoformat(record.created_ts)
-        except ValueError:
-            return None
-        return date.fromordinal(created.date().toordinal() - 1)

@@ -741,3 +741,46 @@ def _marker_command(tmp_path: Path, marker: Path) -> list[str]:
         encoding="utf-8",
     )
     return [sys.executable, str(script)]
+
+
+class TestKillSwitchStateProjection:
+    """The shape a surface renders the stop control from.
+
+    Read back through :meth:`KillSwitch.read` in every case rather than from a
+    hand-built state, so the projection is of what is actually persisted: a
+    surface showing "released" over an engaged flag file is the one failure a
+    stop control cannot have.
+    """
+
+    def test_a_released_switch_projects_released(self, tmp_path: Path):
+        switch = KillSwitch(tmp_path)
+        payload = switch.read().to_json_object()
+        assert payload["engaged"] is False
+        assert payload["unreadable"] is False
+        assert payload["initiator"] == ""
+
+    def test_an_engaged_switch_projects_who_stopped_it_and_why(self, tmp_path: Path):
+        switch = KillSwitch(tmp_path)
+        switch.engage(initiator="ops", reason="runaway wave")
+        payload = switch.read().to_json_object()
+        assert payload["engaged"] is True
+        assert payload["initiator"] == "ops"
+        assert payload["reason"] == "runaway wave"
+        assert payload["engaged_ts"]
+        assert "ops" in payload["description"]
+
+    def test_an_unparseable_record_projects_engaged_and_says_it_is_doubt(self, tmp_path: Path):
+        # Fails closed, and reports WHY it is closed: a surface offering a release
+        # has to tell an operator's deliberate stop from a corrupt record, because
+        # releasing the second one is a repair rather than a decision.
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        (tmp_path / KILL_SWITCH_FILENAME).write_text("{not json", encoding="utf-8")
+        payload = KillSwitch(tmp_path).read().to_json_object()
+        assert payload["engaged"] is True
+        assert payload["unreadable"] is True
+
+    def test_the_projection_is_json_serialisable(self, tmp_path: Path):
+        switch = KillSwitch(tmp_path)
+        switch.engage(initiator="ops", reason="runaway wave")
+        payload = json.loads(json.dumps(switch.read().to_json_object()))
+        assert payload["engaged"] is True

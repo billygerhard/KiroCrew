@@ -196,3 +196,83 @@ class TestOrigin:
             for key, value in resolved.items():
                 assert value.value == SETTINGS[key].default
                 assert value.declared_at == (key if key in explicit else "")
+
+
+class TestEffectiveValueProjection:
+    """The shape a surface renders: the value in force, and where it came from.
+
+    Every assertion here reads the projection of a value the STORE resolved, not
+    one built by hand. A projection tested over a hand-made ``EffectiveValue``
+    would pass while the surface showed a number the engine does not use, which
+    is the one failure this projection exists to prevent.
+    """
+
+    def test_a_default_projects_as_a_default_with_no_declaration_site(self, store: ConfigStore):
+        payload = store.effective("concurrency.global_max_runs").to_json_object()
+        assert payload["origin"] == ValueOrigin.BUNDLED_DEFAULT.value
+        assert payload["is_default"] is True
+        # Empty rather than absent: a surface renders "shipped default" from the
+        # origin, and a missing key would make it guess.
+        assert payload["declared_at"] == ""
+        assert payload["value"] == payload["default"]
+
+    def test_an_override_projects_its_origin_and_the_path_it_was_read_from(
+        self, store: ConfigStore
+    ):
+        _save(store, {"concurrency": {"global_max_runs": 9}})
+        payload = store.effective("concurrency.global_max_runs").to_json_object()
+        assert payload["value"] == 9
+        assert payload["origin"] == ValueOrigin.APP_CONFIG.value
+        assert payload["is_default"] is False
+        assert payload["declared_at"] == "concurrency.global_max_runs"
+        # The bundled default travels beside the override, so a surface can offer
+        # "reset to shipped value" without a second read.
+        assert payload["default"] == SETTINGS["concurrency.global_max_runs"].default
+
+    def test_a_project_override_projects_the_narrower_origin_and_its_project_path(
+        self, store: ConfigStore
+    ):
+        _save(
+            store,
+            {
+                "concurrency": {"project_max_runs": 2},
+                "projects": {"web": {"concurrency": {"project_max_runs": 7}}},
+            },
+        )
+        payload = store.effective("concurrency.project_max_runs", project="web").to_json_object()
+        assert payload["value"] == 7
+        assert payload["origin"] == ValueOrigin.PROJECT_CONFIG.value
+        assert payload["declared_at"] == "projects.web.concurrency.project_max_runs"
+
+    def test_the_projection_carries_the_scopes_a_write_would_be_accepted_at(
+        self, store: ConfigStore
+    ):
+        # A surface that offered a project-scoped field for an app-only setting
+        # would collect an edit the write path then refuses. The scopes come from
+        # the registry, so the field the surface draws and the write the engine
+        # accepts are decided by one table.
+        payload = store.effective("concurrency.global_max_runs").to_json_object()
+        assert payload["scopes"] == ["app"]
+        project_scoped = store.effective("concurrency.project_max_runs").to_json_object()
+        assert project_scoped["scopes"] == ["app", "project"]
+
+    def test_every_registered_setting_projects_a_renderable_row(self, store: ConfigStore):
+        resolved = store.effective_settings()
+        assert set(resolved) == set(SETTINGS)
+        for key, value in resolved.items():
+            payload = value.to_json_object()
+            assert payload["key"] == key
+            # A row with no summary is a row a surface can only label with its
+            # dotted key, which is the field name it already has.
+            assert payload["summary"]
+            assert payload["kind"] in {"int", "float", "bool", "str"}
+            assert payload["value"] == value.value
+            assert payload["origin"] == value.origin.value
+
+    def test_the_projection_is_json_serialisable(self, store: ConfigStore):
+        _save(store, {"concurrency": {"global_max_runs": 9}})
+        rows = {k: v.to_json_object() for k, v in store.effective_settings().items()}
+        # Round-tripped rather than merely dumped: a value that serialises but
+        # comes back as something else (an Enum member stringified, say) would
+        # reach a surface as a label nobody chose.
+        assert json.loads(json.dumps(rows))["concurrency.global_max_runs"]["value"] == 9
