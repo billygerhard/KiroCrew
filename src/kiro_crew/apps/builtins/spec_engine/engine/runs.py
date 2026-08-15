@@ -1285,17 +1285,15 @@ class RunMachine:
     def _outstanding_gate(self, ref: SpecRef) -> str:
         """The gate the spec is waiting on, for the notice's body.
 
-        Derived from the spec's own documents and approvals rather than from the
-        run row, so the gate named in the notice is the one a reviewer will be
-        asked about. Best-effort: an unreadable spec yields no gate name and the
-        notice still goes out saying the run is waiting.
+        Best-effort: an unreadable spec yields no gate name and the notice still
+        goes out saying the run is waiting.
         """
         try:
-            gate = phases.derive_phase(self._store, ref).current_gate
+            gate = phases.outstanding_gate(self._store, ref)
         except Exception as exc:  # noqa: BLE001 - the notice matters more than the name
             logger.debug("could not derive the outstanding gate for %r: %s", ref.name, exc)
             return ""
-        return gate.gate if gate is not None else ""
+        return gate or ""
 
     def _item_feedback(self) -> Any:
         """The item-feedback poster, or ``None`` when this machine cannot post.

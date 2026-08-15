@@ -484,6 +484,21 @@ def derive_phase(store: StateStore, ref: SpecRef, *, spec_type: str | None = Non
     return PhaseState(ref=ref, spec_type=resolved_type, phase=phase, gates=tuple(gates))
 
 
+def outstanding_gate(store: StateStore, ref: SpecRef) -> str | None:
+    """The document gate *ref* is working on, or ``None`` when it has none left.
+
+    Derived from disk and recorded approvals, not from the cached phase column: a
+    person is being told which document to look at, and a cached value that
+    predates the last edit sends them to the wrong one.
+
+    One function rather than the same two lines wherever a gate name is needed —
+    the review queue's entries, the awaiting-review notice the run machine sends —
+    so those two cannot come to disagree about which gate a waiting run is on.
+    """
+    current = derive_phase(store, ref).current_gate
+    return current.gate if current is not None else None
+
+
 def _is_stale(approval: ApprovalRecord | None, digest: str | None) -> bool:
     """Whether *approval* still covers the document hashing to *digest*.
 

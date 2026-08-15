@@ -616,12 +616,10 @@ class ReviewQueue:
     def _outstanding_gate(self, ref: SpecRef) -> str | None:
         """The document gate the spec is working on, or ``None``.
 
-        Derived from disk, not from the cached phase column: the reviewer is
-        being told which document to look at, and a cached value that predates
-        the last edit sends them to the wrong one.
+        The shared derivation, so the gate this queue shows a reviewer is the same
+        one the awaiting-review notice named.
         """
-        current = phases.derive_phase(self._store, ref).current_gate
-        return current.gate if current is not None else None
+        return phases.outstanding_gate(self._store, ref)
 
     # -------------------------------------------------------------- archival
 
