@@ -3833,6 +3833,9 @@
         "domains_read_only": "Ces domaines sont affichés tels que configurés. Leur modification n'est pas encore disponible dans ce panneau."
       },
       "reviewQueue": {
+        "analysis_heading": "Résultats de l'analyse",
+        "analysis_none": "L'analyse n'a enregistré aucun constat pour ce critère.",
+        "analysis_unkeyed": "Constats ne nommant aucun critère déclaré",
         "clean": "Supprimer l’espace de travail",
         "cleanup_note": "Un identifiant de ligne d’espace de travail ne fait pas partie de la projection de la file. Prenez-le dans un rapport de démontage ou dans le journal d’audit.",
         "cleanup_section": "Nettoyage des espaces de travail",
@@ -3858,6 +3861,8 @@
         "state_stalled": "Bloqué",
         "teardown": "Démonter les espaces de travail",
         "teardown_incomplete": "Le démontage n'a pas pu supprimer tous les espaces de travail. Ceux qui ont été conservés sont listés ci-dessous.",
+        "teardown_stage_failed": "Tous les espaces de travail ont été supprimés, mais l'étape de démontage a échoué : {{reason}}",
+        "teardown_stage_unnamed": "l'étape n'a signalé aucun motif",
         "title": "File de revue",
         "workspace_id": "Identifiant de ligne d’espace de travail"
       }

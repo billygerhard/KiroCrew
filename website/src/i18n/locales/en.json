@@ -3089,6 +3089,9 @@
         "domains_read_only": "These domains are shown as configured. Editing them is not available on this panel yet."
       },
       "reviewQueue": {
+        "analysis_heading": "Analysis findings",
+        "analysis_none": "The analysis recorded no findings for this criterion.",
+        "analysis_unkeyed": "Findings that name no declared criterion",
         "clean": "Remove workspace",
         "cleanup_note": "A workspace row id is not part of the queue projection. Take it from a teardown report or the audit trail.",
         "cleanup_section": "Workspace cleanup",
@@ -3114,6 +3117,8 @@
         "state_stalled": "Stalled",
         "teardown": "Tear down workspaces",
         "teardown_incomplete": "The teardown could not remove every workspace. The ones it kept are listed below.",
+        "teardown_stage_failed": "Every workspace was removed, but the teardown stage failed: {{reason}}",
+        "teardown_stage_unnamed": "the stage reported no reason",
         "title": "Review queue",
         "workspace_id": "Workspace row id"
       }

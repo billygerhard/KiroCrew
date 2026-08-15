@@ -3711,6 +3711,9 @@
         "domains_read_only": "这些域按已配置的内容显示。此面板暂不支持编辑它们。"
       },
       "reviewQueue": {
+        "analysis_heading": "分析结果",
+        "analysis_none": "分析未针对此判定标准记录任何结论。",
+        "analysis_unkeyed": "未指明任何已声明判定标准的结论",
         "clean": "删除工作区",
         "cleanup_note": "工作区行 ID 不属于队列投影。请从拆除报告或审计记录中获取。",
         "cleanup_section": "工作区清理",
@@ -3736,6 +3739,8 @@
         "state_stalled": "停滞",
         "teardown": "拆除工作区",
         "teardown_incomplete": "本次清理未能删除所有工作区。保留下来的列在下方。",
+        "teardown_stage_failed": "所有工作区均已删除，但清理阶段失败：{{reason}}",
+        "teardown_stage_unnamed": "该阶段未报告原因",
         "title": "评审队列",
         "workspace_id": "工作区行 ID"
       }

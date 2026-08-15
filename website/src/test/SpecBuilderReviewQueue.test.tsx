@@ -237,6 +237,76 @@ describe('ReviewQueuePanel', () => {
     expect(screen.queryByText(/^Done\.$/)).toBeNull()
   })
 
+  it('shows the analysis findings the engine stored, grouped by criterion', async () => {
+    harness({
+      entries: [HELD_ROW],
+      grouped: {
+        awaiting_review: [
+          {
+            ...HELD_ROW,
+            analysis: [
+              {
+                criterion: '3.2',
+                keyed: true,
+                findings: [
+                  { kind: 'ambiguity', severity: 'warning', message: 'Two readings of "promptly".' },
+                ],
+              },
+              {
+                criterion: null,
+                keyed: false,
+                findings: [{ kind: 'coverage', severity: 'info', message: 'No test names this.' }],
+              },
+            ],
+          },
+        ],
+      },
+      total: 1,
+      total_credits: 2,
+    })
+    mount()
+
+    await waitFor(() => screen.getByText(/Analysis findings/i))
+    screen.getByText('3.2')
+    // The unkeyed group is named, not dropped -- a finding the provider could not
+    // key is still one a reviewer has to read.
+    screen.getByText(/name no declared criterion/i)
+    screen.getByText(/Two readings of "promptly"/i)
+    screen.getByText(/No test names this/i)
+  })
+
+  it('says nothing about analysis for a run that has none', async () => {
+    // The engine distinguishes "no analysis recorded" from "recorded no
+    // findings", so an absent array must not render as a clean bill of health.
+    harness()
+    mount()
+
+    await waitFor(() => screen.getByRole('region', { name: /Waiting for review/i }))
+    expect(screen.queryByText(/Analysis findings/i)).toBeNull()
+  })
+
+  it('names a stage failure as such rather than pointing at an empty kept list', async () => {
+    // complete:false covers two different failures. Every row went, but the
+    // teardown stage failed -- so the kept-rows wording would send the operator
+    // to a list with nothing in it.
+    harness(
+      QUEUE,
+      JSON.stringify({
+        ok: true,
+        complete: false,
+        report: { run_id: 'run-b', kept: [], removed: [{ workspace_id: 4 }], stage: 'failed', stage_reason: 'the cleanup command exited 1' },
+      }),
+    )
+    mount()
+
+    const buttons = await waitFor(() => screen.getAllByRole('button', { name: /Tear down workspaces/i }))
+    fireEvent.click(buttons[1])
+
+    await waitFor(() => screen.getByText(/the cleanup command exited 1/i))
+    expect(screen.queryByText(/could not remove every workspace/i)).toBeNull()
+    expect(screen.queryByText(/^Done\.$/)).toBeNull()
+  })
+
   it('cleans a workspace row by ledger id, which no queue row carries', async () => {
     const calls = harness(QUEUE, '{"ok":true,"removed":true}')
     mount()

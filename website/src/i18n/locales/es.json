@@ -3833,6 +3833,9 @@
         "domains_read_only": "Estos dominios se muestran tal como están configurados. Su edición aún no está disponible en este panel."
       },
       "reviewQueue": {
+        "analysis_heading": "Resultados del análisis",
+        "analysis_none": "El análisis no registró hallazgos para este criterio.",
+        "analysis_unkeyed": "Hallazgos que no nombran ningún criterio declarado",
         "clean": "Eliminar espacio de trabajo",
         "cleanup_note": "El identificador de fila del espacio de trabajo no forma parte de la proyección de la cola. Tómalo de un informe de desmontaje o del registro de auditoría.",
         "cleanup_section": "Limpieza de espacios de trabajo",
@@ -3858,6 +3861,8 @@
         "state_stalled": "Estancado",
         "teardown": "Desmontar espacios de trabajo",
         "teardown_incomplete": "El desmontaje no pudo eliminar todos los espacios de trabajo. Los conservados se enumeran abajo.",
+        "teardown_stage_failed": "Se eliminaron todos los espacios de trabajo, pero la etapa de desmontaje falló: {{reason}}",
+        "teardown_stage_unnamed": "la etapa no informó ningún motivo",
         "title": "Cola de revisión",
         "workspace_id": "Identificador de fila del espacio de trabajo"
       }

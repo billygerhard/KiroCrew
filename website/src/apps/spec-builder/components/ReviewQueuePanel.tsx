@@ -99,10 +99,23 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
       // and an incomplete teardown is neither -- work was done and some of it
       // could not be. No count in the line: the kept rows are listed with their
       // ids just below, which is both the number and the thing to act on.
+      //
+      // Two different failures share `complete: false`. The engine also refuses
+      // to call a teardown complete when its stage failed even though every
+      // ledger row went -- so pointing that case at a kept-rows retry would send
+      // the operator to an empty list. The stage's own reason is what to show.
+      const stageOnly = incomplete && rows.length === 0
       setOutcome(
-        incomplete
-          ? i18nT('apps.specBuilder.reviewQueue.teardown_incomplete')
-          : i18nT('apps.specBuilder.reviewQueue.done'),
+        !incomplete
+          ? i18nT('apps.specBuilder.reviewQueue.done')
+          : stageOnly
+            ? i18nT('apps.specBuilder.reviewQueue.teardown_stage_failed', {
+                reason:
+                  result.report?.stage_reason ||
+                  result.report?.stage ||
+                  i18nT('apps.specBuilder.reviewQueue.teardown_stage_unnamed'),
+              })
+            : i18nT('apps.specBuilder.reviewQueue.teardown_incomplete'),
       )
       void qc.invalidateQueries({ queryKey: ['spec-builder', 'engine-queue'] })
     },
@@ -160,7 +173,7 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((row) => (
+                  {rows.map((row) => [
                     <tr key={row.run_id}>
                       <td>{row.run_id}</td>
                       <td>{row.spec}</td>
@@ -258,8 +271,65 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
                           onClick={() => teardownMutation.mutate(row)}
                         />
                       </td>
-                    </tr>
-                  ))}
+                    </tr>,
+                    // A second row rather than a cell: findings are prose, and a
+                    // prose column would squeeze every other column on the widest
+                    // finding. `analysis` empty means no analysis was recorded --
+                    // distinct from one that recorded no findings, so this says
+                    // nothing at all rather than "none found".
+                    ...(row.analysis && row.analysis.length > 0
+                      ? [
+                          <tr key={`${row.run_id}-analysis`}>
+                            <td colSpan={5}>
+                              <details>
+                                <summary>
+                                  {i18nT('apps.specBuilder.reviewQueue.analysis_heading')}
+                                </summary>
+                                {row.analysis.map((group) => (
+                                  <div
+                                    key={group.criterion ?? '_unkeyed'}
+                                    style={{ margin: '6px 0 0' }}
+                                  >
+                                    <p style={{ margin: '0 0 2px', fontWeight: 600 }}>
+                                      {group.criterion ??
+                                        i18nT('apps.specBuilder.reviewQueue.analysis_unkeyed')}
+                                    </p>
+                                    {group.findings.length === 0 ? (
+                                      <p style={{ margin: 0 }}>
+                                        {i18nT('apps.specBuilder.reviewQueue.analysis_none')}
+                                      </p>
+                                    ) : (
+                                      <ul style={{ margin: 0, paddingLeft: 18 }}>
+                                        {group.findings.map((finding, index) => (
+                                          <li key={`${finding.kind}-${index}`}>
+                                            <span>{`${finding.severity} · ${finding.kind}`}</span>
+                                            {/* The engine preserves newlines in
+                                                prose, so they are laid out here --
+                                                but inside this finding's own block
+                                                and with pre-wrap rather than pre,
+                                                so a crafted message cannot widen
+                                                the table or reflow its neighbours. */}
+                                            <div
+                                              style={{
+                                                whiteSpace: 'pre-wrap',
+                                                overflowWrap: 'anywhere',
+                                                margin: 0,
+                                              }}
+                                            >
+                                              {finding.message}
+                                            </div>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    )}
+                                  </div>
+                                ))}
+                              </details>
+                            </td>
+                          </tr>,
+                        ]
+                      : []),
+                  ])}
                 </tbody>
               </table>
             </section>

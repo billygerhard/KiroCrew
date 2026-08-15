@@ -3772,6 +3772,9 @@
         "domains_read_only": "Diese Domänen werden als konfiguriert angezeigt. Ihre Bearbeitung ist in diesem Panel noch nicht verfügbar."
       },
       "reviewQueue": {
+        "analysis_heading": "Analyseergebnisse",
+        "analysis_none": "Die Analyse hat für dieses Kriterium keine Befunde erfasst.",
+        "analysis_unkeyed": "Befunde ohne zugeordnetes Kriterium",
         "clean": "Arbeitsbereich entfernen",
         "cleanup_note": "Eine Arbeitsbereichs-Zeilen-ID gehört nicht zur Projektion der Warteschlange. Nehmen Sie sie aus einem Abbaubericht oder dem Audit-Protokoll.",
         "cleanup_section": "Arbeitsbereich aufräumen",
@@ -3797,6 +3800,8 @@
         "state_stalled": "Hängt",
         "teardown": "Arbeitsbereiche abbauen",
         "teardown_incomplete": "Der Abbau konnte nicht jeden Arbeitsbereich entfernen. Die behaltenen sind unten aufgeführt.",
+        "teardown_stage_failed": "Alle Arbeitsbereiche wurden entfernt, aber die Abbaustufe ist fehlgeschlagen: {{reason}}",
+        "teardown_stage_unnamed": "die Stufe hat keinen Grund gemeldet",
         "title": "Prüfwarteschlange",
         "workspace_id": "Arbeitsbereichs-Zeilen-ID"
       }

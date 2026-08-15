@@ -3711,6 +3711,9 @@
         "domains_read_only": "これらのドメインは構成内容として表示されます。このパネルでの編集はまだ利用できません。"
       },
       "reviewQueue": {
+        "analysis_heading": "分析結果",
+        "analysis_none": "この基準について分析は所見を記録しませんでした。",
+        "analysis_unkeyed": "宣言された基準に該当しない所見",
         "clean": "ワークスペースを削除",
         "cleanup_note": "ワークスペース行の ID はキューの投影には含まれません。撤去レポートまたは監査ログから取得してください。",
         "cleanup_section": "ワークスペースのクリーンアップ",
@@ -3736,6 +3739,8 @@
         "state_stalled": "停滞",
         "teardown": "ワークスペースを撤去",
         "teardown_incomplete": "解体ですべてのワークスペースを削除できませんでした。残ったものは以下に一覧表示されます。",
+        "teardown_stage_failed": "ワークスペースはすべて削除されましたが、解体ステージが失敗しました: {{reason}}",
+        "teardown_stage_unnamed": "ステージは理由を報告しませんでした",
         "title": "レビューキュー",
         "workspace_id": "ワークスペース行の ID"
       }

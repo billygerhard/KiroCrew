@@ -428,6 +428,33 @@ export interface QueueRow {
    *  `revision_exhausted`: they bound different loops, and acting on one is not
    *  acting on the other. */
   feedback_needs_human?: boolean
+  /** The run's stored analysis findings, grouped by the criterion they concern,
+   *  in the engine's order (keyed criteria first, then the unkeyed group). An
+   *  EMPTY array is meaningful: no analysis was recorded for the run, which is
+   *  not the same as an analysis that found nothing — that records a group with
+   *  no findings. Every string here has already been through the engine's display
+   *  contract, so a surface renders it as text and never re-escapes it. */
+  analysis?: CriterionFindings[]
+}
+
+/** One finding as the engine stored it, already display-safe. */
+export interface AnalysisFinding {
+  kind: string
+  severity: string
+  /** Prose. It may contain newlines the engine deliberately preserved, so a
+   *  surface that lays them out must BOUND them to this finding's own block —
+   *  otherwise a crafted message reflows the rows around it. */
+  message: string
+  refs?: string[]
+}
+
+/** The findings concerning one acceptance criterion. */
+export interface CriterionFindings {
+  /** `null` for findings whose references matched no declared criterion. They
+   *  are grouped rather than dropped: a reviewer still needs to read them. */
+  criterion: string | null
+  keyed: boolean
+  findings: AnalysisFinding[]
 }
 
 export interface EngineQueueResponse {

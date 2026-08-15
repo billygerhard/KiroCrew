@@ -3833,6 +3833,9 @@
         "domains_read_only": "Questi domini sono mostrati come configurati. La loro modifica non è ancora disponibile in questo pannello."
       },
       "reviewQueue": {
+        "analysis_heading": "Risultati dell'analisi",
+        "analysis_none": "analisi non ha registrato rilievi per questo criterio.",
+        "analysis_unkeyed": "Rilievi che non indicano alcun criterio dichiarato",
         "clean": "Rimuovi lo spazio di lavoro",
         "cleanup_note": "L’identificatore di riga di uno spazio di lavoro non fa parte della proiezione della coda. Prendilo da un report di smontaggio o dal registro di audit.",
         "cleanup_section": "Pulizia degli spazi di lavoro",
@@ -3858,6 +3861,8 @@
         "state_stalled": "In stallo",
         "teardown": "Smonta gli spazi di lavoro",
         "teardown_incomplete": "Lo smantellamento non ha potuto rimuovere tutti gli spazi di lavoro. Quelli mantenuti sono elencati sotto.",
+        "teardown_stage_failed": "Tutti gli spazi di lavoro sono stati rimossi, ma la fase di smantellamento è fallita: {{reason}}",
+        "teardown_stage_unnamed": "la fase non ha riportato alcun motivo",
         "title": "Coda di revisione",
         "workspace_id": "Identificatore di riga dello spazio di lavoro"
       }
