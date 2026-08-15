@@ -24,6 +24,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.analysis import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyDecision, AutonomyLevel
+from kiro_crew.apps.builtins.spec_engine.engine.budget.ceiling import guard_for
 from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunAccounting, RunCostSink
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.builtins import (
     AUTHORING_PROVIDER,
@@ -53,7 +54,11 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import AUDIT_PREREQUISITE_UNMET
 from kiro_crew.apps.builtins.spec_engine.engine.roles import Dispatch
-from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine, RunState
+from kiro_crew.apps.builtins.spec_engine.engine.runs import (
+    RUN_TRANSITIONED_EVENT,
+    RunMachine,
+    RunState,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.seeder import (
     AWAITING_REVIEW_EVENT,
     AWAITING_REVIEW_NOTIFY_FAILED_EVENT,
@@ -245,6 +250,74 @@ class TestOneRunMachinePerStore:
         # orchestrator_for builds its own machine when passed none, which over
         # this store would be a second writer of the state column.
         assert getattr(runner, "_machine") is graph.machine
+
+    def test_the_budget_guard_runs_over_the_same_machine_as_the_runner(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """The other half of the forwarding, which nothing asserted.
+
+        ``orchestrator_for`` passes its machine to the wave runner AND to
+        ``guard_for``, whose own ``machine`` parameter defaults to a fresh
+        machine. A drop on this half is invisible to the runner assertion above:
+        the run still moves, so the halt looks applied.
+        """
+        graph = build(tmp_path)
+        record = graph.machine.create(ref, source=SOURCE)
+        runner = graph.orchestrator(
+            ref,
+            record.run_id,
+            authority=self.authority(graph),
+            worker=worker,
+            reviewer=reviewer,
+        )
+        guard = getattr(runner, "_guard")
+        assert getattr(guard, "_machine") is graph.machine
+
+    def test_a_guard_over_a_second_machine_parks_the_run_with_no_audit_trail(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """What the forwarding assertion is worth: the probe that makes it matter.
+
+        A second machine over the same store still moves the row, so nothing
+        obvious breaks — which is exactly why this needs pinning. What it loses is
+        the audit log and the host notifier the graph's machine carries: a
+        kill-switch stop applied through one records nothing, and "the run halted
+        and nobody can say why" is the failure the single-writer rule prevents.
+        """
+        graph = build(tmp_path)
+        through_graph = graph.machine.create(ref, source=SOURCE)
+        through_second = graph.machine.create(ref, source=SOURCE)
+        for run in (through_graph, through_second):
+            graph.machine.transition(ref, run.run_id, RunState.AUTHORING)
+
+        second = RunMachine(graph.state, graph.config, project=graph.project)
+        guards = {
+            through_graph.run_id: graph.machine,
+            through_second.run_id: second,
+        }
+        for run_id, machine in guards.items():
+            guard_for(
+                run_id,
+                ref,
+                state=graph.state,
+                config=graph.config,
+                project=graph.project,
+                audit=graph.audit,
+                machine=machine,
+            ).halt_for_kill_switch(reason="probe")
+
+        assert graph.machine.state_of(through_second.run_id) is RunState.HALTED_BUDGET
+        moved = {
+            entry.run
+            for entry in graph.audit.read(ref)
+            if entry.event == RUN_TRANSITIONED_EVENT
+            and (entry.detail or {}).get("to") == RunState.HALTED_BUDGET.value
+        }
+        assert through_graph.run_id in moved
+        assert through_second.run_id not in moved, (
+            "the second machine recorded the halt after all; if this ever passes, "
+            "the single-writer rule is documentation and this probe is the proof"
+        )
 
     def test_no_collaborator_the_graph_owns_can_be_substituted_per_run(self) -> None:
         """The shared seams are absent from the accessor, not merely defaulted.
