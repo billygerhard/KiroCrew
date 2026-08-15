@@ -410,11 +410,46 @@ export interface QueueRow {
   /** Credits this run consumed, the same number the ceiling accounts against. */
   cost_credits: number
   gate: string | null
+  /** The watch source and item this run came from, when it came from one. Both
+   *  are needed to name a re-dispatch, and both are absent for a run a person
+   *  started. */
+  source?: string | null
+  item_id?: string | null
+  entered_ts?: string
+  /** The run used up its revision cycles at the gate it waits on, so no further
+   *  revision turn will be dispatched and a person has to act. */
+  revision_exhausted?: boolean
+  /** How MANY reviewer comments are held for release — not which ones. The ids
+   *  and the comment text live behind the watcher, deliberately: a queue row must
+   *  not become a second place someone else's comment is copied to. So a release
+   *  needs an id from the audit trail, and this surface cannot supply it. */
+  feedback_quarantined?: number
+  /** A review-feedback bound parked this run. Separate from
+   *  `revision_exhausted`: they bound different loops, and acting on one is not
+   *  acting on the other. */
+  feedback_needs_human?: boolean
 }
 
 export interface EngineQueueResponse {
   entries: QueueRow[]
+  /** The same runs, grouped by run state as the ENGINE groups them
+   *  (`QueueSnapshot.grouped`), in its order. A state with nothing waiting is
+   *  absent rather than empty. Nothing here re-groups `entries`: two groupings of
+   *  one run drift, and an operator cannot tell which is current. */
+  grouped?: Record<string, QueueRow[]>
+  total?: number
   total_credits: number
+}
+
+/** What one queue action did. Each flag is the ENGINE's answer to "did anything
+ *  actually change", so a click on a stale row reads as "nothing to do" rather
+ *  than as a change that did not happen. */
+export interface QueueActionResponse {
+  ok?: boolean
+  released?: boolean
+  lifted?: boolean
+  removed?: boolean
+  complete?: boolean
 }
 
 export const engineApi = {
@@ -435,6 +470,56 @@ export const engineApi = {
     }),
   getQueue: (project?: string) =>
     req<EngineQueueResponse>('/engine/queue' + (project ? '?project=' + enc(project) : '')),
+  // The queue row's actions. None of them names an actor: every one is a
+  // privileged override attributed to the authenticated session on the server,
+  // for the same reason an approval is.
+  releaseFeedback: (row: { project: string; spec: string; run_id: string }, commentId: string) =>
+    req<QueueActionResponse>('/engine/queue/release-feedback', {
+      method: 'POST',
+      body: JSON.stringify({
+        project: row.project,
+        spec: row.spec,
+        run_id: row.run_id,
+        comment_id: commentId,
+      }),
+    }),
+  redispatchItem: (source: string, itemId: string, generation: number) =>
+    req<QueueActionResponse>('/engine/queue/redispatch', {
+      method: 'POST',
+      body: JSON.stringify({ source, item_id: itemId, generation }),
+    }),
+  cleanWorkspace: (workspaceId: number) =>
+    req<QueueActionResponse>('/engine/queue/clean-workspace', {
+      method: 'POST',
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    }),
+  teardownRunWorkspaces: (runId: string) =>
+    req<QueueActionResponse>('/engine/queue/teardown', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId }),
+    }),
+}
+
+/**
+ * Catalog key per run state the queue groups by. Copy only, and the same shape
+ * as ORIGIN_LABEL_KEY for the same reason: a literal Record is what
+ * ``scripts/check-i18n-keys.mjs`` can resolve statically, and a state the engine
+ * reports that this table does not know renders as its own id rather than as a
+ * missing group. The engine decides which states hold a person's work; this
+ * table only spells them.
+ */
+const QUEUE_STATE_LABEL_KEY: Record<string, string> = {
+  awaiting_review: 'apps.specBuilder.reviewQueue.state_awaiting_review',
+  halted_budget: 'apps.specBuilder.reviewQueue.state_halted_budget',
+  stalled: 'apps.specBuilder.reviewQueue.state_stalled',
+}
+
+/** Localised heading for a queue group, or the run state id VERBATIM when this
+ *  table has no phrase for it. */
+export function queueStateLabel(state: string): string {
+  return Object.prototype.hasOwnProperty.call(QUEUE_STATE_LABEL_KEY, state)
+    ? i18nT(QUEUE_STATE_LABEL_KEY[state])
+    : state
 }
 
 /**

@@ -3831,6 +3831,32 @@
         "domains_heading": "Domínios configurados",
         "domain_none": "não configurado",
         "domains_read_only": "Estes domínios são mostrados como configurados. A sua edição ainda não está disponível neste painel."
+      },
+      "reviewQueue": {
+        "clean": "Remover espaço de trabalho",
+        "cleanup_note": "O identificador de linha do espaço de trabalho não faz parte da projeção da fila. Pegue-o em um relatório de desmontagem ou na trilha de auditoria.",
+        "cleanup_section": "Limpeza de espaços de trabalho",
+        "col_actions": "Ações",
+        "col_gate": "Etapa",
+        "col_run": "Execução",
+        "col_waiting": "Aguardando",
+        "comment_id": "Identificador do comentário retido",
+        "done": "Concluído.",
+        "empty": "Nada está aguardando uma pessoa.",
+        "feedback_needs_human": "Um limite de comentários de revisão deixou esta execução aguardando uma pessoa.",
+        "generation": "Geração do item",
+        "held_comments": "{{held}} comentário(s) de revisão estão retidos para liberação.",
+        "held_ids_not_listed": "A fila informa quantos comentários estão retidos, não quais. Pegue o identificador na trilha de auditoria.",
+        "needs_human": "Os ciclos de revisão foram esgotados, então nenhuma outra revisão será executada por conta própria.",
+        "no_change": "Nada correspondeu, então nada mudou.",
+        "redispatch": "Reenviar item",
+        "release": "Liberar comentário",
+        "state_awaiting_review": "Aguardando revisão",
+        "state_halted_budget": "Interrompido pelo orçamento",
+        "state_stalled": "Parado",
+        "teardown": "Desmontar espaços de trabalho",
+        "title": "Fila de revisão",
+        "workspace_id": "Identificador de linha do espaço de trabalho"
       }
     },
     "workflows": {

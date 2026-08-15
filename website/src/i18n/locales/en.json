@@ -3087,6 +3087,32 @@
         "domains_heading": "Configured domains",
         "domain_none": "none configured",
         "domains_read_only": "These domains are shown as configured. Editing them is not available on this panel yet."
+      },
+      "reviewQueue": {
+        "clean": "Remove workspace",
+        "cleanup_note": "A workspace row id is not part of the queue projection. Take it from a teardown report or the audit trail.",
+        "cleanup_section": "Workspace cleanup",
+        "col_actions": "Actions",
+        "col_gate": "Gate",
+        "col_run": "Run",
+        "col_waiting": "Waiting",
+        "comment_id": "Held comment id",
+        "done": "Done.",
+        "empty": "Nothing is waiting on a person.",
+        "feedback_needs_human": "A review-feedback limit parked this run for a person.",
+        "generation": "Item generation",
+        "held_comments": "{{held}} reviewer comment(s) are held for release.",
+        "held_ids_not_listed": "The queue reports how many comments are held, not which ones. Take the id from the audit trail.",
+        "needs_human": "Revision cycles are used up, so no further revision runs on its own.",
+        "no_change": "Nothing matched, so nothing changed.",
+        "redispatch": "Re-dispatch item",
+        "release": "Release comment",
+        "state_awaiting_review": "Waiting for review",
+        "state_halted_budget": "Stopped by the budget",
+        "state_stalled": "Stalled",
+        "teardown": "Tear down workspaces",
+        "title": "Review queue",
+        "workspace_id": "Workspace row id"
       }
     },
     "workflows": {

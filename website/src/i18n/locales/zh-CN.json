@@ -3709,6 +3709,32 @@
         "domains_heading": "已配置的域",
         "domain_none": "未配置",
         "domains_read_only": "这些域按已配置的内容显示。此面板暂不支持编辑它们。"
+      },
+      "reviewQueue": {
+        "clean": "删除工作区",
+        "cleanup_note": "工作区行 ID 不属于队列投影。请从拆除报告或审计记录中获取。",
+        "cleanup_section": "工作区清理",
+        "col_actions": "操作",
+        "col_gate": "关卡",
+        "col_run": "运行",
+        "col_waiting": "等待",
+        "comment_id": "被扣留意见的 ID",
+        "done": "已完成。",
+        "empty": "没有任何内容在等待人工处理。",
+        "feedback_needs_human": "评审反馈的上限已让该运行停下来等待人工处理。",
+        "generation": "条目世代",
+        "held_comments": "有 {{held}} 条评审意见被扣留，等待放行。",
+        "held_ids_not_listed": "队列只报告被扣留的意见数量，不报告具体是哪几条。请从审计记录中获取其 ID。",
+        "needs_human": "修订轮次已用完，因此不会再自动执行修订。",
+        "no_change": "没有匹配项，因此没有任何变化。",
+        "redispatch": "重新派发条目",
+        "release": "放行意见",
+        "state_awaiting_review": "等待评审",
+        "state_halted_budget": "因预算而停止",
+        "state_stalled": "停滞",
+        "teardown": "拆除工作区",
+        "title": "评审队列",
+        "workspace_id": "工作区行 ID"
       }
     },
     "workflows": {

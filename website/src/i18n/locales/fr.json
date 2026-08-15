@@ -3831,6 +3831,32 @@
         "domains_heading": "Domaines configurés",
         "domain_none": "non configuré",
         "domains_read_only": "Ces domaines sont affichés tels que configurés. Leur modification n'est pas encore disponible dans ce panneau."
+      },
+      "reviewQueue": {
+        "clean": "Supprimer l’espace de travail",
+        "cleanup_note": "Un identifiant de ligne d’espace de travail ne fait pas partie de la projection de la file. Prenez-le dans un rapport de démontage ou dans le journal d’audit.",
+        "cleanup_section": "Nettoyage des espaces de travail",
+        "col_actions": "Actions",
+        "col_gate": "Étape",
+        "col_run": "Exécution",
+        "col_waiting": "En attente",
+        "comment_id": "Identifiant du commentaire retenu",
+        "done": "Terminé.",
+        "empty": "Rien n’attend une personne.",
+        "feedback_needs_human": "Une limite de retours de revue a mis cette exécution en attente d’une personne.",
+        "generation": "Génération de l’élément",
+        "held_comments": "{{held}} commentaire(s) de revue sont retenus en attente de libération.",
+        "held_ids_not_listed": "La file indique combien de commentaires sont retenus, pas lesquels. Prenez l’identifiant dans le journal d’audit.",
+        "needs_human": "Les cycles de révision sont épuisés, aucune autre révision ne se lancera d’elle-même.",
+        "no_change": "Rien ne correspondait, donc rien n’a changé.",
+        "redispatch": "Réenvoyer l’élément",
+        "release": "Libérer le commentaire",
+        "state_awaiting_review": "En attente de revue",
+        "state_halted_budget": "Arrêté par le budget",
+        "state_stalled": "Bloqué",
+        "teardown": "Démonter les espaces de travail",
+        "title": "File de revue",
+        "workspace_id": "Identifiant de ligne d’espace de travail"
       }
     },
     "workflows": {

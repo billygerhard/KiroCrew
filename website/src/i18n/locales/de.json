@@ -3770,6 +3770,32 @@
         "domains_heading": "Konfigurierte Domänen",
         "domain_none": "nicht konfiguriert",
         "domains_read_only": "Diese Domänen werden als konfiguriert angezeigt. Ihre Bearbeitung ist in diesem Panel noch nicht verfügbar."
+      },
+      "reviewQueue": {
+        "clean": "Arbeitsbereich entfernen",
+        "cleanup_note": "Eine Arbeitsbereichs-Zeilen-ID gehört nicht zur Projektion der Warteschlange. Nehmen Sie sie aus einem Abbaubericht oder dem Audit-Protokoll.",
+        "cleanup_section": "Arbeitsbereich aufräumen",
+        "col_actions": "Aktionen",
+        "col_gate": "Gate",
+        "col_run": "Lauf",
+        "col_waiting": "Wartet",
+        "comment_id": "ID des zurückgehaltenen Kommentars",
+        "done": "Fertig.",
+        "empty": "Nichts wartet auf eine Person.",
+        "feedback_needs_human": "Eine Grenze für Prüf-Feedback hat diesen Lauf für eine Person angehalten.",
+        "generation": "Generation des Elements",
+        "held_comments": "{{held}} Prüfkommentar(e) warten auf Freigabe.",
+        "held_ids_not_listed": "Die Warteschlange nennt die Anzahl der zurückgehaltenen Kommentare, nicht welche. Nehmen Sie die ID aus dem Audit-Protokoll.",
+        "needs_human": "Die Überarbeitungszyklen sind aufgebraucht, daher läuft keine weitere Überarbeitung von selbst.",
+        "no_change": "Nichts passte, also hat sich nichts geändert.",
+        "redispatch": "Element erneut zuweisen",
+        "release": "Kommentar freigeben",
+        "state_awaiting_review": "Wartet auf Prüfung",
+        "state_halted_budget": "Durch das Budget gestoppt",
+        "state_stalled": "Hängt",
+        "teardown": "Arbeitsbereiche abbauen",
+        "title": "Prüfwarteschlange",
+        "workspace_id": "Arbeitsbereichs-Zeilen-ID"
       }
     },
     "workflows": {

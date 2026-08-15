@@ -3831,6 +3831,32 @@
         "domains_heading": "Dominios configurados",
         "domain_none": "sin configurar",
         "domains_read_only": "Estos dominios se muestran tal como están configurados. Su edición aún no está disponible en este panel."
+      },
+      "reviewQueue": {
+        "clean": "Eliminar espacio de trabajo",
+        "cleanup_note": "El identificador de fila del espacio de trabajo no forma parte de la proyección de la cola. Tómalo de un informe de desmontaje o del registro de auditoría.",
+        "cleanup_section": "Limpieza de espacios de trabajo",
+        "col_actions": "Acciones",
+        "col_gate": "Puerta",
+        "col_run": "Ejecución",
+        "col_waiting": "Esperando",
+        "comment_id": "Identificador del comentario retenido",
+        "done": "Listo.",
+        "empty": "Nada está esperando a una persona.",
+        "feedback_needs_human": "Un límite de comentarios de revisión dejó esta ejecución a la espera de una persona.",
+        "generation": "Generación del elemento",
+        "held_comments": "{{held}} comentario(s) de revisión están retenidos para su liberación.",
+        "held_ids_not_listed": "La cola informa cuántos comentarios están retenidos, no cuáles. Toma el identificador del registro de auditoría.",
+        "needs_human": "Los ciclos de revisión se han agotado, así que no se ejecutará ninguna revisión más por su cuenta.",
+        "no_change": "Nada coincidió, así que nada cambió.",
+        "redispatch": "Reenviar elemento",
+        "release": "Liberar comentario",
+        "state_awaiting_review": "Esperando revisión",
+        "state_halted_budget": "Detenido por el presupuesto",
+        "state_stalled": "Estancado",
+        "teardown": "Desmontar espacios de trabajo",
+        "title": "Cola de revisión",
+        "workspace_id": "Identificador de fila del espacio de trabajo"
       }
     },
     "workflows": {

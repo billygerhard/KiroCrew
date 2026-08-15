@@ -3831,6 +3831,32 @@
         "domains_heading": "Domini configurati",
         "domain_none": "non configurato",
         "domains_read_only": "Questi domini sono mostrati come configurati. La loro modifica non è ancora disponibile in questo pannello."
+      },
+      "reviewQueue": {
+        "clean": "Rimuovi lo spazio di lavoro",
+        "cleanup_note": "L’identificatore di riga di uno spazio di lavoro non fa parte della proiezione della coda. Prendilo da un report di smontaggio o dal registro di audit.",
+        "cleanup_section": "Pulizia degli spazi di lavoro",
+        "col_actions": "Azioni",
+        "col_gate": "Fase",
+        "col_run": "Esecuzione",
+        "col_waiting": "In attesa",
+        "comment_id": "Identificatore del commento trattenuto",
+        "done": "Fatto.",
+        "empty": "Nulla è in attesa di una persona.",
+        "feedback_needs_human": "Un limite sui commenti di revisione ha messo questa esecuzione in attesa di una persona.",
+        "generation": "Generazione dell’elemento",
+        "held_comments": "{{held}} commento/i di revisione sono trattenuti in attesa di rilascio.",
+        "held_ids_not_listed": "La coda indica quanti commenti sono trattenuti, non quali. Prendi l’identificatore dal registro di audit.",
+        "needs_human": "I cicli di revisione sono esauriti, quindi nessun’altra revisione partirà da sola.",
+        "no_change": "Nulla corrispondeva, quindi nulla è cambiato.",
+        "redispatch": "Reinvia l’elemento",
+        "release": "Rilascia il commento",
+        "state_awaiting_review": "In attesa di revisione",
+        "state_halted_budget": "Fermato dal budget",
+        "state_stalled": "In stallo",
+        "teardown": "Smonta gli spazi di lavoro",
+        "title": "Coda di revisione",
+        "workspace_id": "Identificatore di riga dello spazio di lavoro"
       }
     },
     "workflows": {

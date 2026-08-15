@@ -31,6 +31,7 @@
     "apps.issueRadar.connectPanel.cli": "\"CLI\" = command-line interface, naming a connection method the user picks. Keep the acronym practitioners in the target language use.",
     "apps.issueRadar.views.settings.generalSettings.refresh_section": "Section HEADING (a noun: 'the refresh settings'), not the verb. The nearby repoSettings.refresh IS the verb on a button — five languages already translate the two differently, so do not reuse one word for both.",
     "apps.issueRadar.views.tagging.untaggedIssueCard.add": "Verb on a button: add an entry to the list beside it. If the target language needs an object, name the thing being added.",
+    "apps.specBuilder.reviewQueue.col_run": "Column HEADING in the review queue table, above a cell naming one spec run. A noun — the execution of a spec, the thing waiting in the queue — never the verb 'to run' and never a count. Languages that distinguish a job/execution from the act of running should use the job sense.",
     "apps.meetings.priority.low": "Priority level of a meeting action item, the lowest of high/medium/low. An adjective describing importance, not volume or position.",
     "apps.meetings.settings.addTerm": "Verb on a button: add a term to the meeting dictionary (the vocabulary list that improves transcription accuracy). If the target language needs an object, \"add a term\" is the sense.",
     "apps.meetings.taskSidebar.add": "Verb on a button: add an entry to the list beside it. If the target language needs an object, name the thing being added.",

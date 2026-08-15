@@ -3709,6 +3709,32 @@
         "domains_heading": "구성된 도메인",
         "domain_none": "구성되지 않음",
         "domains_read_only": "이 도메인은 구성된 상태로 표시됩니다. 이 패널에서의 편집은 아직 지원되지 않습니다."
+      },
+      "reviewQueue": {
+        "clean": "작업 공간 제거",
+        "cleanup_note": "작업 공간 행 ID는 대기열 투영에 포함되지 않습니다. 해체 보고서나 감사 기록에서 가져오세요.",
+        "cleanup_section": "작업 공간 정리",
+        "col_actions": "작업",
+        "col_gate": "게이트",
+        "col_run": "실행",
+        "col_waiting": "대기",
+        "comment_id": "보류된 의견 ID",
+        "done": "완료되었습니다.",
+        "empty": "사람을 기다리는 항목이 없습니다.",
+        "feedback_needs_human": "검토 피드백 한도로 인해 이 실행은 사람을 기다리고 있습니다.",
+        "generation": "항목 세대",
+        "held_comments": "검토 의견 {{held}}건이 해제를 기다리며 보류되어 있습니다.",
+        "held_ids_not_listed": "대기열은 보류된 의견의 개수만 알려 주며 어떤 것인지는 알려 주지 않습니다. ID는 감사 기록에서 확인하세요.",
+        "needs_human": "수정 주기를 모두 사용했으므로 더 이상 자동으로 수정이 실행되지 않습니다.",
+        "no_change": "일치하는 항목이 없어 변경된 것이 없습니다.",
+        "redispatch": "항목 재전송",
+        "release": "의견 해제",
+        "state_awaiting_review": "검토 대기 중",
+        "state_halted_budget": "예산으로 중단됨",
+        "state_stalled": "정체됨",
+        "teardown": "작업 공간 해체",
+        "title": "검토 대기열",
+        "workspace_id": "작업 공간 행 ID"
       }
     },
     "workflows": {

@@ -3709,6 +3709,32 @@
         "domains_heading": "構成済みドメイン",
         "domain_none": "未構成",
         "domains_read_only": "これらのドメインは構成内容として表示されます。このパネルでの編集はまだ利用できません。"
+      },
+      "reviewQueue": {
+        "clean": "ワークスペースを削除",
+        "cleanup_note": "ワークスペース行の ID はキューの投影には含まれません。撤去レポートまたは監査ログから取得してください。",
+        "cleanup_section": "ワークスペースのクリーンアップ",
+        "col_actions": "操作",
+        "col_gate": "ゲート",
+        "col_run": "実行",
+        "col_waiting": "待機",
+        "comment_id": "保留中コメントの ID",
+        "done": "完了しました。",
+        "empty": "人の対応を待っているものはありません。",
+        "feedback_needs_human": "レビューフィードバックの上限により、この実行は人の対応待ちになっています。",
+        "generation": "項目の世代",
+        "held_comments": "{{held}} 件のレビューコメントが解放待ちで保留されています。",
+        "held_ids_not_listed": "キューは保留中のコメントの件数を示しますが、どのコメントかは示しません。ID は監査ログから取得してください。",
+        "needs_human": "改訂サイクルを使い切ったため、これ以上の改訂は自動では実行されません。",
+        "no_change": "一致するものがなかったため、何も変わりませんでした。",
+        "redispatch": "項目を再ディスパッチ",
+        "release": "コメントを解放",
+        "state_awaiting_review": "レビュー待ち",
+        "state_halted_budget": "予算により停止",
+        "state_stalled": "停滞",
+        "teardown": "ワークスペースを撤去",
+        "title": "レビューキュー",
+        "workspace_id": "ワークスペース行の ID"
       }
     },
     "workflows": {
