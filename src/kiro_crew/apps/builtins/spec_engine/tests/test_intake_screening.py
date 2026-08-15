@@ -40,7 +40,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.trust import (
     StaleContent,
     consume,
 )
-from kiro_crew.apps.builtins.spec_engine.engine.turns import TurnOutcome, TurnRequest
+from kiro_crew.apps.builtins.spec_engine.engine.turns import TurnFailed, TurnOutcome, TurnRequest
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     PollOutcome,
     PollStatus,
@@ -707,11 +707,15 @@ class _FakeTurn:
     The double sits one layer BELOW the provider under test -- it stands in for
     the gateway's session manager, not for the provider -- so the provider, its
     verdict reader, and its exception path are all the real code here.
+
+    *raises* makes ``run`` fail instead of answering, which is the only way to
+    reach the provider's two non-parse failure exits.
     """
 
-    def __init__(self, session_key: str, text: str) -> None:
+    def __init__(self, session_key: str, text: str, raises: Exception | None = None) -> None:
         self._session_key = session_key
         self._text = text
+        self._raises = raises
         self.closed = False
 
     @property
@@ -719,6 +723,8 @@ class _FakeTurn:
         return self._session_key
 
     def run(self, prompt: str, *, deadline_s: int) -> TurnOutcome:
+        if self._raises is not None:
+            raise self._raises
         return TurnOutcome(text=self._text)
 
     def close(self) -> None:
@@ -728,9 +734,9 @@ class _FakeTurn:
 class _FakeTurnHost:
     """Opens one :class:`_FakeTurn` and records what it was asked for."""
 
-    def __init__(self, session_key: str, text: str) -> None:
+    def __init__(self, session_key: str, text: str, raises: Exception | None = None) -> None:
         self.requests: list[TurnRequest] = []
-        self.turn = _FakeTurn(session_key, text)
+        self.turn = _FakeTurn(session_key, text, raises)
 
     def open_turn(self, request: TurnRequest) -> _FakeTurn:
         self.requests.append(request)
@@ -795,6 +801,40 @@ class TestTheDispatchedProviderReportsItsSession:
             provider.screen(_screening_request(tmp_path))
 
         assert caught.value.session_key == ""
+
+    def test_a_turn_that_fails_after_spending_still_names_its_session(
+        self, tmp_path: Path
+    ) -> None:
+        """A deadline struck mid-turn is the expensive failure, not a parse one.
+
+        The reply never arrives, so the parse path is never reached -- this exits
+        through ``except TurnFailed``. That site carries the key too, and this
+        test is what holds it: without it, dropping the key there left every
+        covering test green while the spend went unattributed again.
+        """
+        host = _FakeTurnHost("sess-4", "", raises=TurnFailed("the turn exceeded its deadline"))
+        provider = DispatchedScreeningProvider(host)
+
+        with pytest.raises(ScreeningUnavailable) as caught:
+            provider.screen(_screening_request(tmp_path))
+
+        assert caught.value.session_key == "sess-4"
+        assert host.turn.closed is True
+
+    def test_a_host_fault_of_any_type_still_names_its_session(self, tmp_path: Path) -> None:
+        """The broad catch is a real exit, so it carries the key like the rest.
+
+        A host seam can fail in ways it never declared. The verdict is the same
+        -- no verdict, so quarantine -- and so is the accounting: the turn may
+        already have spent, and the run owns that cost.
+        """
+        host = _FakeTurnHost("sess-5", "", raises=RuntimeError("the host connection dropped"))
+        provider = DispatchedScreeningProvider(host)
+
+        with pytest.raises(ScreeningUnavailable) as caught:
+            provider.screen(_screening_request(tmp_path))
+
+        assert caught.value.session_key == "sess-5"
 
     def test_a_readable_verdict_reports_its_session_as_before(self, tmp_path: Path) -> None:
         """The success path is unchanged, so the failure fix cannot be vacuous."""
