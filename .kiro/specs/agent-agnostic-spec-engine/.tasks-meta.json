@@ -34,13 +34,13 @@
     "11.1": "completed",
     "11.2": "completed",
     "12.1": "completed",
-    "12.2": "queued",
+    "12.2": "completed",
     "12.3": "queued",
     "12.4": "queued",
     "13.1": "completed",
     "13.2": "completed",
     "13.3": "completed",
-    "14.1": "queued",
+    "14.1": "completed",
     "15.1": "completed",
     "15.2": "completed",
     "16.1": "completed",
@@ -50,7 +50,7 @@
     "7.7": "completed",
     "8.7": "completed",
     "9.4": "completed",
-    "12.5": "queued",
+    "12.5": "completed",
     "13.4": "completed",
     "17.1": "completed",
     "17.4": "completed",
@@ -63,8 +63,8 @@
     "18.1": "queued",
     "20.1": "completed",
     "20.2": "completed",
-    "20.3": "queued",
-    "20.4": "queued",
+    "20.3": "completed",
+    "20.4": "completed",
     "20.5": "queued",
     "20.6": "completed"
   },
@@ -525,6 +525,31 @@
     {
       "ts": "2026-08-15T15:28:45",
       "taskId": "20.6",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-15T15:57:27",
+      "taskId": "20.4",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-15T15:57:34",
+      "taskId": "14.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-15T15:57:38",
+      "taskId": "12.5",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-15T16:26:05",
+      "taskId": "20.3",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-15T17:02:52",
+      "taskId": "12.2",
       "status": "completed"
     }
   ]
