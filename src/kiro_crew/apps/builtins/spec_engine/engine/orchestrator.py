@@ -55,6 +55,19 @@ temporary copy that is worth nothing once the run is over and is the reason disk
 fills up if nobody removes it. Branches, commits, and published deployments are
 left untouched; only the disposable materialization is swept, and only at a
 terminal state, never for a parked run that will resume.
+
+**Execute, then deliver, then finish — and the order is the guarantee.**
+:meth:`WaveRunner.run` is that sequence, and each step depends on the one before
+it rather than merely following it. :meth:`WaveRunner.deliver` takes the
+execution report as an argument, so a caller cannot deliver before executing:
+there is nothing to pass, and only a report whose every leaf carries an approving
+verdict is delivered at all — submitting a change no reviewer approved is the
+failure the per-leaf gate exists to prevent, one level up. Delivery comes before
+:meth:`finish` because finish is where the checkout is retired, and the stages
+that raise a review artifact run inside that checkout. A delivery that never
+reached review fails the run without unwinding a leaf: the statuses were
+persisted as each leaf settled, so the completed work stays completed and stays
+resumable while the run itself is reported as the failure it is.
 """
 
 from __future__ import annotations
@@ -69,6 +82,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from . import phases, structure
 from .audit import AuditLog
+from .autonomy import AutonomyLevel
 from .budget import (
     BudgetGuard,
     CompletionReport,
@@ -91,6 +105,7 @@ from .delivery import (
     CommandRunner,
     DeliveryAuthority,
     DeliveryPipeline,
+    DeliveryRun,
 )
 from .delivery import Notifier as DeliveryNotifier
 from .delivery import (
@@ -477,6 +492,57 @@ class RunCompletion:
 
 
 @dataclass(frozen=True)
+class DeliveryPass:
+    """What the run's delivery pass did, between execution and the run's end.
+
+    Carried on the execution report rather than handed back on its own, because
+    the two are one answer to the question "what happened to this run": a run
+    reported done whose change never reached review is a contradiction, and
+    keeping both on one value is what lets :meth:`WaveRunner.finish` read the
+    second from the first instead of being told.
+    """
+
+    #: What the pipeline did, absent when the pass never entered the pipeline.
+    delivery: DeliveryRun | None = None
+    #: Why the pass never entered the pipeline, when it did not.
+    reason: str = ""
+    #: Whether this run was authorized to deliver at all. A run below the
+    #: delivery rung is finished when its tasks are: it has no review artifact to
+    #: raise, so an absent delivery is the correct outcome rather than a failure.
+    expected: bool = False
+
+    @property
+    def submitted(self) -> bool:
+        """Whether the pipeline carried this run's change through to a pass."""
+        return self.delivery is not None and self.delivery.ok
+
+    @property
+    def failure(self) -> str:
+        """Why the change did not reach review, empty when it did.
+
+        One spelling of the reason, read from the pipeline's own record wherever
+        the pipeline produced one: a sentence written here would name the delivery
+        differently than the trail the delivery itself wrote.
+        """
+        if self.submitted:
+            return ""
+        if self.reason:
+            return self.reason
+        if self.delivery is None:
+            return "the delivery pass did not run"
+        return self.delivery.reason or f"the delivery {self.delivery.outcome.value}"
+
+    def detail(self) -> dict[str, Any]:
+        """The pass as bounded detail for the run's completion record."""
+        return {
+            "expected": self.expected,
+            "submitted": self.submitted,
+            "outcome": self.delivery.outcome.value if self.delivery is not None else None,
+            "reason": self.failure,
+        }
+
+
+@dataclass(frozen=True)
 class ExecutionReport:
     """Everything one pass of the wave loop did."""
 
@@ -492,6 +558,10 @@ class ExecutionReport:
     #: is reached" one sentence about one condition rather than two spellings a
     #: reader has to connect.
     finding_id: str = ""
+    #: What the delivery pass did, set once :meth:`WaveRunner.deliver` has run.
+    #: ``None`` means no pass was made over this report at all, which is what a
+    #: bare :meth:`WaveRunner.execute` returns.
+    delivery: DeliveryPass | None = None
     #: Set once the run has been ended and its consumption reported.
     completion: RunCompletion | None = None
 
@@ -603,15 +673,100 @@ class WaveRunner:
     # --- the loop ----------------------------------------------------------
 
     def run(self, context: RunContext) -> ExecutionReport:
-        """Execute the run's tasks and then end the run, reporting what it cost."""
-        return self.finish(self.execute(context))
+        """Execute the run's tasks, deliver what they produced, then end the run.
+
+        The whole sequence. Each step is handed what the previous one produced
+        rather than merely following it: :meth:`deliver` cannot be reached without
+        an :class:`ExecutionReport` to pass, and :meth:`finish` reads the delivery
+        off that report to decide the state the run ends in. The module docstring
+        says why the order is the guarantee.
+        """
+        return self.finish(self.deliver(self.execute(context), context))
+
+    def deliver(self, executed: ExecutionReport, context: RunContext) -> ExecutionReport:
+        """Submit what execution produced for review, and report what that did.
+
+        Takes the execution report rather than a flag or nothing at all, because
+        the report is the evidence: only :meth:`execute` produces one, and a leaf
+        reaches :attr:`~.runs.TaskStatus.COMPLETE` only behind an approving review
+        verdict, so a report of a completed execution *is* the statement that the
+        review gate cleared for every leaf. A caller that tried to deliver first
+        has nothing to pass.
+
+        Anything short of a completed execution is declined — a failed leaf, a
+        halted run, a refused isolation. Delivery raises a review artifact, and
+        raising one for work the engine already knows is incomplete asks a person
+        to review a change no verdict approved: the same failure the per-leaf gate
+        exists to prevent, one level up.
+
+        **A failed delivery does not unwind the execution.** Task statuses are
+        persisted as each leaf settles, so completed work stays completed and a
+        resumed run still skips it; what changes is the run's own outcome, which
+        becomes a failure because the change never reached review. Reporting the
+        run as succeeded there would say a person has the change in front of them
+        when nobody does.
+
+        A run below the delivery rung is the other direction. The pipeline refuses
+        without running a stage, and the run keeps the outcome its tasks earned,
+        because it never had an artifact to raise. The authority is *asked* here
+        rather than re-decided: the pipeline is the only thing that decides whether
+        a delivery may start, and this reads the same authority object to tell an
+        absence that was intended from one that is a failure.
+        """
+        if executed.delivery is not None:
+            # Already delivered. A second pass would raise a second review
+            # artifact for one run's one change, so the first pass's record stands
+            # and this one declines rather than repeating it.
+            logger.warning(
+                "run %s has already made a delivery pass, so a second one is declined",
+                self._run_id,
+            )
+            return executed
+        expected = self._pipeline.authority.permits(AutonomyLevel.DELIVERY)
+        if not executed.ok:
+            return replace(
+                executed,
+                delivery=DeliveryPass(
+                    expected=expected,
+                    reason=(
+                        f"execution {executed.outcome.value}, so there is no reviewed "
+                        "change to submit"
+                    ),
+                ),
+            )
+        delivery, raised = self._delivered(context)
+        made = DeliveryPass(delivery=delivery, expected=expected, reason=raised)
+        if made.submitted or not expected:
+            return replace(executed, delivery=made)
+        return replace(
+            executed,
+            outcome=ExecutionOutcome.FAILED,
+            reason=f"the change did not reach review: {made.failure}",
+            delivery=made,
+        )
+
+    def _delivered(self, context: RunContext) -> tuple[DeliveryRun | None, str]:
+        """Run the delivery pass, turning a raise into a delivery that failed.
+
+        The pipeline returns rather than raises for every stage-level problem, so
+        a raise reaching here is the pipeline itself failing. It is still a change
+        that did not reach review, and it must not escape: the run has to be ended
+        either way, and an exception travelling out of :meth:`run` would leave the
+        run executing forever with its checkout still on disk.
+        """
+        try:
+            return self._pipeline.deliver(context), ""
+        except Exception as exc:  # a raising pipeline is a delivery that failed
+            logger.warning("the delivery pass for run %s raised: %s", self._run_id, exc)
+            return None, f"the delivery pass raised: {exc}"
 
     def execute(self, context: RunContext) -> ExecutionReport:
         """Isolate, then dispatch every wave in order.
 
         Does not end the run: :meth:`finish` is what moves it into a final state
         and reports what it consumed, and the two are separate so a delivery pass
-        can sit between them. :meth:`run` is the whole sequence.
+        can sit between them. :meth:`run` is the whole sequence, and
+        :meth:`deliver` is the pass it puts there.
 
         Returns rather than raises for a refusal or a failure, so the report says
         what ran alongside what did not. A persistence failure is the exception:
@@ -905,6 +1060,12 @@ class WaveRunner:
         parked run is left alone: halted for budget is resumable, and reporting
         it as finished would spend the once-per-run notification on a run that
         has not finished.
+
+        The state this ends in is read off *report* rather than decided here, so a
+        delivery that never reached review ends the run as the failure
+        :meth:`deliver` already recorded. Which is also why the delivery pass runs
+        before this and not after: the review artifact is raised by stages running
+        inside the run's checkout, and this is where that checkout is retired.
         """
         state = self._machine.state_of(self._run_id)
         if state in PARKED_STATES:
@@ -955,6 +1116,10 @@ class WaveRunner:
                 "outcome": report.outcome.value,
                 "consumed_credits": completion.consumed_credits,
                 "notified": completion.notified,
+                # Whether the run's change reached a person. Absent when no
+                # delivery pass was made over this report at all, which is not the
+                # same as a pass that submitted nothing.
+                "delivery": report.delivery.detail() if report.delivery is not None else None,
             },
         )
         return replace(

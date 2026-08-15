@@ -48,9 +48,13 @@ from kiro_crew.apps.builtins.spec_engine.engine.budget import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
+    DEPLOYMENT_KIND,
     ISOLATE_STAGE,
     NO_NOTIFIER_REASON,
+    PUBLISH_STAGE,
+    SUBMIT_STAGE,
     CommandOutcome,
+    CommandRunner,
     DeliveryAuthority,
     RunContext,
     StageOutcome,
@@ -418,7 +422,9 @@ def runner_for(
     session_default: SessionDefault = SessionDefault(model=SESSION_MODEL),
     headless: bool = False,
     reviewer: RecordingReviewer | None = None,
+    notifier: Any = None,
     delivery_notifier: Any = None,
+    runner: CommandRunner | None = None,
 ) -> WaveRunner:
     """Build the runner the way a real caller does: through the factory."""
     return orchestrator_for(
@@ -433,11 +439,11 @@ def runner_for(
         session_default=session_default,
         audit=harness.audit,
         headless=headless,
-        notifier=harness.notifier,
+        notifier=notifier if notifier is not None else harness.notifier,
         delivery_notifier=delivery_notifier,
         accounting=harness.accounting,
         kill_switch=harness.switch,
-        runner=harness.runner,
+        runner=runner if runner is not None else harness.runner,
     )
 
 
@@ -1418,3 +1424,295 @@ class TestTheDeliveryPipelineNotifies:
 
         assert run.notice is not None
         assert run.notice.error == NO_NOTIFIER_REASON
+
+
+#: Programs the delivery stages are configured with below. Distinct from the
+#: isolate stage's ``git`` so a spy keyed by program name says which stage ran.
+SUBMIT_PROGRAM = "submit-tool"
+PUBLISH_PROGRAM = "publish-tool"
+
+#: An address a publish command prints. Deliberately http, since that is all the
+#: pipeline recognises as somewhere a person can be sent.
+DEPLOYED_AT = "https://deployed.example/spec-engine"
+
+
+def set_stages(harness: Harness, stages: dict[str, list[list[str]]]) -> None:
+    """Declare delivery stages for the project, keeping the isolate stage."""
+    harness.config.write(
+        {"projects": {PROJECT: {"workflow": {"stages": stages}}}},
+        surface=DASHBOARD_SURFACE,
+    )
+
+
+class StageSpy:
+    """A command runner recording what the engine's state held at each spawn.
+
+    The ordering questions cannot be answered from the report. Whether every leaf
+    was already recorded complete when the submit command ran, and whether the
+    run's workspace row was still active while it ran, are facts about the moment
+    the command spawned: read afterwards they cannot tell a sequence apart from
+    two things that happened to be arranged that way.
+    """
+
+    def __init__(
+        self,
+        harness: Harness,
+        *,
+        fail: Iterable[str] = (),
+        raises: Iterable[str] = (),
+        stdout: str = "",
+    ) -> None:
+        self.argv: list[tuple[str, ...]] = []
+        self.statuses: dict[str, dict[str, TaskStatus]] = {}
+        self.workspaces: dict[str, int] = {}
+        self._harness = harness
+        self._fail = set(fail)
+        self._raises = set(raises)
+        self._stdout = stdout
+
+    def __call__(self, argv: Sequence[str], *, cwd: Path, timeout_s: int) -> CommandOutcome:
+        program = argv[0]
+        self.argv.append(tuple(argv))
+        self.statuses[program] = self._harness.detail_statuses()
+        self.workspaces[program] = len(self._harness.state.list_workspaces(run_id=RUN))
+        if program in self._raises:
+            raise RuntimeError(f"{program} could not be spawned at all")
+        if program in self._fail:
+            return CommandOutcome(exit_code=1, stderr=f"{program} exited non-zero")
+        return CommandOutcome(exit_code=0, stdout=self._stdout)
+
+    def ran(self, program: str) -> bool:
+        return program in self.statuses
+
+
+class TestTheDeliveryPassIsSequenced:
+    """Execute, then deliver, then finish — and each step depends on the last.
+
+    This is the wiring defect in its purest form. The pipeline, its gates, its
+    notifier and its deployment ledger were each built and tested, and nothing
+    ever sequenced a delivery after execution: every one of those tests passed
+    while no run submitted anything for review. So these assertions are made
+    through :meth:`WaveRunner.run` — the sequence a caller invokes — and removing
+    the ``deliver`` call from it has to fail one of them even though the pipeline
+    it calls is untouched.
+    """
+
+    def test_a_completed_run_submits_its_change_after_the_work_and_before_the_end(
+        self, harness: Harness
+    ) -> None:
+        """The submit command spawns once every leaf carries an approving verdict,
+        and while the run's own checkout still exists to spawn it in."""
+        run_id = harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness)
+
+        report = runner_for(harness, Worker(), runner=spy).run(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert spy.ran(SUBMIT_PROGRAM), "the run never submitted its change for review"
+        # The persisted COMPLETE is the review verdict's record: a leaf reaches it
+        # only behind an approving verdict, so this is the gate having cleared for
+        # every leaf before the artifact was raised.
+        assert spy.statuses[SUBMIT_PROGRAM] == {
+            "1.1": TaskStatus.COMPLETE,
+            "1.2": TaskStatus.COMPLETE,
+            "2.1": TaskStatus.COMPLETE,
+        }
+        # And before the terminal sweep, which is the other half of the ordering:
+        # finish removes the checkout the submit stage runs in.
+        assert spy.workspaces[SUBMIT_PROGRAM] == 1
+        assert harness.state.list_workspaces(run_id=run_id) == []
+        assert report.delivery is not None
+        assert report.delivery.submitted is True
+        assert report.delivery.failure == ""
+        assert harness.machine.state_of(run_id) is RunState.DONE
+
+    def test_a_run_with_a_failed_leaf_submits_nothing_for_review(self, harness: Harness) -> None:
+        """A leaf that never earned a verdict is not delivered to a person.
+
+        The per-leaf review gate exists so nobody is asked to review unapproved
+        work; delivering a run that contains such a leaf would ask exactly that,
+        one level up.
+        """
+        harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness)
+
+        report = runner_for(harness, Worker(fail=["2.1"]), runner=spy).run(context_for(harness))
+
+        assert not spy.ran(SUBMIT_PROGRAM), "a run with a failed leaf raised a review artifact"
+        assert report.delivery is not None
+        assert report.delivery.submitted is False
+        assert "execution failed" in report.delivery.failure
+        assert harness.machine.state_of(RUN) is RunState.FAILED
+
+    def test_a_run_halted_for_budget_submits_nothing_for_review(self, harness: Harness) -> None:
+        """A halted run is resumable and unfinished, so there is nothing to submit."""
+        harness.start_run()
+        harness.spend(9.0)
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness)
+
+        report = runner_for(harness, Worker(), runner=spy).run(context_for(harness))
+
+        assert not spy.ran(SUBMIT_PROGRAM)
+        assert report.delivery is not None
+        assert "execution halted" in report.delivery.failure
+        assert harness.machine.state_of(RUN) is RunState.HALTED_BUDGET
+        assert harness.state.list_workspaces(run_id=RUN), "a parked run keeps its tree"
+
+    def test_a_failed_delivery_fails_the_run_and_keeps_every_completed_task(
+        self, harness: Harness
+    ) -> None:
+        """The two directions of a delivery failure, in one run.
+
+        It must not roll back the task work: the statuses were persisted as each
+        leaf settled and a resumed run still skips them. And it must not report
+        the run as succeeded: the change never reached review, so nobody has it.
+        """
+        harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness, fail=[SUBMIT_PROGRAM])
+
+        report = runner_for(harness, Worker(), runner=spy).run(context_for(harness))
+
+        assert harness.detail_statuses() == {
+            "1.1": TaskStatus.COMPLETE,
+            "1.2": TaskStatus.COMPLETE,
+            "2.1": TaskStatus.COMPLETE,
+        }
+        assert report.failed_tasks == (), "a delivery failure unwound a completed leaf"
+        assert report.outcome is ExecutionOutcome.FAILED
+        assert "the change did not reach review" in report.reason
+        assert report.delivery is not None
+        assert report.delivery.submitted is False
+        assert report.completion is not None
+        assert report.completion.final_state is RunState.FAILED
+        assert harness.machine.state_of(RUN) is RunState.FAILED
+
+    def test_a_run_below_the_delivery_rung_keeps_the_outcome_its_tasks_earned(
+        self, harness: Harness
+    ) -> None:
+        """An absent delivery that was never authorized is not a failure.
+
+        The pipeline is asked and refuses without running a stage, so the run ends
+        on what its tasks earned. Failing it here would fail every run an operator
+        deliberately capped below delivery.
+        """
+        harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness)
+
+        report = runner_for(harness, Worker(), level=AutonomyLevel.EXECUTION, runner=spy).run(
+            context_for(harness)
+        )
+
+        assert not spy.ran(SUBMIT_PROGRAM)
+        assert report.outcome is ExecutionOutcome.COMPLETED, report.reason
+        assert report.delivery is not None
+        assert report.delivery.expected is False
+        assert "does not authorize delivery" in report.delivery.failure
+        assert harness.machine.state_of(RUN) is RunState.DONE
+
+    def test_a_delivery_that_raises_still_ends_the_run_and_retires_its_workspace(
+        self, harness: Harness
+    ) -> None:
+        """An exception out of the pipeline is a change that did not reach review.
+
+        It must not escape the sequence: a raise travelling out would leave the run
+        executing for good and its checkout on disk, which is the leak the terminal
+        sweep exists to prevent.
+        """
+        harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness, raises=[SUBMIT_PROGRAM])
+
+        report = runner_for(harness, Worker(), runner=spy).run(context_for(harness))
+
+        assert report.outcome is ExecutionOutcome.FAILED
+        assert "raised" in report.reason
+        assert report.delivery is not None
+        assert report.delivery.delivery is None
+        assert harness.machine.state_of(RUN) is RunState.FAILED
+        assert harness.state.list_workspaces(run_id=RUN) == []
+
+    def test_a_second_delivery_pass_over_one_report_is_declined(self, harness: Harness) -> None:
+        """One run's change is one review artifact.
+
+        A pass over a report that already carries one submits nothing, so a caller
+        that sequenced delivery twice cannot raise two artifacts for one change.
+        """
+        harness.start_run()
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        spy = StageSpy(harness)
+        runner = runner_for(harness, Worker(), runner=spy)
+        context = context_for(harness)
+
+        first = runner.deliver(runner.execute(context), context)
+        again = runner.deliver(first, context)
+
+        assert spy.argv.count((SUBMIT_PROGRAM,)) == 1
+        assert again.delivery is first.delivery
+
+    def test_a_published_deployment_is_recorded_and_survives_the_terminal_sweep(
+        self, harness: Harness
+    ) -> None:
+        """The publish stage's address is in the ledger after the run ended.
+
+        The deployment row is what archive's teardown commands find from the run
+        identifier alone, and it is recorded by the delivery pass — so a run that
+        never delivered records none. The terminal sweep removes the disposable
+        checkout and leaves the deployment standing: a published environment is
+        still published once the run is over.
+        """
+        run_id = harness.start_run()
+        set_stages(
+            harness,
+            {SUBMIT_STAGE: [[SUBMIT_PROGRAM]], PUBLISH_STAGE: [[PUBLISH_PROGRAM]]},
+        )
+        spy = StageSpy(harness, stdout=DEPLOYED_AT)
+
+        report = runner_for(harness, Worker(), runner=spy).run(context_for(harness))
+
+        assert report.delivery is not None
+        assert report.delivery.submitted is True
+        remaining = harness.state.list_workspaces(run_id=run_id)
+        assert [record.kind for record in remaining] == [DEPLOYMENT_KIND]
+        assert remaining[0].address == DEPLOYED_AT
+        assert remaining[0].disposable is False
+
+    def test_one_notifier_object_serves_the_budget_ceiling_and_the_delivery_notice(
+        self, harness: Harness
+    ) -> None:
+        """Two seams, two parameters, one object — and both notices land.
+
+        The factory takes the budget notifier and the delivery notifier
+        separately, and a production caller passes the same host notifier to both
+        because it satisfies each protocol. Collapsing them into one parameter
+        would tie a budget halt and a delivery notice to one channel for good, so
+        the separation is asserted here by using it.
+        """
+        harness.start_run()
+        harness.spend(2.0)
+        set_stages(harness, {SUBMIT_STAGE: [[SUBMIT_PROGRAM]]})
+        bus = _FakeBus()
+        notifier = HostNotifier(harness.config, project=PROJECT, bus=bus, limiter=None)
+
+        runner_for(
+            harness,
+            Worker(),
+            runner=StageSpy(harness),
+            notifier=notifier,
+            delivery_notifier=notifier,
+        ).run(context_for(harness))
+
+        titles = [payload.title for payload in bus.pushed]
+        bodies = [payload.body for payload in bus.pushed]
+        assert any("Spec delivery passed" in title for title in titles), titles
+        assert any(
+            f"ended as done after consuming {format_credits(2.0)} credits" in body
+            for body in bodies
+        ), bodies
+        # The delivery notice comes first, which is the sequence read from the
+        # notification feed: the budget's completion notice is sent by finish.
+        assert "Spec delivery passed" in titles[0]
