@@ -3722,7 +3722,7 @@
         "roles_section": "角色分配",
         "role_model": "模型",
         "role_effort": "投入程度",
-        "roles_inherit_note": "留空表示继承。这里没有让角色不带任何设置运行的写法。",
+        "roles_inherit_note": "角色分配必须指定一个模型。投入程度从引擎提供的等级中选择。",
         "workflow_section": "工作流命令",
         "workflow_preset": "当前生效的预设为 {{preset}}，在 {{origin}} 中选定。",
         "workflow_no_preset": "尚未选择工作流预设。",

@@ -3722,7 +3722,7 @@
         "roles_section": "ロール割り当て",
         "role_model": "モデル",
         "role_effort": "労力",
-        "roles_inherit_note": "空欄は継承を意味します。ロールを何も指定せずに実行する書き方はありません。",
+        "roles_inherit_note": "ロール割り当てにはモデルの指定が必要です。労力はエンジンのレベルから選びます。",
         "workflow_section": "ワークフローのコマンド",
         "workflow_preset": "プリセット {{preset}} が有効です（{{origin}} で選択）。",
         "workflow_no_preset": "ワークフロープリセットが選択されていません。",

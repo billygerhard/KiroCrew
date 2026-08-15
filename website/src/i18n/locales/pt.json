@@ -3844,7 +3844,7 @@
         "roles_section": "Atribuições de função",
         "role_model": "Modelo",
         "role_effort": "Esforço",
-        "roles_inherit_note": "Um campo vazio herda. Aqui não há forma de executar uma função sem nada atribuído.",
+        "roles_inherit_note": "Uma atribuição de função deve nomear um modelo. O esforço é escolhido entre os níveis do motor.",
         "workflow_section": "Comandos do fluxo de trabalho",
         "workflow_preset": "O preset {{preset}} está em vigor, selecionado em {{origin}}.",
         "workflow_no_preset": "Nenhum preset de fluxo de trabalho está selecionado.",

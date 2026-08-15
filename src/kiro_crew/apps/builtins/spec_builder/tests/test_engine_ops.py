@@ -1082,3 +1082,168 @@ class TestTheSurfaceSaysWhatItWillWrite:
         assert body["catalogs"]["spec_types"] == list(SPEC_TYPES)
         assert body["catalogs"]["roles"] == list(ROLES)
         assert body["config_only_paths"] == list(CONFIG_ONLY_PATHS)
+
+
+class TestTheEditableDomainsActuallySave:
+    """Each domain the surface offers an editor for, saved through the HTTP route.
+
+    The point is not that the engine accepts a patch -- the store's own tests
+    cover that. It is that the domains this panel offers controls for are
+    writable AT THIS ROUTE, on the surface it writes at. Three of the four live
+    under ``sources``, which is a config-only path: it is accepted only because
+    ``DASHBOARD_SURFACE`` is operator-confirmed. If that ever changed, a control
+    the panel offers would start failing silently, and these are the tests that
+    would say so instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_autonomy_level_saves_and_reads_back_as_effective(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        _store(config_root).write(
+            {"sources": {"gh": {"poll": ["gh", "issue", "list"]}}},
+            surface=_dashboard_surface(),
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config",
+                json={"patch": {"sources": {"gh": {"autonomy": {"external": {"feature": "delivery"}}}}}},
+            )
+            assert resp.status == 200, await resp.text()
+            read = await client.get(f"{_BASE}/engine/config")
+            body = await read.json()
+        assert body["domains"]["sources"]["gh"]["autonomy"]["external"]["feature"] == "delivery"
+        # And the engine agrees it is stored where the ladder is read from.
+        document = _store(config_root).document()
+        assert document["sources"]["gh"]["autonomy"]["external"]["feature"] == "delivery"
+
+    @pytest.mark.asyncio
+    async def test_a_source_enable_saves(self, monkeypatch, tmp_path, config_root):
+        _store(config_root).write(
+            {"sources": {"gh": {"poll": ["gh", "issue", "list"], "enabled": True}}},
+            surface=_dashboard_surface(),
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config", json={"patch": {"sources": {"gh": {"enabled": False}}}}
+            )
+            assert resp.status == 200, await resp.text()
+        assert _store(config_root).document()["sources"]["gh"]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_role_assignment_saves(self, monkeypatch, tmp_path, config_root):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config",
+                json={
+                    "patch": {
+                        "cost_profiles": {
+                            "thrifty": {"roles": {"review": {"model": "auto", "effort": "low"}}}
+                        }
+                    }
+                },
+            )
+            assert resp.status == 200, await resp.text()
+        assignment = _store(config_root).document()["cost_profiles"]["thrifty"]["roles"]["review"]
+        assert assignment == {"model": "auto", "effort": "low"}
+
+    @pytest.mark.asyncio
+    async def test_a_role_assignment_without_a_model_is_refused_by_path(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The engine requires a role assignment to name a model, and it answers by
+        # PATH. The panel shows that reason verbatim, so the operator is told which
+        # field to fill rather than that something went wrong.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config",
+                json={
+                    "patch": {
+                        "cost_profiles": {"thrifty": {"roles": {"review": {"effort": "low"}}}}
+                    }
+                },
+            )
+            assert resp.status == 422
+            body = await resp.json()
+        assert body["code"] == "config_invalid"
+        assert "cost_profiles.thrifty.roles.review.model" in body["error"]
+        # Nothing partial persisted: the engine validates the MERGED document and
+        # writes nothing when it refuses.
+        assert "cost_profiles" not in _store(config_root).document()
+
+    @pytest.mark.asyncio
+    async def test_the_effort_picker_offers_only_levels_the_write_path_accepts(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        from kiro_crew.effort import EFFORT_LEVELS
+
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/config")
+            catalogs = (await resp.json())["catalogs"]
+            # Every advertised level is accepted, which is the property a picker
+            # built from this list depends on.
+            for level in catalogs["effort_levels"]:
+                write = await client.put(
+                    f"{_BASE}/engine/config",
+                    json={
+                        "patch": {
+                            "cost_profiles": {
+                                "thrifty": {
+                                    "roles": {"review": {"model": "auto", "effort": level}}
+                                }
+                            }
+                        }
+                    },
+                )
+                assert write.status == 200, level
+            # And a level outside it is refused, so the list is a real constraint
+            # rather than decoration.
+            refused = await client.put(
+                f"{_BASE}/engine/config",
+                json={
+                    "patch": {
+                        "cost_profiles": {
+                            "thrifty": {"roles": {"review": {"model": "auto", "effort": "turbo"}}}
+                        }
+                    }
+                },
+            )
+            assert refused.status == 422
+        assert catalogs["effort_levels"] == list(EFFORT_LEVELS)
+
+    @pytest.mark.asyncio
+    async def test_the_notification_channel_saves(self, monkeypatch, tmp_path, config_root):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config", json={"patch": {"notify": {"channel": "ops-room"}}}
+            )
+            assert resp.status == 200, await resp.text()
+            read = await client.get(f"{_BASE}/engine/config")
+            body = await read.json()
+        row = body["settings"]["notify.channel"]
+        assert row["value"] == "ops-room"
+        # Reported with the layer that produced it, which is what makes the saved
+        # value distinguishable from the default it replaced.
+        assert row["origin"] == "app_config"
+
+    @pytest.mark.asyncio
+    async def test_a_null_returns_a_setting_to_its_bundled_default(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The reset control's write. Deleting the key is not the same as writing
+        # the default's current value: the second one PINS it, and the origin the
+        # panel then shows would say app_config for a value nobody chose.
+        _store(config_root).write(
+            {"concurrency": {"global_max_runs": 9}}, surface=_dashboard_surface()
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config", json={"patch": {"concurrency": {"global_max_runs": None}}}
+            )
+            assert resp.status == 200, await resp.text()
+            read = await client.get(f"{_BASE}/engine/config")
+            body = await read.json()
+        row = body["settings"]["concurrency.global_max_runs"]
+        assert row["origin"] == "bundled_default"
+        assert row["is_default"] is True
+        assert "global_max_runs" not in _store(config_root).document().get("concurrency", {})

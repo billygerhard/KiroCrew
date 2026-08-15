@@ -3844,7 +3844,7 @@
         "roles_section": "Affectations de rôle",
         "role_model": "Modèle",
         "role_effort": "Effort",
-        "roles_inherit_note": "Un champ vide hérite. Il n'existe ici aucune écriture pour exécuter un rôle sans rien.",
+        "roles_inherit_note": "Une affectation de rôle doit nommer un modèle. L'effort se choisit parmi les niveaux du moteur.",
         "workflow_section": "Commandes du workflow",
         "workflow_preset": "Le préréglage {{preset}} est actif, sélectionné dans {{origin}}.",
         "workflow_no_preset": "Aucun préréglage de workflow n'est sélectionné.",

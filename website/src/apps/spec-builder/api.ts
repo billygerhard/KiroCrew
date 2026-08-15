@@ -394,6 +394,9 @@ export interface EngineConfigResponse {
     submitter_classes: string[]
     spec_types: string[]
     roles: string[]
+    /** Efforts a role assignment may name. Validated by the write path, so a
+     *  free-text field would offer a value the engine refuses. */
+    effort_levels: string[]
     wildcard: string
   }
 }
@@ -506,11 +509,18 @@ export interface QueueRow {
    *  acting on the other. */
   feedback_needs_human?: boolean
   /** The run's stored analysis findings, grouped by the criterion they concern,
-   *  in the engine's order (keyed criteria first, then the unkeyed group). An
-   *  EMPTY array is meaningful: no analysis was recorded for the run, which is
-   *  not the same as an analysis that found nothing — that records a group with
-   *  no findings. Every string here has already been through the engine's display
-   *  contract, so a surface renders it as text and never re-escapes it. */
+   *  in the engine's order (keyed criteria first, then the unkeyed group).
+   *
+   *  EMPTY OR ABSENT MEANS "NOTHING TO SHOW", AND DELIBERATELY CANNOT BE READ
+   *  MORE PRECISELY THAN THAT. A run nothing analysed and a run whose analysis
+   *  found nothing both arrive empty: the second stores zero rows, so it projects
+   *  the same way (see `QueueEntry.analysis` in the engine, which says so). The
+   *  audit trail is where the two are told apart. So a surface must render
+   *  nothing here -- rendering "no findings" would assert a clean bill of health
+   *  for a run that may never have been looked at.
+   *
+   *  Every string has already been through the engine's display contract, so a
+   *  surface renders it as text and never re-escapes it. */
   analysis?: CriterionFindings[]
 }
 

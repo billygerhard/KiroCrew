@@ -3722,7 +3722,7 @@
         "roles_section": "역할 배정",
         "role_model": "모델",
         "role_effort": "노력 수준",
-        "roles_inherit_note": "빈 칸은 상속을 뜻합니다. 아무것도 지정하지 않고 역할을 실행하는 표기는 없습니다.",
+        "roles_inherit_note": "역할 배정에는 모델을 지정해야 합니다. 노력 수준은 엔진의 레벨에서 선택합니다.",
         "workflow_section": "워크플로 명령",
         "workflow_preset": "프리셋 {{preset}}이 적용 중입니다({{origin}}에서 선택).",
         "workflow_no_preset": "선택된 워크플로 프리셋이 없습니다.",

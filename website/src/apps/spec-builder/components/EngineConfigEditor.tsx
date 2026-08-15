@@ -378,11 +378,15 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
                       placeholder={i18nT('apps.specBuilder.engineOps.role_model')}
                       onChange={(e) => setEdit(modelPath, e.target.value)}
                     />{' '}
-                    <Input
+                    {/* A picker, not a text field: the write path validates
+                        effort against the engine's own levels, and the levels
+                        travel with the config read. */}
+                    <SimpleSelect
                       aria-label={editKey(effortPath)}
+                      options={catalogs?.effort_levels ?? []}
                       value={String(shown(effortPath, assignment.effort ?? ''))}
-                      placeholder={i18nT('apps.specBuilder.engineOps.role_effort')}
-                      onChange={(e) => setEdit(effortPath, e.target.value)}
+                      onChange={(value) => setEdit(effortPath, value)}
+                      triggerFallback={i18nT('apps.specBuilder.engineOps.role_effort')}
                     />
                   </li>
                 )

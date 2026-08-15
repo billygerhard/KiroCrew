@@ -3100,7 +3100,7 @@
         "roles_section": "Role assignments",
         "role_model": "Model",
         "role_effort": "Effort",
-        "roles_inherit_note": "An empty field inherits. There is no spelling here for running a role with nothing.",
+        "roles_inherit_note": "A role assignment must name a model. Effort is chosen from the engine's own levels.",
         "workflow_section": "Workflow commands",
         "workflow_preset": "Preset {{preset}} is in force, selected in {{origin}}.",
         "workflow_no_preset": "No workflow preset is selected.",

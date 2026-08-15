@@ -3844,7 +3844,7 @@
         "roles_section": "Asignaciones de rol",
         "role_model": "Modelo",
         "role_effort": "Esfuerzo",
-        "roles_inherit_note": "Un campo vacío hereda. Aquí no existe forma de ejecutar un rol sin nada asignado.",
+        "roles_inherit_note": "Una asignación de rol debe nombrar un modelo. El esfuerzo se elige entre los niveles del motor.",
         "workflow_section": "Comandos del flujo de trabajo",
         "workflow_preset": "El preajuste {{preset}} está en vigor, seleccionado en {{origin}}.",
         "workflow_no_preset": "No hay ningún preajuste de flujo de trabajo seleccionado.",

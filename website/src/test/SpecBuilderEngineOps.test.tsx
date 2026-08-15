@@ -132,6 +132,7 @@ const CONFIG_BODY = {
     submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
     spec_types: ['feature', 'bugfix', 'quick'],
     roles: ['review'],
+    effort_levels: ['low', 'medium', 'high'],
     wildcard: '*',
   },
 }
@@ -474,6 +475,24 @@ describe('EngineConfigEditor', () => {
     expect((screen.getByLabelText('concurrency.global_max_runs') as HTMLInputElement).value).toBe(
       '9',
     )
+  })
+
+  it('offers effort as a pick from the engine levels, not free text', async () => {
+    const writes: { url: string; init?: RequestInit }[] = []
+    stubEngineFetch(RELEASED_SWITCH, { writes })
+    await openEditor()
+
+    // The write path validates effort against a fixed list, so a text field here
+    // would collect a value the engine refuses -- and it did, until the levels
+    // started travelling with the config read.
+    fireEvent.click(screen.getByRole('combobox', { name: 'cost_profiles.thrifty.roles.review.effort' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'high' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }))
+
+    await waitFor(() => expect(writes.length).toBe(1))
+    expect(JSON.parse(String(writes[0].init?.body))).toEqual({
+      patch: { cost_profiles: { thrifty: { roles: { review: { effort: 'high' } } } } },
+    })
   })
 
   it('renders each workflow stage at its own layer, from the engine summary', async () => {

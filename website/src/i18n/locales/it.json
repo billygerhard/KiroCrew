@@ -3844,7 +3844,7 @@
         "roles_section": "Assegnazioni di ruolo",
         "role_model": "Modello",
         "role_effort": "Impegno",
-        "roles_inherit_note": "Un campo vuoto eredita. Qui non esiste un modo per eseguire un ruolo senza nulla.",
+        "roles_inherit_note": "Un'assegnazione di ruolo deve indicare un modello. L'impegno si scegli tra i livelli del motore.",
         "workflow_section": "Comandi del workflow",
         "workflow_preset": "Il preset {{preset}} è in vigore, selezionato in {{origin}}.",
         "workflow_no_preset": "Nessun preset di workflow è selezionato.",

@@ -3783,7 +3783,7 @@
         "roles_section": "Rollenzuweisungen",
         "role_model": "Modell",
         "role_effort": "Aufwand",
-        "roles_inherit_note": "Ein leeres Feld erbt. Es gibt hier keine Schreibweise dafür, eine Rolle ohne Modell auszuführen.",
+        "roles_inherit_note": "Eine Rollenzuweisung muss ein Modell nennen. Der Aufwand wird aus den Stufen der Engine gewählt.",
         "workflow_section": "Workflow-Befehle",
         "workflow_preset": "Voreinstellung {{preset}} ist aktiv, ausgewählt in {{origin}}.",
         "workflow_no_preset": "Es ist keine Workflow-Voreinstellung ausgewählt.",

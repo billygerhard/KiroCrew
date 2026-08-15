@@ -44,6 +44,8 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.effort import EFFORT_LEVELS
+
 from ...spec_engine.engine import review_queue as engine_review_queue
 from ...spec_engine.engine import runs as engine_runs
 from ...spec_engine.engine import state as engine_state
@@ -274,6 +276,9 @@ async def handle_get_config(request: web.Request) -> web.Response:
                 "submitter_classes": list(SUBMITTER_CLASSES),
                 "spec_types": list(SPEC_TYPES),
                 "roles": list(ROLES),
+                # A role's effort is validated against this list, so a free-text
+                # field here would offer a value the write path refuses.
+                "effort_levels": list(EFFORT_LEVELS),
                 "wildcard": WILDCARD_KEY,
             },
         }
