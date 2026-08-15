@@ -54,12 +54,14 @@ from .orchestrator import (
     orchestrator_for,
     workspace_root,
 )
+from .phases import ExecutionOutcome
 from .prerequisites import BranchResolver, Budget, ProgramResolver, RunRefusal, gate_run
+from .resume import ResumeAuthority, authority_for, request_execution_for_run
 from .review_queue import ReviewQueue
 from .roles import SessionDefault
 from .runs import RunMachine
 from .seeder import SessionOpener, SessionSeeder
-from .state import SpecRef, StateStore
+from .state import SpecLock, SpecRef, StateStore
 
 #: The provider each deeper builtin must resolve to once
 #: :func:`~.capabilities.builtins.register_builtins` has run. Checked on the
@@ -274,6 +276,50 @@ class EngineGraph:
         if refusal is not None:
             raise RunPrevented(refusal)
         return self._seeder
+
+    def resume_authority(self, run_id: str) -> ResumeAuthority:
+        """The authority *run_id* may act under, read back from its own row.
+
+        Exposed for a surface that has to *explain* a held run — why a queue entry
+        is waiting, which rung it is at, whether intake screening is what is
+        holding it — without being able to change the answer. The reconstruction
+        is :func:`~.resume.authority_for`, which is also what the gate below uses,
+        so an explanation and a decision cannot come apart.
+        """
+        return authority_for(self.machine.get(run_id))
+
+    def request_execution(
+        self,
+        ref: SpecRef,
+        run_id: str,
+        *,
+        user: str | None = None,
+        spec_type: str | None = None,
+        lock: SpecLock | None = None,
+    ) -> ExecutionOutcome:
+        """The execution gate for a run this graph already has a row for.
+
+        Takes no autonomy level and no decision. A run's authority was settled
+        when it was admitted and persisted on its row, so this reads it back
+        through :func:`~.resume.request_execution_for_run` rather than resolving
+        the policy again — a fresh resolution would hand a quarantined run its
+        configured rung back, and would let a widened configuration retroactively
+        raise a run already in flight.
+
+        Contrast :meth:`begin_run`, which does take a level: there the level is
+        the *ceiling a caller is asking for* before any row exists, and the
+        prerequisite gate is what refuses it. Once the row exists there is nothing
+        left to ask.
+        """
+        return request_execution_for_run(
+            self.state,
+            ref,
+            run=run_id,
+            audit=self.audit,
+            user=user,
+            spec_type=spec_type,
+            lock=lock,
+        )
 
     def notify_awaiting_review(self, ref: SpecRef, run_id: str, *, gate: str = "") -> object:
         """Announce a run parked at a human-reserved gate, through the seeder.

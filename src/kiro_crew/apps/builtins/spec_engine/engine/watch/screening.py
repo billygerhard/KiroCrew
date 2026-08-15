@@ -51,6 +51,7 @@ from ..autonomy import AutonomyDecision, AutonomyLevel
 from ..budget.ledger import RunAccounting
 from ..config import ConfigStore
 from ..config.schema import SECTION_SOURCES, WILDCARD_KEY
+from ..resume import DETAIL_AUTONOMY, DETAIL_SCREENING_QUARANTINED
 from ..roles import RolePlan, SessionDefault, WorkKind
 from ..state import SpecRef, StateStore
 from .dispatch import RunSeed, SourceRoute
@@ -567,8 +568,11 @@ class IntakeScreener:
             seed.run_id,
             posture=capped.level.value,
             detail={
-                "autonomy": capped.level.value,
-                "screening_quarantined": True,
+                # The rung and the quarantine mark are read back by
+                # :func:`~..resume.authority_for` on every later gate, through
+                # these key names rather than through a copy of them.
+                DETAIL_AUTONOMY: capped.level.value,
+                DETAIL_SCREENING_QUARANTINED: True,
                 "screening_findings": list(findings),
             },
         )
