@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
 
 from . import phases
+from .audit import AuditLog
 from .delivery.teardown import TeardownReport, WorkspaceJanitor
 from .findings import ValidationReport
 from .notify.routing import quote_untrusted
@@ -57,6 +58,8 @@ from .runs import (
     run_state_of,
 )
 from .state import RunRecord, SpecLock, SpecRecord, SpecRef, StatePersistenceError
+from .watch.lifecycle import forget_snapshot, release_dispatch_claim
+from .watch.review_feedback import release_quarantined_comment
 
 logger = logging.getLogger(__name__)
 
@@ -1081,6 +1084,96 @@ class ReviewQueue:
                 REVISION_CYCLE_LIMIT_SETTING, project=self._machine.project
             ).value
         )
+
+    # -------------------------------------------------- the queue's actions
+    #
+    # A reviewer acts on a queue row, so the actions a row offers live here --
+    # but the RULES behind each one stay in the module that owns them, and each
+    # method below is a delegation rather than a reimplementation. A second
+    # spelling of any of these would be a second answer to a question the engine
+    # has already settled: which comment was actually held, what re-offers a
+    # suppressed item, when a workspace row may be closed out.
+
+    def release_quarantined_feedback(
+        self, ref: SpecRef, run_id: str, comment_id: str, *, actor: str | None = None
+    ) -> bool:
+        """Release one held reviewer comment. The queue row's quarantine action.
+
+        Delegates to the review-feedback watcher, which owns the release: the
+        comment leaves the run's held list AND its claim is dropped, so the next
+        poll re-derives the whole decision, including the commenter's class from
+        the text the comment now has. Returns whether a comment was actually held,
+        so a release for one nobody held is answered rather than reported as a
+        success that did not happen.
+
+        The comment identifier is all that crosses this boundary. The comment TEXT
+        never does: it is someone-else's data, and a queue row must not become a
+        second place it is copied to.
+        """
+        return release_quarantined_comment(
+            self._store,
+            self._require_audit("releasing a quarantined comment"),
+            ref,
+            run_id,
+            comment_id,
+            actor=actor,
+        )
+
+    def redispatch_item(self, source: str, item_id: str, *, generation: int) -> bool:
+        """Lift the suppression on one watched item. The manual re-dispatch override.
+
+        BOTH halves, because either alone does nothing useful: the dispatch claim
+        is released so the generation is dispatchable again, and the snapshot row is
+        forgotten so the next poll derives the item as NEW rather than UNCHANGED --
+        an unchanged open item is not a dispatch candidate whatever the claim ledger
+        says. Returns whether anything was actually lifted.
+        """
+        released = release_dispatch_claim(self._store, source, item_id, generation)
+        forgotten = forget_snapshot(self._store, source, item_id)
+        logger.info(
+            "manual re-dispatch override for %s item %r: claim released=%s, snapshot forgotten=%s",
+            source,
+            item_id,
+            released,
+            forgotten,
+        )
+        return released or forgotten
+
+    def clean_workspace(self, workspace_id: int, *, force: bool = False) -> Any:
+        """Remove one ledger-recorded workspace. The queue row's cleanup action.
+
+        The retry for a teardown that could not finish during an archival: that
+        archival deliberately proceeds anyway and reports what it kept, and this is
+        how the kept tree is finally released. Delegates to the janitor this queue
+        already holds -- the same one archival tears down through -- so there is one
+        idea of where a run's workspace lives. ``None`` when no active row has that
+        identifier, so a double click is answered rather than mistaken for a
+        removal.
+        """
+        return self._janitor.clean_workspace(workspace_id, force=force)
+
+    def teardown_run_workspaces(self, run_id: str) -> TeardownReport:
+        """Tear down every workspace a run recorded, on request.
+
+        The whole-run counterpart of :meth:`clean_workspace`, for a queue row whose
+        archival left a deployment standing.
+        """
+        return self._janitor.archive_run(run_id)
+
+    def _require_audit(self, action: str) -> AuditLog:
+        """The machine's audit log, or a refusal.
+
+        A privileged manual action that leaves no trace is worse than one that did
+        not happen: the release is what lets a held comment drive a fix dispatch,
+        and an operator reconstructing later would find the dispatch with nothing
+        saying who allowed it. So this refuses rather than recording nowhere.
+        """
+        audit = self._machine.audit
+        if audit is None:
+            raise ReviewFeedbackRefused(
+                f"{action} needs an audit log, and this queue's run machine records to none"
+            )
+        return audit
 
     # --------------------------------------------------------------- plumbing
 

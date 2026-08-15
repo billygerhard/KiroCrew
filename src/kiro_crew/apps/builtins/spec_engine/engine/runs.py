@@ -1227,6 +1227,18 @@ class RunMachine:
             return
         self._audit.append(ref, event, run=run, initiator=initiator, detail=detail)
 
+    @property
+    def audit(self) -> AuditLog | None:
+        """This machine's audit log, for a sibling that must record to the SAME one.
+
+        Public for the same reason :meth:`append_audit` is: a sibling built on this
+        machine that opened its own handle could root it differently, and an
+        operator reading one log while the other holds half the history is exactly
+        what the audit log exists to prevent. ``None`` when this machine records
+        nothing, which a caller passes on rather than substituting a log of its own.
+        """
+        return self._audit
+
     def _observe_transition(
         self,
         ref: SpecRef,
