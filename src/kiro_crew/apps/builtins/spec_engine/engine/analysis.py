@@ -784,9 +784,10 @@ class SemanticAnalyzer:
         # already attributed this session and this call is the idempotent no-op
         # RunSessions.stamp promises; one that did not gets attributed late, which
         # is better than not at all and is recorded as late rather than passing for
-        # timely attribution.
+        # timely attribution. An analysis outside any run has nothing to attribute
+        # to and no ceiling to escape, so it stamps nothing rather than raising.
         on_dispatch = stamp.holds(response.session_key)
-        if response.session_key and not on_dispatch:
+        if run and response.session_key and not on_dispatch:
             self._accounting.stamp(run, response.session_key)
             logger.warning(
                 "the semantic analysis provider %s returned session %s without stamping it on "
