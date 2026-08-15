@@ -143,7 +143,12 @@ class RecordingScreener:
         return seed
 
 
-def build(tmp_path: Path, opener: RecordingOpener | None = None) -> EngineGraph:
+def build(
+    tmp_path: Path,
+    opener: RecordingOpener | None = None,
+    *,
+    autonomy: dict[str, dict[str, str]] | None = None,
+) -> EngineGraph:
     graph = build_engine(
         model_resolver=models,
         findings_sink=CountingFindingsSink(),
@@ -156,19 +161,20 @@ def build(tmp_path: Path, opener: RecordingOpener | None = None) -> EngineGraph:
     )
     tree = tmp_path / "tree"
     (tree / ".kiro").mkdir(parents=True)
+    source: dict[str, object] = {
+        "enabled": True,
+        # A program that exists: the poll checks PATH before it runs
+        # anything, and the runner seam below is what actually answers.
+        "poll": ["echo", "list"],
+        "project": PROJECT,
+        "spec_types": {"bug": "bugfix"},
+    }
+    if autonomy is not None:
+        source["autonomy"] = autonomy
     graph.config.write(
         {
             "projects": {PROJECT: {"path": str(tree)}},
-            "sources": {
-                SOURCE: {
-                    "enabled": True,
-                    # A program that exists: the poll checks PATH before it runs
-                    # anything, and the runner seam below is what actually answers.
-                    "poll": ["echo", "list"],
-                    "project": PROJECT,
-                    "spec_types": {"bug": "bugfix"},
-                }
-            },
+            "sources": {SOURCE: source},
         },
         surface=DASHBOARD_SURFACE,
     )
@@ -218,9 +224,7 @@ def queue_one(graph: EngineGraph, identifier: str = "queued-1") -> None:
 
 
 class TestTheScreenerIsConstructedAndReachesBothPaths:
-    def test_the_poll_path_screens_through_the_constructed_screener(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_poll_path_screens_through_the_constructed_screener(self, tmp_path: Path) -> None:
         """Deleting the screener construction from ``watch_tick`` fails here."""
         graph = build(tmp_path)
         host = RecordingTurnHost()
@@ -262,16 +266,16 @@ class TestTheScreenerIsConstructedAndReachesBothPaths:
         # same provider the poll path uses.
         assert any(HOSTILE_BODY in prompt for prompt in host.prompts)
 
-    def test_a_queued_item_that_screens_dirty_is_capped_to_authoring(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_queued_item_that_screens_dirty_is_capped_to_authoring(self, tmp_path: Path) -> None:
         """Unscreened text cannot reach a run on the queue path either.
 
-        The strongest form of the claim: with a provider that suspects the text,
-        the seed the starter receives from the *queue* is capped to the authoring
-        rung, which is only true if the screener was wired into that path.
+        The source grants this submitter class the delivery rung deliberately: an
+        unconfigured external submitter already sits at authoring, so asserting
+        authoring without that grant would pass whether or not the screener ran
+        at all. With the grant in place, authoring is reachable only by the
+        quarantine, which makes this the queue-path claim it says it is.
         """
-        graph = build(tmp_path)
+        graph = build(tmp_path, autonomy={"external": {"bugfix": "delivery"}})
         host = RecordingTurnHost(suspected=True)
         queue_one(graph)
 
@@ -280,6 +284,23 @@ class TestTheScreenerIsConstructedAndReachesBothPaths:
         seeds = [d.seed for d in result.drained if d.seed is not None]
         assert seeds, "nothing was drained, so nothing proves the queue was screened"
         assert all(seed.autonomy.level is AutonomyLevel.AUTHORING for seed in seeds)
+
+    def test_a_queued_item_that_screens_clean_keeps_its_granted_rung(self, tmp_path: Path) -> None:
+        """The control that makes the test above mean something.
+
+        Same grant, same path, a provider that suspects nothing: the seed keeps
+        the delivery rung. Without this, a cap applied unconditionally -- by a
+        bug rather than by a verdict -- would look identical to screening working.
+        """
+        graph = build(tmp_path, autonomy={"external": {"bugfix": "delivery"}})
+        host = RecordingTurnHost(suspected=False)
+        queue_one(graph)
+
+        result = watch_tick(graph, host=host, sources=(SOURCE,), runner=_runner_for())
+
+        seeds = [d.seed for d in result.drained if d.seed is not None]
+        assert seeds, "nothing was drained, so the control proves nothing"
+        assert all(seed.autonomy.level is AutonomyLevel.DELIVERY for seed in seeds)
 
     def test_one_screener_serves_both_paths(self, tmp_path: Path) -> None:
         """A caller-supplied screener is passed to both calls, not one of them."""
@@ -413,9 +434,7 @@ class TestTheReviewFeedbackWatcherIsConstructed:
         assert getattr(watcher, "_audit") is graph.audit
         assert getattr(watcher, "_notifier") is graph.notifier
 
-    def test_it_screens_comments_through_the_intake_screener_itself(
-        self, tmp_path: Path
-    ) -> None:
+    def test_it_screens_comments_through_the_intake_screener_itself(self, tmp_path: Path) -> None:
         """The same object, not a second one built the same way.
 
         Identity is the assertion: two screeners built from the same graph would

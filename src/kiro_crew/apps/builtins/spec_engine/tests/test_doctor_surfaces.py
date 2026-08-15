@@ -115,6 +115,52 @@ def _spend() -> RunSpend:
 # --- one assembly, two surfaces ---------------------------------------------
 
 
+def _doctor_assemblies(source: str) -> list[int]:
+    """Line numbers where *source* could obtain a :class:`Doctor`.
+
+    A scan that matched only a bare ``Doctor(`` call was demonstrably evadable:
+    an attribute call through the module, an aliased import, a subclass, and a
+    ``getattr`` by name all reached the class while the scan stayed silent. The
+    invariant is "one assembly site", so the scan has to follow the ways a second
+    site could actually spell it rather than the one spelling it happened to use.
+
+    Aliases are resolved from the file's own imports, so ``import ... as D``
+    followed by ``D(...)`` is found while an unrelated ``D`` is not.
+    """
+    tree = ast.parse(source)
+    bound: set[str] = {"Doctor"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "Doctor":
+                    bound.add(alias.asname or alias.name)
+
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        # A subclass is a second assembly even before anyone instantiates it,
+        # and its own name is unbounded, so the definition is the thing to catch.
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if (isinstance(base, ast.Name) and base.id in bound) or (
+                    isinstance(base, ast.Attribute) and base.attr == "Doctor"
+                ):
+                    hits.append(node.lineno)
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id in bound:
+                hits.append(node.lineno)
+            elif func.id == "getattr" and any(
+                isinstance(arg, ast.Constant) and arg.value == "Doctor" for arg in node.args
+            ):
+                hits.append(node.lineno)
+        elif isinstance(func, ast.Attribute) and func.attr == "Doctor":
+            hits.append(node.lineno)
+    return sorted(hits)
+
+
 class TestThereIsOneAggregation:
     def test_only_the_diagnosis_module_assembles_a_doctor(self) -> None:
         # The property behind "identical Findings from every surface". A second
@@ -125,33 +171,45 @@ class TestThereIsOneAggregation:
             relative = path.relative_to(app_root()).as_posix()
             if relative.startswith("tests/") or relative == "engine/doctor.py":
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "Doctor"
-                ):
-                    offenders.append(f"{relative}:{node.lineno}")
+            for line in _doctor_assemblies(path.read_text(encoding="utf-8")):
+                offenders.append(f"{relative}:{line}")
         assert all(
             offender.startswith(_ASSEMBLY_MODULE) for offender in offenders
         ), f"a second surface assembles its own Doctor: {offenders}"
         assert offenders, "the scan found no assembly at all, so it proves nothing"
 
-    def test_the_scanner_detects_a_planted_second_assembly(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "planted",
+        [
+            pytest.param("report = Doctor(config=None).run()\n", id="bare-call"),
+            pytest.param(
+                "from .engine import doctor as d\nreport = d.Doctor(config=None)\n",
+                id="attribute-call",
+            ),
+            pytest.param(
+                "from .engine.doctor import Doctor as D\nreport = D(config=None)\n",
+                id="aliased-import",
+            ),
+            pytest.param(
+                "from .engine.doctor import Doctor\n\n\nclass Mine(Doctor):\n    pass\n",
+                id="subclass",
+            ),
+            pytest.param(
+                'from .engine import doctor as d\nc = getattr(d, "Doctor")\n',
+                id="getattr-by-name",
+            ),
+        ],
+    )
+    def test_the_scanner_detects_a_planted_second_assembly(self, planted: str) -> None:
         # The scan above would pass over an app that constructs nothing, so the
-        # detector is driven against source that does construct one.
-        planted = tmp_path / "planted.py"
-        planted.write_text("report = Doctor(config=None).run()\n", encoding="utf-8")
-        tree = ast.parse(planted.read_text(encoding="utf-8"))
-        found = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "Doctor"
-        ]
-        assert len(found) == 1
+        # detector is driven against source that does. Each spelling here is one
+        # a review demonstrated slipping past the bare-name-only form.
+        assert _doctor_assemblies(planted), f"the scanner missed this spelling:\n{planted}"
+
+    def test_the_scanner_does_not_fire_on_an_unrelated_name(self) -> None:
+        # The other half of the parametrized case above: a scan that matched any
+        # short alias would flag half the app and stop meaning anything.
+        assert _doctor_assemblies("from json import loads as D\nD('{}')\n") == []
 
 
 class TestTheToolAndThePanelAgree:
@@ -410,9 +468,7 @@ class TestARefusalAndAPanelQuoteOneIdentifier:
     )
     def test_a_blocked_dispatch_quotes_a_finding_identifier(self, outcome: DispatchOutcome) -> None:
         payload = dispatch_block_report(
-            DispatchDecision(
-                outcome=outcome, spend=_spend(), ceiling_credits=1.0, message="halted"
-            )
+            DispatchDecision(outcome=outcome, spend=_spend(), ceiling_credits=1.0, message="halted")
         )
 
         assert payload["finding_id"], f"{outcome.value} quoted no identifier"
