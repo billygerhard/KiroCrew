@@ -27,12 +27,18 @@ import pytest
 
 from kiro_crew.apps.builtins.spec_builder.backend import routes
 from kiro_crew.apps.builtins.spec_engine.engine import runs as engine_runs
+from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunAccounting
 from kiro_crew.apps.builtins.spec_engine.engine.budget.switch import (
     KILL_SWITCH_FILENAME,
     KillSwitch,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.config.settings import SETTINGS
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.preset_display import stage_origins
+from kiro_crew.apps.builtins.spec_engine.engine.delivery.workflow import (
+    DeliveryWorkflow,
+    workflow_presets,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.review_queue import ReviewQueue
 from kiro_crew.apps.builtins.spec_engine.engine.runs import RunState
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef
@@ -858,3 +864,221 @@ def _dashboard_surface():
     from kiro_crew.apps.builtins.spec_engine.engine.config.store import DASHBOARD_SURFACE
 
     return DASHBOARD_SURFACE
+
+
+class TestWorkflowOriginSurface:
+    """Per-stage command origin, relayed from the engine's own preset display.
+
+    The claim is that the surface reports the LAYER, not a value comparison. The
+    case that separates the two is a mixed workflow: a project overriding one
+    stage of a selected preset must read as an override on that stage and as the
+    preset on the others, and an override whose commands are byte-identical to the
+    preset's must still read as an override.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_mixed_workflow_reports_each_stage_at_its_own_layer(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        _store(config_root).write(
+            {
+                "workflow": {"preset": "git-pull-request"},
+                "projects": {
+                    "web": {
+                        "path": "/tmp/web",
+                        "workflow": {"stages": {"submit": [["git", "push"]]}},
+                    }
+                },
+            },
+            surface=_dashboard_surface(),
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/workflow-origins?project=web")
+            assert resp.status == 200
+            body = await resp.json()
+        by_stage = {row["stage"]: row for row in body["stages"]}
+        # Cross-checked against the engine's own projection over the same
+        # document: a surface that re-derived the layer and disagreed fails here.
+        engine_rows = {
+            origin.stage: origin.to_json_object()
+            for origin in stage_origins(
+                DeliveryWorkflow.load(_store(config_root), project="web")
+            )
+        }
+        assert by_stage == engine_rows
+        assert by_stage["submit"]["source"] == "project_override"
+        assert by_stage["submit"]["from_preset"] is False
+        # Every OTHER stage the preset defines still reads as the preset's, which
+        # is what makes this a per-stage answer rather than one label.
+        preset_stages = [
+            stage for stage, row in by_stage.items() if row["source"] == "bundled_preset"
+        ]
+        assert preset_stages, "overriding one stage must not detach the rest"
+        assert body["preset"]["name"] == "git-pull-request"
+        assert body["preset"]["bundled"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_override_identical_to_the_preset_still_reads_as_an_override(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The case a value comparison gets wrong. The engine derives the layer from
+        # the declaration, so a byte-identical copy is still this project's own.
+        _store(config_root).write(
+            {"workflow": {"preset": "git-pull-request"}}, surface=_dashboard_surface()
+        )
+        # The preset's own definition, copied verbatim: byte-identical to what the
+        # stage would have run had nobody declared it.
+        copied = [list(argv) for argv in workflow_presets("git-pull-request")["stages"]["submit"]]
+        _store(config_root).write(
+            {
+                "projects": {
+                    "web": {"path": "/tmp/web", "workflow": {"stages": {"submit": copied}}}
+                }
+            },
+            surface=_dashboard_surface(),
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/workflow-origins?project=web")
+            body = await resp.json()
+        row = next(r for r in body["stages"] if r["stage"] == "submit")
+        assert row["source"] == "project_override"
+        assert row["preset"] == "", "an override names no preset, however it was spelled"
+
+    @pytest.mark.asyncio
+    async def test_a_stage_nobody_defines_says_it_is_skipped(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # An unconfigured stage skips at execution. Omitting it, or rendering it as
+        # preset-supplied, would tell an operator a stage runs when it does not.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/workflow-origins")
+            assert resp.status == 200
+            body = await resp.json()
+        assert body["preset"] is None
+        assert body["stages"], "every delivery stage gets a row"
+        skipped = [row for row in body["stages"] if row["skipped"]]
+        assert skipped, "a zero-configuration install defines no stage of its own"
+        assert all(row["summary"] for row in body["stages"]), "the engine writes the line"
+
+    @pytest.mark.asyncio
+    async def test_a_selection_the_engine_refuses_is_reported_as_a_refusal(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # Written past the write path, which is the only way this document exists.
+        # "no stages" and "the selection names a preset that does not exist" call
+        # for different edits, so they must not read the same.
+        config_root.mkdir(parents=True, exist_ok=True)
+        (config_root / "config.json").write_text(
+            json.dumps({"workflow": {"preset": "not-a-preset"}}), encoding="utf-8"
+        )
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/workflow-origins")
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "workflow_invalid"
+
+
+class TestRunSpendDetail:
+    @pytest.mark.asyncio
+    async def test_a_run_detail_reports_the_engine_s_attributed_total(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            resp = await client.get(f"{_BASE}/engine/run-spend?run_id=run-a")
+            assert resp.status == 200
+            body = await resp.json()
+            store, _audit = routes._engine_store()
+            engine_total = RunAccounting(store).spend("run-a").total_credits
+        # The engine's own attribution, not a sum of whatever the browser fetched.
+        assert body["credits"] == pytest.approx(engine_total)
+        assert body["run_id"] == "run-a"
+        assert body["spec"] == "example"
+        # The ceiling travels with it, so the number has the denominator the engine
+        # will judge it against, with the origin that produced it.
+        assert body["ceiling"]["value"] == SETTINGS["budget.run_ceiling_credits"].default
+        assert body["ceiling"]["origin"] == "bundled_default"
+
+    @pytest.mark.asyncio
+    async def test_declared_spend_outside_a_session_is_inside_the_total(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The half a browser-side sum over turn rows misses: a capability provider
+        # (screening, analysis) declares credits spent outside any host session,
+        # and this engine has already shipped one defect where that spend escaped a
+        # run's ceiling.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            store, _audit = routes._engine_store()
+            RunAccounting(store).cost_sink.attribute(
+                run="run-a", capability="analysis", provider="external", credits=2.5
+            )
+            resp = await client.get(f"{_BASE}/engine/run-spend?run_id=run-a")
+            body = await resp.json()
+            engine_total = RunAccounting(store).spend("run-a").total_credits
+        assert body["declared_credits"] == pytest.approx(2.5)
+        assert body["credits"] == pytest.approx(engine_total)
+        assert body["credits"] >= 2.5
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_run_is_a_404_rather_than_a_zero(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # Zero credits for a run that does not exist would read as a free run.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/run-spend?run_id=nope")
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "run_unknown"
+
+    @pytest.mark.asyncio
+    async def test_a_spend_view_without_a_run_is_refused(self, monkeypatch, tmp_path, config_root):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/run-spend")
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "field_required"
+
+
+class TestTheSurfaceSaysWhatItWillWrite:
+    @pytest.mark.asyncio
+    async def test_the_domains_that_execute_argv_are_reported_read_only_with_a_reason(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/config")
+            body = await resp.json()
+        editors = {row["domain"]: row for row in body["domain_editors"]}
+        # The four domains the bullet names as editable.
+        for domain in ("autonomy", "watch_sources", "role_assignments", "notification_channels"):
+            assert editors[domain]["editable"] is True, domain
+        # And the ones this surface deliberately does not write, each carrying a
+        # code the surface can translate: a control that silently failed would be
+        # worse than an honest read-only view.
+        for domain in ("workflow", "quality_gates", "programs", "capabilities"):
+            assert editors[domain]["editable"] is False, domain
+            assert editors[domain]["reason_code"], domain
+        # A partial editor names the fields it offers, so ``poll`` (the argv the
+        # watcher executes) is visibly not one of them.
+        assert editors["watch_sources"]["fields"] == ["enabled"]
+
+    @pytest.mark.asyncio
+    async def test_the_pickers_vocabulary_is_the_engine_s_own(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        from kiro_crew.apps.builtins.spec_engine.engine.config import (
+            AUTONOMY_LEVELS,
+            CONFIG_ONLY_PATHS,
+            ROLES,
+            SPEC_TYPES,
+            SUBMITTER_CLASSES,
+        )
+
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.get(f"{_BASE}/engine/config")
+            body = await resp.json()
+        # A picker built from a hardcoded copy would offer a level or a role the
+        # validator refuses the day either list grows.
+        assert body["catalogs"]["autonomy_levels"] == list(AUTONOMY_LEVELS)
+        assert body["catalogs"]["submitter_classes"] == list(SUBMITTER_CLASSES)
+        assert body["catalogs"]["spec_types"] == list(SPEC_TYPES)
+        assert body["catalogs"]["roles"] == list(ROLES)
+        assert body["config_only_paths"] == list(CONFIG_ONLY_PATHS)

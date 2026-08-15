@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import web
@@ -46,6 +47,8 @@ from aiohttp import web
 from ...spec_engine.engine import review_queue as engine_review_queue
 from ...spec_engine.engine import runs as engine_runs
 from ...spec_engine.engine import state as engine_state
+from ...spec_engine.engine.budget import ceiling as engine_ceiling
+from ...spec_engine.engine.budget import ledger as engine_ledger
 from ...spec_engine.engine.budget import switch as engine_switch
 from ...spec_engine.engine.budget.killswitch import (
     engage_kill_switch,
@@ -53,12 +56,20 @@ from ...spec_engine.engine.budget.killswitch import (
     stoppable_runs,
 )
 from ...spec_engine.engine.config import (
+    AUTONOMY_LEVELS,
+    CONFIG_ONLY_PATHS,
+    ROLES,
+    SPEC_TYPES,
+    SUBMITTER_CLASSES,
+    WILDCARD_KEY,
     ConfigLoadError,
     ConfigStore,
     ConfigValidationError,
     ConfigWriteRefused,
 )
 from ...spec_engine.engine.config.store import DASHBOARD_SURFACE
+from ...spec_engine.engine.delivery.preset_display import stage_origins
+from ...spec_engine.engine.delivery.workflow import DeliveryWorkflow
 
 logger = logging.getLogger("kirocrew.app.spec-builder")
 
@@ -79,6 +90,73 @@ CONFIG_DOMAIN_SECTIONS: tuple[str, ...] = (
     "notifications",
     "capabilities",
     "cost_profiles",
+)
+
+
+@dataclass(frozen=True)
+class DomainEditor:
+    """Whether this surface offers an editor for one configuration domain.
+
+    A domain with no editor is rendered read-only WITH its reason, rather than
+    given a control that the engine's write path would refuse: a form that
+    collects an edit nobody can save is worse than an honest read-only view,
+    because the operator believes the change landed.
+
+    ``reason_code`` is a code rather than prose because backend-owned strings have
+    no translation catalog; the surface owns the wording.
+    """
+
+    domain: str
+    #: Dotted path (or section) the domain lives at, so a surface can point at it.
+    path: str
+    editable: bool
+    #: Fields the editor offers, when it deliberately offers only some.
+    fields: tuple[str, ...] = ()
+    reason_code: str = ""
+
+    def to_json_object(self) -> dict[str, Any]:
+        return {
+            "domain": self.domain,
+            "path": self.path,
+            "editable": self.editable,
+            "fields": list(self.fields),
+            "reason_code": self.reason_code,
+        }
+
+
+#: What this surface will and will not write, decided per domain rather than per
+#: request. Every ``editable=False`` row here is a path in
+#: :data:`CONFIG_ONLY_PATHS` that carries argv the engine EXECUTES or an assertion
+#: the Doctor checks: the engine would accept the write from this
+#: operator-confirmed surface, and the decision not to offer it is this surface's
+#: own. A workflow editor in a browser panel would put command lines that run on
+#: a run's workspace one click away from a page that is otherwise about numbers,
+#: and the panel has no way to show what a command would do. The autonomy ladder
+#: is offered because choosing how far unattended work may go is the decision an
+#: operator opens this panel to make, and it is a bounded choice from a fixed
+#: ladder rather than free text.
+CONFIG_DOMAIN_EDITORS: tuple[DomainEditor, ...] = (
+    DomainEditor(domain="autonomy", path="sources.*.autonomy", editable=True),
+    DomainEditor(
+        domain="watch_sources",
+        path="sources",
+        editable=True,
+        # Not ``poll``: it is the argv the watcher executes.
+        fields=("enabled",),
+        reason_code="argv_read_only",
+    ),
+    DomainEditor(domain="role_assignments", path="cost_profiles.*.roles", editable=True),
+    DomainEditor(domain="notification_channels", path="notify.channel", editable=True),
+    DomainEditor(domain="workflow", path="workflow", editable=False, reason_code="executes_argv"),
+    DomainEditor(
+        domain="quality_gates", path="quality_gates", editable=False, reason_code="executes_argv"
+    ),
+    DomainEditor(
+        domain="programs", path="programs", editable=False, reason_code="host_assertion"
+    ),
+    DomainEditor(
+        domain="capabilities", path="capabilities", editable=False, reason_code="binds_provider"
+    ),
 )
 
 
@@ -181,6 +259,23 @@ async def handle_get_config(request: web.Request) -> web.Response:
             # Named so a surface can label the domains it has no editor for
             # instead of implying that an absent section is an empty one.
             "domain_sections": list(CONFIG_DOMAIN_SECTIONS),
+            # Which domains this surface writes, and why it does not write the
+            # rest. A surface deciding that for itself would drift from what the
+            # write path accepts.
+            "domain_editors": [editor.to_json_object() for editor in CONFIG_DOMAIN_EDITORS],
+            # The paths the engine fences to an operator-confirmed surface. Relayed
+            # so a panel can mark them rather than keep a second copy of the list.
+            "config_only_paths": list(CONFIG_ONLY_PATHS),
+            # The engine's own vocabularies. A picker built from a hardcoded copy
+            # would offer a level or a role the validator refuses the day either
+            # list grows.
+            "catalogs": {
+                "autonomy_levels": list(AUTONOMY_LEVELS),
+                "submitter_classes": list(SUBMITTER_CLASSES),
+                "spec_types": list(SPEC_TYPES),
+                "roles": list(ROLES),
+                "wildcard": WILDCARD_KEY,
+            },
         }
     )
 
@@ -237,6 +332,122 @@ async def handle_put_config(request: web.Request) -> web.Response:
     logger.info("spec-builder: %s wrote the engine configuration", actor or "an operator")
     _sel_audit("engine_config_write", f"actor={actor}" if actor else "")
     return web.json_response({"ok": True, "document": document})
+
+
+async def handle_get_workflow_origins(request: web.Request) -> web.Response:
+    """GET one row per delivery stage: which layer's commands it runs.
+
+    Relayed from :func:`stage_origins`, which derives preset-versus-override per
+    stage from what the workflow resolver already decided. Nothing here compares a
+    project's stages against the bundled table: a byte-identical override is still
+    an override, and a value comparison would report it as inherited on exactly
+    the stage an operator is inspecting. The rows already carry their own
+    ``summary`` line, so the surface renders text the engine wrote.
+
+    A mixed workflow -- some stages from the preset, some overridden, some defined
+    by nobody -- is the normal case, which is why this is per stage and not one
+    label per workflow.
+    """
+    project = request.query.get("project") or None
+    store = _config_store()
+    try:
+        workflow = DeliveryWorkflow.load(store, project=project)
+        selection = workflow.selected_preset()
+        rows = [origin.to_json_object() for origin in stage_origins(workflow)]
+    except ConfigValidationError as exc:
+        # A selected preset that resolves to nothing, most often. Reported as the
+        # engine's refusal rather than as an empty workflow: "no stages" and "the
+        # selection names a preset that does not exist" call for different edits.
+        return _bad_request(
+            "workflow_invalid",
+            "; ".join(str(e) for e in exc.errors),
+            status=409,
+        )
+    except (ConfigLoadError, ValueError) as exc:
+        return _bad_request("workflow_unreadable", str(exc), status=409)
+    return web.json_response(
+        {
+            "scope": {"project": project},
+            "preset": (
+                None
+                if selection is None
+                else {
+                    "name": selection.name,
+                    "origin": selection.origin.value,
+                    "declared_at": selection.declared_at,
+                    "bundled": selection.bundled,
+                }
+            ),
+            "stages": rows,
+        }
+    )
+
+
+async def handle_get_run_spend(request: web.Request) -> web.Response:
+    """GET one run's attributed spend: the number the ceiling compares.
+
+    ``credits`` is :meth:`RunAccounting.spend`'s total for the run -- every
+    stamped session's metered credits plus every credit an external capability
+    provider declared. It is deliberately NOT a sum of whatever rows a surface
+    happened to fetch: a browser-side total silently disagrees with the ceiling
+    the engine enforces, and the split below is what shows a caller that
+    out-of-session spend (a screening or analysis provider's declared cost) is
+    inside the total rather than beside it.
+
+    The ceiling travels with it, resolved for the run's own project, so the number
+    has the denominator the engine will judge it against.
+    """
+    run_id = (request.query.get("run_id") or "").strip()
+    if not run_id:
+        return _bad_request("field_required", "a spend view needs the run_id to report on")
+
+    from . import routes
+
+    store, _audit_log = routes._engine_store()
+    try:
+        payload = await asyncio.to_thread(_run_spend_payload, store, run_id)
+    except (OSError, ValueError) as exc:
+        return _bad_request("spend_unreadable", str(exc), status=503)
+    if payload is None:
+        return _bad_request("run_unknown", "no run has that id", status=404)
+    return web.json_response(payload)
+
+
+def _run_spend_payload(store: engine_state.StateStore, run_id: str) -> dict[str, Any] | None:
+    """BLOCKING -- one run's attributed spend and the ceiling in force for it."""
+    record = store.get_run(run_id)
+    if record is None:
+        return None
+    specs = {spec.spec_key: spec for spec in store.list_specs(include_archived=True)}
+    spec = specs.get(record.spec_key)
+    project = spec.project if spec is not None else None
+    spend = engine_ledger.RunAccounting(store).spend(run_id)
+    ceiling = _config_store().effective(engine_ceiling.CEILING_SETTING, project=project)
+    return {
+        "run_id": run_id,
+        "project": project,
+        "spec": spec.name if spec is not None else "",
+        "state": record.state,
+        "source": record.source,
+        # The engine's attributed total. Rounded for display only at the last
+        # step, and the parts are reported beside it so the total is checkable.
+        "credits": round(spend.total_credits, 4),
+        "metered_credits": round(spend.metered_credits, 4),
+        # Spend that happened OUTSIDE any host session, which is the half a
+        # browser-side sum over turn rows would miss entirely.
+        "declared_credits": round(spend.declared_credits, 4),
+        "turns": spend.turns,
+        "sessions": len(spend.sessions),
+        # The run row's own stored figure. Reported so a surface can show the two
+        # agreeing rather than choosing one silently; the ceiling compares
+        # ``credits``.
+        "recorded_credits": round(record.cost_credits, 4),
+        "ceiling": {
+            "value": ceiling.value,
+            "origin": ceiling.origin.value,
+            "declared_at": ceiling.declared_at,
+        },
+    }
 
 
 async def handle_get_kill_switch(request: web.Request) -> web.Response:
@@ -604,6 +815,14 @@ def register_engine_routes(app: web.Application, base: str, wrap: Any) -> None:
     app.router.add_get(f"{base}/engine/config", wrap(handle_get_config))
     app.router.add_put(f"{base}/engine/config", wrap(handle_put_config))
     app.router.add_post(f"{base}/engine/config", wrap(handle_put_config))
+    # Per-stage command origin. A read of the same document the config GET
+    # reports, projected by the engine's own preset-display rather than by a
+    # surface comparing stage lists.
+    app.router.add_get(f"{base}/engine/workflow-origins", wrap(handle_get_workflow_origins))
+    # One run's attributed spend, for a detail view. The queue's per-row credits
+    # answer "which run is expensive"; this answers "what did THIS run spend, and
+    # against what ceiling".
+    app.router.add_get(f"{base}/engine/run-spend", wrap(handle_get_run_spend))
     app.router.add_get(f"{base}/engine/kill-switch", wrap(handle_get_kill_switch))
     app.router.add_post(f"{base}/engine/kill-switch", wrap(handle_post_kill_switch))
     app.router.add_get(f"{base}/engine/queue", wrap(handle_get_queue))
