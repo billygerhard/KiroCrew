@@ -169,5 +169,6 @@ class TestVariableAssembly:
             item_url="https://example.invalid/7",
             review_title="t",
             review_summary="y",
+            review_url="https://example.invalid/7/pull/1",
         )
         assert tuple(context.to_variables()) == RUN_CONTEXT_VARIABLES

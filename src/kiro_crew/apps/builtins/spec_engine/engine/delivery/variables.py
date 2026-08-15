@@ -36,6 +36,7 @@ RUN_CONTEXT_VARIABLES: tuple[str, ...] = (
     "item_url",
     "review_title",
     "review_summary",
+    "review_url",
 )
 
 
@@ -70,6 +71,12 @@ class RunContext:
     item_url: str = ""
     review_title: str = ""
     review_summary: str = ""
+    #: Address of the review artifact this run's submit stage raised, learned
+    #: from what that command printed. Empty until a submit actually raised one:
+    #: a link-artifact writeback names the artifact, and a run with no artifact
+    #: has no link to give, so the variable is absent rather than a branch name
+    #: standing in for a URL.
+    review_url: str = ""
 
     def to_variables(self) -> dict[str, str]:
         """Return the non-blank run context values, keyed by variable name."""
@@ -84,6 +91,7 @@ class RunContext:
             "item_url": self.item_url,
             "review_title": self.review_title,
             "review_summary": self.review_summary,
+            "review_url": self.review_url,
         }
         return {name: value for name, value in candidates.items() if value and value.strip()}
 
