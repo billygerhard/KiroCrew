@@ -1,7 +1,7 @@
 // EngineOpsPanel — the engine's operator controls: the stop switch, per-run
 // spend, and every setting's effective value with the layer that produced it.
 //
-// The panel renders what the backend relays and derives nothing. Two rules it
+// The panel renders what the backend relays and derives nothing. Three rules it
 // keeps deliberately:
 //
 //   * **origin is never inferred.** A row's layer comes from the engine's
@@ -12,6 +12,11 @@
 //   * **the scopes a write is accepted at come from the registry.** A field is
 //     offered read-only when the setting is not overridable at the scope on
 //     screen, rather than collecting an edit the engine's write path refuses.
+//   * **a run's credits are the ENGINE's attributed total.** The queue column and
+//     the detail view both read a number the engine computed. Neither sums rows in
+//     the browser: a browser-side total silently disagrees with the ceiling the
+//     engine enforces, which is the shape of a budget defect this engine has
+//     already shipped once.
 //
 // The stop control is a safety control, so it says what it will stop BEFORE it
 // is thrown (the run count and the credits already spent) and what a release
@@ -19,8 +24,9 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, OctagonX, Play } from 'lucide-react'
-import { engineApi, originLabel, type EffectiveSetting } from '../api'
+import { engineApi, originLabel } from '../api'
 import { Btn } from './shared'
+import EngineConfigEditor from './EngineConfigEditor'
 import { Input } from '../../../components/ui'
 import Modal from '../../../components/Modal'
 import { i18nT } from '../../../i18n/t'
@@ -31,24 +37,58 @@ export interface EngineOpsPanelProps {
   setErr: (msg: string) => void
 }
 
-/** Settings grouped by their dotted prefix, which is the domain an operator
- *  thinks in (concurrency, limits, timeouts, budget, watch, delivery). */
-function grouped(settings: Record<string, EffectiveSetting>): [string, EffectiveSetting[]][] {
-  const groups = new Map<string, EffectiveSetting[]>()
-  for (const key of Object.keys(settings)) {
-    const group = key.split('.')[0]
-    const rows = groups.get(group)
-    if (rows) rows.push(settings[key])
-    else groups.set(group, [settings[key]])
+/** One run's spend, read from the engine per run rather than summed here.
+ *
+ *  `credits` is `RunAccounting.spend(run).total_credits` — the figure the ceiling
+ *  compares — and the declared part is shown beside it because that is the spend
+ *  a sum over turn rows would miss entirely. */
+function RunSpendDetail({ runId }: { runId: string }) {
+  const detail = useQuery({
+    queryKey: ['spec-builder', 'engine-run-spend', runId],
+    queryFn: () => engineApi.getRunSpend(runId),
+  })
+  if (detail.isError) {
+    return (
+      <p role="alert" style={{ margin: '8px 0 0' }}>
+        <AlertTriangle className="lucide-inline" aria-hidden="true" />
+        {(detail.error as Error).message}
+      </p>
+    )
   }
-  // Sorted with an explicit locale: an unlocalised sort orders differently per
-  // browser, so two operators would see the same panel in two orders.
-  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }))
+  const row = detail.data
+  if (!row) return null
+  return (
+    <div aria-label={i18nT('apps.specBuilder.engineOps.detail_section')} style={{ marginTop: 8 }}>
+      <h4 style={{ margin: '0 0 4px' }}>
+        {i18nT('apps.specBuilder.engineOps.detail_heading', { run: row.run_id })}
+      </h4>
+      <p style={{ margin: 0 }}>
+        {i18nT('apps.specBuilder.engineOps.detail_credits', {
+          credits: fmtNumber(row.credits, { maximumFractionDigits: 2 }),
+          ceiling: fmtNumber(Number(row.ceiling.value), { maximumFractionDigits: 2 }),
+        })}
+      </p>
+      <p style={{ margin: 0 }}>
+        {i18nT('apps.specBuilder.engineOps.detail_split', {
+          metered: fmtNumber(row.metered_credits, { maximumFractionDigits: 2 }),
+          declared: fmtNumber(row.declared_credits, { maximumFractionDigits: 2 }),
+        })}
+      </p>
+      <p style={{ margin: 0 }}>
+        {i18nT('apps.specBuilder.engineOps.detail_ceiling_origin', {
+          origin: originLabel(row.ceiling.origin),
+        })}
+      </p>
+    </div>
+  )
 }
 
 export default function EngineOpsPanel({ onClose, setErr }: EngineOpsPanelProps) {
   const qc = useQueryClient()
   const [reason, setReason] = useState('')
+  // The run whose spend detail is open. One at a time: the detail is a read of
+  // ONE run's attribution, and a page of them would invite adding them up.
+  const [detailRun, setDetailRun] = useState('')
 
   const configQuery = useQuery({
     queryKey: ['spec-builder', 'engine-config'],
@@ -189,6 +229,9 @@ export default function EngineOpsPanel({ onClose, setErr }: EngineOpsPanelProps)
                     <th scope="col" style={{ textAlign: 'right' }}>
                       {i18nT('apps.specBuilder.engineOps.col_credits')}
                     </th>
+                    <th scope="col" style={{ textAlign: 'left' }}>
+                      {i18nT('apps.specBuilder.engineOps.col_detail')}
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -199,50 +242,28 @@ export default function EngineOpsPanel({ onClose, setErr }: EngineOpsPanelProps)
                       <td style={{ textAlign: 'right' }}>
                         {fmtNumber(row.cost_credits, { maximumFractionDigits: 2 })}
                       </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </>
-          )}
-        </section>
-
-        {/* ── configuration, with the origin of every value ────────────── */}
-        <section aria-label={i18nT('apps.specBuilder.engineOps.config_section')}>
-          <h3 style={{ margin: '0 0 6px' }}>{i18nT('apps.specBuilder.engineOps.config_section')}</h3>
-          <p style={{ margin: '0 0 8px' }}>{i18nT('apps.specBuilder.engineOps.config_origin_note')}</p>
-          {grouped(configQuery.data?.settings ?? {}).map(([group, rows]) => (
-            <div key={group} style={{ marginBottom: 12 }}>
-              <h4 style={{ margin: '0 0 4px' }}>{group}</h4>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr>
-                    <th scope="col" style={{ textAlign: 'left' }}>
-                      {i18nT('apps.specBuilder.engineOps.col_setting')}
-                    </th>
-                    <th scope="col" style={{ textAlign: 'left' }}>
-                      {i18nT('apps.specBuilder.engineOps.col_effective')}
-                    </th>
-                    <th scope="col" style={{ textAlign: 'left' }}>
-                      {i18nT('apps.specBuilder.engineOps.col_origin')}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row) => (
-                    <tr key={row.key} title={row.summary || ''}>
-                      <td>{row.key}</td>
-                      <td>{String(row.value)}</td>
                       <td>
-                        {originLabel(row.origin)}
-                        {row.declared_at ? ` (${row.declared_at})` : ''}
+                        <Btn
+                          label={i18nT('apps.specBuilder.engineOps.open_detail')}
+                          ariaLabel={i18nT('apps.specBuilder.engineOps.open_detail_run', {
+                            run: row.run_id,
+                          })}
+                          onClick={() => setDetailRun(row.run_id)}
+                        />
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-            </div>
-          ))}
+              {detailRun && <RunSpendDetail runId={detailRun} />}
+            </>
+          )}
+        </section>
+
+        {/* ── configuration: effective values, origins, and the editor ─── */}
+        <section aria-label={i18nT('apps.specBuilder.engineOps.config_section')}>
+          <h3 style={{ margin: '0 0 6px' }}>{i18nT('apps.specBuilder.engineOps.config_section')}</h3>
+          <p style={{ margin: '0 0 8px' }}>{i18nT('apps.specBuilder.engineOps.config_origin_note')}</p>
           {/* Domains that are containers rather than registry settings. Named
               even when empty, so an operator can tell "nothing configured" from
               "this panel has no view of it". */}
@@ -261,7 +282,7 @@ export default function EngineOpsPanel({ onClose, setErr }: EngineOpsPanelProps)
               )
             })}
           </ul>
-          <p style={{ margin: '8px 0 0' }}>{i18nT('apps.specBuilder.engineOps.domains_read_only')}</p>
+          {configQuery.data && <EngineConfigEditor config={configQuery.data} />}
         </section>
       </div>
     </Modal>

@@ -359,6 +359,20 @@ export interface EffectiveSetting {
   choices?: string[]
 }
 
+/** Whether this surface writes one configuration domain, and why not when it
+ *  does not. `reason_code` is a code because backend strings have no catalog: the
+ *  wording is this app's. A domain with `editable: false` is rendered read-only
+ *  WITH its reason rather than given a control the write path would refuse. */
+export interface ConfigDomainEditor {
+  domain: string
+  /** Dotted path the domain lives at, so the panel can point at it. */
+  path: string
+  editable: boolean
+  /** Fields the editor offers, when it deliberately offers only some. */
+  fields: string[]
+  reason_code: string
+}
+
 export interface EngineConfigResponse {
   scope: { project: string | null; source: string | null }
   settings: Record<string, EffectiveSetting>
@@ -368,6 +382,69 @@ export interface EngineConfigResponse {
   /** Every domain this surface knows, so an absent one reads as "none
    *  configured" rather than as a domain that does not exist. */
   domain_sections: string[]
+  /** What this surface will and will not write, decided by the backend. A panel
+   *  deciding for itself would drift from what the write path accepts. */
+  domain_editors?: ConfigDomainEditor[]
+  /** Paths the engine fences to an operator-confirmed surface. */
+  config_only_paths?: string[]
+  /** The ENGINE's own vocabularies. A picker built from a hardcoded copy would
+   *  offer a level or a role the validator refuses the day either list grows. */
+  catalogs?: {
+    autonomy_levels: string[]
+    submitter_classes: string[]
+    spec_types: string[]
+    roles: string[]
+    wildcard: string
+  }
+}
+
+/** One delivery stage and the layer whose commands it runs, as the ENGINE
+ *  derived it (`preset_display.stage_origins`). Never derived here: a
+ *  byte-identical override is still an override, so comparing a stage's commands
+ *  against the preset's would report it as inherited on exactly the stage an
+ *  operator is inspecting. */
+export interface StageOriginRow {
+  stage: string
+  /** bundled_preset | user_preset | app_override | project_override | unconfigured */
+  source: string
+  from_preset: boolean
+  bundled: boolean
+  preset: string
+  declared_at: string
+  commands: number
+  /** True when nothing defines the stage, so it SKIPS at execution. Not the same
+   *  as a stage that runs the preset's commands. */
+  skipped: boolean
+  /** The engine's own one-line description of the row. */
+  summary: string
+}
+
+export interface WorkflowOriginsResponse {
+  scope: { project: string | null }
+  /** The preset in force, or null when none is selected. */
+  preset: { name: string; origin: string; declared_at: string; bundled: boolean } | null
+  stages: StageOriginRow[]
+}
+
+/** One run's spend as the ENGINE attributes it. `credits` is the number the
+ *  ceiling compares -- never a browser-side sum over fetched rows, which would
+ *  silently disagree with the limit the engine enforces. */
+export interface RunSpendResponse {
+  run_id: string
+  project: string | null
+  spec: string
+  state: string
+  source: string | null
+  credits: number
+  metered_credits: number
+  /** Spend an external capability provider declared OUTSIDE any host session.
+   *  Reported separately because it is the half a sum over turn rows misses. */
+  declared_credits: number
+  turns: number
+  sessions: number
+  /** The run row's own stored figure, for showing the two agree. */
+  recorded_credits: number
+  ceiling: { value: number | string | boolean; origin: string; declared_at: string }
 }
 
 export interface KillSwitchView {
@@ -510,6 +587,13 @@ export const engineApi = {
   },
   putConfig: (patch: Record<string, unknown>) =>
     req<{ ok?: boolean }>('/engine/config', { method: 'PUT', body: JSON.stringify({ patch }) }),
+  /** Per-stage command origin, as the ENGINE derived it. */
+  getWorkflowOrigins: (project?: string) =>
+    req<WorkflowOriginsResponse>(
+      '/engine/workflow-origins' + (project ? '?project=' + enc(project) : ''),
+    ),
+  /** One run's attributed spend, for a detail view. */
+  getRunSpend: (runId: string) => req<RunSpendResponse>('/engine/run-spend?run_id=' + enc(runId)),
   getKillSwitch: () => req<KillSwitchResponse>('/engine/kill-switch'),
   setKillSwitch: (action: 'engage' | 'release', reason?: string) =>
     req<KillSwitchActionResponse>('/engine/kill-switch', {
