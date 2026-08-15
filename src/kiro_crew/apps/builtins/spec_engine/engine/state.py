@@ -334,14 +334,39 @@ def reject_spec_tree_path(path: Path) -> None:
     The engine's own state must be storable somewhere that is not the interop
     contract. A misconfigured root pointed at a spec directory is that failure,
     so it is reported as one rather than silently honoured.
+
+    Two spellings reach the same directory and both are refused, because a fence
+    that holds at one spelling of a path is the shape every security defect in
+    this engine has had:
+
+    * **Case.** ``.KIRO/SPECS`` and ``.kiro/specs`` are the SAME directory on a
+      case-insensitive filesystem, which is the default on macOS and Windows, so
+      the comparison folds case. On a case-sensitive filesystem that makes this a
+      refusal of a genuinely different directory -- accepted deliberately, since
+      refusing an oddly-cased path costs an operator one clear error message
+      while admitting one puts the engine's state inside the interop contract.
+    * **Symlinks.** A parent that is a link into a spec tree lands there just as
+      surely as a literal path, so the resolved path is checked as well as the
+      one given. ``resolve`` is non-strict: a root that does not exist yet
+      normalises rather than raising, which is the ordinary case at first start.
     """
-    parts = tuple(path.parts)
-    window = len(SPEC_TREE_SEGMENTS)
-    for index in range(len(parts) - window + 1):
-        if parts[index : index + window] == SPEC_TREE_SEGMENTS:
-            raise StatePersistenceError(
-                f"refusing to store engine state inside a spec tree: {path}"
-            )
+    folded = tuple(segment.casefold() for segment in SPEC_TREE_SEGMENTS)
+    window = len(folded)
+    candidates = [path]
+    try:
+        candidates.append(path.resolve())
+    except OSError:
+        # A path the OS cannot resolve (a loop, or a parent we may not stat) is
+        # still checked in its literal form rather than skipped: failing to
+        # resolve is not evidence the path is outside the tree.
+        pass
+    for candidate in candidates:
+        parts = tuple(segment.casefold() for segment in candidate.parts)
+        for index in range(len(parts) - window + 1):
+            if parts[index : index + window] == folded:
+                raise StatePersistenceError(
+                    f"refusing to store engine state inside a spec tree: {path}"
+                )
 
 
 def utc_now_iso() -> str:

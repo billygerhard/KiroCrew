@@ -269,18 +269,6 @@ def test_a_normalised_spelling_of_a_spec_tree_is_refused(tmp_path: Path, spellin
     assert "spec tree" in str(raised.value)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect: reject_spec_tree_path compares path parts against the "
-        "lowercase literals ('.kiro', 'specs'), so on a case-insensitive "
-        "filesystem -- macOS and Windows defaults -- a state root spelled "
-        "'.KIRO/SPECS' passes the fence while being the same directory as "
-        "'.kiro/specs'. Verified: state.db lands at .kiro/specs/state/state.db, "
-        "inside the interop contract. Reported, not fixed: engine/state.py "
-        "belongs to another task."
-    ),
-)
 def test_a_case_spelled_spec_tree_is_refused_where_case_does_not_distinguish(
     tmp_path: Path,
 ) -> None:
@@ -299,15 +287,6 @@ def test_a_case_spelled_spec_tree_is_refused_where_case_does_not_distinguish(
         StateStore(root=project / ".KIRO" / "SPECS" / "state")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect: the fence matches lexical path parts and does not resolve "
-        "symlinks, so a state root whose parent is a symlink into a spec tree is "
-        "accepted. Verified: state.db lands at .kiro/specs/state/state.db through "
-        "the link. Reported, not fixed: engine/state.py belongs to another task."
-    ),
-)
 def test_a_state_root_reached_through_a_symlink_into_a_spec_tree_is_refused(
     tmp_path: Path,
 ) -> None:
