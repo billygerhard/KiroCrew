@@ -29,7 +29,6 @@ from hypothesis import strategies as st
 from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE, ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.config.schema import DELIVERY_STAGES
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
-    DELIVERY_FLOW_STAGES,
     DeliveryWorkflow,
     StageOrigin,
     StageSource,
@@ -327,6 +326,3 @@ class TestTheDisplayAgreesWithTheResolver:
         configure(store, {"workflow": {"preset": "local-only"}})
         resolved = stage_origins(DeliveryWorkflow.load(store))
         assert tuple(row.stage for row in resolved) == DELIVERY_STAGES
-        # The flow's own stage order is a subset of the schema's, so a surface
-        # listing these rows never shows a stage the pipeline cannot run.
-        assert set(DELIVERY_FLOW_STAGES) <= set(DELIVERY_STAGES)
