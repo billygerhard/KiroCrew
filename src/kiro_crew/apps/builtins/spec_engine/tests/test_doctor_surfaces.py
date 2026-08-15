@@ -513,6 +513,23 @@ class TestAWatchSourceThatCannotCancel:
     ) -> None:
         assert poll_reports_closed_items(argv) is widened
 
+    def test_the_advisory_reads_the_bundled_presets_the_way_the_asymmetry_says(self) -> None:
+        """The bundled presets, judged by the predicate rather than by hand.
+
+        ``test_only_github_can_derive_a_cancellation_and_that_asymmetry_is_deliberate``
+        pins the same gap from the presets' side. This pins it from the advisory's:
+        the GitHub preset asks for ``state=all`` and reads widened, the GitLab one
+        does not and reads narrow, so an operator who copies it is told. Both fail
+        the day the GitLab argv gains a state filter -- at which point the flag has
+        been verified against a real ``glab`` and both claims are what to correct.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.watch.sources import (
+            WATCH_SOURCE_PRESETS,
+        )
+
+        assert poll_reports_closed_items(list(WATCH_SOURCE_PRESETS["github"]["poll"])) is True
+        assert poll_reports_closed_items(list(WATCH_SOURCE_PRESETS["gitlab"]["poll"])) is False
+
     def test_the_advisory_does_not_widen_anything(self, config: ConfigStore) -> None:
         # It never guesses a flag: a plausible flag the real CLI rejects fails every
         # poll rather than degrading one, which is a worse defect than the one being
