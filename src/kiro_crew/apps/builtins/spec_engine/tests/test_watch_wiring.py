@@ -41,6 +41,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.watch.wiring import (
     build_feedback_poster,
+    build_review_feedback_watcher,
     build_screener,
     watch_tick,
 )
@@ -383,6 +384,85 @@ class TestTheScreenerIsBuiltOverTheGraph:
         assert getattr(screener, "_config") is graph.config
         assert getattr(screener, "_state") is graph.state
         assert getattr(screener, "_notifier") is graph.notifier
+
+
+class TestTheReviewFeedbackWatcherIsConstructed:
+    """Nothing built this watcher, so a reviewer's comment reached nothing.
+
+    Task 11.2 built the whole of it — per-comment class gating, refusal before
+    spend, both bounds, bounded retry — and its requirements held at module level
+    only. These assertions are about the construction: which stores it writes to,
+    and above all that it screens through the SAME screener intake uses. A second
+    screener here would be a second screening path, which is the defect class
+    every security defect in this engine has belonged to.
+    """
+
+    def test_it_is_built_over_the_graphs_stores_and_notifier(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+        screener = build_screener(graph, host=RecordingTurnHost())
+
+        watcher = build_review_feedback_watcher(
+            graph,
+            screener=screener,
+            reviser=_reviser(),
+            delivery=_delivery(),
+        )
+
+        assert getattr(watcher, "_config") is graph.config
+        assert getattr(watcher, "_state") is graph.state
+        assert getattr(watcher, "_audit") is graph.audit
+        assert getattr(watcher, "_notifier") is graph.notifier
+
+    def test_it_screens_comments_through_the_intake_screener_itself(
+        self, tmp_path: Path
+    ) -> None:
+        """The same object, not a second one built the same way.
+
+        Identity is the assertion: two screeners built from the same graph would
+        satisfy any structural check while giving a comment and an issue body two
+        places for a verdict to differ.
+        """
+        graph = build(tmp_path)
+        screener = build_screener(graph, host=RecordingTurnHost())
+
+        watcher = build_review_feedback_watcher(
+            graph,
+            screener=screener,
+            reviser=_reviser(),
+            delivery=_delivery(),
+        )
+
+        assert getattr(watcher, "_screener") is screener
+
+    def test_the_reviser_and_the_delivery_pipeline_have_no_defaults(self) -> None:
+        """A default for either could only mean "claim comments and do nothing"."""
+        import inspect
+
+        parameters = inspect.signature(build_review_feedback_watcher).parameters
+        assert parameters["reviser"].default is inspect.Parameter.empty
+        assert parameters["delivery"].default is inspect.Parameter.empty
+        assert parameters["screener"].default is inspect.Parameter.empty
+
+
+def _reviser() -> Any:
+    """A fix-round reviser stands here; the production one is not constructible yet."""
+
+    def revise(revision: Any) -> None:  # pragma: no cover - construction test only
+        return None
+
+    return revise
+
+
+def _delivery() -> Any:
+    """A delivery pipeline stands here; the real one is the pipeline 20.4 owns."""
+
+    class _Delivery:
+        def deliver(  # pragma: no cover - construction test only
+            self, context: Any, *, requester: str | None = None
+        ) -> Any:
+            raise AssertionError("no revision should be delivered by a construction test")
+
+    return _Delivery()
 
 
 def _runner_for(*items: WatchedItem) -> Any:
