@@ -8,7 +8,7 @@ a delegated capability is attributed to a durable row rather than to memory, the
 capability audit reaches the same log the rest of the run writes to, and exactly
 one :class:`~.runs.RunMachine` exists over the state store.
 
-Two properties are load-bearing and both are enforced by construction rather
+Four properties are load-bearing and each is enforced by construction rather
 than by convention:
 
 *One machine per store.* :meth:`RunMachine.transition` is the only production
@@ -23,6 +23,21 @@ engine library cannot build for itself as required keywords. A default for any
 of them would be the same defect this module exists to remove, moved up one
 level: a graph that looks complete, resolves no builtin, and records what it
 found where nobody can read it.
+
+*A run's authority comes from its row.* :meth:`EngineGraph.begin_run` takes the
+rung a caller is asking for, because no row exists yet and the prerequisite gate
+is what judges the request. :meth:`EngineGraph.request_execution` takes none: by
+then the run has been admitted under a resolved rung that is persisted on it, and
+:mod:`.resume` reads it back. Re-resolving the policy for an existing run answers
+a different question and answers it dangerously — a quarantined item's cap lives
+on the run rather than in configuration, and configuration is live.
+
+*A graph that drives runs records what it finds.* :func:`build_run_engine` is
+that construction, and it takes no ``findings_sink`` at all. Both wrong answers
+on a run path look plausible: the in-memory sink is what
+:class:`~.analysis.AnalysisEngine` defaults to, and the engine-MCP surface's
+refusing sink is the only non-test spelling in the tree. Removing the parameter
+removes the choice.
 """
 
 from __future__ import annotations
