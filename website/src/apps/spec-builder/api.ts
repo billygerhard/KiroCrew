@@ -47,6 +47,46 @@ export interface SpecContextStats {
   worktree_branch?: string
 }
 
+/** One document gate, as the ENGINE derived it. The browser renders these; it
+ *  does not compute which one is next or whether one is approved. */
+export interface SpecGate {
+  gate: string
+  document?: string
+  present?: boolean
+  approved?: boolean
+  stale?: boolean
+  approver?: string | null
+  approved_ts?: string | null
+}
+
+/** The engine's answer to "where is this spec and what may it do next".
+ *
+ *  This exists because the app used to answer both questions itself: a
+ *  client-side map decided which phase followed which, and the build control
+ *  only checked that tasks.md existed. Every field here comes from the engine's
+ *  own gate derivation, so the surface renders a decision rather than making
+ *  one. `addressable: false` means the engine could not be asked — which reads as
+ *  "no answer", never as "nothing blocks execution". */
+export interface SpecEngineView {
+  addressable?: boolean
+  reason_code?: string
+  gates?: SpecGate[]
+  engine_phase?: string
+  /** The gate a person is being asked about right now, or null when none is. */
+  current_gate?: string | null
+  can_execute?: boolean
+  execution_blocked_by?: { code: string; message: string; gate?: string }[]
+}
+
+/** What one advance did, as the ENGINE decided it. */
+export interface AdvanceResponse {
+  ok?: boolean
+  gate?: string
+  from_phase?: string
+  /** Where the spec goes next. The engine's answer; never computed here. */
+  to_phase?: string | null
+}
+
 /** Full single-spec payload (GET /specs/{name}). */
 export interface SpecDetail {
   name: string
@@ -65,6 +105,10 @@ export interface SpecDetail {
   state?: SpecState
   context?: SpecContextStats
   running?: boolean
+  /** The engine's gate state. Absent from an older backend, which is why every
+   *  field is optional and the controls treat a missing view as "no advance
+   *  offered" rather than as permission. */
+  engine?: SpecEngineView
 }
 
 /** Directory listing for the project folder picker (GET /browse?path=). */
@@ -153,6 +197,20 @@ export const specApi = {
     req<void>('/specs/' + enc(name) + '/message', {
       method: 'POST',
       body: JSON.stringify({ text, ...identity(id) }),
+    }),
+  // Approve one gate WITH THE ENGINE, and advance past one. The advance records
+  // the approval and then asks the engine to move: its response carries the
+  // transition, which is why nothing here computes a next phase. The approver is
+  // the authenticated session, never a field in this body.
+  approve: (name: string, gate: string, id?: SpecIdentity) =>
+    req<{ ok?: boolean; gate?: string }>('/specs/' + enc(name) + '/approve', {
+      method: 'POST',
+      body: JSON.stringify({ gate, ...identity(id) }),
+    }),
+  advance: (name: string, gate: string, id?: SpecIdentity) =>
+    req<AdvanceResponse>('/specs/' + enc(name) + '/advance', {
+      method: 'POST',
+      body: JSON.stringify({ gate, ...identity(id) }),
     }),
   execute: (name: string, id?: SpecIdentity) =>
     req<void>('/specs/' + enc(name) + '/execute', {
