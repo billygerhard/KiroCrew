@@ -97,6 +97,12 @@ from .isolation import (
     plan_workspace,
     slugify,
 )
+from .preset_display import (
+    MAX_PRESET_NAME_CHARS,
+    StageOrigin,
+    StageSource,
+    stage_origins,
+)
 from .stages import (
     MAX_CAPTURED_CHARS,
     STAGE_TIMEOUT_SETTING,
@@ -169,6 +175,7 @@ __all__ = [
     "MAX_CAPTURED_CHARS",
     "MAX_DEPLOYMENT_ADDRESSES",
     "MAX_GATE_OUTPUT_CHARS",
+    "MAX_PRESET_NAME_CHARS",
     "MAX_SLUG_CHARS",
     "NO_GATES_REASON",
     "NO_NOTIFIER_REASON",
@@ -227,9 +234,11 @@ __all__ = [
     "PresetSelection",
     "StageCommands",
     "StageExecutor",
+    "StageOrigin",
     "StageOutcome",
     "StageResult",
     "StageRunner",
+    "StageSource",
     "TeardownReport",
     "TemplateError",
     "VariableError",
@@ -256,4 +265,5 @@ __all__ = [
     "resolve_protected_branches",
     "run_argv",
     "slugify",
+    "stage_origins",
 ]
