@@ -130,7 +130,20 @@ class ScreeningUnavailable(Exception):
     Raised by a provider whose model is unavailable, whose turn failed, or whose
     output could not be read as a verdict. The screener catches it and quarantines
     rather than letting the run proceed on text nothing screened.
+
+    *session_key* carries the turn's session when one was opened, and is the
+    reason this is not a plain exception. A turn that ran and spent before
+    failing must still be attributed to the run: its credits are real whether or
+    not a verdict came back, and screening runs on text an outside submitter
+    controls, so the failure path is the one an item crafted to derail the reply
+    would take. Leaving the key in the message text put that spend outside the
+    run's ceiling and outside the kill switch. Empty means no session was opened
+    and there is nothing to attribute.
     """
+
+    def __init__(self, message: str, *, session_key: str = "") -> None:
+        super().__init__(message)
+        self.session_key = session_key
 
 
 @dataclass(frozen=True)
@@ -470,6 +483,10 @@ class IntakeScreener:
                 trust=trust,
                 verdict=ScreeningVerdict.UNAVAILABLE,
                 reason=f"the screening provider could not produce a verdict: {exc}",
+                # A turn that ran and spent before failing is still the run's
+                # cost, so the key travels on the exception and is stamped here
+                # exactly as a verdict's would be. Empty when no session opened.
+                session_key=exc.session_key,
             )
             return self._record(run_id, ref, outcome)
         except Exception as exc:  # noqa: BLE001 - any provider fault must quarantine
@@ -490,10 +507,7 @@ class IntakeScreener:
             outcome = ElementScreening(
                 trust=trust,
                 verdict=ScreeningVerdict.UNAVAILABLE,
-                reason=(
-                    "the screening provider failed with "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                reason=("the screening provider failed with " f"{type(exc).__name__}: {exc}"),
             )
             return self._record(run_id, ref, outcome)
         verdict = (

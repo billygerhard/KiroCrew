@@ -170,16 +170,24 @@ class DispatchedScreeningProvider:
         try:
             outcome = turn.run(screening_prompt(request), deadline_s=self._deadline_s)
             suspected, findings = parse_verdict(outcome.text)
-        except ScreeningUnavailable:
+        except ScreeningUnavailable as exc:
+            # parse_verdict raises this for a reply that is not a readable
+            # verdict -- the likeliest failure, and the one a crafted item can
+            # induce. It cannot know the session, so attribute it here rather
+            # than re-raising a turn that already spent as unattributable.
+            if not exc.session_key:
+                exc.session_key = session_key
             raise
         except TurnFailed as exc:
             raise ScreeningUnavailable(
-                f"the screening turn in session {session_key} produced no usable output: {exc}"
+                f"the screening turn in session {session_key} produced no usable output: {exc}",
+                session_key=session_key,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - any host fault is "no verdict"
             raise ScreeningUnavailable(
                 f"the screening turn in session {session_key} failed with "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}",
+                session_key=session_key,
             ) from exc
         finally:
             self._close(turn)

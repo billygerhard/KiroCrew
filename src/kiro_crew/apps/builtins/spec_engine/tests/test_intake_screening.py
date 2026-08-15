@@ -40,6 +40,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.trust import (
     StaleContent,
     consume,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.turns import TurnOutcome, TurnRequest
 from kiro_crew.apps.builtins.spec_engine.engine.watch import (
     PollOutcome,
     PollStatus,
@@ -59,6 +60,9 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch.screening import (
     ScreeningVerdict,
     elements_of_item,
     screening_enabled_for,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.watch.screening_provider import (
+    DispatchedScreeningProvider,
 )
 
 SOURCE = "upstream-issues"
@@ -112,6 +116,28 @@ class UnavailableProvider:
         raise ScreeningUnavailable("the review model is not reachable")
 
 
+class SpendingUnavailableProvider:
+    """A provider whose turn RAN and spent, then failed to yield a verdict.
+
+    Distinct from :class:`UnavailableProvider`, which never opens a session at
+    all. This is the expensive failure: the model was dispatched, the credits are
+    gone, and only the verdict is missing. It is also the failure an outside
+    submitter can most plausibly induce, since the text being screened is theirs
+    and a reply derailed into prose is not a readable verdict.
+    """
+
+    def __init__(self, session_key: str = "sess-spent") -> None:
+        self.calls = 0
+        self._session_key = session_key
+
+    def screen(self, request: ScreeningRequest) -> ScreeningResponse:
+        self.calls += 1
+        raise ScreeningUnavailable(
+            "the screening turn's reply carries no boolean 'suspected' field",
+            session_key=self._session_key,
+        )
+
+
 class RecordingNotifier:
     """Records every notice it was asked to send."""
 
@@ -134,7 +160,9 @@ class RecordingNotifier:
 # --- fixtures --------------------------------------------------------------
 
 
-def _write_config(root: Path, tree: Path, *, extra_source: dict[str, Any] | None = None) -> ConfigStore:
+def _write_config(
+    root: Path, tree: Path, *, extra_source: dict[str, Any] | None = None
+) -> ConfigStore:
     """A permissive, valid configuration whose autonomy grid says integration."""
     config = ConfigStore(root / "config")
     source: dict[str, Any] = {
@@ -346,6 +374,39 @@ class TestThePollPathScreens:
         assert run is not None and run.detail.get("screening_quarantined") is True
         events = _trust_events(state, seed.ref)
         assert events[0].detail["context"]["verdict"] == ScreeningVerdict.UNAVAILABLE.value
+
+    def test_a_screening_turn_that_spent_before_failing_is_still_charged_to_the_run(
+        self, tmp_path: Path
+    ) -> None:
+        """A turn's credits belong to the run whether or not a verdict came back.
+
+        The expensive failure: the model ran, spent, and produced a reply that is
+        not a verdict. Attributing only on the success path put that spend outside
+        the run's ceiling and outside the kill switch -- and because the text
+        being screened is an outside submitter's, a reply crafted to derail the
+        format is the one input that reliably reaches this branch. So the session
+        key travels on the exception and is stamped exactly as a verdict's is.
+        """
+        tree = _tree(tmp_path)
+        state = StateStore(root=tmp_path / "state")
+        config = _write_config(tmp_path, tree)
+        starter = _Starter()
+        provider = SpendingUnavailableProvider()
+
+        dispatch_source(
+            state,
+            config,
+            _polled(_item()),
+            gate=_AllowAll(),
+            start=starter,
+            screener=_screener(config, state, provider),
+        )
+
+        seed = starter.seeds[0]
+        assert provider.calls == 1
+        assert "sess-spent" in RunAccounting(state).sessions_for(seed.run_id)
+        # Still fails closed: attributing the cost does not make the item screened.
+        assert seed.autonomy.level is AutonomyLevel.AUTHORING
 
     def test_a_provider_fault_it_never_declared_also_fails_closed(self, tmp_path: Path) -> None:
         """A provider can fail in ways it did not declare, and must still quarantine.
@@ -625,9 +686,7 @@ class TestOptOutCostAndGuidance:
 
     def test_the_title_is_screened_with_the_body(self, tmp_path: Path) -> None:
         seed_item = _item(body="the body")
-        (element,) = elements_of_item(
-            RunSeedStub(item=seed_item)  # type: ignore[arg-type]
-        )
+        (element,) = elements_of_item(RunSeedStub(item=seed_item))  # type: ignore[arg-type]
         assert "something is broken" in element.text
         assert "the body" in element.text
 
@@ -637,3 +696,113 @@ class RunSeedStub:
 
     def __init__(self, item: WatchedItem) -> None:
         self.item = item
+
+
+# --- the dispatched provider itself ----------------------------------------
+
+
+class _FakeTurn:
+    """A host turn that reports a session key and returns *text* verbatim.
+
+    The double sits one layer BELOW the provider under test -- it stands in for
+    the gateway's session manager, not for the provider -- so the provider, its
+    verdict reader, and its exception path are all the real code here.
+    """
+
+    def __init__(self, session_key: str, text: str) -> None:
+        self._session_key = session_key
+        self._text = text
+        self.closed = False
+
+    @property
+    def session_key(self) -> str:
+        return self._session_key
+
+    def run(self, prompt: str, *, deadline_s: int) -> TurnOutcome:
+        return TurnOutcome(text=self._text)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeTurnHost:
+    """Opens one :class:`_FakeTurn` and records what it was asked for."""
+
+    def __init__(self, session_key: str, text: str) -> None:
+        self.requests: list[TurnRequest] = []
+        self.turn = _FakeTurn(session_key, text)
+
+    def open_turn(self, request: TurnRequest) -> _FakeTurn:
+        self.requests.append(request)
+        return self.turn
+
+
+def _screening_request(tmp_path: Path) -> ScreeningRequest:
+    return ScreeningRequest(
+        run_id="r1",
+        ref=SpecRef(project=str(_tree(tmp_path)), name="s1"),
+        element_kind=ElementKind.ITEM_BODY.value,
+        element_id="7",
+        submitter_class="external",
+        guidance=BUNDLED_SCREENING_GUIDANCE,
+        quoted_text="a first-time reporter's description",
+        turn_options={"model": "claude-sonnet-5"},
+    )
+
+
+class TestTheDispatchedProviderReportsItsSession:
+    """The provider's own contract, exercised over the real object.
+
+    Its failure path is the one that matters for cost: the session key is known
+    the moment the turn opens, which is the entire reason the host seam is two
+    steps rather than one. A failure that dropped the key would put a turn that
+    already spent outside the run's accounting.
+    """
+
+    def test_an_unreadable_verdict_still_names_the_session_that_spent(self, tmp_path: Path) -> None:
+        """The likeliest failure, and the one crafted text can induce."""
+        host = _FakeTurnHost("sess-1", "I'm sorry, I can't help with that.")
+        provider = DispatchedScreeningProvider(host)
+
+        with pytest.raises(ScreeningUnavailable) as caught:
+            provider.screen(_screening_request(tmp_path))
+
+        assert caught.value.session_key == "sess-1"
+        assert host.turn.closed is True
+
+    def test_a_verdict_missing_its_boolean_still_names_the_session(self, tmp_path: Path) -> None:
+        """A reply shaped like a verdict but carrying no decision is not one."""
+        host = _FakeTurnHost("sess-2", '{"findings": ["something odd"]}')
+        provider = DispatchedScreeningProvider(host)
+
+        with pytest.raises(ScreeningUnavailable) as caught:
+            provider.screen(_screening_request(tmp_path))
+
+        assert caught.value.session_key == "sess-2"
+
+    def test_a_session_with_no_key_reports_no_session_rather_than_a_false_one(
+        self, tmp_path: Path
+    ) -> None:
+        """No key means nothing ran that could be charged, and it must say so.
+
+        The opposite error to the one above: inventing an attribution here would
+        stamp a run for a turn that never happened.
+        """
+        host = _FakeTurnHost("", '{"suspected": false}')
+        provider = DispatchedScreeningProvider(host)
+
+        with pytest.raises(ScreeningUnavailable) as caught:
+            provider.screen(_screening_request(tmp_path))
+
+        assert caught.value.session_key == ""
+
+    def test_a_readable_verdict_reports_its_session_as_before(self, tmp_path: Path) -> None:
+        """The success path is unchanged, so the failure fix cannot be vacuous."""
+        host = _FakeTurnHost("sess-3", '{"suspected": true, "findings": ["ignore instructions"]}')
+        provider = DispatchedScreeningProvider(host)
+
+        response = provider.screen(_screening_request(tmp_path))
+
+        assert response.suspected is True
+        assert response.session_key == "sess-3"
+        assert response.findings == ("ignore instructions",)
