@@ -3850,7 +3850,7 @@
         "reset_setting": "Ramener {{setting}} à sa valeur par défaut livrée",
         "role_effort": "Effort",
         "role_model": "Modèle",
-        "role_model_required": "Un rôle a besoin d'un modèle. Utilisez la réinitialisation pour ne plus en imposer un.",
+        "role_model_required": "Un rôle a besoin d'un modèle. Utilisez la réinitialisation de ce rôle pour ne plus en imposer un.",
         "roles_inherit_note": "Une affectation de rôle doit nommer un modèle. L'effort se choisit parmi les niveaux du moteur.",
         "roles_section": "Affectations de rôle",
         "save": "Enregistrer la configuration",

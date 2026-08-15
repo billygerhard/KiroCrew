@@ -3728,7 +3728,7 @@
         "reset_setting": "{{setting}}을(를) 기본값으로 되돌리기",
         "role_effort": "노력 수준",
         "role_model": "모델",
-        "role_model_required": "역할에는 모델이 필요합니다. 고정을 해제하려면 초기화를 사용하세요.",
+        "role_model_required": "역할에는 모델이 필요합니다. 고정을 해제하려면 이 역할의 초기화를 사용하세요.",
         "roles_inherit_note": "역할 배정에는 모델을 지정해야 합니다. 노력 수준은 엔진의 레벨에서 선택합니다.",
         "roles_section": "역할 배정",
         "save": "구성 저장",

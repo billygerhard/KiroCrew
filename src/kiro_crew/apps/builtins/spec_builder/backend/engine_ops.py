@@ -577,7 +577,14 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
                 audit=audit_log,
             )
         )
-    except (OSError, ValueError, engine_state.StateError) as exc:
+    except (OSError, ValueError, engine_state.StateError, ConfigLoadError) as exc:
+        # ConfigLoadError is the one that took a second review to find, and it is
+        # the worst one to miss: engage reads the budget through the config
+        # document, so an unparseable document raises AFTER the flag has
+        # persisted. Uncaught, the operator got a bare 500 while the stop was
+        # silently in force -- the exact failure this branch exists to prevent.
+        # It derives from RuntimeError, so no other arm here reaches it; every
+        # other config-reading handler in this module names it explicitly.
         return _bad_request("engage_failed", str(exc), status=503)
     _sel_audit("engine_kill_switch_engage", f"actor={initiator}")
     return web.json_response(

@@ -35,6 +35,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.budget.switch import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.config.settings import SETTINGS
+from kiro_crew.apps.builtins.spec_engine.engine.config.store import ConfigLoadError
 from kiro_crew.apps.builtins.spec_engine.engine.delivery.preset_display import stage_origins
 from kiro_crew.apps.builtins.spec_engine.engine.delivery.workflow import (
     DeliveryWorkflow,
@@ -384,6 +385,30 @@ class TestKillSwitchSurface:
         assert body["code"] == "release_failed"
         # The fail-safe direction: an unrecordable release leaves the stop standing.
         assert KillSwitch(state_dir / "engine-state").engaged is True
+
+    @pytest.mark.asyncio
+    async def test_an_engage_that_cannot_read_the_budget_is_refused_by_code(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        """An engage reads the budget through the config document.
+
+        So an unparseable document raises AFTER the flag persists, and the switch
+        is in force while the request failed. Reporting that as a bare crash left
+        an operator with no machine-readable answer about whether spending stopped.
+        ConfigLoadError derives from RuntimeError, which is why it escaped a tuple
+        that already named OSError, ValueError and StateError.
+        """
+        async with _make_client(monkeypatch, tmp_path) as client:
+
+            def _refuse(*args, **kwargs):
+                raise ConfigLoadError("config.json is not valid JSON")
+
+            monkeypatch.setattr(engine_ops, "engage_kill_switch", _refuse)
+            resp = await client.post(f"{_BASE}/engine/kill-switch", json={"action": "engage"})
+            body = await resp.json()
+
+        assert resp.status == 503
+        assert body["code"] == "engage_failed"
 
     @pytest.mark.asyncio
     async def test_an_unknown_action_is_refused_and_changes_nothing(

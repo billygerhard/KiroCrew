@@ -3850,7 +3850,7 @@
         "reset_setting": "Devolver {{setting}} a su valor predeterminado de fábrica",
         "role_effort": "Esfuerzo",
         "role_model": "Modelo",
-        "role_model_required": "Un rol necesita un modelo. Use el control de restablecer para dejar de fijar uno.",
+        "role_model_required": "Un rol necesita un modelo. Use el restablecer de este rol para dejar de fijar uno.",
         "roles_inherit_note": "Una asignación de rol debe nombrar un modelo. El esfuerzo se elige entre los niveles del motor.",
         "roles_section": "Asignaciones de rol",
         "save": "Guardar configuración",

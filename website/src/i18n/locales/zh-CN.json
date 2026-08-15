@@ -3728,7 +3728,7 @@
         "reset_setting": "将 {{setting}} 恢复为出厂默认值",
         "role_effort": "投入程度",
         "role_model": "模型",
-        "role_model_required": "角色需要指定模型。若不再固定，请使用重置。",
+        "role_model_required": "角色需要指定模型。若不再固定，请使用该角色的重置。",
         "roles_inherit_note": "角色分配必须指定一个模型。投入程度从引擎提供的等级中选择。",
         "roles_section": "角色分配",
         "save": "保存配置",

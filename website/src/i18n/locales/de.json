@@ -3789,7 +3789,7 @@
         "reset_setting": "{{setting}} auf den mitgelieferten Standard zurücksetzen",
         "role_effort": "Aufwand",
         "role_model": "Modell",
-        "role_model_required": "Eine Rolle braucht ein Modell. Verwenden Sie das Zurücksetzen, um keines mehr festzulegen.",
+        "role_model_required": "Eine Rolle braucht ein Modell. Nutzen Sie das Zurücksetzen dieser Rolle, um keines mehr festzulegen.",
         "roles_inherit_note": "Eine Rollenzuweisung muss ein Modell nennen. Der Aufwand wird aus den Stufen der Engine gewählt.",
         "roles_section": "Rollenzuweisungen",
         "save": "Konfiguration speichern",

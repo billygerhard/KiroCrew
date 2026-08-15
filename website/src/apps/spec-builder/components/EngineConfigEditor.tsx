@@ -159,6 +159,16 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
     setSaved(false)
     setEdits((current) => {
       const next = new Map(current)
+      // Deleting a subtree supersedes any pending edit inside it. Without this, a
+      // model emptied and then reset away would leave the blank edit pending, and
+      // the blank-model guard would keep blocking a save the operator had already
+      // resolved -- the guard's own advice made unfollowable by bookkeeping.
+      if (value === null) {
+        const prefix = editKey(path)
+        for (const key of [...next.keys()]) {
+          if (key !== prefix && key.startsWith(`${prefix}.`)) next.delete(key)
+        }
+      }
       next.set(editKey(path), { path, value })
       return next
     })
@@ -399,6 +409,26 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
                       value={String(shown(effortPath, assignment.effort ?? ''))}
                       onChange={(value) => setEdit(effortPath, value)}
                       triggerFallback={i18nT('apps.specBuilder.engineOps.role_effort')}
+                    />{' '}
+                    {/* The unpin path for a role, and the reason the blank-model
+                        guard can point somewhere: null DELETES the assignment, so
+                        the role falls back to what it inherits. Emptying the model
+                        field cannot do this -- the engine refuses an empty model --
+                        so without this control the guard would stop an operator
+                        with nowhere to go. */}
+                    <Btn
+                      label={
+                        <>
+                          <Undo2 className="lucide-inline" aria-hidden="true" />
+                          {i18nT('apps.specBuilder.engineOps.reset')}
+                        </>
+                      }
+                      ariaLabel={i18nT('apps.specBuilder.engineOps.reset_setting', {
+                        setting: `${profileName}.${role}`,
+                      })}
+                      onClick={() =>
+                        setEdit(['cost_profiles', profileName, 'roles', role], null)
+                      }
                     />
                   </li>
                 )

@@ -435,6 +435,31 @@ describe('EngineConfigEditor', () => {
     expect(writes.length).toBe(0)
   })
 
+  it('lets this role be reset away, which is what the blank-model guard advises', async () => {
+    // The guard tells the operator to reset the role, so that has to be reachable
+    // AND has to resolve the guard: the blank edit is superseded by the delete
+    // rather than left pending, or the advice would leave the save still blocked.
+    const writes: { url: string; init?: RequestInit }[] = []
+    stubEngineFetch(RELEASED_SWITCH, { writes })
+    await openEditor()
+
+    const model = screen.getByLabelText('cost_profiles.thrifty.roles.review.model')
+    await userEvent.clear(model)
+    expect(screen.getByRole('button', { name: 'Save configuration' })).toBeDisabled()
+
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Return thrifty.review to its shipped default' }),
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }))
+
+    await waitFor(() => expect(writes.length).toBe(1))
+    // null DELETES the assignment so the role inherits, rather than pinning a
+    // value nobody chose. And the superseded blank model is not in the patch.
+    expect(JSON.parse(String(writes[0].init?.body))).toEqual({
+      patch: { cost_profiles: { thrifty: { roles: { review: null } } } },
+    })
+  })
+
   it('resets a setting by deleting its key rather than writing the default', async () => {
     const writes: { url: string; init?: RequestInit }[] = []
     stubEngineFetch(RELEASED_SWITCH, { writes })

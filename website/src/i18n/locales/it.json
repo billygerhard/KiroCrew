@@ -3850,7 +3850,7 @@
         "reset_setting": "Riporta {{setting}} al valore predefinito di fabbrica",
         "role_effort": "Impegno",
         "role_model": "Modello",
-        "role_model_required": "Un ruolo ha bisogno di un modello. Usa il ripristino per non fissarne più uno.",
+        "role_model_required": "Un ruolo ha bisogno di un modello. Usa il ripristino di questo ruolo per non fissarne più uno.",
         "roles_inherit_note": "Un'assegnazione di ruolo deve indicare un modello. L'impegno si scegli tra i livelli del motore.",
         "roles_section": "Assegnazioni di ruolo",
         "save": "Salva configurazione",

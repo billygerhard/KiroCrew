@@ -3850,7 +3850,7 @@
         "reset_setting": "Devolver {{setting}} ao padrão de fábrica",
         "role_effort": "Esforço",
         "role_model": "Modelo",
-        "role_model_required": "Uma função precisa de um modelo. Use o controle de redefinição para deixar de fixar um.",
+        "role_model_required": "Uma função precisa de um modelo. Use a redefinição desta função para deixar de fixar um.",
         "roles_inherit_note": "Uma atribuição de função deve nomear um modelo. O esforço é escolhido entre os níveis do motor.",
         "roles_section": "Atribuições de função",
         "save": "Salvar configuração",
