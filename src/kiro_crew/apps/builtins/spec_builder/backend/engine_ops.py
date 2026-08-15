@@ -494,9 +494,12 @@ async def handle_get_kill_switch(request: web.Request) -> web.Response:
     from . import routes
 
     store, _audit_log = routes._engine_store()
-    # Off the loop: a file read plus a database query, small but still I/O.
-    switch, records = await asyncio.to_thread(
-        lambda: (engine_switch.KillSwitch(store.root), stoppable_runs(store))
+    # Off the loop: a file read plus a database query, small but still I/O. The
+    # READ is what has to be threaded -- constructing KillSwitch only stores a
+    # path, so threading the construction alone would have moved nothing while
+    # claiming otherwise.
+    switch_state, records = await asyncio.to_thread(
+        lambda: (engine_switch.KillSwitch(store.root).read(), stoppable_runs(store))
     )
     rows = [
         {
@@ -510,7 +513,7 @@ async def handle_get_kill_switch(request: web.Request) -> web.Response:
     ]
     return web.json_response(
         {
-            "switch": switch.read().to_json_object(),
+            "switch": switch_state.to_json_object(),
             "stoppable": rows,
             "stoppable_credits": round(sum(record.cost_credits for record in records), 4),
         }

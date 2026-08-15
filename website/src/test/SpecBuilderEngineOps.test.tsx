@@ -85,7 +85,12 @@ const CONFIG_BODY = {
         autonomy: { external: { feature: 'authoring' } },
       },
     },
-    cost_profiles: { thrifty: { roles: { review: { model: 'auto' } } } },
+    // Two profiles, the second named so its dotted key reads like a descendant of
+    // the first's review role -- the collision a string-prefix match falls for.
+    cost_profiles: {
+      thrifty: { roles: { review: { model: 'auto' } } },
+      'thrifty.roles.review': { roles: { review: { model: 'auto' } } },
+    },
   },
   domain_sections: ['sources', 'projects'],
   domain_editors: [
@@ -457,6 +462,38 @@ describe('EngineConfigEditor', () => {
     // value nobody chose. And the superseded blank model is not in the patch.
     expect(JSON.parse(String(writes[0].init?.body))).toEqual({
       patch: { cost_profiles: { thrifty: { roles: { review: null } } } },
+    })
+  })
+
+  it('supersedes only edits genuinely inside the deleted role', async () => {
+    // The case the two matchers disagree on. A profile NAMED "thrifty.roles.review"
+    // produces a dotted key that reads like a descendant of the deleted role's
+    // path, so a string-prefix match drops its pending edit; comparing path
+    // SEGMENTS does not. Nothing in the schema forbids a dot in a profile name,
+    // and a normal sibling would not show this -- both matchers handle that.
+    const writes: { url: string; init?: RequestInit }[] = []
+    stubEngineFetch(RELEASED_SWITCH, { writes })
+    await openEditor()
+
+    const lookalike = screen.getByLabelText(
+      'cost_profiles.thrifty.roles.review.roles.review.model',
+    )
+    await userEvent.clear(lookalike)
+    await userEvent.type(lookalike, 'kept-model')
+
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Stop pinning thrifty.review, so the role inherits' }),
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save configuration' }))
+
+    await waitFor(() => expect(writes.length).toBe(1))
+    const body = JSON.parse(String(writes[0].init?.body)) as {
+      patch: { cost_profiles: Record<string, unknown> }
+    }
+    // The delete landed, and the lookalike profile's edit was NOT swallowed by it.
+    expect(body.patch.cost_profiles.thrifty).toEqual({ roles: { review: null } })
+    expect(body.patch.cost_profiles['thrifty.roles.review']).toEqual({
+      roles: { review: { model: 'kept-model' } },
     })
   })
 
