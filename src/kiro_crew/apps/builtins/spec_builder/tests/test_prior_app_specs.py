@@ -33,10 +33,12 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.apps.bridges import _register_skills
 from kiro_crew.apps.builtins.spec_builder.backend import routes
 from kiro_crew.apps.builtins.spec_engine.engine import native_format, phases, spec_types
 from kiro_crew.apps.builtins.spec_engine.engine.documents import DocumentKind
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
+from kiro_crew.apps.manifest import AppManifest
 
 from .test_routes import _READY_REQUIREMENTS
 
@@ -364,3 +366,77 @@ class TestTheHalfFinishedArtifact:
         assert phase is not None
         assert files.get("requirements.md") == ""
         assert state is None  # no sidecar was ever written
+
+
+class TestThePriorFormatPromptNoLongerReachesASession:
+    """One format authority, made structurally true rather than documented.
+
+    The prior app's prompt is a second, DISAGREEING statement of the spec format --
+    the tests above prove documents written to it are refused by the engine's
+    validator. While the manifest declared it, the host linked it into every
+    user's ``~/.kiro/crew/skills`` and any session could load it by trigger, so an
+    agent could be instructed to write documents the engine would then reject.
+    Nothing referenced it: ``_seed_prompt`` is deliberately self-contained, and
+    ``test_seed_prompt_is_self_contained_and_type_aware`` pins that. So it was a
+    registered second spelling with no caller.
+
+    Undeclaring it is what removes it: registration reads the manifest's ``skills``
+    list, so a skill absent from that list is never linked and cannot be loaded.
+    The FILE stays in the repo on purpose -- it is the authoritative record of what
+    the specs already on users' disks look like, and the anchor the compatibility
+    fixtures above depend on.
+    """
+
+    APP_NAME = "spec-builder"
+
+    @property
+    def _manifest_path(self) -> Path:
+        return Path(routes.__file__).parents[1] / "app.json"
+
+    def test_the_manifest_declares_no_skill_at_all(self):
+        manifest = AppManifest.from_json_file(self._manifest_path)
+        assert manifest.skills == []
+        assert manifest.validate(app_root=self._manifest_path.parent) == []
+
+    def test_registration_places_no_skill_for_this_app(self, tmp_path, monkeypatch):
+        """Driven through the host's own registrar, not a reading of the JSON.
+
+        A manifest field can look right while the registrar still places a
+        directory from somewhere else; this asserts the destination is empty.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        root = self._manifest_path.parent
+        manifest = AppManifest.from_json_file(self._manifest_path)
+
+        placed = _register_skills(self.APP_NAME, manifest, root)
+
+        assert placed == []
+
+    def test_the_same_registrar_does_place_a_declared_skill(self, tmp_path, monkeypatch):
+        """Non-vacuity: otherwise "places nothing" passes for a broken registrar.
+
+        The engine app declares one, so the identical call over its manifest must
+        place it. Without this, the assertion above would also hold if
+        ``_register_skills`` had stopped working entirely.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        engine_root = Path(spec_types.__file__).parents[1]
+        engine_manifest = AppManifest.from_json_file(engine_root / "app.json")
+
+        placed = _register_skills("spec-engine", engine_manifest, engine_root)
+
+        assert placed == ["spec-engine/spec-engine-discovery"]
+
+    def test_the_prior_definition_is_kept_as_the_record_of_prior_specs(self):
+        """Retired, not deleted: the compatibility fixtures are anchored to it."""
+        assert _PRIOR_SKILL_PATH.is_file()
+
+    def test_the_retired_prompt_really_did_state_the_format(self):
+        """Why it had to stop being registered, asserted against its own text.
+
+        If this prompt stated no format rules it would have been harmless to
+        declare, and undeclaring it would be churn rather than a fix.
+        """
+        skill = _prior_skill()
+        for owned_by_the_engine in ("requirements.md", "tasks.md", "SHALL", "_Requirements:"):
+            assert owned_by_the_engine in skill
