@@ -3859,6 +3859,13 @@
         "workspace_id": "Identificador de fila del espacio de trabajo"
       }
     },
+    "specEngine": {
+      "manifest": {
+        "description": "Convierta una solicitud en una especificación revisada y luego ejecútela. Cualquier agente capaz de llamar a herramientas MCP dirige todo el flujo de trabajo: el motor proporciona las instrucciones de redacción, orquestación y revisión, valida los documentos nativos que produce y se niega a avanzar a una fase cuyo documento no valide o carezca de una aprobación vigente. Nada del formato vive en un prompt que un agente pueda olvidar o parafrasear.",
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
+      }
+    },
     "workflows": {
       "manifest": {
         "description": "Crea, ejecuta y observa flujos de trabajo dinámicos: scripts de Python, normalmente escritos por un agente a partir de un objetivo en lenguaje natural, que guían a varios agentes de Kiro Crew por fases ordenadas. Un script se comprueba contra un conjunto aislado de comandos de flujo de trabajo antes de que se ejecute nada, así los errores salen a la luz sin ejecutarse, y luego la página transmite cada fase y cada evento de los agentes a medida que avanza la ejecución. La aplicación incluye ejemplos ejecutables para empezar.",

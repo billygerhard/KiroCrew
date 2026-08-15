@@ -297,6 +297,12 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
     pageLabel: 'apps.specBuilder.manifest.page_label',
     highlights: [],
   },
+  'spec-engine': {
+    displayName: 'apps.specEngine.manifest.display_name',
+    description: 'apps.specEngine.manifest.description',
+    pageLabel: 'apps.specEngine.manifest.page_label',
+    highlights: [],
+  },
   'workflows': {
     displayName: 'apps.workflows.manifest.display_name',
     description: 'apps.workflows.manifest.description',

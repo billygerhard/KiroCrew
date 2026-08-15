@@ -3859,6 +3859,13 @@
         "workspace_id": "Identifiant de ligne d’espace de travail"
       }
     },
+    "specEngine": {
+      "manifest": {
+        "description": "Transformez une demande en spécification révisée, puis exécutez-la. Tout agent capable d'appeler des outils MCP pilote l'ensemble du flux : le moteur fournit les instructions de rédaction, d'orchestration et de revue, valide les documents natifs produits et refuse de passer à une phase dont le document n'est pas valide ou dont l'approbation manque. Rien du format ne réside dans un prompt qu'un agent pourrait oublier ou reformuler.",
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
+      }
+    },
     "workflows": {
       "manifest": {
         "description": "Crée, exécute et suis des workflows dynamiques : des scripts Python, généralement écrits pour toi par un agent à partir d’un objectif en langage courant, qui pilotent plusieurs agents Kiro Crew à travers des phases ordonnées. Un script est vérifié contre un jeu de commandes de workflow en bac à sable avant toute exécution, donc les erreurs apparaissent sans rien exécuter, puis la page diffuse chaque phase et chaque événement d’agent à mesure que l’exécution avance. Des exemples exécutables sont fournis avec l’application comme point de départ.",

@@ -3115,6 +3115,13 @@
         "workspace_id": "Workspace row id"
       }
     },
+    "specEngine": {
+      "manifest": {
+        "description": "Turn a request into a reviewed spec and then execute it. Any agent that can call MCP tools drives the whole workflow: the engine vends the authoring, orchestration and review instructions, validates the native documents it produces, and refuses to advance a phase whose document does not validate or lacks a live approval. Nothing about the format lives in a prompt an agent can forget or paraphrase.",
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
+      }
+    },
     "workflows": {
       "manifest": {
         "description": "Author, run, and watch dynamic workflows: Python scripts, usually written for you by an agent from a plain-English goal, that drive several Kiro Crew agents through ordered phases. A script is checked against a sandboxed set of workflow commands before anything runs, so mistakes surface without executing, and the page then streams each phase and agent event as the run progresses. Runnable examples ship with the app to start from.",

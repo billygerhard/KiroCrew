@@ -3798,6 +3798,13 @@
         "workspace_id": "Arbeitsbereichs-Zeilen-ID"
       }
     },
+    "specEngine": {
+      "manifest": {
+        "description": "Verwandeln Sie eine Anfrage in eine geprüfte Spezifikation und führen Sie sie dann aus. Jeder Agent, der MCP-Tools aufrufen kann, steuert den gesamten Ablauf: Die Engine liefert die Anweisungen für Erstellung, Orchestrierung und Prüfung, validiert die daraus entstehenden nativen Dokumente und verweigert den Übergang zu einer Phase, deren Dokument nicht validiert oder deren Freigabe fehlt. Nichts am Format steckt in einem Prompt, den ein Agent vergessen oder umformulieren kann.",
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
+      }
+    },
     "workflows": {
       "manifest": {
         "description": "Dynamische Workflows erstellen, ausführen und beobachten: Python-Skripte, die dir meist ein Agent aus einem Ziel in normaler Sprache schreibt und die mehrere Kiro Crew-Agenten durch geordnete Phasen führen. Ein Skript wird gegen einen abgeschirmten Satz von Workflow-Befehlen geprüft, bevor irgendetwas läuft, sodass Fehler ohne Ausführung sichtbar werden, und die Seite überträgt dann jede Phase und jedes Agentenereignis, während die Ausführung fortschreitet. Ausführbare Beispiele liegen der App bei, um damit zu starten.",
