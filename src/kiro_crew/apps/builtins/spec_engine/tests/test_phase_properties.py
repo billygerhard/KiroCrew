@@ -82,6 +82,14 @@ class _Model:
     deleted: set[DocumentKind] = field(default_factory=set)
     #: Documents the trace has made unparseable under the native-format rules.
     corrupted: set[DocumentKind] = field(default_factory=set)
+    #: Gates whose staleness has been PERSISTED. Staleness is sticky: once
+    #: ``advance`` has recorded that a document moved, reverting it to the exact
+    #: bytes that were approved makes the hashes agree again without reviving the
+    #: approval, which was given without sight of the intervening edit. Only the
+    #: calls that persist put a gate in here, because stickiness reaches exactly
+    #: as far as what was observed -- an edit made and undone with no persisting
+    #: derivation in between is indistinguishable from an untouched document.
+    staled: set[str] = field(default_factory=set)
 
     def present(self, kind: DocumentKind) -> bool:
         return kind not in self.deleted
@@ -89,20 +97,34 @@ class _Model:
     def valid(self, kind: DocumentKind) -> bool:
         return self.present(kind) and kind not in self.corrupted
 
-    def expected_stale(self, gate: str) -> bool:
-        """An approval is stale exactly when its own document has moved.
+    def observe_staleness(self) -> None:
+        """Persist staleness for every gate whose document has moved.
 
-        A deleted document counts as moved. An approval recorded over text that
-        is no longer there plainly does not cover what is there now, so the gate
+        Called for the engine operations that sync it, so the model becomes
+        sticky at the same moments the engine does.
+        """
+        for gate in list(self.approved_over):
+            if self._hash_moved(gate):
+                self.staled.add(gate)
+
+    def _hash_moved(self, gate: str) -> bool:
+        kind = DocumentKind(gate)
+        if not self.present(kind):
+            return True
+        return self.approved_over[gate] != content_hash(self.texts[kind])
+
+    def expected_stale(self, gate: str) -> bool:
+        """Whether the gate's approval no longer covers its document.
+
+        Either the hash has moved, or a persisted flag says it once did. A
+        deleted document counts as moved: an approval recorded over text that is
+        no longer there plainly does not cover what is there now, so the gate
         reports it stale rather than treating absence as a separate axis that
         leaves the approval looking live.
         """
         if gate not in self.approved_over:
             return False
-        kind = DocumentKind(gate)
-        if not self.present(kind):
-            return True
-        return self.approved_over[gate] != content_hash(self.texts[kind])
+        return gate in self.staled or self._hash_moved(gate)
 
     def settled(self, gate: str) -> bool:
         kind = DocumentKind(gate)
@@ -348,7 +370,10 @@ class TestPhaseGateSoundnessWithDefectiveDocuments:
             # An approval lands exactly when the document is there and valid.
             assert outcome.ok is model.valid(kind), [str(r) for r in outcome.reasons]
             if outcome.ok:
+                # A fresh approval records the current hash, which clears any
+                # flag a previous edit had persisted.
                 model.approved_over[gate] = content_hash(model.texts[kind])
+                model.staled.discard(gate)
             else:
                 # Approval refuses on the document's own defects only: whether an
                 # approval already exists is what this call is deciding.
@@ -360,6 +385,9 @@ class TestPhaseGateSoundnessWithDefectiveDocuments:
 
         plan = document_plan(_SPEC_TYPE)
         upto = plan[: plan.index(kind) + 1]
+        # advance persists staleness for every gate it derives, so the model
+        # becomes sticky at the same moment the engine does.
+        model.observe_staleness()
         expected_ok = all(model.settled(item.value) for item in upto)
         result = advance(store, ref, actor=f"agent:{step}", gate=gate)
         assert result.ok is expected_ok, [str(reason) for reason in result.reasons]
