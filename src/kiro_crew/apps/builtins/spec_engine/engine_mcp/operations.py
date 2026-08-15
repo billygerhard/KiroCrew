@@ -26,6 +26,7 @@ from ..engine.composition import EngineGraph, build_engine
 from ..engine.config import ConfigWriteSurface
 from ..engine.cross_document import validate_spec as validate_spec_documents
 from ..engine.phases import RunMode, advance, approve, derive_phase
+from ..engine.seeder import OpenedSession, SessionRequest
 from ..engine.state import SpecRef
 from ..engine.structure import parse_tasks
 
@@ -89,6 +90,24 @@ def _report_json(report: Any) -> dict[str, Any]:
     }
 
 
+class RefusingSessionOpener:
+    """Refuses to open a session: this process cannot create host sessions.
+
+    The MCP server runs outside the gateway, and only the host's session manager
+    can create a session that appears in the dashboard session list. None of this
+    adapter's tools starts a headless run, so nothing calls this; it raises rather
+    than returning a stub handle so that a tool which one day does start a run
+    cannot get a session that exists nowhere, is attributed to nothing, and spends
+    under no posture the operator granted.
+    """
+
+    def __call__(self, request: SessionRequest) -> OpenedSession:
+        raise NotImplementedError(
+            "the engine-MCP surface cannot open host sessions; a run-starting tool "
+            "must build its graph with the gateway's session opener"
+        )
+
+
 class EngineOperations:
     """Adapter binding tool calls to engine library calls.
 
@@ -141,6 +160,7 @@ class EngineOperations:
             model_resolver=no_host_model_catalog,
             findings_sink=RefusingFindingsSink(),
             host_state=None,
+            session_opener=RefusingSessionOpener(),
             state_root=state_root,
             audit_root=audit_root,
             config_root=config_root,

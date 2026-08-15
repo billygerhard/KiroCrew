@@ -236,6 +236,7 @@ class TestTheAdapterRunsOverTheCompositionRoot:
             model_resolver=lambda: ("host-model",),
             findings_sink=_CollectingSink(),
             host_state=None,
+            session_opener=_RefusingOpener(),
             state_root=tmp_path / "given-state",
             audit_root=tmp_path / "given-audit",
             config_root=tmp_path / "given-config",
@@ -274,3 +275,10 @@ class _CollectingSink:
 
     def record(self, ref: SpecRef, *, run: str, report: Any) -> None:
         self.rows.append(run)
+
+
+class _RefusingOpener:
+    """The caller-supplied graph's opener; this module starts no runs."""
+
+    def __call__(self, request: Any) -> Any:
+        raise AssertionError("no test in this module opens a session")

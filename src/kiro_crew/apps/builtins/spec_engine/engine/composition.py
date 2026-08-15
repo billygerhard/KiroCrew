@@ -33,7 +33,8 @@ from typing import Any
 
 from .analysis import AnalysisEngine, FindingsSink, RecordingFindingsSink
 from .audit import AuditLog
-from .budget.ledger import RunCostSink
+from .autonomy import AutonomyLevel
+from .budget.ledger import RunAccounting, RunCostSink
 from .capabilities.builtins import (
     AUTHORING_PROVIDER,
     IMPLEMENTATION_PROVIDER,
@@ -53,9 +54,11 @@ from .orchestrator import (
     orchestrator_for,
     workspace_root,
 )
+from .prerequisites import BranchResolver, Budget, ProgramResolver, RunRefusal, gate_run
 from .review_queue import ReviewQueue
 from .roles import SessionDefault
 from .runs import RunMachine
+from .seeder import SessionOpener, SessionSeeder
 from .state import SpecRef, StateStore
 
 #: The provider each deeper builtin must resolve to once
@@ -81,6 +84,21 @@ class IncompleteEngineGraph(ValueError):
     directly and, more likely, reachable through :func:`dataclasses.replace`,
     which an ordinary refactor reaches for and which re-runs ``__post_init__``.
     """
+
+
+class RunPrevented(RuntimeError):
+    """A run was refused before it started, and will not be started.
+
+    Raised rather than returned by :meth:`EngineGraph.begin_run`, because that
+    method's return value is the object that *starts* runs: a caller free to
+    ignore a returned refusal would hold a starter it was just told not to use.
+    The refusal it carries is the audited one, so a surface can render every
+    unmet prerequisite without re-deriving them.
+    """
+
+    def __init__(self, refusal: RunRefusal) -> None:
+        super().__init__(refusal.describe())
+        self.refusal = refusal
 
 
 @dataclass(frozen=True)
@@ -111,6 +129,11 @@ class EngineGraph:
     #: they share this one instead of each building another over the same store.
     machine: RunMachine
     review_queue: ReviewQueue
+    #: The headless run driver, deliberately private. It is a ``RunStarter``, so a
+    #: surface holding it could pass it straight to a dispatch entry point as
+    #: ``start=`` and open sessions for a run whose prerequisites are unmet.
+    #: :meth:`begin_run` is the only way to obtain it, and it gates first.
+    _seeder: SessionSeeder
 
     def __post_init__(self) -> None:
         """Refuse a partial graph, whatever spelling produced it.
@@ -157,11 +180,103 @@ class EngineGraph:
                 "the review queue transitions runs through a second machine over this store, "
                 "which would be a second writer of the run's state column"
             )
+        if getattr(self._seeder, "_audit", None) is not self.audit:
+            problems.append(
+                "the session seeder records the posture it applied to a seeded session in "
+                "a different audit log than the run writes to"
+            )
+        if getattr(self._seeder, "_config", None) is not self.config:
+            problems.append(
+                "the session seeder resolves its notification channel from a different "
+                "configuration document than the graph's"
+            )
 
         if problems:
             raise IncompleteEngineGraph(
                 "this engine graph is missing wiring build_engine performs: " + "; ".join(problems)
             )
+
+    def prerequisite_refusal(
+        self,
+        ref: SpecRef,
+        level: AutonomyLevel,
+        *,
+        base_branch: str = "",
+        run: str | None = None,
+        which: ProgramResolver | None = None,
+        branch_exists: BranchResolver | None = None,
+        budget: Budget | None = None,
+    ) -> RunRefusal | None:
+        """Evaluate the run gate for *ref* at *level*, recording any refusal.
+
+        Returns the refusal rather than raising, for a surface that *reports*
+        readiness (Doctor, a settings panel) instead of starting work. Nothing
+        here hands back a starter, so this is not a second route past
+        :meth:`begin_run`'s gate — it is the same gate, asked without acting.
+        """
+        return gate_run(
+            self.config,
+            level,
+            self.audit,
+            ref,
+            project=self.project,
+            base_branch=base_branch,
+            run=run,
+            which=which,
+            branch_exists=branch_exists,
+            budget=budget,
+        )
+
+    def begin_run(
+        self,
+        ref: SpecRef,
+        level: AutonomyLevel,
+        *,
+        base_branch: str = "",
+        run: str | None = None,
+        which: ProgramResolver | None = None,
+        branch_exists: BranchResolver | None = None,
+        budget: Budget | None = None,
+    ) -> SessionSeeder:
+        """Gate, then hand back the starter that opens sessions for runs.
+
+        The one door onto starting work, and the reason the prerequisite gate runs
+        *before the first credit*. A dispatch entry point cannot dispatch without
+        a ``RunStarter`` — ``start=`` is required at every one of them — and the
+        only way to obtain the engine's is through this method, so the gate
+        precedes the claim, the spec, the intake screening, and the session.
+        Discovering a missing delivery program at the delivery phase instead would
+        mean an authored spec, a screened item, and real spend already gone.
+
+        *level* is the highest rung a run started with this starter may reach: the
+        gate refuses on any unmet prerequisite of any phase that rung permits, so
+        an entry point that will only author passes ``AUTHORING`` and is not
+        refused for a delivery program it will never invoke.
+
+        Raises :class:`RunPrevented` when the gate refuses, which is already
+        audited by then.
+        """
+        refusal = self.prerequisite_refusal(
+            ref,
+            level,
+            base_branch=base_branch,
+            run=run,
+            which=which,
+            branch_exists=branch_exists,
+            budget=budget,
+        )
+        if refusal is not None:
+            raise RunPrevented(refusal)
+        return self._seeder
+
+    def notify_awaiting_review(self, ref: SpecRef, run_id: str, *, gate: str = "") -> object:
+        """Announce a run parked at a human-reserved gate, through the seeder.
+
+        Exposed so the run lifecycle can announce a parked run without being
+        handed the starter: this reaches the notification half of the seeder only,
+        and cannot open a session.
+        """
+        return self._seeder.notify_awaiting_review(ref, run_id, project=self.project, gate=gate)
 
     def orchestrator(
         self,
@@ -211,6 +326,7 @@ def build_engine(
     model_resolver: ModelResolver,
     findings_sink: FindingsSink,
     host_state: Any,
+    session_opener: SessionOpener,
     project: str | None = None,
     state_root: str | Path | None = None,
     audit_root: str | Path | None = None,
@@ -235,6 +351,11 @@ def build_engine(
       ``None`` is a legitimate value — a process with no bus cannot deliver, and
       the notifier reports that through :attr:`HostNotifier.available` — but it
       has to be *said*, not arrived at by forgetting a keyword.
+    * *session_opener* creates the host session a headless run works in. Required
+      for the same reason: a default could only be a no-op opener, and a run whose
+      session never opened is one that reports as started and does nothing. Only a
+      real host session appears in the dashboard session list, so this seam is the
+      host's to satisfy.
 
     The root arguments are different in kind: their default is the app's real
     data home, so omitting one selects production rather than skipping a wiring.
@@ -244,11 +365,14 @@ def build_engine(
         raise ValueError("build_engine needs a model resolver to register the builtins with")
     if findings_sink is None:  # pragma: no cover - typed away, guarded anyway
         raise ValueError("build_engine needs a findings sink; a default would only be memory")
+    if session_opener is None:  # pragma: no cover - typed away, guarded anyway
+        raise ValueError("build_engine needs a session opener; a default would open nothing")
 
     state = StateStore(root=state_root)
     config = ConfigStore(root=Path(config_root) if config_root is not None else None)
     audit = AuditLog(root=audit_root)
 
+    cost_sink = RunCostSink(state)
     registry = CapabilityRegistry(
         config,
         project=project,
@@ -256,7 +380,7 @@ def build_engine(
         # Durable per-run attribution rather than the in-memory recorder the
         # registry falls back to: a delegated provider's spend happened in
         # another process, so nothing else in the engine would ever record it.
-        cost_sink=RunCostSink(state),
+        cost_sink=cost_sink,
     )
     # The registration that makes a running engine's builtins real. Without this
     # call the graph is complete in shape and empty in effect.
@@ -283,4 +407,14 @@ def build_engine(
         notifier=notifier,
         machine=machine,
         review_queue=review_queue,
+        _seeder=SessionSeeder(
+            config,
+            opener=session_opener,
+            # The same durable cost sink the registry attributes through, so a
+            # seeded session's metering and a delegated provider's spend land on
+            # one run row rather than in two ideas of what a run cost.
+            accounting=RunAccounting(state, cost_sink=cost_sink),
+            audit=audit,
+            state=host_state,
+        ),
     )

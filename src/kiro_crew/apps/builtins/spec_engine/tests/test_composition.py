@@ -12,10 +12,11 @@ from __future__ import annotations
 import dataclasses
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from kiro_crew.apps.builtins.spec_engine.engine import seeder as seeder_module
 from kiro_crew.apps.builtins.spec_engine.engine.analysis import (
     AnalysisEngine,
     AnalysisReport,
@@ -23,7 +24,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.analysis import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AutonomyDecision, AutonomyLevel
-from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunCostSink
+from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunAccounting, RunCostSink
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.builtins import (
     AUTHORING_PROVIDER,
     IMPLEMENTATION_PROVIDER,
@@ -39,8 +40,10 @@ from kiro_crew.apps.builtins.spec_engine.engine.capabilities.registry import (
 from kiro_crew.apps.builtins.spec_engine.engine.composition import (
     EngineGraph,
     IncompleteEngineGraph,
+    RunPrevented,
     build_engine,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.config import DASHBOARD_SURFACE
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import resolve_authority
 from kiro_crew.apps.builtins.spec_engine.engine.notify.routing import HostNotifier
 from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
@@ -48,8 +51,10 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
     RunContext,
     TaskResult,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import AUDIT_PREREQUISITE_UNMET
 from kiro_crew.apps.builtins.spec_engine.engine.roles import Dispatch
 from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine
+from kiro_crew.apps.builtins.spec_engine.engine.seeder import SessionSeeder
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 PROJECT = "acme"
@@ -76,12 +81,57 @@ def models() -> tuple[str, ...]:
     return MODELS
 
 
+class RecordingOpener:
+    """Stands in for the host session manager, and records what it was asked for.
+
+    Echoes the requested posture, which is the honest host: it applies what the
+    engine resolved. Deliberately not a no-op returning ``None`` — the seeder is
+    supposed to read a session key and a posture back, and a stub that returned
+    neither would let a graph that never seeds anything look wired.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def __call__(self, request: Any) -> Any:
+        self.requests.append(request)
+        return OpenedChat(f"chat-{len(self.requests)}", request.posture)
+
+
+@dataclasses.dataclass(frozen=True)
+class OpenedChat:
+    session_key: str
+    applied_posture: str
+
+
+@dataclasses.dataclass(frozen=True)
+class SeedForTest:
+    """A resolved run, carrying only what the seeder reads off one."""
+
+    run_id: str
+    ref: SpecRef
+    project: str
+    working_tree: Path
+    autonomy: AutonomyDecision = dataclasses.field(
+        default_factory=lambda: AutonomyDecision(
+            level=AutonomyLevel.AUTHORING,
+            source=SOURCE,
+            spec_type="feature",
+            submitter_class="maintainer",
+        )
+    )
+
+    def seed_text(self) -> str:
+        return "author this spec"
+
+
 def build(tmp_path: Path, **overrides: Any) -> EngineGraph:
     """A graph on temporary roots, with every required seam supplied."""
     kwargs: dict[str, Any] = {
         "model_resolver": models,
         "findings_sink": CountingFindingsSink(),
         "host_state": None,
+        "session_opener": RecordingOpener(),
         "project": PROJECT,
         "state_root": tmp_path / "state",
         "audit_root": tmp_path / "audit",
@@ -258,7 +308,142 @@ class TestSharedCollaborators:
             graph.machine = RunMachine(graph.state, graph.config)  # type: ignore[misc]
 
 
-class TestAPartialGraphIsUnconstructable:
+class TestTheGatePrecedesTheFirstCredit:
+    """No starter, and therefore no dispatch, until the prerequisite gate passes.
+
+    The order is the guarantee. A dispatch entry point cannot run without a
+    ``RunStarter`` — ``start=`` is required at every one of them — and
+    :meth:`EngineGraph.begin_run` is the only way to obtain the engine's, so an
+    unmet prerequisite is discovered before the claim, the spec, the intake
+    screening and the session rather than at the phase that needed the missing
+    thing. These tests assert absences: nothing opened, nothing spent.
+    """
+
+    def refusing_config(self, graph: EngineGraph) -> None:
+        """Configure a delivery stage whose program this host does not have."""
+        graph.config.write(
+            {
+                "budget": {"run_ceiling_credits": 50.0},
+                "workflow": {"stages": {"submit": [["definitely-not-on-path", "--push"]]}},
+                "projects": {PROJECT: {"path": f"/w/{PROJECT}", "base_branch": "main"}},
+            },
+            surface=DASHBOARD_SURFACE,
+        )
+
+    def test_a_run_whose_delivery_program_is_missing_never_reaches_a_session(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        opener = RecordingOpener()
+        graph = build(tmp_path, session_opener=opener)
+        self.refusing_config(graph)
+
+        with pytest.raises(RunPrevented) as caught:
+            graph.begin_run(ref, AutonomyLevel.DELIVERY, which=lambda program: None)
+
+        # The absences, not a small number: no session was opened, so no turn ran
+        # and nothing was attributed to a run.
+        assert opener.requests == []
+        assert graph.state.list_runs() == []
+        assert caught.value.refusal.unmet
+
+    def test_the_refusal_is_recorded_before_anything_else_happens(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """The reason survives: a prevented run that logged nothing is unusable."""
+        graph = build(tmp_path)
+        self.refusing_config(graph)
+        with pytest.raises(RunPrevented):
+            graph.begin_run(ref, AutonomyLevel.DELIVERY, which=lambda program: None)
+        events = [entry.event for entry in graph.audit.read(ref)]
+        assert AUDIT_PREREQUISITE_UNMET in events
+
+    def test_an_authoring_run_is_not_refused_for_a_delivery_program(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """The gate refuses only what the run's rung reaches.
+
+        Without this, the check would be indistinguishable from one that refuses
+        everything, and every assertion above would pass for the wrong reason.
+        """
+        graph = build(tmp_path)
+        self.refusing_config(graph)
+        starter = graph.begin_run(ref, AutonomyLevel.AUTHORING, which=lambda program: None)
+        assert starter is not None
+
+    def test_the_starter_is_the_seeder_the_dispatcher_accepts(self, tmp_path: Path) -> None:
+        """What ``begin_run`` returns is what ``start=`` takes: one seeder."""
+        graph = build(tmp_path)
+        ref_ = SpecRef.of(str(tmp_path / "p"), "s")
+        starter = graph.begin_run(ref_, AutonomyLevel.AUTHORING)
+        assert isinstance(starter, SessionSeeder)
+        assert starter is getattr(graph, "_seeder")
+        assert callable(starter)
+
+    def test_the_seeder_is_not_reachable_without_passing_the_gate(self) -> None:
+        """A public seeder would be an equivalent second path to ``start=``.
+
+        ``begin_run`` would then be advice rather than a gate: a surface could
+        hand the seeder straight to a dispatch entry point.
+        """
+        public = {name for name in vars(EngineGraph).get("__annotations__", {})}
+        public |= {f.name for f in dataclasses.fields(EngineGraph) if not f.name.startswith("_")}
+        assert "seeder" not in public
+        assert not hasattr(build_engine, "seeder")
+
+    def test_the_starter_the_gate_hands_back_really_does_open_a_session(
+        self, tmp_path: Path, ref: SpecRef, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The positive control for the absence asserted above.
+
+        Without this, "the opener was never called" could be true because the
+        seeder in the graph is inert. Here the same object, obtained through a
+        gate that passed, opens a session and stamps it — so the empty opener in
+        the refusal case is the gate's doing and nothing else's.
+        """
+        monkeypatch.setattr(seeder_module, "session_posture", lambda app: "auto")
+        monkeypatch.setattr(seeder_module, "verify_session_posture", lambda app, applied: None)
+        opener = RecordingOpener()
+        graph = build(tmp_path, session_opener=opener)
+        starter = graph.begin_run(ref, AutonomyLevel.AUTHORING)
+
+        seed = SeedForTest(run_id="run-1", ref=ref, project=PROJECT, working_tree=tmp_path)
+        # Called the way a dispatcher calls a RunStarter. The seam's annotation
+        # names the watcher's concrete RunSeed while the seeder reads only the
+        # structural SeededRun this stands in for, so the cast is the nominal
+        # gap, not a shortcut around a real mismatch.
+        starter(cast(Any, seed))
+
+        assert [request.run_id for request in opener.requests] == ["run-1"]
+        assert opener.requests[0].posture == "auto"
+        # Attributed, which is what makes the session's turns visible to the
+        # ceiling: an unstamped session is spend nothing counts.
+        assert RunAccounting(graph.state).sessions_for("run-1") == ("chat-1",)
+
+    def test_a_refused_run_leaves_the_seeder_with_nothing_to_stamp(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """The other half of the pair: same graph, same seeder, gate refuses."""
+        opener = RecordingOpener()
+        graph = build(tmp_path, session_opener=opener)
+        self.refusing_config(graph)
+        with pytest.raises(RunPrevented):
+            graph.begin_run(ref, AutonomyLevel.DELIVERY, which=lambda program: None)
+        assert opener.requests == []
+        assert RunAccounting(graph.state).sessions_for("run-1") == ()
+
+    def test_the_same_gate_can_be_asked_without_starting_anything(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """Doctor-style reporting reads the refusal; it gets no starter with it."""
+        graph = build(tmp_path)
+        self.refusing_config(graph)
+        refusal = graph.prerequisite_refusal(
+            ref, AutonomyLevel.DELIVERY, which=lambda program: None
+        )
+        assert refusal is not None
+        assert refusal.unmet
+        assert graph.prerequisite_refusal(ref, AutonomyLevel.AUTHORING) is None
+
     """The module claims completeness "by construction"; this is what enforces it.
 
     Both spellings below type-check and both were demonstrated to produce a graph
@@ -292,6 +477,7 @@ class TestAPartialGraphIsUnconstructable:
                 notifier=graph.notifier,
                 machine=graph.machine,
                 review_queue=graph.review_queue,
+                _seeder=getattr(graph, "_seeder"),
             )
         assert "authoring" in str(caught.value)
 
