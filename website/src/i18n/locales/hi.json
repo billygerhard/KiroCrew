@@ -3664,9 +3664,13 @@
           "writing_this_document": "यह दस्तावेज़ लिखा जा रहा है…"
         },
         "specDetail": {
+          "advance_gate": "स्वीकृत करो → आगे बढ़ो",
           "advance_to_design": "स्वीकृत करो → डिज़ाइन",
           "advance_to_tasks": "स्वीकृत करो → कार्य",
           "an_agent_will_work_through_the_task_list": "एक एजेंट कार्य सूची पूरी करेगा",
+          "approve_gate": "{{gate}} स्वीकृत करो",
+          "approve_gate_tooltip": "इंजिन में इस दस्तावेज़ के लिए आपकी स्वीकृति दर्ज करता है। यह अगला चरण शुरू नहीं करता।",
+          "approving": "स्वीकृत किया जा रहा है…",
           "clear": "खाली करें",
           "close_esc": "बंद करें (Esc)",
           "close_review_view": "समीक्षा दृश्य बंद करें",

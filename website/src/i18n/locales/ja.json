@@ -3604,9 +3604,13 @@
           "writing_this_document": "このドキュメント作成中…"
         },
         "specDetail": {
+          "advance_gate": "承認 → 次へ",
           "advance_to_design": "承認 → デザイン",
           "advance_to_tasks": "承認 → タスク",
           "an_agent_will_work_through_the_task_list": "エージェントがタスクリストを処理します",
+          "approve_gate": "{{gate}} を承認",
+          "approve_gate_tooltip": "このドキュメントに対する承認をエンジンに記録します。次のフェーズは開始されません。",
+          "approving": "承認中…",
           "clear": "クリア",
           "close_esc": "閉じる（Esc）",
           "close_review_view": "レビュービューを閉じる",

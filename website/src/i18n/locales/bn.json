@@ -3664,9 +3664,13 @@
           "writing_this_document": "এই নথিটি লেখা হচ্ছে…"
         },
         "specDetail": {
+          "advance_gate": "অনুমোদন → চালিয়ে যান",
           "advance_to_design": "অনুমোদন → ডিজাইন",
           "advance_to_tasks": "অনুমোদন → কাজ",
           "an_agent_will_work_through_the_task_list": "একজন এজেন্ট কাজের তালিকা ধরে এগোবে",
+          "approve_gate": "{{gate}} অনুমোদন করুন",
+          "approve_gate_tooltip": "ইঞ্জিনে এই ডকুমেন্টের জন্য আপনার অনুমোদন রেকর্ড করে। এটি পরবর্তী ধাপ শুরু করে না।",
+          "approving": "অনুমোদন করা হচ্ছে…",
           "clear": "খালি করুন",
           "close_esc": "বন্ধ করুন (Esc)",
           "close_review_view": "পর্যালোচনা ভিউ বন্ধ করুন",

@@ -3664,9 +3664,13 @@
           "writing_this_document": "Dieses Dokument wird geschrieben…"
         },
         "specDetail": {
+          "advance_gate": "Freigeben → Weiter",
           "advance_to_design": "Freigeben → Design",
           "advance_to_tasks": "Freigeben → Aufgaben",
           "an_agent_will_work_through_the_task_list": "Ein Agent arbeitet die Aufgabenliste ab",
+          "approve_gate": "{{gate}} freigeben",
+          "approve_gate_tooltip": "Erfasst Ihre Freigabe dieses Dokuments in der Engine. Die nächste Phase wird dadurch nicht gestartet.",
+          "approving": "Wird freigegeben…",
           "clear": "Leeren",
           "close_esc": "Schließen (Esc)",
           "close_review_view": "Prüfansicht schließen",

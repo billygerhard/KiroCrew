@@ -2981,9 +2981,13 @@
           "writing_this_document": "Writing this document…"
         },
         "specDetail": {
+          "advance_gate": "Approve → Continue",
           "advance_to_design": "Approve → Design",
           "advance_to_tasks": "Approve → Tasks",
           "an_agent_will_work_through_the_task_list": "An agent will work through the task list",
+          "approve_gate": "Approve {{gate}}",
+          "approve_gate_tooltip": "Records your approval of this document with the engine. It does not start the next phase.",
+          "approving": "Approving…",
           "clear": "Clear",
           "close_esc": "Close (Esc)",
           "close_review_view": "Close review view",

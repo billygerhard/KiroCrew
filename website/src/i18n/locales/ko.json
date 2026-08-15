@@ -3604,9 +3604,13 @@
           "writing_this_document": "이 문서 작성 중…"
         },
         "specDetail": {
+          "advance_gate": "승인 → 계속",
           "advance_to_design": "승인 → 설계",
           "advance_to_tasks": "승인 → 작업",
           "an_agent_will_work_through_the_task_list": "에이전트가 작업 목록을 처리합니다",
+          "approve_gate": "{{gate}} 승인",
+          "approve_gate_tooltip": "이 문서에 대한 승인을 엔진에 기록합니다. 다음 단계를 시작하지는 않습니다.",
+          "approving": "승인 중…",
           "clear": "지우기",
           "close_esc": "닫기(Esc)",
           "close_review_view": "검토 화면 닫기",

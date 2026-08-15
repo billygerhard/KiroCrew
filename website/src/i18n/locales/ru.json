@@ -3784,9 +3784,13 @@
           "writing_this_document": "Документ пишется…"
         },
         "specDetail": {
+          "advance_gate": "Согласовать → Далее",
           "advance_to_design": "Согласовать → Дизайн",
           "advance_to_tasks": "Согласовать → Задачи",
           "an_agent_will_work_through_the_task_list": "Агент пройдёт по списку задач",
+          "approve_gate": "Согласовать {{gate}}",
+          "approve_gate_tooltip": "Записывает ваше согласование этого документа в движке. Следующая фаза при этом не начинается.",
+          "approving": "Согласование…",
           "clear": "Очистить",
           "close_esc": "Закрыть (Esc)",
           "close_review_view": "Закрыть режим просмотра",

@@ -37,14 +37,34 @@ const DOC_TABS = [
 
 type DocTabId = (typeof DOC_TABS)[number]['id']
 
-// The label for the control that leaves one gate. Copy only: which gate can be
-// left, and what follows it, are the ENGINE's answers and arrive on the detail
-// payload. There used to be a map here that computed the transition and sent an
-// "approved -- proceed" prompt the engine had never authorised, which is why the
-// table below holds nothing but a label key.
+// The label for the control that leaves one gate. COPY ONLY, and copy only for
+// the gates whose next document this app happens to have a phrase for: which
+// gate can be left, and what follows it, are the ENGINE's answers and arrive on
+// the detail payload. There used to be a map here that computed the transition
+// and sent an "approved -- proceed" prompt the engine had never authorised,
+// which is why the table below holds nothing but a label key.
+//
+// A gate absent from this table is a gate this table has no PHRASE for, never a
+// gate that cannot be left. Reading it as the latter is how the tasks gate
+// became unleavable from the browser -- the engine names it, advances past it to
+// `ready`, and the surface rendered no control at all, so no spec could ever
+// reach execution through the UI. Any spec type with a different phase plan
+// would have reproduced that on its own gates, which is why the miss now
+// degrades to `advance_gate` below instead of to a missing control.
 const GATE_LABEL_KEY: Record<string, string> = {
   requirements: 'apps.specBuilder.components.specDetail.advance_to_design',
   design: 'apps.specBuilder.components.specDetail.advance_to_tasks',
+}
+
+/** The advance control's label for *gate*, degrading to the generic phrase.
+ *
+ *  The generic phrase names no destination, because this module does not know
+ *  one: only the engine's ``to_phase`` does, and that arrives after the advance
+ *  it labels. */
+function advanceLabel(gate: string): string {
+  return Object.prototype.hasOwnProperty.call(GATE_LABEL_KEY, gate)
+    ? i18nT(GATE_LABEL_KEY[gate])
+    : i18nT('apps.specBuilder.components.specDetail.advance_gate')
 }
 
 export interface SpecDetailProps {
@@ -175,10 +195,27 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
 
   const advancing = advanceMutation.isPending || messageMutation.isPending
 
+  // Recording an approval on its own, without asking for a transition. The
+  // engine treats the two as separate facts and so does this: a reviewer who
+  // approves the document in front of them has done a complete thing, and the
+  // last gate in a plan is approved without any further phase to author. The
+  // actor is the authenticated session on the server side -- nothing here names
+  // an approver.
+  const approveMutation = useMutation({
+    mutationFn: (gate: string) => specApi.approve(name, gate, specId()),
+    onError: (e) => setErr((e as Error).message),
+    onSettled: invalidate,
+  })
+
   // The gate the engine says a person is being asked about. Absent means the
-  // engine offered none, and no advance control is rendered -- the surface never
+  // engine offered none, and no gate control is rendered -- the surface never
   // picks a gate the engine did not name.
   const currentGate = detail?.engine?.addressable ? detail.engine.current_gate ?? null : null
+  // Whether the engine has already recorded an approval for that gate, from the
+  // engine's own gate row. Undefined when it reported no row for it, which is
+  // treated as "not approved" for rendering only: the endpoint is what decides,
+  // and offering the approval again is harmless where hiding it is not.
+  const currentGateApproved = !!detail?.engine?.gates?.find((g) => g.gate === currentGate)?.approved
   // Whether the engine permits a build, and its first reason when it does not.
   // ``undefined`` means the engine did not answer -- an older backend, or one that
   // could not be asked -- and the control is left enabled so the ENDPOINT decides,
@@ -187,6 +224,9 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
   const blockedReason = detail?.engine?.execution_blocked_by?.[0]?.message ?? ''
   const advance = () => {
     if (currentGate) advanceMutation.mutate(currentGate)
+  }
+  const approve = () => {
+    if (currentGate) approveMutation.mutate(currentGate)
   }
   const execute = () => executeMutation.mutate()
   const stop = () => stopMutation.mutate()
@@ -247,11 +287,29 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
         ariaLabel={fullscreen ? i18nT('apps.specBuilder.components.specDetail.close_review_view') : i18nT('apps.specBuilder.components.specDetail.expand_document_for_review')}
         label={fullscreen ? <Minimize2 className="lucide-inline" /> : <Maximize2 className="lucide-inline" />}
       />
-      {!fullscreen && !executing && currentGate && GATE_LABEL_KEY[currentGate] && (
+      {/* Recording the approval, offered for whatever gate the engine named and
+          has no approval for yet. Separate from the advance because it is a
+          separate fact: the LAST gate in a plan has no next phase to author, and
+          before this control existed the app had no way to record an approval at
+          all -- so a spec parked on that gate was blocked from execution by a
+          missing approval with nothing on screen able to record one. */}
+      {!fullscreen && !executing && currentGate && !currentGateApproved && (
         <Btn
-          label={advancing ? i18nT('apps.specBuilder.components.specDetail.sending') : <><Play className="lucide-inline" /> {i18nT(GATE_LABEL_KEY[currentGate])}</>}
+          label={approveMutation.isPending
+            ? i18nT('apps.specBuilder.components.specDetail.approving')
+            : i18nT('apps.specBuilder.components.specDetail.approve_gate', { gate: currentGate })}
+          disabled={approveMutation.isPending || advancing}
+          title={i18nT('apps.specBuilder.components.specDetail.approve_gate_tooltip')}
+          onClick={approve}
+        />
+      )}
+      {/* The advance, offered for EVERY gate the engine names. The label may be
+          generic; the control is not conditional on having a specific phrase. */}
+      {!fullscreen && !executing && currentGate && (
+        <Btn
+          label={advancing ? i18nT('apps.specBuilder.components.specDetail.sending') : <><Play className="lucide-inline" /> {advanceLabel(currentGate)}</>}
           primary
-          disabled={advancing}
+          disabled={advancing || approveMutation.isPending}
           title={i18nT('apps.specBuilder.components.specDetail.tells_the_agent_this_phase_is_approved_and_to_mo')}
           onClick={advance}
         />

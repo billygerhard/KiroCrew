@@ -3724,9 +3724,13 @@
           "writing_this_document": "Escribiendo este documento…"
         },
         "specDetail": {
+          "advance_gate": "Aprobar → Continuar",
           "advance_to_design": "Aprobar → Diseño",
           "advance_to_tasks": "Aprobar → Tareas",
           "an_agent_will_work_through_the_task_list": "Un agente irá completando la lista de tareas",
+          "approve_gate": "Aprobar {{gate}}",
+          "approve_gate_tooltip": "Registra tu aprobación de este documento en el motor. No inicia la siguiente fase.",
+          "approving": "Aprobando…",
           "clear": "Vaciar",
           "close_esc": "Cerrar (Esc)",
           "close_review_view": "Cerrar la vista de revisión",

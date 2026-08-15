@@ -3604,9 +3604,13 @@
           "writing_this_document": "正在撰写此文档…"
         },
         "specDetail": {
+          "advance_gate": "通过 → 继续",
           "advance_to_design": "通过 → 设计",
           "advance_to_tasks": "通过 → 任务",
           "an_agent_will_work_through_the_task_list": "代理将逐项完成任务清单",
+          "approve_gate": "通过 {{gate}}",
+          "approve_gate_tooltip": "在引擎中记录你对该文档的批准。不会启动下一阶段。",
+          "approving": "正在通过…",
           "clear": "清空",
           "close_esc": "关闭（Esc）",
           "close_review_view": "关闭审阅视图",
