@@ -274,9 +274,11 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
                     </tr>,
                     // A second row rather than a cell: findings are prose, and a
                     // prose column would squeeze every other column on the widest
-                    // finding. `analysis` empty means no analysis was recorded --
-                    // distinct from one that recorded no findings, so this says
-                    // nothing at all rather than "none found".
+                    // finding. Empty or absent means "nothing to show" and cannot
+                    // be read more precisely: a run nothing analysed and a run
+                    // whose analysis found nothing both project empty, so saying
+                    // "no findings" would assert a clean bill of health for a run
+                    // that may never have been looked at.
                     ...(row.analysis && row.analysis.length > 0
                       ? [
                           <tr key={`${row.run_id}-analysis`}>
@@ -295,6 +297,12 @@ export default function ReviewQueuePanel({ onClose, setErr }: ReviewQueuePanelPr
                                         i18nT('apps.specBuilder.reviewQueue.analysis_unkeyed')}
                                     </p>
                                     {group.findings.length === 0 ? (
+                                      // Not reachable from engine data today --
+                                      // a group exists only because a row was
+                                      // stored for it. Kept so a group that ever
+                                      // does arrive empty renders as itself
+                                      // rather than as a silently missing
+                                      // heading.
                                       <p style={{ margin: 0 }}>
                                         {i18nT('apps.specBuilder.reviewQueue.analysis_none')}
                                       </p>

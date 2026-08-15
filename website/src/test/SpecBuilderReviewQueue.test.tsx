@@ -307,6 +307,45 @@ describe('ReviewQueuePanel', () => {
     expect(screen.queryByText(/^Done\.$/)).toBeNull()
   })
 
+  it('lays finding prose out without letting it reflow the rows around it', async () => {
+    // The bullet names this threat directly: the display path KEEPS the line
+    // breaks prose is entitled to, so a surface that lays them out can be
+    // reflowed by a crafted message. pre-wrap honours the breaks; anywhere (not
+    // break-word) is the value that contributes break opportunities to
+    // min-content sizing, so a long unbroken token cannot widen this table.
+    // jsdom cannot measure layout, so the inline styles are what gets pinned --
+    // without this, deleting both properties left every test green.
+    const hostile = 'line one\nline two\n' + 'A'.repeat(400)
+    harness({
+      entries: [HELD_ROW],
+      grouped: {
+        awaiting_review: [
+          {
+            ...HELD_ROW,
+            analysis: [
+              {
+                criterion: '1.1',
+                keyed: true,
+                findings: [{ kind: 'injection', severity: 'warning', message: hostile }],
+              },
+            ],
+          },
+        ],
+      },
+      total: 1,
+      total_credits: 2,
+    })
+    mount()
+
+    const prose = await waitFor(() => screen.getByText(/line one/))
+    expect(prose).toHaveStyle({ whiteSpace: 'pre-wrap' })
+    expect(prose).toHaveStyle({ overflowWrap: 'anywhere' })
+    // The newlines survive as text rather than being collapsed or stripped: the
+    // engine preserved them deliberately, so losing them here would discard
+    // information a reviewer is meant to read.
+    expect(prose.textContent).toContain('line one\nline two')
+  })
+
   it('cleans a workspace row by ledger id, which no queue row carries', async () => {
     const calls = harness(QUEUE, '{"ok":true,"removed":true}')
     mount()
