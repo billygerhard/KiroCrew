@@ -460,7 +460,12 @@ def revision_cycles(record: RunRecord) -> dict[str, int]:
         return {}
     cycles: dict[str, int] = {}
     for gate, raw in stored.items():
-        if isinstance(gate, str) and isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        if (
+            isinstance(gate, str)
+            and isinstance(raw, int)
+            and not isinstance(raw, bool)
+            and raw >= 0
+        ):
             cycles[gate] = raw
     return cycles
 
@@ -629,6 +634,22 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class ReviewAnnouncer(Protocol):
+    """Announces that a run has reached a gate reserved for human action.
+
+    A seam rather than an import of the seeder: this module owns *when* a run
+    parks on a person (the move into ``awaiting_review``, decided by the one state
+    writer) and the seeder owns *how* that is announced — the channel resolved per
+    project, the engine-authored body, the audit record. Satisfied by
+    :meth:`~.seeder.SessionSeeder.notify_awaiting_review`, whose signature this
+    mirrors, so the composition root passes that bound method with no adapter.
+    """
+
+    def __call__(
+        self, ref: SpecRef, run_id: str, *, project: str | None = ..., gate: str = ...
+    ) -> Any: ...
+
+
 class RunMachine:
     """Creates runs, moves them between states, stalls them, and resumes them.
 
@@ -648,6 +669,7 @@ class RunMachine:
         notifier: Notifier | None = None,
         clock: Callable[[], datetime] | None = None,
         feedback: Any | None = None,
+        review_announcer: "ReviewAnnouncer | None" = None,
     ) -> None:
         self._store = store
         self._config = config
@@ -668,6 +690,13 @@ class RunMachine:
         #: post without recording would drop the one trace that a tracker refused.
         self._feedback: Any = feedback
         self._feedback_ready = feedback is not None
+        #: Announces a run that has just parked on a person. ``None`` means this
+        #: machine cannot announce -- a machine built without one still moves runs,
+        #: and the state is what the review surfaces read, so a missing announcer
+        #: costs a notice rather than a transition. The composition root passes the
+        #: session seeder's, which is the one place the notice's body, channel and
+        #: audit trail are decided.
+        self._review_announcer = review_announcer
 
     # ------------------------------------------------------------------ clock
 
@@ -1224,6 +1253,49 @@ class RunMachine:
         observer cannot stall a contended write or unwind a move that happened.
         """
         self._post_item_feedback(ref, record, from_state, to_state)
+        self._announce_awaiting_review(ref, record, to_state)
+
+    def _announce_awaiting_review(
+        self, ref: SpecRef, record: RunRecord, to_state: RunState
+    ) -> None:
+        """Tell the configured channel that a run is now waiting for a person.
+
+        The move into ``awaiting_review`` IS the moment a run reaches a gate
+        reserved for human action, which is why this hangs off the state writer
+        rather than off whichever driver happened to park the run: a second driver
+        would otherwise park a run silently.
+
+        Never raises. A notice is a courtesy and the parked state is the fact, so a
+        channel failure -- or a bug in the announcer -- is logged and swallowed. The
+        alternative is worse in a way that is hard to recover from: an exception
+        here unwinds a caller whose state change is ALREADY durable, so the run is
+        parked while its driver believes the transition failed.
+        """
+        if to_state is not RunState.AWAITING_REVIEW or self._review_announcer is None:
+            return
+        try:
+            self._review_announcer(
+                ref, record.run_id, project=self._project, gate=self._outstanding_gate(ref)
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost notice must not unwind a move
+            logger.warning(
+                "run %s parked for review but could not be announced: %s", record.run_id, exc
+            )
+
+    def _outstanding_gate(self, ref: SpecRef) -> str:
+        """The gate the spec is waiting on, for the notice's body.
+
+        Derived from the spec's own documents and approvals rather than from the
+        run row, so the gate named in the notice is the one a reviewer will be
+        asked about. Best-effort: an unreadable spec yields no gate name and the
+        notice still goes out saying the run is waiting.
+        """
+        try:
+            gate = phases.derive_phase(self._store, ref).current_gate
+        except Exception as exc:  # noqa: BLE001 - the notice matters more than the name
+            logger.debug("could not derive the outstanding gate for %r: %s", ref.name, exc)
+            return ""
+        return gate.gate if gate is not None else ""
 
     def _item_feedback(self) -> Any:
         """The item-feedback poster, or ``None`` when this machine cannot post.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -894,3 +895,90 @@ def _approve(machine: RunMachine, ref: SpecRef, gate: str) -> None:
     text = phases.read_document(ref.spec_dir, kind)
     assert text is not None
     machine._store.record_approval(ref, gate=gate, actor="ada", doc_hash=phases.content_hash(text))
+
+
+class RecordingAnnouncer:
+    """Stands in for the seeder's awaiting-review announcement.
+
+    Deliberately records the ``gate`` and ``project`` it was given as well as the
+    run: the notice's whole value to a person is which spec is waiting and on
+    what, so an announcer called with nothing useful is not much better than one
+    never called.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls: list[tuple[str, str, str | None, str]] = []
+        self._fail = fail
+
+    def __call__(
+        self, ref: SpecRef, run_id: str, *, project: str | None = None, gate: str = ""
+    ) -> object:
+        self.calls.append((ref.name, run_id, project, gate))
+        if self._fail:
+            raise RuntimeError("the notification channel is down")
+        return object()
+
+
+class TestAwaitingReviewIsAnnounced:
+    """A run that parks on a person says so, and cannot be parked silently.
+
+    The announcement hangs off the state writer's own observation of the move, so
+    every driver that parks a run announces it. Requirement 6.3's failure mode is
+    a run that waits forever because nobody was told to look at it.
+    """
+
+    def parked(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef, announcer: Any
+    ) -> RunMachine:
+        machine = RunMachine(store, config, project="acme", audit=audit, review_announcer=announcer)
+        machine.create(ref, run_id="run-1")
+        machine.transition(ref, "run-1", RunState.AUTHORING)
+        machine.transition(ref, "run-1", RunState.AWAITING_REVIEW)
+        return machine
+
+    def test_parking_a_run_for_review_announces_it_once(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        announcer = RecordingAnnouncer()
+        self.parked(store, config, audit, ref, announcer)
+        assert [(name, run) for name, run, _, _ in announcer.calls] == [(ref.name, "run-1")]
+        # Scoped to the machine's project, so the notice resolves that project's
+        # channel rather than the unscoped default.
+        assert announcer.calls[0][2] == "acme"
+        # The gate is derived from the spec, so the notice can say what is waiting.
+        assert announcer.calls[0][3] == "requirements"
+
+    def test_a_move_that_is_not_a_human_gate_announces_nothing(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        """Otherwise the hook would be indistinguishable from one on every move."""
+        announcer = RecordingAnnouncer()
+        machine = RunMachine(store, config, audit=audit, review_announcer=announcer)
+        machine.create(ref, run_id="run-2")
+        machine.transition(ref, "run-2", RunState.AUTHORING)
+        machine.transition(ref, "run-2", RunState.STALLED)
+        assert announcer.calls == []
+
+    def test_a_failing_announcer_does_not_unwind_the_park(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        """The deliberate choice: a lost notice beats a state that never moved.
+
+        The transition is durable before the announcer is called, so an exception
+        escaping here would leave the run parked while its driver was told the
+        move failed — and the driver's recovery would then act on a state that is
+        not the one in the store.
+        """
+        announcer = RecordingAnnouncer(fail=True)
+        machine = self.parked(store, config, audit, ref, announcer)
+        assert announcer.calls, "the failing announcer was never reached"
+        assert machine.state_of("run-1") is RunState.AWAITING_REVIEW
+
+    def test_a_machine_with_no_announcer_still_parks_the_run(
+        self, store: StateStore, config: ConfigStore, audit: AuditLog, ref: SpecRef
+    ) -> None:
+        machine = RunMachine(store, config, audit=audit)
+        machine.create(ref, run_id="run-3")
+        machine.transition(ref, "run-3", RunState.AUTHORING)
+        machine.transition(ref, "run-3", RunState.AWAITING_REVIEW)
+        assert machine.state_of("run-3") is RunState.AWAITING_REVIEW

@@ -190,6 +190,12 @@ class EngineGraph:
                 "the session seeder resolves its notification channel from a different "
                 "configuration document than the graph's"
             )
+        announcer = getattr(self.machine, "_review_announcer", None)
+        if getattr(announcer, "__self__", None) is not self._seeder:
+            problems.append(
+                "the run machine announces a run parked for review through something "
+                "other than this graph's seeder, so a parked run may tell nobody"
+            )
 
         if problems:
             raise IncompleteEngineGraph(
@@ -388,7 +394,28 @@ def build_engine(
 
     analysis = AnalysisEngine(registry, findings_sink=findings_sink)
     notifier = HostNotifier(config, project=project, state=host_state)
-    machine = RunMachine(state, config, project=project, audit=audit, notifier=notifier)
+    seeder = SessionSeeder(
+        config,
+        opener=session_opener,
+        # The same durable cost sink the registry attributes through, so a seeded
+        # session's metering and a delegated provider's spend land on one run row
+        # rather than in two ideas of what a run cost.
+        accounting=RunAccounting(state, cost_sink=cost_sink),
+        audit=audit,
+        state=host_state,
+    )
+    machine = RunMachine(
+        state,
+        config,
+        project=project,
+        audit=audit,
+        notifier=notifier,
+        # Built before the machine so this can be passed rather than set
+        # afterwards: the announcement is a property of the transition, and a
+        # machine that could be handed one later would have a window in which a
+        # run parks on a person and tells nobody.
+        review_announcer=seeder.notify_awaiting_review,
+    )
     review_queue = ReviewQueue(
         machine,
         # Rooted where the orchestrator's own janitor is rooted, so archival
@@ -407,14 +434,5 @@ def build_engine(
         notifier=notifier,
         machine=machine,
         review_queue=review_queue,
-        _seeder=SessionSeeder(
-            config,
-            opener=session_opener,
-            # The same durable cost sink the registry attributes through, so a
-            # seeded session's metering and a delegated provider's spend land on
-            # one run row rather than in two ideas of what a run cost.
-            accounting=RunAccounting(state, cost_sink=cost_sink),
-            audit=audit,
-            state=host_state,
-        ),
+        _seeder=seeder,
     )

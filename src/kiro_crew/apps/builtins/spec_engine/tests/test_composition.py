@@ -53,8 +53,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import AUDIT_PREREQUISITE_UNMET
 from kiro_crew.apps.builtins.spec_engine.engine.roles import Dispatch
-from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine
-from kiro_crew.apps.builtins.spec_engine.engine.seeder import SessionSeeder
+from kiro_crew.apps.builtins.spec_engine.engine.runs import RunMachine, RunState
+from kiro_crew.apps.builtins.spec_engine.engine.seeder import (
+    AWAITING_REVIEW_EVENT,
+    AWAITING_REVIEW_NOTIFY_FAILED_EVENT,
+    SessionSeeder,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef, StateStore
 
 PROJECT = "acme"
@@ -444,6 +448,47 @@ class TestTheGatePrecedesTheFirstCredit:
         assert refusal.unmet
         assert graph.prerequisite_refusal(ref, AutonomyLevel.AUTHORING) is None
 
+
+class TestAParkedRunAnnouncesItself:
+    """The awaiting-review notice has a caller, and it is the one state writer.
+
+    ``notify_awaiting_review`` passed its own tests while nothing called it, so
+    these tests are about the *call*: a run parked through the graph's machine
+    reaches the seeder's announcement, with the graph's project scope.
+    """
+
+    def test_the_machine_announces_through_the_graphs_seeder(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+        announcer = getattr(graph.machine, "_review_announcer")
+        assert announcer is not None
+        assert getattr(announcer, "__self__") is getattr(graph, "_seeder")
+        assert announcer.__func__ is SessionSeeder.notify_awaiting_review
+
+    def test_parking_a_run_reaches_the_notification_path(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """End to end through the graph: the notice is attempted and recorded.
+
+        There is no bus in this process, so the notifier cannot deliver — what is
+        asserted is that the announcement ran and its outcome was written to the
+        run's audit log, which is what makes a lost notice diagnosable.
+        """
+        graph = build(tmp_path)
+        record = graph.machine.create(ref, source=SOURCE)
+        graph.machine.transition(ref, record.run_id, RunState.AUTHORING)
+        graph.machine.transition(ref, record.run_id, RunState.AWAITING_REVIEW)
+        events = [entry.event for entry in graph.audit.read(ref)]
+        assert AWAITING_REVIEW_EVENT in events or AWAITING_REVIEW_NOTIFY_FAILED_EVENT in events
+
+    def test_replace_cannot_leave_a_machine_that_announces_to_nobody(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+        silent = RunMachine(graph.state, graph.config, project=graph.project, audit=graph.audit)
+        with pytest.raises(IncompleteEngineGraph) as caught:
+            dataclasses.replace(graph, machine=silent)
+        assert "tell nobody" in str(caught.value)
+
+
+class TestAPartialGraphIsUnconstructable:
     """The module claims completeness "by construction"; this is what enforces it.
 
     Both spellings below type-check and both were demonstrated to produce a graph
