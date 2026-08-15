@@ -94,7 +94,9 @@ from .delivery import (
 )
 from .delivery import Notifier as DeliveryNotifier
 from .delivery import (
+    OnSubmitted,
     RunContext,
+    StageExecutor,
     StageResult,
     WorkspaceBroker,
     WorkspaceJanitor,
@@ -1048,6 +1050,73 @@ def _audit_recorder(log: AuditLog, ref: SpecRef, run_id: str) -> AuditRecorder:
     return record
 
 
+def _submitted_observer(
+    ref: SpecRef,
+    run_id: str,
+    *,
+    state: StateStore,
+    config: ConfigStore,
+    audit: AuditLog,
+    project: str | None,
+    runner: CommandRunner | None = None,
+) -> OnSubmitted:
+    """Back the pipeline's ``on_submitted`` seam with the shared feedback poster.
+
+    ``delivery_submitted`` is the one item lifecycle event no run-state move
+    emits: raising a review artifact is a stage outcome inside a delivery, not a
+    transition, so :func:`~.runs.lifecycle_event_for` never names it and this is
+    its only route. Wiring it here rather than in the pipeline is what keeps the
+    writeback on the one at-most-once ledger every other event uses -- the
+    delivery layer never imports the poster, so a second writeback route cannot
+    grow inside it.
+
+    The run's source is read at post time rather than captured now, because a
+    pipeline is built before the run's first task and the record is the one
+    authority on which tracker the run came from. A run with no source posts
+    nothing: the poster declines a blank source, which is the ordinary case for a
+    spec a person authored by hand.
+
+    The writeback spawns through the same command runner the delivery stages do.
+    A caller that supplied one meant it for every command this run runs, and a
+    poster reaching around it to the process spawner would be a second answer to
+    how this run executes configured argv.
+
+    Nothing escapes. The pipeline documents this announcement as best-effort
+    because the artifact is already raised by the time it happens, and
+    :func:`~.watch.feedback.post_feedback` honours that for every outcome it
+    reports -- but resolving the run row and the workflow to reach it can fail on
+    their own, and an exception here would unwind a delivery that has already
+    submitted.
+
+    Deferred import for the same reason :meth:`~.runs.RunMachine._item_feedback`
+    defers it: the watch package imports this module, so importing its poster at
+    module load would import a half-built ``orchestrator``.
+    """
+    from .watch.feedback import EVENT_DELIVERY_SUBMITTED, FeedbackPoster
+
+    poster = FeedbackPoster(state, config, audit, project=project)
+
+    def announce(context: RunContext) -> None:
+        try:
+            record = state.get_run(run_id)
+            poster.post(
+                ref,
+                source=record.source if record is not None else "",
+                run_id=run_id,
+                event=EVENT_DELIVERY_SUBMITTED,
+                context=context,
+                executor=StageExecutor(config, project=project, runner=runner),
+            )
+        except Exception:  # noqa: BLE001 - a writeback must not unwind a submission
+            logger.warning(
+                "run %s submitted a review artifact but could not write back to its item",
+                run_id,
+                exc_info=True,
+            )
+
+    return announce
+
+
 def workspace_root(state: StateStore, root: str | Path | None = None) -> Path:
     """Where run workspaces are created: ``<state root>/workspaces`` by default."""
     resolved = Path(root) if root is not None else state.root / WORKSPACES_DIRNAME
@@ -1117,6 +1186,19 @@ def orchestrator_for(
         audit=recorder,
         isolation=broker,
         notifier=delivery_notifier,
+        on_submitted=(
+            _submitted_observer(
+                ref,
+                run_id,
+                state=state,
+                config=config,
+                audit=audit,
+                project=project,
+                runner=runner,
+            )
+            if audit is not None
+            else None
+        ),
     )
     janitor = WorkspaceJanitor(state, root=ws_root, runner=runner, audit=recorder)
     return WaveRunner(

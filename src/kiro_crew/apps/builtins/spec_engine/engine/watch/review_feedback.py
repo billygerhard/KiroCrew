@@ -97,6 +97,7 @@ from ..runs import (
     feedback_quarantined,
 )
 from ..state import SpecRef, StateStore
+from .echo import EchoCandidate, EchoedContext, echoed_context
 from .poll import HealthReason, PollStatus, decode_entries
 from .screening import ScreeningReport
 
@@ -958,8 +959,30 @@ class ReviewFeedbackWatcher:
         # derivation and here raises rather than being dispatched under a class
         # derived for text that is gone.
         text = consume(element, trust)
+        # The comment's words reach a COMMAND only if the class that wrote them
+        # may be echoed on this source. The gate is applied here, where the text
+        # would enter the run context, because from there the shared executor
+        # substitutes it for every delivery stage command and every quality gate
+        # alike -- the bundled workflow presets put ``review_summary`` into a
+        # commit message and a pull-request body, which is republishing it into a
+        # shared system just as much as a tracker comment is. A refused class
+        # leaves the field with no value, so a command referencing it refuses
+        # before spawning instead of running with the words in its argv.
+        echoed = echoed_context(
+            self._config,
+            route.source,
+            context,
+            summary=EchoCandidate(element, trust),
+        )
         outcome = self._dispatch(
-            ref, run_id, comment, trust, context=context, project=route.project, text=text
+            ref,
+            run_id,
+            comment,
+            trust,
+            context=echoed.context,
+            project=route.project,
+            text=text,
+            echoed=echoed,
         )
         acknowledge(self._state, route, element, scope=run_id)
         return outcome
@@ -1173,6 +1196,7 @@ class ReviewFeedbackWatcher:
         context: RunContext,
         project: str,
         text: str,
+        echoed: EchoedContext | None = None,
     ) -> CommentDisposition:
         """Author the fix, then carry it through the configured delivery stages.
 
@@ -1202,6 +1226,11 @@ class ReviewFeedbackWatcher:
         self._mark(run_id, {DETAIL_FEEDBACK_CYCLES: cycle})
         delivered = self._delivery.deliver(context)
         detail = f"cycle {cycle} delivered: {getattr(delivered, 'outcome', '')}"
+        if echoed is not None and echoed.refused:
+            # The refusal is recorded rather than only acted on: a stage that
+            # refused for a variable with no value is otherwise a puzzle, and
+            # "the class that wrote this text may not be echoed" is the answer.
+            detail += "; " + "; ".join(omission.reason for omission in echoed.omitted)
         self._record(ref, run_id, ReviewFeedbackOutcome.DISPATCHED, trust, detail=detail, cycle=cycle)
         return CommentDisposition(
             comment_id=comment.identifier,

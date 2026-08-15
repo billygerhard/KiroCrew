@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AUDIT_ITEM_FEEDBACK",
+    "EVENT_DELIVERY_SUBMITTED",
     "FEEDBACK_FIELD",
     "FEEDBACK_PRESETS",
     "FEEDBACK_PRESET_HOSTS",
@@ -78,6 +79,14 @@ __all__ = [
 
 #: Source field holding the event-to-commands map.
 FEEDBACK_FIELD = "feedback"
+
+#: The one lifecycle event no run-state transition emits. Every other event in
+#: :data:`~..config.schema.ITEM_LIFECYCLE_EVENTS` is reached from a move the run
+#: machine makes; a review artifact being raised is a *stage* outcome inside a
+#: delivery, so the delivery pipeline announces it through its ``on_submitted``
+#: seam. Named here rather than spelled at the wiring site so the event, its
+#: preset, and its ledger claim key cannot drift apart.
+EVENT_DELIVERY_SUBMITTED = "delivery_submitted"
 
 #: Audit event for one item-feedback attempt.
 AUDIT_ITEM_FEEDBACK = "item.feedback"
