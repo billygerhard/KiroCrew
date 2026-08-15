@@ -52,6 +52,13 @@ def _redirect_state(monkeypatch, tmp_path):
     # deletion tests wrote into the USER's live state and made their real deleted
     # specs discoverable again.
     monkeypatch.setattr(routes, "_DELETED_PATH", state_dir / "deleted.json")
+    # The ENGINE's state root, for the same reason: the detail read, the approval
+    # path and the execution gate all open the engine's SQLite store, and an
+    # un-redirected root writes approvals into the user's live engine state.
+    monkeypatch.setattr(routes, "_ENGINE_STATE_ROOT", state_dir / "engine-state")
+    # A store is cached per root, and a previous test's tmp root would still be in
+    # that cache with its temporary directory already deleted.
+    routes._ENGINE_STORES.clear()
     monkeypatch.setattr(routes, "is_app_enabled", lambda name: True)
     return state_dir
 
@@ -116,6 +123,115 @@ def _make_client(monkeypatch, tmp_path):
     return TestClient(TestServer(app))
 
 
+# ── an engine-executable spec ────────────────────────────────────────────────
+#
+# The handoff endpoint's gate is the ENGINE's (``phases.execution_blocking_reasons``),
+# so a test that wants to reach the code AFTER the gate -- authorization, the
+# execution claim, the unwind paths -- needs a spec the engine permits: every
+# planned document written, valid under the native format, carrying a live
+# approval, with a tasks plan that resolves against the requirements it cites.
+#
+# A bare ``tasks.md`` used to be enough, which was the defect: the app executed a
+# spec that was never validated and never approved.
+
+_READY_REQUIREMENTS = """# Requirements Document
+
+## Introduction
+
+A spec whose documents are format-clean, for a test that needs the gate open.
+
+## Requirements
+
+### Requirement 1: The thing
+
+**User Story:** As a user, I want a thing, so that I benefit.
+
+#### Acceptance Criteria
+
+1. WHEN a user asks THEN the system SHALL answer.
+"""
+
+_READY_DESIGN = """# Design Document
+
+## Overview
+
+One component answers the question.
+
+## Architecture
+
+A single module.
+
+## Components and Interfaces
+
+One component.
+
+## Data Models
+
+None.
+
+## Error Handling
+
+Errors are reported to the caller.
+
+## Testing Strategy
+
+Unit tests.
+"""
+
+_READY_TASKS = """# Implementation Plan
+
+## Tasks
+
+- [ ] 1. Build the answering module
+  - _Requirements: 1.1_
+"""
+
+
+def _write_ready_documents(spec_dir: Path) -> None:
+    """Write a document trio the engine's format rules accept."""
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / "requirements.md").write_text(_READY_REQUIREMENTS, encoding="utf-8")
+    (spec_dir / "design.md").write_text(_READY_DESIGN, encoding="utf-8")
+    (spec_dir / "tasks.md").write_text(_READY_TASKS, encoding="utf-8")
+    (spec_dir / ".config.kiro").write_text(
+        json.dumps({"specId": spec_dir.name, "specType": "feature"}), encoding="utf-8"
+    )
+
+
+def _approve_every_gate(name: str, meta: dict) -> None:
+    """Approve the whole document plan through the app's OWN approval writer.
+
+    Deliberately not by inserting approval rows: a fixture that wrote the table
+    directly would keep passing if the app's approval path broke, and these tests
+    depend on that path being the thing that opens the gate.
+    """
+    for gate in ("requirements", "design", "tasks"):
+        outcome = routes._record_gate_approval(name, meta, gate, actor="tester")
+        assert outcome is not None and outcome.ok, (
+            f"the {gate} gate could not be approved: "
+            f"{[str(r) for r in outcome.reasons] if outcome else 'engine cannot address the spec'}"
+        )
+
+
+def _ready_spec(tmp_path: Path, name: str = "s", **extra) -> tuple[Path, dict]:
+    """A spec on disk, indexed, with every gate approved. Returns (spec_dir, meta).
+
+    The caller still saves the index it wants; this returns the metadata so a test
+    can add its own fields.
+    """
+    working_dir = tmp_path / "wd"
+    spec_dir = working_dir / ".kiro" / "specs" / name
+    _write_ready_documents(spec_dir)
+    meta = {
+        "spec_dir": str(spec_dir),
+        "working_dir": str(working_dir),
+        "spec_type": "feature",
+        **extra,
+    }
+    _approve_every_gate(name, meta)
+    return spec_dir, meta
+
+
 # ── route set (builtin contract) ─────────────────────────────────────────────
 
 
@@ -144,6 +260,8 @@ def test_register_routes_wires_expected_set(tmp_path, monkeypatch):
         ("GET", f"{_BASE}/specs/{{name}}"),
         ("GET", f"{_BASE}/specs/{{name}}/messages"),
         ("POST", f"{_BASE}/specs/{{name}}/message"),
+        ("POST", f"{_BASE}/specs/{{name}}/approve"),
+        ("POST", f"{_BASE}/specs/{{name}}/advance"),
         ("POST", f"{_BASE}/specs/{{name}}/handoff"),
         ("POST", f"{_BASE}/specs/{{name}}/execute"),
         ("POST", f"{_BASE}/specs/{{name}}/stop"),
@@ -1392,9 +1510,12 @@ async def test_handoff_refuses_when_authorization_is_unavailable(tmp_path, monke
     and no SEL audit, exactly when the enforcing machinery was unavailable."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "s"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index({"s": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}})
+    _approve_every_gate('s', routes._load_index()['s'])
 
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append("x"))
@@ -1428,9 +1549,12 @@ async def test_handoff_refuses_when_authorization_raises(tmp_path, monkeypatch):
     returning an error string."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "s"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index({"s": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}})
+    _approve_every_gate('s', routes._load_index()['s'])
 
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append("x"))
@@ -2824,11 +2948,14 @@ async def test_handoff_unwinds_when_the_index_commit_raises(tmp_path, monkeypatc
     at all -- and still no dispatch, no slot and no "executing" state."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "boom"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index(
         {"boom": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}}
     )
+    _approve_every_gate('boom', routes._load_index()['boom'])
 
     removed: list[str] = []
     dispatched: list[str] = []
@@ -2986,11 +3113,14 @@ async def test_failed_handoff_keeps_a_pre_existing_conversation(tmp_path, monkey
     handoff never owned. Only a slot this request created may be torn down."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "chatty"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index(
         {"chatty": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}}
     )
+    _approve_every_gate('chatty', routes._load_index()['chatty'])
 
     class _Loop:
         id = "loop-armed"
@@ -4360,8 +4490,10 @@ async def test_second_handoff_is_refused_while_executing(tmp_path, monkeypatch):
     immediately -- so the run the user stopped carried on. The second handoff is
     now refused BEFORE any side effect."""
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "busy"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append("turn"))
 
@@ -4394,6 +4526,7 @@ async def test_second_handoff_is_refused_while_executing(tmp_path, monkeypatch):
         # (the autouse fixture points elsewhere until then).
         client = _make_client(monkeypatch, tmp_path)
         routes._save_index(index)
+        _approve_every_gate("busy", routes._load_index()["busy"])
         slot = types.SimpleNamespace(
             key=routes._slot_key("busy"), _app=routes.APP_NAME, running=slot_running,
             project="", messages=[], _titled=True,
@@ -4493,12 +4626,15 @@ async def test_authorization_failure_reverts_the_recorded_execution_state(tmp_pa
     means a refused authorization must now revert what was recorded."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "nope"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index(
         {"nope": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd"),
                   "slot_key": "spec-builder-nope-1234abcd"}}
     )
+    _approve_every_gate('nope', routes._load_index()['nope'])
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append("x"))
 
@@ -4554,11 +4690,14 @@ async def test_deletion_during_authorization_removes_the_armed_loop(tmp_path, mo
     re-verification catches that and removes it."""
     client = _make_client(monkeypatch, tmp_path)
     spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "gone"
-    spec_dir.mkdir(parents=True)
-    (spec_dir / "tasks.md").write_text("- [ ] task")
+    # The engine gates execution, so the documents have to be ones it permits
+    # to build: written, format-valid and approved. This test is about what
+    # happens AFTER that gate.
+    _write_ready_documents(spec_dir)
     routes._save_index(
         {"gone": {"spec_dir": str(spec_dir), "working_dir": str(tmp_path / "wd")}}
     )
+    _approve_every_gate('gone', routes._load_index()['gone'])
     removed: list[str] = []
     dispatched: list[str] = []
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append("x"))
