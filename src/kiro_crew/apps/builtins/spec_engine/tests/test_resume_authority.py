@@ -75,9 +75,22 @@ from kiro_crew.apps.builtins.spec_engine.engine.watch.dispatch import (
     ClassEvidence,
     RunSeed,
     SubmitterClass,
+    dispatch_source,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.watch.items import WatchedItem
 
+from .test_intake_screening import INJECTION_BODY
+from .test_intake_screening import SOURCE as SCREENED_SOURCE
+from .test_intake_screening import (
+    SuspectProvider,
+    _AllowAll,
+    _item,
+    _polled,
+    _screener,
+    _Starter,
+    _tree,
+    _write_config,
+)
 from .test_phases import SPEC_NAME, approve_gates, write_spec
 
 SOURCE = "tracker"
@@ -235,7 +248,9 @@ class TestTheRowIsTheAuthority:
         self, store: StateStore, ref: SpecRef
     ) -> None:
         record = admit(store, ref, level="execution")
-        rewritten = store.update_run(RUN, detail={DETAIL_SUBMITTER_CLASS: "owner", DETAIL_SPEC_TYPE: "epic"})
+        rewritten = store.update_run(
+            RUN, detail={DETAIL_SUBMITTER_CLASS: "owner", DETAIL_SPEC_TYPE: "epic"}
+        )
         assert record.detail[DETAIL_SUBMITTER_CLASS] == "member"
 
         authority = authority_for(rewritten)
@@ -279,9 +294,11 @@ class TestTheDetailKeysMatchTheWriter:
     def test_the_quarantine_key_is_the_one_the_screener_writes(self) -> None:
         # The screener imports this constant rather than spelling the key again,
         # so the assertion is that it did not go back to a literal.
-        source = Path(
-            resume_module.__file__
-        ).parent.joinpath("watch", "screening.py").read_text(encoding="utf-8")
+        source = (
+            Path(resume_module.__file__)
+            .parent.joinpath("watch", "screening.py")
+            .read_text(encoding="utf-8")
+        )
         assert f'"{DETAIL_SCREENING_QUARANTINED}"' not in source
         assert "DETAIL_SCREENING_QUARANTINED" in source
 
@@ -448,6 +465,50 @@ class TestTheAuthorityRendersForASurface:
         assert isinstance(authority, ResumeAuthority)
 
 
+class TestTheRowTheScreenerWroteIsTheRowTheGateReads:
+    def test_a_real_quarantine_write_reconstructs_as_an_authoring_authority(
+        self, tmp_path: Path
+    ) -> None:
+        """Writer and reader, end to end, with nothing standing in for either.
+
+        The dispatch runs with an integration grid and a provider that suspects
+        the item, so the row is written by the screener itself rather than by this
+        test's idea of what the screener writes. A rename on either side of the
+        detail keys, or a reader that consulted configuration, lands here.
+        """
+        tree = _tree(tmp_path)
+        state = StateStore(root=tmp_path / "screened")
+        config = _write_config(tmp_path, tree)
+
+        starter = _Starter()
+        dispatch_source(
+            state,
+            config,
+            _polled(_item(body=INJECTION_BODY)),
+            gate=_AllowAll(),
+            start=starter,
+            screener=_screener(config, state, SuspectProvider()),
+        )
+
+        seed = starter.seeds[0]
+        record = state.get_run(seed.run_id)
+        assert record is not None
+        authority = authority_for(record)
+
+        assert authority.quarantined is True
+        assert authority.level is AutonomyLevel.AUTHORING
+        assert authority.decision.execution_is_human_reserved
+        # And the grid really did say integration, so the cap is the row's doing.
+        assert (
+            AutonomyPolicy.from_store(config)
+            .resolve(
+                source=SCREENED_SOURCE, spec_type="bugfix", submitter_class=LEAST_TRUSTED_CLASS
+            )
+            .level
+            is AutonomyLevel.INTEGRATION
+        )
+
+
 #: Rungs the ladder knows, plus the shapes a hand-edited or older row arrives as.
 _STORED = st.sampled_from([level.value for level in AutonomyLevel] + ["", "root", "INTEGRATION"])
 
@@ -485,7 +546,9 @@ def test_a_reconstructed_authority_never_exceeds_what_the_row_recorded(
     authority = authority_for(record)
 
     recognised = [
-        AutonomyLevel(raw) for raw in (column, mirrored) if raw in {lv.value for lv in AutonomyLevel}
+        AutonomyLevel(raw)
+        for raw in (column, mirrored)
+        if raw in {lv.value for lv in AutonomyLevel}
     ]
     if quarantined:
         assert authority.level is AutonomyLevel.AUTHORING
