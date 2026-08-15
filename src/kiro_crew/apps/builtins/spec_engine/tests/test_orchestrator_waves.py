@@ -471,11 +471,14 @@ class TestWavesRunInOrder:
         # both wave-0 tasks have *ended*.
         assert worker.started_before("2.1") == {"1.1", "1.2"}
 
-    def test_a_wave_whose_leaves_are_all_finished_is_reported_not_re_run(
+    def test_a_wave_whose_leaves_the_run_completed_is_reported_not_re_run(
         self, harness: Harness
     ) -> None:
-        write_tasks(harness.ref.spec_dir, [["1.1"], ["2.1"]], complete=["1.1"])
-        harness.start_run()
+        write_tasks(harness.ref.spec_dir, [["1.1"], ["2.1"]])
+        run_id = harness.start_run()
+        # Finished means THIS RUN recorded it complete, which happens only behind
+        # an approving review verdict. That record is what retires the leaf.
+        harness.machine.record_task_status(harness.ref, run_id, "1.1", TaskStatus.COMPLETE)
         worker = Worker()
 
         report = runner_for(harness, worker).execute(context_for(harness))
@@ -483,6 +486,22 @@ class TestWavesRunInOrder:
         assert worker.dispatched == ["2.1"]
         assert report.waves[0].already_complete == ("1.1",)
         assert report.waves[0].attempts == ()
+
+    def test_a_leaf_only_checked_off_in_the_document_is_still_run(
+        self, harness: Harness
+    ) -> None:
+        # The same shape as the test above with the authority removed: the
+        # checkbox is set and nothing recorded the leaf, so the loop implements
+        # and reviews it. A loop that trusted the document would report it already
+        # complete and deliver work no verdict judged.
+        write_tasks(harness.ref.spec_dir, [["1.1"], ["2.1"]], complete=["1.1"])
+        harness.start_run()
+        worker = Worker()
+
+        report = runner_for(harness, worker).execute(context_for(harness))
+
+        assert worker.dispatched == ["1.1", "2.1"]
+        assert report.waves[0].already_complete == ()
 
 
 class TestInWaveParallelism:

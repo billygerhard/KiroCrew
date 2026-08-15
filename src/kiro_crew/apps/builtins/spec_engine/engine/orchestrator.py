@@ -1139,9 +1139,11 @@ class WaveRunner:
     def _pending(self, wave: Wave) -> tuple[str, ...]:
         """The wave's leaves that are not already finished, in schedule order.
 
-        Read per wave rather than once, because a leaf checked off in the
-        document while the previous wave ran is finished work either way, and the
-        completed set already merges the run's own record with the checkbox.
+        Read per wave rather than once, because a leaf this run completed while
+        the previous wave was in flight is finished work and must not be handed
+        out again. Finished means the run recorded it complete after an approving
+        verdict: the checkbox in the document is not consulted, here or in
+        :meth:`~..runs.RunMachine.completed_tasks`, because nothing attributes it.
         """
         complete = set(self._machine.completed_tasks(self._ref, self._run_id))
         return tuple(task for task in wave.tasks if task not in complete)

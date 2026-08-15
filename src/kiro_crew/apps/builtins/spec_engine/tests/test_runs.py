@@ -730,16 +730,50 @@ class TestResume:
         assert point.completed_tasks == ("1", "2")
         assert point.reason
 
-    def test_a_leaf_checked_off_in_the_document_counts_as_complete(
+    def test_a_leaf_checked_off_in_the_document_is_not_complete(
         self, machine: RunMachine, ref: SpecRef
     ) -> None:
-        # The checkbox is written by the IDE and by people too, so honouring only
-        # the engine's own record would re-run work someone already finished.
+        # TASKS_DOC ships leaf 1 checked off, written by nobody the engine can
+        # name: the IDE writes that box, a person writes it, and so does anything
+        # with write access to the spec directory -- including the run's own agent
+        # turn. Honouring it retired a leaf no review verdict ever judged.
         _write_tasks(ref, TASKS_DOC)
         machine.create(ref, run_id="run-1")
         drive(machine, ref, "run-1", RunState.AUTHORING, RunState.EXECUTING)
-        assert machine.completed_tasks(ref, "run-1") == ("1",)
-        assert machine.next_incomplete_task(ref, "run-1") == "2"
+        assert machine.completed_tasks(ref, "run-1") == ()
+        assert machine.next_incomplete_task(ref, "run-1") == "1"
+
+    def test_a_checkbox_cannot_retire_the_leaf_a_verdict_has_not_approved(
+        self, machine: RunMachine, ref: SpecRef
+    ) -> None:
+        # The review gate stated from the resume side: leaf 2 is recorded complete
+        # (which only an approving verdict produces) and leaf 1 is only checked
+        # off, so the resume point offers leaf 1 and counts leaf 2 alone.
+        _write_tasks(ref, TASKS_DOC)
+        machine.create(ref, run_id="run-1")
+        drive(machine, ref, "run-1", RunState.AUTHORING, RunState.EXECUTING)
+        machine.record_task_status(ref, "run-1", "2", TaskStatus.COMPLETE)
+
+        point = machine.resume_point(ref, "run-1")
+
+        assert point.completed_tasks == ("2",)
+        assert point.task == "1"
+
+    def test_the_resume_point_and_the_loop_agree_on_what_is_complete(
+        self, machine: RunMachine, ref: SpecRef
+    ) -> None:
+        # One authority, asked two ways: next_incomplete_task derives from
+        # completed_tasks, so a second predicate cannot drift from it and offer a
+        # leaf the resume point reported finished.
+        _write_tasks(ref, TASKS_DOC)
+        machine.create(ref, run_id="run-1")
+        drive(machine, ref, "run-1", RunState.AUTHORING, RunState.EXECUTING)
+        machine.record_task_status(ref, "run-1", "1", TaskStatus.COMPLETE)
+
+        completed = machine.completed_tasks(ref, "run-1")
+        offered = machine.next_incomplete_task(ref, "run-1")
+
+        assert offered is not None and offered not in completed
 
     def test_a_failed_leaf_is_incomplete_and_offered_again(
         self, machine: RunMachine, ref: SpecRef
@@ -747,6 +781,7 @@ class TestResume:
         _write_tasks(ref, TASKS_DOC)
         machine.create(ref, run_id="run-1")
         drive(machine, ref, "run-1", RunState.AUTHORING, RunState.EXECUTING)
+        machine.record_task_status(ref, "run-1", "1", TaskStatus.COMPLETE)
         machine.record_task_status(ref, "run-1", "2", TaskStatus.FAILED)
         assert machine.next_incomplete_task(ref, "run-1") == "2"
 
@@ -855,13 +890,14 @@ class TestResume:
         _write_tasks(ref, TASKS_DOC)
         machine.create(ref, run_id="run-1")
         drive(machine, ref, "run-1", RunState.AUTHORING, RunState.EXECUTING)
+        machine.record_task_status(ref, "run-1", "1", TaskStatus.COMPLETE)
         machine.transition(ref, "run-1", RunState.STALLED)
         machine.resume(ref, "run-1", initiator="ada")
         resumed = [event for event in audit.read(ref) if event.event == runs.RUN_RESUMED_EVENT]
         assert len(resumed) == 1
         assert resumed[0].detail is not None
         assert resumed[0].detail["granularity"] == "task"
-        # Task 1 is checked off in the document, so the run picks up at task 2.
+        # Task 1 is recorded complete on the run, so it picks up at task 2.
         assert resumed[0].detail["target"] == "2"
 
     def test_a_missing_tasks_document_yields_no_task_to_resume_at(

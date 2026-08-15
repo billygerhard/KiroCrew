@@ -1040,33 +1040,45 @@ class RunMachine:
     def completed_tasks(self, ref: SpecRef, run_id: str) -> tuple[str, ...]:
         """Leaf tasks a resumed run must not run again, in document order.
 
-        A leaf counts as complete when the run recorded it complete **or** the
-        tasks document has it checked off. Both are records of the same fact
-        written by different hands — the engine's own bookkeeping, and the
-        checkbox the IDE and a human also write — and honouring only one of them
-        re-runs paid work whenever the other is the one that was updated.
+        A leaf counts as complete when **this run recorded it complete**, and on
+        no other evidence. The status is written by the execution loop only after
+        an approving review verdict, so the recorded status is that verdict's
+        attribution: one path to a complete leaf, and it goes through the review.
+
+        A checkbox in ``tasks.md`` carries no attribution whatsoever. The IDE
+        writes it, a person writes it, and so does anything that can write into
+        the spec directory — including the run's own agent turn. Counting it here
+        meant a checkbox reaching the canonical spec directory retired a leaf no
+        verdict ever judged, which is the per-leaf review gate skipped by editing
+        a document.
+
+        The cost of ignoring it is real and is the cheaper half of the trade: a
+        leaf somebody finished by hand is offered again and paid for twice. Work
+        re-run is recoverable; a change delivered with no review behind it is not.
         """
-        record = self.get(run_id)
-        statuses = task_statuses(record)
+        statuses = task_statuses(self.get(run_id))
         return tuple(
             leaf.number
             for leaf in self._leaves(ref)
-            if leaf.complete or statuses.get(leaf.number) is TaskStatus.COMPLETE
+            if statuses.get(leaf.number) is TaskStatus.COMPLETE
         )
 
     def next_incomplete_task(self, ref: SpecRef, run_id: str) -> str | None:
         """The leaf a resumed execution picks up at, or ``None`` when none is left.
 
-        Document order, not wave order: the first leaf that is neither recorded
-        complete nor checked off. A failed leaf is incomplete, so it is offered
-        again and the retry limit — not this method — decides whether it is tried.
+        Document order, not wave order: the first leaf this run has not recorded
+        complete. A failed leaf is incomplete, so it is offered again and the
+        retry limit — not this method — decides whether it is tried.
+
+        Derived from :meth:`completed_tasks` rather than re-deciding what complete
+        means, so there is one answer to that question. A second predicate here is
+        how the two came to disagree in the first place: the resume point would
+        report a leaf complete while the loop handed it out again, or the reverse.
         """
-        record = self.get(run_id)
-        statuses = task_statuses(record)
+        complete = set(self.completed_tasks(ref, run_id))
         for leaf in self._leaves(ref):
-            if leaf.complete or statuses.get(leaf.number) is TaskStatus.COMPLETE:
-                continue
-            return leaf.number
+            if leaf.number not in complete:
+                return leaf.number
         return None
 
     def _leaves(self, ref: SpecRef) -> tuple[structure.Task, ...]:

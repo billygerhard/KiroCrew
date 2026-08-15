@@ -10,7 +10,10 @@ looks like a corrupt row rather than a machine that let it happen.
 **Resume never skips or repeats.** Whatever mix of leaf completions a run
 persisted, the leaf it resumes at is incomplete, and no completed leaf is ever
 offered. Skipping an incomplete leaf reports success for work nobody did;
-offering a complete one bills a model turn twice.
+offering a complete one bills a model turn twice. Complete means *this run
+recorded it complete* — the generated checkboxes vary independently of the
+recorded set, so a resume path that read the document instead would be caught
+here rather than only in the scripted case.
 """
 
 from __future__ import annotations
@@ -113,7 +116,10 @@ def test_resume_offers_an_incomplete_leaf_and_never_a_complete_one(
         machine.record_task_status(ref, "run-1", leaf, TaskStatus.COMPLETE)
 
     point = machine.resume_point(ref, "run-1")
-    complete = recorded | checked
+    # The run's own record is the whole authority. The generated checkboxes vary
+    # independently of it precisely so that a resume path reading the document
+    # would fail this: a leaf checked but never recorded must still be offered.
+    complete = recorded
 
     assert set(point.completed_tasks) == complete
     if complete == set(_LEAVES):
