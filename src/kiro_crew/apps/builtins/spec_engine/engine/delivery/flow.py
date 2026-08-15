@@ -1065,6 +1065,12 @@ class DeliveryPipeline:
                 declared_gates=declared,
             )
         self._post_submitted(context, submit)
+        # Everything after submit runs with the artifact's address available. A
+        # post-submit gate is CI on the review artifact and a link-artifact
+        # writeback names it, so the one place that learns the address is the one
+        # that raised it -- carrying it forward here rather than re-deriving it
+        # per consumer is what keeps them naming the same artifact.
+        context = self._submitted_context(context, submit)
 
         post_submit = tuple(gate for gate in gates if gate.runs_at(GATE_POSITION_POST_SUBMIT))
         attempts.extend(self._verify(context, gates=post_submit))
@@ -1086,7 +1092,7 @@ class DeliveryPipeline:
         publish = self._run_stage(PUBLISH_STAGE, context)
         stages.append(publish)
         remaining.remove(PUBLISH_STAGE)
-        addresses = _deployment_addresses(publish)
+        addresses = _addresses(publish)
         if addresses:
             self._record(EVENT_PUBLISHED, {"addresses": list(addresses)})
             # Recorded whether or not publish exited zero: a command that
@@ -1477,10 +1483,26 @@ class DeliveryPipeline:
         happened. Best-effort like the rest of the notice path -- the observer is
         backed by the feedback poster, which records a failure without raising, so
         a tracker refusal cannot unwind a delivery that already submitted.
+
+        The observer is handed the context carrying the artifact's address, since
+        a writeback that announces a submission is the caller that most needs to
+        link to what was submitted.
         """
         if self._on_submitted is None or not submit.executed:
             return
-        self._on_submitted(context)
+        self._on_submitted(self._submitted_context(context, submit))
+
+    def _submitted_context(self, context: RunContext, submit: StageResult) -> RunContext:
+        """*context* with the review artifact's address on it, when submit printed one.
+
+        Left untouched when it printed none, so the variable stays absent and a
+        command referencing it refuses rather than running with a blank argument
+        where a link belongs.
+        """
+        url = _artifact_url(submit)
+        if not url or url == context.review_url:
+            return context
+        return replace(context, review_url=url)
 
     def _record_stage(self, result: StageResult) -> None:
         self._record(
@@ -1631,15 +1653,21 @@ def _gate_output(result: StageResult) -> str:
     return text[:MAX_GATE_OUTPUT_CHARS] + TRUNCATION_NOTICE
 
 
-def _deployment_addresses(publish: StageResult) -> tuple[str, ...]:
-    """Extract deployment addresses from a publish stage's captured output.
+def _addresses(result: StageResult) -> tuple[str, ...]:
+    """Extract http(s) addresses from a stage's captured output.
 
     Both streams are scanned: plenty of deployment tools print the address they
     created to stderr alongside their progress, and an address a human needs is
     not less useful for having arrived on the other stream.
+
+    One extractor for both callers that need one — the publish stage's deployment
+    addresses and the submit stage's review artifact — because a second one would
+    be a second answer to how much of a line written by a program the engine does
+    not control counts as an address, and only one of the two would carry the
+    count and length bounds.
     """
     found: dict[str, None] = {}
-    for command in publish.commands:
+    for command in result.commands:
         for stream in (command.stdout, command.stderr):
             for match in _ADDRESS_PATTERN.finditer(stream or ""):
                 address = match.group(0).rstrip(_ADDRESS_TRAILING)
@@ -1649,3 +1677,22 @@ def _deployment_addresses(publish: StageResult) -> tuple[str, ...]:
                 if len(found) >= MAX_DEPLOYMENT_ADDRESSES:
                     return tuple(found)
     return tuple(found)
+
+
+def _artifact_url(submit: StageResult) -> str:
+    """The review artifact's address, as the submit stage printed it.
+
+    The first address in the stage's output, because that is what a review-raising
+    command prints: ``gh pr create`` and ``glab mr create`` both write the URL of
+    the artifact they just created. Empty when the stage printed none, which keeps
+    the run context field absent rather than filled with something else standing
+    in for a link.
+
+    Not trusted text, and treated the same way a deployment address is: it is
+    matched by a narrow http(s) pattern, length-bounded, and reaches a command as
+    exactly one argument.
+    """
+    if not submit.executed:
+        return ""
+    addresses = _addresses(submit)
+    return addresses[0] if addresses else ""

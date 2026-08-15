@@ -20,10 +20,18 @@ lists run through the delivery executor; nothing here composes text with a model
 Tracker text can reach an *argument* position -- ``review_title`` carries it, and
 a feedback command may legitimately quote it -- but never the program position,
 which ``CommandTemplate.parse`` requires to be literal, and never a shell, because
-a value becomes exactly one argv element. Echoing that text onward is a separate
-gate this module does not implement: requirement 36.7 restricts which submitter
-classes may be echoed, and task 8.7 owns it. Deriving a class is not gating an
-echo.
+a value becomes exactly one argv element.
+
+**The echo gate is not here, and must not be added here.** Requirement 36.7
+restricts which submitter classes may be echoed, and the decision is made where
+an element's text becomes a run context field
+(:func:`~.echo.echoed_context`). A gate in front of :func:`post_feedback` would
+look like it covered echoing and would not: element text reaches an argument
+through :meth:`~..delivery.stages.StageExecutor.run_labelled`, which this module
+shares with every delivery stage command and every quality gate, and
+``review_title`` / ``review_summary`` are engine-owned variables all of them can
+reference. By the time a context arrives here the decision has already been made
+and the refused text is not on it.
 """
 
 from __future__ import annotations
@@ -98,7 +106,15 @@ AUDIT_ITEM_FEEDBACK = "item.feedback"
 #: every ``{name}`` here is a real :data:`~..delivery.variables.RUN_CONTEXT_VARIABLES`
 #: name present at that lifecycle point: ``item_url`` / ``item_id`` for the
 #: triggering item at every event, ``branch_name`` only from delivery onward,
-#: ``review_title`` only once a review artifact exists.
+#: ``review_title`` only once a review artifact exists, and ``review_url`` only at
+#: ``delivery_submitted`` and after, because the delivery pipeline learns the
+#: artifact's address from the submit command that raised it.
+#:
+#: **The link-artifact operation names the artifact, not the branch.** Requirement
+#: 36.1 names linking the review artifact among the operations these presets
+#: demonstrate, and a comment naming the branch a change was pushed from is not a
+#: link to the artifact -- the branch was a stand-in from before a run-context
+#: variable carried the address.
 FEEDBACK_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
     "github": {
         "claimed": (
@@ -113,7 +129,7 @@ FEEDBACK_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
         ),
         "delivery_submitted": (
             ("gh", "issue", "comment", "{item_url}", "--body",
-             "Delivery submitted from branch {branch_name}."),
+             "Delivery submitted for review: {review_url}"),
         ),
         "completed": (
             ("gh", "issue", "comment", "{item_url}", "--body", "Spec run completed."),
@@ -142,7 +158,7 @@ FEEDBACK_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
         ),
         "delivery_submitted": (
             ("glab", "issue", "note", "{item_id}", "--message",
-             "Delivery submitted from branch {branch_name}."),
+             "Delivery submitted for review: {review_url}"),
         ),
         "completed": (
             ("glab", "issue", "note", "{item_id}", "--message", "Spec run completed."),

@@ -35,7 +35,8 @@ _ITEM_VARS = {"item_url", "item_id"}
 _VARS_AVAILABLE_AT = {
     "claimed": _ITEM_VARS,
     "awaiting_review": _ITEM_VARS | {"review_title", "review_summary"},
-    "delivery_submitted": _ITEM_VARS | {"branch_name", "review_title", "review_summary"},
+    "delivery_submitted": _ITEM_VARS
+    | {"branch_name", "review_title", "review_summary", "review_url"},
     "completed": _ITEM_VARS | {"branch_name", "review_title", "review_summary"},
     "failed": _ITEM_VARS | {"branch_name", "review_title", "review_summary"},
     "refused": _ITEM_VARS,
@@ -149,6 +150,21 @@ class TestPresetShape:
         assert any("--add-label" in j for j in joined)  # set label
         assert any("issue close" in j for j in joined)  # set state
         assert any("--add-assignee" in j for j in joined)  # assign
+
+    def test_the_bundled_presets_link_the_review_artifact_rather_than_a_branch(self) -> None:
+        """Requirement 36.1's link-artifact operation, in both bundled presets.
+
+        A comment naming the branch a change was pushed from is not a link to the
+        artifact, and the branch was what these presets said before a run-context
+        variable carried the artifact's address. Asserted for both hosts, and
+        asserted as the absence of the stand-in too: a preset that referenced the
+        URL somewhere while still announcing the branch would leave the reading
+        that a branch mention is the link.
+        """
+        for host in FEEDBACK_PRESET_HOSTS:
+            submitted = [" ".join(argv) for argv in FEEDBACK_PRESETS[host]["delivery_submitted"]]
+            assert any("{review_url}" in j for j in submitted), host
+            assert not any("{branch_name}" in j for j in submitted), host
 
 
 class TestEnableIsConfigurationOnly:
