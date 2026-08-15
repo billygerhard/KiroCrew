@@ -296,7 +296,7 @@ def echoed_context(
             populated[field] = ""
             continue
         populated[field] = text
-    if not populated:
+    if not populated and not omitted:
         return EchoedContext(context=context)
     echoed = tuple(name for name, value in populated.items() if value)
     return EchoedContext(
