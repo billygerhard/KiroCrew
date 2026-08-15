@@ -1,7 +1,7 @@
-"""The operator-facing engine surfaces: configuration, spend, and the stop control.
+"""The operator-facing engine surfaces: configuration, spend, the queue, and the stop control.
 
-Three read models and two writes, each a thin relay onto an engine object that
-already owns the answer:
+Three read models and the writes that act on them, each a thin relay onto an
+engine object that already owns the answer:
 
 * **configuration.** Every setting's effective value with the origin that
   produced it, from :meth:`ConfigStore.effective_settings`. This module does NOT
@@ -12,7 +12,8 @@ already owns the answer:
   the HTTP envelope around it.
 * **the Review_Queue with per-run spend.** Relayed from
   :meth:`ReviewQueue.snapshot`, whose ``QueueEntry`` already carries
-  ``cost_credits``. Nothing here builds a second projection of a run: two
+  ``cost_credits`` and whose ``grouped()`` already groups by run state. Nothing
+  here builds a second projection of a run, or a second grouping of one: two
   projections of one run drift, and an operator cannot tell which is current.
 * **the kill switch.** Read and written through
   :func:`engage_kill_switch` / :func:`release_kill_switch`, which park the runs
@@ -24,10 +25,19 @@ operator-confirmed, which is correct for a panel a human is looking at and is
 also why nothing here needs its own fence: the engine refuses an invalid
 document, and the config-only paths that an unconfirmed surface may not write are
 the engine's rule, applied identically to this one.
+
+**The queue actions are privileged.** A feedback release is the human gate on
+quarantined content; a re-dispatch overrides the suppression that stopped an item
+from being worked twice; a cleanup deletes a recorded tree. So each one
+authenticates, takes its actor from that authenticated session rather than from
+its request body, and passes the engine's real audit log -- which is what makes
+the engine's own refusal (a release into a queue that records to no log) apply
+here instead of being routed around.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -35,6 +45,7 @@ from aiohttp import web
 
 from ...spec_engine.engine import review_queue as engine_review_queue
 from ...spec_engine.engine import runs as engine_runs
+from ...spec_engine.engine import state as engine_state
 from ...spec_engine.engine.budget import switch as engine_switch
 from ...spec_engine.engine.budget.killswitch import (
     engage_kill_switch,
@@ -255,10 +266,13 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
 
 
 async def handle_get_queue(request: web.Request) -> web.Response:
-    """GET the Review_Queue, each row carrying the credits its run consumed.
+    """GET the Review_Queue: every run waiting on a person, flat and grouped.
 
     Relayed from the engine's own snapshot, so the credits an operator reads here
-    are the ones the ceiling and the kill switch account against.
+    are the ones the ceiling and the kill switch account against, and the run
+    state grouping is :meth:`QueueSnapshot.grouped`'s rather than a second
+    grouping assembled per surface -- two groupings of one run drift, and an
+    operator cannot tell which is current.
     """
     from . import routes
 
@@ -266,12 +280,214 @@ async def handle_get_queue(request: web.Request) -> web.Response:
     project = request.query.get("project") or None
     machine = engine_runs.RunMachine(store, _config_store(), audit=audit_log)
     snapshot = engine_review_queue.ReviewQueue(machine).snapshot(project=project)
-    entries = [entry.to_json_object() for entry in snapshot]
+    payload = snapshot.to_json_object()
+    payload["total_credits"] = round(sum(entry.cost_credits for entry in snapshot), 4)
+    return web.json_response(payload)
+
+
+def _review_queue() -> engine_review_queue.ReviewQueue:
+    """The engine's Review_Queue over the live data home, WITH the audit log.
+
+    The audit log is not optional decoration here. Every action below is a
+    privileged manual override, and the engine refuses a feedback release
+    outright when its run machine records to nowhere -- so a queue built without
+    the log would not silently skip the trail, it would fail. Passing it is how
+    the trail gets written, and there is no branch here that proceeds without it.
+    """
+    from . import routes
+
+    store, audit_log = routes._engine_store()
+    machine = engine_runs.RunMachine(store, _config_store(), audit=audit_log)
+    return engine_review_queue.ReviewQueue(machine)
+
+
+async def _action_request(request: web.Request) -> tuple[dict, str] | web.Response:
+    """The body and the ACTOR for one queue action, or a refusal.
+
+    The actor is the authenticated session, read from the request the middleware
+    populated. It is never taken from the body: a privileged override that let
+    its caller name the actor would record whoever the caller typed, which is the
+    same as recording nothing. This mirrors the approval writer's rule, for the
+    same reason.
+    """
+    from . import routes
+
+    if denied := routes._require_auth(request):
+        return denied
+    try:
+        payload = await request.json()
+    except Exception:
+        return _bad_request("bad_json", "request body must be a JSON object")
+    if not isinstance(payload, dict):
+        return _bad_request("bad_json", "request body must be a JSON object")
+    return payload, str(request.get("user") or "")
+
+
+def _text_field(payload: dict, field: str) -> str:
+    return str(payload.get(field, "")).strip()
+
+
+def _int_field(payload: dict, field: str) -> int | None:
+    """*field* as an int, or ``None`` when it is absent or not one.
+
+    A bool is refused: ``True`` is an ``int`` in Python and a workspace id of
+    ``True`` would resolve to row 1.
+    """
+    value = payload.get(field)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+async def handle_post_release_feedback(request: web.Request) -> web.Response:
+    """Release one held reviewer comment for a queue row.
+
+    The human gate on quarantined content, so the comment IDENTIFIER is all that
+    crosses this boundary -- the comment text is someone else's data and this
+    route must not become a second place it is copied to. Refused when the
+    engine's queue records to no audit log, because a release with no trail is
+    what lets held content drive a dispatch with nothing saying who allowed it.
+    """
+    prepared = await _action_request(request)
+    if isinstance(prepared, web.Response):
+        return prepared
+    payload, actor = prepared
+    project = _text_field(payload, "project")
+    spec = _text_field(payload, "spec")
+    run_id = _text_field(payload, "run_id")
+    comment_id = _text_field(payload, "comment_id")
+    missing = [
+        name
+        for name, value in (
+            ("project", project),
+            ("spec", spec),
+            ("run_id", run_id),
+            ("comment_id", comment_id),
+        )
+        if not value
+    ]
+    if missing:
+        return _bad_request(
+            "field_required",
+            "releasing a held comment needs " + ", ".join(missing),
+        )
+    ref = engine_state.SpecRef(project=project, name=spec)
+    try:
+        released = await asyncio.to_thread(_run_release, ref, run_id, comment_id, actor=actor)
+    except engine_review_queue.ReviewFeedbackRefused as exc:
+        # The engine's own refusal, reported rather than worked around.
+        return _bad_request("release_refused", str(exc), status=409)
+    except (OSError, ValueError) as exc:
+        return _bad_request("release_failed", str(exc), status=503)
+    logger.info("spec-builder: a held review comment was released from the dashboard")
     return web.json_response(
         {
-            "entries": entries,
-            "total_credits": round(sum(entry.cost_credits for entry in snapshot), 4),
+            "ok": True,
+            # False means nobody held that comment, so a click on a stale row is
+            # answered rather than reported as a release that did not happen.
+            "released": released,
         }
+    )
+
+
+def _run_release(ref: engine_state.SpecRef, run_id: str, comment_id: str, *, actor: str) -> bool:
+    """BLOCKING -- the release itself, off the event loop."""
+    return _review_queue().release_quarantined_feedback(ref, run_id, comment_id, actor=actor)
+
+
+async def handle_post_redispatch(request: web.Request) -> web.Response:
+    """Lift the suppression on one watched item, so the next poll dispatches it."""
+    prepared = await _action_request(request)
+    if isinstance(prepared, web.Response):
+        return prepared
+    payload, actor = prepared
+    source = _text_field(payload, "source")
+    item_id = _text_field(payload, "item_id")
+    generation = _int_field(payload, "generation")
+    if not source or not item_id:
+        return _bad_request("field_required", "a re-dispatch needs source and item_id")
+    if generation is None:
+        return _bad_request(
+            "field_required",
+            "a re-dispatch needs the generation it is lifting, which the queue row "
+            "does not carry",
+        )
+    try:
+        lifted = await asyncio.to_thread(
+            lambda: _review_queue().redispatch_item(source, item_id, generation=generation)
+        )
+    except (OSError, ValueError) as exc:
+        return _bad_request("redispatch_failed", str(exc), status=503)
+    logger.info(
+        "spec-builder: %s requested a manual re-dispatch of a %s item",
+        actor or "an operator",
+        source,
+    )
+    return web.json_response({"ok": True, "lifted": lifted})
+
+
+async def handle_post_clean_workspace(request: web.Request) -> web.Response:
+    """Remove one ledger-recorded workspace: the retry for a kept teardown."""
+    prepared = await _action_request(request)
+    if isinstance(prepared, web.Response):
+        return prepared
+    payload, actor = prepared
+    workspace_id = _int_field(payload, "workspace_id")
+    if workspace_id is None:
+        return _bad_request("field_required", "a cleanup needs the workspace_id to remove")
+    force = payload.get("force") is True
+    try:
+        cleanup = await asyncio.to_thread(
+            lambda: _review_queue().clean_workspace(workspace_id, force=force)
+        )
+    except (OSError, ValueError) as exc:
+        return _bad_request("cleanup_failed", str(exc), status=503)
+    logger.info(
+        "spec-builder: %s asked to clean workspace row %s (force=%s)",
+        actor or "an operator",
+        workspace_id,
+        force,
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            # None from the engine means no ACTIVE row has that id, so a double
+            # click reads as "nothing to do" rather than as a second removal.
+            "removed": cleanup is not None,
+            "cleanup": cleanup.to_json_object() if cleanup is not None else None,
+        }
+    )
+
+
+async def handle_post_teardown_workspaces(request: web.Request) -> web.Response:
+    """Tear down every workspace a run recorded.
+
+    Reports what it KEPT as well as what it removed: a teardown that could not
+    finish leaves a tree or a deployment standing, and calling that a success is
+    how an environment outlives every record of itself.
+    """
+    prepared = await _action_request(request)
+    if isinstance(prepared, web.Response):
+        return prepared
+    payload, actor = prepared
+    run_id = _text_field(payload, "run_id")
+    if not run_id:
+        return _bad_request("field_required", "a teardown needs the run_id to tear down")
+    try:
+        report = await asyncio.to_thread(lambda: _review_queue().teardown_run_workspaces(run_id))
+    except (OSError, ValueError) as exc:
+        return _bad_request("teardown_failed", str(exc), status=503)
+    logger.info(
+        "spec-builder: %s asked to tear down the workspaces of run %s",
+        actor or "an operator",
+        run_id,
+    )
+    return web.json_response(
+        {"ok": True, "complete": report.complete, "report": report.to_json_object()}
     )
 
 
@@ -289,3 +505,9 @@ def register_engine_routes(app: web.Application, base: str, wrap: Any) -> None:
     app.router.add_get(f"{base}/engine/kill-switch", wrap(handle_get_kill_switch))
     app.router.add_post(f"{base}/engine/kill-switch", wrap(handle_post_kill_switch))
     app.router.add_get(f"{base}/engine/queue", wrap(handle_get_queue))
+    # The queue row's actions. Each one is a privileged manual override, so each
+    # is authenticated inside its handler and takes its actor from that session.
+    app.router.add_post(f"{base}/engine/queue/release-feedback", wrap(handle_post_release_feedback))
+    app.router.add_post(f"{base}/engine/queue/redispatch", wrap(handle_post_redispatch))
+    app.router.add_post(f"{base}/engine/queue/clean-workspace", wrap(handle_post_clean_workspace))
+    app.router.add_post(f"{base}/engine/queue/teardown", wrap(handle_post_teardown_workspaces))

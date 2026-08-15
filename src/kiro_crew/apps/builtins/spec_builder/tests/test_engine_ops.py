@@ -25,12 +25,18 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.apps.builtins.spec_builder.backend import routes
+from kiro_crew.apps.builtins.spec_engine.engine import runs as engine_runs
 from kiro_crew.apps.builtins.spec_engine.engine.budget.switch import (
     KILL_SWITCH_FILENAME,
     KillSwitch,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
 from kiro_crew.apps.builtins.spec_engine.engine.config.settings import SETTINGS
+from kiro_crew.apps.builtins.spec_engine.engine.review_queue import ReviewQueue
+from kiro_crew.apps.builtins.spec_engine.engine.runs import RunState
+from kiro_crew.apps.builtins.spec_engine.engine.state import SpecRef
+from kiro_crew.apps.builtins.spec_engine.engine.watch import lifecycle as engine_lifecycle
 
 from .test_routes import _BASE, _make_client
 
@@ -392,6 +398,337 @@ class TestQueueSpendSurface:
             body = await resp.json()
         for entry in body["entries"]:
             assert "cost_credits" in entry
+
+
+class TestQueueGrouping:
+    """The queue reaches a surface grouped by run state, as the ENGINE groups it.
+
+    Asserted against ``QueueSnapshot.grouped()`` opened over the same store, so a
+    handler that assembled its own grouping and disagreed with the engine's would
+    fail here rather than show an operator a second, drifting view of one run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_response_groups_by_run_state(self, monkeypatch, tmp_path, config_root):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(
+                tmp_path,
+                (("run-a", RunState.AWAITING_REVIEW), ("run-b", RunState.HALTED_BUDGET)),
+            )
+            resp = await client.get(f"{_BASE}/engine/queue")
+            assert resp.status == 200
+            body = await resp.json()
+            engine_grouped = {
+                state.value: [entry.run_id for entry in group]
+                for state, group in _queue().snapshot().grouped().items()
+            }
+        assert {
+            state: [entry["run_id"] for entry in group] for state, group in body["grouped"].items()
+        } == engine_grouped
+        assert engine_grouped == {
+            "awaiting_review": ["run-a"],
+            "halted_budget": ["run-b"],
+        }
+        # The flat list is still relayed for the spend table, and the grouping is
+        # the same runs rather than a second query.
+        assert {entry["run_id"] for entry in body["entries"]} == {"run-a", "run-b"}
+        assert ref.name == "example"
+
+    @pytest.mark.asyncio
+    async def test_a_state_with_nothing_waiting_gets_no_group(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            body = await (await client.get(f"{_BASE}/engine/queue")).json()
+        # A permanent empty heading trains an operator to ignore headings, so the
+        # engine omits it and the relay must not re-introduce one.
+        assert list(body["grouped"]) == ["awaiting_review"]
+
+    @pytest.mark.asyncio
+    async def test_a_row_carries_what_a_reviewer_has_to_act_on(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            _hold_comment("run-a", "c-1")
+            body = await (await client.get(f"{_BASE}/engine/queue")).json()
+        row = body["grouped"]["awaiting_review"][0]
+        assert row["gate"] == "requirements"
+        assert row["waiting_on"] == "review"
+        # The COUNT of held comments, which is what the engine's projection
+        # exposes: the ids and the text live behind the watcher, so a queue row
+        # cannot become a second place someone else's comment is copied to.
+        assert row["feedback_quarantined"] == 1
+        assert "c-1" not in json.dumps(row)
+
+
+class TestQueueActions:
+    """The row actions, at the HTTP boundary an operator actually reaches.
+
+    Each is a privileged manual override, so each is asserted for three things:
+    it happened in the ENGINE (read back, not taken from the response), it
+    attributes itself to the authenticated session, and a no-op is answered
+    rather than reported as a change that did not occur.
+    """
+
+    @pytest.mark.asyncio
+    async def test_releasing_a_held_comment_releases_it_in_the_engine(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            _hold_comment("run-a", "c-1")
+            resp = await client.post(
+                f"{_BASE}/engine/queue/release-feedback",
+                json={
+                    "project": ref.project,
+                    "spec": ref.name,
+                    "run_id": "run-a",
+                    "comment_id": "c-1",
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["released"] is True
+            # Read back from the engine: the comment is no longer held.
+            store, _audit = routes._engine_store()
+            record = store.get_run("run-a")
+            assert record is not None
+            assert engine_runs.feedback_quarantined(record) == ()
+
+    @pytest.mark.asyncio
+    async def test_a_release_records_the_authenticated_session_as_its_actor(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            _hold_comment("run-a", "c-1")
+            resp = await client.post(
+                f"{_BASE}/engine/queue/release-feedback",
+                json={
+                    "project": ref.project,
+                    "spec": ref.name,
+                    "run_id": "run-a",
+                    "comment_id": "c-1",
+                    # A body that names its own actor. It must not be believed:
+                    # the release is the human gate on quarantined content, and an
+                    # override that records whoever the caller typed records
+                    # nothing.
+                    "actor": "somebody-else",
+                    "user": "somebody-else",
+                },
+            )
+            assert resp.status == 200
+            entries = _audit_entries(ref)
+        released = [e for e in entries if "release" in str(e.get("event", ""))]
+        assert released, f"no release entry in the audit trail: {entries}"
+        assert released[-1]["initiator"] == "tester"
+
+    @pytest.mark.asyncio
+    async def test_releasing_a_comment_nobody_held_is_answered_not_reported_as_a_release(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            resp = await client.post(
+                f"{_BASE}/engine/queue/release-feedback",
+                json={
+                    "project": ref.project,
+                    "spec": ref.name,
+                    "run_id": "run-a",
+                    "comment_id": "never-held",
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["released"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_release_missing_the_comment_it_names_is_refused(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.post(
+                f"{_BASE}/engine/queue/release-feedback",
+                json={"project": "/p", "spec": "example", "run_id": "run-a"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_a_redispatch_needs_the_generation_the_queue_row_does_not_carry(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.post(
+                f"{_BASE}/engine/queue/redispatch",
+                json={"source": "github", "item_id": "42"},
+            )
+            # Named rather than defaulted: guessing a generation would lift the
+            # suppression on a version of the item nobody asked about.
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_a_redispatch_lifts_the_suppression_the_engine_recorded(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            store, _audit = routes._engine_store()
+            # Claimed the way the dispatcher claims it, through the engine's own
+            # generation key: an override that formatted the generation
+            # differently would report success and release nothing.
+            claimed = engine_lifecycle.generation_key(3)
+            assert store.claim_dispatch("github", "42", generation=claimed) is True
+            resp = await client.post(
+                f"{_BASE}/engine/queue/redispatch",
+                json={"source": "github", "item_id": "42", "generation": 3},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["lifted"] is True
+            # Nothing is claimed any more, so the next poll can dispatch it.
+            assert store.claim_dispatch("github", "42", generation=claimed) is True
+
+    @pytest.mark.asyncio
+    async def test_cleaning_a_workspace_row_that_does_not_exist_is_answered(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.post(
+                f"{_BASE}/engine/queue/clean-workspace", json={"workspace_id": 9999}
+            )
+            assert resp.status == 200
+            body = await resp.json()
+        # None from the engine means no ACTIVE row has that id, so a double click
+        # reads as "nothing to do" rather than as a second removal.
+        assert body["removed"] is False
+        assert body["cleanup"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_workspace_id_that_is_not_a_number_is_refused(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.post(
+                f"{_BASE}/engine/queue/clean-workspace", json={"workspace_id": True}
+            )
+            # True is an int in Python and would resolve to ledger row 1.
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_reports_what_it_kept_as_well_as_what_it_removed(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            _park_runs(tmp_path, (("run-a", RunState.AWAITING_REVIEW),))
+            resp = await client.post(f"{_BASE}/engine/queue/teardown", json={"run_id": "run-a"})
+            assert resp.status == 200
+            body = await resp.json()
+        # A teardown with no ledger rows removes nothing and is complete. The
+        # kept list is reported either way: calling a teardown that left a tree
+        # standing a success is how an environment outlives every record of it.
+        assert body["report"]["run_id"] == "run-a"
+        assert body["report"]["kept"] == []
+        assert body["complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_without_a_run_is_refused(self, monkeypatch, tmp_path, config_root):
+        async with _make_client(monkeypatch, tmp_path) as client:
+            resp = await client.post(f"{_BASE}/engine/queue/teardown", json={})
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_every_action_refuses_an_unauthenticated_request(self, monkeypatch, tmp_path):
+        # No auth middleware at all, so ``request["user"]`` is absent. These are
+        # privileged overrides: a release drives held content into a dispatch and
+        # a cleanup deletes a recorded tree, so an anonymous caller is refused
+        # before the engine is reached.
+        async with _make_client_without_auth(monkeypatch, tmp_path) as client:
+            for path, body in (
+                (
+                    "release-feedback",
+                    {"project": "/p", "spec": "s", "run_id": "r", "comment_id": "c"},
+                ),
+                ("redispatch", {"source": "github", "item_id": "42", "generation": 1}),
+                ("clean-workspace", {"workspace_id": 1}),
+                ("teardown", {"run_id": "run-a"}),
+            ):
+                resp = await client.post(f"{_BASE}/engine/queue/{path}", json=body)
+                assert resp.status == 401, path
+                assert (await resp.json())["code"] == "unauthorized"
+
+
+def _make_client_without_auth(monkeypatch, tmp_path):
+    """The app with NO auth middleware, so nothing populates ``request['user']``."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from .test_routes import _redirect_state
+
+    _redirect_state(monkeypatch, tmp_path)
+    app = web.Application()
+    routes.register_routes(app)
+    return TestClient(TestServer(app))
+
+
+def _queue():
+    """The engine's Review_Queue over the redirected root, as the handler builds it."""
+    store, audit_log = routes._engine_store()
+    machine = engine_runs.RunMachine(store, ConfigStore(), audit=audit_log)
+    return ReviewQueue(machine)
+
+
+#: A legal route to each parked state, so a test naming a state need not spell
+#: the walk. Mirrors the engine suite's own table.
+_PATHS: dict[RunState, tuple[RunState, ...]] = {
+    RunState.AWAITING_REVIEW: (RunState.AUTHORING, RunState.AWAITING_REVIEW),
+    RunState.HALTED_BUDGET: (RunState.HALTED_BUDGET,),
+    RunState.STALLED: (RunState.AUTHORING, RunState.STALLED),
+}
+
+
+def _park_runs(tmp_path: Path, runs: tuple[tuple[str, RunState], ...]) -> SpecRef:
+    """Create a spec the engine can address and park *runs* in the queue.
+
+    Walked through the RunMachine by legal transitions rather than written into
+    the store directly, so the rows the surface reads are rows the state machine
+    actually produces.
+    """
+    project = tmp_path / "queue-project"
+    spec_dir = project / ".kiro" / "specs" / "example"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / "requirements.md").write_text("# Requirements Document\n", encoding="utf-8")
+    (spec_dir / "design.md").write_text("# Design Document\n", encoding="utf-8")
+    (spec_dir / "tasks.md").write_text("# Implementation Plan\n", encoding="utf-8")
+    (spec_dir / ".config.kiro").write_text(
+        json.dumps({"specId": "example", "specType": "feature"}), encoding="utf-8"
+    )
+    ref = SpecRef.of(project, "example")
+    store, audit_log = routes._engine_store()
+    machine = engine_runs.RunMachine(store, ConfigStore(), audit=audit_log)
+    for run_id, state in runs:
+        machine.create(ref, run_id=run_id, source="github")
+        for step in _PATHS[state]:
+            machine.transition(ref, run_id, step)
+    return ref
+
+
+def _hold_comment(run_id: str, comment_id: str) -> None:
+    """Put *comment_id* on *run_id*'s held list, as the watcher's screening does."""
+    store, _audit = routes._engine_store()
+    record = store.get_run(run_id)
+    held = list(engine_runs.feedback_quarantined(record)) if record is not None else []
+    store.update_run(
+        run_id,
+        detail={engine_runs.DETAIL_FEEDBACK_QUARANTINED: held + [comment_id]},
+    )
+
+
+def _audit_entries(ref: SpecRef) -> list[dict]:
+    """Every audit row the engine wrote for *ref*, read through its own reader."""
+    _store_, audit_log = routes._engine_store()
+    return [event.to_json_object() for event in audit_log.read(ref)]
 
 
 def _dashboard_surface():
