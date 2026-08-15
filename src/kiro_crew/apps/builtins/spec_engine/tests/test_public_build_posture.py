@@ -1503,8 +1503,12 @@ class TestShippedPromptTextIsAuthoredHere:
             (APP_ROOT / "app.json").read_text(encoding="utf-8")
 
     def test_the_prompt_text_names_nothing_non_public(self) -> None:
+        texts = _prompt_texts()
+        # Guarded: the assertion below holds trivially over no text at all, and a
+        # resolver that stopped finding any would otherwise pass forever.
+        assert len(texts) == len(FLOWS) + len(PROMPT_SOURCES) + 1
         offenders: list[str] = []
-        for where, text in sorted(_prompt_texts().items()):
+        for where, text in sorted(texts.items()):
             offenders.extend(f"{where}: {detail}" for _line, detail in _non_public_references(text))
         assert offenders == [], f"shipped prompt text names something non-public: {offenders}"
 
