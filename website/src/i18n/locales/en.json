@@ -3099,6 +3099,7 @@
         "no_profiles": "No cost profile is configured.",
         "roles_section": "Role assignments",
         "role_model": "Model",
+        "role_model_required": "A role needs a model. Use the reset control to stop pinning one.",
         "role_effort": "Effort",
         "roles_inherit_note": "A role assignment must name a model. Effort is chosen from the engine's own levels.",
         "workflow_section": "Workflow commands",

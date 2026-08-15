@@ -411,6 +411,30 @@ describe('EngineConfigEditor', () => {
     })
   })
 
+  it('holds an emptied role model rather than sending a write the engine refuses', async () => {
+    // The engine requires a non-empty model for a declared role, and clearing the
+    // field is how an operator reaches for "stop pinning this" -- which is what
+    // the reset control does. So the panel must not offer the empty save at all:
+    // offering a value the write path refuses is the defect that made role effort
+    // a picker over the engine's own levels.
+    const writes: { url: string; init?: RequestInit }[] = []
+    stubEngineFetch(RELEASED_SWITCH, { writes })
+    await openEditor()
+
+    const model = screen.getByLabelText('cost_profiles.thrifty.roles.review.model')
+    await userEvent.clear(model)
+
+    const save = screen.getByRole('button', { name: 'Save configuration' })
+    expect(save).toBeDisabled()
+    screen.getByText(/A role needs a model/i)
+
+    // And typing one re-enables it, so the guard is about the value and not a
+    // one-way latch that strands the form.
+    await userEvent.type(model, 'claude-sonnet-5')
+    expect(screen.getByRole('button', { name: 'Save configuration' })).toBeEnabled()
+    expect(writes.length).toBe(0)
+  })
+
   it('resets a setting by deleting its key rather than writing the default', async () => {
     const writes: { url: string; init?: RequestInit }[] = []
     stubEngineFetch(RELEASED_SWITCH, { writes })

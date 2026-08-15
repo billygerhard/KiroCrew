@@ -25,8 +25,9 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.apps.builtins.spec_builder.backend import routes
+from kiro_crew.apps.builtins.spec_builder.backend import engine_ops, routes
 from kiro_crew.apps.builtins.spec_engine.engine import runs as engine_runs
+from kiro_crew.apps.builtins.spec_engine.engine import state as engine_state
 from kiro_crew.apps.builtins.spec_engine.engine.budget.ledger import RunAccounting
 from kiro_crew.apps.builtins.spec_engine.engine.budget.switch import (
     KILL_SWITCH_FILENAME,
@@ -355,6 +356,34 @@ class TestKillSwitchSurface:
         # never move.
         assert body["resumed"] == []
         assert KillSwitch(state_dir / "engine-state").engaged is False
+
+    @pytest.mark.asyncio
+    async def test_a_release_whose_trail_cannot_be_written_is_refused_by_code(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        """The refusal this branch exists for must be REACHABLE, not just written.
+
+        The engine raises StatePersistenceError for both failure modes here -- the
+        audit append and the flag unlink -- and that derives from StateError, not
+        from OSError or ValueError. So a catch tuple naming only those two made the
+        designed 503 dead code and handed the operator a bare 500 on the control
+        that decides whether spending is stopped.
+        """
+        state_dir = tmp_path / "spec-builder"
+        async with _make_client(monkeypatch, tmp_path) as client:
+            await client.post(f"{_BASE}/engine/kill-switch", json={"action": "engage"})
+
+            def _refuse(*args, **kwargs):
+                raise engine_state.StatePersistenceError("the audit trail is not writable")
+
+            monkeypatch.setattr(engine_ops, "release_kill_switch", _refuse)
+            resp = await client.post(f"{_BASE}/engine/kill-switch", json={"action": "release"})
+            body = await resp.json()
+
+        assert resp.status == 503
+        assert body["code"] == "release_failed"
+        # The fail-safe direction: an unrecordable release leaves the stop standing.
+        assert KillSwitch(state_dir / "engine-state").engaged is True
 
     @pytest.mark.asyncio
     async def test_an_unknown_action_is_refused_and_changes_nothing(

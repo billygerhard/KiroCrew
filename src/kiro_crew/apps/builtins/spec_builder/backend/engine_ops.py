@@ -535,10 +535,17 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
                     audit=audit_log,
                 )
             )
-        except (OSError, ValueError) as exc:
-            # Includes the audit-first refusal: a release whose trail could not be
-            # written leaves the switch engaged, and says so rather than reporting
-            # a stop that is no longer in force.
+        except (OSError, ValueError, engine_state.StateError) as exc:
+            # StateError is the one that matters and the one that was missing:
+            # both failure modes this branch exists for -- the audit append and
+            # the flag unlink -- raise StatePersistenceError, which derives from
+            # StateError and from neither OSError nor ValueError. Without it the
+            # designed refusal below was unreachable and the operator got a bare
+            # 500 on the most safety-sensitive control in the app.
+            #
+            # The refusal itself: a release whose trail could not be written
+            # leaves the switch engaged, and says so rather than reporting a stop
+            # that is no longer in force.
             return _bad_request("release_failed", str(exc), status=503)
         _sel_audit("engine_kill_switch_release", f"actor={initiator}")
         switch = engine_switch.KillSwitch(store.root)
@@ -554,14 +561,24 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
             }
         )
     machine = engine_runs.RunMachine(store, config, audit=audit_log)
-    report = engage_kill_switch(
-        state=store,
-        config=config,
-        initiator=initiator,
-        reason=reason,
-        machine=machine,
-        audit=audit_log,
-    )
+    # Off the loop and guarded like the release above: this writes a flag file and
+    # parks every stoppable run, so it is per-run blocking I/O, and the module's
+    # convention for that is a worker thread. An engage that cannot persist must
+    # report failure rather than a 500, because an operator who reads "stopped"
+    # and is not stopped will keep spending.
+    try:
+        report = await asyncio.to_thread(
+            lambda: engage_kill_switch(
+                state=store,
+                config=config,
+                initiator=initiator,
+                reason=reason,
+                machine=machine,
+                audit=audit_log,
+            )
+        )
+    except (OSError, ValueError, engine_state.StateError) as exc:
+        return _bad_request("engage_failed", str(exc), status=503)
     _sel_audit("engine_kill_switch_engage", f"actor={initiator}")
     return web.json_response(
         {

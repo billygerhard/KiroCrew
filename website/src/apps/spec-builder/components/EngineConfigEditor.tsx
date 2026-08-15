@@ -185,6 +185,18 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
   }, [sources])
 
   const dirty = edits.size > 0
+  // A model is the one edited field the engine requires to be non-empty, and
+  // clearing it is how an operator naturally reaches for "stop pinning this" --
+  // which is what the reset control does, by writing null. So an emptied model is
+  // held here rather than sent: the panel must not offer a value the write path
+  // refuses, which is the same rule that made effort a picker over the engine's
+  // own levels.
+  const blankModel = [...edits.values()].some(
+    (edit) =>
+      edit.path[edit.path.length - 1] === 'model' &&
+      typeof edit.value === 'string' &&
+      edit.value.trim() === '',
+  )
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -478,9 +490,12 @@ export default function EngineConfigEditor({ config, project }: EngineConfigEdit
             }
             ariaLabel={i18nT('apps.specBuilder.engineOps.save')}
             onClick={() => save.mutate()}
-            disabled={!dirty || save.isPending}
+            disabled={!dirty || blankModel || save.isPending}
           />
           {dirty && <span> {i18nT('apps.specBuilder.engineOps.unsaved')}</span>}
+          {blankModel && (
+            <span> {i18nT('apps.specBuilder.engineOps.role_model_required')}</span>
+          )}
         </div>
         {refusal && (
           // The ENGINE's reason, verbatim. A generic failure would leave an
