@@ -310,14 +310,17 @@ class TestKillSwitchSurface:
         assert (engine_root / KILL_SWITCH_FILENAME).exists()
 
     @pytest.mark.asyncio
-    async def test_engaging_records_the_dashboard_as_the_initiator(
+    async def test_engaging_records_the_authenticated_session_as_the_initiator(
         self, monkeypatch, tmp_path, config_root
     ):
+        # The SESSION user, not this surface's name. "dashboard" answers where the
+        # stop came from and nothing about who threw it, and the flag is what a
+        # later operator reads to find out who stopped their work.
         async with _make_client(monkeypatch, tmp_path) as client:
             await client.post(f"{_BASE}/engine/kill-switch", json={"action": "engage"})
             resp = await client.get(f"{_BASE}/engine/kill-switch")
             body = await resp.json()
-        assert body["switch"]["initiator"] == "dashboard"
+        assert body["switch"]["initiator"] == "tester"
 
     @pytest.mark.asyncio
     async def test_engaging_twice_reports_the_second_call_as_already_engaged(
@@ -658,6 +661,100 @@ class TestQueueActions:
                 assert resp.status == 401, path
                 assert (await resp.json())["code"] == "unauthorized"
 
+    @pytest.mark.asyncio
+    async def test_the_config_write_and_the_stop_switch_refuse_an_unauthenticated_request(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The two privileged writes that had NO auth check while every queue
+        # action beside them did. The config write runs at an operator-confirmed
+        # surface (so it can lower an autonomy floor or a program minimum) and a
+        # kill-switch release restores spending, which makes them the two that
+        # least tolerate an anonymous caller.
+        async with _make_client_without_auth(monkeypatch, tmp_path) as client:
+            for method, path, body in (
+                ("put", "config", {"patch": {"concurrency": {"global_max_runs": 9}}}),
+                ("post", "config", {"patch": {"concurrency": {"global_max_runs": 9}}}),
+                ("post", "kill-switch", {"action": "engage"}),
+                ("post", "kill-switch", {"action": "release"}),
+            ):
+                resp = await getattr(client, method)(f"{_BASE}/engine/{path}", json=body)
+                assert resp.status == 401, f"{method} {path} {body}"
+                assert (await resp.json())["code"] == "unauthorized"
+        # And nothing landed: a refusal that still wrote would be the defect the
+        # status code hides.
+        assert not (config_root / "config.json").exists()
+        assert KillSwitch(tmp_path / "spec-builder" / "engine-state").engaged is False
+
+    @pytest.mark.asyncio
+    async def test_the_config_write_and_the_stop_switch_refuse_an_app_token(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # An app token yields a truthy ``request["user"]``, so the auth check alone
+        # does not separate a human from an app -- and this app's own manifest
+        # allowlists ``/api/apps/spec-builder/*``, so a token minted from an
+        # ``.app_secret`` reaches these routes. Both are refused with 403, and the
+        # denial is audited.
+        events: list[tuple[str, str, str]] = []
+        monkeypatch.setattr(
+            routes,
+            "_audit",
+            lambda operation, resources="", outcome="success": events.append(
+                (operation, resources, outcome)
+            ),
+        )
+        async with _make_client_as_app(monkeypatch, tmp_path) as client:
+            resp = await client.put(
+                f"{_BASE}/engine/config", json={"patch": {"concurrency": {"global_max_runs": 9}}}
+            )
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "dashboard_user_required"
+            for action in ("engage", "release"):
+                resp = await client.post(f"{_BASE}/engine/kill-switch", json={"action": action})
+                assert resp.status == 403, action
+                assert (await resp.json())["code"] == "dashboard_user_required"
+        assert not (config_root / "config.json").exists()
+        assert KillSwitch(tmp_path / "spec-builder" / "engine-state").engaged is False
+        assert [outcome for _op, _res, outcome in events] == ["denied", "denied", "denied"]
+        assert all("app:squatter" in resources for _op, resources, _out in events)
+
+    @pytest.mark.asyncio
+    async def test_a_release_is_recorded_in_the_engine_audit_log_with_the_session_user(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # The dangerous half of this control: engaging is conservative, releasing
+        # restores spending. It recorded a logger.warning and nothing else.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(tmp_path, (("run-a", RunState.HALTED_BUDGET),))
+            await client.post(
+                f"{_BASE}/engine/kill-switch", json={"action": "engage", "reason": "runaway"}
+            )
+            before = len(_audit_entries(ref))
+            resp = await client.post(f"{_BASE}/engine/kill-switch", json={"action": "release"})
+            assert resp.status == 200
+            entries = _audit_entries(ref)
+        released = [row for row in entries if row["event"] == "budget.kill_switch_released"]
+        assert len(released) == 1, entries[before:]
+        assert released[0]["initiator"] == "tester"
+        # Who stopped it and why travel onto the release, and the runs the release
+        # does NOT resume are named.
+        assert released[0]["detail"]["engaged_by"] == "tester"
+        assert released[0]["detail"]["engaged_reason"] == "runaway"
+        assert released[0]["detail"]["parked_runs"] == ["run-a"]
+
+    @pytest.mark.asyncio
+    async def test_releasing_a_switch_that_was_not_engaged_records_no_release(
+        self, monkeypatch, tmp_path, config_root
+    ):
+        # A no-op must not put a spending event in the trail: a reader counting
+        # releases would count decisions nobody made.
+        async with _make_client(monkeypatch, tmp_path) as client:
+            ref = _park_runs(tmp_path, (("run-a", RunState.HALTED_BUDGET),))
+            resp = await client.post(f"{_BASE}/engine/kill-switch", json={"action": "release"})
+            assert resp.status == 200
+            assert (await resp.json())["changed"] is False
+            entries = _audit_entries(ref)
+        assert [row for row in entries if row["event"] == "budget.kill_switch_released"] == []
+
 
 def _make_client_without_auth(monkeypatch, tmp_path):
     """The app with NO auth middleware, so nothing populates ``request['user']``."""
@@ -668,6 +765,32 @@ def _make_client_without_auth(monkeypatch, tmp_path):
 
     _redirect_state(monkeypatch, tmp_path)
     app = web.Application()
+    routes.register_routes(app)
+    return TestClient(TestServer(app))
+
+
+def _make_client_as_app(monkeypatch, tmp_path):
+    """The app reached by an APP TOKEN rather than a browser session.
+
+    Mirrors what the gateway's token middleware sets for one: a truthy ``user``
+    AND an ``app`` identity. The pair is the point -- an app token passes an
+    auth check on its ``user`` alone, so only the ``app`` key separates it from
+    the operator whose confirmation the config surface claims.
+    """
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from .test_routes import _redirect_state
+
+    _redirect_state(monkeypatch, tmp_path)
+
+    @web.middleware
+    async def _app_token_mw(request, handler):
+        request["user"] = "app:squatter"
+        request["app"] = "squatter"
+        return await handler(request)
+
+    app = web.Application(middlewares=[_app_token_mw])
     routes.register_routes(app)
     return TestClient(TestServer(app))
 

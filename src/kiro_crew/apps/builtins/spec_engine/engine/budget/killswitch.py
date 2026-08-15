@@ -43,6 +43,11 @@ from .switch import KillSwitch, KillSwitchState
 
 logger = logging.getLogger(__name__)
 
+#: Event recorded when the switch is released. The engage's own event
+#: (:data:`~.ceiling.AUDIT_EVENT_STOPPED`) is written per halted run by the budget
+#: guard; this one is the mirror for the direction that restores spending.
+AUDIT_EVENT_RELEASED = "budget.kill_switch_released"
+
 #: States a run may be stopped from: everything that is neither finished nor
 #: already parked. Derived from the lifecycle's own sets rather than listed, so a
 #: state added to the lifecycle is stopped by this switch without an edit here — a
@@ -189,7 +194,73 @@ def release_kill_switch(
     state: StateStore,
     initiator: str = "",
     switch: KillSwitch | None = None,
+    audit: AuditSink | None = None,
 ) -> bool:
-    """Release the switch so unattended work may start again. Resumes nothing."""
+    """Release the switch so unattended work may start again. Resumes nothing.
+
+    *audit* records the release before it happens, which is the opposite order
+    from the engage and deliberately so. The engage writes its flag first because
+    the fail-safe direction there is *stopped*: a stop that could not be recorded
+    must still stop. Releasing runs the other way -- the fail-safe direction is
+    *stays stopped* -- so the trail is written first and a trail that cannot land
+    raises with the switch still engaged. This mirrors the queue's refusal to
+    release held feedback into a run machine that records to nowhere: a release
+    with no trail is the one direction of this control that spends money, and it
+    does not happen unattributably.
+
+    The engine's audit log is per spec by construction, so the entry lands on
+    every spec holding a run the stop parked -- the mirror of the engage, which
+    also records per halted run's spec. A release while nothing is parked
+    concerns no spec and writes no engine entry; the surface that took the
+    request records that case (the dashboard route emits a SEL event naming the
+    authenticated operator), because an engine-wide event has no per-spec log to
+    live in.
+
+    The residual: an audit entry followed by a release that then fails to unlink
+    the flag raises to the caller, so the operator is told the release failed and
+    the recorded entry reads as an attempt. That is the accepted trade against an
+    unrecorded release, which nothing would tell anyone about.
+    """
     resolved = switch if switch is not None else KillSwitch(state.root)
+    record = resolved.read()
+    # Nothing engaged is nothing released: recording a release of a switch that
+    # was already off would put a spending event in the trail for a no-op.
+    if audit is not None and record.engaged:
+        _record_release(state, audit, record=record, initiator=initiator)
     return resolved.release(initiator=initiator)
+
+
+def _record_release(
+    state: StateStore,
+    audit: AuditSink,
+    *,
+    record: KillSwitchState,
+    initiator: str,
+) -> None:
+    """Append the release entry to every spec holding a run the stop parked."""
+    parked = state.list_runs(states=[run_state.value for run_state in PARKED_STATES])
+    if not parked:
+        return
+    runs_by_spec: dict[str, list[str]] = {}
+    for run in parked:
+        runs_by_spec.setdefault(run.spec_key, []).append(run.run_id)
+    refs = {spec.spec_key: spec.ref for spec in state.list_specs(include_archived=True)}
+    for spec_key, run_ids in runs_by_spec.items():
+        ref = refs.get(spec_key)
+        if ref is None:  # pragma: no cover - a run row without its spec row
+            continue
+        audit.append(
+            ref,
+            AUDIT_EVENT_RELEASED,
+            initiator=initiator or None,
+            detail={
+                # Who stopped it and why, carried onto the release: the two halves
+                # of the decision are read together or not at all.
+                "engaged_by": record.initiator,
+                "engaged_ts": record.engaged_ts,
+                "engaged_reason": record.reason,
+                "unreadable": record.unreadable,
+                # Named because the release does NOT resume them.
+                "parked_runs": sorted(run_ids),
+            },
+        )

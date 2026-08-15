@@ -77,6 +77,7 @@ from .ceiling import (
     resolve_budget,
 )
 from .killswitch import (
+    AUDIT_EVENT_RELEASED,
     STOPPABLE_STATES,
     HaltedRun,
     KillSwitchReport,
@@ -114,6 +115,7 @@ __all__ = [
     "AUDIT_EVENT_COMPLETED",
     "AUDIT_EVENT_HALTED",
     "AUDIT_EVENT_REFUSED",
+    "AUDIT_EVENT_RELEASED",
     "AUDIT_EVENT_STOPPED",
     "DETAIL_KILL_SWITCH",
     "AUDIT_EVENT_WARNING",

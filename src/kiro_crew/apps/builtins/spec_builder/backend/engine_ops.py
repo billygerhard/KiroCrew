@@ -52,7 +52,12 @@ from ...spec_engine.engine.budget.killswitch import (
     release_kill_switch,
     stoppable_runs,
 )
-from ...spec_engine.engine.config import ConfigLoadError, ConfigStore, ConfigValidationError
+from ...spec_engine.engine.config import (
+    ConfigLoadError,
+    ConfigStore,
+    ConfigValidationError,
+    ConfigWriteRefused,
+)
 from ...spec_engine.engine.config.store import DASHBOARD_SURFACE
 
 logger = logging.getLogger("kirocrew.app.spec-builder")
@@ -90,6 +95,51 @@ def _config_store() -> ConfigStore:
 def _bad_request(code: str, error: str, *, status: int = 400) -> web.Response:
     """A refusal carrying a machine-readable code beside its human text."""
     return web.json_response({"code": code, "error": error}, status=status)
+
+
+def _sel_audit(operation: str, resources: str = "", outcome: str = "success") -> None:
+    """Record one security-relevant event on this app's SEL trail.
+
+    Best-effort by the same rule the app's own ``_audit`` uses: this is the
+    record of an operator action, not a precondition for it, and a SEL log that
+    cannot be written must not turn a completed stop into a reported failure.
+    """
+    from . import routes
+
+    routes._audit(operation, resources, outcome)
+
+
+def _operator_only(request: web.Request, *, operation: str) -> web.Response | None:
+    """Refuse anything that is not an authenticated dashboard browser session.
+
+    Two refusals, because there are two distinct callers to keep out of a write
+    that can lower a floor:
+
+    * **anonymous** -- the 401 every other privileged route in this module
+      applies. These two writes did not have it.
+    * **an app token** -- 403. ``request["user"]`` is truthy for an app token, so
+      the auth check alone does not separate a human from an app, and an app whose
+      manifest allowlists this app's API path (``spec-builder``'s own does) passes
+      the token layer's scope gate. That matters here specifically because the
+      config write runs at an ``operator_confirmed`` surface and the kill-switch
+      release restores spending: an agent that can mint an app token would
+      otherwise be able to widen its own autonomy ladder or lift the stop an
+      operator put on it. Same gate, and same reason, as the computer-use and
+      Browser Mode keystone saves.
+    """
+    from . import routes
+
+    if denied := routes._require_auth(request):
+        return denied
+    app_caller = request.get("app")
+    if app_caller:
+        _sel_audit(operation, f"app:{app_caller}", "denied")
+        return _bad_request(
+            "dashboard_user_required",
+            "this control is only writable from a signed-in dashboard session",
+            status=403,
+        )
+    return None
 
 
 async def handle_get_config(request: web.Request) -> web.Response:
@@ -143,7 +193,22 @@ async def handle_put_config(request: web.Request) -> web.Response:
     at a scope it is not overridable at, a screening opt-out carrying a
     disable-all key -- is enforced there and reported here by path, so this
     handler has no validation of its own to keep in step.
+
+    **A dashboard browser session only.** This write is the one place a floor can
+    be lowered: :data:`DASHBOARD_SURFACE` claims ``operator_confirmed``, which is
+    what unlocks the config-only sections (the workflow and quality-gate argv the
+    delivery pipeline executes, the declared program minimums the Doctor checks,
+    a source's autonomy ladder, and ``delivery.auto_integrate``). That claim is
+    only true while a human is the one writing, and ``request["user"]`` is truthy
+    for an app token too -- ``spec_builder/app.json`` allowlists
+    ``/api/apps/spec-builder/*`` in ``permissions.api``, so an app token minted
+    from an ``.app_secret`` reaches this route with an identity that passes an
+    auth check. So an app token is refused before the body is read, the same gate
+    the computer-use and Browser Mode keystone saves apply for the same reason.
     """
+    denied = _operator_only(request, operation="engine_config_write")
+    if denied is not None:
+        return denied
     try:
         payload = await request.json()
     except Exception:
@@ -153,6 +218,7 @@ async def handle_put_config(request: web.Request) -> web.Response:
     patch = payload.get("patch", payload)
     if not isinstance(patch, dict):
         return _bad_request("bad_patch", "patch must be a JSON object")
+    actor = str(request.get("user") or "")
     try:
         document = _config_store().write(patch, surface=DASHBOARD_SURFACE)
     except ConfigValidationError as exc:
@@ -161,9 +227,15 @@ async def handle_put_config(request: web.Request) -> web.Response:
             "; ".join(str(e) for e in exc.errors),
             status=422,
         )
+    except ConfigWriteRefused as exc:
+        # The engine's own surface fence. Reported as a refusal with its paths
+        # rather than as a validation failure: nothing about the values is wrong,
+        # and an operator told "invalid" would keep editing them.
+        return _bad_request("config_write_refused", str(exc), status=403)
     except (ConfigLoadError, OSError) as exc:
         return _bad_request("config_write_failed", str(exc), status=503)
-    logger.info("spec-builder: engine configuration written from the dashboard")
+    logger.info("spec-builder: %s wrote the engine configuration", actor or "an operator")
+    _sel_audit("engine_config_write", f"actor={actor}" if actor else "")
     return web.json_response({"ok": True, "document": document})
 
 
@@ -204,7 +276,18 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
     Engaging parks every stoppable run and reports what it stopped; releasing
     only lets new work start again and resumes nothing, which is the engine's
     behaviour and is reported as such rather than smoothed over here.
+
+    Both directions are attributed to the AUTHENTICATED session rather than to
+    this surface's name, and both are gated to a dashboard session: the release
+    is the direction that restores spending, so an app token lifting an
+    operator's stop is exactly what :func:`_operator_only` is here to prevent.
+    The engine writes the release into its own audit log; the SEL event below
+    covers the case that log cannot address -- a release while nothing is parked
+    concerns no spec, and the engine's log is per spec.
     """
+    denied = _operator_only(request, operation="engine_kill_switch")
+    if denied is not None:
+        return denied
     try:
         payload = await request.json()
     except Exception:
@@ -222,8 +305,26 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
 
     store, audit_log = routes._engine_store()
     config = _config_store()
+    # The actor is the session, never the body: a stop or a release recorded
+    # against a name its caller supplied records nothing. The surface name is the
+    # fallback for a deployment with no user on the request, so the entry still
+    # says where the action came from.
+    initiator = str(request.get("user") or "") or DASHBOARD_INITIATOR
     if action == "release":
-        released = release_kill_switch(state=store, initiator=DASHBOARD_INITIATOR)
+        try:
+            released = await asyncio.to_thread(
+                lambda: release_kill_switch(
+                    state=store,
+                    initiator=initiator,
+                    audit=audit_log,
+                )
+            )
+        except (OSError, ValueError) as exc:
+            # Includes the audit-first refusal: a release whose trail could not be
+            # written leaves the switch engaged, and says so rather than reporting
+            # a stop that is no longer in force.
+            return _bad_request("release_failed", str(exc), status=503)
+        _sel_audit("engine_kill_switch_release", f"actor={initiator}")
         switch = engine_switch.KillSwitch(store.root)
         return web.json_response(
             {
@@ -240,11 +341,12 @@ async def handle_post_kill_switch(request: web.Request) -> web.Response:
     report = engage_kill_switch(
         state=store,
         config=config,
-        initiator=DASHBOARD_INITIATOR,
+        initiator=initiator,
         reason=reason,
         machine=machine,
         audit=audit_log,
     )
+    _sel_audit("engine_kill_switch_engage", f"actor={initiator}")
     return web.json_response(
         {
             "ok": True,

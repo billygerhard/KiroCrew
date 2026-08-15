@@ -23,6 +23,7 @@ import pytest
 
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog
 from kiro_crew.apps.builtins.spec_engine.engine.budget import (
+    AUDIT_EVENT_RELEASED,
     AUDIT_EVENT_STOPPED,
     DETAIL_KILL_SWITCH,
     KILL_SWITCH_FILENAME,
@@ -784,3 +785,92 @@ class TestKillSwitchStateProjection:
         switch.engage(initiator="ops", reason="runaway wave")
         payload = json.loads(json.dumps(switch.read().to_json_object()))
         assert payload["engaged"] is True
+
+
+class TestTheReleaseLeavesATrail:
+    """The direction of this control that RESTORES spending.
+
+    Engaging is conservative and already records per halted run. Releasing lets
+    every watcher poll and every run dispatch again, and it recorded a log line
+    and nothing else -- so a release was unattributable after the fact. These
+    assert the trail, and assert it in the order that makes a release without one
+    impossible rather than merely unlikely.
+    """
+
+    def test_a_release_is_recorded_against_every_spec_holding_a_parked_run(
+        self,
+        store: StateStore,
+        project: Path,
+        ref: SpecRef,
+        switch: KillSwitch,
+        tmp_path: Path,
+    ) -> None:
+        make_spec_dir(project, "second")
+        other = SpecRef.of(project, "second")
+        make_run(store, ref, "run-a", state=RunState.HALTED_BUDGET)
+        make_run(store, other, "run-b", state=RunState.STALLED)
+        log = AuditLog(tmp_path / "audit")
+        switch.engage(initiator=OPERATOR, reason="runaway wave")
+
+        assert release_kill_switch(state=store, initiator="ops-2", switch=switch, audit=log) is True
+
+        for spec, run_id in ((ref, "run-a"), (other, "run-b")):
+            events = [e for e in log.read(spec) if e.event == AUDIT_EVENT_RELEASED]
+            assert len(events) == 1, spec.name
+            assert events[0].initiator == "ops-2"
+            assert events[0].detail is not None
+            # Who stopped it and why travel onto the release: the two halves of
+            # the decision are read together or not at all.
+            assert events[0].detail["engaged_by"] == OPERATOR
+            assert events[0].detail["engaged_reason"] == "runaway wave"
+            assert events[0].detail["engaged_ts"]
+            # The runs the release does NOT resume, named on the entry.
+            assert events[0].detail["parked_runs"] == [run_id]
+
+    def test_releasing_a_switch_nobody_engaged_records_nothing(
+        self, store: StateStore, ref: SpecRef, switch: KillSwitch, tmp_path: Path
+    ) -> None:
+        make_run(store, ref, "run-a", state=RunState.HALTED_BUDGET)
+        log = AuditLog(tmp_path / "audit")
+
+        assert release_kill_switch(state=store, initiator=OPERATOR, switch=switch, audit=log) is (
+            False
+        )
+
+        # A no-op must not put a spending event in the trail: a reader counting
+        # releases would count decisions nobody made.
+        assert [e for e in log.read(ref) if e.event == AUDIT_EVENT_RELEASED] == []
+
+    def test_a_trail_that_cannot_be_written_leaves_the_switch_ENGAGED(
+        self, store: StateStore, ref: SpecRef, switch: KillSwitch
+    ) -> None:
+        # The ordering claim, and the reason the audit happens BEFORE the unlink.
+        # The fail-safe direction for a release is "stays stopped", so a release
+        # whose record cannot land does not happen -- the mirror of the engage,
+        # where the flag lands first because ITS fail-safe direction is "stopped".
+        make_run(store, ref, "run-a", state=RunState.HALTED_BUDGET)
+        switch.engage(initiator=OPERATOR)
+
+        class RefusingLog:
+            def append(self, *args: Any, **kwargs: Any) -> Any:
+                raise StatePersistenceError("the audit log is unwritable")
+
+        with pytest.raises(StatePersistenceError):
+            release_kill_switch(
+                state=store, initiator=OPERATOR, switch=switch, audit=RefusingLog()
+            )
+
+        assert switch.engaged is True, "a release with no trail must not take effect"
+        assert switch.path.exists()
+
+    def test_a_release_with_no_audit_sink_still_releases(
+        self, store: StateStore, ref: SpecRef, switch: KillSwitch
+    ) -> None:
+        # The engine's own callers (the watch tick's repair paths, the CLI) pass no
+        # sink, and a release is not gated on one being supplied: the gate that
+        # matters is at the operator surface, which always passes the real log.
+        make_run(store, ref, "run-a", state=RunState.HALTED_BUDGET)
+        switch.engage(initiator=OPERATOR)
+
+        assert release_kill_switch(state=store, initiator=OPERATOR, switch=switch) is True
+        assert switch.engaged is False
