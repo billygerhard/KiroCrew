@@ -55,12 +55,21 @@ from kiro_crew.apps.builtins.spec_engine.engine.orchestrator import (
     RunContext,
     TaskResult,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.phases import (
+    EXECUTION_REFUSED_EVENT,
+    REASON_HUMAN_REQUIRED,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.prerequisites import AUDIT_PREREQUISITE_UNMET
+from kiro_crew.apps.builtins.spec_engine.engine.resume import (
+    DETAIL_AUTONOMY,
+    DETAIL_SCREENING_QUARANTINED,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.roles import Dispatch
 from kiro_crew.apps.builtins.spec_engine.engine.runs import (
     RUN_TRANSITIONED_EVENT,
     RunMachine,
     RunState,
+    UnknownRun,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.seeder import (
     AWAITING_REVIEW_EVENT,
@@ -296,6 +305,105 @@ class TestARunPathGraphRecordsFindingsDurably:
         # travel into a graph, which would record nothing while type-checking.
         assert not hasattr(DURABLE_FINDINGS, "record")
         assert not isinstance(DURABLE_FINDINGS, RecordingFindingsSink)
+
+
+class TestAResumedRunIsGatedOnItsPersistedPosture:
+    """The resume path through the graph, which is the driver a surface holds.
+
+    The authority reconstruction has its own suite; what is asserted here is that
+    the graph reaches it — that a caller holding the object a surface is given
+    cannot get at the execution gate any other way, and that resuming a parked run
+    and then asking the gate gives the answer the run's row implies rather than
+    the answer configuration currently implies.
+
+    Neither owning task could write this. The quarantine cap and the per-leaf
+    review gate are both properties of a *resume*, and until the composition root
+    existed there was nothing to resume a run through.
+    """
+
+    def admitted(
+        self, graph: EngineGraph, ref: SpecRef, *, level: str, quarantined: bool = False
+    ) -> str:
+        """A run row as an admitted dispatch leaves one, through the one writer."""
+        detail: dict[str, Any] = {DETAIL_AUTONOMY: level}
+        if quarantined:
+            detail[DETAIL_SCREENING_QUARANTINED] = True
+        record = graph.machine.create(
+            ref, run_id="run-resumed", source=SOURCE, posture=level, detail=detail
+        )
+        return record.run_id
+
+    def parked_then_resumed(self, graph: EngineGraph, ref: SpecRef, run_id: str) -> None:
+        """Interrupt the run and return it, which is the resume this gates after.
+
+        Stalled rather than awaiting-review: a run parked on a person is waiting for
+        a decision, while a stalled one is the interrupted run ``resume`` returns to
+        the phase it was in — the path a driver takes after a Gateway restart.
+        """
+        graph.machine.transition(ref, run_id, RunState.AUTHORING)
+        graph.machine.transition(ref, run_id, RunState.STALLED)
+        point = graph.machine.resume(ref, run_id)
+        assert point.state is RunState.AUTHORING
+
+    def test_the_graph_reports_the_authority_the_row_carries(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        graph = build(tmp_path)
+        run_id = self.admitted(graph, ref, level="delivery")
+
+        authority = graph.resume_authority(run_id)
+
+        assert authority.level is AutonomyLevel.DELIVERY
+        assert authority.run_id == run_id
+
+    def test_asking_about_a_run_that_does_not_exist_is_refused(self, tmp_path: Path) -> None:
+        graph = build(tmp_path)
+
+        with pytest.raises(UnknownRun):
+            graph.resume_authority("run-nobody")
+
+    def test_a_resumed_quarantined_run_is_refused_the_execution_it_was_configured_for(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        graph = build(tmp_path)
+        run_id = self.admitted(graph, ref, level="integration", quarantined=True)
+        self.parked_then_resumed(graph, ref, run_id)
+
+        outcome = graph.request_execution(ref, run_id)
+
+        assert not outcome.ok
+        assert REASON_HUMAN_REQUIRED in {reason.code for reason in outcome.reasons}
+        assert EXECUTION_REFUSED_EVENT in [entry.event for entry in graph.audit.read(ref)]
+
+    def test_the_same_resumed_run_without_the_mark_is_not_refused_on_authority(
+        self, tmp_path: Path, ref: SpecRef
+    ) -> None:
+        """The counterfactual, isolating the authority half of the refusal.
+
+        This spec's documents are unapproved either way, so both runs are refused
+        on the document plan; what separates them is whether the authority reason is
+        among the refusals. Asserting only ``not ok`` above would pass for a gate
+        that refused everything for unrelated reasons.
+        """
+        graph = build(tmp_path)
+        run_id = self.admitted(graph, ref, level="integration")
+        self.parked_then_resumed(graph, ref, run_id)
+
+        outcome = graph.request_execution(ref, run_id)
+
+        assert REASON_HUMAN_REQUIRED not in {reason.code for reason in outcome.reasons}
+
+    def test_the_graphs_gate_takes_no_authority_from_its_caller(self) -> None:
+        """A surface holding the graph cannot supply the level the run runs at.
+
+        ``begin_run`` takes a level because no row exists yet and the prerequisite
+        gate is what judges the request. Once the row exists the authority is
+        settled, so this signature offers nothing to overrule it with.
+        """
+        names = set(inspect.signature(EngineGraph.request_execution).parameters)
+
+        assert not names & {"decision", "level", "autonomy", "policy", "authority"}
+        assert "level" in set(inspect.signature(EngineGraph.begin_run).parameters)
 
 
 class TestCostAttributionIsDurable:
