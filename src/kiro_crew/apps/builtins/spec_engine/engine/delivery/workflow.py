@@ -25,6 +25,7 @@ Absence resolves rather than fails, in two layered ways:
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -224,7 +225,9 @@ class PresetSelection:
     declared_at: str
     #: Whether the definition is the engine's own rather than the document's.
     bundled: bool
-    #: The preset's stages, as command lists. Bundled definitions are copies.
+    #: The preset's stages, as command lists. Always a copy of the definition,
+    #: bundled or user-defined, so mutating it edits neither the engine's table
+    #: nor the project's configuration document.
     stages: Mapping[str, Any]
 
 
@@ -462,6 +465,14 @@ class DeliveryWorkflow:
         Resolution goes through :func:`workflow_presets`, so an unknown name is
         refused by the one accessor that knows the bundled set, and no name
         outside it can be reached by adding a definition the engine did not ship.
+
+        A user-defined definition is copied out of the document rather than
+        returned live, so both kinds of preset answer the same way. The live node
+        was harmless while nothing mutated the result -- ``document()`` re-parses
+        per load -- but it made the returned mapping a writable handle on that
+        project's configuration, and the difference between the two kinds was
+        nowhere stated. The copy is a deep one because the node is unvalidated
+        JSON of arbitrary shape, unlike the bundled table's known argv lists.
         """
         if name in WORKFLOW_PRESETS:
             return workflow_presets(name)[STAGES_KEY]
@@ -469,7 +480,7 @@ class DeliveryWorkflow:
         if isinstance(definition, Mapping):
             stages = definition.get(STAGES_KEY)
             if isinstance(stages, Mapping) and stages:
-                return stages
+                return deepcopy(dict(stages))
             raise ConfigValidationError(
                 [
                     ConfigError(

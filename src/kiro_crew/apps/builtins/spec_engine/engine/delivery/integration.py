@@ -253,6 +253,21 @@ def resolve_authority(
 
     Reads the workflow once and holds it: a configuration saved mid-run would
     otherwise let a run isolate under one answer and integrate under another.
+
+    **Raises ``ConfigValidationError``** when the workflow cannot be resolved --
+    an unresolvable ``workflow.preset`` name is the case, refused by name rather
+    than ignored, because a silent ignore turned a typo into the
+    zero-configuration workflow and capped a project's autonomy without saying
+    so. Nothing here catches it, and the callers today are tests and the
+    prerequisite gate's own reader, which converts it.
+
+    The first *production* caller must convert it the way
+    :func:`~..prerequisites.gate_run` does -- into an audited
+    :class:`~..prerequisites.RunRefusal` naming the configuration path -- rather
+    than letting a configuration error escape from a delivery decision. A run
+    stopped by an unreadable document is the strongest case for a recorded
+    refusal, and an exception unwinding past the audit log loses the one thing
+    the operator can act on.
     """
     resolved = workflow if workflow is not None else DeliveryWorkflow.load(store, project=project)
     document = store.document()
