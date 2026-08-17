@@ -49,23 +49,52 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
 
 ROUTES_SOURCE = Path(routes.__file__)
 
-#: Helpers in :mod:`routes` that touch disk or the state database. Every one of
-#: them must be reached only from inside ``asyncio.to_thread``.
-BLOCKING_HELPERS = frozenset(
-    {
+
+def _blocking_helpers() -> frozenset[str]:
+    """Helpers in :mod:`routes` that touch disk or the state database.
+
+    Derived from the module's own ``BLOCKING`` docstring markers rather than
+    kept as a hand list: the hand-maintained version of this set already missed
+    ``_release_feedback`` once — the helper was marked BLOCKING at its
+    definition, wrapped correctly at its one call site, and invisible to this
+    suite, so a regression on that handler would have passed. A helper whose
+    docstring opens with ``BLOCKING-safe`` is excluded by that same convention.
+    """
+    module = ast.parse(ROUTES_SOURCE.read_text(encoding="utf-8"))
+    marked: set[str] = set()
+    for node in ast.walk(module):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        doc = ast.get_docstring(node) or ""
+        if doc.startswith("BLOCKING") and not doc.startswith("BLOCKING-safe"):
+            marked.add(node.name)
+    return frozenset(marked)
+
+
+#: Every one of these must be reached only from inside ``asyncio.to_thread``.
+BLOCKING_HELPERS = _blocking_helpers()
+
+
+def test_the_derived_blocking_set_still_sees_the_known_helpers() -> None:
+    """A marker-format drift must fail loudly, not silently empty the set.
+
+    If ``BLOCKING`` markers were reworded, :func:`_blocking_helpers` would
+    return fewer names and every downstream off-loop assertion would pass on
+    nothing. Pinning known members keeps the derivation honest, and pinning
+    ``_release_feedback`` specifically keeps the name that the hand list lost.
+    """
+    assert {
         "_config_store",
         "_state_store",
-        "_audit_log",
         "_review_queue",
-        "_config_snapshot",
         "_write_config",
-        "_kill_switch_snapshot",
-        "_engage",
-        "_release",
-        "_run_spend",
         "_queue_snapshot",
-    }
-)
+        "_release_feedback",
+    } <= BLOCKING_HELPERS
+    assert "_audit_log" not in BLOCKING_HELPERS, (
+        "_audit_log's docstring marks it BLOCKING-safe; the derivation must "
+        "honor the -safe suffix rather than matching the BLOCKING prefix alone"
+    )
 
 
 # --- reading the module as source -------------------------------------------

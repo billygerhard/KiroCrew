@@ -32,10 +32,18 @@ widen its own autonomy or lift its own stop. So every MUTATING handler refuses
 an app token with 403 and a security event, and refuses an unauthenticated
 caller with 401.
 
-Reads deliberately stop at 401. An app token may READ this surface: the
-configuration comes back with credential-classified values elided, and an agent
-already has the same read through the Engine_MCP_Server's ``get_config``, so
-refusing it here would buy nothing and diverge the two doors.
+Reads deliberately stop at 401. An app token may READ all four read routes,
+and the rationale differs by route. The configuration read is equivalence: the
+values come back with credential-classified values elided, and an agent already
+has the same read through the Engine_MCP_Server's ``get_config``, so refusing
+it here would buy nothing and diverge the two doors. The queue, run-spend and
+kill-switch reads have NO MCP equivalent — an app token gains reads here it
+could not otherwise obtain (queue rows with source and item ids, per-run spend,
+kill-switch state with stoppable run ids). That is accepted, not overlooked:
+the requirement guards mutations, these payloads carry no credential-classified
+material, and an agent acting on a run legitimately needs to see the queue it
+is part of. If that acceptance is ever revisited, the guard mechanism below is
+already per-route.
 
 **Nothing blocking runs on the event loop.** Every handler's disk and database
 work — including constructing the stores, which opens SQLite and migrates the

@@ -46,7 +46,7 @@ no capability is surfaceless for longer than a wave.
   - [x] 4.1 Join BUILTIN_NAMES deliberately
     - Add `spec_engine` to `BUILTIN_NAMES`; rewrite the pin test's recorded reasoning to state what the entry now buys (the dashboard route-registration loop) and keep the test failing for an entry added without reading it
     - _Requirements: 5.1, 5.3_
-  - [ ] 4.2 Backend routes under the Spec_App
+  - [x] 4.2 Backend routes under the Spec_App
     - New `spec_engine/backend/routes.py` registering `/api/apps/spec-engine/*`: queue snapshot, queue actions (release-feedback, redispatch, clean-workspace, teardown), config get/put, kill-switch get/post, run spend
     - Every mutating handler passes an operator-only guard that refuses app-minted tokens with 403 plus a security event, tested at route level; every file and database read runs off the event loop
     - Write handlers against the engine library directly; the deleted surface in git history is a capability checklist, not a source to copy
@@ -61,8 +61,8 @@ no capability is surfaceless for longer than a wave.
     - Add `ui.pages` (route `/spec-engine`) and `backend.routes` to the manifest; retire `test_declares_no_ui` with a reasoned replacement; keep `defaultEnabled` false
     - Add `page_label` and any new strings to all thirteen catalogs (generated pseudo-locale via the script, countless strings, Korean dual particles, context entries for short strings); restore `pageLabel` to the app-store key table for spec-engine; manifest-sync gate green by real exit status
     - _Requirements: 5.1, 5.2, 5.5_
-- [ ] 5. Design before pixels
-  - [ ] 5.1 Mockups and recorded selection
+- [x] 5. Design before pixels
+  - [x] 5.1 Mockups and recorded selection
     - Produce at least two materially different self-contained HTML mockups of the Operator_Surface (layout, density, and interaction model must differ, not shades of one idea), built with the dashboard's real theme tokens
     - Cover: run review and operation as the primary activity, first-run setup entry, review queue with bounded untrusted text, config editing, kill switch and spend
     - A REVIEWER agent selects one against recorded criteria; commit mockups plus the written rationale; mark the selection VETO-PENDING for the owner in the task record and final report
@@ -150,5 +150,8 @@ no capability is surfaceless for longer than a wave.
     exempted. **4.3 owns the scan ROOTS and must not narrow the suffixes.**
 
 - **For 6.1 (from 4.4's review, two unrecorded shared-file obligations):** `website/src/apps/builtinIcons.tsx` must register `Cog` (unregistered today — the app store falls back to the generic Package glyph) and `website/src/apps/builtinRegistry.ts` must map `/spec-engine` (unmapped today — the route redirects to /chat). Both files sit outside the declared roots, so each needs its own reviewed BOUNDARY_ALLOWLIST entry with a one-line justification.
+- **For 6.3 (from 4.2's review):** the backend serves only the PERSISTED config document — the deleted predecessor also served an effective/resolved view (`ConfigStore.effective_settings`, value-in-force plus origin, narrowed by project/source) and no route exposes it now. The selected mockup shows config.json as the write path and the resolved view beside it as a read, so 6.3 must either add that read route or record the narrowed scope as a deliberate disposition.
+- **For 6.2 and 6.4 (from 5.1's review):** mockup-b's docked inspector is STATIC below its header — selecting the budget-parked or closed run still shows the first run's documents/findings/spend/teardown. Treat the inspector's per-row binding as unresolved design, not fidelity: bind those panes to the selected row for real.
+- **Disposition (criteria checkability, from 5.1's review):** criteria.md's "checkable rather than asserted" ordering claim is overstated — all five design files land in one commit, so criteria-before-judging is not verifiable from history. Process-conformant (disclosed, owner-vetoable) and the selection stands; recorded so the claim is not repeated as fact.
 - **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
 - **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.

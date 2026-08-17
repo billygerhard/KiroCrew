@@ -246,11 +246,17 @@ class TestTheFencedHalfIsWhereTheSurfacesDiverge:
     the fence separating them, so the scope means something.
     """
 
+    def test_the_fence_is_not_empty(self) -> None:
+        """Pinned outside the parametrization below, because an empty
+        parametrize SKIPS under this repo's pytest config (no
+        ``empty_parameter_set_mark`` override) — it does not fail. A fence that
+        emptied out would otherwise pass this class on nothing."""
+        assert CONFIG_ONLY_PATHS
+
     @pytest.mark.parametrize("path", sorted(CONFIG_ONLY_PATHS))
     def test_the_fenced_paths_are_the_documented_ones(self, path: str) -> None:
         """Read from the engine, so a path added to the fence is covered here
-        without an edit — and a fence that emptied out fails the parametrization
-        rather than passing on nothing."""
+        without an edit."""
         assert path and isinstance(path, str)
 
     def test_the_unconfirmed_surface_refuses_what_the_route_accepts(self, tmp_path: Path) -> None:

@@ -162,12 +162,14 @@ Applied to B:
 - **A's drawer accessibility work (focus trap, Escape, `aria-modal`) is unbuilt
   cost, not absent cost.** Recorded in case the veto restores A.
 
-## Where the mockups live, and why not where the task said
+## Where the mockups live
 
-The task record directed
-`src/kiro_crew/apps/builtins/spec_engine/design/`. These files are in the
-Spec_App's **other** declared root, `website/src/apps/spec-engine/design/`,
-because the directed path fails a real gate:
+An early draft of this task's brief used
+`src/kiro_crew/apps/builtins/spec_engine/design/` as its example location; the
+spec's own record (design.md, and the requirement covering the frontend root)
+points at `website/src/apps/spec-engine/`. These files are in the Spec_App's
+frontend root, `website/src/apps/spec-engine/design/`, and the Python-tree
+location was ruled out by a real gate, not by preference:
 `test_public_build_posture.py::TestBundledResourcesArePackaged::test_every_bundled_non_python_file_is_packaged`
 requires every non-`.py` file under the app's Python tree to be covered by a
 `setup.cfg` `package_data` glob. Verified empirically, not assumed — a probe
@@ -182,8 +184,10 @@ The three ways out and why this one:
   artifacts are not tests.
 - **Chosen: `website/src/apps/spec-engine/design/`** — inside `DECLARED_ROOTS`,
   so the App_Boundary_Fence admits it with no allowlist change; not packaged
-  into the wheel; not picked up by the provenance UI scan
-  (`UI_SUFFIXES` is `.ts`/`.tsx`); and not a Vite build entry, because
+  into the wheel; **provenance-scanned deliberately** — `UI_SUFFIXES` was
+  widened to include `.html`/`.md` in the same change, so these artifacts are
+  scanned rather than exempted (proven non-vacuous with a planted internal
+  endpoint the scan reported by path); and not a Vite build entry, because
   `appWindowEntries()` reads only the direct children of `src/apps/<app>/` and
   these sit one level deeper. It is also where the components they describe will
   live.
