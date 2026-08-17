@@ -669,6 +669,29 @@ APP_PACKAGE = (__package__ or "").rsplit(".", 1)[0]
 #: asserts rather than assumes.
 PROVENANCE_SUFFIXES = frozenset({".py", ".json", ".md"})
 
+#: The repository root, derived from this module's own location rather than spelled.
+REPO_ROOT = APP_ROOT.parents[3].parent
+
+#: The Spec_Builder_UI's trees. Requirement 28's subject is THE Spec_App, and the
+#: UI is a component of it: it ships its own agent-directed prompt text
+#: (``prompts.ts``) and its own fixtures. Rooting the scan at :data:`APP_ROOT`
+#: alone would licence a clean-tree belief for a whole component nobody reads,
+#: which is the false negative this module exists to prevent. The rules are NOT
+#: restated for TypeScript — the same :func:`_non_public_references` runs over
+#: these files, because a second spelling of a rule is a second thing to get wrong.
+UI_ROOTS = (
+    REPO_ROOT / "website" / "src" / "apps" / "spec-builder",
+    REPO_ROOT / "website" / "src" / "apps" / "spec-engine",  # absent today; scanned if added
+)
+
+#: The UI's own test files, which live in the shared website test directory rather
+#: than under the app directory, so they need naming rather than walking.
+UI_TEST_ROOT = REPO_ROOT / "website" / "src" / "test"
+UI_TEST_GLOB = "SpecBuilder*"
+
+#: File kinds the UI ships.
+UI_SUFFIXES = frozenset({".ts", ".tsx"})
+
 #: Name suffixes reserved by RFC 2606 and RFC 6761 for documentation and testing.
 #: A host under one of these can never resolve, so it cannot be an address of
 #: anything, public or not — which is what makes a fixture that uses one provably
@@ -707,6 +730,40 @@ _URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]*://(?P<host>[^\s/?#'\"`)\]}>,;|\\
 #: ``BUSY_TIMEOUT_S = 10.0``, which is how a check gets disabled.
 _IPV4_RE = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])")
 
+#: A scheme-relative URL (``//host/path``), which is an endpoint with the scheme
+#: left to the page. Anchored to a quote or line start so that a comment's ``//``
+#: and a doubled path separator cannot match.
+_SCHEME_RELATIVE_RE = re.compile(r"""(?:^|["'`(\s])//(?P<host>[a-z0-9.\-]+\.[a-z]{2,})(?=[/"'`\s)]|$)""")
+
+#: A bare IPv6 literal. Every hit is parsed before it is judged, which is what
+#: keeps a timestamp or a slice expression from matching — an unparseable hit is
+#: not an address. Symmetric with the IPv4 rule above; its absence was a hole.
+_IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])")
+
+#: Top-level names a bare (scheme-less) host may end in. Deliberately a small
+#: closed list of GENERIC names — no organization's own name appears here, so the
+#: rule can exist without violating the provenance it enforces. The list is what
+#: separates a hostname from the dotted things this tree is full of: a module
+#: path, a filename, a config key, a version. Only real top-level names are
+#: listed, learned the hard way: drafting this with ``stage`` and ``prod`` in it
+#: fired on ``EVENT_STAGE = "delivery.stage"`` and two preset fixtures, and a rule
+#: that fires on ordinary dotted keys is a rule someone switches off.
+_BARE_HOST_TLDS = (
+    "com", "net", "org", "io", "dev", "co", "ai", "cloud", "app", "sh", "gov", "edu",
+    "corp", "internal", "intranet", "local",
+)
+
+#: A QUOTED dotted host with no scheme, which is the commonest accidental spelling
+#: of an endpoint: a constant holding just the host, with the scheme added later.
+#: Quoting is required because an unquoted dotted word in prose is vocabulary, not
+#: an address, and this rule must not become the ordinary-word rule it cannot be.
+_BARE_HOST_RE = re.compile(
+    r"""["'`](?P<host>(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+(?:"""
+    + "|".join(_BARE_HOST_TLDS)
+    + r"""))["'`/]""",
+    re.IGNORECASE,
+)
+
 #: HTTP headers that carry authentication or identity. The trailing colon is
 #: required so prose naming a header in a sentence does not fire.
 _AUTH_HEADER_RE = re.compile(
@@ -735,12 +792,17 @@ _CREDENTIAL_RE = re.compile(
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/=\-]{16,}"
 )
 
-#: Marker of a documentation placeholder, by the same convention the reserved
-#: TLDs above use. The AWS documentation key ``AKIAIOSFODNN7EXAMPLE`` appears in
-#: this app's redaction test, where its whole point is being scrubbed from
-#: output; a credential shape that does not say EXAMPLE is not exempt, which
-#: ``credential-key`` among the planted cases proves.
-_DOC_PLACEHOLDER = "EXAMPLE"
+#: Documentation placeholders exempt from the credential rules, listed EXACTLY.
+#:
+#: This was a substring test for ``EXAMPLE`` anywhere in the hit, and that was a
+#: hole rather than a convention: a review demonstrated that a token of the form
+#: ``gh`` + ``p_EXAMPLE`` + 24 more characters passed the scan, because the word
+#: appeared somewhere inside it. Proving the old form was load-bearing (a key
+#: without the word is caught) is not the same as proving it was narrow. Exact
+#: membership closes it: the one real placeholder this tree needs is the AWS
+#: documentation key, which appears in the redaction test where its whole point
+#: is being scrubbed from output.
+_DOC_PLACEHOLDER_CREDENTIALS = frozenset({"AKIA" + "IOSFODNN7EXAMPLE"})
 
 #: An identifier component that means "this holds a credential". Whole components
 #: only, so ``authoring`` is not an ``auth`` and ``TOKEN_BUCKET`` is only a
@@ -794,6 +856,37 @@ def _provenance_files() -> list[Path]:
     )
 
 
+def _ui_files() -> list[Path]:
+    """The Spec_Builder_UI's own files, scanned by the same rules as the app tree.
+
+    A component of the Spec_App that the scan never reads is a hole in the
+    guarantee, not a smaller guarantee: requirement 28 is about the app, and the
+    UI ships prompt text and fixtures of its own.
+    """
+    found: list[Path] = []
+    for root in UI_ROOTS:
+        if not root.is_dir():
+            continue  # spec-engine has no UI today; scanned the moment it gains one
+        found.extend(
+            path for path in root.rglob("*") if path.is_file() and path.suffix in UI_SUFFIXES
+        )
+    if UI_TEST_ROOT.is_dir():
+        found.extend(
+            path
+            for path in UI_TEST_ROOT.glob(UI_TEST_GLOB)
+            if path.is_file() and path.suffix in UI_SUFFIXES
+        )
+    return sorted(found)
+
+
+def _display(path: Path) -> str:
+    """A path as written in an offender report: repo-relative, so both roots read alike."""
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def _host_of(raw: str) -> str:
     """The bare host of a URL authority: no userinfo, no port, lowercased."""
     host = raw.rsplit("@", 1)[-1].strip().lower().rstrip(".")
@@ -833,12 +926,27 @@ def _non_public_references(text: str) -> list[tuple[int, str]]:
             host = _host_of(match.group("host"))
             if not _host_is_public(host):
                 found.append((index, f"non-public endpoint host {host!r}"))
+        for match in _SCHEME_RELATIVE_RE.finditer(line):
+            host = _host_of(match.group("host"))
+            if not _host_is_public(host):
+                found.append((index, f"non-public scheme-relative host {host!r}"))
+        for match in _BARE_HOST_RE.finditer(line):
+            host = match.group("host").lower().rstrip(".")
+            if not _host_is_public(host):
+                found.append((index, f"non-public host literal {host!r}"))
         for match in _IPV4_RE.finditer(line):
             try:
                 address = ipaddress.IPv4Address(match.group(0))
             except ValueError:
                 continue
             if not address.is_loopback:
+                found.append((index, f"network address literal {match.group(0)!r}"))
+        for match in _IPV6_RE.finditer(line):
+            try:
+                six = ipaddress.IPv6Address(match.group(0))
+            except ValueError:
+                continue  # not an address: a timestamp, a slice, a dict of hex
+            if not (six.is_loopback or six.is_unspecified):
                 found.append((index, f"network address literal {match.group(0)!r}"))
         for regex, label in (
             (_AUTH_HEADER_RE, "auth header"),
@@ -848,7 +956,7 @@ def _non_public_references(text: str) -> list[tuple[int, str]]:
             if header:
                 found.append((index, f"{label} literal {header.group(0)!r}"))
         for match in _CREDENTIAL_RE.finditer(line):
-            if _DOC_PLACEHOLDER in match.group(0).upper():
+            if match.group(0).upper() in _DOC_PLACEHOLDER_CREDENTIALS:
                 continue
             found.append((index, f"credential shape {match.group(0)[:12]!r}..."))
     return found
@@ -860,7 +968,7 @@ def _secret_shaped(value: Any) -> bool:
         and bool(_SECRET_SHAPE_RE.match(value))
         and any(character.isdigit() for character in value)
         and any(character.isalpha() for character in value)
-        and _DOC_PLACEHOLDER not in value.upper()
+        and value.upper() not in _DOC_PLACEHOLDER_CREDENTIALS
     )
 
 
@@ -1068,13 +1176,20 @@ def _prompt_texts() -> dict[str, str]:
     return texts
 
 
-#: Planted hosts and addresses. Invented, and assembled into URLs at runtime by
-#: :func:`_planted_url` so the offending form never appears as a literal here.
-_PLANTED_FQDN = "review-service.somecorp.net"
-_PLANTED_SUBDOMAIN = "specs.eng.somecorp.co"
+#: Planted hosts and addresses. Invented, and assembled from parts at runtime so
+#: the offending form never appears as a literal here — including the HOST itself,
+#: not just the URL around it. The host constants were previously written whole,
+#: which was only safe while the scan could not see a scheme-less host; once the
+#: bare-host rule existed the scan reported this very file, which is the check
+#: working on its own author.
+_PLANTED_FQDN = "review-service." + "somecorp" + ".net"
+_PLANTED_SUBDOMAIN = "specs.eng." + "somecorp" + ".co"
 _PLANTED_SHORT_HOST = "buildhost"
 _PLANTED_PRIVATE_IP = "10.20" + ".30.40"
 _PLANTED_LAN_IP = "192.168" + ".7.7"
+#: Split after the third group: each half alone is an unparseable fragment, so the
+#: IPv6 rule (which judges only what parses) does not report this file for it.
+_PLANTED_IPV6 = "fd00:1234:" + ":9"
 
 #: Planted credential tails, split so no whole credential is a literal.
 _PLANTED_KEY_TAIL = "3XMPLQR7ZZTOPKID"
@@ -1098,13 +1213,29 @@ class TestNoNonPublicReferenceIsInTheTree:
       host, no scheme, no argv position, no credential shape. That is not
       decidable from text, and the names could not be listed here anyway without
       putting them in the tree. Where such a name would actually do damage it is
-      reachable: inside a hostname (the endpoint rule), as the program of a
-      bundled command (:class:`TestOnlyPublicPresetsAreBundled`), or as an in-tree
-      provider implementation (:class:`TestDelegatedProvidersAreConfigurationOnly`).
+      reachable: inside a hostname (the endpoint and bare-host rules), as the
+      program of a bundled command (:class:`TestOnlyPublicPresetsAreBundled`), or
+      as an in-tree provider implementation
+      (:class:`TestDelegatedProvidersAreConfigurationOnly`).
       A bare word in prose is left to review.
     * A credential of a shape not listed — a bare high-entropy string bound to an
       innocuous name reads exactly like a test fixture.
-    * Anything outside this app's tree. The scan is rooted at :data:`APP_ROOT`.
+    * **An UNQUOTED bare hostname**, and a quoted one whose top-level name is not
+      in :data:`_BARE_HOST_TLDS`. The bare-host rule requires quoting and a real
+      top-level name on purpose: this tree is full of dotted things that are not
+      addresses (module paths, filenames, config keys, event names, versions), and
+      a rule that fired on ``"delivery.stage"`` would be switched off within a day.
+      A conservative rule over unquoted text would need a public-suffix list this
+      module deliberately does not carry. So: a host in a string constant is seen;
+      a host in prose, or under a top-level name nobody listed, is not.
+    * **File and directory NAMES.** The scan reads file CONTENT only, so a
+      non-public system name used as a filename passes. Contiguous with the
+      ordinary-word gap above, and stated because it is not obvious.
+    * Anything outside the trees scanned: this app (:data:`APP_ROOT`) and the
+      Spec_Builder_UI (:data:`UI_ROOTS`, :data:`UI_TEST_ROOT`). The UI is scanned
+      because requirement 28's subject is the Spec_App, of which it is a
+      component; earlier this class read only the app tree, which meant it
+      licensed a clean-tree belief for a whole component it never opened.
     """
 
     def test_the_scan_reads_the_whole_tree(self) -> None:
@@ -1134,8 +1265,9 @@ class TestNoNonPublicReferenceIsInTheTree:
 
     def test_the_tree_names_no_non_public_endpoint_header_or_credential(self) -> None:
         offenders: list[str] = []
-        for path in _provenance_files():
-            relative = path.relative_to(APP_ROOT).as_posix()
+        scanned = _provenance_files() + _ui_files()
+        for path in scanned:
+            relative = _display(path)
             for line, detail in _non_public_references(path.read_text(encoding="utf-8")):
                 offenders.append(f"{relative}:{line}: {detail}")
         assert offenders == [], (
@@ -1144,6 +1276,42 @@ class TestNoNonPublicReferenceIsInTheTree:
             "repository: an internal endpoint, address, header, or credential "
             "cannot be checked in, in code or in a docstring."
         )
+
+    def test_the_user_interface_tree_is_scanned_too(self) -> None:
+        """The UI is a component of the Spec_App, so the same rules must reach it.
+
+        Asserted separately from the scan above because that one passes vacuously
+        if the UI file list is empty — which is exactly how a whole component
+        stays unread while the gate reports a clean tree.
+        """
+        files = _ui_files()
+        assert len(files) > 10, f"the UI tree is barely scanned: {[_display(p) for p in files]}"
+        names = {_display(path) for path in files}
+        for expected in (
+            "website/src/apps/spec-builder/prompts.ts",
+            "website/src/apps/spec-builder/api.ts",
+            "website/src/apps/spec-builder/SpecBuilderPage.tsx",
+        ):
+            assert expected in names, f"{expected} is outside the provenance scan"
+        assert any(
+            name.startswith("website/src/test/SpecBuilder") for name in names
+        ), "the UI's own test fixtures are outside the provenance scan"
+
+    def test_the_user_interfaces_prompt_text_is_inventoried(self) -> None:
+        """The UI ships agent-directed prompt text, so it belongs to the ledger.
+
+        Requirement 28.3 is about ALL shipped prompt text. The UI's prompts are
+        not Python constants, so the in-tree resolution the ledger proves for
+        ``guidance.py`` does not apply — what is asserted here is narrower and
+        honest: the file exists, it is scanned by the text rules, and a reviewer
+        is told to read it.
+        """
+        prompts = UI_ROOTS[0] / "prompts.ts"
+        assert prompts.is_file(), "the UI's prompt module moved; the inventory is stale"
+        assert prompts in set(_ui_files()), "the UI's prompt text is not scanned"
+        text = prompts.read_text(encoding="utf-8")
+        assert text.strip(), "an empty prompt module would satisfy this vacuously"
+        assert _non_public_references(text) == [], "the UI's prompt text names something non-public"
 
     def test_no_credential_is_bound_to_a_credential_named_symbol(self) -> None:
         offenders: list[str] = []
@@ -1162,6 +1330,14 @@ class TestNoNonPublicReferenceIsInTheTree:
             pytest.param(_planted_url(_PLANTED_SUBDOMAIN), id="endpoint-subdomain"),
             pytest.param(_planted_url(_PLANTED_SHORT_HOST), id="endpoint-single-label"),
             pytest.param(_planted_url(_PLANTED_PRIVATE_IP), id="endpoint-private-ip"),
+            pytest.param(f"TRACKER_HOST = {_PLANTED_FQDN!r}", id="bare-host-no-scheme"),
+            pytest.param(f'SPECS = "{_PLANTED_SUBDOMAIN}/api"', id="bare-host-with-path"),
+            pytest.param(f'SRC = "//{_PLANTED_FQDN}/lib.js"', id="scheme-relative-url"),
+            pytest.param(f'PEER = "{_PLANTED_IPV6}"', id="address-literal-ipv6"),
+            pytest.param(
+                "TOKEN = " + repr("gh" + "p_EXAMPLE" + "aB1cD2eF3gH4iJ5kL6mN7oP8"),
+                id="credential-containing-the-placeholder-word",
+            ),
             pytest.param(f"HOST = {_PLANTED_LAN_IP!r}", id="address-literal-no-url"),
             pytest.param(
                 "# reachable at " + _planted_url(_PLANTED_FQDN), id="endpoint-in-a-comment"
