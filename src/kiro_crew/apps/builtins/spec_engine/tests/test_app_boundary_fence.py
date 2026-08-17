@@ -114,6 +114,10 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "The manifest-sync gate, made bidirectional for a card with no page.",
     ),
     (
+        "src/kiro_crew/apps/builtins/__init__.py",
+        "The shared builtin roster; a builtin's routes register only from that list.",
+    ),
+    (
         "src/kiro_crew/apps/approval_grants.py",
         "App Kit platform module owning per-app approval grants for every app.",
     ),
