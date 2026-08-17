@@ -42,7 +42,7 @@ no capability is surfaceless for longer than a wave.
     - Drive all five through the existing stdio conformance harness: tools/list advertises them with schemas, tools/call round-trips each, error shapes are structured refusals not stack traces
     - Non-vacuity: a positive control per tool proving the harness observes a real effect (a written config, a returned plan), not merely a 200-shaped reply
     - _Requirements: 3.1, 3.2, 3.3, 4.1, 4.2_
-- [ ] 4. The app's own surface plumbing
+- [x] 4. The app's own surface plumbing
   - [x] 4.1 Join BUILTIN_NAMES deliberately
     - Add `spec_engine` to `BUILTIN_NAMES`; rewrite the pin test's recorded reasoning to state what the entry now buys (the dashboard route-registration loop) and keep the test failing for an entry added without reading it
     - _Requirements: 5.1, 5.3_
@@ -52,7 +52,7 @@ no capability is surfaceless for longer than a wave.
     - Write handlers against the engine library directly; the deleted surface in git history is a capability checklist, not a source to copy
     - Config route and `write_config` tool produce byte-identical files for the same patch (design Property 1)
     - _Requirements: 5.1, 5.3, 4.4_
-  - [ ] 4.3 Posture distinction: inbound serving versus outbound transmission
+  - [x] 4.3 Posture distinction: inbound serving versus outbound transmission
     - Engine trees keep the full network denylist; `backend/` alone may import aiohttp, with an AST check asserting no outbound constructor reference (`ClientSession`, `request`, `TCPConnector`, `UnixConnector`); state the distinction in the boundary docstring and fail when it cannot be drawn
     - Planted cases in both directions: an aiohttp import inside `engine/` is reported, and an outbound constructor reference inside `backend/` is reported
     - Extend the frontend provenance scan roots to `website/src/apps/spec-engine/`
@@ -68,7 +68,7 @@ no capability is surfaceless for longer than a wave.
     - A REVIEWER agent selects one against recorded criteria; commit mockups plus the written rationale; mark the selection VETO-PENDING for the owner in the task record and final report
     - _Requirements: 6.1, 6.3_
 - [ ] 6. The Operator_Surface, from the selected mockup
-  - [ ] 6.1 Page shell, routing, and API client
+  - [x] 6.1 Page shell, routing, and API client
     - `website/src/apps/spec-engine/`: `SpecEnginePage.tsx` matching the selected mockup's layout, an `api.ts` for `/api/apps/spec-engine/*` written against the real route handlers, and first-run detection that leads with the setup flow when `get_config` reports no configuration
     - _Requirements: 5.4, 6.2, 6.5_
   - [ ] 6.2 Review queue panel
@@ -153,6 +153,8 @@ no capability is surfaceless for longer than a wave.
 - **For 6.3 (from 4.2's review):** the backend serves only the PERSISTED config document — the deleted predecessor also served an effective/resolved view (`ConfigStore.effective_settings`, value-in-force plus origin, narrowed by project/source) and no route exposes it now. The selected mockup shows config.json as the write path and the resolved view beside it as a read, so 6.3 must either add that read route or record the narrowed scope as a deliberate disposition.
 - **For 6.2 and 6.4 (from 5.1's review):** mockup-b's docked inspector is STATIC below its header — selecting the budget-parked or closed run still shows the first run's documents/findings/spend/teardown. Treat the inspector's per-row binding as unresolved design, not fidelity: bind those panes to the selected row for real.
 - **For 6.2 (from 6.1's review):** the corrected mockup's row-level state words (`revisions spent`, `N held`, `N workspaces kept` — post-selection correction 3 in design/selection.md) are absent from the shell's rows; `revision_exhausted` surfaces only in the inspector's why line, and `feedback_quarantined`/`feedback_needs_human` are transcribed into QueueEntry but rendered nowhere. 6.2 owns rendering them on the row per the corrected mockup.
+- **For 6.2/6.4 (from 6.1's round-2 review, strip and shell leftovers):** (a) the strip renders confident zeros while the queue read is PENDING — branch on isPending too (the error state is fixed; pending is the same argument one state earlier); (b) on a failed kill-switch read the dot stays green (`data-engaged="false"` → var(--ok)) beside text saying the switch could not be read — doubt must not read released on the visual channel; the test pins only the text; (c) the `pane === null` pending shell has no covering test; (d) api.ts's REFUSAL docstring still overstates — the page branches on no code today, and the `__testing` re-export of REFUSAL is dead; restate or drop when the first real branch lands.
+- **Disposition (mockup narrowing, from 6.1's round-2 review):** mockup-b carries working/closed filters, an "In flight" count and a ceiling meter, but `/queue` vends only runs waiting on a person and no route vends a global ceiling — the shell's narrowing is correct given the routes. Recorded so 6.2/6.4 treat those affordances as requiring either a new read route or a recorded omission, not as shell bugs.
 - **Disposition (criteria checkability, from 5.1's review):** criteria.md's "checkable rather than asserted" ordering claim is overstated — all five design files land in one commit, so criteria-before-judging is not verifiable from history. Process-conformant (disclosed, owner-vetoable) and the selection stands; recorded so the claim is not repeated as fact.
 - **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
 - **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.
