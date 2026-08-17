@@ -198,6 +198,10 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "Workspace-local scratch for build and gate logs; carries no source.",
     ),
     (
+        "website/tmp/",
+        "The frontend's own scratch for gate logs and throwaway helpers; nothing ships from it.",
+    ),
+    (
         ".spec_engine_mutation_probe.lock",
         "Lock the engine's mutation-probe harness leaves beside the tree; carries no source.",
     ),
@@ -210,6 +214,7 @@ ALLOWLIST_MAY_MATCH_NOTHING = frozenset(
     {
         ".kirocrew-spec-test/",  # created by a harness run, absent on a clean checkout
         "tmp/",  # created by a gate run, absent on a clean checkout
+        "website/tmp/",  # created by a frontend gate run, absent on a clean checkout
         # Created by a mutation-probe run and deliberately never unlinked --
         # ``mutation_probe._tree_lock`` explains why removing it would reopen the
         # race the lock closes -- so it is absent until the first probe runs.
