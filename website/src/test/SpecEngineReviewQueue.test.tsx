@@ -412,8 +412,9 @@ describe('teardown', () => {
     // that fails on a run with no kept rows yields complete:false, kept:[].
     // The emittable shape: stage carries the outcome (failed / timed_out /
     // refused) and stage_reason is EMPTY — the engine only populates the
-    // reason when no stage ran at all, and that report is complete. Rendering
-    // "workspaces were kept" here would misname the failure.
+    // reason when no stage ran at all, and that report is complete. The
+    // outcome is appended only when it says more than the sentence (a bare
+    // 'failed' would stutter), so the fixture uses timed_out.
     renderWith([entry()], {
       teardown: {
         body: {
@@ -425,7 +426,7 @@ describe('teardown', () => {
             forced: false,
             removed: [],
             kept: [],
-            stage: 'failed',
+            stage: 'timed_out',
             stage_reason: '',
           },
         },
@@ -436,7 +437,7 @@ describe('teardown', () => {
     await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
     expect(screen.getByText(new RegExp(T.the_teardown_stage_failed))).toBeInTheDocument()
     // The cause the payload actually carries: the stage outcome.
-    expect(screen.getByText('failed')).toBeInTheDocument()
+    expect(screen.getByText('timed_out')).toBeInTheDocument()
     // The kept sentence must be absent — nothing was kept, and the neutral
     // headline no longer asserts otherwise.
     expect(screen.queryByText(T.kept_workspaces_are_still_standing)).toBeNull()

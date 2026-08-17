@@ -163,7 +163,12 @@ export function UntrustedText({ text }: { text: string }) {
       <p className="se-untrusted-body">{text}</p>
       {/* Countless: the label does not name a line count, so it needs no plural
           form in any catalog and cannot disagree with the text it reveals. */}
-      <button type="button" className="se-untrusted-more" onClick={() => setOpen(!open)}>
+      <button
+        type="button"
+        className="se-untrusted-more"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+      >
         {i18nT(
           open
             ? 'apps.specEngine.reviewQueuePanel.collapse'
@@ -361,45 +366,53 @@ function HeldBlock({ entry }: { entry: QueueEntry }) {
               </div>
             </div>
           )}
-          <IdField
-            label={i18nT('apps.specEngine.reviewQueuePanel.comment_identifier')}
-            hint={i18nT('apps.specEngine.reviewQueuePanel.the_queue_carries_a_count_not_the_ids')}
-            value={commentId}
-            onChange={setCommentId}
-          />
-          <div className="se-acts">
-            <button
-              type="button"
-              className="se-btn"
-              disabled={commentId.trim() === '' || release.isPending}
-              onClick={() => release.mutate()}
-            >
-              {i18nT('apps.specEngine.reviewQueuePanel.release_the_comment')}
-            </button>
-          </div>
-          {release.isError && (
-            <Refused
-              // A 409 from the engine and a 503 from the store are different
-              // answers: the first is a rule (this run's machine records the
-              // release nowhere), the second is a failure that may succeed on a
-              // retry. Presenting both as "could not release" would tell an
-              // operator to retry something that will refuse again forever.
-              title={i18nT(
-                codeOf(release.error) === REFUSAL.releaseRefused
-                  ? 'apps.specEngine.reviewQueuePanel.the_engine_refused_the_release'
-                  : 'apps.specEngine.reviewQueuePanel.the_release_failed',
+          {/* The release control exists only while something is actually held:
+              with zero held comments it could only ever answer "nobody held
+              that comment", and a control that refuses on every click is worse
+              than an absent one — the same rule the redispatch block applies. */}
+          {held > 0 && (
+            <>
+              <IdField
+                label={i18nT('apps.specEngine.reviewQueuePanel.comment_identifier')}
+                hint={i18nT('apps.specEngine.reviewQueuePanel.the_queue_carries_a_count_not_the_ids')}
+                value={commentId}
+                onChange={setCommentId}
+              />
+              <div className="se-acts">
+                <button
+                  type="button"
+                  className="se-btn"
+                  disabled={commentId.trim() === '' || release.isPending}
+                  onClick={() => release.mutate()}
+                >
+                  {i18nT('apps.specEngine.reviewQueuePanel.release_the_comment')}
+                </button>
+              </div>
+              {release.isError && (
+                <Refused
+                  // A 409 from the engine and a 503 from the store are different
+                  // answers: the first is a rule (this run's machine records the
+                  // release nowhere), the second is a failure that may succeed on a
+                  // retry. Presenting both as "could not release" would tell an
+                  // operator to retry something that will refuse again forever.
+                  title={i18nT(
+                    codeOf(release.error) === REFUSAL.releaseRefused
+                      ? 'apps.specEngine.reviewQueuePanel.the_engine_refused_the_release'
+                      : 'apps.specEngine.reviewQueuePanel.the_release_failed',
+                  )}
+                  error={release.error}
+                />
               )}
-              error={release.error}
-            />
-          )}
-          {release.isSuccess && (
-            <p className="se-note" data-released={release.data.released ? 'true' : 'false'}>
-              {i18nT(
-                release.data.released
-                  ? 'apps.specEngine.reviewQueuePanel.the_comment_was_released'
-                  : 'apps.specEngine.reviewQueuePanel.nobody_held_that_comment',
+              {release.isSuccess && (
+                <p className="se-note" data-released={release.data.released ? 'true' : 'false'}>
+                  {i18nT(
+                    release.data.released
+                      ? 'apps.specEngine.reviewQueuePanel.the_comment_was_released'
+                      : 'apps.specEngine.reviewQueuePanel.nobody_held_that_comment',
+                  )}
+                </p>
               )}
-            </p>
+            </>
           )}
         </>
       )}
@@ -568,8 +581,13 @@ function TeardownBlock({
           {stageFailed && (
             <p className="se-note">
               {i18nT('apps.specEngine.reviewQueuePanel.the_teardown_stage_failed')}
-              {result.report?.stage ? ' ' : ''}
-              {result.report?.stage && <span className="se-m">{result.report.stage}</span>}
+              {/* The outcome value is appended only when it says more than the
+                  sentence already does: the commonest value is 'failed', and
+                  "the teardown stage failed. failed" reads as a stutter. */}
+              {result.report?.stage && result.report.stage !== 'failed' ? ' ' : ''}
+              {result.report?.stage && result.report.stage !== 'failed' && (
+                <span className="se-m">{result.report.stage}</span>
+              )}
             </p>
           )}
           {!result.complete && keptRows.length > 0 && (
