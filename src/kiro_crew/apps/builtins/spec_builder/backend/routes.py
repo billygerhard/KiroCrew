@@ -2314,12 +2314,14 @@ def _seed_prompt(spec_type: str, name: str, spec_dir: Path, working_dir: str, de
     """The opening turn for a new spec.
 
     SELF-CONTAINED by choice: everything the agent needs is stated here rather
-    than deferred to the ``spec-workflow`` skill this app's manifest declares.
-    A builtin's declared skills and MCP servers DO reach a session (registration
-    resolves them against the packaged app root), so a skill reference would
-    resolve — but a seed that carries its own rules cannot be silently weakened
-    by a skill that fails to register, and it lets the prompt list only the
-    documents the chosen spec type actually calls for.
+    than deferred to a skill. This app declared a ``spec-workflow`` skill until
+    that skill was retired for stating a document format the engine's own native
+    validator rejects; the manifest now declares none, so there is no skill left
+    to defer to. The reasoning outlives the skill: a builtin's declared skills DO
+    reach a session (registration resolves them against the packaged app root),
+    so a reference would have resolved — but a seed carrying its own rules cannot
+    be silently weakened by a skill that fails to register, and it lets the prompt
+    list only the documents the chosen spec type actually calls for.
     """
     desc = f"\n\nThe user's initial description:\n{description.strip()}" if description.strip() else ""
     # The deliverables are the engine's document plan for this type, never a list

@@ -839,9 +839,7 @@ class TestAPartialGraphIsUnconstructable:
             dataclasses.replace(graph, audit=AuditLog(root=tmp_path / "second-audit"))
         assert "audit log" in str(caught.value)
 
-    def test_replace_cannot_leave_the_graph_scoped_to_another_project(
-        self, tmp_path: Path
-    ) -> None:
+    def test_replace_cannot_leave_the_graph_scoped_to_another_project(self, tmp_path: Path) -> None:
         """A graph's project has to agree with the one its collaborators baked in.
 
         ``replace(graph, project=...)`` rebuilds nothing: the machine, registry and
