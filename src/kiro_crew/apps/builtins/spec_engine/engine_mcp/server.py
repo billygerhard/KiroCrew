@@ -21,8 +21,10 @@ from typing import Any, Callable
 
 from kiro_crew.security import redact
 
+from ..engine.setup import InferredSubjectRefused, SetupApprovalRequired
 from .guidance import GuidanceUnavailable, get_authoring_guidance, get_guidance
 from .operations import EngineOperations
+from .setup_surface import refusal_payload
 
 #: JSON-RPC 2.0 error codes.
 _METHOD_NOT_FOUND = -32601
@@ -41,6 +43,48 @@ _MAX_RESULT_CHARS = 200_000
 ToolFn = Callable[[dict[str, Any], "EngineOperations | None"], "str | dict[str, Any]"]
 
 _STRING = {"type": "string"}
+
+#: The operator's answers, shared by ``plan_setup`` and ``apply_setup`` so the two
+#: cannot advertise different answer shapes for the same flow. Every field is
+#: optional in the schema and none is defaulted here: an unanswered rung and an
+#: unchosen cost profile are refusals the engine makes with a message naming what
+#: is missing, and a schema-level ``required`` would answer with a JSON-RPC error
+#: that names a key instead.
+_ANSWERS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "The operator's answers to the questions inspect_setup returned. "
+        "cost_profile and each autonomy confirmation are asked, never inferred."
+    ),
+    "properties": {
+        "cost_profile": {
+            **_STRING,
+            "description": "Bundled cost profile name the operator chose.",
+        },
+        "confirmations": {
+            "type": "object",
+            "description": (
+                "One true/false per autonomy rung above authoring, keyed by rung name. "
+                "Each rung is confirmed separately; a missing rung is unanswered, not no."
+            ),
+            "additionalProperties": {"type": "boolean"},
+        },
+        "approved_subjects": {
+            "type": "array",
+            "description": "Subjects of the inferences the operator accepted.",
+            "items": _STRING,
+        },
+        "workflow_preset": {
+            "type": ["string", "null"],
+            "description": "Offered workflow preset to write, or null for none.",
+        },
+        "watch_source": {
+            "type": ["string", "null"],
+            "description": "Offered watch source preset to write, or null for none.",
+        },
+    },
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -133,6 +177,73 @@ def _tool_advance_phase(args: dict[str, Any], ops: EngineOperations | None) -> d
         str(args["spec"]),
         str(args["actor"]),
         gate=str(gate) if gate is not None else None,
+    )
+
+
+def _refusing(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run *call*, returning a structured refusal for a setup refusal it raises.
+
+    A refusal is a decision the engine made and an answer the caller can act on --
+    which rung is unanswered, which preset was never offered, that the plan is
+    stale -- so it comes back as a result with a ``refused`` code rather than as a
+    protocol error carrying a class name. Anything else propagates: a broken setup
+    path must surface as a tool error, never as an empty plan or a refusal the
+    engine did not make.
+
+    The catch is written against the class chain the setup module actually raises,
+    not against what the names suggest: ``InferredSubjectRefused`` derives
+    ``ValueError`` and ``SetupApprovalRequired`` derives ``PermissionError`` (and
+    so ``OSError``). Catching them here, inside the handler, also puts them ahead
+    of the dispatcher's ``(ValueError, KeyError)`` clause, which would otherwise
+    turn the first into an invalid-arguments error and let the second fall through
+    to the internal-error clause.
+    """
+    try:
+        return call()
+    except (InferredSubjectRefused, SetupApprovalRequired) as exc:
+        refusal = refusal_payload(exc)
+        if refusal is None:  # pragma: no cover - both classes are in REFUSAL_CODES
+            raise
+        return refusal
+
+
+def _tool_inspect_setup(args: dict[str, Any], ops: EngineOperations | None) -> dict[str, Any]:
+    """Inspect a project: evidence read, values inferred, questions left to ask."""
+    name = args.get("name")
+    return _refusing(
+        lambda: _adapter(ops).inspect_setup(
+            str(args["project"]), name=str(name) if name is not None else None
+        )
+    )
+
+
+def _tool_plan_setup(args: dict[str, Any], ops: EngineOperations | None) -> dict[str, Any]:
+    """Compute the configuration plan a set of answers produces. Writes nothing."""
+    name = args.get("name")
+    answers = args.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError("answers must be an object holding the operator's answers")
+    return _refusing(
+        lambda: _adapter(ops).plan_setup(
+            str(args["project"]), answers, name=str(name) if name is not None else None
+        )
+    )
+
+
+def _tool_apply_setup(args: dict[str, Any], ops: EngineOperations | None) -> dict[str, Any]:
+    """Apply a plan by its identity, on a named human approver's authority."""
+    name = args.get("name")
+    answers = args.get("answers")
+    if not isinstance(answers, dict):
+        raise ValueError("answers must be an object holding the operator's answers")
+    return _refusing(
+        lambda: _adapter(ops).apply_setup(
+            str(args["project"]),
+            answers,
+            plan_id=str(args.get("plan_id") or ""),
+            approver=str(args.get("approver") or ""),
+            name=str(name) if name is not None else None,
+        )
     )
 
 
@@ -257,6 +368,69 @@ TOOLS: dict[str, ToolSpec] = {
             },
         },
         ("project", "spec", "actor"),
+        needs_ops=True,
+    ),
+    "inspect_setup": ToolSpec(
+        _tool_inspect_setup,
+        "Inspect a project and report what its own files state about how it works: the "
+        "evidence read, the values inferred from it with that evidence attached, the "
+        "questions that cannot be inferred and must be asked, and every bundled preset "
+        "the evidence makes applicable together with the commands that preset would run. "
+        "Read-only: it writes no configuration and spends nothing.",
+        {
+            "project": {**_STRING, "description": "Path to the project to set up."},
+            "name": {
+                **_STRING,
+                "description": (
+                    "Name to configure the project under (optional; defaults to the "
+                    "project directory's own name)."
+                ),
+            },
+        },
+        ("project",),
+        needs_ops=True,
+    ),
+    "plan_setup": ToolSpec(
+        _tool_plan_setup,
+        "Compute the configuration plan a set of answers produces, and apply nothing. "
+        "Returns the patch that would be written, the paths it would touch, and a "
+        "plan_id identifying it. Refuses when the cost profile was not chosen, when an "
+        "autonomy rung is unanswered, or when a selected preset was never offered.",
+        {
+            "project": {**_STRING, "description": "Path to the project to set up."},
+            "name": {
+                **_STRING,
+                "description": "Name to configure the project under (optional).",
+            },
+            "answers": _ANSWERS_SCHEMA,
+        },
+        ("project", "answers"),
+        needs_ops=True,
+    ),
+    "apply_setup": ToolSpec(
+        _tool_apply_setup,
+        "Write a computed setup plan through the engine's validated configuration path. "
+        "Requires the plan_id returned by plan_setup for the same project and answers, "
+        "and a non-empty approver naming the human who accepted the plan. Refuses "
+        "without an approver, and refuses a plan_id that no longer identifies the plan "
+        "these inputs produce.",
+        {
+            "project": {**_STRING, "description": "Path to the project to set up."},
+            "name": {
+                **_STRING,
+                "description": "Name to configure the project under (optional).",
+            },
+            "answers": _ANSWERS_SCHEMA,
+            "plan_id": {
+                **_STRING,
+                "description": "The plan_id plan_setup returned for these same inputs.",
+            },
+            "approver": {
+                **_STRING,
+                "description": "Identity of the human who approved the plan.",
+            },
+        },
+        ("project", "answers", "plan_id", "approver"),
         needs_ops=True,
     ),
     "run_doctor": ToolSpec(

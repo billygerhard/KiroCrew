@@ -215,6 +215,13 @@ class TestToolSurfaceIsInvariantAcrossBindings:
                 "advance_phase",
                 "run_doctor",
                 "check_run_prerequisites",
+                # The setup assistant. Its tools read the project's own files and
+                # the bundled preset tables, both of which are inside this app, so
+                # they are as configuration-independent as the rest: which presets
+                # are OFFERED follows the project's evidence, never a binding.
+                "inspect_setup",
+                "plan_setup",
+                "apply_setup",
             }
         )
 

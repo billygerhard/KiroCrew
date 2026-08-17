@@ -24,11 +24,24 @@ from typing import Any, Mapping, Sequence
 from ..engine.analysis import AnalysisReport
 from ..engine.composition import EngineGraph, build_engine
 from ..engine.config import ConfigWriteSurface
+from ..engine.config.store import SETUP_ASSISTANT_SURFACE
 from ..engine.cross_document import validate_spec as validate_spec_documents
 from ..engine.phases import RunMode, advance, approve, derive_phase
 from ..engine.seeder import OpenedSession, SessionRequest
+from ..engine.setup import SetupPlan
+from ..engine.setup import apply_setup as apply_setup_plan
+from ..engine.setup import propose_setup, setup_patch
 from ..engine.state import SpecRef
 from ..engine.structure import parse_tasks
+from .setup_surface import (
+    SetupPlanEnvelope,
+    answers_from_arguments,
+    apply_payload,
+    inspection_payload,
+    plan_envelope,
+    require_approver,
+    require_plan_identity,
+)
 
 #: The surface this adapter writes configuration through. It is deliberately not
 #: operator-confirmed: a tool call arrives from an agent, not from a human
@@ -70,6 +83,38 @@ class RefusingFindingsSink:
             "the engine-MCP surface has no findings sink wired; a tool that runs "
             "analysis must build its graph with the durable sink"
         )
+
+
+def _setup_root(project: str) -> Path:
+    """Return the project root a setup call names, normalised the engine's way.
+
+    Same normalisation :meth:`~..engine.state.SpecRef.of` applies, so a project
+    identified one way to the authoring tools is the same project here. It also
+    makes the plan identity stable across two spellings of one path: without it,
+    ``/tmp/p`` and ``/tmp/p/`` would hash to two different plans for one project.
+    """
+    return Path(project).expanduser().resolve()
+
+
+def _project_name(root: Path, given: str | None) -> str:
+    """Return the configuration name for *root*: the caller's, or the directory's.
+
+    Falling back to the directory name is not a guess about the project -- the
+    directory is where the name is written down, and the whole resolved root is
+    part of the plan identity, so a caller who meant a different name gets a
+    different ``plan_id`` rather than a write under a name it did not choose. A
+    root with no final segment (a filesystem root) has nothing to fall back on and
+    is refused rather than named something plausible.
+    """
+    if given is not None and given.strip():
+        return given.strip()
+    inferred = root.name.strip()
+    if not inferred:
+        raise ValueError(
+            f"cannot name the project at {root}: the path has no final segment, so pass an "
+            "explicit name rather than having one chosen"
+        )
+    return inferred
 
 
 def _report_json(report: Any) -> dict[str, Any]:
@@ -238,6 +283,91 @@ class EngineOperations:
         ref = SpecRef.of(project, spec)
         result = advance(self._store, ref, actor=actor, gate=gate, audit=self._audit)
         return result.to_json_object()
+
+    # --- the setup assistant -----------------------------------------------
+
+    def inspect_setup(self, project: str, *, name: str | None = None) -> dict[str, Any]:
+        """Inspect *project* and return evidence, inferences, questions, and offers.
+
+        Read-only in both directions: it reads the project's own files and writes
+        nothing, not even the state store. No memory is passed, because this
+        process holds no memory handle -- which the engine supports as a first-class
+        degraded mode, and the payload says so through ``memory_consulted`` rather
+        than reporting inferences it could not make.
+        """
+        root = _setup_root(project)
+        plan = propose_setup(root, project=_project_name(root, name))
+        return inspection_payload(plan, root=root)
+
+    def plan_setup(
+        self, project: str, answers: Mapping[str, Any], *, name: str | None = None
+    ) -> dict[str, Any]:
+        """Compute the plan *answers* produce for *project*, applying nothing.
+
+        Every gate the apply would fail is evaluated here, so a caller learns that
+        a rung is unanswered or a preset was never offered before an approver is
+        asked for anything. The returned ``plan_id`` is what the apply must quote.
+        """
+        return self._envelope(project, answers, name=name)[1].to_json_object()
+
+    def apply_setup(
+        self,
+        project: str,
+        answers: Mapping[str, Any],
+        *,
+        plan_id: str,
+        approver: str,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Write the plan identified by *plan_id*, on *approver*'s authority.
+
+        Two gates precede the write, in this order, and both refuse before the
+        plan is even recomputed or before it is used:
+
+        * an absent *approver* -- the plan writes the commands a project runs
+          unattended and the rung it runs them at, so the human who accepted it is
+          named;
+        * a ``plan_id`` that is not the identity these inputs produce now -- the
+          project's evidence or the answers have changed since the plan was
+          computed, so applying it would write something the caller never read.
+
+        The write goes through the engine's single validated path on
+        :data:`~..engine.config.store.SETUP_ASSISTANT_SURFACE`, which is
+        operator-confirmed. That is deliberate and it is what the approver
+        authorizes: the setup patch necessarily touches config-only paths (a
+        project's workflow and a source's autonomy grid), so a surface that could
+        not claim confirmation could not complete setup at all. The authority is
+        narrow by construction rather than by promise -- the patch is built by the
+        engine from an offered, approved plan, no caller-supplied patch reaches
+        this path, and the preset values come from the bundled tables. An
+        arbitrary configuration write still has only the unconfirmed
+        :data:`ENGINE_MCP_SURFACE` door.
+        """
+        identity = require_approver(approver)
+        plan, envelope = self._envelope(project, answers, name=name)
+        require_plan_identity(plan_id, envelope.plan_id)
+        result = apply_setup_plan(
+            self._config,
+            plan,
+            answers_from_arguments(answers),
+            surface=SETUP_ASSISTANT_SURFACE,
+        )
+        return apply_payload(envelope, result, identity)
+
+    def _envelope(
+        self, project: str, answers: Mapping[str, Any], *, name: str | None
+    ) -> tuple[SetupPlan, SetupPlanEnvelope]:
+        """Recompute the plan and its envelope from the arguments alone.
+
+        The one place a plan is built for both tools, so ``plan_setup`` and
+        ``apply_setup`` cannot compute two different plans from one set of
+        arguments -- which is the only way the identity check could pass while the
+        write differed from the plan returned.
+        """
+        root = _setup_root(project)
+        plan = propose_setup(root, project=_project_name(root, name))
+        parsed = answers_from_arguments(answers)
+        return plan, plan_envelope(plan, parsed, setup_patch(plan, parsed))
 
     # --- the guarded configuration door ------------------------------------
 

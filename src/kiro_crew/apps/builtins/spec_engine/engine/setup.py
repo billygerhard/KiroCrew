@@ -104,10 +104,12 @@ __all__ = [
     "RemoteOrigin",
     "SetupAnswers",
     "SetupApprovalRequired",
+    "SetupPatch",
     "SetupPlan",
     "SetupResult",
     "inspect_project",
     "propose_setup",
+    "setup_patch",
     "apply_setup",
 ]
 
@@ -491,6 +493,28 @@ class SetupResult:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class SetupPatch:
+    """The configuration patch an approved plan would write, before it is written.
+
+    Exists so a surface that has to *show* a write before performing it -- a
+    configuration preview, an agent that must return a plan and apply it in a
+    second call -- reads the same object :func:`apply_setup` writes. A second
+    builder for display is how a preview comes to disagree with the write it
+    previews, and here the disagreement would be about which commands a project
+    executes unattended.
+    """
+
+    patch: Mapping[str, Any]
+    written_paths: tuple[str, ...]
+    notes: tuple[str, ...] = ()
+    #: The rungs the answers confirmed, lowest first. Carried because it is the
+    #: reason the patch holds an autonomy grid (or the note saying why it does
+    #: not), and recomputing it beside the patch would be a second reading of the
+    #: same answers.
+    granted: tuple[AutonomyLevel, ...] = ()
+
+
 # --- inspection ------------------------------------------------------------
 
 #: Reads a project's git origin. Injectable so a test describes a repository
@@ -612,23 +636,18 @@ def propose_setup(
     )
 
 
-def apply_setup(
-    store: ConfigStore,
-    plan: SetupPlan,
-    answers: SetupAnswers,
-    *,
-    surface: ConfigWriteSurface = SETUP_ASSISTANT_SURFACE,
-    which: ProgramResolver | None = None,
-) -> SetupResult:
-    """Write *plan*'s approved parts through the validated config path.
+def setup_patch(plan: SetupPlan, answers: SetupAnswers) -> SetupPatch:
+    """Return the patch *answers* would write for *plan*, applying nothing.
 
-    Refuses before writing anything when the cost profile was not chosen from the
-    bundled names, when any rung in :data:`CONFIRMED_LEVELS` is unanswered, when a
-    confirmed rung sits above a declined one, or when a selected preset was not
-    offered and therefore never checked. Each refusal names what is missing.
+    Every refusal :func:`apply_setup` makes happens here, before a patch exists:
+    a cost profile that was not chosen from the bundled names, a rung left
+    unanswered, a rung confirmed above a declined one, or a selected preset that
+    was never offered and therefore never checked. Each refusal names what is
+    missing.
 
-    The patch goes to :meth:`~.config.ConfigStore.write`, which validates the
-    merged document and persists it under the lock. Nothing here touches the file.
+    Pure: it reads the plan and the answers and touches neither the filesystem nor
+    the config store. That is what lets a two-step surface show the operator the
+    same patch the write will use.
     """
     _require_cost_profile(answers)
     granted = _require_confirmations(answers)
@@ -671,7 +690,32 @@ def apply_setup(
             f"source at {SECTION_SOURCES}.<name>.{AUTONOMY_FIELD}, and no source was selected"
         )
 
-    document = store.write(patch, surface=surface)
+    return SetupPatch(
+        patch=patch,
+        written_paths=tuple(written),
+        notes=tuple(notes),
+        granted=granted,
+    )
+
+
+def apply_setup(
+    store: ConfigStore,
+    plan: SetupPlan,
+    answers: SetupAnswers,
+    *,
+    surface: ConfigWriteSurface = SETUP_ASSISTANT_SURFACE,
+    which: ProgramResolver | None = None,
+) -> SetupResult:
+    """Write *plan*'s approved parts through the validated config path.
+
+    The patch, and every refusal that precedes it, comes from :func:`setup_patch`,
+    so what lands is what a caller could have been shown first.
+
+    The patch goes to :meth:`~.config.ConfigStore.write`, which validates the
+    merged document and persists it under the lock. Nothing here touches the file.
+    """
+    proposed = setup_patch(plan, answers)
+    document = store.write(proposed.patch, surface=surface)
 
     checks: list[Prerequisite] = []
     if answers.watch_source is not None:
@@ -681,9 +725,9 @@ def apply_setup(
         checks.extend(check_source(store, answers.watch_source, which=which).checks)
     return SetupResult(
         document=document,
-        written_paths=tuple(written),
+        written_paths=proposed.written_paths,
         prerequisites=PrerequisiteReport(checks=tuple(checks)),
-        notes=tuple(notes),
+        notes=proposed.notes,
     )
 
 

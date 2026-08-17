@@ -47,6 +47,8 @@ from hypothesis import strategies as st
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog, audit_root
+from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
+from kiro_crew.apps.builtins.spec_engine.engine.config.store import CONFIG_FILENAME
 from kiro_crew.apps.builtins.spec_engine.engine.cross_document import (
     validate_spec as validate_spec_documents,
 )
@@ -55,6 +57,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.phases import (
     advance,
     approve,
     derive_phase,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.setup import (
+    CONFIRMED_LEVELS,
+    SetupAnswers,
+    apply_setup,
+    propose_setup,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.state import (
     DB_FILENAME,
@@ -80,6 +88,17 @@ GUIDANCE_ONLY = ("get_authoring_prompt", "get_orchestrator_prompt", "get_review_
 #: resulting state against -- what they must prove instead is that they leave the
 #: state untouched, which ``test_diagnostic_tools_write_no_state`` does.
 DIAGNOSTIC_ONLY = ("run_doctor", "check_run_prerequisites")
+
+#: The setup assistant's tools. They DO reach the engine adapter, so they are not
+#: guidance and not diagnostics -- but they touch neither the state store nor the
+#: audit log. They read a project's own files and, for the one that writes, write
+#: the configuration document. So their equivalence claim is about ``config.json``
+#: rather than about rows, and the ``Step`` machinery below cannot express them
+#: anyway: every step it builds is ``(project, spec)``-shaped and these tools
+#: declare no spec. ``test_setup_tools_write_the_same_configuration_as_the_library``
+#: makes the claim in the form that fits: same document from both paths, and the
+#: reads leaving the state at the untouched baseline.
+CONFIGURATION_ONLY = ("inspect_setup", "plan_setup", "apply_setup")
 
 #: Arguments for the diagnostic tools, so the no-state proof can call them.
 DIAGNOSTIC_ARGUMENTS: dict[str, dict[str, Any]] = {
@@ -497,8 +516,12 @@ def test_every_tool_is_a_state_operation_or_guidance() -> None:
     # new tool that reaches the engine adapter fails here until it is covered, and
     # a new guidance tool has to be declared as one.
     state_tools = {name for name, spec in TOOLS.items() if spec.needs_ops}
-    assert state_tools == set(OPERATIONS), "a state operation has no library spelling here"
-    assert set(TOOLS) == set(OPERATIONS) | set(GUIDANCE_ONLY) | set(DIAGNOSTIC_ONLY)
+    assert state_tools == set(OPERATIONS) | set(
+        CONFIGURATION_ONLY
+    ), "a tool reaching the engine adapter has no library spelling here"
+    assert set(TOOLS) == (
+        set(OPERATIONS) | set(GUIDANCE_ONLY) | set(DIAGNOSTIC_ONLY) | set(CONFIGURATION_ONLY)
+    )
     assert set(GUIDANCE_ARGUMENTS) == set(GUIDANCE_ONLY)
     assert set(DIAGNOSTIC_ARGUMENTS) == set(DIAGNOSTIC_ONLY)
     assert set(SEQUENCES) == set(OPERATIONS), "a state operation has no sequence"
@@ -527,6 +550,127 @@ def test_diagnostic_tools_write_no_state(tmp_path: Path, baseline: dict[str, Any
             payload = running.tool_payload(name, DIAGNOSTIC_ARGUMENTS[name])
             assert isinstance(payload, dict) and payload, f"{name} returned nothing"
     assert _dump_state(home) == baseline
+
+
+# --- the setup tools: one engine, one configuration document ---------------
+
+#: A project whose own files state a remote and a review practice, so the setup
+#: assistant has something to infer from on both paths.
+_SETUP_PROJECT = "setup-project"
+
+#: The answers used on both paths. Every rung declined, so the case does not
+#: depend on an autonomy grant to produce a document.
+_SETUP_ANSWERS: dict[str, Any] = {
+    "cost_profile": "budget",
+    "confirmations": {"execution": False, "delivery": False, "integration": False},
+    "approved_subjects": ["watch.source", "workflow.preset", "tooling"],
+    "workflow_preset": "git-pull-request",
+    "watch_source": "github",
+}
+
+
+def _setup_project(tmp_path: Path) -> Path:
+    root = tmp_path / _SETUP_PROJECT
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:acme/widgets.git\n', encoding="utf-8"
+    )
+    steering = root / ".kiro" / "steering"
+    steering.mkdir(parents=True)
+    (steering / "review.md").write_text("We land changes through a pull request.\n", "utf-8")
+    (root / "Makefile").write_text("build:\n\t@echo build\n\ntest:\n\t@echo test\n", "utf-8")
+    return root
+
+
+def test_setup_reads_write_no_state(tmp_path: Path, baseline: dict[str, Any]) -> None:
+    # The two read-only setup tools, through the real child server: the state tree
+    # afterwards is the untouched baseline, which for these also means no
+    # configuration document was created.
+    project = _setup_project(tmp_path)
+    home = tmp_path / "setup-read-home"
+    with stdio_server(home) as running:
+        running.initialize()
+        inspected = running.tool_payload("inspect_setup", {"project": str(project)})
+        assert inspected["inferences"], "inspection found nothing to compare"
+        planned = running.tool_payload(
+            "plan_setup", {"project": str(project), "answers": _SETUP_ANSWERS}
+        )
+        assert planned["plan_id"], "planning returned no identity"
+    assert _dump_state(home) == baseline
+
+
+def test_setup_tools_write_the_same_configuration_as_the_library(
+    tmp_path: Path, baseline: dict[str, Any]
+) -> None:
+    """The apply tool is the library's flow, not a second implementation of it.
+
+    Both paths run against their own pinned home and the same project, and the
+    document each produces is compared byte for byte. The state tables and audit
+    log are compared against a home where the server merely started, so "the setup
+    tools wrote only configuration" is a measurement rather than a claim about
+    intent.
+    """
+    project = _setup_project(tmp_path)
+
+    mcp_home = tmp_path / "setup-mcp-home"
+    with stdio_server(mcp_home) as running:
+        running.initialize()
+        planned = running.tool_payload(
+            "plan_setup", {"project": str(project), "answers": _SETUP_ANSWERS}
+        )
+        applied = running.tool_payload(
+            "apply_setup",
+            {
+                "project": str(project),
+                "answers": _SETUP_ANSWERS,
+                "plan_id": planned["plan_id"],
+                "approver": ACTOR,
+            },
+        )
+    assert applied["applied"] is True, f"the apply did not report a write: {applied}"
+
+    library_home = tmp_path / "setup-library-home"
+    with _pinned_home(library_home):
+        plan = propose_setup(project.resolve(), project=_SETUP_PROJECT)
+        library_result = apply_setup(
+            ConfigStore(),
+            plan,
+            SetupAnswers(
+                cost_profile=str(_SETUP_ANSWERS["cost_profile"]),
+                confirmations={level: False for level in CONFIRMED_LEVELS},
+                approved_subjects=frozenset(item.subject for item in plan.inferences),
+                workflow_preset=str(_SETUP_ANSWERS["workflow_preset"]),
+                watch_source=str(_SETUP_ANSWERS["watch_source"]),
+            ),
+        )
+    assert library_result.written_paths == tuple(applied["written_paths"])
+
+    with _pinned_home(mcp_home):
+        mcp_document = ConfigStore().path
+    with _pinned_home(library_home):
+        library_document = ConfigStore().path
+        library_valid = ConfigStore().validate()
+
+    # The claim, at the file: the tool's document and the library's document are
+    # the same bytes -- same merged content, same version stamp, same formatting.
+    # A tool that assembled its own patch, wrote through another surface, or
+    # skipped the stamp diverges here.
+    assert mcp_document.is_file(), "the apply tool wrote no configuration document"
+    assert library_document.is_file(), "the library path wrote no configuration document"
+    assert mcp_document.read_bytes() == library_document.read_bytes()
+    assert library_valid == ()
+
+    # And the tool wrote ONLY configuration: no row, no audit record. Compared
+    # against a home where the server merely started, because starting it creates
+    # the state database either way -- that is the difference this comparison must
+    # not read as a write.
+    mcp_state = _dump_state(mcp_home)
+    assert mcp_state["tables"] == baseline["tables"], "the setup tools wrote state rows"
+    assert mcp_state["audit"] == baseline["audit"], "the setup tools wrote audit records"
+    assert CONFIG_FILENAME not in " ".join(
+        baseline["files"]
+    ), "the baseline already holds a configuration document, so its absence proves nothing"
+    assert any(name.endswith(CONFIG_FILENAME) for name in mcp_state["files"])
 
 
 # --- the claim: identical resulting state ---------------------------------
