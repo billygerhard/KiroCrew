@@ -44,6 +44,11 @@ guarantee:
   deletion there and an addition here — both judged. What remains unseen is
   git-ignored content, what a change does (paths only), and whether an
   allowlisted claim is true.
+* **A ``..`` segment in a scanned path.** Matching is lexical, so
+  ``spec_engine/../<other-app>/x.py`` would be admitted as declared territory
+  while denoting another app's file. Git never emits ``..`` segments in change
+  lists, so no real scan can present one — allowlist ENTRIES are ``..``-checked
+  because a human writes those.
 """
 
 from __future__ import annotations
@@ -146,7 +151,7 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ),
     (
         "test/test_cron_sdk.py",
-        "Covers the SDK posture clamp in the platform's own suite.",
+        "Mirrors the SDK's new approval_mode/timeout fields onto MockCronJob.",
     ),
     (
         "test/test_security.py",
@@ -154,7 +159,7 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ),
     (
         "test/test_spawn_audit.py",
-        "Covers the reserved approval var's audit trail in the platform's suite.",
+        "Adds a BENIGN_SPAWNS exemption for the delivery-isolation git helper.",
     ),
     (
         "docs/app-kit/manifest-reference.md",
@@ -473,8 +478,11 @@ class TestTheFenceComputesItsBaselineOrFails:
 
     def test_a_history_sharing_no_ancestor_fails_closed(self, tmp_path: Path) -> None:
         """What a shallow clone or a grafted branch looks like: the ref resolves,
-        and ``merge-base`` still has nothing to say. Exit status alone would read
-        this as success on some git versions, so the empty answer is checked too.
+        and ``merge-base`` still has nothing to say. Git exits 1 with empty
+        stdout here, so this drives the exit-status branch; the separate
+        empty-answer-despite-exit-0 branch in ``merge_base`` is defensive only —
+        no known git emits that shape, and it exists so a future one cannot turn
+        a missing baseline into a clean report.
         """
         root = _fixture_repo(tmp_path)
         _commit(root, "kept.py", "x = 1\n")
@@ -645,7 +653,20 @@ class TestTheAllowlistCannotSwallowAnotherApp:
             "/".join(("src", "kiro_crew", "apps", "builtins", app_dir)) + "/"
             for app_dir in _builtin_app_dirs()
             if app_dir != "spec_engine"
-        ] + ["website/src/apps/spec-" + "builder/"]
+        ]
+        # The frontend territories are assembled from the real listing, exactly
+        # like the backend ones: a review probe showed the first version named
+        # only ONE frontend tree, so an entry covering any other app's frontend
+        # wholesale passed both guards. Non-directories in website/src/apps/
+        # (shared router/registry modules) are not app territory.
+        frontend_root = REPO_ROOT / "website" / "src" / "apps"
+        territories += [
+            f"website/src/apps/{entry.name}/"
+            for entry in sorted(frontend_root.iterdir())
+            if entry.is_dir() and entry.name != "spec-engine"
+        ]
+        # The Prior_App's shared-directory test namespace is territory too.
+        territories.append("website/src/test/SpecBuilder")
         for prefix, _justification in BOUNDARY_ALLOWLIST:
             for territory in territories:
                 inside = prefix.startswith(territory)
