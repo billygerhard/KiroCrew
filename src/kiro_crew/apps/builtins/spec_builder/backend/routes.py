@@ -39,13 +39,6 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 
-from ...spec_engine.engine import audit as engine_audit
-from ...spec_engine.engine import documents as engine_documents
-from ...spec_engine.engine import phases as engine_phases
-from ...spec_engine.engine import spec_types as engine_spec_types
-from ...spec_engine.engine import state as engine_state
-from . import engine_ops
-
 try:
     from kiro_crew.security import (
         is_sensitive_path,
@@ -146,21 +139,7 @@ def _settings_path() -> Path:
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-#: This app's wire names for the engine's spec types, and the ONLY place the two
-#: vocabularies are bridged. The dashboard and every stored index entry have said
-#: ``bug`` since before the engine existed, so the wire keeps that name while the
-#: engine keeps ``bugfix``. Everything else about a type -- which documents it
-#: owes, in what order, whether it is a type at all -- is asked of the engine, so
-#: this table cannot drift into a second definition of a spec type. It is keyed by
-#: the engine's enum members rather than by strings so that removing a type from
-#: the engine breaks this import instead of silently leaving a name behind.
-_SPEC_TYPE_WIRE_NAMES: dict[str, engine_spec_types.SpecType] = {
-    "feature": engine_spec_types.SpecType.FEATURE,
-    "bug": engine_spec_types.SpecType.BUGFIX,
-    "quick": engine_spec_types.SpecType.QUICK,
-}
-
-_VALID_TYPES = tuple(_SPEC_TYPE_WIRE_NAMES)
+_VALID_TYPES = ("feature", "bug", "quick")
 
 #: Every status this app can be in. index.json is agent-writable, so the stored
 #: value is untrusted: an unrecognised one is reported as "planning" rather than
@@ -867,78 +846,7 @@ def _new_slot_key(name: str) -> str:
     return f"spec-builder-{name}-{uuid.uuid4().hex[:8]}"
 
 
-def _engine_spec_type(spec_type: object) -> engine_spec_types.SpecType:
-    """The engine spec type this app's *spec_type* wire name refers to.
-
-    Falls back to the feature type for any value no wire name covers. index.json
-    is agent-writable, so the stored type is untrusted input; the widest plan is
-    the honest reading of an unrecognised one, because it names every document the
-    app can serve rather than silently dropping a tab from the UI.
-    """
-    if isinstance(spec_type, engine_spec_types.SpecType):
-        return spec_type
-    name = spec_type.strip().casefold() if isinstance(spec_type, str) else ""
-    return _SPEC_TYPE_WIRE_NAMES.get(name, engine_spec_types.SpecType.FEATURE)
-
-
-def _plan_kinds(spec_type: object) -> tuple[engine_documents.DocumentKind, ...]:
-    """The documents *spec_type* owes, in plan order, as the engine defines them.
-
-    The single spelling of "what does this spec type owe" in this app. Asked of
-    the phase machine's own accessor so the plan the UI shows is the plan the
-    engine gates on.
-    """
-    return engine_phases.document_plan(_engine_spec_type(spec_type).value)
-
-
-def _plan_filenames(spec_type: object) -> tuple[str, ...]:
-    return tuple(kind.filename for kind in _plan_kinds(spec_type))
-
-
-#: This app's wire name for each engine spec type, so a type read off disk can be
-#: reported in the vocabulary the dashboard and index.json already use. Inverted
-#: from the forward table rather than written out again.
-_WIRE_NAME_BY_SPEC_TYPE: dict[engine_spec_types.SpecType, str] = {
-    engine_type: wire for wire, engine_type in _SPEC_TYPE_WIRE_NAMES.items()
-}
-
-
-def _looks_like_a_spec(spec_dir: Path) -> bool:
-    """Whether *spec_dir* holds any document a spec is made of.
-
-    The document set is the engine's, not a list kept here: a directory holding
-    only a document type the engine added later would otherwise be invisible to
-    discovery while being a perfectly good spec everywhere else.
-    """
-    return any((spec_dir / kind.filename).is_file() for kind in engine_documents.DocumentKind)
-
-
-def _discovered_spec_type(spec_dir: Path) -> str:
-    """The type of a spec found on disk, read from the record the IDE writes.
-
-    A discovered spec was created by something else -- the IDE, the CLI, or the
-    engine -- and that writer records the type in the native sidecar. Reading it
-    beats defaulting: a bugfix spec adopted as a feature would be shown the wrong
-    plan, and the phase derived against it would name a gate the spec does not owe.
-    Falls back to the feature wire name when nothing recorded a type, which is the
-    widest plan and so hides no document.
-    """
-    try:
-        recorded = engine_spec_types.recorded_spec_type(spec_dir)
-    except engine_spec_types.SpecTypeError:
-        return _WIRE_NAME_BY_SPEC_TYPE[engine_spec_types.SpecType.FEATURE]
-    return _WIRE_NAME_BY_SPEC_TYPE.get(
-        recorded, _WIRE_NAME_BY_SPEC_TYPE[engine_spec_types.SpecType.FEATURE]
-    )
-
-
-#: Every document a spec can hold, furthest-first, taken from the engine's own
-#: document vocabulary rather than restated here -- a document the engine adds is
-#: one this app reads and serves without a second edit. Furthest-first because the
-#: phase this app reports is the furthest document drafted (see ``_derive_phase``).
-_PHASE_FILES = [
-    (kind.value, kind.filename) for kind in reversed(list(engine_documents.DocumentKind))
-]
+_PHASE_FILES = [("tasks", "tasks.md"), ("design", "design.md"), ("requirements", "requirements.md")]
 
 
 def _spec_file(spec_dir: Path, fname: str) -> Path | None:
@@ -1001,7 +909,7 @@ def _read_spec_text(spec_dir: Path, fname: str) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def _collect_spec_documents(spec_dir: Path, spec_type: object = None) -> tuple[_PhaseView, dict, dict | None]:
+def _collect_spec_documents(spec_dir: Path) -> tuple[str, dict, dict | None]:
     """Gather everything the detail endpoint needs off the filesystem.
 
     BLOCKING — call via ``asyncio.to_thread``. Bundled into one function so the
@@ -1009,7 +917,7 @@ def _collect_spec_documents(spec_dir: Path, spec_type: object = None) -> tuple[_
     edit can reintroduce an inline read: derive the phase, read the three spec
     documents, and read + normalize the agent-authored state file.
     """
-    phase = _derive_phase(spec_dir, spec_type)
+    phase = _derive_phase(spec_dir)
     files = _read_spec_files(spec_dir)
     state: dict | None = None
     raw_text = _read_spec_text(spec_dir, ".spec-state.json")
@@ -1245,7 +1153,7 @@ def _prepare_handoff(
     # run then edited the link target outside the spec directory. _spec_file
     # refuses a symlink, a realpath that escapes the spec dir, and a sensitive
     # target; the extra is_file() keeps the "not written yet" case honest.
-    tasks = _spec_file(spec_dir, engine_documents.DocumentKind.TASKS.filename)
+    tasks = _spec_file(spec_dir, "tasks.md")
     ready = tasks is not None and tasks.is_file()
     return ready, sentinel
 
@@ -1887,92 +1795,11 @@ async def _halt_active_turn(state: Any, name: str, *, only_slot: Any = _UNPINNED
     return True
 
 
-class _PhaseView(NamedTuple):
-    """The phase the UI shows, and whether it is the engine's current answer.
-
-    ``stale`` is not decoration. A failed engine read must neither blank the UI
-    (which loses the user's context) nor present the previous answer as current
-    (which is worse, because it looks authoritative). Carrying both the retained
-    phase and the flag is what keeps those two apart.
-    """
-
-    phase: str
-    stale: bool
-
-
-#: Last phase the engine successfully reported, per spec directory, so a failed
-#: read can retain it. Bounded: the index is agent-writable and can name an
-#: unbounded number of directories, and an unbounded cache in a long-lived gateway
-#: is a leak. Insertion-ordered, so the oldest entry is the one evicted.
-_LAST_PHASE: dict[str, str] = {}
-_LAST_PHASE_LOCK = threading.Lock()
-_LAST_PHASE_MAX = 512
-
-#: The unknown phase. Reported only when the engine read failed AND nothing was
-#: ever retained for this spec, so there is genuinely no last known state.
-_PHASE_UNKNOWN = "unknown"
-
-#: The answer for a spec the phase pass did not cover. Deliberately not "new":
-#: no engine answer was obtained for it, and reporting it as undrafted would be
-#: this app inventing a phase the engine never gave.
-_MISSING_PHASE = _PhaseView(_PHASE_UNKNOWN, True)
-
-
-def _remember_phase(key: str, phase: str) -> None:
-    with _LAST_PHASE_LOCK:
-        _LAST_PHASE.pop(key, None)
-        _LAST_PHASE[key] = phase
-        while len(_LAST_PHASE) > _LAST_PHASE_MAX:
-            del _LAST_PHASE[next(iter(_LAST_PHASE))]
-
-
-def _retained_phase(key: str) -> _PhaseView:
-    """The last phase the engine reported for *key*, marked stale."""
-    with _LAST_PHASE_LOCK:
-        return _PhaseView(_LAST_PHASE.get(key, _PHASE_UNKNOWN), True)
-
-
-def _derive_phase(spec_dir: Path, spec_type: object = None) -> _PhaseView:
-    """Where the spec sits, decided entirely by the engine.
-
-    BLOCKING -- call via ``asyncio.to_thread``: it reads every document the plan
-    names.
-
-    Three questions decide a phase and the engine answers all three: which
-    documents this spec type owes and in what order (``DocumentPlan``), whether a
-    document counts as drafted (``read_document``, which treats a whitespace-only
-    file as absent), and what the phases are called (``DocumentKind``). What is
-    left here is the projection onto the answer this app's UI asks for -- the
-    furthest document drafted -- which the engine has no term for, because its own
-    ``PhaseState.phase`` names the gate a spec is *waiting at* and is approval-
-    gated. The two answer different questions and both are wanted: the rail orders
-    specs by how far their documents got, while the approve, advance and build
-    controls read the engine's gates (``_engine_gate_view``), which is the only
-    answer that knows what has been approved. The projection stands on engine
-    answers only, so there is no second rule to disagree with.
-
-    Each candidate is filtered through ``_spec_file`` FIRST. The engine reads a
-    document with a plain open, which follows a symlink; this app refuses one, and
-    a planted ``design.md -> ~/.aws/credentials`` must not be read at all, let
-    alone counted as a drafted design.
-
-    Never raises. An engine that cannot answer yields the last answer it gave,
-    flagged stale: a blank spec list loses the user's context, and presenting a
-    previous answer as current is worse, so the flag is what keeps them apart.
-    """
-    key = str(spec_dir)
-    try:
-        phase = "new"
-        for kind in _plan_kinds(spec_type):
-            if _spec_file(spec_dir, kind.filename) is None:
-                continue
-            if engine_phases.read_document(spec_dir, kind) is not None:
-                phase = kind.value
-    except Exception:
-        logger.warning("engine could not report the phase of %s", _redact(key), exc_info=True)
-        return _retained_phase(key)
-    _remember_phase(key, phase)
-    return _PhaseView(phase, False)
+def _derive_phase(spec_dir: Path) -> str:
+    for phase, fname in _PHASE_FILES:
+        if _spec_file(spec_dir, fname) is not None and (spec_dir / fname).is_file():
+            return phase
+    return "new"
 
 
 def _read_spec_files(spec_dir: Path) -> dict:
@@ -1981,286 +1808,6 @@ def _read_spec_files(spec_dir: Path) -> dict:
         text = _read_spec_text(spec_dir, fname)
         out[fname] = _redact(text) if text is not None else None
     return out
-
-
-# ── engine gates: approvals, transitions, execution ─────────────────────────
-#
-# This app used to keep its own answers to three questions the engine already
-# owns: whether a gate is approved (it recorded no approvals at all), which
-# transition comes next (the SPA computed it and sent an "approved -- proceed"
-# prompt), and whether a spec may execute (a tasks.md existence check). Each was
-# a second authority beside the engine's, and each was more permissive: a spec
-# holding only a never-validated, never-approved tasks.md executed through this
-# app while ``phases.execution_blocking_reasons`` would have refused it at every
-# gate with an approval-missing reason.
-#
-# Recording approvals HAD to come first. Routing the gate through the engine
-# before an approval could be recorded would have refused every execution the app
-# currently permits -- securing nothing and breaking the product -- which is why
-# the approval writer below exists before the gate that reads it.
-
-#: Override hook for the engine's state root, resolved per call for the same
-#: reason ``_STATE_DIR`` is: ``data_home()`` reads ``KIROCREW_HOME`` on every
-#: call, and a value bound at import freezes whichever home was active then.
-_ENGINE_STATE_ROOT: Path | None = None
-
-#: One engine store and audit log per resolved root, built on first use. A store
-#: is thread-safe (its connections are per thread) and the engine documents one
-#: instance per process as sufficient, so caching avoids re-running schema
-#: convergence on every request without introducing a second writer.
-_ENGINE_STORES: dict[str, tuple[engine_state.StateStore, engine_audit.AuditLog]] = {}
-_ENGINE_STORE_LOCK = threading.Lock()
-
-
-def _engine_state_root() -> Path:
-    return _ENGINE_STATE_ROOT if _ENGINE_STATE_ROOT is not None else engine_state.state_root()
-
-
-def _engine_store() -> tuple[engine_state.StateStore, engine_audit.AuditLog]:
-    """The engine's state store and audit log for the live data home.
-
-    BLOCKING on first use per root: opens SQLite and converges the schema.
-    """
-    root = _engine_state_root()
-    key = str(root)
-    with _ENGINE_STORE_LOCK:
-        cached = _ENGINE_STORES.get(key)
-        if cached is None:
-            cached = (
-                engine_state.StateStore(root=root),
-                engine_audit.AuditLog(root=root),
-            )
-            _ENGINE_STORES[key] = cached
-        return cached
-
-
-def _engine_ref(name: str, meta: dict) -> engine_state.SpecRef | None:
-    """The engine's identity for this spec, or ``None`` when it has none.
-
-    An engine ref addresses its documents as ``<project>/.kiro/specs/<name>``,
-    which is the interop contract it shares with the Kiro IDE and CLI. This app
-    also allows a ``base_path`` setting that puts a spec at ``<base>/<name>``
-    instead, and a ref built for one of those would resolve to a DIFFERENT
-    directory: an approval recorded through it would hash a document at a path
-    nobody edited, and the gate reading it back would judge the wrong bytes.
-
-    So this fails closed rather than approximating. The caller turns ``None``
-    into a refusal naming the reason, which is a spec the engine cannot govern —
-    not a spec that may proceed ungoverned.
-    """
-    working_dir = str(meta.get("working_dir", ""))
-    spec_dir = str(meta.get("spec_dir", ""))
-    if not working_dir or not spec_dir:
-        return None
-    try:
-        ref = engine_state.SpecRef.of(working_dir, name)
-    except (ValueError, OSError):
-        return None
-    try:
-        addressed = ref.spec_dir.resolve()
-        actual = Path(spec_dir).resolve()
-    except OSError:
-        return None
-    return ref if addressed == actual else None
-
-
-def _engine_spec_type_value(meta: dict) -> str:
-    """The engine's own name for this spec's type, for a phase derivation.
-
-    Passed explicitly rather than left to the engine's sidecar read: this app
-    stores the type in its index and a spec it imported may carry no sidecar, and
-    an unrecorded type makes every gate refuse with ``spec-type-unrecorded``.
-    """
-    return _engine_spec_type(meta.get("spec_type")).value
-
-
-def _reasons_json(reasons: tuple[engine_phases.Reason, ...]) -> list[dict]:
-    """Engine refusal reasons, with their prose redacted on the way out.
-
-    A reason names a document filename and can name the approver of a stale
-    approval, so it goes through the same egress redaction every other string
-    this app returns does. The ``code`` is an engine constant and is left alone —
-    it is what a client branches on, and redacting it would break that.
-    """
-    rendered: list[dict] = []
-    for reason in reasons:
-        record = reason.to_json_object()
-        record["message"] = _redact(str(record.get("message", "")))
-        rendered.append(record)
-    return rendered
-
-
-def _gate_views(state: engine_phases.PhaseState) -> list[dict]:
-    """Each planned gate, as the engine derived it.
-
-    This is what replaces the SPA's client-side transition map: the browser
-    renders the gates and the advance the engine reports rather than computing
-    which one comes next from a phase string.
-    """
-    views: list[dict] = []
-    for gate in state.gates:
-        approval = gate.approval
-        views.append(
-            {
-                "gate": gate.gate,
-                "document": gate.kind.filename,
-                "present": gate.present,
-                "approved": gate.approved,
-                "stale": gate.stale,
-                "approver": _redact(approval.actor) if approval is not None else None,
-                "approved_ts": approval.approved_ts if approval is not None else None,
-            }
-        )
-    return views
-
-
-def _engine_gate_view(name: str, meta: dict) -> dict:
-    """The engine's answer to "where is this spec, and what may it do next".
-
-    BLOCKING -- call via ``asyncio.to_thread``: derives the phase from disk and
-    reads the approval rows.
-
-    Never raises. An engine that cannot answer yields ``addressable: False`` with
-    no gates, which a surface renders as "the engine could not be asked" — the
-    same stance ``_derive_phase`` takes. It must not read as "nothing blocks
-    execution": the execution gate asks the engine directly rather than trusting
-    a cached view, so an unanswerable engine refuses there.
-    """
-    ref = _engine_ref(name, meta)
-    if ref is None:
-        return {"addressable": False, "reason_code": _ENGINE_UNADDRESSABLE_CODE, "gates": []}
-    try:
-        store, _audit = _engine_store()
-        state = engine_phases.derive_phase(store, ref, spec_type=_engine_spec_type_value(meta))
-        blocking, _report = engine_phases.execution_blocking_reasons(state)
-    except Exception:
-        logger.warning("the engine could not report gates for %s", _redact(name), exc_info=True)
-        return {"addressable": False, "reason_code": "engine_unavailable", "gates": []}
-    current = state.current_gate
-    return {
-        "addressable": True,
-        "gates": _gate_views(state),
-        "engine_phase": state.phase.value,
-        # The gate a person is being asked about right now. The SPA labels its
-        # approve control from this instead of deciding from a phase string which
-        # document it is looking at.
-        "current_gate": current.gate if current is not None else None,
-        "can_execute": not blocking,
-        "execution_blocked_by": _reasons_json(blocking),
-    }
-
-
-#: Reported when the engine cannot address a spec's documents (see ``_engine_ref``).
-_ENGINE_UNADDRESSABLE_CODE = "spec_outside_engine_layout"
-
-_ENGINE_UNADDRESSABLE_ERROR = (
-    "this spec's documents are not at <project>/.kiro/specs/<name>, so the engine "
-    "cannot record an approval or judge a gate for it"
-)
-
-
-def _record_gate_approval(
-    name: str, meta: dict, gate: str, *, actor: str
-) -> engine_phases.ApprovalOutcome | None:
-    """Record *actor*'s approval of one gate WITH THE ENGINE.
-
-    BLOCKING -- call via ``asyncio.to_thread``: takes the spec's lock, validates
-    the document, and writes the approval row.
-
-    ``None`` means the engine cannot address this spec (see :func:`_engine_ref`).
-    Everything else, including a refusal, comes back as the engine's own outcome:
-    this app does not decide whether an approval is acceptable. ``approve``
-    validates the document first and refuses an invalid one, which is why there
-    is no pre-check here — a second check would be a second answer.
-    """
-    ref = _engine_ref(name, meta)
-    if ref is None:
-        return None
-    store, audit = _engine_store()
-    return engine_phases.approve_interactive(
-        store,
-        ref,
-        gate,
-        user=actor,
-        spec_type=_engine_spec_type_value(meta),
-        audit=audit,
-    )
-
-
-def _advance_past_gate(
-    name: str, meta: dict, gate: str, *, actor: str
-) -> tuple[engine_phases.ApprovalOutcome, engine_phases.AdvanceResult | None] | None:
-    """Record the gate's approval and then ask the engine to advance past it.
-
-    BLOCKING -- call via ``asyncio.to_thread``.
-
-    The two are one action from a person's point of view ("this document is
-    good, move on") and two facts to the engine: an approval of named bytes, and
-    a transition that every earlier gate must also permit. They happen in this
-    order because ``advance`` refuses without a live approval, and the advance is
-    skipped entirely when the approval was refused — so a refused approval can
-    never be followed by a transition that assumed one.
-
-    The transition itself is the engine's answer, not this app's: nothing here
-    decides which phase comes next.
-    """
-    ref = _engine_ref(name, meta)
-    if ref is None:
-        return None
-    store, audit = _engine_store()
-    spec_type = _engine_spec_type_value(meta)
-    outcome = engine_phases.approve_interactive(
-        store, ref, gate, user=actor, spec_type=spec_type, audit=audit
-    )
-    if not outcome.ok:
-        return outcome, None
-    result = engine_phases.advance(
-        store, ref, actor=actor, gate=gate, spec_type=spec_type, audit=audit
-    )
-    return outcome, result
-
-
-def _execution_refusal(name: str, meta: dict) -> dict | None:
-    """Why the engine refuses to start execution, or ``None`` when it does not.
-
-    BLOCKING -- call via ``asyncio.to_thread``.
-
-    THE execution gate. ``execution_blocking_reasons`` is policy-free by
-    construction — it takes no autonomy decision and cannot consult one — so no
-    configuration shortens the list it returns: every document written, valid and
-    carrying a live approval, plus a tasks plan that resolves against the
-    requirements it claims to cover.
-
-    Fails CLOSED. An engine that cannot be asked refuses rather than falling
-    through to the weaker check this replaced, because a gate with a permissive
-    error path is the gate an attacker aims at.
-    """
-    ref = _engine_ref(name, meta)
-    if ref is None:
-        return {"code": _ENGINE_UNADDRESSABLE_CODE, "error": _ENGINE_UNADDRESSABLE_ERROR}
-    try:
-        store, _audit = _engine_store()
-        state = engine_phases.derive_phase(store, ref, spec_type=_engine_spec_type_value(meta))
-        reasons, _report = engine_phases.execution_blocking_reasons(state)
-    except Exception:
-        logger.warning("the engine could not judge execution for %s", _redact(name), exc_info=True)
-        return {
-            "code": "engine_unavailable",
-            "error": (
-                "the engine could not be asked whether this spec may execute, so "
-                "execution is refused"
-            ),
-        }
-    if not reasons:
-        return None
-    return {
-        "code": "execution_blocked",
-        "error": (
-            "this spec is not ready to build: "
-            + "; ".join(_redact(reason.message) for reason in reasons)
-        ),
-        "reasons": _reasons_json(reasons),
-    }
 
 
 # ── validation / auth ────────────────────────────────────────────────────────
@@ -2291,6 +1838,15 @@ def _valid_name(name: str) -> bool:
 # ── seed / execution prompts ─────────────────────────────────────────────────
 
 
+#: Per-type deliverables. `quick` deliberately skips design.md: the previous seed
+#: demanded all three documents for every type, which contradicted the spec type
+#: the user had chosen.
+_TYPE_PLAN: dict[str, tuple[str, ...]] = {
+    "feature": ("requirements.md", "design.md", "tasks.md"),
+    "bug": ("requirements.md", "design.md", "tasks.md"),
+    "quick": ("requirements.md", "tasks.md"),
+}
+
 _TYPE_GUIDANCE: dict[str, str] = {
     "feature": (
         "FEATURE spec: full Requirements -> Design -> Tasks. requirements.md states "
@@ -2313,21 +1869,16 @@ _TYPE_GUIDANCE: dict[str, str] = {
 def _seed_prompt(spec_type: str, name: str, spec_dir: Path, working_dir: str, description: str) -> str:
     """The opening turn for a new spec.
 
-    SELF-CONTAINED by choice: everything the agent needs is stated here rather
-    than deferred to a skill. This app declared a ``spec-workflow`` skill until
-    that skill was retired for stating a document format the engine's own native
-    validator rejects; the manifest now declares none, so there is no skill left
-    to defer to. The reasoning outlives the skill: a builtin's declared skills DO
-    reach a session (registration resolves them against the packaged app root),
-    so a reference would have resolved — but a seed carrying its own rules cannot
-    be silently weakened by a skill that fails to register, and it lets the prompt
-    list only the documents the chosen spec type actually calls for.
+    SELF-CONTAINED by necessity: this app ships a ``spec-workflow`` skill in its
+    manifest, but builtin apps are not run through ``bridges.register_app`` (that
+    path symlinks from ``~/.kiro/crew/apps/<name>/``, which a wheel-shipped
+    builtin does not have), so the skill is NOT on the agent's skill path. The
+    old prompt told the agent to "follow the `spec-workflow` skill exactly" --
+    a dangling reference -- and listed all three documents regardless of the spec
+    type the user picked. Everything the agent needs is now stated here.
     """
     desc = f"\n\nThe user's initial description:\n{description.strip()}" if description.strip() else ""
-    # The deliverables are the engine's document plan for this type, never a list
-    # kept here: a seed that named a document the engine does not gate, or omitted
-    # one it does, would send the agent to write the wrong set of files.
-    files = _plan_filenames(spec_type)
+    files = _TYPE_PLAN.get(spec_type, _TYPE_PLAN["feature"])
     guidance = _TYPE_GUIDANCE.get(spec_type, _TYPE_GUIDANCE["feature"])
     paths = "\n".join(f"  - {spec_dir / f}" for f in files)
     return (
@@ -2839,7 +2390,7 @@ def _discover_folder_specs(index: dict) -> bool:
         for child in children:
             if not child.is_dir() or str(child) in known_dirs:
                 continue
-            if not _looks_like_a_spec(child):
+            if not any((child / f).is_file() for f in ("requirements.md", "design.md", "tasks.md")):
                 continue
             name = child.name
             # _usable_name for the same reason as create: discovery WRITES
@@ -2854,7 +2405,7 @@ def _discover_folder_specs(index: dict) -> bool:
             index[name] = {
                 "working_dir": root,
                 "spec_dir": str(child),
-                "spec_type": _discovered_spec_type(child),
+                "spec_type": "feature",
                 "status": "planning",
                 "slot_key": _new_slot_key(name),
                 "worktree_branch": "",
@@ -2910,24 +2461,21 @@ def _prepare_spec_dir(
     return spec_dir, ""
 
 
-def _load_index_with_discovery() -> tuple[dict, dict[str, _PhaseView]]:
+def _load_index_with_discovery() -> tuple[dict, dict[str, str]]:
     """Load the index, fold in specs found on disk, and derive every phase --
     all in ONE thread hop, under the index lock.
 
     BLOCKING -- call via ``asyncio.to_thread``. The list endpoint is polled every
     15s, so none of this may run on the event loop: discovery walks every known
-    project root's ``.kiro/specs``, and ``_derive_phase`` reads every document a
-    spec's plan names PER SPEC (the response loop used to do that inline, so a
-    large index froze the loop on every poll). Returns ``(index, {name: phase})``.
+    project root's ``.kiro/specs``, and ``_derive_phase`` stats up to three files
+    PER SPEC (the response loop used to do that inline, so a large index froze
+    the loop on every poll). Returns ``(index, {name: phase})``.
     """
     with _INDEX_LOCK:
         index = _load_index()
         if _discover_folder_specs(index):
             _save_index(index)
-    phases = {
-        name: _derive_phase(Path(m.get("spec_dir", "")), m.get("spec_type"))
-        for name, m in index.items()
-    }
+    phases = {name: _derive_phase(Path(m.get("spec_dir", ""))) for name, m in index.items()}
     return index, phases
 
 
@@ -2956,10 +2504,7 @@ async def _handle_list(request: web.Request) -> web.Response:
                 # Reconciled, not raw: a capped nudge loop that ran out of cycles
                 # leaves "executing" in the index forever (see _effective_status).
                 "status": await _effective_status(name, meta, slot),
-                "phase": phases.get(name, _MISSING_PHASE).phase,
-                # See the note on the detail payload: a retained phase is flagged,
-                # never presented as the engine's current answer.
-                "phase_stale": phases.get(name, _MISSING_PHASE).stale,
+                "phase": phases.get(name, "new"),
                 "running": bool(getattr(slot, "running", False)),
                 # Validated, not passed through: see _numeric.
                 "created_at": _numeric(meta.get("created_at")),
@@ -3256,17 +2801,7 @@ async def _handle_get(request: web.Request) -> web.Response:
     # and reading .spec-state.json. The UI polls this endpoint every 2.5s while a
     # build runs, so doing it inline froze the gateway's event loop — chat
     # streaming and heartbeats included — for the duration of every poll.
-    # The stored type decides which documents the plan names, so the phase pass
-    # needs it: a quick spec owes no design document and must not be reported as
-    # sitting in a design phase because a stray file exists.
-    spec_type = meta.get("spec_type")
-    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir, spec_type)
-    # What the ENGINE says about this spec's gates: which are approved, which one
-    # a person is being asked about, and whether execution is permitted. The SPA
-    # renders its approve and advance controls from this rather than deciding from
-    # the phase string above, which is only "the furthest document drafted" and
-    # says nothing about approval.
-    engine_gates = await asyncio.to_thread(_engine_gate_view, name, meta)
+    phase, files, spec_state = await asyncio.to_thread(_collect_spec_documents, spec_dir)
 
     # Live context counters from the worker slot's transcript. The slot is
     # CREATED here if it does not exist yet (see _ensure_worker_slot): a spec
@@ -3326,14 +2861,7 @@ async def _handle_get(request: web.Request) -> web.Response:
             # already returns it -- omitting it here left every one of those dead
             # for the SELECTED spec, which is the only place they matter.
             "running": bool(getattr(slot, "running", False)) if slot is not None else False,
-            "phase": phase.phase,
-            # True when the engine could not be asked and the phase above is the
-            # last answer it gave. The SPA shows a staleness indicator rather than
-            # presenting a retained phase as the current one.
-            "phase_stale": phase.stale,
-            # The engine's gate state: gates with their approvals, the gate a
-            # person is being asked about, and whether execution is permitted.
-            "engine": engine_gates,
+            "phase": phase,
             "files": files,
             "state": spec_state,
             "context": {
@@ -3341,143 +2869,6 @@ async def _handle_get(request: web.Request) -> web.Response:
                 "turns": turns,
                 "tool_calls": tool_calls,
             },
-        }
-    )
-
-
-async def _handle_approve(request: web.Request) -> web.Response:
-    """Record a gate approval with the engine, and report what it did.
-
-    The approval-recording path this app did not have. Every approval here is an
-    explicit user action attributed to the authenticated person, which is what
-    ``approve_interactive`` requires: the autonomy policy is refused inside the
-    engine, so no request can attribute an approval to something that never
-    looked at the document.
-    """
-    if denied := _require_auth(request):
-        return denied
-    name = request.match_info["name"]
-    body = await _read_json(request)
-    if body is None:
-        return web.json_response({"code": "bad_json", "error": "invalid JSON body"}, status=400)
-    gate = str(body.get("gate", "")).strip()
-    index = await _aload_index()
-    meta = index.get(name)
-    if not meta:
-        return web.json_response({"code": "not_found", "error": "not found"}, status=404)
-    if not gate:
-        return web.json_response(
-            {"code": "gate_required", "error": "an approval must name the gate being approved"},
-            status=400,
-        )
-    actor = str(request.get("user") or "")
-    try:
-        outcome = await asyncio.to_thread(_record_gate_approval, name, meta, gate, actor=actor)
-    except Exception as exc:
-        logger.warning("recording an approval for %s failed", _redact(name), exc_info=True)
-        return web.json_response(
-            {"code": "approval_failed", "error": f"could not record the approval: {exc}"},
-            status=500,
-        )
-    if outcome is None:
-        return web.json_response(
-            {"code": _ENGINE_UNADDRESSABLE_CODE, "error": _ENGINE_UNADDRESSABLE_ERROR}, status=409
-        )
-    if not outcome.ok:
-        # The engine's refusal, verbatim in structure. Reported as a conflict
-        # rather than a server error: the request was well formed and the spec is
-        # simply not in a state where the gate can be approved.
-        _audit("spec_gate_approval_refused", f"{name}:{gate}", outcome="denied")
-        return web.json_response(
-            {
-                "code": "approval_refused",
-                "error": "; ".join(_redact(reason.message) for reason in outcome.reasons),
-                "gate": gate,
-                "reasons": _reasons_json(outcome.reasons),
-            },
-            status=409,
-        )
-    _audit("spec_gate_approved", f"{name}:{gate}")
-    return web.json_response(
-        {
-            "ok": True,
-            "gate": gate,
-            "approver": _redact(outcome.approval.actor) if outcome.approval else None,
-            "approved_ts": outcome.approval.approved_ts if outcome.approval else None,
-        }
-    )
-
-
-async def _handle_advance(request: web.Request) -> web.Response:
-    """Approve the named gate and ask the ENGINE what comes next.
-
-    The server half of removing the SPA's client-side transition map. The browser
-    no longer computes which phase follows which: it names the gate it is looking
-    at, and the transition in the response is the engine's own answer. A request
-    that names no gate leaves the choice to the engine too — ``advance`` defaults
-    to the last written document in the plan.
-    """
-    if denied := _require_auth(request):
-        return denied
-    name = request.match_info["name"]
-    body = await _read_json(request)
-    if body is None:
-        return web.json_response({"code": "bad_json", "error": "invalid JSON body"}, status=400)
-    index = await _aload_index()
-    meta = index.get(name)
-    if not meta:
-        return web.json_response({"code": "not_found", "error": "not found"}, status=404)
-    gate = str(body.get("gate", "")).strip()
-    if not gate:
-        return web.json_response(
-            {"code": "gate_required", "error": "an advance must name the gate being left"},
-            status=400,
-        )
-    actor = str(request.get("user") or "")
-    try:
-        moved = await asyncio.to_thread(_advance_past_gate, name, meta, gate, actor=actor)
-    except Exception as exc:
-        logger.warning("advancing %s failed", _redact(name), exc_info=True)
-        return web.json_response(
-            {"code": "advance_failed", "error": f"could not advance the spec: {exc}"}, status=500
-        )
-    if moved is None:
-        return web.json_response(
-            {"code": _ENGINE_UNADDRESSABLE_CODE, "error": _ENGINE_UNADDRESSABLE_ERROR}, status=409
-        )
-    outcome, result = moved
-    if not outcome.ok:
-        _audit("spec_gate_approval_refused", f"{name}:{gate}", outcome="denied")
-        return web.json_response(
-            {
-                "code": "approval_refused",
-                "error": "; ".join(_redact(reason.message) for reason in outcome.reasons),
-                "gate": gate,
-                "reasons": _reasons_json(outcome.reasons),
-            },
-            status=409,
-        )
-    if result is None or not result.ok:
-        reasons = result.reasons if result is not None else ()
-        _audit("spec_advance_refused", f"{name}:{gate}", outcome="denied")
-        return web.json_response(
-            {
-                "code": "advance_refused",
-                "error": "; ".join(_redact(reason.message) for reason in reasons),
-                "gate": gate,
-                "reasons": _reasons_json(reasons),
-            },
-            status=409,
-        )
-    _audit("spec_advanced", f"{name}:{gate}")
-    return web.json_response(
-        {
-            "ok": True,
-            "gate": result.gate,
-            "from_phase": result.from_phase.value,
-            # The transition, decided by the engine. A client renders it and may
-            # send a continuation prompt keyed on it; it does not compute it.
-            "to_phase": result.to_phase.value if result.to_phase else None,
         }
     )
 
@@ -3616,19 +3007,6 @@ async def _handle_handoff(request: web.Request) -> web.Response:
         return web.json_response(
             {"code": "tasks_missing", "error": "tasks.md does not exist yet — finish the Tasks phase first"}, status=409
         )
-    # THE execution gate, and now the engine's. The tasks.md existence check above
-    # was the whole of it: a spec holding one never-validated, never-approved
-    # tasks.md executed through this app, while the engine would have refused it at
-    # every gate with an approval-missing reason. The engine is asked here rather
-    # than a weaker local rule being applied, so there is one answer to "may this
-    # spec build" and it is the strict one.
-    #
-    # Placed before the first side effect -- no claim, no arm, no dispatch has
-    # happened yet -- and BEFORE the slot re-acquisition below, so a refusal
-    # changes nothing about the spec.
-    if (refusal := await asyncio.to_thread(_execution_refusal, name, meta)) is not None:
-        _audit("spec_execution_blocked", f"{name}: {refusal['code']}", outcome="denied")
-        return web.json_response(refusal, status=409)
     # Reread AFTER the await as well: a delete+recreate can land during the thread
     # hop, and a stale request would then capture the REPLACEMENT's slot while its
     # own abort path -- correctly pinned to what it captured -- closed the new
@@ -4109,20 +3487,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get(f"{base}/specs/{{name}}", _require_enabled(_handle_get))
     app.router.add_get(f"{base}/specs/{{name}}/messages", _require_enabled(_handle_messages))
     app.router.add_post(f"{base}/specs/{{name}}/message", _require_enabled(_handle_message))
-    # The engine's approval and transition path. Both exist so this app stops
-    # holding a second answer to "is this gate approved" and "what comes next":
-    # the approval is recorded with the engine, and the transition in the advance
-    # response is the engine's own.
-    app.router.add_post(f"{base}/specs/{{name}}/approve", _require_enabled(_handle_approve))
-    app.router.add_post(f"{base}/specs/{{name}}/advance", _require_enabled(_handle_advance))
     app.router.add_post(f"{base}/specs/{{name}}/handoff", _require_enabled(_handle_handoff))
     # Alias: the SPA page calls this "execute".
     app.router.add_post(f"{base}/specs/{{name}}/execute", _require_enabled(_handle_handoff))
     app.router.add_post(f"{base}/specs/{{name}}/stop", _require_enabled(_handle_stop_execution))
     app.router.add_delete(f"{base}/specs/{{name}}", _require_enabled(_handle_delete))
-    # The operator surfaces: effective configuration, per-run spend, and the stop
-    # control. Registered from their own module and handed this app's
-    # ``_require_enabled`` so they sit behind the one enablement gate rather than
-    # a second spelling of it.
-    engine_ops.register_engine_routes(app, base, _require_enabled)
     logger.info("spec-builder: registered app routes under %s", base)

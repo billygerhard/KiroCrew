@@ -6,7 +6,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion } from 'framer-motion'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Maximize2, Minimize2, Play, Pause, MessageSquare, X } from 'lucide-react'
-import { AUTHOR_PHASE_PROMPT } from '../prompts'
+import { ADVANCE_PROMPT } from '../prompts'
 import { specApi, LS, phaseLabel, PHASE_BUILDING_KEY, type SpecDetail as SpecDetailData } from '../api'
 import { ACCENT, SEL_BG, SEL_BORDER, PULSE_MOTION, Btn } from './shared'
 import SegmentedControl, { type Segment } from '../../../components/SegmentedControl'
@@ -37,34 +37,17 @@ const DOC_TABS = [
 
 type DocTabId = (typeof DOC_TABS)[number]['id']
 
-// The label for the control that leaves one gate. COPY ONLY, and copy only for
-// the gates whose next document this app happens to have a phrase for: which
-// gate can be left, and what follows it, are the ENGINE's answers and arrive on
-// the detail payload. There used to be a map here that computed the transition
-// and sent an "approved -- proceed" prompt the engine had never authorised,
-// which is why the table below holds nothing but a label key.
-//
-// A gate absent from this table is a gate this table has no PHRASE for, never a
-// gate that cannot be left. Reading it as the latter is how the tasks gate
-// became unleavable from the browser -- the engine names it, advances past it to
-// `ready`, and the surface rendered no control at all, so no spec could ever
-// reach execution through the UI. Any spec type with a different phase plan
-// would have reproduced that on its own gates, which is why the miss now
-// degrades to `advance_gate` below instead of to a missing control.
-const GATE_LABEL_KEY: Record<string, string> = {
-  requirements: 'apps.specBuilder.components.specDetail.advance_to_design',
-  design: 'apps.specBuilder.components.specDetail.advance_to_tasks',
-}
-
-/** The advance control's label for *gate*, degrading to the generic phrase.
- *
- *  The generic phrase names no destination, because this module does not know
- *  one: only the engine's ``to_phase`` does, and that arrives after the advance
- *  it labels. */
-function advanceLabel(gate: string): string {
-  return Object.prototype.hasOwnProperty.call(GATE_LABEL_KEY, gate)
-    ? i18nT(GATE_LABEL_KEY[gate])
-    : i18nT('apps.specBuilder.components.specDetail.advance_gate')
+// The button label is copy and is translated; ``msg`` is the instruction sent to
+// the agent and lives in prompts.ts, deliberately untranslated.
+const ADVANCE: Record<string, { labelKey: string; msg: string }> = {
+  requirements: {
+    labelKey: 'apps.specBuilder.components.specDetail.advance_to_design',
+    msg: ADVANCE_PROMPT.requirements,
+  },
+  design: {
+    labelKey: 'apps.specBuilder.components.specDetail.advance_to_tasks',
+    msg: ADVANCE_PROMPT.design,
+  },
 }
 
 export interface SpecDetailProps {
@@ -167,66 +150,21 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
     onError: (e) => setErr((e as Error).message),
     onSettled: invalidate,
   })
-  // ONE mutation for every message this view sends (review feedback, decision
-  // answers, and the authoring prompt an engine-authorised advance is followed
-  // by). Direct specApi.message calls refetched only the detail, so updated_at
-  // changed without the specs list knowing and the rail's ordering went stale
-  // until its own 15s poll.
+  // ONE mutation for every message this view sends (phase approval, review
+  // feedback, decision answers). Direct specApi.message calls refetched only the
+  // detail, so updated_at changed without the specs list knowing and the rail's
+  // ordering went stale until its own 15s poll.
   const messageMutation = useMutation({
     mutationFn: (msg: string) => specApi.message(name, msg, specId()),
     onError: (e) => setErr((e as Error).message),
     onSettled: invalidate,
   })
 
-  // Leaving a gate: the ENGINE records the approval and decides the transition,
-  // and only then is the authoring prompt for the phase it named sent. A refusal
-  // surfaces its reason and sends nothing -- which is the whole difference from
-  // the prompt this used to send unilaterally, whose text asserted an approval
-  // that did not exist anywhere.
-  const advanceMutation = useMutation({
-    mutationFn: (gate: string) => specApi.advance(name, gate, specId()),
-    onSuccess: (result) => {
-      const next = result?.to_phase ? AUTHOR_PHASE_PROMPT[result.to_phase] : undefined
-      if (next) messageMutation.mutate(next)
-    },
-    onError: (e) => setErr((e as Error).message),
-    onSettled: invalidate,
-  })
+  const advancing = messageMutation.isPending
 
-  const advancing = advanceMutation.isPending || messageMutation.isPending
-
-  // Recording an approval on its own, without asking for a transition. The
-  // engine treats the two as separate facts and so does this: a reviewer who
-  // approves the document in front of them has done a complete thing, and the
-  // last gate in a plan is approved without any further phase to author. The
-  // actor is the authenticated session on the server side -- nothing here names
-  // an approver.
-  const approveMutation = useMutation({
-    mutationFn: (gate: string) => specApi.approve(name, gate, specId()),
-    onError: (e) => setErr((e as Error).message),
-    onSettled: invalidate,
-  })
-
-  // The gate the engine says a person is being asked about. Absent means the
-  // engine offered none, and no gate control is rendered -- the surface never
-  // picks a gate the engine did not name.
-  const currentGate = detail?.engine?.addressable ? detail.engine.current_gate ?? null : null
-  // Whether the engine has already recorded an approval for that gate, from the
-  // engine's own gate row. Undefined when it reported no row for it, which is
-  // treated as "not approved" for rendering only: the endpoint is what decides,
-  // and offering the approval again is harmless where hiding it is not.
-  const currentGateApproved = !!detail?.engine?.gates?.find((g) => g.gate === currentGate)?.approved
-  // Whether the engine permits a build, and its first reason when it does not.
-  // ``undefined`` means the engine did not answer -- an older backend, or one that
-  // could not be asked -- and the control is left enabled so the ENDPOINT decides,
-  // rather than the surface guessing either way from a missing field.
-  const canExecute = detail?.engine?.addressable ? detail.engine.can_execute : undefined
-  const blockedReason = detail?.engine?.execution_blocked_by?.[0]?.message ?? ''
   const advance = () => {
-    if (currentGate) advanceMutation.mutate(currentGate)
-  }
-  const approve = () => {
-    if (currentGate) approveMutation.mutate(currentGate)
+    const a = detail?.phase ? ADVANCE[detail.phase] : undefined
+    if (a) messageMutation.mutate(a.msg)
   }
   const execute = () => executeMutation.mutate()
   const stop = () => stopMutation.mutate()
@@ -287,29 +225,11 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
         ariaLabel={fullscreen ? i18nT('apps.specBuilder.components.specDetail.close_review_view') : i18nT('apps.specBuilder.components.specDetail.expand_document_for_review')}
         label={fullscreen ? <Minimize2 className="lucide-inline" /> : <Maximize2 className="lucide-inline" />}
       />
-      {/* Recording the approval, offered for whatever gate the engine named and
-          has no approval for yet. Separate from the advance because it is a
-          separate fact: the LAST gate in a plan has no next phase to author, and
-          before this control existed the app had no way to record an approval at
-          all -- so a spec parked on that gate was blocked from execution by a
-          missing approval with nothing on screen able to record one. */}
-      {!fullscreen && !executing && currentGate && !currentGateApproved && (
+      {!fullscreen && !executing && detail?.phase && ADVANCE[detail.phase] && (
         <Btn
-          label={approveMutation.isPending
-            ? i18nT('apps.specBuilder.components.specDetail.approving')
-            : i18nT('apps.specBuilder.components.specDetail.approve_gate', { gate: currentGate })}
-          disabled={approveMutation.isPending || advancing}
-          title={i18nT('apps.specBuilder.components.specDetail.approve_gate_tooltip')}
-          onClick={approve}
-        />
-      )}
-      {/* The advance, offered for EVERY gate the engine names. The label may be
-          generic; the control is not conditional on having a specific phrase. */}
-      {!fullscreen && !executing && currentGate && (
-        <Btn
-          label={advancing ? i18nT('apps.specBuilder.components.specDetail.sending') : <><Play className="lucide-inline" /> {advanceLabel(currentGate)}</>}
+          label={advancing ? i18nT('apps.specBuilder.components.specDetail.sending') : <><Play className="lucide-inline" /> {i18nT(ADVANCE[detail.phase].labelKey)}</>}
           primary
-          disabled={advancing || approveMutation.isPending}
+          disabled={advancing}
           title={i18nT('apps.specBuilder.components.specDetail.tells_the_agent_this_phase_is_approved_and_to_mo')}
           onClick={advance}
         />
@@ -328,18 +248,11 @@ export default function SpecDetail({ name, setErr }: SpecDetailProps) {
           // handoffs, and Pause halts the running turn while leaving the queued
           // one intact -- so execution resumed by itself and kept editing files
           // after the user had stopped it.
-          //
-          // ``hasTasks`` is a rendering condition, NOT the gate: the gate is the
-          // engine's and lives on the endpoint, which refuses a spec whose
-          // documents are not all written, valid and approved. This control is
-          // shown as unavailable when the engine says the spec cannot build, with
-          // the engine's own first reason as the tooltip, so a user reads why
-          // rather than clicking into a refusal.
           <Btn
             label={<><Play className="lucide-inline" /> {executeMutation.isPending ? i18nT('apps.specBuilder.components.specDetail.starting') : i18nT('apps.specBuilder.components.specDetail.start_building')}</>}
             primary
-            disabled={executeMutation.isPending || canExecute === false}
-            title={blockedReason || i18nT('apps.specBuilder.components.specDetail.an_agent_will_work_through_the_task_list')}
+            disabled={executeMutation.isPending}
+            title={i18nT('apps.specBuilder.components.specDetail.an_agent_will_work_through_the_task_list')}
             onClick={execute}
           />
         )

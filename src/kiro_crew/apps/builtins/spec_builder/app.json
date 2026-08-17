@@ -24,6 +24,7 @@
   "backend": {
     "routes": "backend.routes:register_routes"
   },
+  "skills": ["skills/spec-workflow"],
   "ui": {
     "pages": [
       {
