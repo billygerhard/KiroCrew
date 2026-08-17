@@ -311,8 +311,8 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Every capability answers from a working builtin: no absent, stubbed, or not-configured tool in the surface
     - _Requirements: 35.1, 35.2, 35.3, 35.4, 35.5, 35.6, 35.7, 35.8_
 
-- [ ] 18. Clean-room provenance gate
-  - [ ] 18.1 Provenance checks and audit
+- [x] 18. Clean-room provenance gate
+  - [x] 18.1 Provenance checks and audit
     - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
     - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5, 28.6_
 
