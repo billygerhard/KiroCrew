@@ -732,8 +732,13 @@ _IPV4_RE = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])")
 
 #: A scheme-relative URL (``//host/path``), which is an endpoint with the scheme
 #: left to the page. Anchored to a quote or line start so that a comment's ``//``
-#: and a doubled path separator cannot match.
-_SCHEME_RELATIVE_RE = re.compile(r"""(?:^|["'`(\s])//(?P<host>[a-z0-9.\-]+\.[a-z]{2,})(?=[/"'`\s)]|$)""")
+#: and a doubled path separator cannot match. The authority may carry userinfo or
+#: a port — both are matched and then stripped by :func:`_host_of`, because a
+#: group that excluded them would not fail to strip them, it would fail to MATCH,
+#: and ``//host:8081/path`` would pass the gate entirely.
+_SCHEME_RELATIVE_RE = re.compile(
+    r"""(?:^|["'`(\s])//(?P<host>[a-z0-9.\-]*[@]?[a-z0-9.\-]+\.[a-z]{2,}(?::\d+)?)(?=[/"'`\s)]|$)"""
+)
 
 #: A bare IPv6 literal. Every hit is parsed before it is judged, which is what
 #: keeps a timestamp or a slice expression from matching — an unparseable hit is
@@ -743,24 +748,42 @@ _IPV6_RE = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![
 #: Top-level names a bare (scheme-less) host may end in. Deliberately a small
 #: closed list of GENERIC names — no organization's own name appears here, so the
 #: rule can exist without violating the provenance it enforces. The list is what
-#: separates a hostname from the dotted things this tree is full of: a module
-#: path, a filename, a config key, a version. Only real top-level names are
-#: listed, learned the hard way: drafting this with ``stage`` and ``prod`` in it
-#: fired on ``EVENT_STAGE = "delivery.stage"`` and two preset fixtures, and a rule
-#: that fires on ordinary dotted keys is a rule someone switches off.
+#: separates a hostname from the dotted things a repository is full of, and it has
+#: been narrowed twice by evidence rather than taste. First: ``stage`` and ``prod``
+#: fired on ``EVENT_STAGE = "delivery.stage"`` and two preset fixtures. Then a
+#: review ran the rule over the WHOLE repository and found ``sh`` firing on
+#: backticked script names (``install.sh`` in prose), ``local`` on
+#: ``threading.local``, and ``app`` on ``"request.app"`` and dotted i18n keys.
+#: Those three are gone too. A provenance rule that fires on ordinary code is
+#: worse than the hole it closes, because it is the rule that gets switched off.
 _BARE_HOST_TLDS = (
-    "com", "net", "org", "io", "dev", "co", "ai", "cloud", "app", "sh", "gov", "edu",
-    "corp", "internal", "intranet", "local",
+    "com",
+    "net",
+    "org",
+    "io",
+    "dev",
+    "co",
+    "ai",
+    "cloud",
+    "gov",
+    "edu",
+    "corp",
+    "internal",
+    "intranet",
 )
 
 #: A QUOTED dotted host with no scheme, which is the commonest accidental spelling
 #: of an endpoint: a constant holding just the host, with the scheme added later.
 #: Quoting is required because an unquoted dotted word in prose is vocabulary, not
 #: an address, and this rule must not become the ordinary-word rule it cannot be.
+#: BACKTICKS are deliberately NOT a quote form here: in Markdown a backtick spans
+#: prose, and the review above found the backticked form matching filenames in
+#: ordinary sentences — including one in this app's own SKILL.md, which the scan
+#: reads.
 _BARE_HOST_RE = re.compile(
-    r"""["'`](?P<host>(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+(?:"""
+    r"""["'](?P<host>(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+(?:"""
     + "|".join(_BARE_HOST_TLDS)
-    + r"""))["'`/]""",
+    + r"""))["'/]""",
     re.IGNORECASE,
 )
 
@@ -1202,7 +1225,8 @@ class TestNoNonPublicReferenceIsInTheTree:
     **What this can see.** Any URL whose host is not provably unresolvable,
     loopback, or a reviewed public name; any non-loopback IPv4 literal; any
     authentication or custom HTTP header literal; any credential in an issued
-    shape; and any credential-named binding holding a credential-shaped literal.
+    shape; and any credential-named binding holding a credential-shaped literal
+    (Python only, and in this app's tree only — see the boundary below).
     Each of those is driven against a planted violation below, one case per
     spelling, because a rule with no planted case is decoration.
 
@@ -1220,14 +1244,33 @@ class TestNoNonPublicReferenceIsInTheTree:
       A bare word in prose is left to review.
     * A credential of a shape not listed — a bare high-entropy string bound to an
       innocuous name reads exactly like a test fixture.
+    * **A credential-named binding outside Python, or outside the app tree.** The
+      binding rule is an AST walk, so it runs on ``.py`` files in
+      :data:`APP_ROOT` only — ``const apiToken = "…"`` in the UI tree is seen by
+      the TEXT rules alone, which match issued shapes (``ghp_``, ``AKIA``, a JWT)
+      and not a generic high-entropy string. The can-see list above says
+      "credential-named binding" without qualification; this is that
+      qualification. Extending the walk to TypeScript would need a TS parser this
+      module does not carry, and a text rule broad enough to catch a generic
+      literal is the false-positive shape that gets a gate switched off.
+    * **A host or address split across concatenation.** Every host rule reads one
+      line of text, so ``"review-service." + "somecorp" + ".net"`` passes. This is
+      not incidental: it is how the planted violations in this very module are
+      written, so the scan does not report its own fixtures. It is stated here as
+      well as at the plant site, because a hole documented only where it is
+      exploited is not documented.
+    * **An 8-group hex-colon string is indistinguishable from IPv6.** A key
+      fingerprint of that shape parses as an address and WOULD be reported. The
+      rule judges only what parses, which is what keeps timestamps out; the cost
+      is this ambiguity, and it is unfixable from text.
     * **An UNQUOTED bare hostname**, and a quoted one whose top-level name is not
       in :data:`_BARE_HOST_TLDS`. The bare-host rule requires quoting and a real
-      top-level name on purpose: this tree is full of dotted things that are not
-      addresses (module paths, filenames, config keys, event names, versions), and
-      a rule that fired on ``"delivery.stage"`` would be switched off within a day.
-      A conservative rule over unquoted text would need a public-suffix list this
-      module deliberately does not carry. So: a host in a string constant is seen;
-      a host in prose, or under a top-level name nobody listed, is not.
+      top-level name on purpose: a repository is full of dotted things that are not
+      addresses (module paths, filenames, config keys, event names, i18n keys), and
+      a rule that fired on ``"delivery.stage"`` or ``threading.local`` would be
+      switched off within a day — both of which it did, in drafts, before the list
+      was narrowed. A conservative rule over unquoted text would need a
+      public-suffix list this module deliberately does not carry.
     * **File and directory NAMES.** The scan reads file CONTENT only, so a
       non-public system name used as a filename passes. Contiguous with the
       ordinary-word gap above, and stated because it is not obvious.
@@ -1296,6 +1339,17 @@ class TestNoNonPublicReferenceIsInTheTree:
         assert any(
             name.startswith("website/src/test/SpecBuilder") for name in names
         ), "the UI's own test fixtures are outside the provenance scan"
+        # Nothing escapes by extension, the same guarantee the app tree gets: a
+        # .json or .css fixture added under the UI would otherwise sit unread while
+        # the boundary claims only files outside the scanned trees are unseen.
+        unread = sorted(
+            _display(path)
+            for root in UI_ROOTS
+            if root.is_dir()
+            for path in root.rglob("*")
+            if path.is_file() and path not in set(files)
+        )
+        assert unread == [], f"files of a kind the UI provenance scan does not read: {unread}"
 
     def test_the_user_interfaces_prompt_text_is_inventoried(self) -> None:
         """The UI ships agent-directed prompt text, so it belongs to the ledger.
@@ -1333,6 +1387,8 @@ class TestNoNonPublicReferenceIsInTheTree:
             pytest.param(f"TRACKER_HOST = {_PLANTED_FQDN!r}", id="bare-host-no-scheme"),
             pytest.param(f'SPECS = "{_PLANTED_SUBDOMAIN}/api"', id="bare-host-with-path"),
             pytest.param(f'SRC = "//{_PLANTED_FQDN}/lib.js"', id="scheme-relative-url"),
+            pytest.param(f'SRC = "//{_PLANTED_FQDN}:8081/repo"', id="scheme-relative-with-port"),
+            pytest.param(f'SRC = "//svc@{_PLANTED_FQDN}/repo"', id="scheme-relative-with-userinfo"),
             pytest.param(f'PEER = "{_PLANTED_IPV6}"', id="address-literal-ipv6"),
             pytest.param(
                 "TOKEN = " + repr("gh" + "p_EXAMPLE" + "aB1cD2eF3gH4iJ5kL6mN7oP8"),
