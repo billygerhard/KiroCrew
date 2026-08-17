@@ -39,10 +39,11 @@ guarantee:
   fence only forces the claim to exist, to be attached to a path prefix, and to
   be narrow enough not to cover another app's tree
   (:class:`TestTheAllowlistCannotSwallowAnotherApp`).
-* **A rename's source path when git pairs it.** ``--name-only`` reports the
-  destination of a detected rename. A file moved OUT of another app's tree would
-  therefore be seen at its destination only — reported all the same unless the
-  destination is in-bounds, in which case the deletion side is invisible.
+* **A rename's source path is no longer invisible**: the change list passes
+  ``--no-renames``, so a file moved out of another app's tree appears as a
+  deletion there and an addition here — both judged. What remains unseen is
+  git-ignored content, what a change does (paths only), and whether an
+  allowlisted claim is true.
 """
 
 from __future__ import annotations
@@ -273,8 +274,13 @@ def branch_changed_paths(root: Path, base: str) -> list[str]:
     """
     found: set[str] = set()
     for args in (
-        ("diff", "--name-only", f"{base}..HEAD"),
-        ("diff", "--name-only", "HEAD"),
+        # --no-renames: a detected rename reports only its destination, so a file
+        # moved OUT of another app's tree into ours would be seen at its in-bounds
+        # destination and the disappearance from theirs would be invisible. With
+        # rename pairing off, both sides appear — the source as a deletion, which
+        # is exactly the trespass the fence exists to report.
+        ("diff", "--no-renames", "--name-only", f"{base}..HEAD"),
+        ("diff", "--no-renames", "--name-only", "HEAD"),
         ("ls-files", "--others", "--exclude-standard"),
     ):
         result = _git(root, *args)
@@ -624,12 +630,30 @@ class TestTheAllowlistCannotSwallowAnotherApp:
     """The allowlist is the fence's own soft spot, so it is fenced in turn."""
 
     def test_no_entry_admits_a_path_inside_another_app(self) -> None:
-        """Assembled at runtime so no other app's path sits in this tree literally."""
-        for app_dir in _builtin_app_dirs():
-            if app_dir == "spec_engine":
-                continue
-            planted = "/".join(("src", "kiro_crew", "apps", "builtins", app_dir, "app" + ".json"))
-            assert admits(planted) is None, f"the allowlist admits {planted}"
+        """Judge the ENTRIES, not a sample path.
+
+        The first version planted one filename per app (``app.json``) and asked
+        whether it was admitted — which an exact-file entry naming any OTHER
+        file inside another app's tree slipped straight past. A review attack
+        demonstrated it with an entry for a single module inside the Prior_App.
+        So the check is now structural: no allowlist entry's PREFIX may lie
+        inside, equal, or contain another app's territory, which no choice of
+        planted filename can miss. The app directories are assembled at runtime
+        so no other app's path sits in this tree literally.
+        """
+        territories = [
+            "/".join(("src", "kiro_crew", "apps", "builtins", app_dir)) + "/"
+            for app_dir in _builtin_app_dirs()
+            if app_dir != "spec_engine"
+        ] + ["website/src/apps/spec-" + "builder/"]
+        for prefix, _justification in BOUNDARY_ALLOWLIST:
+            for territory in territories:
+                inside = prefix.startswith(territory)
+                covers = territory.startswith(prefix)
+                assert not (inside or covers), (
+                    f"allowlist entry {prefix!r} reaches into another app's "
+                    f"territory {territory!r}"
+                )
 
     def test_no_entry_admits_the_shared_app_directories_wholesale(self) -> None:
         for wide in (
