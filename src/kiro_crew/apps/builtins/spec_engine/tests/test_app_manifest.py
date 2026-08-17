@@ -2,9 +2,10 @@
 
 Three claims live here, and each has a way to fail loudly:
 
-* The manifest declares the discovery skill and the Engine_MCP_Server, and
-  declares no UI (the dashboard page is a later task, and a page declared before
-  it exists is a broken sidebar entry).
+* The manifest declares the discovery skill, the Engine_MCP_Server, its own dashboard
+  page, and its own backing route module. The page and the routes are the app's whole
+  operator surface: no page means no way to open the app, and a page whose label has no
+  catalog entry renders untranslated everywhere but English.
 * The skill routes to the tools and states no format rules. Enforced by
   comparing the skill against the engine's own guidance text rather than against
   a hand-typed list of forbidden words: a copied rule is caught because it
@@ -117,10 +118,41 @@ class TestManifest:
         # having registered nothing and the client sees the server vanish.
         assert '__name__ == "__main__"' in source.read_text(encoding="utf-8")
 
-    def test_declares_no_ui(self, manifest_data: dict):
-        # The dashboard page belongs to a later task. Declaring a route now puts
-        # a sidebar entry in front of a page that does not exist.
-        assert "ui" not in manifest_data
+    def test_declares_its_own_page_and_its_own_backing_routes(self, manifest_data: dict):
+        """The app's surface is its own: one page, one route module, one app card.
+
+        Both halves are asserted from the manifest because the manifest is the only
+        place any consumer looks. ``appNav.ts`` builds the nav destination from
+        ``ui.pages[0]`` — no page means no way to open the app at all — and the
+        localized nav label is keyed off the app id, so a page declared without its
+        ``page_label`` catalog entry renders the raw manifest label untranslated in
+        every locale but English. That pairing is enforced from the catalog side by
+        ``website/scripts/check-app-manifest-sync.mjs`` (bidirectional: it demands
+        ``page_label`` exactly when ``ui.pages`` exists) and from the key-table side
+        by ``website/src/test/appManifest.test.ts``; neither is reachable from here,
+        so this asserts the manifest facts they key off.
+
+        ``route`` matters beyond being non-empty: it is the path the compiled surface
+        registers, so a drifted spelling is a nav row that resolves to nothing.
+        """
+        pages = manifest_data["ui"]["pages"]
+        assert len(pages) == 1, "one page, so the app is one card with one surface"
+        assert pages[0]["route"] == "/spec-engine"
+        assert pages[0]["label"] == "Spec Engine"
+        # A lucide glyph name. An unregistered name is not broken — the rail falls back
+        # to a generic package icon — so this pins the intent rather than a rendering.
+        assert pages[0]["icon"] == "Cog"
+        # The route module the app's own handlers live in. For a builtin the gateway
+        # reaches them through ``BUILTIN_NAMES`` -> ``package.register_routes(app)``;
+        # this field is the declaration every sibling builtin carries, and the host
+        # never imports it, so it can be declared ahead of the module.
+        assert manifest_data["backend"]["routes"] == "backend.routes:register_routes"
+
+    def test_the_page_does_not_appear_until_an_operator_enables_the_app(self, manifest_data: dict):
+        # Why declaring the page before its component exists is not a broken sidebar:
+        # ``isAppNavigable`` requires ``enabled``, and this app ships disabled, so no
+        # nav row exists on any host until an operator turns it on.
+        assert manifest_data["defaultEnabled"] is False
 
     def test_declares_no_auto_approve(self, manifest_data: dict):
         # Every tool goes through the host's approval gate. An autoApprove list

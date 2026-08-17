@@ -3799,7 +3799,8 @@
     "specEngine": {
       "manifest": {
         "description": "Convierta una solicitud en una especificación revisada y luego ejecútela. Cualquier agente capaz de llamar a herramientas MCP dirige todo el flujo de trabajo: el motor proporciona las instrucciones de redacción, orquestación y revisión, valida los documentos nativos que produce y se niega a avanzar a una fase cuyo documento no valide o carezca de una aprobación vigente. Nada del formato vive en un prompt que un agente pueda olvidar o parafrasear.",
-        "display_name": "Spec Engine"
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
       }
     },
     "workflows": {

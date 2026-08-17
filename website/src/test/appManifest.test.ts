@@ -27,6 +27,17 @@ import '../i18n'
 const lookup = (cat: unknown, key: string): unknown =>
   key.split('.').reduce<unknown>((o, p) => (o == null ? undefined : (o as Record<string, unknown>)[p]), cat)
 
+/** Every shipped built-in manifest, read the way the gateway's discovery walk finds them. */
+type ShippedManifest = { name: string, displayName?: string, highlights?: string[], ui?: { pages?: unknown[] } }
+const shippedManifests = (): ShippedManifest[] => {
+  const dir = resolve(__dirname, '../../../src/kiro_crew/apps/builtins')
+  return readdirSync(dir, { withFileTypes: true })
+    .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('_'))
+    .map(e => join(dir, e.name, 'app.json'))
+    .filter(f => existsSync(f))
+    .map(f => JSON.parse(readFileSync(f, 'utf8')) as ShippedManifest)
+}
+
 describe('APP_MANIFEST_KEY', () => {
   /**
    * Coverage lives HERE and not in `scripts/check-app-manifest-sync.mjs` on purpose.
@@ -37,12 +48,7 @@ describe('APP_MANIFEST_KEY', () => {
    * simply is not in the object and fails here.
    */
   it('has an entry for every built-in that ships an app.json', () => {
-    const dir = resolve(__dirname, '../../../src/kiro_crew/apps/builtins')
-    const shipped = readdirSync(dir, { withFileTypes: true })
-      .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('_'))
-      .map(e => join(dir, e.name, 'app.json'))
-      .filter(f => existsSync(f))
-      .map(f => JSON.parse(readFileSync(f, 'utf8')))
+    const shipped = shippedManifests()
     expect(shipped.length).toBeGreaterThan(10)
     for (const m of shipped) {
       expect(APP_MANIFEST_KEY, `no APP_MANIFEST_KEY entry for '${m.name}'`)
@@ -59,10 +65,26 @@ describe('APP_MANIFEST_KEY', () => {
     }
   })
 
+  // The pairing the sync gate enforces from the CATALOG side and cannot enforce here: it
+  // demands `apps.<id>.manifest.page_label` exactly when `ui.pages` is non-empty, but it
+  // reads only JSON, so nothing else checks that this TS table agrees. A row that keeps
+  // `pageLabel` for an app whose page was removed renders a label for a page that cannot
+  // be opened; a row that omits it for an app that HAS a page sends the nav rail through
+  // the raw-manifest fallback, which is untranslated in every locale but English.
+  it('declares a page label exactly for the built-ins that declare a page', () => {
+    const declared = shippedManifests().filter(m => APP_MANIFEST_KEY[m.name])
+    expect(declared.length).toBeGreaterThan(10)
+    for (const m of declared) {
+      const hasPage = (m.ui?.pages?.length ?? 0) > 0
+      expect(Boolean(APP_MANIFEST_KEY[m.name].pageLabel), `pageLabel for '${m.name}'`).toBe(hasPage)
+    }
+  })
+
   it('carries full literal keys, which is the only form check-i18n-keys resolves', () => {
     for (const [name, keys] of Object.entries(APP_MANIFEST_KEY)) {
-      // `pageLabel` is optional (an app with no `ui.pages` has no page to name), so it
-      // is spread in only when present rather than asserted as a key on every app.
+      // `pageLabel` is optional (an app that ships a store card and no `ui.pages` has no
+      // page to name), so it is spread in only when present rather than asserted as a
+      // key on every app.
       const present = [
         keys.displayName,
         keys.description,
@@ -172,17 +194,24 @@ describe('resolvers', () => {
     expect(appPageLabel('vendor-app')).toBe('vendor-app')
   })
 
-  // An app can ship a store card and no page (spec-engine is MCP-plus-hook only). It
-  // contributes no nav page, so it must not claim a page label — an earlier revision
-  // gave it one, which put a label for a non-existent page into thirteen catalogs and
-  // turned the sync gate red. The fallback is asserted, not just the absence, so this
-  // stays a statement about behaviour rather than about the table's shape.
-  it('falls back to the display name for an app that declares no page', () => {
-    const pageless = Object.entries(APP_MANIFEST_KEY).filter(([, k]) => !k.pageLabel)
-    expect(pageless.length, 'expected at least one pageless app in the table').toBeGreaterThan(0)
-    for (const [name] of pageless) {
-      expect(appPageLabel(name, '', 'Raw Display')).toBe('Raw Display')
-      expect(appPageLabel(name)).toBe(name)
+  // `pageLabel` stays OPTIONAL on the type because an app may ship a store card and no
+  // page at all, and the resolver's fallback for that shape is the behaviour under test:
+  // it must return the caller's own label rather than render a raw catalog key. Every
+  // shipped built-in currently declares a page, so the shape is supplied here — a real
+  // table row of a legal shape, driven through the real resolver, rather than a stub of
+  // the function itself.
+  it('falls back to the display name for a table entry that declares no page label', () => {
+    const probe = 'pageless-probe-app'
+    APP_MANIFEST_KEY[probe] = {
+      displayName: 'apps.specEngine.manifest.display_name',
+      description: 'apps.specEngine.manifest.description',
+      highlights: [],
+    }
+    try {
+      expect(appPageLabel(probe, '', 'Raw Display')).toBe('Raw Display')
+      expect(appPageLabel(probe)).toBe(probe)
+    } finally {
+      delete APP_MANIFEST_KEY[probe]
     }
   })
 })

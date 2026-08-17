@@ -23,7 +23,17 @@
       ]
     }
   },
+  "ui": {
+    "pages": [
+      {
+        "route": "/spec-engine",
+        "label": "Spec Engine",
+        "icon": "Cog"
+      }
+    ]
+  },
   "backend": {
+    "routes": "backend.routes:register_routes",
     "hooks": {
       "on_startup": "startup:on_startup"
     }

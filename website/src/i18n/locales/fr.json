@@ -3799,7 +3799,8 @@
     "specEngine": {
       "manifest": {
         "description": "Transformez une demande en spécification révisée, puis exécutez-la. Tout agent capable d'appeler des outils MCP pilote l'ensemble du flux : le moteur fournit les instructions de rédaction, d'orchestration et de revue, valide les documents natifs produits et refuse de passer à une phase dont le document n'est pas valide ou dont l'approbation manque. Rien du format ne réside dans un prompt qu'un agent pourrait oublier ou reformuler.",
-        "display_name": "Spec Engine"
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
       }
     },
     "workflows": {

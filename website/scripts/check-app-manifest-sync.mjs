@@ -68,8 +68,8 @@ function manifests() {
       dir: entry.name,
       displayName: m.displayName || '',
       description: m.description || '',
-      // Distinct from an empty label: an app may ship a store card and no page at all
-      // (spec-engine is MCP-plus-hook only), and such an app has no page to label.
+      // Distinct from an empty label: an app may ship a store card and no page at all,
+      // and such an app has no page to label.
       hasPage: pages.length > 0,
       pageLabel: (pages[0] && pages[0].label) || '',
       highlights: m.highlights || [],
@@ -135,9 +135,11 @@ for (const [name, app] of apps) {
   check(keys.displayName, app.displayName, 'displayName')
   check(keys.description, app.description, 'description')
   // An app with no `ui.pages` has no page to label, so it must not carry a page_label
-  // key. Checked in BOTH directions: demanding one for a pageless app is what put an
-  // untranslatable "Spec Engine" label in thirteen catalogs for a page that cannot
-  // exist, and only asserting the forward direction would let it back in silently.
+  // key. Checked in BOTH directions because each direction has its own silent failure:
+  // omitting the key for an app that HAS a page leaves its nav row falling back to the
+  // raw manifest label, untranslated in every locale but English, while demanding one for
+  // a pageless app puts a label for a page that cannot be opened into all thirteen
+  // catalogs.
   if (app.hasPage) {
     check(keys.pageLabel, app.pageLabel, 'pageLabel')
   } else if (lookup(en, keys.pageLabel) !== undefined) {

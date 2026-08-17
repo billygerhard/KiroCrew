@@ -3677,7 +3677,8 @@
     "specEngine": {
       "manifest": {
         "description": "요청을 검토된 명세로 바꾸고 그대로 실행합니다. MCP 도구를 호출할 수 있는 에이전트라면 전체 워크플로를 진행할 수 있습니다. 엔진이 작성·오케스트레이션·검토 지침을 제공하고, 생성된 네이티브 문서를 검증하며, 문서가 검증을 통과하지 못하거나 유효한 승인이 없는 단계로는 진행을 거부합니다. 형식에 관한 내용은 에이전트가 잊거나 다르게 표현할 수 있는 프롬프트에 두지 않습니다.",
-        "display_name": "Spec Engine"
+        "display_name": "Spec Engine",
+        "page_label": "Spec Engine"
       }
     },
     "workflows": {

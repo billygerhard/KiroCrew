@@ -12,8 +12,9 @@ right level for "what does this method answer". :class:`StdioServer` is the same
 surface one level lower: the packaged server as a child process, driven over the
 line-delimited framing a client actually speaks. It lives here beside ``_req`` so
 there is one request builder and one driver for the whole suite —
-``test_engine_mcp_library_equivalence`` imports it rather than starting a second
-one.
+``test_engine_mcp_library_equivalence`` and
+``test_engine_mcp_setup_config_conformance`` import it rather than starting a
+second one.
 """
 
 from __future__ import annotations
@@ -96,11 +97,14 @@ class StdioServer:
             line = self._lines.get(timeout=REPLY_TIMEOUT_S)
         except queue.Empty:  # pragma: no cover - only on a wedged server
             raise AssertionError(
-                f"no reply to id {req_id} within {REPLY_TIMEOUT_S}s; "
+                f"no reply to id {req_id} within {REPLY_TIMEOUT_S}s ({self._liveness()}); "
                 f"server stderr:\n{self.stderr_text()}"
             ) from None
         if not line:
-            raise AssertionError(f"server exited before answering; stderr:\n{self.stderr_text()}")
+            raise AssertionError(
+                f"server exited before answering id {req_id}: {self._exit_status()}; "
+                f"stderr:\n{self.stderr_text()}"
+            )
         reply = json.loads(line)
         assert isinstance(reply, dict), f"a reply must be a JSON object, got {line!r}"
         assert reply.get("jsonrpc") == "2.0", f"reply is not JSON-RPC 2.0: {line!r}"
@@ -113,6 +117,45 @@ class StdioServer:
         req_id = self._next_id
         self._write(_req(method, params, req_id=req_id))
         return self._read(req_id)
+
+    def send_raw(self, line: str) -> None:
+        """Write one raw line, bypassing the request builder, and read no reply.
+
+        For the framing cases a well-formed request cannot express: a line that is
+        not JSON at all, which the server must skip without ending the session. A
+        caller proves the session survived by sending a real request afterwards
+        and getting its reply.
+        """
+        stream = self._proc.stdin
+        if stream is None:  # pragma: no cover - stdin is always a pipe here
+            raise RuntimeError("the server child has no stdin")
+        stream.write(line + "\n")
+        stream.flush()
+
+    def _liveness(self) -> str:
+        """Whether the child is still up, for a timeout message.
+
+        A silent server and a dead one are different defects and a timeout alone
+        cannot tell them apart, so the message says which was observed rather than
+        leaving both readings open.
+        """
+        status = self._proc.poll()
+        return "still running" if status is None else f"already exited with status {status}"
+
+    def _exit_status(self) -> str:
+        """The child's exit status, named, for a failure message.
+
+        A child that closed its stdout has gone or is going, so waiting a bounded
+        moment turns "the server exited" into "the server exited with status N" --
+        the difference between a test that reports a crash and one that reports a
+        silence. The wait is bounded because a process that closed stdout and then
+        refused to exit must still fail the test rather than hang the suite.
+        """
+        try:
+            code = self._proc.wait(timeout=EXIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:  # pragma: no cover - only on a wedged server
+            return "stdout closed but the process is still running"
+        return f"exit status {code}"
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         """Send a notification: no id, and no reply is read."""
