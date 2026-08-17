@@ -10,7 +10,7 @@ no capability is surfaceless for longer than a wave.
 ## Tasks
 
 - [ ] 1. Restore the Prior App
-  - [ ] 1.1 Revert every Prior_App file to the Merge_Base
+  - [x] 1.1 Revert every Prior_App file to the Merge_Base
     - Compute the Merge_Base (`git merge-base origin/main HEAD`) and inventory every modified or added file under `src/kiro_crew/apps/builtins/spec_builder/`, `website/src/apps/spec-builder/`, and `website/src/test/SpecBuilder*` from `git diff --name-status`, never from notes
     - Restore modified files with `git checkout <merge-base> -- <path>`; delete files this branch added under those trees
     - Verify the Prior_App's own backend test suite passes at its Merge_Base count (measure the count from the Merge_Base tree, do not assume it)
@@ -28,7 +28,7 @@ no capability is surfaceless for longer than a wave.
     - Plant violations assembled at runtime (a path under the Prior_App tree; an undeclared new root) and assert each is reported; prove the fail-closed branch by driving the Merge_Base computation to fail in a fixture repo
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 - [ ] 3. Agent surface for setup and configuration
-  - [ ] 3.1 Setup assistant tools on the Engine_MCP_Server
+  - [x] 3.1 Setup assistant tools on the Engine_MCP_Server
     - Add `inspect_setup`, `plan_setup`, and `apply_setup` to the TOOLS table, delegating to `engine/setup.py`; `inspect_setup` returns evidence, inferences, open questions, and preset offers including each preset's declared programs
     - `plan_setup` computes and returns a SetupPlanEnvelope with a deterministic content-hash `plan_id` and applies nothing; `apply_setup` recomputes the plan, refuses on `plan_id` mismatch, requires a non-empty `approver`, and surfaces `SetupApprovalRequired` and `InferredSubjectRefused` as structured refusals
     - Property test: `plan_id` equality is total over canonical plan inputs, and a stale `plan_id` always refuses (design Property 2)
@@ -109,3 +109,9 @@ no capability is surfaceless for longer than a wave.
 - Task 5.1's mockup selection is made by a reviewer agent and is VETO-PENDING for the owner; overturning it re-runs only waves 4-7's frontend tasks.
 - All tests run offline; the fence and posture checks are ordinary pytest tests in the Spec_App's suite, so CI needs no new steps.
 - The config file remains JSON by the owner's explicit decision.
+
+### Findings carried forward by the review gate
+
+- **R1.4 final-report item (from 1.1's review):** no reverted hunk fixed a genuine Merge_Base defect of the Prior_App. One observation for its owner: the Prior_App's `_seed_prompt` docstring claims a builtin's declared skills "are NOT on the agent's skill path", but `bridges.reconcile_app_skills` links manifest-declared skills for enabled non-self-managed apps, so the claim appears factually wrong at the Merge_Base. Not fixed (byte-identity forbids it); report to the owner.
+- **For 1.2's gate sweep:** two Prior_App files (`backend/routes.py`, `tests/test_routes.py`) are black-dirty AT the Merge_Base; the sweep must treat them as pre-existing, not reformat them.
+- **For 3.2 (owns the config door):** (a) the approver identity demanded by `apply_setup` is echoed but recorded nowhere durable — `ConfigStore.write` logs only surface name and key count; give the write path a durable approver record. (b) `apply_setup` drops `ConfigStore.write`'s merge advisories from the tool reply (pre-existing engine shape, newly exposed) — plumb the warn recorder into the reply. (c) `CONFIGURATION_ONLY` in the library-equivalence fence lacks the completeness pin its sibling categories have — add it so a future tool cannot join the partition undriven.
