@@ -347,7 +347,18 @@ export default function SpecEnginePage() {
         </div>
       </nav>
 
-      {pane === 'setup' ? (
+      {pane === null ? (
+        /* The landing pane is still the configuration read's to decide. Without
+           this branch, null fell through to the queue pane, so an unconfigured
+           engine flashed the run list before switching to setup. */
+        <div className="se-work" data-pane-pending="true">
+          <section className="se-rows" aria-busy="true">
+            <p className="se-lbl">
+              {i18nT('apps.specEngine.specEnginePage.reading_the_configuration')}
+            </p>
+          </section>
+        </div>
+      ) : pane === 'setup' ? (
         <div className="se-setup">
           <aside
             className="se-steps"
@@ -584,16 +595,34 @@ export default function SpecEnginePage() {
         data-engaged={engaged ? 'true' : 'false'}
         aria-label={i18nT('apps.specEngine.specEnginePage.safety_and_spend')}
       >
-        <span className="se-lbl">{i18nT('apps.specEngine.specEnginePage.spend')}</span>
-        <span className="se-val">
-          {fmtNumber(queue.data?.total_credits ?? 0, { maximumFractionDigits: 1 })}
-        </span>
-        <span className="se-lbl">{i18nT('apps.specEngine.specEnginePage.credits')}</span>
-        <span className="se-sep" />
-        <span className="se-lbl">
-          {i18nT('apps.specEngine.specEnginePage.waiting_on_a_person')}
-        </span>
-        <span className="se-val">{fmtNumber(entries.length)}</span>
+        {queue.isError ? (
+          /* An unread queue must not read as an empty one. The two figures on
+             this strip are queue-derived, so when that read failed they are
+             unknown — rendering 0 here would be the fail-open the kill-switch
+             text two spans down deliberately refuses. */
+          <span className="se-lbl" data-strip-error="queue">
+            {i18nT('apps.specEngine.specEnginePage.could_not_read_the_run_queue')}
+          </span>
+        ) : (
+          <>
+            {/* Scoped label: total_credits sums ONLY runs waiting on a person
+                (the queue route's population), not runs working or closed. An
+                unqualified "Spend" would under-report by an unbounded amount.
+                The all-runs figure belongs to the spend panel, a later task. */}
+            <span className="se-lbl">
+              {i18nT('apps.specEngine.specEnginePage.spend_on_waiting_runs')}
+            </span>
+            <span className="se-val">
+              {fmtNumber(queue.data?.total_credits ?? 0, { maximumFractionDigits: 1 })}
+            </span>
+            <span className="se-lbl">{i18nT('apps.specEngine.specEnginePage.credits')}</span>
+            <span className="se-sep" />
+            <span className="se-lbl">
+              {i18nT('apps.specEngine.specEnginePage.waiting_on_a_person')}
+            </span>
+            <span className="se-val">{fmtNumber(entries.length)}</span>
+          </>
+        )}
         <span className="se-ks">
           <span className="se-ks-dot" />
           <span className="se-ks-text">

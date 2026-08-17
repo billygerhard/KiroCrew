@@ -118,6 +118,14 @@ describe('the no-overlay rule', () => {
     // is not an exception: a sticky element scrolls inside its own container and
     // cannot leave it, so it can never cover the status strip, which is a sibling
     // row of the page grid.
+    //
+    // The ban is deliberately WIDER than the property it protects: it also
+    // rejects the standard sr-only utility (position:absolute + clip), which
+    // cannot occlude anything. That is a chosen cost, not an oversight — a
+    // narrower rule ("absolute is fine if clipped") is exactly the kind of
+    // judgement call that erodes one exception at a time until a drawer ships.
+    // If screen-reader-only text is ever needed, amend THIS test in the same
+    // change, with the reviewer looking at both; the failing test is the gate.
     const declarations = SE_CSS.replace(/\s+/g, '')
     expect(declarations).not.toContain('position:fixed')
     expect(declarations).not.toContain('position:absolute')
@@ -223,6 +231,25 @@ describe('the run list', () => {
     expect(alert).toHaveTextContent(T.could_not_read_the_run_queue)
     expect(alert).toHaveTextContent('queue_unreadable')
     expect(screen.getByRole('button', { name: T.retry })).toBeInTheDocument()
+  })
+
+  it('does not let the status strip read an unread queue as an empty one', async () => {
+    // The strip's two figures are queue-derived. On a failed read they are
+    // unknown, and "Spend 0 / Waiting 0" on the config or setup pane would be
+    // the fail-open the kill-switch text deliberately refuses. The strip must
+    // state the refusal instead of coalescing to zero.
+    stubReads({
+      queue: { status: 503, body: { code: 'queue_unreadable', error: 'database is locked' } },
+    })
+    const { container } = renderPage()
+    await screen.findByRole('alert')
+    const strip = container.querySelector('.se-status')
+    expect(strip).not.toBeNull()
+    expect(strip!.querySelector('[data-strip-error="queue"]')).toHaveTextContent(
+      T.could_not_read_the_run_queue,
+    )
+    expect(strip!.textContent).not.toContain(T.spend_on_waiting_runs)
+    expect(strip!.textContent).not.toContain(T.waiting_on_a_person)
   })
 })
 

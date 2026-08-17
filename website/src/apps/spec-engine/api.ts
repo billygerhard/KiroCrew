@@ -56,8 +56,16 @@ export class SpecEngineApiError extends Error {
 }
 
 /**
- * The refusal codes these handlers emit, as a lookup rather than a union of
- * string literals used inline.
+ * The refusal codes the page branches on today, as a lookup rather than a
+ * union of string literals used inline. NOT the full set the handlers emit:
+ * the queue-action failure codes (`release_refused`, `release_failed`,
+ * `redispatch_failed`, `cleanup_failed`, `teardown_failed`), the kill-switch
+ * `engage_failed`, and the malformed-request family (`bad_json`, `bad_patch`,
+ * `bad_action`, `bad_reason`) have no branch on this shell — the panels that
+ * act on them arrive with the queue and kill-switch tasks, and each code
+ * should be added HERE when its branch is written, not spelled inline.
+ * `release_refused` in particular is a 409 engine refusal, not a failure, and
+ * the queue panel must distinguish the two.
  *
  * Kept because the page's behaviour differs per code in ways a status cannot
  * express: `app_disabled` and `unauthorized` are both a 403/401 the operator
