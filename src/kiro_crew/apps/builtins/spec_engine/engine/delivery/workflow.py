@@ -89,9 +89,19 @@ WORKFLOW_PRESETS: Mapping[str, Mapping[str, tuple[tuple[str, ...], ...]]] = {
     "git-pull-request": {
         ISOLATE_STAGE: GIT_ISOLATE_COMMANDS,
         "submit": (
-            # Commands run in the run's own worktree, so staging everything stages
-            # this run's work and nothing else. The subject and body come from the
-            # spec's review artifact rather than from a template of their own.
+            # WARNING, and the reason this preset is not yet safe for a project
+            # with unrelated uncommitted work: these commands do NOT run in the
+            # run's worktree. ``isolated_context`` sets ``isolated_path`` for the
+            # isolate stage alone and deliberately leaves ``workspace_path``
+            # alone, and the flow passes the ORIGINAL context to submit, so every
+            # command here runs in the project's own tree and ``{isolated_path}``
+            # is not even in scope. ``git add --all`` therefore stages whatever is
+            # in the project tree, and the commit does not land on the branch the
+            # push then names. An earlier version of this comment asserted the
+            # opposite ("commands run in the run's own worktree, so staging
+            # everything stages this run's work and nothing else"), which is how a
+            # preset comes to license the one command that makes the gap harmful.
+            # Recorded as a follow-up obligation on requirement 13 in tasks.md.
             ("git", "add", "--all"),
             ("git", "commit", "--message", "{review_title}", "--message", "{review_summary}"),
             ("git", "push", "--set-upstream", "origin", "{branch_name}"),

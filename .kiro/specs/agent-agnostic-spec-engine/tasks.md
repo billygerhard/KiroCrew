@@ -200,7 +200,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Comment-driven dispatch gated on the commenter's own submitter class; a class not permitted to drive dispatch is quarantined in the Review_Queue for human release, consuming no credits; dispatching comments screened for embedded instructions on watched-item terms
     - _Requirements: 23.1, 23.2, 23.3, 23.4, 23.5, 23.6, 23.7, 23.8_
 
-- [ ] 12. UI driver (absorb Spec Builder)
+- [x] 12. UI driver (absorb Spec Builder)
   - [x] 12.1 Backend collapse onto the engine
     - Replace `_seed_prompt`/`_TYPE_PLAN`/`_derive_phase` backend logic with engine library calls; UI state, validation, and transitions come only from the engine; failed refresh retains last known state with a staleness indicator
     - _Requirements: 12.1, 12.2_
@@ -217,7 +217,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Per-stage display of whether commands come from the selected preset or a project override
     - _Requirements: 33.6_
 
-  - [ ] 12.4 Replace the Spec Builder builtin
+  - [x] 12.4 Replace the Spec Builder builtin
     - New app replaces spec-builder as the single spec surface; specs created by the prior app remain valid artifacts
     - _Requirements: 12.6_
 
@@ -254,11 +254,11 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Deliver through the host gateway's channels with selection from project config; default to the gateway dashboard channel when unconfigured
     - _Requirements: 6.5, 24.4_
 
-- [ ] 16. Verification suites
+- [x] 16. Verification suites
   - [x] 16.1 Property-based test suite
     - Hypothesis tests for the seven design properties: wave ordering, ladder monotonicity, claim exactly-once, substitution safety under adversarial values, budget attribution completeness, phase gate soundness, spec directory purity
     - _Requirements: 1.5, 8.7, 10.3, 13.6, 16.2, 2.5, 1.7, 17.4_
-  - [ ] 16.2 End-to-end integration suite
+  - [x] 16.2 End-to-end integration suite
     - Fixture git repository with a local bare remote exercising isolate through teardown offline; seeded fake metering ledger exercising budget halt; deterministic stages verified to make zero model invocations
     - _Requirements: 13.16, 16.3, 6.4, 17.1, 17.2_
 
@@ -316,7 +316,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Repository check asserting no non-public endpoints, service names, headers, or credentials appear in the tree; shipped prompt text authored for this app; delegated providers referenced by configuration only
     - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5, 28.6_
 
-- [ ] 20. Engine composition and wiring
+- [x] 20. Engine composition and wiring
   - [x] 20.1 Composition root
     - One construction point building the engine's object graph, so a surface cannot assemble a partial one. Reach the orchestrator through `orchestrator_for` rather than assembling a wave runner by hand: task 9.1 made that factory the single construction point for the workspace broker, the role resolver and the completion reporter, so a surface that builds its own runner silently drops all three -- the inertness moves up one level rather than away
     - Register the engine's builtin providers and pass a findings sink. Task 17.5 built `register_builtins(registry, model_resolver=...)` and the `FindingsSink` seam but has no production caller, so today no capability resolves to a builtin and every analysis report lands in a memory-only default. Call it at the registry construction point and hand `AnalysisEngine` the durable sink once it exists
@@ -345,7 +345,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
     - Add the artifact-URL run context variable the link-artifact operation needs. Task 8.7's bundled presets reference the delivery BRANCH where requirement 36.1 names a link-artifact operation, because no run-context variable carries a PR or MR URL. A comment naming a branch is not a link to the artifact, so 36.1 is satisfied only once this variable exists and a preset references it -- and the delivery pipeline is what learns the submitted artifact's URL
     - Handle the preset refusal when `resolve_authority` first gets a production caller. Task 13.4 made an unresolvable `workflow.preset` name raise `ConfigValidationError` from `workflow.configured` -- deliberately, replacing a silent ignore -- and `resolve_authority` in `engine/delivery/integration.py` reads `configured` with no `try`. Its reviewer found it has no production caller today (tests only), so this is latent rather than live; whoever wires it must convert the refusal the way `prerequisites.py:470` does, into an audited `RunRefusal`, rather than letting a bad preset name escape as an unhandled error from a delivery decision. While there: `_preset_stages` returns the live document node for a USER-DEFINED preset while bundled ones get deep copies -- harmless today because `document()` re-parses per load and nothing mutates `PresetSelection.stages`, but the asymmetry is undocumented and a caller that did mutate it would edit that project's configuration in place
     - _Requirements: 9.3, 9.4, 36.1, 36.7, 10.10, 33.3_
-  - [ ] 20.5 Resume authority
+  - [x] 20.5 Resume authority
     - Make the execution gate read the run's PERSISTED posture rather than re-resolving autonomy from config. Two reviews raised this shape independently. Task 8.6 caps a quarantined run to authoring and persists `posture` plus `screening_quarantined` on the run row, but nothing outside tests reads `posture` back to reconstruct a decision -- so a driver that re-resolves from `AutonomyPolicy` would run a quarantined item at its configured level with never-screened text, and requirement 25.4's "regardless of policy" would be false exactly when it matters
     - Stop treating a `tasks.md` checkbox as authority. Task 9.3's review found the sibling defect: `completed_tasks` counts a leaf complete when its checkbox is set, with no attribution, so a checkbox reaching the canonical spec directory would let a resumed run skip the review gate 9.3 built. Treat the approving verdict and the persisted posture as the authorities
     - Add the resume tests neither owning task could write without a driver. Both defects are resume paths trusting a stored fact whose authority nothing checks, and both are only reachable once 20.2 exists
@@ -380,3 +380,12 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 - Task 16.1 implements the seven property-based correctness properties from design.md with hypothesis.
 - All tests run offline: stage commands under test are stubbed binaries; the e2e suite uses a fixture git repo with a local bare remote and a seeded fake metering ledger.
 - The app's working name is spec-engine; the final published name requires explicit sign-off before packaging (names are one-way doors).
+
+### Open obligation found by the review gate, owned by no task yet
+- **Delivery stages do not run in the run's isolated checkout (requirement 13).** Found independently by task 16.2's implementer and its reviewer, and confirmed against source: `isolated_context` sets `isolated_path` for the ISOLATE stage alone and deliberately leaves `workspace_path` untouched, and `flow.py` passes the ORIGINAL context to submit, verify and publish — so those stages run with `cwd=workspace_path` (the project tree) and `{isolated_path}` is not in scope for them at all. The bundled `git-pull-request` preset's submit therefore runs `git add --all` in the project tree, and its commit does not land on the branch the following push names. Concurrency makes it worse: the spec supports concurrent specs via worktrees, so one run's submit can stage another's uncommitted work. Task 16.2 pinned the current behaviour rather than papering over it, and the preset's comment — which had asserted the opposite and so licensed `git add --all` — is corrected. NOT FIXED: carrying the isolated context forward through the flow (or targeting the checkout with `git -C {isolated_path}`) is a change to the delivery contract that wants its own task and its own tests, not an unreviewed edit at the end of the wave. Needs: a decision on which of the two shapes the delivery contract takes, then the stage-cwd change, then an e2e assertion that a submit stage cannot see a file that exists only in the project tree.
+
+### Spec-document dispositions the review gate asked for
+
+- **Requirement 12.6's second clause, read against the glossary, is unsatisfiable as written.** The glossary defines Spec_Artifacts as the three documents PLUS the `.config.kiro` sidecar, and the native validator requires the native headings — a spec written by the prior app has neither. Task 12.4 pinned the honest weaker guarantee instead (a prior-app spec opens, is discovered, is typed through the documented fallback, is judged, and is never assumed approved) and pinned the native rejection with its real rule ids. Decide: amend 12.6 and the glossary to state that guarantee, or schedule a migration task that writes the sidecar and rewrites the headings. Do not leave the requirement claiming more than the code does.
+- **The design still describes ONE app; the shipped shape is two.** The design overview and glossary say a single app packages engine, MCP server, skill and UI. What ships is two builtins: the engine (no page, no routes, its own store card, `defaultEnabled: false`) and the Spec_Builder_UI that imports it. Task 20.5 ratified the split deliberately and task 12.4's review confirmed requirement 12.6 tolerates it, because the engine's card offers a human no spec workflow. The drift is a decision, but it was never written back to the documents.
+- **Requirement 6.4 is not traced by any test in the e2e suite** (16.2's review). Both e2e legs drive policy-authorized runs only, with no interactive `deliver(requester=...)` leg, so "interactive and headless artifacts satisfy the same validation rules" is asserted nowhere in that suite. Check whether an earlier task already covers 6.4 before adding anything; if not, it needs one assertion, not a new suite.
