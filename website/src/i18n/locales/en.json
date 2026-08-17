@@ -3116,7 +3116,7 @@
         "the_suppression_was_lifted": "The suppression was lifted; the next poll may dispatch the item.",
         "the_teardown_failed": "The teardown failed",
         "the_teardown_stage_failed": "No workspaces were kept, but the teardown stage failed.",
-        "the_workspace_was_kept": "The workspace was not removed:",
+        "the_workspace_was_kept_because": "The workspace was not removed: {{reason}}",
         "the_workspace_was_removed": "The workspace was removed.",
         "unkeyed": "unkeyed",
         "unkeyed_findings_are_grouped_note": "Findings whose references resolved to no declared criterion are grouped as unkeyed rather than listed separately."

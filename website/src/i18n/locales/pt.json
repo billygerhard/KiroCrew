@@ -3860,7 +3860,7 @@
         "the_suppression_was_lifted": "A supressão foi levantada; a próxima consulta pode despachar o item.",
         "the_teardown_failed": "A desmontagem falhou",
         "the_teardown_stage_failed": "Nenhum espaço de trabalho foi mantido, mas a etapa de desmontagem falhou.",
-        "the_workspace_was_kept": "O espaço de trabalho não foi removido:",
+        "the_workspace_was_kept_because": "O espaço de trabalho não foi removido: {{reason}}",
         "the_workspace_was_removed": "O espaço de trabalho foi removido.",
         "unkeyed": "sem chave",
         "unkeyed_findings_are_grouped_note": "As constatações cujas referências não resolveram para nenhum critério declarado são agrupadas como sem chave em vez de listadas em separado."

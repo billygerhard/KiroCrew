@@ -223,7 +223,8 @@ ul.se-findings li:last-child{border-bottom:none}
   border-radius:var(--radius-sm);padding:9px;font-size:12px}
 .se-kept ul{margin:6px 0 0;padding:0;list-style:none}
 .se-kept li{display:flex;align-items:center;gap:8px;padding:3px 0;font-family:var(--mono);
-  font-size:11.5px}
+  font-size:11.5px;flex-wrap:wrap}
+.se-kept li .se-acts{flex:none}
 .se-torn{background:var(--ok-subtle);border:1px solid var(--ok);border-radius:var(--radius-sm);
   padding:9px;font-size:12px}
 /* The confirmation is a sibling block, never an overlay: a dialog here would

@@ -651,7 +651,12 @@ function TeardownBlock({
               <span className="se-m">{String(clean.data.cleanup.workspace_id)}</span>{' '}
               {clean.data.cleanup.removed
                 ? i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_removed')
-                : `${i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept')} ${clean.data.cleanup.reason}`}
+                : /* A full sentence with the reason interpolated, never
+                     concatenated: a trailing-connector half-sentence cannot be
+                     reordered by a translator and fails the source-strings gate. */
+                  i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept_because', {
+                    reason: clean.data.cleanup.reason,
+                  })}
             </>
           )}
         </p>

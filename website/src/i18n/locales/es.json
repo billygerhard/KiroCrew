@@ -3860,7 +3860,7 @@
         "the_suppression_was_lifted": "Se levantó la supresión; el siguiente sondeo puede despachar el elemento.",
         "the_teardown_failed": "El desmontaje falló",
         "the_teardown_stage_failed": "No se conservó ningún espacio de trabajo, pero la etapa de desmontaje falló.",
-        "the_workspace_was_kept": "El espacio de trabajo no se eliminó:",
+        "the_workspace_was_kept_because": "El espacio de trabajo no se eliminó: {{reason}}",
         "the_workspace_was_removed": "El espacio de trabajo se eliminó.",
         "unkeyed": "sin clave",
         "unkeyed_findings_are_grouped_note": "Los hallazgos cuyas referencias no resolvieron a ningún criterio declarado se agrupan como sin clave en lugar de listarse por separado."

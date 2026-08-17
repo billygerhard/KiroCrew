@@ -3701,7 +3701,7 @@
         "document_bodies_have_no_route_note": "검토 대상 문서는 이 데이터에 없고 이를 제공하는 경로도 없습니다. 이 화면이 보여 줄 수 있는 것은 발견 사항입니다.",
         "external_unverified_not_markup": "외부 · 미검증 · 마크업 아님",
         "findings": "발견 사항",
-        "flag_held": "건 보류",
+        "flag_held": "보류 중",
         "flag_needs_a_person": "담당자 필요",
         "flag_revisions_spent": "수정 소진",
         "flag_workspaces_kept": "작업 공간 남음",
@@ -3738,7 +3738,7 @@
         "the_suppression_was_lifted": "억제를 해제했습니다. 다음 조회에서 항목이 배정될 수 있습니다.",
         "the_teardown_failed": "철거에 실패했습니다",
         "the_teardown_stage_failed": "남은 작업 공간은 없지만 teardown 단계가 실패했습니다.",
-        "the_workspace_was_kept": "작업 공간이 제거되지 않았습니다:",
+        "the_workspace_was_kept_because": "작업 공간이 제거되지 않았습니다: {{reason}}",
         "the_workspace_was_removed": "작업 공간을 제거했습니다.",
         "unkeyed": "미지정",
         "unkeyed_findings_are_grouped_note": "참조가 선언된 기준에 연결되지 않은 발견 사항은 따로 나열하지 않고 미지정으로 묶습니다."

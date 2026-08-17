@@ -3738,7 +3738,7 @@
         "the_suppression_was_lifted": "抑制を解除しました。次回のポーリングで項目が発行される場合があります。",
         "the_teardown_failed": "撤去に失敗しました",
         "the_teardown_stage_failed": "保持されたワークスペースはありませんが、teardown ステージが失敗しました。",
-        "the_workspace_was_kept": "ワークスペースは削除されませんでした：",
+        "the_workspace_was_kept_because": "ワークスペースは削除されませんでした：{{reason}}",
         "the_workspace_was_removed": "ワークスペースを削除しました。",
         "unkeyed": "対応なし",
         "unkeyed_findings_are_grouped_note": "参照が宣言済みの基準に解決しなかった所見は、個別に列挙せず対応なしとしてまとめています。"

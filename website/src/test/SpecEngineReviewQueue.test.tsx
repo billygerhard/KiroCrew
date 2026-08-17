@@ -526,9 +526,15 @@ describe('teardown', () => {
     screen.getByRole('button', { name: T.remove }).click()
 
     await waitFor(() =>
-      expect(screen.getByText(new RegExp(T.the_workspace_was_kept))).toBeInTheDocument(),
+      expect(
+        screen.getByText(
+          T.the_workspace_was_kept_because.replace(
+            '{{reason}}',
+            'the ledger records this as a deployment',
+          ),
+        ),
+      ).toBeInTheDocument(),
     )
-    expect(screen.getByText(/the ledger records this as a deployment/)).toBeInTheDocument()
     expect(screen.queryByText(T.the_workspace_was_removed)).toBeNull()
   })
 
@@ -606,10 +612,66 @@ describe('teardown', () => {
     await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
     screen.getByRole('button', { name: T.remove }).click()
     await waitFor(() =>
-      expect(screen.getByText(new RegExp(T.the_workspace_was_kept))).toBeInTheDocument(),
+      expect(
+        screen.getByText(
+          T.the_workspace_was_kept_because.replace(
+            '{{reason}}',
+            'the ledger records this as a deployment',
+          ),
+        ),
+      ).toBeInTheDocument(),
     )
     // A declined removal leaves the row standing, so the retry stays live.
     expect(screen.getByRole('button', { name: T.remove })).toBeInTheDocument()
+  })
+
+  it('sends force through the force-remove button', async () => {
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        body: { ok: true, removed: true, cleanup: cleanupRow(703, true, 'forced') },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    screen.getByRole('button', { name: T.force_remove }).click()
+    await waitFor(() => expect(screen.getByText(T.the_workspace_was_removed)).toBeInTheDocument())
+    const cleanup = calls.find((call) => call.url.endsWith('/clean-workspace'))
+    expect(cleanup?.body).toEqual({ workspace_id: 703, force: true })
+  })
+
+  it('names the failed cleanup by its workspace id', async () => {
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        status: 503,
+        body: { code: 'cleanup_failed', error: 'the store is locked' },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    screen.getByRole('button', { name: T.remove }).click()
+    // The failure is named by the raw id, like the success verdict: with
+    // several kept rows an operator must know which retry failed.
+    await waitFor(() =>
+      expect(screen.getByText(`703 — ${T.the_cleanup_failed}`)).toBeInTheDocument(),
+    )
   })
 
   it('states a teardown refusal with its code', async () => {

@@ -3738,7 +3738,7 @@
         "the_suppression_was_lifted": "抑制已解除；下一次轮询可能派发该条目。",
         "the_teardown_failed": "拆除失败",
         "the_teardown_stage_failed": "没有保留任何工作区，但拆除阶段失败了。",
-        "the_workspace_was_kept": "工作区未被移除：",
+        "the_workspace_was_kept_because": "工作区未被移除：{{reason}}",
         "the_workspace_was_removed": "该工作区已删除。",
         "unkeyed": "无对应准则",
         "unkeyed_findings_are_grouped_note": "引用未能解析到任何已声明准则的发现项会归为无对应准则一组，而不是单独列出。"

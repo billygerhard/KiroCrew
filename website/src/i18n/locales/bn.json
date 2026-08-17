@@ -3762,7 +3762,7 @@
         "document_bodies_have_no_route_note": "পর্যালোচনাধীন নথিগুলি এই ডেটায় নেই এবং কোনো পথ সেগুলি দেয় না; এই পৃষ্ঠা যা দেখাতে পারে তা হলো পর্যবেক্ষণগুলি।",
         "external_unverified_not_markup": "বাহ্যিক · অযাচাইকৃত · মার্কআপ নয়",
         "findings": "পর্যবেক্ষণ",
-        "flag_held": "টি আটকে",
+        "flag_held": "আটকে রাখা",
         "flag_needs_a_person": "একজন মানুষ প্রয়োজন",
         "flag_revisions_spent": "সংশোধন শেষ",
         "flag_workspaces_kept": "কার্যক্ষেত্র রয়ে গেছে",
@@ -3799,7 +3799,7 @@
         "the_suppression_was_lifted": "দমন তুলে নেওয়া হয়েছে; পরের অনুসন্ধানে আইটেমটি পাঠানো হতে পারে।",
         "the_teardown_failed": "অপসারণ ব্যর্থ হয়েছে",
         "the_teardown_stage_failed": "কোনো কার্যক্ষেত্র রাখা হয়নি, তবে টিয়ারডাউন ধাপটি ব্যর্থ হয়েছে।",
-        "the_workspace_was_kept": "কার্যক্ষেত্রটি সরানো হয়নি:",
+        "the_workspace_was_kept_because": "কার্যক্ষেত্রটি সরানো হয়নি: {{reason}}",
         "the_workspace_was_removed": "কার্যক্ষেত্রটি সরানো হয়েছে।",
         "unkeyed": "চাবিহীন",
         "unkeyed_findings_are_grouped_note": "যেসব পর্যবেক্ষণের রেফারেন্স ঘোষিত কোনো মানদণ্ডে মেলেনি, সেগুলি আলাদা তালিকা নয়, চাবিহীন দল হিসেবে রাখা হয়।"

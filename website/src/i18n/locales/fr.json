@@ -3860,7 +3860,7 @@
         "the_suppression_was_lifted": "La suppression a été levée ; la prochaine interrogation peut lancer l’élément.",
         "the_teardown_failed": "Le démontage a échoué",
         "the_teardown_stage_failed": "Aucun espace de travail n'a été conservé, mais l'étape de démontage a échoué.",
-        "the_workspace_was_kept": "L'espace de travail n'a pas été supprimé :",
+        "the_workspace_was_kept_because": "L'espace de travail n'a pas été supprimé : {{reason}}",
         "the_workspace_was_removed": "L’espace de travail a été supprimé.",
         "unkeyed": "sans clé",
         "unkeyed_findings_are_grouped_note": "Les constats dont les références ne correspondent à aucun critère déclaré sont regroupés comme sans clé plutôt que listés séparément."

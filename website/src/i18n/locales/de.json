@@ -3799,7 +3799,7 @@
         "the_suppression_was_lifted": "Die Sperre wurde aufgehoben; die nächste Abfrage kann das Element zuweisen.",
         "the_teardown_failed": "Der Abbau ist fehlgeschlagen",
         "the_teardown_stage_failed": "Es wurden keine Arbeitsbereiche behalten, aber die Teardown-Stufe ist fehlgeschlagen.",
-        "the_workspace_was_kept": "Der Arbeitsbereich wurde nicht entfernt:",
+        "the_workspace_was_kept_because": "Der Arbeitsbereich wurde nicht entfernt: {{reason}}",
         "the_workspace_was_removed": "Der Arbeitsbereich wurde entfernt.",
         "unkeyed": "ohne Zuordnung",
         "unkeyed_findings_are_grouped_note": "Befunde, deren Verweise auf kein deklariertes Kriterium auflösen, werden als ohne Zuordnung gruppiert statt getrennt aufgeführt."
