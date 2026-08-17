@@ -487,9 +487,7 @@ class TestWavesRunInOrder:
         assert report.waves[0].already_complete == ("1.1",)
         assert report.waves[0].attempts == ()
 
-    def test_a_leaf_only_checked_off_in_the_document_is_still_run(
-        self, harness: Harness
-    ) -> None:
+    def test_a_leaf_only_checked_off_in_the_document_is_still_run(self, harness: Harness) -> None:
         # The same shape as the test above with the authority removed: the
         # checkbox is set and nothing recorded the leaf, so the loop implements
         # and reviews it. A loop that trusted the document would report it already

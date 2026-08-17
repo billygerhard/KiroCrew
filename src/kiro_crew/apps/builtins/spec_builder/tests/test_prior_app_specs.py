@@ -45,9 +45,7 @@ from .test_routes import _READY_REQUIREMENTS
 #: The prior app's own format definition, read from the shipped skill rather than
 #: described here. If that skill is edited, the anchor test below fails and these
 #: fixtures get revisited instead of quietly describing a format nothing produced.
-_PRIOR_SKILL_PATH = (
-    Path(routes.__file__).parents[1] / "skills" / "spec-workflow" / "SKILL.md"
-)
+_PRIOR_SKILL_PATH = Path(routes.__file__).parents[1] / "skills" / "spec-workflow" / "SKILL.md"
 
 
 def _prior_skill() -> str:
@@ -175,9 +173,7 @@ def mid_phase(tmp_path: Path) -> Path:
 @pytest.fixture()
 def placeholder(tmp_path: Path) -> Path:
     """The emptiest artifact the prior app could leave: a touched placeholder."""
-    return _prior_spec(
-        tmp_path, "just-started", documents={"requirements.md": ""}, sidecar=None
-    )
+    return _prior_spec(tmp_path, "just-started", documents={"requirements.md": ""}, sidecar=None)
 
 
 class TestTheFixtureIsThePriorAppsShapeNotTheEngines:
@@ -237,7 +233,9 @@ class TestAPriorAppSpecStillOpens:
         for kind in DocumentKind:
             text = phases.read_document(complete, kind)
             assert text, f"{kind.filename} did not open"
-        assert "Add Google login" in (phases.read_document(complete, DocumentKind.REQUIREMENTS) or "")
+        assert "Add Google login" in (
+            phases.read_document(complete, DocumentKind.REQUIREMENTS) or ""
+        )
 
     def test_the_app_discovers_it_as_a_spec(self, complete: Path):
         assert routes._looks_like_a_spec(complete) is True
@@ -305,9 +303,7 @@ class TestTheEnginesPhaseLogicStillJudgesIt:
         project = spec_dir.parents[2]  # <project>/.kiro/specs/<name>
         return phases.derive_phase(store, SpecRef.of(project, spec_dir.name))
 
-    def test_a_complete_prior_spec_derives_its_furthest_phase(
-        self, tmp_path: Path, complete: Path
-    ):
+    def test_a_complete_prior_spec_derives_its_furthest_phase(self, tmp_path: Path, complete: Path):
         state = self._state(tmp_path, complete)
         assert state.phase is not None
 

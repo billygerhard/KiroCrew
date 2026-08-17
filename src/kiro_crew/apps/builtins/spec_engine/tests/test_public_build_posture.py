@@ -776,14 +776,16 @@ _BARE_HOST_TLDS = (
 #: of an endpoint: a constant holding just the host, with the scheme added later.
 #: Quoting is required because an unquoted dotted word in prose is vocabulary, not
 #: an address, and this rule must not become the ordinary-word rule it cannot be.
-#: BACKTICKS are deliberately NOT a quote form here: in Markdown a backtick spans
-#: prose, and the review above found the backticked form matching filenames in
-#: ordinary sentences — including one in this app's own SKILL.md, which the scan
-#: reads.
+#: A Markdown code span counts as quoting. Backticks were removed once, on the
+#: strength of a review finding that the backticked form matched script names in
+#: prose — but the next review showed the cause was ``sh`` in the list above, not
+#: the backtick: with ``sh``, ``app`` and ``local`` gone, restoring backticks fires
+#: on nothing in either scanned tree. So they are back, because a code span is how
+#: documentation usually names a host and ``SKILL.md`` is scanned.
 _BARE_HOST_RE = re.compile(
-    r"""["'](?P<host>(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+(?:"""
+    r"""["'`](?P<host>(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+(?:"""
     + "|".join(_BARE_HOST_TLDS)
-    + r"""))["'/]""",
+    + r"""))["'`/]""",
     re.IGNORECASE,
 )
 
@@ -1225,8 +1227,9 @@ class TestNoNonPublicReferenceIsInTheTree:
     **What this can see.** Any URL whose host is not provably unresolvable,
     loopback, or a reviewed public name; any non-loopback IPv4 literal; any
     authentication or custom HTTP header literal; any credential in an issued
-    shape; and any credential-named binding holding a credential-shaped literal
-    (Python only, and in this app's tree only — see the boundary below).
+    shape; and a credential-named assignment, annotation, keyword argument, dict
+    entry or attribute holding a credential-shaped literal (Python only, and in
+    this app's tree only — see the boundary below).
     Each of those is driven against a planted violation below, one case per
     spelling, because a rule with no planted case is decoration.
 
@@ -1252,7 +1255,15 @@ class TestNoNonPublicReferenceIsInTheTree:
       "credential-named binding" without qualification; this is that
       qualification. Extending the walk to TypeScript would need a TS parser this
       module does not carry, and a text rule broad enough to catch a generic
-      literal is the false-positive shape that gets a gate switched off.
+      literal is the false-positive shape that gets a gate switched off. Within
+      Python the walk follows five spellings and NOT a walrus
+      (``api_token := "…"``), which is contrived but real.
+    * **A ``.local`` or otherwise unlisted internal domain.** ``local`` is not in
+      :data:`_BARE_HOST_TLDS`, so ``"jira.example-corp.local"`` passes — the
+      classic legacy-directory and mDNS spelling of an internal domain. It is out
+      because it fired on ``threading.local``; the ordinary-word collision is real
+      in both directions, and this is the side that was chosen. Adding it back
+      means accepting that collision.
     * **A host or address split across concatenation.** Every host rule reads one
       line of text, so ``"review-service." + "somecorp" + ".net"`` passes. This is
       not incidental: it is how the planted violations in this very module are
@@ -1347,6 +1358,15 @@ class TestNoNonPublicReferenceIsInTheTree:
             for root in UI_ROOTS
             if root.is_dir()
             for path in root.rglob("*")
+            if path.is_file() and path not in set(files)
+        )
+        # The shared test directory is named in the boundary as a scanned tree, so
+        # its SpecBuilder* files get the same guarantee: only the suffix filter
+        # stood between a SpecBuilder fixture in another format and going unread
+        # inside a tree the docstring says is read.
+        unread += sorted(
+            _display(path)
+            for path in (UI_TEST_ROOT.glob(UI_TEST_GLOB) if UI_TEST_ROOT.is_dir() else ())
             if path.is_file() and path not in set(files)
         )
         assert unread == [], f"files of a kind the UI provenance scan does not read: {unread}"
