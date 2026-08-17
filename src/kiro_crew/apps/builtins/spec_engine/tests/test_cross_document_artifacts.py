@@ -71,14 +71,22 @@ def test_the_repositorys_own_dependency_graph_is_healthy():
 
 
 def test_the_repositorys_own_spec_has_a_graph_to_check():
-    """Guards the case above from passing because nothing was parsed."""
+    """Guards the case above from passing because nothing was parsed.
+
+    The anti-vacuity claim is that a real schedule was read and that it is this
+    plan's schedule: a non-empty set of task numbers the checklist declares,
+    covering every leaf the graph rules examine. It deliberately says nothing
+    about how much of the plan remains open, because a finished spec is the
+    healthiest state the corpus can be in and must not read as an empty check.
+    """
     plan = parse_tasks((_spec_dir() / "tasks.md").read_text(encoding="utf-8"))
     assert plan.graph_block is not None
     scheduled = {
         task for wave in json.loads(plan.graph_block.body)["waves"] for task in wave["tasks"]
     }
+    assert scheduled
+    assert scheduled <= {task.number for task in plan.leaves}
     unfinished = {task.number for task in plan.leaves if not task.complete}
-    assert unfinished
     assert unfinished <= scheduled
 
 
@@ -166,15 +174,47 @@ def test_renumbering_a_real_wave_is_caught():
 
 def test_unscheduling_a_real_task_is_caught():
     spec = _spec_dir()
-    tasks = (spec / "tasks.md").read_text(encoding="utf-8")
-    plan = parse_tasks(tasks)
-    unfinished = next(task for task in plan.leaves if not task.complete)
-    mutated = tasks.replace(f'"{unfinished.number}", ', "", 1)
-    assert mutated != tasks
+    tasks, number, line = _with_an_unfinished_leaf((spec / "tasks.md").read_text(encoding="utf-8"))
+    mutated = _unschedule(tasks, number)
     found = check_dependency_graph(parse_tasks(mutated), tasks_file="tasks.md")
-    assert [(v.rule, v.location.line) for v in found] == [
-        (rules.GRAPH_TASK_UNASSIGNED, unfinished.line)
-    ]
+    assert [(v.rule, v.location.line) for v in found] == [(rules.GRAPH_TASK_UNASSIGNED, line)]
+
+
+def _with_an_unfinished_leaf(tasks: str) -> tuple[str, str, int]:
+    """Return ``tasks`` holding an unfinished scheduled leaf, and its identity.
+
+    ``GRAPH_TASK_UNASSIGNED`` fires only for a leaf that is not complete, so a
+    corpus spec whose work has finished carries nothing for the unscheduling
+    check to bite on — and every spec finishes eventually. The leaf is therefore
+    derived rather than found: one real, scheduled leaf is marked incomplete.
+    That keeps the check running against the real documents (a fixture spec
+    would not) and keeps it running when the corpus is at its healthiest (a skip
+    would go vacuous exactly then). The checkbox flip preserves the line's
+    length and the document's line count, so the line the check reports is the
+    line the real file carries.
+    """
+    plan = parse_tasks(tasks)
+    assert plan.graph_block is not None, "the corpus spec declares a dependency graph"
+    scheduled = {
+        task for wave in json.loads(plan.graph_block.body)["waves"] for task in wave["tasks"]
+    }
+    target = next(task for task in plan.leaves if task.number in scheduled)
+    lines = tasks.splitlines(keepends=True)
+    lines[target.line - 1] = lines[target.line - 1].replace("- [x] ", "- [ ] ", 1)
+    return "".join(lines), target.number, target.line
+
+
+def _unschedule(tasks: str, number: str) -> str:
+    """Drop ``number`` from the graph block, leaving the JSON body well-formed.
+
+    The trailing-separator form is tried first so that removing a task from the
+    middle of a wave does not leave a doubled comma; the bare form covers a wave
+    that scheduled the task alone.
+    """
+    for occurrence in (f'"{number}", ', f', "{number}"', f'"{number}"'):
+        if occurrence in tasks:
+            return tasks.replace(occurrence, "", 1)
+    raise AssertionError(f"task {number} is not scheduled in the graph block")
 
 
 # --- Generated documents --------------------------------------------------
