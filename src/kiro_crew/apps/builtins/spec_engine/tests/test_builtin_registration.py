@@ -84,6 +84,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,44 @@ def _register_routes_calls(node: ast.AST) -> list[ast.Call]:
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == "register_routes"
     ]
+
+
+def _handlers(loop: ast.For) -> list[ast.ExceptHandler]:
+    return [
+        handler for node in ast.walk(loop) if isinstance(node, ast.Try) for handler in node.handlers
+    ]
+
+
+def _wraps_the_import_in_a_try(loop: ast.For) -> bool:
+    return any(isinstance(node, ast.Try) for node in ast.walk(loop))
+
+
+def _caught_exception_names(loop: ast.For) -> set[str]:
+    """The exception classes the loop's handlers name.
+
+    A bare ``except:`` or a tuple contributes nothing here, which is deliberate:
+    the assertion compares this set for EQUALITY with the one tolerated class, so
+    a shape this cannot read shows up as a mismatch rather than as agreement.
+    """
+    names: set[str] = set()
+    for handler in _handlers(loop):
+        if isinstance(handler.type, ast.Name):
+            names.add(handler.type.id)
+        elif isinstance(handler.type, ast.Tuple):
+            names.update(
+                element.id for element in handler.type.elts if isinstance(element, ast.Name)
+            )
+    return names
+
+
+def _reraises(loop: ast.For) -> bool:
+    return any(
+        isinstance(node, ast.Raise) for handler in _handlers(loop) for node in ast.walk(handler)
+    )
+
+
+def _handler_source(source: str, loop: ast.For) -> str:
+    return " ".join((ast.get_source_segment(source, handler) or "") for handler in _handlers(loop))
 
 
 class TestTheAppIsDeliberatelyABuiltinName:
@@ -279,22 +318,20 @@ class TestWhatTheEntryBuys:
         """
         source = _dashboard_source()
         loop = _builtin_route_loop(source)
-        tries = [node for node in ast.walk(loop) if isinstance(node, ast.Try)]
-        assert tries, "the builtin loop no longer wraps the import in a try"
+        assert _wraps_the_import_in_a_try(loop), "the builtin loop no longer wraps the import"
 
-        handlers = [handler for node in tries for handler in node.handlers]
-        caught = {handler.type.id for handler in handlers if isinstance(handler.type, ast.Name)}
+        caught = _caught_exception_names(loop)
         assert caught == {"ModuleNotFoundError"}, (
             f"the builtin loop now catches {sorted(caught)}; a wider catch would "
             "swallow a broken route import and serve 404s silently instead"
         )
+        assert _reraises(loop), (
+            "the handler no longer re-raises: every ModuleNotFoundError from a "
+            "listed app would be swallowed and its routes would silently 404"
+        )
         # Re-raised unless the missing module IS the app package: that comparison
         # is what makes the tolerance narrow, so it is asserted, not described.
-        segment = " ".join((ast.get_source_segment(source, handler) or "") for handler in handlers)
-        assert "exc.name" in segment
-        assert any(
-            isinstance(node, ast.Raise) for handler in handlers for node in ast.walk(handler)
-        ), "the handler no longer re-raises: every ModuleNotFoundError is swallowed"
+        assert "exc.name" in _handler_source(source, loop)
 
 
 class TestWhatTheEntryStillDoesNotBuy:
@@ -414,3 +451,77 @@ class TestTheManifestAndThePackageAgreeOnRoutes:
         assert (sibling_root / "backend" / "routes.py").is_file()
         package = importlib.import_module(f"kiro_crew.apps.builtins.{sibling}")
         assert hasattr(package, "register_routes")
+
+
+class TestTheLoopClaimsWouldNoticeTheShapesTheyForbid:
+    """Non-vacuity for every claim made about the loop by reading it.
+
+    Those assertions all pass against the loop as it stands, which is exactly the
+    state in which a check that cannot fail is indistinguishable from one that
+    can. Proving detection by mutating ``dashboard/server.py`` is not available
+    here — it is a shared platform file — so the helpers are driven over
+    synthetic loops of the forbidden shapes instead. The helpers are the same
+    ones the real assertions use, so a helper that stopped seeing anything would
+    fail here rather than pass quietly there.
+    """
+
+    GUARDED = textwrap.dedent("""
+        for name in BUILTIN_NAMES:
+            try:
+                mod = importlib.import_module(f"pkg.{name}")
+                if hasattr(mod, "register_routes"):
+                    mod.register_routes(app)
+            except ModuleNotFoundError as exc:
+                if exc.name != f"pkg.{name}":
+                    raise
+        """)
+    UNGUARDED = textwrap.dedent("""
+        for name in BUILTIN_NAMES:
+            try:
+                mod = importlib.import_module(f"pkg.{name}")
+                mod.register_routes(app)
+            except ModuleNotFoundError as exc:
+                if exc.name != f"pkg.{name}":
+                    raise
+        """)
+    WIDE_CATCH = textwrap.dedent("""
+        for name in BUILTIN_NAMES:
+            try:
+                mod = importlib.import_module(f"pkg.{name}")
+                if hasattr(mod, "register_routes"):
+                    mod.register_routes(app)
+            except Exception:
+                pass
+        """)
+    NO_LOOP = "def start_dashboard():\n    return None\n"
+
+    def test_the_control_loop_satisfies_every_claim(self) -> None:
+        """The positive control: a loop of the right shape passes all four checks,
+        so the negatives below are known to be about the shape rather than about a
+        helper that rejects whatever it is handed.
+        """
+        loop = _builtin_route_loop(self.GUARDED)
+        guarded = [
+            call for guard in _hasattr_guards(loop) for call in _register_routes_calls(guard)
+        ]
+        assert len(guarded) == len(_register_routes_calls(loop)) == 1
+        assert _wraps_the_import_in_a_try(loop)
+        assert _caught_exception_names(loop) == {"ModuleNotFoundError"}
+        assert _reraises(loop)
+        assert "exc.name" in _handler_source(self.GUARDED, loop)
+
+    def test_an_unguarded_call_is_seen_as_unguarded(self) -> None:
+        loop = _builtin_route_loop(self.UNGUARDED)
+        assert _hasattr_guards(loop) == []
+        assert len(_register_routes_calls(loop)) == 1
+
+    def test_a_wider_catch_is_seen_as_wider(self) -> None:
+        loop = _builtin_route_loop(self.WIDE_CATCH)
+        assert _caught_exception_names(loop) == {"Exception"}
+        assert not _reraises(loop)
+
+    def test_a_source_without_the_loop_raises_rather_than_agreeing(self) -> None:
+        """Losing sight of the loop must not read as the loop being fine."""
+        with pytest.raises(AssertionError) as caught:
+            _builtin_route_loop(self.NO_LOOP)
+        assert "BUILTIN_NAMES" in str(caught.value)
