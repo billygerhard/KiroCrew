@@ -533,17 +533,21 @@ function TeardownBlock({
 
   const result = teardown.data
   // The rich rows from the report, not the top-level id list: kind and reason
-  // are what tell an operator which retry can possibly succeed. Rows whose
-  // per-id cleanup verdict came back removed are dropped from the list; the
-  // row-level kept flag on the run list is NOT recomputed, which is the
-  // conservative direction (it over-reports standing workspaces).
-  const keptRows = (result?.report?.kept ?? []).filter((row) => !removedIds.has(row.workspace_id))
-  // Incomplete with nothing kept means the teardown STAGE failed — rendering
-  // "workspaces were kept" over an empty list would misname the failure. The
-  // cause that CAN render here is report.stage (failed / timed_out / refused):
-  // stage_reason is only ever populated when no stage ran at all, and a report
-  // with no stage and nothing kept is complete, so this branch never sees it.
-  const stageFailed = result != null && !result.complete && keptRows.length === 0
+  // are what tell an operator which retry can possibly succeed.
+  const allKept = result?.report?.kept ?? []
+  // Rows whose per-id cleanup verdict came back removed are dropped from the
+  // RENDERED list only. The diagnosis below must read the unfiltered report:
+  // deriving it from the filtered list made "the stage failed" appear after
+  // the operator removed the last kept row — a teardown that kept workspaces
+  // and had no stage failure. The run-list kept flag is likewise not
+  // recomputed, the conservative direction (over-reporting standing rows).
+  const keptRows = allKept.filter((row) => !removedIds.has(row.workspace_id))
+  // Incomplete with nothing kept IN THE REPORT means the teardown STAGE failed.
+  // The cause that CAN render here is report.stage (failed / timed_out /
+  // refused): stage_reason is only ever populated when no stage ran at all,
+  // and a report with no stage and nothing kept is complete, so this branch
+  // never sees it.
+  const stageFailed = result != null && !result.complete && allKept.length === 0
 
   return (
     <div className="se-blk">
@@ -576,7 +580,10 @@ function TeardownBlock({
               <ul>
                 {keptRows.map((row) => (
                   <li key={row.workspace_id}>
-                    <span className="se-m">{fmtNumber(row.workspace_id)}</span>
+                    {/* Raw digits, NOT fmtNumber: a ledger id is an identifier,
+                        so a grouping separator would both misrender it (1,703)
+                        and break copying it against the ledger or audit log. */}
+                    <span className="se-m">{String(row.workspace_id)}</span>
                     <span className="se-m se-dim">{row.kind}</span>
                     <span className="se-acts">
                       <button
@@ -616,7 +623,14 @@ function TeardownBlock({
 
       {clean.isError && (
         <Refused
-          title={i18nT('apps.specEngine.reviewQueuePanel.the_cleanup_failed')}
+          // Named by id like the success verdict: with several kept rows an
+          // operator must be able to tell which retry failed. Raw digits — an
+          // identifier, not a count.
+          title={
+            clean.variables
+              ? `${String(clean.variables.workspace_id)} — ${i18nT('apps.specEngine.reviewQueuePanel.the_cleanup_failed')}`
+              : i18nT('apps.specEngine.reviewQueuePanel.the_cleanup_failed')
+          }
           error={clean.error}
         />
       )}
@@ -632,9 +646,9 @@ function TeardownBlock({
             i18nT('apps.specEngine.reviewQueuePanel.no_active_workspace_has_that_id')
           ) : (
             <>
-              {/* Named by id: with several kept rows, an unnamed verdict cannot
-                  be matched to the row it answers. */}
-              <span className="se-m">{fmtNumber(clean.data.cleanup.workspace_id)}</span>{' '}
+              {/* Named by id — raw digits, an identifier — so with several kept
+                  rows the verdict can be matched to the row it answers. */}
+              <span className="se-m">{String(clean.data.cleanup.workspace_id)}</span>{' '}
               {clean.data.cleanup.removed
                 ? i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_removed')
                 : `${i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept')} ${clean.data.cleanup.reason}`}

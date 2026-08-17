@@ -553,6 +553,65 @@ describe('teardown', () => {
     )
   })
 
+  it('retires a row from the kept list only when its removal was confirmed', async () => {
+    // A confirmed removal (cleanup.removed true) must stop the row offering a
+    // live Remove button. The diagnosis must NOT change: the teardown still
+    // kept workspaces, so the stage-failure sentence must not appear after the
+    // last row is retired — deriving the diagnosis from the filtered list was
+    // a real regression a review caught.
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        body: { ok: true, removed: true, cleanup: cleanupRow(703, true, 'removed the worktree') },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    screen.getByRole('button', { name: T.remove }).click()
+    await waitFor(() => expect(screen.getByText(T.the_workspace_was_removed)).toBeInTheDocument())
+    // The row is gone from the kept list…
+    expect(screen.queryByRole('button', { name: T.remove })).toBeNull()
+    // …and the empty rendered list is NOT misread as a stage failure.
+    expect(screen.queryByText(new RegExp(T.the_teardown_stage_failed))).toBeNull()
+  })
+
+  it('keeps offering the retry when the removal was declined', async () => {
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        body: {
+          ok: true,
+          removed: true,
+          cleanup: cleanupRow(703, false, 'the ledger records this as a deployment'),
+        },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    screen.getByRole('button', { name: T.remove }).click()
+    await waitFor(() =>
+      expect(screen.getByText(new RegExp(T.the_workspace_was_kept))).toBeInTheDocument(),
+    )
+    // A declined removal leaves the row standing, so the retry stays live.
+    expect(screen.getByRole('button', { name: T.remove })).toBeInTheDocument()
+  })
+
   it('states a teardown refusal with its code', async () => {
     renderWith([entry()], {
       teardown: { status: 503, body: { code: 'teardown_failed', error: 'janitor is absent' } },

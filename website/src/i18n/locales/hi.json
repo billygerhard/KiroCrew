@@ -3798,8 +3798,8 @@
         "the_release_failed": "जारी करना विफल रहा",
         "the_suppression_was_lifted": "रोक हटा दी गई; अगली जाँच में मद भेजी जा सकती है।",
         "the_teardown_failed": "हटाना विफल रहा",
-        "the_teardown_stage_failed": "कोई वर्कस्पेस नहीं रखा गया, लेकिन टियरडाउन चरण विफल रहा।",
-        "the_workspace_was_kept": "वर्कस्पेस हटाया नहीं गया:",
+        "the_teardown_stage_failed": "कोई कार्यक्षेत्र नहीं रखा गया, लेकिन टियरडाउन चरण विफल रहा।",
+        "the_workspace_was_kept": "कार्यक्षेत्र हटाया नहीं गया:",
         "the_workspace_was_removed": "कार्यक्षेत्र हटा दिया गया।",
         "unkeyed": "बिना कुंजी",
         "unkeyed_findings_are_grouped_note": "जिन निष्कर्षों के संदर्भ किसी घोषित मानदंड से नहीं जुड़े, उन्हें अलग सूची में नहीं, बिना कुंजी के समूह में रखा जाता है।"
