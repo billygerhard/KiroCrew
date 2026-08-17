@@ -114,6 +114,18 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "The manifest-sync gate, made bidirectional for a card with no page.",
     ),
     (
+        "website/src/apps/builtinRegistry.ts",
+        "The shared route table; a builtin page is unreachable without its row here.",
+    ),
+    (
+        "website/src/apps/builtinIcons.tsx",
+        "The shared nav-icon table; an unregistered icon name falls back to a generic glyph.",
+    ),
+    (
+        "website/eslint.i18n.config.js",
+        "The shared i18n lint's CSS-only path exemptions, where the sibling app's already is.",
+    ),
+    (
         "src/kiro_crew/apps/builtins/__init__.py",
         "The shared builtin roster; a builtin's routes register only from that list.",
     ),

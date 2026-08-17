@@ -1,0 +1,620 @@
+/**
+ * The Spec Engine Operator_Surface — the page shell.
+ *
+ * Built to `design/mockup-b.html` ("Operator Console"), the mockup a reviewer
+ * agent selected against `design/criteria.md`. That selection is recorded in
+ * `design/selection.md` and is **VETO-PENDING** for the owner; overturning it
+ * re-runs the frontend wave and nothing upstream.
+ *
+ * ## The geometry, and which parts of it are load-bearing
+ *
+ * `"rail work" / "rail status"`: a vertical rail on the left, the work area, and
+ * a status strip that is a GRID ROW rather than a floating bar. The work area is
+ * one split — an ordered table on the left, a permanently docked pane on the
+ * right — and every pane reuses that split, so moving between the queue and the
+ * configuration costs no re-orientation.
+ *
+ * Two properties are not styling choices:
+ *
+ * 1. **Nothing overlays anything.** The kill-switch state and the spend figure
+ *    are on screen in every pane at every scroll position because the strip is a
+ *    row of the grid. The losing mockup failed that criterion on precisely this:
+ *    its detail drawer's scrim covered the header, so the stop control was dimmed
+ *    and click-blocked exactly when it mattered. A drawer, modal or scrim added
+ *    later would silently reintroduce that failure — see the rule and its test in
+ *    `styles.ts`.
+ * 2. **The inspector is docked, not summoned.** Detail follows selection with no
+ *    open step and no dismiss step, which is what makes working a backlog down to
+ *    zero cost one keystroke per run instead of three.
+ *
+ * ## Reviewer, not driver
+ *
+ * The blocking selection criterion: every control on the default path acts on
+ * work the engine already produced. Nothing here asks a human to compose or edit
+ * spec prose. The losing mockup's `Rewrite the gate myself` button is the
+ * affordance that criterion exists to exclude, and it is deliberately not ported.
+ *
+ * ## What this shell owns, and what the panels own
+ *
+ * This task owns the shell: the grid, the rail, the ordered table with real rows
+ * and keyboard selection, the docked inspector's identity header, the config
+ * pane's read of the persisted document, the setup pane as the first-run landing,
+ * and the status strip's reading of the kill switch. The panel INTERIORS — the
+ * verdict and feedback actions, the documents-and-findings view, configuration
+ * editing, the setup flow, and the kill-switch and spend controls — are later
+ * tasks. Their regions render an honest statement that they are not built rather
+ * than a mock of what they will be: an inert control that looks live is worse on
+ * this surface than a sentence saying it is absent.
+ *
+ * The inspector's tab strip belongs with those panels for the same reason — four
+ * tabs over four unbuilt panes would be navigation to nothing.
+ *
+ * ## Backend contract
+ *
+ * `src/kiro_crew/apps/builtins/spec_engine/backend/routes.py`, through `api.ts`.
+ * Three reads run here: the configuration (which is also the first-run signal),
+ * the review queue, and the kill switch. The configuration read is the one whose
+ * FAILURE mode matters: `config_unreadable` means a document exists and cannot be
+ * parsed, which is not "nothing is configured", and an operator sent to the setup
+ * assistant on that signal would meet a flow that refuses to overwrite a file it
+ * cannot read.
+ */
+import { useCallback, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { AlertTriangle, Cog, ListOrdered, ShieldCheck, Wand2 } from 'lucide-react'
+
+import { i18nT } from '../../i18n/t'
+import { fmtDuration, fmtNumber, type FormatUnit } from '../../i18n/format'
+import {
+  QK,
+  REFUSAL,
+  SpecEngineApiError,
+  specEngineApi,
+  type QueueEntry,
+  type WaitingOn,
+} from './api'
+import { SE_CSS } from './styles'
+
+/** Which pane the work area shows. Panes, not destinations: one list, one document. */
+type Pane = 'queue' | 'config' | 'setup'
+
+/** The queue filter. `all` plus one per `WaitingOn`, because those are three jobs. */
+type Filter = 'all' | WaitingOn
+
+/**
+ * The queue read is a snapshot of work waiting on a person, so it goes stale
+ * quietly — a run leaves the queue when somebody else acts on it. Polled rather
+ * than pushed: this surface has no event stream, and a stale queue that looks
+ * live is how two operators act on the same row.
+ */
+const QUEUE_POLL_MS = 15000
+
+/** Separator between two identifiers on one line. Punctuation, not copy. */
+const SEP = ' \u00b7 '
+/** Stands in for a field the engine has no value for. Punctuation, not copy. */
+const NONE = '\u2014'
+
+/**
+ * A frozen empty list, so a pending or failed read yields a referentially STABLE
+ * fallback. `?? []` allocates a new array per render, which makes it a changing
+ * dependency of the memos below and defeats them silently.
+ */
+const NO_ENTRIES: readonly QueueEntry[] = Object.freeze([])
+
+/**
+ * The waiting reason in words, keyed by what the run waits on.
+ *
+ * A coloured dot says a run is waiting; it does not say what for, and the reason
+ * is what decides which actions are legitimate. A run parked at a budget ceiling
+ * offered "approve this gate" is the confusion the selection criteria forbid, so
+ * the reason is stated in prose beside the identity rather than left to a hue.
+ *
+ * Holds KEYS, not resolved strings: a module-level `i18nT()` would run once at
+ * import and freeze this table in the language that happened to be active then.
+ */
+const WHY_KEY: Record<WaitingOn, string> = {
+  review: 'apps.specEngine.specEnginePage.why_review',
+  budget: 'apps.specEngine.specEnginePage.why_budget',
+  stall: 'apps.specEngine.specEnginePage.why_stall',
+}
+
+/**
+ * Spent revision cycles are their own reason, not a footnote on `review`.
+ *
+ * The run stays in `awaiting_review` and keeps `waiting_on: review`, so the
+ * engine's two fields together are the only thing that distinguishes "waiting for
+ * a verdict" from "waiting for a verdict with no further revision turn coming".
+ */
+const WHY_EXHAUSTED_KEY = 'apps.specEngine.specEnginePage.why_review_exhausted'
+
+/**
+ * The waiting reason as a cell value, keyed the same way.
+ *
+ * Every key here is a whole literal string. A key assembled from the enum member
+ * (`` `…${entry.waiting_on}` ``) would resolve at runtime, which puts it beyond
+ * every gate that checks a key exists — and a missing key renders as its own
+ * dotted path in the UI rather than failing.
+ */
+const WAIT_LABEL_KEY: Record<WaitingOn, string> = {
+  review: 'apps.specEngine.specEnginePage.verdict',
+  budget: 'apps.specEngine.specEnginePage.budget',
+  stall: 'apps.specEngine.specEnginePage.stall',
+}
+
+/** The filter chips, in the order a reader scans them. */
+const FILTERS: ReadonlyArray<{ id: Filter; labelKey: string }> = [
+  { id: 'all', labelKey: 'apps.specEngine.specEnginePage.all' },
+  { id: 'review', labelKey: WAIT_LABEL_KEY.review },
+  { id: 'budget', labelKey: WAIT_LABEL_KEY.budget },
+  { id: 'stall', labelKey: WAIT_LABEL_KEY.stall },
+]
+
+/** The setup assistant's four steps, in the order it walks them. */
+const SETUP_STEPS: readonly string[] = [
+  'apps.specEngine.specEnginePage.step_inspect_the_project',
+  'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
+  'apps.specEngine.specEnginePage.step_review_the_plan',
+  'apps.specEngine.specEnginePage.step_approve_and_apply',
+]
+
+/**
+ * A wait, split into the two coarsest units that carry information.
+ *
+ * Split here rather than inside the formatter because granularity is a product
+ * decision: a run that has waited a day and a half is a different problem from
+ * one that has waited four minutes, and seconds never change that reading.
+ */
+function waitedParts(seconds: number): Array<[number, FormatUnit]> {
+  const whole = Math.max(0, Math.floor(seconds))
+  const days = Math.floor(whole / 86400)
+  const hours = Math.floor((whole % 86400) / 3600)
+  const minutes = Math.floor((whole % 3600) / 60)
+  if (days > 0) return [[days, 'day'], [hours, 'hour']]
+  if (hours > 0) return [[hours, 'hour'], [minutes, 'minute']]
+  return [[minutes, 'minute']]
+}
+
+/** The refusal code behind an error, or `''` when it is not one of ours. */
+function refusalCode(error: unknown): string {
+  return error instanceof SpecEngineApiError ? error.code : ''
+}
+
+/** A refusal's human text, for the one line under the code. */
+function refusalText(error: unknown): string {
+  return error instanceof Error ? error.message : ''
+}
+
+/** A refusal block: the sentence a reader acts on, with the code underneath. */
+function Refusal({ title, error }: { title: string; error: unknown }) {
+  const code = refusalCode(error)
+  return (
+    <div className="se-refusal" role="alert">
+      {title}
+      <code>{code ? `${code}${SEP}${refusalText(error)}` : refusalText(error)}</code>
+    </div>
+  )
+}
+
+/** A region a later task fills in. Stated, never mocked. */
+function Pending({ children }: { children: string }) {
+  return <p className="se-pending">{children}</p>
+}
+
+export default function SpecEnginePage() {
+  // `retry: false` on all three: every failure here is a refusal the operator
+  // has to read (a disabled app, an unparseable document, an unreadable
+  // database), and retrying one silently turns a stated reason into a spinner.
+  const config = useQuery({
+    queryKey: QK.config,
+    queryFn: () => specEngineApi.config(),
+    retry: false,
+  })
+  const queue = useQuery({
+    queryKey: QK.queue,
+    queryFn: () => specEngineApi.queue(),
+    retry: false,
+    refetchInterval: QUEUE_POLL_MS,
+  })
+  const killSwitch = useQuery({
+    queryKey: QK.killSwitch,
+    queryFn: () => specEngineApi.killSwitch(),
+    retry: false,
+  })
+
+  // `null` means the operator has not chosen a pane, so the landing pane is still
+  // the configuration read's to decide. Once they click, their choice pins.
+  const [chosenPane, setChosenPane] = useState<Pane | null>(null)
+  const [filter, setFilter] = useState<Filter>('all')
+  const [selectedRunId, setSelectedRunId] = useState<string>('')
+  const rowRefs = useRef(new Map<string, HTMLDivElement>())
+
+  /**
+   * First run: the configuration read says no document exists.
+   *
+   * `configured` rather than an empty `document`, because an absent file and an
+   * empty one both serialize to `{}` and only the first means "offer the
+   * assistant". A config read that FAILED is not first run either — a document
+   * that cannot be parsed is a repair, and the assistant would refuse to write
+   * over it.
+   */
+  const firstRun = config.data?.configured === false
+
+  const pane: Pane | null =
+    chosenPane ?? (config.isPending ? null : firstRun ? 'setup' : 'queue')
+
+  const entries = queue.data?.entries ?? NO_ENTRIES
+  const counts = useMemo(() => {
+    const tally: Record<Filter, number> = { all: entries.length, review: 0, budget: 0, stall: 0 }
+    for (const entry of entries) tally[entry.waiting_on] += 1
+    return tally
+  }, [entries])
+
+  const rows = useMemo(
+    () => (filter === 'all' ? entries : entries.filter((e) => e.waiting_on === filter)),
+    [entries, filter],
+  )
+
+  // Selection follows the list: a row that left the queue (somebody else acted on
+  // it) must not keep a docked pane describing a run nobody can act on.
+  const selected: QueueEntry | undefined =
+    rows.find((entry) => entry.run_id === selectedRunId) ?? rows[0]
+
+  /**
+   * Keyboard traversal over the rows: roving tabindex, selection follows focus.
+   *
+   * The mockup marked the selected row with `aria-selected` on a plain `<tr>` with
+   * no role, no tabindex and no key handling, which announces a selection to a
+   * screen reader while making it unreachable without a pointer. The grid pattern
+   * is what makes the advertised `j`/`k` traversal real: exactly one row is in the
+   * tab order, the arrow keys move focus within the grid, and selection follows
+   * focus so there is no second "commit" step to discover.
+   */
+  const focusRow = useCallback((runId: string) => {
+    rowRefs.current.get(runId)?.focus()
+  }, [])
+
+  const onRowKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>, index: number) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return
+      let next = -1
+      if (event.key === 'ArrowDown' || event.key === 'j') next = index + 1
+      else if (event.key === 'ArrowUp' || event.key === 'k') next = index - 1
+      else if (event.key === 'Home') next = 0
+      else if (event.key === 'End') next = rows.length - 1
+      else return
+      event.preventDefault()
+      const target = rows[Math.min(Math.max(next, 0), rows.length - 1)]
+      if (target) focusRow(target.run_id)
+    },
+    [rows, focusRow],
+  )
+
+  const switchState = killSwitch.data?.switch
+  const engaged = switchState?.engaged === true
+
+  return (
+    <div className="se-root">
+      <style>{SE_CSS}</style>
+
+      <nav className="se-rail" aria-label={i18nT('apps.specEngine.specEnginePage.panes')}>
+        <span className="se-brand">
+          <ShieldCheck className="lucide-inline" aria-hidden="true" />
+          {i18nT('apps.specEngine.manifest.page_label')}
+        </span>
+
+        <button
+          type="button"
+          className="se-nav"
+          aria-current={pane === 'queue' ? 'page' : undefined}
+          onClick={() => setChosenPane('queue')}
+        >
+          <ListOrdered className="lucide-inline" aria-hidden="true" />
+          {i18nT('apps.specEngine.specEnginePage.queue')}
+          <span className="se-badge">{fmtNumber(entries.length)}</span>
+        </button>
+        <button
+          type="button"
+          className="se-nav"
+          aria-current={pane === 'config' ? 'page' : undefined}
+          onClick={() => setChosenPane('config')}
+        >
+          <Cog className="lucide-inline" aria-hidden="true" />
+          {i18nT('apps.specEngine.specEnginePage.configuration')}
+        </button>
+        <button
+          type="button"
+          className="se-nav"
+          aria-current={pane === 'setup' ? 'page' : undefined}
+          // The first-run alarm marks the pane an unconfigured engine has to visit,
+          // so the entry is the loudest thing in the rail rather than one of four
+          // equals.
+          data-alarm={firstRun ? 'true' : undefined}
+          onClick={() => setChosenPane('setup')}
+        >
+          <Wand2 className="lucide-inline" aria-hidden="true" />
+          {i18nT('apps.specEngine.specEnginePage.setup_assistant')}
+          {firstRun && (
+            <span className="se-badge">
+              <AlertTriangle className="lucide-inline" aria-hidden="true" />
+            </span>
+          )}
+        </button>
+
+        <div className="se-rail-foot">
+          <div className="se-keys">
+            <kbd>j</kbd> <kbd>k</kbd> {i18nT('apps.specEngine.specEnginePage.move_between_runs')}
+          </div>
+        </div>
+      </nav>
+
+      {pane === 'setup' ? (
+        <div className="se-setup">
+          <aside
+            className="se-steps"
+            aria-label={i18nT('apps.specEngine.specEnginePage.setup_progress')}
+          >
+            <h2>{i18nT('apps.specEngine.specEnginePage.setup_assistant')}</h2>
+            {SETUP_STEPS.map((key, index) => (
+              <div key={key} className="se-step" data-state={index === 0 ? 'now' : 'todo'}>
+                <span className="se-dot" aria-hidden="true">
+                  {fmtNumber(index + 1)}
+                </span>
+                <span>{i18nT(key)}</span>
+              </div>
+            ))}
+          </aside>
+          <section className="se-setup-body">
+            <h1>{i18nT('apps.specEngine.specEnginePage.nothing_is_configured_yet')}</h1>
+            <p className="se-setup-lead">
+              {i18nT('apps.specEngine.specEnginePage.setup_lead')}
+            </p>
+            <Pending>{i18nT('apps.specEngine.specEnginePage.setup_flow_not_built_yet')}</Pending>
+          </section>
+        </div>
+      ) : pane === 'config' ? (
+        <div className="se-work">
+          <section className="se-cfg">
+            <div className="se-cfg-head">
+              {/* A filename, not copy: translating it would name a file that does not exist. */}
+              <h1 className="se-m">config.json</h1>
+              <span className="se-sort">
+                {i18nT('apps.specEngine.specEnginePage.the_write_path_validated_on_save')}
+              </span>
+            </div>
+            <div className="se-cfg-body">
+              {config.isError ? (
+                <Refusal
+                  title={i18nT('apps.specEngine.specEnginePage.could_not_read_the_configuration')}
+                  error={config.error}
+                />
+              ) : (
+                <>
+                  <pre className="se-json">{JSON.stringify(config.data?.document ?? {}, null, 2)}</pre>
+                  <p className="se-note">
+                    {i18nT(
+                      'apps.specEngine.specEnginePage.secret_values_are_withheld_from_this_read',
+                    )}
+                  </p>
+                  <Pending>
+                    {i18nT('apps.specEngine.specEnginePage.config_editing_not_built_yet')}
+                  </Pending>
+                </>
+              )}
+            </div>
+          </section>
+          <section
+            className="se-inspector"
+            aria-label={i18nT('apps.specEngine.specEnginePage.resolved_configuration')}
+          >
+            <div className="se-insp-head">
+              <span className="se-insp-title">
+                {i18nT('apps.specEngine.specEnginePage.resolved_configuration')}
+              </span>
+            </div>
+            <div className="se-insp-body">
+              <Pending>
+                {i18nT('apps.specEngine.specEnginePage.resolved_view_not_built_yet')}
+              </Pending>
+            </div>
+          </section>
+        </div>
+      ) : (
+        <div className="se-work">
+          <section className="se-list">
+            <div className="se-list-head">
+              <h1>{i18nT('apps.specEngine.specEnginePage.runs')}</h1>
+              <span className="se-sort">
+                {i18nT('apps.specEngine.specEnginePage.sorted_by_time_waiting_longest_first')}
+              </span>
+            </div>
+            {/* Filters over one list, never columns: the engine's waiting reason is a
+                cell value here, so a run cannot be missed by looking in the wrong
+                container. */}
+            <div className="se-filters">
+              {FILTERS.map(({ id, labelKey }) => (
+                <button
+                  key={id}
+                  type="button"
+                  className="se-filter"
+                  aria-pressed={filter === id}
+                  onClick={() => setFilter(id)}
+                >
+                  {i18nT(labelKey)}
+                  <span className="se-filter-count">{fmtNumber(counts[id])}</span>
+                </button>
+              ))}
+            </div>
+            <div className="se-rows">
+              {queue.isError ? (
+                <div className="se-empty">
+                  <Refusal
+                    title={i18nT('apps.specEngine.specEnginePage.could_not_read_the_run_queue')}
+                    error={queue.error}
+                  />
+                  <button
+                    type="button"
+                    className="se-btn"
+                    style={{ marginTop: 10 }}
+                    onClick={() => void queue.refetch()}
+                  >
+                    {i18nT('apps.specEngine.specEnginePage.retry')}
+                  </button>
+                </div>
+              ) : queue.isPending ? (
+                <div className="se-empty">
+                  {i18nT('apps.specEngine.specEnginePage.reading_the_queue')}
+                </div>
+              ) : rows.length === 0 ? (
+                <div className="se-empty">
+                  {entries.length === 0
+                    ? i18nT('apps.specEngine.specEnginePage.nothing_is_waiting_on_a_person')
+                    : i18nT('apps.specEngine.specEnginePage.nothing_matches_this_filter')}
+                </div>
+              ) : (
+                <div
+                  className="se-q"
+                  role="grid"
+                  aria-label={i18nT('apps.specEngine.specEnginePage.runs')}
+                >
+                  <div className="se-qhead" role="row">
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_waiting_on')}
+                    </span>
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_spec_and_project')}
+                    </span>
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_gate')}
+                    </span>
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_run')}
+                    </span>
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_waited')}
+                    </span>
+                    <span role="columnheader">
+                      {i18nT('apps.specEngine.specEnginePage.col_credits')}
+                    </span>
+                  </div>
+                  {rows.map((entry, index) => {
+                    const isSelected = selected?.run_id === entry.run_id
+                    return (
+                      <div
+                        key={entry.run_id}
+                        ref={(node) => {
+                          if (node) rowRefs.current.set(entry.run_id, node)
+                          else rowRefs.current.delete(entry.run_id)
+                        }}
+                        className="se-row"
+                        role="row"
+                        aria-selected={isSelected}
+                        tabIndex={isSelected ? 0 : -1}
+                        onFocus={() => setSelectedRunId(entry.run_id)}
+                        onClick={() => focusRow(entry.run_id)}
+                        onKeyDown={(event) => onRowKeyDown(event, index)}
+                      >
+                        <span role="gridcell">
+                          <span className="se-wait" data-wait={entry.waiting_on}>
+                            {i18nT(WAIT_LABEL_KEY[entry.waiting_on])}
+                          </span>
+                        </span>
+                        <span role="gridcell">
+                          <span className="se-spec">{entry.spec}</span>
+                          <span className="se-id">{SEP}{entry.project}</span>
+                        </span>
+                        <span role="gridcell">{entry.gate || NONE}</span>
+                        <span role="gridcell" className="se-id">{entry.run_id}</span>
+                        <span role="gridcell" className="se-age">
+                          {fmtDuration(waitedParts(entry.waiting_s))}
+                        </span>
+                        <span role="gridcell" className="se-cost">
+                          {fmtNumber(entry.cost_credits, { maximumFractionDigits: 1 })}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section
+            className="se-inspector"
+            aria-label={i18nT('apps.specEngine.specEnginePage.selected_run')}
+          >
+            {selected ? (
+              <>
+                <div className="se-insp-head">
+                  <span className="se-insp-title">{selected.spec}</span>
+                  <span className="se-insp-sub">
+                    {selected.run_id}
+                    {SEP}
+                    {selected.state}
+                    {selected.gate ? `${SEP}${selected.gate}` : ''}
+                  </span>
+                  <span className="se-insp-why">
+                    {i18nT(
+                      selected.waiting_on === 'review' && selected.revision_exhausted
+                        ? WHY_EXHAUSTED_KEY
+                        : WHY_KEY[selected.waiting_on],
+                    )}
+                  </span>
+                </div>
+                <div className="se-insp-body">
+                  <Pending>
+                    {i18nT('apps.specEngine.specEnginePage.run_controls_not_built_yet')}
+                  </Pending>
+                </div>
+              </>
+            ) : (
+              <div className="se-insp-body">
+                <p className="se-note">
+                  {i18nT('apps.specEngine.specEnginePage.select_a_run_to_see_it_here')}
+                </p>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* The status strip. A grid row in every pane, at every scroll position,
+          because a stop control you have to navigate to is not a stop control. */}
+      <div
+        className="se-status"
+        data-engaged={engaged ? 'true' : 'false'}
+        aria-label={i18nT('apps.specEngine.specEnginePage.safety_and_spend')}
+      >
+        <span className="se-lbl">{i18nT('apps.specEngine.specEnginePage.spend')}</span>
+        <span className="se-val">
+          {fmtNumber(queue.data?.total_credits ?? 0, { maximumFractionDigits: 1 })}
+        </span>
+        <span className="se-lbl">{i18nT('apps.specEngine.specEnginePage.credits')}</span>
+        <span className="se-sep" />
+        <span className="se-lbl">
+          {i18nT('apps.specEngine.specEnginePage.waiting_on_a_person')}
+        </span>
+        <span className="se-val">{fmtNumber(entries.length)}</span>
+        <span className="se-ks">
+          <span className="se-ks-dot" />
+          <span className="se-ks-text">
+            {killSwitch.isError
+              ? i18nT('apps.specEngine.specEnginePage.could_not_read_the_kill_switch')
+              : engaged
+                ? i18nT('apps.specEngine.specEnginePage.kill_switch_engaged')
+                : i18nT('apps.specEngine.specEnginePage.kill_switch_released')}
+          </span>
+          {/* A stop in force because its own record could not be parsed is a repair,
+              not an operator's decision, and the two must not read alike. */}
+          {switchState?.unreadable && (
+            <span className="se-lbl">
+              {i18nT('apps.specEngine.specEnginePage.kill_switch_record_unreadable')}
+            </span>
+          )}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+/** Exported for the shell's own tests, which assert the reading rather than re-deriving it. */
+export const __testing = { waitedParts, WHY_KEY, WHY_EXHAUSTED_KEY, WAIT_LABEL_KEY, REFUSAL }

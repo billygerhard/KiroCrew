@@ -23,6 +23,7 @@ import {
   BookOpen,
   BookOpenText,
   Brain,
+  Cog,
   FolderTree,
   FlaskConical,
   ScanSearch,
@@ -46,6 +47,10 @@ const BUILTIN_ICON_REGISTRY: Record<string, ReactElement> = {
   BookOpen: <BookOpen size={16} />,
   BookOpenText: <BookOpenText size={16} />,
   Brain: <Brain size={16} />,
+  // spec-engine's manifest names Cog. Without this row `getBuiltinIcon` returns
+  // undefined and the rail falls back to the generic package glyph, so the app
+  // reads as a third-party install rather than as a builtin.
+  Cog: <Cog size={16} />,
   FolderTree: <FolderTree size={16} />,
   FlaskConical: <FlaskConical size={16} />,
   ScanSearch: <ScanSearch size={16} />,

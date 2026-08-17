@@ -177,6 +177,15 @@ export default [
       'src/apps/mochi/src/shared/shortcut.ts',
       // CSS text injected through <style>; a stylesheet is not translatable copy.
       'src/apps/spec-builder/inlineStyles.ts',
+      // Same category, same shape: one template literal of scoped CSS rules that
+      // `SpecEnginePage` injects through a <style> tag. Every literal in the module
+      // is handed to the CSS parser — selectors, declarations and token names —
+      // and the module imports no `i18nT` and touches no DOM, so it has no path to
+      // user-visible copy. Exempted by PATH rather than by shape for the reason
+      // `md-notebook/styles.ts` is: full CSS rules carry `{`/`}`/`;`, and widening
+      // a character class to admit them would also exempt comma-joined prose.
+      // Keep this module CSS-only — copy added there belongs in the catalog.
+      'src/apps/spec-engine/styles.ts',
       // The theme stylesheet builders, extracted out of `hooks/useTheme.tsx` so
       // they COULD be exempted by path. Every literal in the module is handed to
       // the CSS parser: the `--*` custom-property allowlist, the
