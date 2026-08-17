@@ -646,8 +646,10 @@ class TestTheAllowlistCannotSwallowAnotherApp:
         demonstrated it with an entry for a single module inside the Prior_App.
         So the check is now structural: no allowlist entry's PREFIX may lie
         inside, equal, or contain another app's territory, which no choice of
-        planted filename can miss. The app directories are assembled at runtime
-        so no other app's path sits in this tree literally.
+        planted filename can miss. Backend and frontend app directories are
+        assembled at runtime; the Prior_App's shared-test namespace is the one
+        literal, matched only against entries a human wrote, never against
+        scanned paths.
         """
         territories = [
             "/".join(("src", "kiro_crew", "apps", "builtins", app_dir)) + "/"
@@ -667,6 +669,12 @@ class TestTheAllowlistCannotSwallowAnotherApp:
         ]
         # The Prior_App's shared-directory test namespace is territory too.
         territories.append("website/src/test/SpecBuilder")
+        # A moved-away apps directory fails closed (iterdir raises), but one that
+        # SURVIVES with no app subdirectories would yield an empty list and a
+        # guard that passes over nothing — a review demonstrated exactly that
+        # with a fixture holding only a registry module. The suite's convention:
+        # a guard over an assembled list asserts the list is real.
+        assert len(territories) > 10, f"territory list implausibly small: {territories}"
         for prefix, _justification in BOUNDARY_ALLOWLIST:
             for territory in territories:
                 inside = prefix.startswith(territory)
