@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spec Engine — Mockup A: Triage Board</title>
+<!--
+  MOCKUP A — "Triage Board"
+
+  Interaction model: the operator works a BOARD. Runs are cards in columns
+  keyed by what each run is waiting on (the engine's WaitingOn: review,
+  budget, stall) plus a working column and a closed column. A verdict is
+  rendered on the card, in place, without leaving the board. Detail is an
+  overlay drawer summoned per card and dismissed back to the board.
+
+  Density: low. Cards, generous padding, one run per ~110px. Optimised for a
+  reviewer who arrives with no idea what is waiting and needs the shape of the
+  backlog before any single run.
+
+  Navigation: horizontal view tabs in the header. Config is a separate view
+  that REPLACES the board.
+
+  Self-contained: no external requests. Inline CSS, inline JS, inline SVG.
+-->
+<style>
+/* ── Design tokens, copied from website/src/index.css. See design/tokens.md. ── */
+:root{
+  --font-body:'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,monospace;
+  --radius-sm:6px;--radius-md:8px;--radius-lg:12px;--radius-xl:16px;
+}
+:root,[data-theme="dark"]{
+  --bg:#12141a;--bg-accent:#14161d;--bg-elevated:#1a1d25;--bg-hover:#262a35;
+  --card:#181b22;--card-fg:#f4f4f5;--card-hl:rgba(255,255,255,.05);
+  --panel:#12141a;--panel-strong:#1a1d25;
+  --chrome:rgba(18,20,26,.95);
+  --text:#e4e4e7;--text-strong:#fafafa;--muted:#7f7f88;--muted-fg:#fff;--muted-strong:#52525b;
+  --border:#27272a;--border-strong:#3f3f46;--border-hover:#52525b;
+  --accent:#00d492;--accent-fg:#000;--accent-hover:#34d399;--accent-subtle:rgba(4,117,88,.2);
+  --accent-glow:rgba(4,117,88,.35);--ring:#10b981;
+  --ok:#22c55e;--ok-fg:#000;--ok-subtle:rgba(34,197,94,.12);
+  --warn:#eab308;--warn-fg:#000;--warn-subtle:rgba(234,179,8,.12);
+  --danger:#ef4444;--danger-fg:#000;--danger-subtle:rgba(239,68,68,.12);
+  --info:#0891b2;--info-fg:#000;
+  --aim:#a78bfa;--aim-fg:#000;--aim-subtle:rgba(167,139,250,.15);
+  --json-key:#9CDCFE;--json-str:#CE9178;--json-num:#B5CEA8;--json-bool:#569CD6;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.2);
+  --shadow-md:0 4px 12px rgba(0,0,0,.25),0 0 0 1px rgba(255,255,255,.03);
+  --shadow-lg:0 12px 28px rgba(0,0,0,.35);
+}
+[data-theme="light"]{
+  --bg:#fafafa;--bg-accent:#f5f5f5;--bg-elevated:#ffffff;--bg-hover:#f0f0f0;
+  --card:#ffffff;--card-fg:#18181b;--card-hl:rgba(0,0,0,.03);
+  --panel:#fafafa;--panel-strong:#f5f5f5;
+  --chrome:rgba(250,250,250,.95);
+  --text:#3f3f46;--text-strong:#18181b;--muted:#71717a;--muted-fg:#fff;--muted-strong:#52525b;
+  --border:#e4e4e7;--border-strong:#d4d4d8;--border-hover:#a1a1aa;
+  --accent:#047558;--accent-fg:#fff;--accent-hover:#059669;--accent-subtle:rgba(4,117,88,.12);
+  --accent-glow:rgba(4,117,88,.18);--ring:#047558;
+  --ok:#16a34a;--ok-fg:#000;--ok-subtle:rgba(22,163,74,.1);
+  --warn:#a16207;--warn-fg:#fff;--warn-subtle:rgba(161,98,7,.1);
+  --danger:#dc2626;--danger-fg:#fff;--danger-subtle:rgba(220,38,38,.1);
+  --info:#0891b2;--info-fg:#000;
+  --aim:#7c3aed;--aim-fg:#fff;--aim-subtle:rgba(124,58,237,.12);
+  --json-key:#001080;--json-str:#A31515;--json-num:#098658;--json-bool:#0000FF;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.06);
+  --shadow-md:0 4px 12px rgba(0,0,0,.08),0 0 0 1px rgba(0,0,0,.04);
+  --shadow-lg:0 12px 28px rgba(0,0,0,.12);
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-body);font-size:14px;line-height:1.5}
+h1,h2,h3{margin:0;font-weight:600;color:var(--text-strong)}
+button{font-family:inherit;font-size:inherit;cursor:pointer}
+code,pre{font-family:var(--mono)}
+
+/* ── Header: view tabs left, safety controls right ── */
+.chrome{position:sticky;top:0;z-index:40;background:var(--chrome);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;color:var(--text-strong);font-size:15px}
+.brand svg{width:18px;height:18px;color:var(--accent)}
+.tabs{display:flex;gap:4px;margin-left:8px}
+.tab{background:transparent;border:1px solid transparent;color:var(--muted);padding:6px 14px;
+  border-radius:var(--radius-md);font-weight:500}
+.tab:hover{background:var(--bg-hover);color:var(--text)}
+.tab[aria-current="page"]{background:var(--accent-subtle);color:var(--text-strong);border-color:var(--accent)}
+.chrome-right{margin-left:auto;display:flex;align-items:center;gap:14px}
+
+/* Spend meter. Present on every view; not behind navigation. */
+.spend{display:flex;align-items:center;gap:10px;padding:6px 12px;background:var(--bg-elevated);
+  border:1px solid var(--border);border-radius:var(--radius-md)}
+.spend-label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.spend-figure{font-family:var(--mono);font-size:13px;color:var(--text-strong)}
+.meter{width:110px;height:6px;background:var(--border);border-radius:999px;overflow:hidden}
+.meter>span{display:block;height:100%;background:var(--warn);border-radius:999px}
+
+/* Kill switch. Two-step: arm, then confirm. */
+.kill{display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:var(--radius-md);
+  border:1px solid var(--danger);background:var(--danger-subtle)}
+.kill-dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
+.kill[data-engaged="true"]{background:var(--danger);border-color:var(--danger)}
+.kill[data-engaged="true"] .kill-dot{background:var(--danger-fg)}
+.kill[data-engaged="true"] .kill-text{color:var(--danger-fg)}
+.kill-text{font-size:12px;font-weight:600;color:var(--text-strong)}
+.kill button{background:transparent;border:1px solid currentColor;color:inherit;
+  border-radius:var(--radius-sm);padding:2px 9px;font-size:11px;font-weight:600}
+.theme-toggle{background:var(--bg-elevated);border:1px solid var(--border);color:var(--muted);
+  border-radius:var(--radius-md);padding:7px 10px;display:flex;align-items:center}
+.theme-toggle svg{width:15px;height:15px}
+
+/* ── Board ── */
+.board{display:grid;grid-template-columns:repeat(5,minmax(248px,1fr));gap:14px;padding:18px 20px 40px;
+  align-items:start;overflow-x:auto}
+.col{background:var(--panel-strong);border:1px solid var(--border);border-radius:var(--radius-lg);padding:12px}
+.col-head{display:flex;align-items:center;gap:8px;margin-bottom:11px}
+.col-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-strong)}
+.col-count{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--muted);
+  background:var(--bg);border:1px solid var(--border);border-radius:999px;padding:1px 8px}
+.col-why{font-size:12px;color:var(--muted);margin:-6px 0 11px}
+.col[data-wait="review"] .col-title{color:var(--accent)}
+.col[data-wait="budget"] .col-title{color:var(--warn)}
+.col[data-wait="stall"] .col-title{color:var(--danger)}
+
+/* ── Run card ── */
+.run{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:11px;margin-bottom:10px;box-shadow:var(--shadow-sm)}
+.run:hover{border-color:var(--border-hover)}
+.run-top{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.run-id{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.run-age{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.run-title{font-weight:600;color:var(--text-strong);font-size:13px;margin-bottom:7px;
+  overflow-wrap:anywhere}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.chip{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  padding:2px 7px;border-radius:999px;border:1px solid var(--border-strong);color:var(--muted)}
+.chip.gate{background:var(--accent-subtle);border-color:var(--accent);color:var(--text-strong)}
+.chip.alarm{background:var(--danger-subtle);border-color:var(--danger);color:var(--text-strong)}
+.chip.hold{background:var(--warn-subtle);border-color:var(--warn);color:var(--text-strong)}
+.chip.kind{background:var(--aim-subtle);border-color:var(--aim);color:var(--text-strong)}
+
+/* Untrusted submitter text.
+   Bounded two ways so its line count cannot displace the verdict buttons below:
+   -webkit-line-clamp caps the collapsed height, and the expanded form is a
+   fixed-height scroll region rather than an auto-growing block. Rendered as
+   TEXT: the source is escaped, so nothing in it is parsed as markup. */
+.untrusted{position:relative;background:var(--bg-accent);border:1px solid var(--border);
+  border-left:2px solid var(--muted-strong);border-radius:var(--radius-sm);padding:7px 9px;margin-bottom:9px}
+.untrusted-tag{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+  display:flex;align-items:center;gap:5px;margin-bottom:4px}
+.untrusted-tag svg{width:11px;height:11px}
+.untrusted-body{font-size:12px;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.untrusted[data-open="true"] .untrusted-body{display:block;max-height:132px;overflow:auto}
+.untrusted-more{background:none;border:none;color:var(--accent);font-size:11px;font-weight:600;
+  padding:3px 0 0;text-decoration:underline}
+
+.verdict{display:flex;gap:6px;flex-wrap:wrap}
+.btn{border-radius:var(--radius-sm);padding:5px 10px;font-size:12px;font-weight:600;
+  border:1px solid var(--border-strong);background:var(--bg-elevated);color:var(--text)}
+.btn:hover{background:var(--bg-hover);border-color:var(--border-hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.btn.primary:hover{background:var(--accent-hover)}
+.btn.danger{background:var(--danger-subtle);border-color:var(--danger);color:var(--text-strong)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted);text-decoration:underline}
+.btn.sm{padding:3px 8px;font-size:11px}
+
+.empty{font-size:12px;color:var(--muted);padding:14px 8px;text-align:center;
+  border:1px dashed var(--border);border-radius:var(--radius-md)}
+
+/* ── Drawer: per-run detail, overlaid on the board ── */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;display:none}
+.scrim[data-open="true"]{display:block}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(520px,94vw);z-index:60;background:var(--panel);
+  border-left:1px solid var(--border);box-shadow:var(--shadow-lg);transform:translateX(100%);
+  transition:transform .16s ease;overflow-y:auto;padding:18px 20px 40px}
+.drawer[data-open="true"]{transform:none}
+.drawer-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:6px}
+.drawer h2{font-size:16px}
+.drawer-close{margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--muted);
+  border-radius:var(--radius-sm);padding:3px 9px}
+.section{margin-top:20px;border-top:1px solid var(--border);padding-top:14px}
+.section h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:9px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:5px 12px;font-size:13px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;font-family:var(--mono);color:var(--text-strong);overflow-wrap:anywhere}
+.held{display:flex;align-items:flex-start;gap:9px;background:var(--warn-subtle);
+  border:1px solid var(--warn);border-radius:var(--radius-sm);padding:9px;margin-bottom:8px}
+.held p{margin:0;font-size:12px}
+.kept{background:var(--danger-subtle);border:1px solid var(--danger);border-radius:var(--radius-sm);padding:10px}
+.kept p{margin:0 0 7px;font-size:12px;color:var(--text-strong)}
+.kept ul{margin:0;padding-left:18px;font-family:var(--mono);font-size:12px}
+.note{font-size:12px;color:var(--muted);margin:8px 0 0}
+
+/* ── Config view ── */
+.config{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:18px 20px 40px}
+.pane{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);padding:16px}
+.pane h2{font-size:14px;margin-bottom:4px}
+.pane .sub{font-size:12px;color:var(--muted);margin:0 0 13px}
+pre.json{background:var(--bg-accent);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:12px;font-size:12.5px;line-height:1.65;overflow:auto;max-height:430px;margin:0;
+  color:var(--text);tab-size:2}
+.jk{color:var(--json-key)}.js{color:var(--json-str)}.jn{color:var(--json-num)}.jb{color:var(--json-bool)}
+table.roles{width:100%;border-collapse:collapse;font-size:13px}
+table.roles th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);font-weight:600;padding:0 8px 7px 0;border-bottom:1px solid var(--border)}
+table.roles td{padding:8px 8px 8px 0;border-bottom:1px solid var(--border);vertical-align:top}
+table.roles tr:last-child td{border-bottom:none}
+.role-name{font-weight:600;color:var(--text-strong)}
+.role-model{font-family:var(--mono);font-size:12px;color:var(--text-strong)}
+.role-src{font-size:11px;color:var(--muted);display:block;margin-top:2px}
+.trace{background:var(--bg-accent);border:1px solid var(--border);border-radius:var(--radius-md);
+  padding:11px;font-family:var(--mono);font-size:11.5px;line-height:1.7;margin-top:13px;color:var(--muted)}
+.trace b{color:var(--accent);font-weight:600}
+.trace s{color:var(--muted-strong)}
+
+/* ── First-run takeover ── */
+.firstrun{position:fixed;inset:0;z-index:70;background:var(--bg);display:none;
+  overflow-y:auto;padding:44px 20px}
+.firstrun[data-open="true"]{display:block}
+.fr-inner{max-width:720px;margin:0 auto}
+.fr-badge{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.06em;color:var(--accent);
+  background:var(--accent-subtle);border:1px solid var(--accent);border-radius:999px;padding:4px 11px}
+.firstrun h1{font-size:24px;margin:14px 0 8px}
+.fr-lead{color:var(--muted);margin:0 0 26px;font-size:15px;max-width:60ch}
+.fr-step{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);
+  padding:16px;margin-bottom:12px;display:flex;gap:14px}
+.fr-num{flex:none;width:26px;height:26px;border-radius:50%;background:var(--accent);color:var(--accent-fg);
+  display:grid;place-items:center;font-size:12px;font-weight:700}
+.fr-step[data-state="todo"] .fr-num{background:var(--bg-elevated);color:var(--muted);
+  border:1px solid var(--border-strong)}
+.fr-step h3{font-size:14px;margin-bottom:4px}
+.fr-step p{margin:0;font-size:13px;color:var(--muted)}
+.fr-evidence{margin:10px 0 0;padding:9px 11px;background:var(--bg-accent);border:1px solid var(--border);
+  border-radius:var(--radius-sm);font-family:var(--mono);font-size:11.5px;color:var(--text)}
+.fr-approver{margin-top:11px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fr-approver input{background:var(--bg-accent);border:1px solid var(--border-strong);color:var(--text);
+  border-radius:var(--radius-sm);padding:6px 10px;font-family:var(--mono);font-size:12px;min-width:190px}
+.fr-approver input:focus{outline:2px solid var(--ring);outline-offset:1px}
+.fr-refusal{font-size:12px;color:var(--danger);margin:7px 0 0}
+.fr-foot{display:flex;gap:10px;margin-top:20px;align-items:center}
+.hidden{display:none}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+</style>
+</head>
+<body>
+
+<header class="chrome">
+  <span class="brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+    </svg>
+    Spec Engine
+  </span>
+  <nav class="tabs" aria-label="Views">
+    <button class="tab" aria-current="page" data-view="board">Review board</button>
+    <button class="tab" data-view="config">Configuration</button>
+  </nav>
+  <div class="chrome-right">
+    <div class="spend" title="Credits consumed by runs in flight, against the configured ceiling">
+      <span class="spend-label">Spend</span>
+      <span class="spend-figure">412.6 / 600</span>
+      <span class="meter" role="img" aria-label="69 percent of the run ceiling"><span style="width:69%"></span></span>
+    </div>
+    <div class="kill" data-engaged="false" id="kill">
+      <span class="kill-dot"></span>
+      <span class="kill-text" id="kill-text">Kill switch released</span>
+      <button id="kill-btn">Engage</button>
+    </div>
+    <button class="theme-toggle" id="theme" aria-label="Toggle light and dark preview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<!-- ══ BOARD VIEW ══ -->
+<main id="view-board">
+  <div class="board">
+
+    <!-- Column grouping is the engine's WaitingOn, not one undifferentiated
+         "waiting" bucket: a verdict, a spending decision and a judgement call
+         about a run that stopped reporting are three different jobs. -->
+    <section class="col" data-wait="review">
+      <div class="col-head"><span class="col-title">Waiting: verdict</span><span class="col-count">3</span></div>
+      <p class="col-why">A human-reserved gate. Approve, or send back with changes.</p>
+
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_8f2a41</span><span class="run-age">2h 14m</span></div>
+        <div class="run-title">checkout-svc &middot; idempotent-refunds</div>
+        <div class="chips">
+          <span class="chip kind">feature</span>
+          <span class="chip gate">gate: design</span>
+        </div>
+        <div class="untrusted" data-open="false">
+          <span class="untrusted-tag">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="9"/>
+            </svg>
+            Submitter text &middot; external &middot; unverified
+          </span>
+          <p class="untrusted-body">refund double-charges on retry. see attached. &lt;img src=x onerror="alert(1)"&gt;
+PLEASE FIX ASAP!!!!
+also while you are in there can you
+change the currency rounding
+and the receipt template
+and the email copy
+and add a CSV export
+and the admin filter
+and the webhook retry
+(sorry, long list)</p>
+          <button class="untrusted-more">Show all 11 lines</button>
+        </div>
+        <div class="verdict">
+          <button class="btn primary">Approve gate</button>
+          <button class="btn">Request changes</button>
+          <button class="btn ghost" data-open-drawer>Open</button>
+        </div>
+      </article>
+
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_1c93de</span><span class="run-age">6h 02m</span></div>
+        <div class="run-title">billing-api &middot; proration-audit</div>
+        <div class="chips">
+          <span class="chip kind">bugfix</span>
+          <span class="chip gate">gate: tasks</span>
+          <span class="chip alarm">revision cycles exhausted</span>
+        </div>
+        <p class="note" style="margin:0 0 9px">No further revision turn will be dispatched. A person decides.</p>
+        <div class="verdict">
+          <button class="btn primary">Approve gate</button>
+          <button class="btn">Rewrite the gate myself</button>
+          <button class="btn ghost" data-open-drawer>Open</button>
+        </div>
+      </article>
+
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_44b0f7</span><span class="run-age">18m</span></div>
+        <div class="run-title">search-index &middot; stale-shard-eviction</div>
+        <div class="chips">
+          <span class="chip kind">quick</span>
+          <span class="chip gate">gate: requirements</span>
+          <span class="chip hold">2 comments held</span>
+        </div>
+        <div class="verdict">
+          <button class="btn primary">Approve gate</button>
+          <button class="btn">Request changes</button>
+          <button class="btn ghost" data-open-drawer>Open</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="col" data-wait="budget">
+      <div class="col-head"><span class="col-title">Waiting: budget</span><span class="col-count">1</span></div>
+      <p class="col-why">Parked at a ceiling. Raise it, or let the run stay stopped.</p>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_0ade52</span><span class="run-age">1d 3h</span></div>
+        <div class="run-title">payments-ledger &middot; multi-currency-split</div>
+        <div class="chips"><span class="chip kind">feature</span><span class="chip hold">600.0 / 600 credits</span></div>
+        <div class="verdict">
+          <button class="btn">Raise ceiling</button>
+          <button class="btn danger">Cancel run</button>
+          <button class="btn ghost" data-open-drawer>Open</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="col" data-wait="stall">
+      <div class="col-head"><span class="col-title">Waiting: stall</span><span class="col-count">1</span></div>
+      <p class="col-why">Overran its phase wall clock. The work may still be alive.</p>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_7e11c0</span><span class="run-age">4h 41m</span></div>
+        <div class="run-title">notify-worker &middot; digest-batching</div>
+        <div class="chips"><span class="chip kind">feature</span><span class="chip alarm">stalled in executing</span></div>
+        <div class="verdict">
+          <button class="btn primary">Resume</button>
+          <button class="btn">Redispatch</button>
+          <button class="btn ghost" data-open-drawer>Open</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="col">
+      <div class="col-head"><span class="col-title">Working</span><span class="col-count">2</span></div>
+      <p class="col-why">Nothing to do here. Shown so the board accounts for every run.</p>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_9b6d18</span><span class="run-age">31m</span></div>
+        <div class="run-title">auth-edge &middot; device-binding</div>
+        <div class="chips"><span class="chip">executing &middot; task 4 of 9</span></div>
+        <div class="verdict"><button class="btn ghost" data-open-drawer>Open</button></div>
+      </article>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_2f77ab</span><span class="run-age">3m</span></div>
+        <div class="run-title">report-svc &middot; csv-streaming</div>
+        <div class="chips"><span class="chip">authoring &middot; design</span></div>
+        <div class="verdict"><button class="btn ghost" data-open-drawer>Open</button></div>
+      </article>
+    </section>
+
+    <section class="col">
+      <div class="col-head"><span class="col-title">Closed</span><span class="col-count">2</span></div>
+      <p class="col-why">Terminal. Teardown is the only thing left to check.</p>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_5d02ee</span><span class="run-age">yesterday</span></div>
+        <div class="run-title">cart-svc &middot; guest-merge</div>
+        <div class="chips"><span class="chip alarm">teardown incomplete</span></div>
+        <div class="verdict">
+          <button class="btn danger" data-open-drawer>Review kept workspaces</button>
+        </div>
+      </article>
+      <article class="run">
+        <div class="run-top"><span class="run-id">run_a1c4b9</span><span class="run-age">yesterday</span></div>
+        <div class="run-title">image-proxy &middot; signed-urls</div>
+        <div class="chips"><span class="chip">done &middot; torn down</span></div>
+        <div class="verdict"><button class="btn ghost" data-open-drawer>Open</button></div>
+      </article>
+    </section>
+
+  </div>
+</main>
+
+<!-- ══ CONFIG VIEW ══ -->
+<main id="view-config" class="hidden">
+  <div class="config">
+    <section class="pane">
+      <h2>config.json</h2>
+      <p class="sub">The stored document, verbatim. Editing here is the write path;
+        the panel to the right is a read of what this document resolves to.</p>
+      <pre class="json"><span class="jb">{</span>
+  <span class="jk">"cost_profiles"</span>: {
+    <span class="jk">"quality-first"</span>: {
+      <span class="jk">"roles"</span>: {
+        <span class="jk">"design"</span>:    { <span class="jk">"model"</span>: <span class="js">"auto"</span>, <span class="jk">"effort"</span>: <span class="js">"high"</span> },
+        <span class="jk">"review"</span>:    { <span class="jk">"model"</span>: <span class="js">"auto"</span>, <span class="jk">"effort"</span>: <span class="js">"high"</span> },
+        <span class="jk">"implement"</span>: { <span class="jk">"model"</span>: <span class="js">"auto"</span>, <span class="jk">"effort"</span>: <span class="js">"medium"</span> },
+        <span class="jk">"analysis"</span>:  { <span class="jk">"model"</span>: <span class="js">"auto"</span>, <span class="jk">"effort"</span>: <span class="js">"medium"</span> },
+        <span class="jk">"setup"</span>:     { <span class="jk">"model"</span>: <span class="js">"auto"</span>, <span class="jk">"effort"</span>: <span class="js">"low"</span> }
+      },
+      <span class="jk">"budget"</span>:      { <span class="jk">"run_ceiling_credits"</span>: <span class="jn">600.0</span> },
+      <span class="jk">"concurrency"</span>: { <span class="jk">"wave_max_tasks"</span>: <span class="jn">3</span> }
+    }
+  },
+  <span class="jk">"projects"</span>: {
+    <span class="jk">"checkout-svc"</span>: {
+      <span class="jk">"path"</span>: <span class="js">"~/src/checkout-svc"</span>,
+      <span class="jk">"cost_profile"</span>: <span class="js">"quality-first"</span>,
+      <span class="jk">"base_branch"</span>: <span class="js">"main"</span>,
+      <span class="jk">"roles"</span>: { <span class="jk">"implement"</span>: { <span class="jk">"effort"</span>: <span class="js">"high"</span> } }
+    }
+  },
+  <span class="jk">"limits"</span>: { <span class="jk">"revision_cycle_limit"</span>: <span class="jn">3</span>, <span class="jk">"task_retry_limit"</span>: <span class="jn">2</span> },
+  <span class="jk">"budget"</span>: { <span class="jk">"warn_fraction"</span>: <span class="jn">0.8</span> }
+<span class="jb">}</span></pre>
+      <div class="fr-foot">
+        <button class="btn primary">Validate and save</button>
+        <button class="btn">Revert unsaved edits</button>
+      </div>
+    </section>
+
+    <section class="pane">
+      <h2>Roles, as resolved for <span class="role-model">checkout-svc</span></h2>
+      <p class="sub">Every role is resolved per call. A reset here names exactly
+        the node it clears, so nobody clears a profile thinking they cleared a project.</p>
+      <table class="roles">
+        <thead><tr><th>Role</th><th>Model</th><th>Effort</th><th>Reset</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="role-name">design</td>
+            <td><span class="role-model">auto</span><span class="role-src">cost_profiles.quality-first.roles.design</span></td>
+            <td>high</td>
+            <td><button class="btn sm" disabled title="Nothing at the project level to clear">No project override</button></td>
+          </tr>
+          <tr>
+            <td class="role-name">review</td>
+            <td><span class="role-model">auto</span><span class="role-src">cost_profiles.quality-first.roles.review</span></td>
+            <td>high</td>
+            <td><button class="btn sm" disabled title="Nothing at the project level to clear">No project override</button></td>
+          </tr>
+          <tr>
+            <td class="role-name">implement</td>
+            <td><span class="role-model">auto</span><span class="role-src">projects.checkout-svc.roles.implement</span></td>
+            <td>high</td>
+            <td><button class="btn sm danger">Clear <code>projects.checkout-svc.roles.implement</code></button></td>
+          </tr>
+          <tr>
+            <td class="role-name">analysis</td>
+            <td><span class="role-model">auto</span><span class="role-src">cost_profiles.quality-first.roles.analysis</span></td>
+            <td>medium</td>
+            <td><button class="btn sm" disabled title="Nothing at the project level to clear">No project override</button></td>
+          </tr>
+          <tr>
+            <td class="role-name">setup</td>
+            <td><span class="role-model">auto</span><span class="role-src">cost_profiles.quality-first.roles.setup</span></td>
+            <td>low</td>
+            <td><button class="btn sm" disabled title="Nothing at the project level to clear">No project override</button></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Segment-wise match: the surface shows which dotted segments were
+           consulted and which one won, so an operator can see WHY a role
+           resolved the way it did rather than being told the answer. -->
+      <div class="trace">
+        <div>resolving <b>roles.implement.effort</b> for project <b>checkout-svc</b></div>
+        <div>&nbsp;&nbsp;<s>session default</s> &nbsp;&rarr;&nbsp; auto / unset</div>
+        <div>&nbsp;&nbsp;<s>cost_profiles.quality-first.roles.implement.effort</s> &nbsp;&rarr;&nbsp; medium <s>(shadowed)</s></div>
+        <div>&nbsp;&nbsp;<b>projects.checkout-svc.roles.implement.effort</b> &nbsp;&rarr;&nbsp; <b>high</b> &nbsp;(match, most specific)</div>
+      </div>
+      <p class="note">Secret-classified values are withheld from this read and
+        cannot be displayed here, only overwritten.</p>
+    </section>
+  </div>
+</main>
+
+<!-- ══ DRAWER: one run in full ══ -->
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-label="Run detail" data-open="false">
+  <div class="drawer-head">
+    <div>
+      <h2>checkout-svc &middot; idempotent-refunds</h2>
+      <span class="run-id">run_8f2a41 &middot; awaiting_review &middot; gate: design</span>
+    </div>
+    <button class="drawer-close" id="drawer-close">Close</button>
+  </div>
+
+  <div class="section">
+    <h3>Verdict</h3>
+    <div class="verdict">
+      <button class="btn primary">Approve gate</button>
+      <button class="btn">Request changes</button>
+      <button class="btn danger">Cancel run</button>
+    </div>
+    <p class="note">Requesting changes records the comment, returns the run to
+      authoring, and dispatches one revision turn. 1 of 3 cycles used at this gate.</p>
+  </div>
+
+  <div class="section">
+    <h3>Held feedback &middot; 2</h3>
+    <div class="held">
+      <div>
+        <p><strong>Held: submitter class may not drive a fix dispatch.</strong></p>
+        <p class="note">Comment body is not copied here. Releasing it hands it to
+          the watcher, which decides whether a fix turn is dispatched.</p>
+      </div>
+      <button class="btn sm" style="margin-left:auto;flex:none">Release</button>
+    </div>
+    <div class="held">
+      <div><p><strong>Held by screening.</strong></p></div>
+      <button class="btn sm" style="margin-left:auto;flex:none">Release</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Spend</h3>
+    <dl class="kv">
+      <dt>Metered</dt><dd>163.20 credits</dd>
+      <dt>Declared</dt><dd>0.00 credits</dd>
+      <dt>Total</dt><dd>163.20 / 600.00</dd>
+      <dt>Turns</dt><dd>41 across 3 sessions</dd>
+    </dl>
+  </div>
+
+  <div class="section">
+    <h3>Teardown</h3>
+    <!-- A teardown that kept anything is NOT complete, and says so with ids. -->
+    <div class="kept">
+      <p><strong>Incomplete.</strong> 2 workspaces kept, 1 removed. The teardown
+        stage did not run: no runner was wired.</p>
+      <ul>
+        <li>ws_8f2a41_t03 &nbsp;&mdash; kept: uncommitted changes</li>
+        <li>ws_8f2a41_t07 &nbsp;&mdash; kept: lock held by another process</li>
+      </ul>
+    </div>
+    <div class="verdict" style="margin-top:10px">
+      <button class="btn">Retry teardown</button>
+      <button class="btn danger">Force teardown</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ══ FIRST RUN: the page leads with the assistant, not an empty form ══ -->
+<div class="firstrun" id="firstrun" data-open="false">
+  <div class="fr-inner">
+    <span class="fr-badge">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" style="width:12px;height:12px">
+        <path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2-6.3-4.6L5.7 21 8 13.8 2 9.2h7.6z"/>
+      </svg>
+      No configuration yet
+    </span>
+    <h1>Let the setup assistant read the project</h1>
+    <p class="fr-lead">It inspects the repository, shows you the evidence behind
+      every inference, and asks only what it cannot infer. Nothing is written
+      until you approve a plan and name yourself as the approver.</p>
+
+    <div class="fr-step" data-state="done">
+      <span class="fr-num">1</span>
+      <div style="flex:1">
+        <h3>Inspect</h3>
+        <p>4 inferences drawn, each carrying its evidence. 3 questions could not be inferred.</p>
+        <div class="fr-evidence">
+          base_branch = "main" &nbsp;&larr;&nbsp; .git/HEAD, 2 open branches<br>
+          workflow preset = "git-pr" &nbsp;&larr;&nbsp; .github/ present, 1 remote<br>
+          subject &nbsp;&mdash;&nbsp; <span style="color:var(--danger)">refused: two candidate roots, ambiguity not resolvable</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="fr-step" data-state="done">
+      <span class="fr-num">2</span>
+      <div style="flex:1">
+        <h3>Answer what it asked</h3>
+        <p>Cost profile, the autonomy rungs you grant, and the watch source.
+          Every rung needs an explicit yes or no — a missing answer is unanswered,
+          not "no".</p>
+      </div>
+    </div>
+
+    <div class="fr-step" data-state="todo">
+      <span class="fr-num">3</span>
+      <div style="flex:1">
+        <h3>Approve the plan</h3>
+        <p>The plan is shown as the exact <code>config.json</code> patch it will apply.
+          It carries a content hash; if anything upstream changes, applying it is refused
+          rather than applied stale.</p>
+        <div class="fr-approver">
+          <label class="sr" for="approver">Approver identity</label>
+          <input id="approver" placeholder="approver identity" value="">
+          <button class="btn primary">Apply plan</button>
+        </div>
+        <p class="fr-refusal">Refused: approver-required. Nothing was written.</p>
+      </div>
+    </div>
+
+    <div class="fr-foot">
+      <button class="btn ghost" id="fr-dismiss">Preview the board without configuring</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Mockup interactions only. No data layer, no network; every handler is local.
+(function () {
+  var root = document.documentElement;
+
+  document.getElementById('theme').addEventListener('click', function () {
+    root.dataset.theme = root.dataset.theme === 'light' ? 'dark' : 'light';
+  });
+
+  // View tabs swap whole regions: config REPLACES the board in this model.
+  var views = { board: document.getElementById('view-board'), config: document.getElementById('view-config') };
+  Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (tab) {
+    tab.addEventListener('click', function () {
+      Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) { t.removeAttribute('aria-current'); });
+      tab.setAttribute('aria-current', 'page');
+      Object.keys(views).forEach(function (name) { views[name].classList.toggle('hidden', name !== tab.dataset.view); });
+    });
+  });
+
+  // Untrusted text: expanding swaps the clamp for a fixed-height scroll region,
+  // so the run's verdict buttons never move regardless of line count.
+  Array.prototype.forEach.call(document.querySelectorAll('.untrusted-more'), function (btn) {
+    btn.addEventListener('click', function () {
+      var box = btn.closest('.untrusted');
+      var open = box.dataset.open === 'true';
+      box.dataset.open = open ? 'false' : 'true';
+      btn.textContent = open ? 'Show all 11 lines' : 'Collapse';
+    });
+  });
+
+  var drawer = document.getElementById('drawer'), scrim = document.getElementById('scrim');
+  function setDrawer(open) { drawer.dataset.open = scrim.dataset.open = open ? 'true' : 'false'; }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-open-drawer]'), function (btn) {
+    btn.addEventListener('click', function () { setDrawer(true); });
+  });
+  document.getElementById('drawer-close').addEventListener('click', function () { setDrawer(false); });
+  scrim.addEventListener('click', function () { setDrawer(false); });
+
+  // Kill switch: arm, then confirm. Engaging is never one click.
+  var kill = document.getElementById('kill'), killBtn = document.getElementById('kill-btn'),
+      killText = document.getElementById('kill-text'), armed = false;
+  killBtn.addEventListener('click', function () {
+    if (kill.dataset.engaged === 'true') {
+      kill.dataset.engaged = 'false'; armed = false;
+      killText.textContent = 'Kill switch released'; killBtn.textContent = 'Engage';
+      return;
+    }
+    if (!armed) { armed = true; killText.textContent = 'Stops 5 runs in flight'; killBtn.textContent = 'Confirm'; return; }
+    kill.dataset.engaged = 'true'; armed = false;
+    killText.textContent = 'ENGAGED \u00b7 5 runs parked'; killBtn.textContent = 'Release';
+  });
+
+  // First-run takeover. Opens with ?firstrun in the URL so a reviewer can see
+  // both states of the same file.
+  var firstrun = document.getElementById('firstrun');
+  if (location.search.indexOf('firstrun') !== -1) firstrun.dataset.open = 'true';
+  document.getElementById('fr-dismiss').addEventListener('click', function () { firstrun.dataset.open = 'false'; });
+})();
+</script>
+</body>
+</html>

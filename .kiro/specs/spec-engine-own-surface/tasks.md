@@ -120,6 +120,35 @@ no capability is surfaceless for longer than a wave.
 - **For 1.2's gate sweep:** two Prior_App files (`backend/routes.py`, `tests/test_routes.py`) are black-dirty AT the Merge_Base; the sweep must treat them as pre-existing, not reformat them.
 - **For 3.2 (owns the config door):** (a) the approver identity demanded by `apply_setup` is echoed but recorded nowhere durable — `ConfigStore.write` logs only surface name and key count; give the write path a durable approver record. (b) `apply_setup` drops `ConfigStore.write`'s merge advisories from the tool reply (pre-existing engine shape, newly exposed) — plumb the warn recorder into the reply. (c) `CONFIGURATION_ONLY` in the library-equivalence fence lacks the completeness pin its sibling categories have — add it so a future tool cannot join the partition undriven.
 
+- **From 5.1 — the mockup selection is VETO-PENDING for Billy.** A reviewer agent
+  selected **`mockup-b.html` ("Operator Console")** over `mockup-a.html`
+  ("Triage Board") against criteria recorded before judging. Everything —
+  criteria, the reviewer's per-criterion comparison, the post-selection
+  corrections applied to the winner, and the open holes — is in
+  `website/src/apps/spec-engine/design/selection.md`. Overturning it re-runs
+  tasks 6.1–6.4 only.
+  - **For 6.1:** B passes the "safety controls never behind navigation"
+    criterion *only because it contains no overlay*. The kill switch and spend
+    strip is a grid row of the page shell. A drawer, modal or scrim added later
+    silently reintroduces the failure the losing mockup had.
+  - **For 6.2:** the documents-and-findings view on B's verdict pane was added
+    *after* the review, to close the reviewer's finding that neither mockup
+    showed enough to render a verdict on. It is the piece of the selected design
+    with the least review behind it.
+  - **For 6.2:** `revision_exhausted` still has no legitimate distinct action.
+    B's corrected mockup offers "raise the revision limit and retry" —
+    confirm the engine supports raising it for one gate before shipping that
+    control.
+  - **For 6.3:** the mockups' config pane is not a second write path.
+    `config.json` is shown as the write path and the resolved view beside it is
+    a read, per Property 1.
+  - **Do NOT port** `mockup-a.html`'s `Rewrite the gate myself` button. It is
+    left in the losing artifact only so the file still matches the recorded
+    comparison; it is the hand-authoring affordance Requirement 6.3 excludes.
+  - Task 5.1 also widened `UI_SUFFIXES` in `test_public_build_posture.py` to
+    `.html`/`.md` so the design artifacts are provenance-scanned rather than
+    exempted. **4.3 owns the scan ROOTS and must not narrow the suffixes.**
+
 - **For 6.1 (from 4.4's review, two unrecorded shared-file obligations):** `website/src/apps/builtinIcons.tsx` must register `Cog` (unregistered today — the app store falls back to the generic Package glyph) and `website/src/apps/builtinRegistry.ts` must map `/spec-engine` (unmapped today — the route redirects to /chat). Both files sit outside the declared roots, so each needs its own reviewed BOUNDARY_ALLOWLIST entry with a one-line justification.
 - **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
 - **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.
