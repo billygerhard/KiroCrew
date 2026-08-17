@@ -3851,8 +3851,7 @@
     "specEngine": {
       "manifest": {
         "description": "Verwandeln Sie eine Anfrage in eine geprüfte Spezifikation und führen Sie sie dann aus. Jeder Agent, der MCP-Tools aufrufen kann, steuert den gesamten Ablauf: Die Engine liefert die Anweisungen für Erstellung, Orchestrierung und Prüfung, validiert die daraus entstehenden nativen Dokumente und verweigert den Übergang zu einer Phase, deren Dokument nicht validiert oder deren Freigabe fehlt. Nichts am Format steckt in einem Prompt, den ein Agent vergessen oder umformulieren kann.",
-        "display_name": "Spec Engine",
-        "page_label": "Spec Engine"
+        "display_name": "Spec Engine"
       }
     },
     "workflows": {

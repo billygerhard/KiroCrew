@@ -61,7 +61,15 @@ describe('APP_MANIFEST_KEY', () => {
 
   it('carries full literal keys, which is the only form check-i18n-keys resolves', () => {
     for (const [name, keys] of Object.entries(APP_MANIFEST_KEY)) {
-      for (const key of [keys.displayName, keys.description, keys.pageLabel, ...keys.highlights]) {
+      // `pageLabel` is optional (an app with no `ui.pages` has no page to name), so it
+      // is spread in only when present rather than asserted as a key on every app.
+      const present = [
+        keys.displayName,
+        keys.description,
+        ...(keys.pageLabel ? [keys.pageLabel] : []),
+        ...keys.highlights,
+      ]
+      for (const key of present) {
         expect(key, `${name} key is not a dotted literal`).toMatch(/^apps\.[A-Za-z]+\.manifest\.[a-z0-9_]+$/)
         expect(lookup(en, key), `${key} missing from en.json`).toBeTypeOf('string')
       }
@@ -155,11 +163,26 @@ describe('resolvers', () => {
   })
 
   it('prefers the page label key, then the passed label, then the id', () => {
-    const name = Object.keys(APP_MANIFEST_KEY)[0]
-    expect(appPageLabel(name, 'Raw Label', 'Raw Display'))
-      .toBe(lookup(en, APP_MANIFEST_KEY[name].pageLabel))
+    const named = Object.entries(APP_MANIFEST_KEY).find(([, k]) => k.pageLabel)
+    expect(named, 'no app in the table declares a page label').toBeDefined()
+    const [name, keys] = named!
+    expect(appPageLabel(name, 'Raw Label', 'Raw Display')).toBe(lookup(en, keys.pageLabel!))
     expect(appPageLabel('vendor-app', 'Raw Label', 'Raw Display')).toBe('Raw Label')
     expect(appPageLabel('vendor-app', '', 'Raw Display')).toBe('Raw Display')
     expect(appPageLabel('vendor-app')).toBe('vendor-app')
+  })
+
+  // An app can ship a store card and no page (spec-engine is MCP-plus-hook only). It
+  // contributes no nav page, so it must not claim a page label — an earlier revision
+  // gave it one, which put a label for a non-existent page into thirteen catalogs and
+  // turned the sync gate red. The fallback is asserted, not just the absence, so this
+  // stays a statement about behaviour rather than about the table's shape.
+  it('falls back to the display name for an app that declares no page', () => {
+    const pageless = Object.entries(APP_MANIFEST_KEY).filter(([, k]) => !k.pageLabel)
+    expect(pageless.length, 'expected at least one pageless app in the table').toBeGreaterThan(0)
+    for (const [name] of pageless) {
+      expect(appPageLabel(name, '', 'Raw Display')).toBe('Raw Display')
+      expect(appPageLabel(name)).toBe(name)
+    }
   })
 })

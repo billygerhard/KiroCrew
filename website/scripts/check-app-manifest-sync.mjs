@@ -68,6 +68,9 @@ function manifests() {
       dir: entry.name,
       displayName: m.displayName || '',
       description: m.description || '',
+      // Distinct from an empty label: an app may ship a store card and no page at all
+      // (spec-engine is MCP-plus-hook only), and such an app has no page to label.
+      hasPage: pages.length > 0,
       pageLabel: (pages[0] && pages[0].label) || '',
       highlights: m.highlights || [],
     })
@@ -131,11 +134,21 @@ for (const [name, app] of apps) {
   }
   check(keys.displayName, app.displayName, 'displayName')
   check(keys.description, app.description, 'description')
-  check(keys.pageLabel, app.pageLabel, 'pageLabel')
+  // An app with no `ui.pages` has no page to label, so it must not carry a page_label
+  // key. Checked in BOTH directions: demanding one for a pageless app is what put an
+  // untranslatable "Spec Engine" label in thirteen catalogs for a page that cannot
+  // exist, and only asserting the forward direction would let it back in silently.
+  if (app.hasPage) {
+    check(keys.pageLabel, app.pageLabel, 'pageLabel')
+  } else if (lookup(en, keys.pageLabel) !== undefined) {
+    fail.push(`${name}: declares no ui.pages, so '${keys.pageLabel}' must not exist in\n`
+      + '      locales/en.json. Remove it from every catalog, or give the app a page.')
+  }
   keys.highlights.forEach((k, i) => check(k, app.highlights[i], `highlight_${i + 1}`))
 }
 
-const strings = [...apps.values()].reduce((n, a) => n + 3 + a.highlights.length, 0)
+const strings = [...apps.values()]
+  .reduce((n, a) => n + 2 + (a.hasPage ? 1 : 0) + a.highlights.length, 0)
 if (fail.length) {
   note(`\n[app-manifest-sync] FAIL — ${fail.length} problem(s)\n`)
   for (const f of fail) note(`    ${f}`)

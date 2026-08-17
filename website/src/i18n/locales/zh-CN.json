@@ -3790,8 +3790,7 @@
     "specEngine": {
       "manifest": {
         "description": "把需求变成经过评审的规格，然后直接执行。只要能调用 MCP 工具，任何智能体都可以推进整个工作流：引擎提供撰写、编排与评审指令，校验其产出的原生文档，并拒绝进入文档未通过校验或缺少有效批准的阶段。格式相关内容不会放进提示词，以免智能体遗忘或改写。",
-        "display_name": "Spec Engine",
-        "page_label": "Spec Engine"
+        "display_name": "Spec Engine"
       }
     },
     "workflows": {

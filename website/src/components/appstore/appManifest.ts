@@ -58,7 +58,8 @@ import { i18nT } from '../../i18n/t'
 type ManifestKeys = {
   displayName: string
   description: string
-  pageLabel: string
+  /** Absent for an app that ships a store card but no `ui.pages` — it has no page to name. */
+  pageLabel?: string
   highlights: string[]
 }
 
@@ -300,7 +301,6 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
   'spec-engine': {
     displayName: 'apps.specEngine.manifest.display_name',
     description: 'apps.specEngine.manifest.description',
-    pageLabel: 'apps.specEngine.manifest.page_label',
     highlights: [],
   },
   'workflows': {
@@ -361,7 +361,10 @@ export function appDescription(app: { name?: string; description?: string; _regi
  */
 export function appPageLabel(name: string | undefined, label?: string, displayName?: string): string {
   const k = keysFor({ name })
-  return k ? i18nT(k.pageLabel) : (label || displayName || name || '')
+  // `pageLabel` is absent for an app with no `ui.pages`. Such an app contributes no nav
+  // page, so this should be unreachable for one — falling through to the caller's own
+  // label keeps it honest rather than rendering a raw catalog key if it ever is reached.
+  return k && k.pageLabel ? i18nT(k.pageLabel) : (label || displayName || name || '')
 }
 
 /**
