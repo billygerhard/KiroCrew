@@ -7,7 +7,8 @@ same-origin, already through the gateway's auth middleware, and there is no
 second process, port or proxy secret anywhere in this module.
 
 **What this surface is for.** One page's worth of operation: the Review_Queue
-and its four manual overrides, the configuration document, the kill switch, and
+and its four manual overrides, the configuration document and the resolved read
+beside it, the setup flow that produces a first document, the kill switch, and
 one run's attributed spend. Everything it does it does by calling the
 Spec_Engine library — no rule, no threshold and no state transition is decided
 here — so a surface reading a number reads the number the engine enforces
@@ -32,11 +33,11 @@ widen its own autonomy or lift its own stop. So every MUTATING handler refuses
 an app token with 403 and a security event, and refuses an unauthenticated
 caller with 401.
 
-Reads deliberately stop at 401. An app token may READ all four read routes,
-and the rationale differs by route. The configuration read is equivalence: the
+Reads deliberately stop at 401. An app token may READ all five read routes,
+and the rationale differs by route. The configuration reads are equivalence: the
 values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
-it here would buy nothing and diverge the two doors. The queue, run-spend and
+them here would buy nothing and diverge the two doors. The queue, run-spend and
 kill-switch reads have NO MCP equivalent — an app token gains reads here it
 could not otherwise obtain (queue rows with source and item ids, per-run spend,
 kill-switch state with stoppable run ids). That is accepted, not overlooked:
@@ -44,6 +45,16 @@ the requirement guards mutations, these payloads carry no credential-classified
 material, and an agent acting on a run legitimately needs to see the queue it
 is part of. If that acceptance is ever revisited, the guard mechanism below is
 already per-route.
+
+**Two of the guarded routes write nothing, and are guarded anyway.** Setup
+inspection and setup planning are pure reads of the library's, but they read a
+project path the CALLER names: they open ``.git/config``, steering notes, docs
+and CI files under an arbitrary directory and hand excerpts back. Left on the
+read composer, an app-minted token would have a general-purpose filesystem reader
+inside this app's own namespace. They are POSTs behind the operator guard for that
+reason, not because they mutate — so the guard here is about the authority to name
+a path, and the mark it stamps is what keeps that decision visible in the route
+table rather than resting on a comment.
 
 **Nothing blocking runs on the event loop.** Every handler's disk and database
 work — including constructing the stores, which opens SQLite and migrates the
@@ -61,6 +72,21 @@ was written for. Every arm below names ``StateError`` for that reason.
 derives ``ValueError``, and ``ConfigLoadError``/``ConfigRecordError`` derive
 ``RuntimeError`` — the last two are named explicitly rather than caught as
 ``RuntimeError`` so a future sibling is not swallowed silently.
+
+The setup path adds the same trap in a second shape. ``SetupApprovalRequired``
+derives ``PermissionError`` and therefore ``OSError``, and
+``InferredSubjectRefused`` derives ``ValueError`` — so on those handlers the
+refusal arm MUST precede the ``OSError`` and ``ValueError`` arms, or a decision
+the engine made is reported as a disk failure or as a malformed request.
+
+**The setup flow keeps no plan.** ``plan_setup`` returns a ``plan_id`` that is a
+content hash of the project subject, the answers used and the patch they produce
+(``engine_mcp/setup_surface.py``), and ``apply_setup`` recomputes it from the
+arguments it was handed and refuses on a mismatch. That module is imported rather
+than paraphrased: it is the boundary shape both doors share, so an apply driven
+from this surface and an apply driven from the Engine_MCP_Server refuse and accept
+the same plans, and a stale identity writes nothing on either. It is pure Python
+with no import-time work of its own.
 """
 
 from __future__ import annotations
@@ -68,6 +94,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from functools import wraps
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
 from aiohttp import web
@@ -78,6 +105,7 @@ from kiro_crew.sel import sel
 from ..engine import audit as engine_audit
 from ..engine import review_queue as engine_review_queue
 from ..engine import runs as engine_runs
+from ..engine import setup as engine_setup
 from ..engine import state as engine_state
 from ..engine.budget import ceiling as engine_ceiling
 from ..engine.budget import killswitch as engine_killswitch
@@ -87,6 +115,8 @@ from ..engine.config import (
     APP_NAME,
     CONFIG_ONLY_PATHS,
     DASHBOARD_SURFACE,
+    ROLES,
+    SETUP_ASSISTANT_SURFACE,
     ConfigLoadError,
     ConfigRecordError,
     ConfigStore,
@@ -95,8 +125,11 @@ from ..engine.config import (
     ConfigWriteRefused,
     document_warnings,
     elide_secrets,
+    resolve_all,
     validate_config_document,
 )
+from ..engine.roles import RolePlan
+from ..engine_mcp import setup_surface
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +157,21 @@ SURFACE_INITIATOR = "spec-engine-dashboard"
 #: signed-in human; bound to a name here so the claim has one place to be read,
 #: asserted, and (if it ever changes) found.
 WRITE_SURFACE = DASHBOARD_SURFACE
+
+#: The surface a setup apply writes on: the engine's own setup-assistant surface,
+#: the SAME constant the Engine_MCP_Server's ``apply_setup`` uses. Shared rather
+#: than declared per door, because the surface name is recorded beside the approver
+#: in the store's durable write record and lands in the merged document's fenced
+#: paths — two doors writing one approved plan under two surface names would make
+#: that record answer "which surface applied this" differently depending on where
+#: the operator happened to be standing.
+#:
+#: It is operator-confirmed for a reason narrower than it looks: a setup patch
+#: necessarily touches config-only paths (a project's workflow, a source's autonomy
+#: grid), so an unconfirmed surface could not complete setup at all. The authority
+#: is bounded by construction — the patch is built by the engine from an offered,
+#: approved plan and no caller-supplied patch reaches this path.
+SETUP_SURFACE = SETUP_ASSISTANT_SURFACE
 
 
 # --- refusals and audit -----------------------------------------------------
@@ -496,6 +544,286 @@ async def handle_put_config(request: web.Request) -> web.Response:
         resources=",".join(sorted(str(key) for key in patch)),
     )
     return web.json_response({"ok": True, "document": document, "advisories": advisories})
+
+
+# --- the resolved read beside the document ----------------------------------
+
+
+def _resolved_snapshot(project: str | None, source: str | None) -> dict[str, Any]:
+    """BLOCKING — every setting's value in force, and the role plan it produces.
+
+    A READ of the document the config route writes, never a second write path.
+    That is the whole point of it: an operator editing ``config.json`` is editing
+    one layer of a five-layer precedence (bundled default, app, the profile a
+    project selected, project, source), and a surface showing only the document
+    cannot answer "what is actually in force here" — which is the question every
+    edit is really about. ``EffectiveValue`` carries the origin and the declaring
+    path beside each value, so a ``2`` that somebody chose is distinguishable from
+    a ``2`` the app shipped; those call for opposite actions.
+
+    Built from ONE read of the document, for the same reason
+    :func:`_config_snapshot` is: ``ConfigStore.effective_settings`` and
+    ``RolePlan.for_run`` each re-read the file, so composing this reply from those
+    two accessors would let a write landing between them resolve the settings from
+    one document and the roles from the next.
+
+    ``roles`` is the engine's own ``RolePlan.detail()``, relayed. The role table a
+    surface renders must be the resolution a DISPATCH would use — including the
+    fallback reasons, which are four distinct conditions fixed in four different
+    places — and a surface that re-derived "which model will the review role run
+    on" from the raw profile object would answer differently from the run.
+
+    ``role_order`` travels because a JSON object has no order a client may rely on,
+    and the engine's role order is meaningful (it is the order the profiles declare
+    and the audit records).
+    """
+    store = _config_store()
+    document = store.document()
+    plan = RolePlan.from_document(document, project=project)
+    resolved = resolve_all(document, project=project, source=source)
+    return {
+        "configured": store.path.is_file(),
+        "project": project,
+        "source": source,
+        "settings": [resolved[key].to_json_object() for key in sorted(resolved)],
+        "roles": plan.detail(),
+        "role_order": list(ROLES),
+    }
+
+
+async def handle_get_resolved_config(request: web.Request) -> web.Response:
+    """GET the value in force for every setting, with the origin of each."""
+    project = request.query.get("project") or None
+    source = request.query.get("source") or None
+    try:
+        payload = await asyncio.to_thread(_resolved_snapshot, project, source)
+    except ConfigValidationError as exc:
+        # An explicitly stored value that fails the setting's own validation.
+        # Resolution RAISES rather than falling through to the default, and this
+        # arm keeps that distinction: the document has a value nobody can act on,
+        # which is a repair, not an unreadable file and not an empty resolution.
+        # It must precede any ValueError arm -- ConfigValidationError derives
+        # ValueError.
+        return _refuse("config_invalid", "; ".join(str(error) for error in exc.errors), status=422)
+    except ConfigLoadError as exc:
+        return _refuse("config_unreadable", str(exc), status=409)
+    except OSError as exc:
+        return _refuse("config_unreadable", str(exc), status=503)
+    return web.json_response(payload)
+
+
+# --- the setup assistant ----------------------------------------------------
+
+
+def _setup_subject(payload: Mapping[str, Any]) -> tuple[Path, str]:
+    """The project root and configuration name a setup call names.
+
+    Both come from :mod:`..engine_mcp.setup_surface` rather than from a spelling
+    here, because they are hashed into the ``plan_id``: a root resolved one way at
+    this door and another way at the MCP door would compute two identities for one
+    project, and the apply would then refuse a plan the operator had just read.
+    """
+    root = setup_surface.setup_root(_text(payload, "project"))
+    name = payload.get("name")
+    return root, setup_surface.project_name(root, str(name) if name is not None else None)
+
+
+def _inspect_setup(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """BLOCKING — read the project and report evidence, inferences, questions.
+
+    Reads the caller's project tree (steering notes, docs, CI and build files, the
+    git remote) and the PATH probes each offered preset's prerequisites make.
+    Writes nothing — not the config document and not the state store.
+    """
+    root, name = _setup_subject(payload)
+    plan = engine_setup.propose_setup(root, project=name)
+    return setup_surface.inspection_payload(plan, root=root)
+
+
+def _plan_envelope(
+    payload: Mapping[str, Any], answers: Mapping[str, Any]
+) -> tuple[engine_setup.SetupPlan, engine_setup.SetupAnswers, setup_surface.SetupPlanEnvelope]:
+    """BLOCKING — recompute the plan and its envelope from the arguments alone.
+
+    The one place a plan is built for both the plan and the apply handlers, so the
+    two cannot compute different plans from one set of arguments — which is the
+    only way the identity check could pass while the write differed from the plan
+    the operator approved.
+    """
+    root, name = _setup_subject(payload)
+    plan = engine_setup.propose_setup(root, project=name)
+    parsed = setup_surface.answers_from_arguments(answers)
+    patch = engine_setup.setup_patch(plan, parsed)
+    return plan, parsed, setup_surface.plan_envelope(plan, parsed, patch)
+
+
+def _plan_setup(payload: Mapping[str, Any], answers: Mapping[str, Any]) -> dict[str, Any]:
+    """BLOCKING — compute the patch these answers would write. Writes nothing.
+
+    Every gate the apply would fail is evaluated here, so an operator learns that a
+    rung is unanswered or a preset was never offered BEFORE they are asked to put
+    their name to it.
+    """
+    _, _, envelope = _plan_envelope(payload, answers)
+    return envelope.to_json_object()
+
+
+def _apply_setup(
+    payload: Mapping[str, Any], answers: Mapping[str, Any], plan_id: str, approver: str
+) -> dict[str, Any]:
+    """BLOCKING — write the plan identified by *plan_id*, on *approver*'s authority.
+
+    Two refusals precede the write, in this order, and neither writes anything:
+
+    * an absent *approver* — the plan writes the commands a project runs
+      unattended and the rung it runs them at, so the human who accepted it is
+      named rather than implied by the session. Checked FIRST, before the project
+      is even read, so a call with no identity cannot cost a filesystem walk;
+    * a ``plan_id`` that is not the identity these inputs produce now — the
+      project's evidence or the answers have changed since the plan was computed,
+      so applying it would write something the operator never read.
+
+    The approver is the identity the caller states, and it is NOT the session: an
+    operator may apply a plan a colleague approved, and the engine records the
+    approver beside the surface name in the store's durable write record. The
+    session is what the operator guard verified in order to reach here at all, and
+    it is recorded separately in the security event.
+    """
+    identity = setup_surface.require_approver(approver)
+    plan, parsed, envelope = _plan_envelope(payload, answers)
+    setup_surface.require_plan_identity(plan_id, envelope.plan_id)
+    result = engine_setup.apply_setup(
+        _config_store(), plan, parsed, surface=SETUP_SURFACE, actor=identity
+    )
+    return setup_surface.apply_payload(envelope, result, identity)
+
+
+def _setup_refusal(exc: Exception) -> web.Response:
+    """A setup refusal as one status with the engine's own refusal code inside.
+
+    One status for all four refusals (an absent approver, a stale plan, an
+    unanswered gate, an inference of a subject that is only ever asked) because
+    they differ in what the caller must do next and not in who may act: every one
+    of them means the flow did not proceed and NOTHING was written. The actionable
+    part is ``refused``, which carries the same vocabulary the Engine_MCP_Server's
+    setup tools return, so a client that learned one door's refusals understands
+    the other's.
+    """
+    payload = setup_surface.refusal_payload(exc)
+    if payload is None:  # pragma: no cover - callers only pass classified refusals
+        raise exc
+    return web.json_response({"code": "setup_refused", "error": str(exc), **payload}, status=409)
+
+
+async def _setup_arguments(
+    request: web.Request,
+) -> tuple[dict[str, Any], dict[str, Any]] | web.Response:
+    """The body and its ``answers`` object, or a refusal.
+
+    ``answers`` is required as an OBJECT rather than defaulted to empty: an empty
+    answer set is a real thing to send (it refuses, naming the unchosen cost
+    profile), but a caller that sent ``answers: null`` or omitted the key has a bug
+    this must not translate into "the operator answered nothing".
+    """
+    body = await _json_object(request)
+    if isinstance(body, web.Response):
+        return body
+    if not _text(body, "project"):
+        return _refuse("field_required", "a setup call needs the project path to inspect")
+    answers = body.get("answers")
+    if not isinstance(answers, dict):
+        return _refuse("bad_answers", "answers must be an object holding the operator's answers")
+    return body, answers
+
+
+async def handle_post_setup_inspect(request: web.Request) -> web.Response:
+    """Inspect a project: evidence read, values inferred, questions left to ask."""
+    body = await _json_object(request)
+    if isinstance(body, web.Response):
+        return body
+    if not _text(body, "project"):
+        return _refuse("field_required", "a setup inspection needs the project path to read")
+    try:
+        payload = await asyncio.to_thread(_inspect_setup, body)
+    except (engine_setup.InferredSubjectRefused, engine_setup.SetupApprovalRequired) as exc:
+        # Ahead of the two arms below, and the ordering is load-bearing:
+        # InferredSubjectRefused derives ValueError and SetupApprovalRequired
+        # derives PermissionError (so OSError). Below them, a decision the engine
+        # made would be reported as a malformed request or as a disk failure.
+        return _setup_refusal(exc)
+    except ValueError as exc:
+        # An unnameable project (a filesystem root has no final segment to fall
+        # back on). A malformed call, not a decision.
+        return _refuse("bad_project", str(exc))
+    except OSError as exc:
+        return _refuse("setup_read_failed", str(exc), status=503)
+    return web.json_response(payload)
+
+
+async def handle_post_setup_plan(request: web.Request) -> web.Response:
+    """Compute the configuration plan a set of answers produces. Writes nothing."""
+    parsed = await _setup_arguments(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    body, answers = parsed
+    try:
+        payload = await asyncio.to_thread(_plan_setup, body, answers)
+    except (engine_setup.InferredSubjectRefused, engine_setup.SetupApprovalRequired) as exc:
+        return _setup_refusal(exc)
+    except ValueError as exc:
+        # An unknown cost profile name, an unknown autonomy rung, an unnameable
+        # project: the caller learns which names exist rather than having a bad key
+        # silently dropped into a rung the engine then refuses as "missing".
+        return _refuse("bad_answers", str(exc))
+    except OSError as exc:
+        return _refuse("setup_read_failed", str(exc), status=503)
+    return web.json_response(payload)
+
+
+async def handle_post_setup_apply(request: web.Request) -> web.Response:
+    """Apply a plan by its identity, on a named human approver's authority."""
+    parsed = await _setup_arguments(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    body, answers = parsed
+    plan_id = _text(body, "plan_id")
+    approver = _text(body, "approver")
+    actor = _actor(request)
+    try:
+        payload = await asyncio.to_thread(_apply_setup, body, answers, plan_id, approver)
+    except (engine_setup.InferredSubjectRefused, engine_setup.SetupApprovalRequired) as exc:
+        # Covers the absent approver and the stale plan too: both refusals are
+        # SetupApprovalRequired subclasses precisely so that every catch which
+        # already refuses to write keeps refusing.
+        return _setup_refusal(exc)
+    except ConfigWriteRefused as exc:
+        # Unreachable while SETUP_SURFACE is operator-confirmed, and kept for the
+        # same reason as its sibling on the config write: without it, a future
+        # unconfirmed surface would render a legitimate engine refusal as a 503
+        # disk problem. Above the OSError arm because ConfigWriteRefused derives
+        # PermissionError, which derives OSError.
+        return _refuse("config_write_refused", str(exc), status=403)
+    except ConfigValidationError as exc:
+        return _refuse("config_invalid", "; ".join(str(error) for error in exc.errors), status=422)
+    except ConfigRecordError as exc:
+        # The plan WAS applied and nothing recorded who approved it. That pair of
+        # facts is the whole reason the approver is demanded, so it is reported as
+        # a failure rather than as an ordinary apply.
+        return _refuse("config_write_unrecorded", str(exc), status=500)
+    except ValueError as exc:
+        return _refuse("bad_answers", str(exc))
+    except (ConfigLoadError, OSError) as exc:
+        return _refuse("setup_apply_failed", str(exc), status=503)
+    _sel_event(
+        caller=actor or SURFACE_INITIATOR,
+        operation="spec_engine_setup_apply",
+        outcome="success",
+        # The approver travels beside the session, never instead of it: the session
+        # is who acted and the approver is who authorized it, and a record holding
+        # one of them answers the wrong question.
+        resources=f"approver={approver} plan={plan_id}",
+    )
+    return web.json_response(payload)
 
 
 # --- the kill switch --------------------------------------------------------
@@ -916,6 +1244,19 @@ def register_routes(app: web.Application) -> None:
 
     add("GET", f"{PREFIX}/config", _read(handle_get_config))
     add("PUT", f"{PREFIX}/config", _mutate(handle_put_config, operation="config_write"))
+    add("GET", f"{PREFIX}/config/resolved", _read(handle_get_resolved_config))
+
+    # The setup flow. All three are POSTs behind the operator guard, and the first
+    # two write nothing: they read a project path the CALLER names, so leaving them
+    # on the read composer would hand an app-minted token a filesystem reader inside
+    # this app's own namespace. See the module docstring.
+    add(
+        "POST",
+        f"{PREFIX}/setup/inspect",
+        _mutate(handle_post_setup_inspect, operation="setup_inspect"),
+    )
+    add("POST", f"{PREFIX}/setup/plan", _mutate(handle_post_setup_plan, operation="setup_plan"))
+    add("POST", f"{PREFIX}/setup/apply", _mutate(handle_post_setup_apply, operation="setup_apply"))
 
     add("GET", f"{PREFIX}/kill-switch", _read(handle_get_kill_switch))
     add(

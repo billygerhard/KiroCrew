@@ -40,8 +40,10 @@ from .setup_surface import (
     apply_payload,
     inspection_payload,
     plan_envelope,
+    project_name,
     require_approver,
     require_plan_identity,
+    setup_root,
 )
 
 #: The surface this adapter writes configuration through. It is deliberately not
@@ -84,38 +86,6 @@ class RefusingFindingsSink:
             "the engine-MCP surface has no findings sink wired; a tool that runs "
             "analysis must build its graph with the durable sink"
         )
-
-
-def _setup_root(project: str) -> Path:
-    """Return the project root a setup call names, normalised the engine's way.
-
-    Same normalisation :meth:`~..engine.state.SpecRef.of` applies, so a project
-    identified one way to the authoring tools is the same project here. It also
-    makes the plan identity stable across two spellings of one path: without it,
-    ``/tmp/p`` and ``/tmp/p/`` would hash to two different plans for one project.
-    """
-    return Path(project).expanduser().resolve()
-
-
-def _project_name(root: Path, given: str | None) -> str:
-    """Return the configuration name for *root*: the caller's, or the directory's.
-
-    Falling back to the directory name is not a guess about the project -- the
-    directory is where the name is written down, and the whole resolved root is
-    part of the plan identity, so a caller who meant a different name gets a
-    different ``plan_id`` rather than a write under a name it did not choose. A
-    root with no final segment (a filesystem root) has nothing to fall back on and
-    is refused rather than named something plausible.
-    """
-    if given is not None and given.strip():
-        return given.strip()
-    inferred = root.name.strip()
-    if not inferred:
-        raise ValueError(
-            f"cannot name the project at {root}: the path has no final segment, so pass an "
-            "explicit name rather than having one chosen"
-        )
-    return inferred
 
 
 def _report_json(report: Any) -> dict[str, Any]:
@@ -296,8 +266,8 @@ class EngineOperations:
         degraded mode, and the payload says so through ``memory_consulted`` rather
         than reporting inferences it could not make.
         """
-        root = _setup_root(project)
-        plan = propose_setup(root, project=_project_name(root, name))
+        root = setup_root(project)
+        plan = propose_setup(root, project=project_name(root, name))
         return inspection_payload(plan, root=root)
 
     def plan_setup(
@@ -366,8 +336,8 @@ class EngineOperations:
         arguments -- which is the only way the identity check could pass while the
         write differed from the plan returned.
         """
-        root = _setup_root(project)
-        plan = propose_setup(root, project=_project_name(root, name))
+        root = setup_root(project)
+        plan = propose_setup(root, project=project_name(root, name))
         parsed = answers_from_arguments(answers)
         return plan, plan_envelope(plan, parsed, setup_patch(plan, parsed))
 

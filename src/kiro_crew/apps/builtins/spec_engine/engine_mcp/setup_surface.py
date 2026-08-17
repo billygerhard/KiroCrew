@@ -1,9 +1,11 @@
-"""The setup assistant's shape at the MCP boundary: envelopes, identity, refusals.
+"""The setup assistant's shape at a stateless boundary: envelopes, identity, refusals.
 
 The Setup_Assistant is a two-step flow -- propose, then apply what the operator
-approved -- and MCP is a stateless protocol. Bridging those two without inventing
-server-side sessions is the whole job of this module, and it is done with a
-content hash rather than a handle:
+approved -- and neither boundary that drives it keeps a session. MCP is a
+stateless protocol, and the Operator_Surface's HTTP routes are stateless for the
+same reason a gateway restart must not lose an approval that was never given.
+Bridging that without inventing server-side sessions is the whole job of this
+module, and it is done with a content hash rather than a handle:
 
 * :func:`plan_identity` hashes the canonical JSON of the three things that decide
   what a write does -- the project subject, the answers used, and the patch they
@@ -25,6 +27,13 @@ a stale ``plan_id`` are properties of *this* boundary, not of the library. Both
 subclass :class:`~..engine.setup.SetupApprovalRequired`, so an existing catch of
 the engine's refusal keeps catching them, and the boundary can still tell them
 apart to name the right refusal code.
+
+**Every caller of the flow normalizes its subject HERE.** :func:`setup_root` and
+:func:`project_name` live in this module rather than beside one of the two doors
+because the subject they produce is hashed into the identity: two boundaries that
+resolved a path or defaulted a name differently would compute two ``plan_id``\\ s
+for one project, and an apply driven from one door with a plan read from the
+other would refuse for a reason no operator could act on.
 """
 
 from __future__ import annotations
@@ -79,6 +88,7 @@ __all__ = [
     "plan_envelope",
     "plan_identity",
     "preset_programs",
+    "project_name",
     "project_subject",
     "refusal_payload",
     "render_offer",
@@ -86,6 +96,7 @@ __all__ = [
     "render_question",
     "require_approver",
     "require_plan_identity",
+    "setup_root",
 ]
 
 #: Key naming the refusal in a structured refusal payload.
@@ -171,6 +182,41 @@ def refusal_payload(exc: Exception) -> dict[str, Any] | None:
                 "message": str(exc),
             }
     return None
+
+
+# --- the subject every caller must resolve the same way --------------------
+
+
+def setup_root(project: str) -> Path:
+    """Return the project root a setup call names, normalised the engine's way.
+
+    Same normalisation :meth:`~..engine.state.SpecRef.of` applies, so a project
+    identified one way to the authoring tools is the same project here. It also
+    makes the plan identity stable across two spellings of one path: without it,
+    ``/tmp/p`` and ``/tmp/p/`` would hash to two different plans for one project.
+    """
+    return Path(project).expanduser().resolve()
+
+
+def project_name(root: Path, given: str | None) -> str:
+    """Return the configuration name for *root*: the caller's, or the directory's.
+
+    Falling back to the directory name is not a guess about the project -- the
+    directory is where the name is written down, and the whole resolved root is
+    part of the plan identity, so a caller who meant a different name gets a
+    different ``plan_id`` rather than a write under a name it did not choose. A
+    root with no final segment (a filesystem root) has nothing to fall back on and
+    is refused rather than named something plausible.
+    """
+    if given is not None and given.strip():
+        return given.strip()
+    inferred = root.name.strip()
+    if not inferred:
+        raise ValueError(
+            f"cannot name the project at {root}: the path has no final segment, so pass an "
+            "explicit name rather than having one chosen"
+        )
+    return inferred
 
 
 # --- plan identity ---------------------------------------------------------

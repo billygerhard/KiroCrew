@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,16 +39,39 @@ from typing import Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.backend import routes
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     CONFIG_FILENAME,
+    ROLES,
     ConfigStore,
     ConfigWriteSurface,
     default_root,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
+    COST_PROFILE_PRESET_NAMES,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.setup import CONFIRMED_LEVELS
+from kiro_crew.apps.builtins.spec_engine.engine_mcp.operations import EngineOperations
+from kiro_crew.apps.builtins.spec_engine.engine_mcp.setup_surface import (
+    REFUSAL_APPROVER_REQUIRED,
+    REFUSAL_PLAN_STALE,
+    REFUSAL_SETUP_APPROVAL,
+    REFUSED_KEY,
+    StalePlan,
+)
 
 ROUTES_SOURCE = Path(routes.__file__)
+
+#: The approver identity the setup tests name. A human identity, because that is
+#: what the apply demands and records.
+APPROVER = "operator@example"
+
+#: Fresh directory names for the property tests, which cannot take a
+#: function-scoped fixture per example.
+_UNIQUE = itertools.count()
 
 
 def _blocking_helpers() -> frozenset[str]:
@@ -90,6 +114,11 @@ def test_the_derived_blocking_set_still_sees_the_known_helpers() -> None:
         "_write_config",
         "_queue_snapshot",
         "_release_feedback",
+        "_resolved_snapshot",
+        "_inspect_setup",
+        "_plan_envelope",
+        "_plan_setup",
+        "_apply_setup",
     } <= BLOCKING_HELPERS
     assert "_audit_log" not in BLOCKING_HELPERS, (
         "_audit_log's docstring marks it BLOCKING-safe; the derivation must "
@@ -223,6 +252,16 @@ MUTATING_BODIES: dict[tuple[str, str], dict[str, Any]] = {
     },
     ("POST", f"{routes.PREFIX}/queue/clean-workspace"): {"workspace_id": 1},
     ("POST", f"{routes.PREFIX}/queue/teardown"): {"run_id": "run-1"},
+    # The setup flow. Its two read-only steps are guarded because the project path
+    # is the CALLER's, so they are driven here like any other mutating route.
+    ("POST", f"{routes.PREFIX}/setup/inspect"): {"project": "/tmp/project"},
+    ("POST", f"{routes.PREFIX}/setup/plan"): {"project": "/tmp/project", "answers": {}},
+    ("POST", f"{routes.PREFIX}/setup/apply"): {
+        "project": "/tmp/project",
+        "answers": {},
+        "plan_id": "0" * 64,
+        "approver": "operator@example",
+    },
 }
 
 
@@ -396,7 +435,7 @@ class TestAnAppTokenIsRefusedOnEveryMutatingRoute:
             f"undriven={sorted(set(MUTATING) - set(MUTATING_BODIES))} "
             f"stale={sorted(set(MUTATING_BODIES) - set(MUTATING))}"
         )
-        assert len(MUTATING) == 6, (
+        assert len(MUTATING) == 9, (
             "the mutating surface changed size; re-read the guard's reasoning in "
             "routes.py before accepting it"
         )
@@ -513,6 +552,10 @@ class TestTheRegisteredSurface:
         assert {(method, path) for method, path, _ in TABLE} == {
             ("GET", f"{routes.PREFIX}/config"),
             ("PUT", f"{routes.PREFIX}/config"),
+            ("GET", f"{routes.PREFIX}/config/resolved"),
+            ("POST", f"{routes.PREFIX}/setup/inspect"),
+            ("POST", f"{routes.PREFIX}/setup/plan"),
+            ("POST", f"{routes.PREFIX}/setup/apply"),
             ("GET", f"{routes.PREFIX}/kill-switch"),
             ("POST", f"{routes.PREFIX}/kill-switch"),
             ("GET", f"{routes.PREFIX}/run-spend"),
@@ -1070,6 +1113,578 @@ class TestTheQueueActionsValidateBeforeTheyReachTheEngine:
         assert reply.body["report"]["kept"] == []
 
 
+# --- the resolved read beside the document -----------------------------------
+
+
+class TestTheResolvedReadIsAReadOfTheDocumentBesideIt:
+    """The value in force, and where each one came from.
+
+    The document alone cannot answer "what is actually in force here": a setting
+    resolves through five layers, and the layer an operator is editing is one of
+    them. This read is what closes that gap, and it is a READ — it writes nothing
+    and it is the same ``ConfigStore`` the write path uses, resolved rather than
+    re-implemented.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_zero_configuration_home_resolves_every_setting_to_its_default(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/resolved")
+        assert reply.status == 200
+        assert reply.body["configured"] is False
+        assert reply.body["settings"], "a resolved read with no settings shows nothing"
+        for value in reply.body["settings"]:
+            # Origin is the field that makes the read worth having: it separates a
+            # value somebody chose from one the app shipped, and those call for
+            # opposite actions.
+            assert value["origin"] == "bundled_default"
+            assert value["is_default"] is True
+            assert value["declared_at"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_profile_the_project_selected_is_reported_as_the_origin(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The layer that is easiest to get wrong: selecting a profile is a
+        per-project act, so a profile pin beats the app-wide value and loses to a
+        value pinned on the project itself."""
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "cost_profiles": {
+                            "thrifty": {
+                                "roles": {"review": {"model": "auto", "effort": "high"}},
+                                "budget": {"run_ceiling_credits": 3.0},
+                            }
+                        },
+                        "projects": {"acme": {"path": "/tmp/acme", "cost_profile": "thrifty"}},
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            resolved = await _get(client, f"{routes.PREFIX}/config/resolved?project=acme")
+        assert resolved.status == 200
+        values = {value["key"]: value for value in resolved.body["settings"]}
+        ceiling = values["budget.run_ceiling_credits"]
+        assert ceiling["value"] == 3.0
+        assert ceiling["origin"] == "cost_profile"
+        assert ceiling["declared_at"] == "cost_profiles.thrifty.budget.run_ceiling_credits"
+
+    @pytest.mark.asyncio
+    async def test_the_role_plan_is_the_engines_own_resolution(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Relayed, not re-derived. The table a surface renders must be the
+        resolution a DISPATCH would use, including the four distinct fallback
+        reasons — a surface that read the raw profile object instead would answer
+        "which model will review run on" differently from the run."""
+        async with _client() as client:
+            await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "cost_profiles": {
+                            "thrifty": {"roles": {"review": {"model": "auto", "effort": "high"}}}
+                        },
+                        "projects": {"acme": {"path": "/tmp/acme", "cost_profile": "thrifty"}},
+                    }
+                },
+            )
+            resolved = await _get(client, f"{routes.PREFIX}/config/resolved?project=acme")
+        roles = resolved.body["roles"]
+        assert roles["profile"] == "thrifty"
+        assert set(roles["roles"]) == set(ROLES)
+        review = roles["roles"]["review"]
+        assert review["source"] == "cost_profile"
+        assert review["model"] == "auto"
+        # The declaring node, which is what an accurately labelled per-role reset
+        # names. The profile NAME travels separately, so a surface never has to
+        # split this dotted string to learn it.
+        assert review["declared_at"] == "cost_profiles.thrifty.roles.review"
+        assert review["profile"] == "thrifty"
+        # A role the profile says nothing about falls back and says why, rather
+        # than reporting a model nobody assigned.
+        design = roles["roles"]["design"]
+        assert design["source"] == "session_default"
+        assert design["fallback"] == "role_unassigned"
+        assert design["report"]
+        # Order travels because a JSON object has none a client may rely on.
+        assert resolved.body["role_order"] == list(ROLES)
+
+    @pytest.mark.asyncio
+    async def test_a_profile_name_holding_a_dot_keeps_its_role_node_addressable(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Segment-wise, never by splitting a dotted path.
+
+        A profile may legitimately be named ``thrifty.roles``, and then the role
+        node's declaring path reads ``cost_profiles.thrifty.roles.roles.review``.
+        Any consumer that recovered the profile and the role by splitting that
+        string would address a node that does not exist — so the profile name and
+        the role name travel as their own fields, which is what lets a reset build
+        its patch from segments.
+        """
+        async with _client() as client:
+            await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "cost_profiles": {
+                            "thrifty.roles": {"roles": {"review": {"model": "auto"}}}
+                        },
+                        "projects": {
+                            "acme": {"path": "/tmp/acme", "cost_profile": "thrifty.roles"}
+                        },
+                    }
+                },
+            )
+            resolved = await _get(client, f"{routes.PREFIX}/config/resolved?project=acme")
+        review = resolved.body["roles"]["roles"]["review"]
+        assert review["profile"] == "thrifty.roles"
+        assert review["role"] == "review"
+        assert review["declared_at"] == "cost_profiles.thrifty.roles.roles.review"
+
+    @pytest.mark.asyncio
+    async def test_the_reply_is_built_from_one_read_of_the_document(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``effective_settings`` and ``RolePlan.for_run`` each re-read the file, so
+        composing this reply from those two accessors would resolve the settings
+        from one document and the roles from the next."""
+        reads: list[int] = []
+        original = ConfigStore.document
+
+        def _counting(self: ConfigStore) -> dict[str, Any]:
+            reads.append(1)
+            return original(self)
+
+        monkeypatch.setattr(ConfigStore, "document", _counting)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/resolved")
+        assert reply.status == 200
+        assert sum(reads) == 1, f"the resolved read read the document {sum(reads)} times"
+
+    @pytest.mark.asyncio
+    async def test_a_stored_value_that_fails_its_own_setting_is_a_422(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Resolution RAISES on an out-of-range explicit value rather than falling
+        through to the default, and this arm keeps that: silently substituting the
+        default would run the very work the operator meant to bound. Written to
+        disk directly, because the write path would have refused it."""
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text(
+            json.dumps({"version": 1, "budget": {"warn_fraction": 9.5}}), encoding="utf-8"
+        )
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/resolved")
+        assert reply.status == 422
+        assert reply.code == "config_invalid"
+        assert "warn_fraction" in reply.body["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_document_is_reported_not_resolved_as_empty(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/resolved")
+        assert reply.status == 409
+        assert reply.code == "config_unreadable"
+
+
+# --- the setup flow ----------------------------------------------------------
+
+
+def _project_tree(root: Path) -> Path:
+    """A project whose own files state a GitHub remote and a build entry point."""
+    root.mkdir(parents=True, exist_ok=True)
+    git = root / ".git"
+    git.mkdir()
+    (git / "config").write_text(
+        '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n'
+        "\turl = git@github.com:acme/widgets.git\n",
+        encoding="utf-8",
+    )
+    (root / "Makefile").write_text("build:\n\t@echo build\n\ntest:\n\t@echo test\n", "utf-8")
+    return root
+
+
+def _answers(inspection: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    """A complete, consistent answer set for an inspected project."""
+    answers: dict[str, Any] = {
+        "cost_profile": "budget",
+        "confirmations": {level.value: False for level in CONFIRMED_LEVELS},
+        "approved_subjects": [item["subject"] for item in inspection["inferences"]],
+        "workflow_preset": "git-pull-request",
+        "watch_source": "github",
+    }
+    answers.update(overrides)
+    return answers
+
+
+async def _inspect(client: TestClient, project: Path) -> dict[str, Any]:
+    reply = await _post(client, f"{routes.PREFIX}/setup/inspect", {"project": str(project)})
+    assert reply.status == 200, reply.body
+    assert isinstance(reply.body, dict)
+    return reply.body
+
+
+class TestTheSetupFlowDrivesInspectPlanApply:
+    """Three calls, and nothing is written before the third.
+
+    The flow the first-run pane walks: inspect a project, answer what could not be
+    inferred, read the plan, and apply it under a named approver. Each step is a
+    separate route because each is a separate decision, and the two that precede
+    the write must be verifiable as having written nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inspection_returns_evidence_inferences_and_questions_and_writes_nothing(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+        assert found["project"] == {"name": "acme", "root": str(project.resolve())}
+        for inference in found["inferences"]:
+            assert inference["evidence"], f"{inference['subject']} arrived without evidence"
+        asked = {question["subject"] for question in found["questions"]}
+        assert "cost_profile" in asked
+        # Each offered preset names the programs it would run, so what an operator
+        # approves is what would land in configuration.
+        for offer in found["offers"]:
+            assert offer["programs"] and offer["commands"]
+        # The evidence that nothing was applied: no document at all.
+        assert not (default_root() / CONFIG_FILENAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_inspection_without_a_project_is_refused(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _post(client, f"{routes.PREFIX}/setup/inspect", {})
+        assert reply.status == 400
+        assert reply.code == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_a_project_path_with_no_final_segment_is_a_client_error(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """A filesystem root has no directory name to fall back on, so the name is
+        refused rather than chosen. A malformed call, not a decision."""
+        async with _client() as client:
+            reply = await _post(client, f"{routes.PREFIX}/setup/inspect", {"project": "/"})
+        assert reply.status == 400
+        assert reply.code == "bad_project"
+
+    @pytest.mark.asyncio
+    async def test_a_plan_is_returned_and_still_nothing_is_written(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+            planned = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {"project": str(project), "answers": _answers(found)},
+            )
+        assert planned.status == 200, planned.body
+        assert planned.body["plan_id"]
+        # The patch itself, not a summary: an approval given against a summary is an
+        # approval of something else.
+        assert planned.body["config_patch"]["cost_profiles"]["budget"]["roles"]
+        assert planned.body["written_paths"]
+        assert not (default_root() / CONFIG_FILENAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unanswered_rung_is_refused_before_a_plan_exists(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+            refused = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {
+                    "project": str(project),
+                    "answers": _answers(found, confirmations={"execution": True}),
+                },
+            )
+        assert refused.status == 409
+        assert refused.code == "setup_refused"
+        assert refused.body[REFUSED_KEY] == REFUSAL_SETUP_APPROVAL
+        # A missing rung is unanswered, not "no", and the refusal names it.
+        assert "delivery" in refused.body["message"]
+        assert "plan_id" not in refused.body
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_cost_profile_is_a_client_error_not_a_refusal(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        """Not a decision the operator has to make — a call the caller got wrong —
+        so it names which profiles exist rather than coming back as something a
+        caller might retry unchanged."""
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+            reply = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {"project": str(project), "answers": _answers(found, cost_profile="cheap")},
+            )
+        assert reply.status == 400
+        assert reply.code == "bad_answers"
+        for name in COST_PROFILE_PRESET_NAMES:
+            assert name in reply.body["error"]
+
+    @pytest.mark.asyncio
+    async def test_answers_must_be_an_object(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        """An empty answer set is a real thing to send; an absent one is a bug that
+        must not be read as "the operator answered nothing"."""
+        async with _client() as client:
+            reply = await _post(
+                client, f"{routes.PREFIX}/setup/plan", {"project": str(tmp_path), "answers": None}
+            )
+        assert reply.status == 400
+        assert reply.code == "bad_answers"
+
+    @pytest.mark.asyncio
+    async def test_an_apply_without_an_approver_refuses_and_writes_nothing(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        """The requirement's own words: an explicit human approver identity, or no
+        write. Refused before the project is even read."""
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+            answers = _answers(found)
+            planned = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {"project": str(project), "answers": answers},
+            )
+            refused = await _post(
+                client,
+                f"{routes.PREFIX}/setup/apply",
+                {
+                    "project": str(project),
+                    "answers": answers,
+                    "plan_id": planned.body["plan_id"],
+                    "approver": "   ",
+                },
+            )
+        assert refused.status == 409
+        assert refused.code == "setup_refused"
+        assert refused.body[REFUSED_KEY] == REFUSAL_APPROVER_REQUIRED
+        assert not (default_root() / CONFIG_FILENAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_plan_id_refuses_and_writes_nothing(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        async with _client() as client:
+            found = await _inspect(client, project)
+            answers = _answers(found)
+            planned = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {"project": str(project), "answers": answers},
+            )
+            # The plan the operator read, applied with DIFFERENT answers: the
+            # identity covers the answers, so the quoted id no longer identifies
+            # the plan these inputs produce.
+            refused = await _post(
+                client,
+                f"{routes.PREFIX}/setup/apply",
+                {
+                    "project": str(project),
+                    "answers": _answers(found, cost_profile="quality-first"),
+                    "plan_id": planned.body["plan_id"],
+                    "approver": APPROVER,
+                },
+            )
+        assert refused.status == 409
+        assert refused.body[REFUSED_KEY] == REFUSAL_PLAN_STALE
+        assert not (default_root() / CONFIG_FILENAME).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_approved_plan_lands_and_records_the_approver(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        async with _client(user="alice") as client:
+            found = await _inspect(client, project)
+            answers = _answers(found)
+            planned = await _post(
+                client,
+                f"{routes.PREFIX}/setup/plan",
+                {"project": str(project), "answers": answers},
+            )
+            applied = await _post(
+                client,
+                f"{routes.PREFIX}/setup/apply",
+                {
+                    "project": str(project),
+                    "answers": answers,
+                    "plan_id": planned.body["plan_id"],
+                    "approver": APPROVER,
+                },
+            )
+            assert applied.status == 200, applied.body
+            configured = await _get(client, f"{routes.PREFIX}/config")
+
+        assert applied.body["applied"] is True
+        assert applied.body["approver"] == APPROVER
+        assert applied.body["written_paths"]
+        # Read back from the document rather than trusted from the reply.
+        assert configured.body["configured"] is True
+        assert configured.body["document"]["projects"]["acme"]["cost_profile"] == "budget"
+
+        # The durable record of who authorized it. The approver is the identity the
+        # caller stated; the SESSION is what the guard verified, and it is recorded
+        # in the security event instead — the two answer different questions and a
+        # record holding one of them answers the wrong one.
+        store = ConfigStore(Path(configured.body["path"]).parent)
+        assert [record.get("actor") for record in store.writes()] == [APPROVER]
+        assert [record.get("surface") for record in store.writes()] == [routes.SETUP_SURFACE.name]
+        event = next(
+            item for item in recorded_sel.events if item["operation"] == "spec_engine_setup_apply"
+        )
+        assert event["caller"] == "alice"
+        assert APPROVER in event["resources"]
+
+    def test_the_setup_surface_is_the_engines_own_and_is_operator_confirmed(self) -> None:
+        """One surface name across both doors, and confirmed — which a setup patch
+        needs, because it necessarily touches config-only paths (a project's
+        workflow, a source's autonomy grid)."""
+        from kiro_crew.apps.builtins.spec_engine.engine.config.store import (
+            SETUP_ASSISTANT_SURFACE,
+        )
+
+        assert routes.SETUP_SURFACE is SETUP_ASSISTANT_SURFACE
+        assert routes.SETUP_SURFACE.operator_confirmed is True
+        # And it is NOT the config route's surface: the two writes are recorded
+        # under different names because they carry different authority.
+        assert routes.SETUP_SURFACE.name != routes.WRITE_SURFACE.name
+
+
+class TestBothDoorsIdentifyOnePlan:
+    """The plan identity is one mechanism, not one per door.
+
+    ``plan_id`` is a content hash over the project subject, the answers used and
+    the patch they produce, and both this surface and the Engine_MCP_Server compute
+    it through ``engine_mcp/setup_surface.py``. If either door normalized the
+    project root or defaulted the project name differently, an operator could read
+    a plan through one and have the other refuse it as stale for a reason nothing
+    on screen explains.
+    """
+
+    def _ops(self, root: Path) -> EngineOperations:
+        return EngineOperations(
+            state_root=root / "state", audit_root=root / "audit", config_root=root / "config"
+        )
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "{project}",
+            # Two spellings of one path, which must not identify two plans.
+            "{project}/",
+            "{project}/./",
+        ],
+    )
+    def test_the_route_and_the_tool_compute_the_same_identity(
+        self, tmp_path: Path, spelling: str
+    ) -> None:
+        project = _project_tree(tmp_path / "acme")
+        engine = self._ops(tmp_path)
+        found = engine.inspect_setup(str(project))
+        answers = _answers(found)
+        through_tool = engine.plan_setup(str(project), answers)["plan_id"]
+        through_route = routes._plan_setup({"project": spelling.format(project=project)}, answers)[
+            "plan_id"
+        ]
+        assert through_route == through_tool
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        profile=st.sampled_from(COST_PROFILE_PRESET_NAMES),
+        granted=st.integers(min_value=0, max_value=len(CONFIRMED_LEVELS)),
+        workflow=st.booleans(),
+        source=st.booleans(),
+    )
+    def test_every_legitimate_answer_set_identifies_one_plan_at_both_doors(
+        self,
+        tmp_path_factory: pytest.TempPathFactory,
+        profile: str,
+        granted: int,
+        workflow: bool,
+        source: bool,
+    ) -> None:
+        # Over the answer sets a caller can legitimately submit: a bundled profile,
+        # a ladder prefix of confirmations (a rung confirmed above a declined one is
+        # refused), and either preset selected or not.
+        root = tmp_path_factory.mktemp("identity")
+        project = _project_tree(root / "acme")
+        engine = self._ops(root)
+        found = engine.inspect_setup(str(project))
+        answers = _answers(
+            found,
+            cost_profile=profile,
+            confirmations={
+                level.value: index < granted for index, level in enumerate(CONFIRMED_LEVELS)
+            },
+            workflow_preset="git-pull-request" if workflow else None,
+            watch_source="github" if source else None,
+        )
+        through_tool = engine.plan_setup(str(project), answers)["plan_id"]
+        through_route = routes._plan_setup({"project": str(project)}, answers)["plan_id"]
+        assert through_route == through_tool
+
+    @settings(
+        max_examples=40,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    @given(supplied=st.text(max_size=70))
+    def test_a_stale_plan_id_always_refuses_and_never_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supplied: str
+    ) -> None:
+        # Whatever a caller quotes, it either is the identity these inputs produce
+        # or the apply refuses. A fresh data home per example, so "nothing was
+        # written" is a claim about THIS call rather than about a directory an
+        # earlier example happened to leave empty.
+        root = tmp_path / f"stale-{next(_UNIQUE)}"
+        root.mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_HOME", str(root))
+        project = _project_tree(root / "acme")
+        found = routes._inspect_setup({"project": str(project)})
+        answers = _answers(found)
+        real = routes._plan_setup({"project": str(project)}, answers)["plan_id"]
+        assume(supplied.strip() != real)
+
+        with pytest.raises(StalePlan) as raised:
+            routes._apply_setup({"project": str(project)}, answers, supplied, APPROVER)
+        assert "plan_id" in str(raised.value)
+        assert not (default_root() / CONFIG_FILENAME).exists()
+
+
 # --- catch clauses traced against the raising code --------------------------
 
 
@@ -1118,6 +1733,88 @@ class TestRefusalsAreTracedAgainstTheClassChainTheEngineRaises:
 
         assert ReviewFeedbackRefused.__mro__[1] is Exception
         assert not issubclass(ReviewFeedbackRefused, (OSError, ValueError))
+
+    def test_the_setup_refusal_chain_is_what_the_setup_handlers_assume(self) -> None:
+        """The same trap in a second shape, and the reason the refusal arm is FIRST
+        on every setup handler.
+
+        ``SetupApprovalRequired`` derives ``PermissionError`` and therefore
+        ``OSError``; ``InferredSubjectRefused`` derives ``ValueError``. Below the
+        generic arms, an absent approver would be reported as a disk failure and a
+        refused inference as a malformed request — and the two boundary refusals
+        are subclasses of the engine's precisely so that every catch which already
+        declines to write keeps declining.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.setup import (
+            InferredSubjectRefused,
+            SetupApprovalRequired,
+        )
+        from kiro_crew.apps.builtins.spec_engine.engine_mcp.setup_surface import (
+            ApproverRequired,
+        )
+
+        assert issubclass(SetupApprovalRequired, PermissionError)
+        assert issubclass(SetupApprovalRequired, OSError)
+        assert issubclass(InferredSubjectRefused, ValueError)
+        assert issubclass(ApproverRequired, SetupApprovalRequired)
+        assert issubclass(StalePlan, SetupApprovalRequired)
+
+    @pytest.mark.parametrize(
+        "handler",
+        [
+            "handle_post_setup_inspect",
+            "handle_post_setup_plan",
+            "handle_post_setup_apply",
+        ],
+    )
+    def test_every_setup_handler_catches_the_refusal_before_the_generic_arms(
+        self, handler: str
+    ) -> None:
+        """Read off the source, because the ORDER is the property. A handler whose
+        refusal arm sank below ``OSError`` would still catch — as the wrong thing."""
+        node = _handler_ast(handler)
+        caught = _caught_names(node)
+        assert {"InferredSubjectRefused", "SetupApprovalRequired"} <= caught
+        order = [
+            name
+            for clause in ast.walk(node)
+            if isinstance(clause, ast.ExceptHandler) and clause.type is not None
+            for element in (
+                clause.type.elts if isinstance(clause.type, ast.Tuple) else [clause.type]
+            )
+            for name in [
+                element.id if isinstance(element, ast.Name) else getattr(element, "attr", "")
+            ]
+        ]
+        refusal = order.index("SetupApprovalRequired")
+        for generic in ("OSError", "ValueError"):
+            if generic in order:
+                assert refusal < order.index(generic), (
+                    f"{handler} catches {generic} before the setup refusal, so a decision "
+                    "the engine made would be reported as a failure"
+                )
+
+    @pytest.mark.asyncio
+    async def test_a_setup_refusal_is_a_409_carrying_the_engines_own_code(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, tmp_path: Path
+    ) -> None:
+        """The arm, driven. One status for every setup refusal, with the actionable
+        part in ``refused`` — the same vocabulary the MCP tools return."""
+        async with _client() as client:
+            reply = await _post(
+                client,
+                f"{routes.PREFIX}/setup/apply",
+                {
+                    "project": str(tmp_path),
+                    "answers": {},
+                    "plan_id": "0" * 64,
+                    "approver": "",
+                },
+            )
+        assert reply.status == 409
+        assert reply.code == "setup_refused"
+        assert reply.body[REFUSED_KEY] == REFUSAL_APPROVER_REQUIRED
+        assert reply.body["reason"] == "ApproverRequired"
 
     @pytest.mark.parametrize(
         "handler",
