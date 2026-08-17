@@ -505,9 +505,55 @@ class TestTelemetryIsOffAndUnimplemented:
 
     def test_the_app_imports_no_network_client(self) -> None:
         # The import-level half of "all spec processing local": a module that
-        # cannot construct a client cannot transmit through one.
-        offenders = _scan_app_imports(_NETWORK_MODULES)
+        # cannot construct a client cannot transmit through one. The app's inbound
+        # HTTP surface is exempted by name and directory -- see
+        # :data:`_INBOUND_SERVING_TREE` for the distinction drawn, the residual
+        # this leaves, and the AST check that replaces it.
+        offenders = _without_inbound_serving(_scan_app_imports(_NETWORK_MODULES))
         assert offenders == [], f"the app now imports a network client: {offenders}"
+
+    def test_the_inbound_exemption_is_bounded_in_both_directions(self) -> None:
+        """The exemption must not read as "aiohttp is fine" or "backend/ is fine".
+
+        Planted both ways, because a predicate that admitted either half alone
+        would pass the check above while granting the app a transmission path.
+        """
+        # The permitted case: the framework, in the inbound tree.
+        assert _is_inbound_serving_import(Path("backend/routes.py"), "aiohttp") is True
+        assert _is_inbound_serving_import(Path("backend/routes.py"), "aiohttp.web") is True
+        # An aiohttp import inside an ENGINE tree is still reported.
+        for engine_path in ("engine/state.py", "engine_mcp/server.py", "startup.py"):
+            assert _is_inbound_serving_import(Path(engine_path), "aiohttp") is False
+        # A different network client inside the inbound tree is still reported.
+        for outbound in ("requests", "httpx", "socket", "urllib.request", "websockets"):
+            assert _is_inbound_serving_import(Path("backend/routes.py"), outbound) is False
+        # And the row filter agrees with the predicate on real-shaped rows.
+        assert _without_inbound_serving(
+            [
+                "backend/routes.py: aiohttp",
+                "backend/client.py: httpx",
+                "engine/state.py: aiohttp",
+            ]
+        ) == ["backend/client.py: httpx", "engine/state.py: aiohttp"]
+
+    def test_the_inbound_tree_holds_only_the_route_surface(self) -> None:
+        """The exemption is scoped to a directory, so what lives there matters.
+
+        A module that grew into ``backend/`` would inherit the aiohttp exemption
+        without anybody granting it one, so the directory's contents are pinned
+        until 4.3's AST check makes the exemption about the CODE rather than about
+        the location.
+        """
+        inbound = APP_ROOT / _INBOUND_SERVING_TREE
+        if not inbound.is_dir():
+            pytest.skip("the app has no inbound tree yet")
+        modules = sorted(
+            path.name for path in inbound.glob("*.py") if not path.name.startswith("__")
+        )
+        assert modules == ["routes.py"], (
+            f"{_INBOUND_SERVING_TREE}/ now holds {modules}; every module there is "
+            "exempt from the network denylist, so a new one needs reading first"
+        )
 
     def test_the_import_scanner_actually_detects(self, tmp_path: Path) -> None:
         # The scan above passes on an app that imports nothing at all, so the
@@ -550,6 +596,61 @@ _NETWORK_MODULES = frozenset(
 
 #: The host's telemetry emitters. The app reaches neither.
 _TELEMETRY_MODULES = frozenset({"kiro_crew.beacon", "kiro_crew.telemetry"})
+
+#: The one tree that may import a web framework: the app's inbound HTTP surface.
+#:
+#: The distinction drawn is **declaring handlers versus constructing a client**.
+#: ``backend/routes.py`` imports ``aiohttp.web`` to mount handlers on the
+#: GATEWAY's own application — the bytes it touches are ones a browser on the
+#: same host already sent inbound. Nothing in the engine trees (``engine/``,
+#: ``engine_mcp/``) may import it at all, because there the same import could only
+#: be the first half of an outbound transmission path.
+#:
+#: **This accommodation is deliberately weaker than the rule it replaces, and
+#: temporary.** It is keyed on the import NAME and the directory, so it cannot yet
+#: tell a handler declaration from a ``ClientSession`` built in the same file: an
+#: outbound client constructed inside ``backend/`` would pass. Task 4.3 replaces
+#: this with an AST check asserting that ``backend/`` references no outbound
+#: constructor (``ClientSession``, ``request``, ``TCPConnector``,
+#: ``UnixConnector``), which is what actually draws the distinction rather than
+#: assuming it. Until then the residual is stated here rather than implied, and
+#: the exemption is bounded to one directory and one module root so it cannot
+#: quietly grow into "the app may import network clients".
+_INBOUND_SERVING_TREE = "backend"
+
+#: Module roots the inbound tree may import. One entry, on purpose: this is the
+#: framework the gateway that mounts these handlers is itself built on.
+_INBOUND_SERVING_ROOTS = frozenset({"aiohttp"})
+
+
+def _is_inbound_serving_import(relative: Path, name: str) -> bool:
+    """Whether *name* imported from *relative* is the permitted inbound framework.
+
+    Both halves must hold. A path outside :data:`_INBOUND_SERVING_TREE` gets no
+    exemption whatever it imports, and a module outside
+    :data:`_INBOUND_SERVING_ROOTS` gets none wherever it sits — so neither
+    "aiohttp anywhere" nor "anything under backend/" is admitted.
+    """
+    return (
+        relative.parts[:1] == (_INBOUND_SERVING_TREE,)
+        and name.split(".")[0] in _INBOUND_SERVING_ROOTS
+    )
+
+
+def _without_inbound_serving(offenders: list[str]) -> list[str]:
+    """Drop the inbound-framework imports from *offenders*.
+
+    Takes the ``"<relative path>: <module>"`` rows :func:`_scan_app_imports`
+    produces, so the exemption is applied to the same strings a reader of a
+    failure message sees.
+    """
+    kept: list[str] = []
+    for row in offenders:
+        location, _, name = row.partition(": ")
+        if _is_inbound_serving_import(Path(location), name):
+            continue
+        kept.append(row)
+    return kept
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -702,8 +803,17 @@ UI_ROOTS = (
 UI_TEST_ROOT = REPO_ROOT / "website" / "src" / "test"
 UI_TEST_GLOB = "SpecBuilder*"
 
-#: File kinds the UI ships.
-UI_SUFFIXES = frozenset({".ts", ".tsx"})
+#: File kinds the UI ships. ``.html`` and ``.md`` are here for the design
+#: artifacts under ``spec-engine/design/``: standalone mockups and the records
+#: that select between them. They are not shipped to a user — the website build
+#: only bundles what it imports, and ``appWindowEntries()`` discovers only the
+#: DIRECT children of ``src/apps/<app>/`` — but they are checked in to a public
+#: repository, which is the condition this scan cares about, not whether a file
+#: reaches an install. Widening the set rather than exempting the directory is
+#: deliberate: an exemption would be a hole that grows, and
+#: :meth:`TestNoNonPublicReferenceIsInTheTree.test_the_user_interface_tree_is_scanned_too`
+#: asserts nothing in these roots escapes by extension.
+UI_SUFFIXES = frozenset({".ts", ".tsx", ".html", ".md"})
 
 #: Name suffixes reserved by RFC 2606 and RFC 6761 for documentation and testing.
 #: A host under one of these can never resolve, so it cannot be an address of
@@ -1606,14 +1716,19 @@ class TestDelegatedProvidersAreConfigurationOnly:
     def test_no_third_party_code_is_vendored_into_the_tree(self) -> None:
         # A vendored provider arrives either as a third-party import or as a
         # directory of foreign code. Shipped modules import stdlib and this host
-        # package only, so either would show up here.
+        # package only, so either would show up here. The one exception is the
+        # inbound HTTP surface's web framework, which is not a provider
+        # implementation and is not vendored -- see :data:`_INBOUND_SERVING_TREE`.
         offenders: list[str] = []
         for path in _app_modules():
+            relative = path.relative_to(APP_ROOT)
             for name in _imported_modules(path):
                 root = name.split(".")[0]
                 if root in ("kiro_crew", "__future__") or root in _STDLIB_ROOTS:
                     continue
-                offenders.append(f"{path.relative_to(APP_ROOT)}: {name}")
+                if _is_inbound_serving_import(relative, name):
+                    continue
+                offenders.append(f"{relative}: {name}")
         assert offenders == [], f"third-party code reached from the app tree: {offenders}"
         assert not (APP_ROOT / "_vendor").exists(), "a vendor directory appeared in the app"
 

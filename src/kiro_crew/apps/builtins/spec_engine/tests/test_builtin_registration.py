@@ -439,6 +439,74 @@ class TestTheManifestAndThePackageAgreeOnRoutes:
                 "calls register_routes and nothing dispatches any other name"
             )
 
+    def test_all_three_legs_of_the_route_contract_agree(self) -> None:
+        """The three-way gate, now that all three legs exist.
+
+        Three independent statements about one entry point, each of which can be
+        true while another is false:
+
+        * the manifest's ``backend.routes`` field — read by humans and by the App
+          Kit reference, dispatched by nothing for a builtin;
+        * the module on disk the field names — where the handlers live;
+        * the attribute on the app PACKAGE — the only one the gateway reads.
+
+        Pairwise agreement is not enough. A manifest naming a module that exists
+        while the package re-exports nothing serves 404s in silence; a package
+        re-exporting a function the manifest points elsewhere misdocuments the
+        surface for whoever comes next. So the dotted path is RESOLVED — imported
+        by the name the manifest gives — and the resolved object is compared for
+        identity against what the loop would call.
+        """
+        declared = manifest_data().get("backend", {}).get("routes", "")
+        assert declared, (
+            "the manifest no longer declares backend.routes. The field is "
+            "documentation for a builtin, but this app has a route module and a "
+            "package re-export, so dropping the declaration leaves the two "
+            "undocumented."
+        )
+        module_path, _, attribute = declared.partition(":")
+        assert module_path and attribute, f"backend.routes={declared!r} is not module:attr"
+
+        # Leg 2: the module the field names is on disk, at the path the dotted
+        # name implies rather than at one this test happens to know.
+        on_disk = APP_ROOT.joinpath(*module_path.split(".")).with_suffix(".py")
+        assert on_disk.is_file(), f"backend.routes names {module_path}, which is not at {on_disk}"
+
+        # Leg 3: the same name resolves through the import system, and the object
+        # it resolves to IS the one the loop would call off the package.
+        module = importlib.import_module(f"{PACKAGE}.{module_path}")
+        declared_callable = getattr(module, attribute, None)
+        assert callable(declared_callable), (
+            f"{module_path} has no callable {attribute!r}; the manifest documents "
+            "an entry point that does not exist"
+        )
+        package = importlib.import_module(PACKAGE)
+        assert getattr(package, attribute, None) is declared_callable, (
+            f"the app package's {attribute} is not the one {module_path} defines. "
+            "The builtin loop reads the PACKAGE attribute, so these two disagreeing "
+            "means the manifest documents one entry point and the gateway calls "
+            "another."
+        )
+
+    def test_the_three_way_gate_would_notice_each_leg_going_missing(self) -> None:
+        """Non-vacuity: three legs that all hold make a conjunction unfalsifiable.
+
+        Each leg's own predicate is driven against a value that violates it, so the
+        gate above is known to be able to fail three different ways rather than to
+        agree with whatever it is handed.
+        """
+        # A manifest field naming a module that is not on disk.
+        missing = APP_ROOT.joinpath(*"backend.absent".split(".")).with_suffix(".py")
+        assert not missing.is_file()
+        # A dotted name that does not resolve.
+        assert importlib.util.find_spec(f"{PACKAGE}.backend.absent") is None
+        # An attribute the named module does not define.
+        module = importlib.import_module(f"{PACKAGE}.backend.routes")
+        assert getattr(module, "register_nothing", None) is None
+        # And a malformed field is rejected by the same partition the gate uses.
+        module_path, _, attribute = "backend.routes".partition(":")
+        assert not attribute
+
     @pytest.mark.parametrize("sibling", ["spec_builder", "issue_radar"])
     def test_the_sibling_builtins_hold_that_contract_too(self, sibling: str) -> None:
         """Non-vacuity for the check above, which passes on two absences as well
