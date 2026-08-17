@@ -3788,7 +3788,7 @@
         "teardown": "हटाना",
         "teardown_complete": "पूर्ण। दर्ज हर कार्यक्षेत्र हटा दिया गया।",
         "teardown_destroys_the_runs_checkouts": "यह रन द्वारा दर्ज हर कार्यक्षेत्र हटा देता है, समीक्षाधीन चेकआउट सहित। इसे पूर्ववत नहीं किया जा सकता।",
-        "teardown_incomplete": "अपूर्ण। कार्यक्षेत्र बचे रह गए।",
+        "teardown_incomplete": "टियरडाउन पूरा नहीं हुआ।",
         "the_cleanup_failed": "सफ़ाई विफल रही",
         "the_comment_was_released": "टिप्पणी जारी कर दी गई।",
         "the_engine_refused_the_release": "इंजन ने जारी करने से इनकार किया",

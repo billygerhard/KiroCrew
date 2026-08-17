@@ -3849,7 +3849,7 @@
         "teardown": "Desmontagem",
         "teardown_complete": "Completo. Todos os espaços de trabalho registados foram removidos.",
         "teardown_destroys_the_runs_checkouts": "Isto remove todos os espaços de trabalho que a execução registou, incluindo a cópia em revisão. Não pode ser desfeito.",
-        "teardown_incomplete": "Incompleto. Foram mantidos espaços de trabalho.",
+        "teardown_incomplete": "A desmontagem não foi concluída.",
         "the_cleanup_failed": "A limpeza falhou",
         "the_comment_was_released": "O comentário foi libertado.",
         "the_engine_refused_the_release": "O motor recusou a libertação",

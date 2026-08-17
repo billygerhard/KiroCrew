@@ -3788,7 +3788,7 @@
         "teardown": "অপসারণ",
         "teardown_complete": "সম্পূর্ণ। নথিবদ্ধ প্রতিটি কার্যক্ষেত্র সরানো হয়েছে।",
         "teardown_destroys_the_runs_checkouts": "এটি রানের নথিবদ্ধ প্রতিটি কার্যক্ষেত্র সরিয়ে দেয়, পর্যালোচনাধীন চেকআউটসহ। এটি ফেরানো যায় না।",
-        "teardown_incomplete": "অসম্পূর্ণ। কিছু কার্যক্ষেত্র রয়ে গেছে।",
+        "teardown_incomplete": "টিয়ারডাউন সম্পূর্ণ হয়নি।",
         "the_cleanup_failed": "পরিষ্কার করা ব্যর্থ হয়েছে",
         "the_comment_was_released": "মন্তব্যটি ছেড়ে দেওয়া হয়েছে।",
         "the_engine_refused_the_release": "ইঞ্জিন ছেড়ে দিতে অস্বীকার করেছে",

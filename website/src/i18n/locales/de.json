@@ -3788,7 +3788,7 @@
         "teardown": "Abbau",
         "teardown_complete": "Vollständig. Jeder erfasste Arbeitsbereich wurde entfernt.",
         "teardown_destroys_the_runs_checkouts": "Dies entfernt jeden Arbeitsbereich, den der Lauf erfasst hat, einschließlich des geprüften Checkouts. Es kann nicht widerrufen werden.",
-        "teardown_incomplete": "Unvollständig. Arbeitsbereiche wurden behalten.",
+        "teardown_incomplete": "Der Teardown wurde nicht abgeschlossen.",
         "the_cleanup_failed": "Die Bereinigung ist fehlgeschlagen",
         "the_comment_was_released": "Der Kommentar wurde freigegeben.",
         "the_engine_refused_the_release": "Die Engine hat die Freigabe abgelehnt",

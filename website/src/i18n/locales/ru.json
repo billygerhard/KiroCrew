@@ -3910,7 +3910,7 @@
         "teardown": "Снос",
         "teardown_complete": "Завершено. Каждая записанная рабочая область удалена.",
         "teardown_destroys_the_runs_checkouts": "Это удалит все рабочие области, записанные запуском, включая проверяемую копию. Отменить нельзя.",
-        "teardown_incomplete": "Не завершено. Рабочие области были оставлены.",
+        "teardown_incomplete": "Демонтаж не был завершён.",
         "the_cleanup_failed": "Очистка не удалась",
         "the_comment_was_released": "Комментарий освобождён.",
         "the_engine_refused_the_release": "Движок отказал в освобождении",

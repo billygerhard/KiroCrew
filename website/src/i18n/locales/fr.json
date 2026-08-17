@@ -3849,7 +3849,7 @@
         "teardown": "Démontage",
         "teardown_complete": "Complet. Chaque espace de travail enregistré a été supprimé.",
         "teardown_destroys_the_runs_checkouts": "Ceci supprime tous les espaces de travail enregistrés par l’exécution, y compris la copie en revue. C’est irréversible.",
-        "teardown_incomplete": "Incomplet. Des espaces de travail ont été conservés.",
+        "teardown_incomplete": "Le démontage ne s'est pas terminé.",
         "the_cleanup_failed": "Le nettoyage a échoué",
         "the_comment_was_released": "Le commentaire a été libéré.",
         "the_engine_refused_the_release": "Le moteur a refusé la libération",

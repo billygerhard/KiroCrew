@@ -3105,7 +3105,7 @@
         "teardown": "Teardown",
         "teardown_complete": "Complete. Every recorded workspace was removed.",
         "teardown_destroys_the_runs_checkouts": "This removes every workspace the run recorded, including the checkout under review. It cannot be undone.",
-        "teardown_incomplete": "Incomplete. Workspaces were kept.",
+        "teardown_incomplete": "The teardown did not finish.",
         "the_cleanup_failed": "The cleanup failed",
         "the_comment_was_released": "The comment was released.",
         "the_engine_refused_the_release": "The engine refused the release",

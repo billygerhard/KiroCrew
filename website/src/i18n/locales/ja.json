@@ -3727,7 +3727,7 @@
         "teardown": "撤去",
         "teardown_complete": "完了しました。記録されたワークスペースはすべて削除されました。",
         "teardown_destroys_the_runs_checkouts": "実行が記録したすべてのワークスペースを削除します。レビュー中のチェックアウトも含まれ、取り消せません。",
-        "teardown_incomplete": "未完了です。ワークスペースが残されました。",
+        "teardown_incomplete": "teardown は完了しませんでした。",
         "the_cleanup_failed": "クリーンアップに失敗しました",
         "the_comment_was_released": "コメントを解放しました。",
         "the_engine_refused_the_release": "エンジンが解放を拒否しました",

@@ -3849,7 +3849,7 @@
         "teardown": "Smontaggio",
         "teardown_complete": "Completo. Ogni spazio di lavoro registrato è stato rimosso.",
         "teardown_destroys_the_runs_checkouts": "Questo rimuove ogni spazio di lavoro registrato dall’esecuzione, incluso il checkout in revisione. Non può essere annullato.",
-        "teardown_incomplete": "Incompleto. Alcuni spazi di lavoro sono stati conservati.",
+        "teardown_incomplete": "Lo smontaggio non è stato completato.",
         "the_cleanup_failed": "La pulizia è fallita",
         "the_comment_was_released": "Il commento è stato rilasciato.",
         "the_engine_refused_the_release": "Il motore ha rifiutato il rilascio",

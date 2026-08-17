@@ -408,9 +408,12 @@ describe('teardown', () => {
   })
 
   it('names the stage failure when a teardown is incomplete with nothing kept', async () => {
-    // complete is `not kept and stage.ok`, so a wired stage that fails on a run
-    // with no ledger rows yields complete:false, kept:[]. Rendering "workspaces
-    // were kept" over an empty list would misname the failure.
+    // complete is `not kept and (stage is None or stage.ok)`, so a wired stage
+    // that fails on a run with no kept rows yields complete:false, kept:[].
+    // The emittable shape: stage carries the outcome (failed / timed_out /
+    // refused) and stage_reason is EMPTY — the engine only populates the
+    // reason when no stage ran at all, and that report is complete. Rendering
+    // "workspaces were kept" here would misname the failure.
     renderWith([entry()], {
       teardown: {
         body: {
@@ -423,7 +426,7 @@ describe('teardown', () => {
             removed: [],
             kept: [],
             stage: 'failed',
-            stage_reason: 'the teardown command exited 1',
+            stage_reason: '',
           },
         },
       },
@@ -432,7 +435,10 @@ describe('teardown', () => {
     ;(await arm()).click()
     await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
     expect(screen.getByText(new RegExp(T.the_teardown_stage_failed))).toBeInTheDocument()
-    expect(screen.getByText(/the teardown command exited 1/)).toBeInTheDocument()
+    // The cause the payload actually carries: the stage outcome.
+    expect(screen.getByText('failed')).toBeInTheDocument()
+    // The kept sentence must be absent — nothing was kept, and the neutral
+    // headline no longer asserts otherwise.
     expect(screen.queryByText(T.kept_workspaces_are_still_standing)).toBeNull()
   })
 

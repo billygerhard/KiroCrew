@@ -3727,7 +3727,7 @@
         "teardown": "拆除",
         "teardown_complete": "已完成。记录在册的工作区都已删除。",
         "teardown_destroys_the_runs_checkouts": "这会删除该运行记录的每个工作区，包括正在评审的检出副本，且无法撤销。",
-        "teardown_incomplete": "未完成。有工作区被保留。",
+        "teardown_incomplete": "拆除未完成。",
         "the_cleanup_failed": "清理失败",
         "the_comment_was_released": "该评论已放行。",
         "the_engine_refused_the_release": "引擎拒绝了放行",

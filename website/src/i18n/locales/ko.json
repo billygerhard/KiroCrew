@@ -3727,7 +3727,7 @@
         "teardown": "철거",
         "teardown_complete": "완료되었습니다. 기록된 작업 공간이 모두 제거되었습니다.",
         "teardown_destroys_the_runs_checkouts": "실행이 기록한 모든 작업 공간을 제거하며, 검토 중인 체크아웃도 포함됩니다. 되돌릴 수 없습니다.",
-        "teardown_incomplete": "완료되지 않았습니다. 작업 공간이 남았습니다.",
+        "teardown_incomplete": "teardown이 완료되지 않았습니다.",
         "the_cleanup_failed": "정리에 실패했습니다",
         "the_comment_was_released": "댓글을 풀었습니다.",
         "the_engine_refused_the_release": "엔진이 풀기를 거부했습니다",

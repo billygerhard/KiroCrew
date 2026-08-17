@@ -504,6 +504,11 @@ function TeardownBlock({
 }) {
   const client = useQueryClient()
   const [armed, setArmed] = useState(false)
+  // Workspace ids whose per-id cleanup verdict came back cleanup.removed. The
+  // kept list derives from the teardown mutation's cached report, which a
+  // later cleanup does not rewrite, so removals are tracked here to stop a
+  // torn-down row offering a live Remove button.
+  const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(new Set())
   const teardown = useMutation({
     mutationFn: () => specEngineApi.teardown({ run_id: entry.run_id }),
     onSuccess: (result) => {
@@ -515,15 +520,29 @@ function TeardownBlock({
   const clean = useMutation({
     mutationFn: (args: { workspace_id: number; force: boolean }) =>
       specEngineApi.cleanWorkspace(args),
-    onSuccess: () => void client.invalidateQueries({ queryKey: QK.queue }),
+    onSuccess: (data) => {
+      // Only a verdict of cleanup.removed retires the row — a declined removal
+      // leaves it standing, and the row must keep offering the retry.
+      const cleanup = data.cleanup
+      if (cleanup?.removed) {
+        setRemovedIds((prior) => new Set(prior).add(cleanup.workspace_id))
+      }
+      void client.invalidateQueries({ queryKey: QK.queue })
+    },
   })
 
   const result = teardown.data
   // The rich rows from the report, not the top-level id list: kind and reason
-  // are what tell an operator which retry can possibly succeed.
-  const keptRows = result?.report.kept ?? []
+  // are what tell an operator which retry can possibly succeed. Rows whose
+  // per-id cleanup verdict came back removed are dropped from the list; the
+  // row-level kept flag on the run list is NOT recomputed, which is the
+  // conservative direction (it over-reports standing workspaces).
+  const keptRows = (result?.report?.kept ?? []).filter((row) => !removedIds.has(row.workspace_id))
   // Incomplete with nothing kept means the teardown STAGE failed — rendering
-  // "workspaces were kept" over an empty list would misname the failure.
+  // "workspaces were kept" over an empty list would misname the failure. The
+  // cause that CAN render here is report.stage (failed / timed_out / refused):
+  // stage_reason is only ever populated when no stage ran at all, and a report
+  // with no stage and nothing kept is complete, so this branch never sees it.
   const stageFailed = result != null && !result.complete && keptRows.length === 0
 
   return (
@@ -531,7 +550,9 @@ function TeardownBlock({
       <h3>{i18nT('apps.specEngine.reviewQueuePanel.teardown')}</h3>
 
       {result && (
-        // `complete` decides which of these two this is. Never `ok`.
+        // `complete` decides which of these two this is. Never `ok`. The
+        // incomplete headline is reason-NEUTRAL: what went wrong is stated by
+        // whichever branch below actually knows.
         <div className={result.complete ? 'se-torn' : 'se-kept'} role="status">
           <strong>
             {i18nT(
@@ -543,7 +564,8 @@ function TeardownBlock({
           {stageFailed && (
             <p className="se-note">
               {i18nT('apps.specEngine.reviewQueuePanel.the_teardown_stage_failed')}
-              {result.report.stage_reason ? ` ${result.report.stage_reason}` : ''}
+              {result.report?.stage ? ' ' : ''}
+              {result.report?.stage && <span className="se-m">{result.report.stage}</span>}
             </p>
           )}
           {!result.complete && keptRows.length > 0 && (
@@ -560,7 +582,9 @@ function TeardownBlock({
                       <button
                         type="button"
                         className="se-btn se-sm"
-                        disabled={clean.isPending}
+                        disabled={
+                          clean.isPending && clean.variables?.workspace_id === row.workspace_id
+                        }
                         onClick={() =>
                           clean.mutate({ workspace_id: row.workspace_id, force: false })
                         }
@@ -570,7 +594,9 @@ function TeardownBlock({
                       <button
                         type="button"
                         className="se-btn se-sm se-danger"
-                        disabled={clean.isPending}
+                        disabled={
+                          clean.isPending && clean.variables?.workspace_id === row.workspace_id
+                        }
                         onClick={() =>
                           clean.mutate({ workspace_id: row.workspace_id, force: true })
                         }
@@ -602,11 +628,18 @@ function TeardownBlock({
         // disposable root. Reading the top-level field would answer "removed"
         // for exactly the rows most likely to be in this list.
         <p className="se-note" role="status">
-          {clean.data.cleanup === null
-            ? i18nT('apps.specEngine.reviewQueuePanel.no_active_workspace_has_that_id')
-            : clean.data.cleanup.removed
-              ? i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_removed')
-              : `${i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept')} ${clean.data.cleanup.reason}`}
+          {clean.data.cleanup === null ? (
+            i18nT('apps.specEngine.reviewQueuePanel.no_active_workspace_has_that_id')
+          ) : (
+            <>
+              {/* Named by id: with several kept rows, an unnamed verdict cannot
+                  be matched to the row it answers. */}
+              <span className="se-m">{fmtNumber(clean.data.cleanup.workspace_id)}</span>{' '}
+              {clean.data.cleanup.removed
+                ? i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_removed')
+                : `${i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept')} ${clean.data.cleanup.reason}`}
+            </>
+          )}
         </p>
       )}
 
