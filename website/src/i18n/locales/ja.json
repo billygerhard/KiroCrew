@@ -3693,6 +3693,7 @@
         "act_note_stall": "これは判定ではなく監視の観測です。作業はまだ生きている可能性があります。停止した実行を再開する経路はこの画面にありません。",
         "act_review": "対応 · 判定待ち",
         "act_stall": "対応 · 実時間の上限を超過",
+        "cancel_has_no_transport": "実行のキャンセルはまだどのサーフェスからもできません。エンジンは操作を記録しますが、ルートも MCP ツールもそれを公開していません。",
         "collapse": "折りたたむ",
         "comment_identifier": "コメント識別子",
         "comments_are_held_for_release": "担当者の解放を待つコメントがあります。",
@@ -3736,6 +3737,8 @@
         "the_release_failed": "解放に失敗しました",
         "the_suppression_was_lifted": "抑制を解除しました。次回のポーリングで項目が発行される場合があります。",
         "the_teardown_failed": "撤去に失敗しました",
+        "the_teardown_stage_failed": "保持されたワークスペースはありませんが、teardown ステージが失敗しました。",
+        "the_workspace_was_kept": "ワークスペースは削除されませんでした：",
         "the_workspace_was_removed": "ワークスペースを削除しました。",
         "unkeyed": "対応なし",
         "unkeyed_findings_are_grouped_note": "参照が宣言済みの基準に解決しなかった所見は、個別に列挙せず対応なしとしてまとめています。"

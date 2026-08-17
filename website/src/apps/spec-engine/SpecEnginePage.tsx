@@ -69,7 +69,6 @@ import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtNumber, type FormatUnit } from '../../i18n/format'
 import {
   QK,
-  REFUSAL,
   SpecEngineApiError,
   specEngineApi,
   type QueueEntry,
@@ -677,4 +676,4 @@ export default function SpecEnginePage() {
 }
 
 /** Exported for the shell's own tests, which assert the reading rather than re-deriving it. */
-export const __testing = { waitedParts, WHY_KEY, WHY_EXHAUSTED_KEY, WAIT_LABEL_KEY, REFUSAL }
+export const __testing = { waitedParts, WHY_KEY, WHY_EXHAUSTED_KEY, WAIT_LABEL_KEY }

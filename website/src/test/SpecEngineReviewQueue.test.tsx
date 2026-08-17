@@ -57,6 +57,36 @@ function entry(over: Record<string, unknown> = {}) {
   }
 }
 
+/** One kept row, in `WorkspaceCleanup.to_json_object`'s shape. */
+function keptRow(workspaceId: number, reason = '') {
+  return cleanupRow(workspaceId, false, reason)
+}
+
+/** One cleanup verdict, in `WorkspaceCleanup.to_json_object`'s shape. */
+function cleanupRow(workspaceId: number, removed: boolean, reason = '') {
+  return {
+    workspace_id: workspaceId,
+    run_id: 'run_8f2a41',
+    kind: 'worktree',
+    location: `/tmp/ws/${workspaceId}`,
+    address: null,
+    removed,
+    reason,
+  }
+}
+
+/** A teardown report with nothing in it, in `TeardownReport.to_json_object`'s shape. */
+function emptyReport() {
+  return {
+    run_id: 'run_8f2a41',
+    forced: false,
+    removed: [],
+    kept: [],
+    stage: null,
+    stage_reason: '',
+  }
+}
+
 type Answer = { status?: number; body: unknown }
 
 /** Every request the page made, so an assertion can read the body that was sent. */
@@ -348,25 +378,67 @@ describe('teardown', () => {
     renderWith([entry()], {
       teardown: {
         // The handler's own shape for a teardown that could not finish: ok is
-        // true, complete is false, and the ids are what matters.
-        body: { ok: true, complete: false, kept: [703, 707], report: {} },
+        // true, complete is false, and the report's kept rows are what matters.
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703, 707],
+          report: {
+            run_id: 'run_1',
+            forced: false,
+            removed: [],
+            kept: [keptRow(703, 'a worktree whose removal was refused'), keptRow(707)],
+            stage: null,
+            stage_reason: '',
+          },
+        },
       },
     })
     await screen.findByRole('grid')
     ;(await arm()).click()
 
     await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
-    // Every kept id is named. A count would let an operator believe the tree they
-    // care about was the one that got removed.
+    // Every kept id is named, WITH the engine's reason: a bare id would not
+    // tell an operator which retry can possibly succeed.
     expect(screen.getByText('703')).toBeInTheDocument()
     expect(screen.getByText('707')).toBeInTheDocument()
+    expect(screen.getByText('a worktree whose removal was refused')).toBeInTheDocument()
     // The completion sentence must be absent, not merely de-emphasised.
     expect(screen.queryByText(T.teardown_complete)).toBeNull()
   })
 
+  it('names the stage failure when a teardown is incomplete with nothing kept', async () => {
+    // complete is `not kept and stage.ok`, so a wired stage that fails on a run
+    // with no ledger rows yields complete:false, kept:[]. Rendering "workspaces
+    // were kept" over an empty list would misname the failure.
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [],
+          report: {
+            run_id: 'run_1',
+            forced: false,
+            removed: [],
+            kept: [],
+            stage: 'failed',
+            stage_reason: 'the teardown command exited 1',
+          },
+        },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    expect(screen.getByText(new RegExp(T.the_teardown_stage_failed))).toBeInTheDocument()
+    expect(screen.getByText(/the teardown command exited 1/)).toBeInTheDocument()
+    expect(screen.queryByText(T.kept_workspaces_are_still_standing)).toBeNull()
+  })
+
   it('reports completion only when nothing was kept', async () => {
     renderWith([entry()], {
-      teardown: { body: { ok: true, complete: true, kept: [], report: {} } },
+      teardown: { body: { ok: true, complete: true, kept: [], report: emptyReport() } },
     })
     await screen.findByRole('grid')
     ;(await arm()).click()
@@ -376,7 +448,14 @@ describe('teardown', () => {
 
   it('shows the kept count on the row once a teardown has reported one', async () => {
     const { container } = renderWith([entry()], {
-      teardown: { body: { ok: true, complete: false, kept: [703, 707], report: {} } },
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703, 707],
+          report: { ...emptyReport(), kept: [keptRow(703), keptRow(707)] },
+        },
+      },
     })
     await screen.findByRole('grid')
     ;(await arm()).click()
@@ -389,8 +468,17 @@ describe('teardown', () => {
 
   it('retries one kept workspace through the cleanup route, by id', async () => {
     renderWith([entry()], {
-      teardown: { body: { ok: true, complete: false, kept: [703], report: {} } },
-      'clean-workspace': { body: { ok: true, removed: true, cleanup: {} } },
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        body: { ok: true, removed: true, cleanup: cleanupRow(703, true, 'removed the worktree') },
+      },
     })
     await screen.findByRole('grid')
     ;(await arm()).click()
@@ -402,9 +490,52 @@ describe('teardown', () => {
     expect(cleanup?.body).toEqual({ workspace_id: 703, force: false })
   })
 
+  it('does not read a declined removal as a removal', async () => {
+    // The handler's top-level `removed` means "an active row with that id
+    // existed", NOT "it came down": the engine declines a deployment row, a
+    // failed `git worktree remove`, or a tree outside the disposable root with
+    // a populated cleanup whose own `removed` is false. The canonical kept row
+    // answers exactly this shape, so reading the top-level field would report
+    // a standing workspace as removed.
+    renderWith([entry()], {
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
+      'clean-workspace': {
+        body: {
+          ok: true,
+          removed: true,
+          cleanup: cleanupRow(703, false, 'the ledger records this as a deployment'),
+        },
+      },
+    })
+    await screen.findByRole('grid')
+    ;(await arm()).click()
+    await waitFor(() => expect(screen.getByText(T.teardown_incomplete)).toBeInTheDocument())
+    screen.getByRole('button', { name: T.remove }).click()
+
+    await waitFor(() =>
+      expect(screen.getByText(new RegExp(T.the_workspace_was_kept))).toBeInTheDocument(),
+    )
+    expect(screen.getByText(/the ledger records this as a deployment/)).toBeInTheDocument()
+    expect(screen.queryByText(T.the_workspace_was_removed)).toBeNull()
+  })
+
   it('reads a cleanup that removed nothing as nothing to do, not as a failure', async () => {
     renderWith([entry()], {
-      teardown: { body: { ok: true, complete: false, kept: [703], report: {} } },
+      teardown: {
+        body: {
+          ok: true,
+          complete: false,
+          kept: [703],
+          report: { ...emptyReport(), kept: [keptRow(703)] },
+        },
+      },
       'clean-workspace': { body: { ok: true, removed: false, cleanup: null } },
     })
     await screen.findByRole('grid')

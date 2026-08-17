@@ -3815,6 +3815,7 @@
         "act_note_stall": "Uma observação do vigia, não um veredito: o trabalho pode continuar vivo. Retomar uma execução parada não tem rota nesta superfície.",
         "act_review": "Agir · à espera de um veredito",
         "act_stall": "Agir · excedeu o seu tempo de relógio",
+        "cancel_has_no_transport": "Cancelar uma execução ainda não é possível de nenhuma superfície: o mecanismo registra a operação, mas nem uma rota nem uma ferramenta MCP a expõe.",
         "collapse": "Recolher",
         "comment_identifier": "Identificador do comentário",
         "comments_are_held_for_release": "Há comentários retidos à espera de que uma pessoa os liberte.",
@@ -3858,6 +3859,8 @@
         "the_release_failed": "A libertação falhou",
         "the_suppression_was_lifted": "A supressão foi levantada; a próxima consulta pode despachar o item.",
         "the_teardown_failed": "A desmontagem falhou",
+        "the_teardown_stage_failed": "Nenhum espaço de trabalho foi mantido, mas a etapa de desmontagem falhou.",
+        "the_workspace_was_kept": "O espaço de trabalho não foi removido:",
         "the_workspace_was_removed": "O espaço de trabalho foi removido.",
         "unkeyed": "sem chave",
         "unkeyed_findings_are_grouped_note": "As constatações cujas referências não resolveram para nenhum critério declarado são agrupadas como sem chave em vez de listadas em separado."

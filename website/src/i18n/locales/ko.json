@@ -3693,6 +3693,7 @@
         "act_note_stall": "판정이 아니라 감시 관측입니다. 작업이 아직 살아 있을 수 있습니다. 멈춘 실행을 재개하는 경로는 이 화면에 없습니다.",
         "act_review": "조치 · 판정 대기",
         "act_stall": "조치 · 실제 시간 한도 초과",
+        "cancel_has_no_transport": "실행 취소는 아직 어떤 화면에서도 할 수 없습니다. 엔진은 이 작업을 기록하지만, 라우트도 MCP 도구도 이를 제공하지 않습니다.",
         "collapse": "접기",
         "comment_identifier": "댓글 식별자",
         "comments_are_held_for_release": "담당자가 풀어 줄 때까지 보류된 의견이 있습니다.",
@@ -3736,6 +3737,8 @@
         "the_release_failed": "풀기에 실패했습니다",
         "the_suppression_was_lifted": "억제를 해제했습니다. 다음 조회에서 항목이 배정될 수 있습니다.",
         "the_teardown_failed": "철거에 실패했습니다",
+        "the_teardown_stage_failed": "유지된 워크스페이스는 없지만 teardown 단계가 실패했습니다.",
+        "the_workspace_was_kept": "워크스페이스가 제거되지 않았습니다:",
         "the_workspace_was_removed": "작업 공간을 제거했습니다.",
         "unkeyed": "미지정",
         "unkeyed_findings_are_grouped_note": "참조가 선언된 기준에 연결되지 않은 발견 사항은 따로 나열하지 않고 미지정으로 묶습니다."

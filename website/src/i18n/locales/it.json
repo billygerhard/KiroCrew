@@ -3815,6 +3815,7 @@
         "act_note_stall": "Un’osservazione del watchdog, non un verdetto: il lavoro può essere ancora vivo. Riprendere un’esecuzione parcheggiata non ha una rotta qui.",
         "act_review": "Agire · in attesa di un verdetto",
         "act_stall": "Agire · ha superato il tempo di orologio",
+        "cancel_has_no_transport": "Annullare un'esecuzione non è ancora possibile da nessuna superficie: il motore registra l'operazione, ma né una route né uno strumento MCP la espone.",
         "collapse": "Comprimi",
         "comment_identifier": "Identificatore del commento",
         "comments_are_held_for_release": "Ci sono commenti trattenuti in attesa che una persona li rilasci.",
@@ -3858,6 +3859,8 @@
         "the_release_failed": "Il rilascio è fallito",
         "the_suppression_was_lifted": "La soppressione è stata rimossa; il prossimo sondaggio può avviare l’elemento.",
         "the_teardown_failed": "Lo smontaggio è fallito",
+        "the_teardown_stage_failed": "Nessuno spazio di lavoro è stato conservato, ma la fase di smontaggio è fallita.",
+        "the_workspace_was_kept": "Lo spazio di lavoro non è stato rimosso:",
         "the_workspace_was_removed": "Lo spazio di lavoro è stato rimosso.",
         "unkeyed": "senza chiave",
         "unkeyed_findings_are_grouped_note": "I rilievi i cui riferimenti non risolvono a nessun criterio dichiarato sono raggruppati come senza chiave invece di essere elencati a parte."

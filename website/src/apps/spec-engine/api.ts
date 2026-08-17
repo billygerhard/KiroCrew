@@ -207,6 +207,33 @@ export interface ConfigSnapshot {
   config_only_paths: string[]
 }
 
+/**
+ * What became of one ledger row, from `WorkspaceCleanup.to_json_object`.
+ *
+ * `removed` here is the removal verdict — distinct from the clean-workspace
+ * response's TOP-LEVEL `removed`, which only says an active row existed.
+ * `reason` is always populated: why a row was left alone, or how it was removed.
+ */
+export interface WorkspaceCleanup {
+  workspace_id: number
+  run_id: string
+  kind: string
+  location: string
+  address: string | null
+  removed: boolean
+  reason: string
+}
+
+/** A teardown's full accounting, from `TeardownReport.to_json_object`. */
+export interface TeardownReport {
+  run_id: string
+  forced: boolean
+  removed: WorkspaceCleanup[]
+  kept: WorkspaceCleanup[]
+  stage: string | null
+  stage_reason: string
+}
+
 /** One run's attributed spend and the ceiling in force for it, from `_run_spend`. */
 export interface RunSpend {
   run_id: string
@@ -323,13 +350,19 @@ export const specEngineApi = {
   /**
    * Remove one ledger-recorded workspace: the retry for a kept teardown.
    *
-   * `removed` is false when no ACTIVE row has that id, so a second click reads as
-   * "nothing to do" rather than as a removal that failed.
+   * Two `removed` fields with DIFFERENT meanings, from the handler's own shape.
+   * The top-level `removed` is `cleanup is not null` — an ACTIVE row with that
+   * id existed, so a second click reads as "nothing to do". Whether the
+   * workspace actually came down is `cleanup.removed`: the engine returns a
+   * populated cleanup with `removed: false` when it DECLINES (a deployment row,
+   * a failed `git worktree remove`, a tree outside the disposable root), and
+   * `cleanup.reason` says why. A caller reading only the top-level field
+   * reports a standing workspace as removed.
    */
   cleanWorkspace: (args: {
     workspace_id: number
     force?: boolean
-  }): Promise<{ ok: boolean; removed: boolean; cleanup: Record<string, unknown> | null }> =>
+  }): Promise<{ ok: boolean; removed: boolean; cleanup: WorkspaceCleanup | null }> =>
     postJson(`${API}/queue/clean-workspace`, args),
 
   /**
@@ -338,6 +371,9 @@ export const specEngineApi = {
    * `complete` is the field that matters and `ok` is not it: a teardown that kept
    * anything answers `ok: true, complete: false` with the kept ids in `kept`, and
    * a caller reading only `ok` would report a standing workspace as torn down.
+   * `report.kept` carries the same rows with their kind and the reason each was
+   * kept; `complete: false` with an empty `kept` means the teardown STAGE failed
+   * (`report.stage`, `report.stage_reason`), not that workspaces stand.
    */
   teardown: (args: {
     run_id: string
@@ -345,7 +381,7 @@ export const specEngineApi = {
     ok: boolean
     complete: boolean
     kept: number[]
-    report: Record<string, unknown>
+    report: TeardownReport
   }> => postJson(`${API}/queue/teardown`, args),
 
   /** GET the persisted configuration, credential values elided. */

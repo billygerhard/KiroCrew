@@ -60,7 +60,7 @@
  *   FIXED-height scroll region rather than a `max-height` cap: a cap still grows
  *   with line count until it binds.
  */
-import { useEffect, useId, useState } from 'react'
+import { useId, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 
@@ -324,15 +324,6 @@ function HeldBlock({ entry }: { entry: QueueEntry }) {
     },
   })
 
-  // A different run is selected, so a half-typed id and a result about the
-  // previous run must not survive into it.
-  useEffect(() => {
-    setCommentId('')
-    release.reset()
-    // The reset is keyed to the run, not to the mutation object's identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entry.run_id])
-
   const held = entry.feedback_quarantined
   return (
     <div className="se-blk">
@@ -439,12 +430,6 @@ function RedispatchBlock({ entry }: { entry: QueueEntry }) {
     onSuccess: () => void client.invalidateQueries({ queryKey: QK.queue }),
   })
 
-  useEffect(() => {
-    setGeneration('')
-    redispatch.reset()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entry.run_id])
-
   if (!entry.source || !entry.item_id) return null
   const parsed = Number.parseInt(generation, 10)
   const usable = Number.isSafeInteger(parsed) && parsed >= 0
@@ -533,15 +518,13 @@ function TeardownBlock({
     onSuccess: () => void client.invalidateQueries({ queryKey: QK.queue }),
   })
 
-  useEffect(() => {
-    setArmed(false)
-    teardown.reset()
-    clean.reset()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entry.run_id])
-
   const result = teardown.data
-  const kept = result?.kept ?? []
+  // The rich rows from the report, not the top-level id list: kind and reason
+  // are what tell an operator which retry can possibly succeed.
+  const keptRows = result?.report.kept ?? []
+  // Incomplete with nothing kept means the teardown STAGE failed — rendering
+  // "workspaces were kept" over an empty list would misname the failure.
+  const stageFailed = result != null && !result.complete && keptRows.length === 0
 
   return (
     <div className="se-blk">
@@ -557,21 +540,30 @@ function TeardownBlock({
                 : 'apps.specEngine.reviewQueuePanel.teardown_incomplete',
             )}
           </strong>
-          {!result.complete && (
+          {stageFailed && (
+            <p className="se-note">
+              {i18nT('apps.specEngine.reviewQueuePanel.the_teardown_stage_failed')}
+              {result.report.stage_reason ? ` ${result.report.stage_reason}` : ''}
+            </p>
+          )}
+          {!result.complete && keptRows.length > 0 && (
             <>
               <p className="se-note">
                 {i18nT('apps.specEngine.reviewQueuePanel.kept_workspaces_are_still_standing')}
               </p>
               <ul>
-                {kept.map((workspaceId) => (
-                  <li key={workspaceId}>
-                    <span className="se-m">{fmtNumber(workspaceId)}</span>
+                {keptRows.map((row) => (
+                  <li key={row.workspace_id}>
+                    <span className="se-m">{fmtNumber(row.workspace_id)}</span>
+                    <span className="se-m se-dim">{row.kind}</span>
                     <span className="se-acts">
                       <button
                         type="button"
                         className="se-btn se-sm"
                         disabled={clean.isPending}
-                        onClick={() => clean.mutate({ workspace_id: workspaceId, force: false })}
+                        onClick={() =>
+                          clean.mutate({ workspace_id: row.workspace_id, force: false })
+                        }
                       >
                         {i18nT('apps.specEngine.reviewQueuePanel.remove')}
                       </button>
@@ -579,11 +571,15 @@ function TeardownBlock({
                         type="button"
                         className="se-btn se-sm se-danger"
                         disabled={clean.isPending}
-                        onClick={() => clean.mutate({ workspace_id: workspaceId, force: true })}
+                        onClick={() =>
+                          clean.mutate({ workspace_id: row.workspace_id, force: true })
+                        }
                       >
                         {i18nT('apps.specEngine.reviewQueuePanel.force_remove')}
                       </button>
                     </span>
+                    {/* The engine's own explanation of why the row was kept. */}
+                    {row.reason && <span className="se-note">{row.reason}</span>}
                   </li>
                 ))}
               </ul>
@@ -599,12 +595,18 @@ function TeardownBlock({
         />
       )}
       {clean.isSuccess && (
-        <p className="se-note">
-          {i18nT(
-            clean.data.removed
-              ? 'apps.specEngine.reviewQueuePanel.the_workspace_was_removed'
-              : 'apps.specEngine.reviewQueuePanel.no_active_workspace_has_that_id',
-          )}
+        // Three verdicts, not two. The response's top-level `removed` only says
+        // an active row EXISTED; whether the workspace came down is
+        // cleanup.removed, and the engine declines with a populated reason for
+        // a deployment row, a failed worktree removal, or a tree outside the
+        // disposable root. Reading the top-level field would answer "removed"
+        // for exactly the rows most likely to be in this list.
+        <p className="se-note" role="status">
+          {clean.data.cleanup === null
+            ? i18nT('apps.specEngine.reviewQueuePanel.no_active_workspace_has_that_id')
+            : clean.data.cleanup.removed
+              ? i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_removed')
+              : `${i18nT('apps.specEngine.reviewQueuePanel.the_workspace_was_kept')} ${clean.data.cleanup.reason}`}
         </p>
       )}
 
@@ -661,6 +663,13 @@ function ActBlock({ entry }: { entry: QueueEntry }) {
       <h3>{i18nT(ACT_HEAD_KEY[reason])}</h3>
       <p className="se-note" data-act-reason={reason}>
         {i18nT(ACT_NOTE_KEY[reason])}
+      </p>
+      {/* The one absent control with NO transport at all: the engine records a
+          user-caused archive, but neither a route nor an MCP tool exposes it.
+          The other absent controls' notes each name a transport that exists;
+          this one cannot, and saying nothing would imply cancelling is covered. */}
+      <p className="se-note" data-act-reason="cancel-gap">
+        {i18nT('apps.specEngine.reviewQueuePanel.cancel_has_no_transport')}
       </p>
     </div>
   )

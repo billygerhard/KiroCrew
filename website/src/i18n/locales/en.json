@@ -3071,6 +3071,7 @@
         "act_note_stall": "A watchdog observation, not a verdict: the work may still be alive. Resuming a parked run has no route on this surface.",
         "act_review": "Act · waiting on a verdict",
         "act_stall": "Act · overran its wall clock",
+        "cancel_has_no_transport": "Cancelling a run is not possible from any surface yet: the engine records the operation, but neither a route nor an MCP tool exposes it.",
         "collapse": "Collapse",
         "comment_identifier": "Comment identifier",
         "comments_are_held_for_release": "Comments are held for a person to release.",
@@ -3114,6 +3115,8 @@
         "the_release_failed": "The release failed",
         "the_suppression_was_lifted": "The suppression was lifted; the next poll may dispatch the item.",
         "the_teardown_failed": "The teardown failed",
+        "the_teardown_stage_failed": "No workspaces were kept, but the teardown stage failed.",
+        "the_workspace_was_kept": "The workspace was not removed:",
         "the_workspace_was_removed": "The workspace was removed.",
         "unkeyed": "unkeyed",
         "unkeyed_findings_are_grouped_note": "Findings whose references resolved to no declared criterion are grouped as unkeyed rather than listed separately."

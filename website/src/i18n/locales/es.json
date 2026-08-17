@@ -3815,6 +3815,7 @@
         "act_note_stall": "Una observación del vigilante, no un veredicto: el trabajo puede seguir vivo. Reanudar una ejecución detenida no tiene ruta en esta superficie.",
         "act_review": "Actuar · esperando un veredicto",
         "act_stall": "Actuar · excedió su tiempo de reloj",
+        "cancel_has_no_transport": "Cancelar una ejecución aún no es posible desde ninguna superficie: el motor registra la operación, pero ni una ruta ni una herramienta MCP la exponen.",
         "collapse": "Contraer",
         "comment_identifier": "Identificador del comentario",
         "comments_are_held_for_release": "Hay comentarios retenidos para que una persona los libere.",
@@ -3858,6 +3859,8 @@
         "the_release_failed": "La liberación falló",
         "the_suppression_was_lifted": "Se levantó la supresión; el siguiente sondeo puede despachar el elemento.",
         "the_teardown_failed": "El desmontaje falló",
+        "the_teardown_stage_failed": "No se conservó ningún espacio de trabajo, pero la etapa de desmontaje falló.",
+        "the_workspace_was_kept": "El espacio de trabajo no se eliminó:",
         "the_workspace_was_removed": "El espacio de trabajo se eliminó.",
         "unkeyed": "sin clave",
         "unkeyed_findings_are_grouped_note": "Los hallazgos cuyas referencias no resolvieron a ningún criterio declarado se agrupan como sin clave en lugar de listarse por separado."

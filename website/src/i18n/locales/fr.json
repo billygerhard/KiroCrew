@@ -3815,6 +3815,7 @@
         "act_note_stall": "Une observation du chien de garde, pas un verdict : le travail peut être encore vivant. Reprendre une exécution en attente n’a pas de route ici.",
         "act_review": "Agir · en attente d’un verdict",
         "act_stall": "Agir · délai d’horloge dépassé",
+        "cancel_has_no_transport": "Annuler une exécution n'est encore possible depuis aucune surface : le moteur enregistre l'opération, mais ni une route ni un outil MCP ne l'expose.",
         "collapse": "Replier",
         "comment_identifier": "Identifiant du commentaire",
         "comments_are_held_for_release": "Des commentaires sont retenus en attente d’une libération par une personne.",
@@ -3858,6 +3859,8 @@
         "the_release_failed": "La libération a échoué",
         "the_suppression_was_lifted": "La suppression a été levée ; la prochaine interrogation peut lancer l’élément.",
         "the_teardown_failed": "Le démontage a échoué",
+        "the_teardown_stage_failed": "Aucun espace de travail n'a été conservé, mais l'étape de démontage a échoué.",
+        "the_workspace_was_kept": "L'espace de travail n'a pas été supprimé :",
         "the_workspace_was_removed": "L’espace de travail a été supprimé.",
         "unkeyed": "sans clé",
         "unkeyed_findings_are_grouped_note": "Les constats dont les références ne correspondent à aucun critère déclaré sont regroupés comme sans clé plutôt que listés séparément."

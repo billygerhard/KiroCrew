@@ -3754,6 +3754,7 @@
         "act_note_stall": "Eine Watchdog-Beobachtung, kein Urteil: die Arbeit kann noch laufen. Für das Fortsetzen eines geparkten Laufs gibt es hier keine Route.",
         "act_review": "Handeln · wartet auf ein Urteil",
         "act_stall": "Handeln · Laufzeitgrenze überschritten",
+        "cancel_has_no_transport": "Das Abbrechen eines Laufs ist von keiner Oberfläche aus möglich: Die Engine zeichnet den Vorgang auf, aber weder eine Route noch ein MCP-Tool stellt ihn bereit.",
         "collapse": "Einklappen",
         "comment_identifier": "Kommentar-Kennung",
         "comments_are_held_for_release": "Kommentare warten auf die Freigabe durch eine Person.",
@@ -3797,6 +3798,8 @@
         "the_release_failed": "Die Freigabe ist fehlgeschlagen",
         "the_suppression_was_lifted": "Die Sperre wurde aufgehoben; die nächste Abfrage kann das Element zuweisen.",
         "the_teardown_failed": "Der Abbau ist fehlgeschlagen",
+        "the_teardown_stage_failed": "Es wurden keine Arbeitsbereiche behalten, aber die Teardown-Stufe ist fehlgeschlagen.",
+        "the_workspace_was_kept": "Der Arbeitsbereich wurde nicht entfernt:",
         "the_workspace_was_removed": "Der Arbeitsbereich wurde entfernt.",
         "unkeyed": "ohne Zuordnung",
         "unkeyed_findings_are_grouped_note": "Befunde, deren Verweise auf kein deklariertes Kriterium auflösen, werden als ohne Zuordnung gruppiert statt getrennt aufgeführt."

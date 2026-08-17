@@ -3693,6 +3693,7 @@
         "act_note_stall": "这是看守的观察而非裁定，工作可能仍在进行。此界面没有恢复已停运行的路由。",
         "act_review": "处理 · 等待裁定",
         "act_stall": "处理 · 超出挂钟时限",
+        "cancel_has_no_transport": "目前还无法从任何界面取消运行：引擎会记录该操作，但没有任何路由或 MCP 工具将其开放。",
         "collapse": "收起",
         "comment_identifier": "评论标识",
         "comments_are_held_for_release": "有评论被扣留，等待有人放行。",
@@ -3736,6 +3737,8 @@
         "the_release_failed": "放行失败",
         "the_suppression_was_lifted": "抑制已解除；下一次轮询可能派发该条目。",
         "the_teardown_failed": "拆除失败",
+        "the_teardown_stage_failed": "没有保留任何工作区，但拆除阶段失败了。",
+        "the_workspace_was_kept": "工作区未被移除：",
         "the_workspace_was_removed": "该工作区已删除。",
         "unkeyed": "无对应准则",
         "unkeyed_findings_are_grouped_note": "引用未能解析到任何已声明准则的发现项会归为无对应准则一组，而不是单独列出。"
