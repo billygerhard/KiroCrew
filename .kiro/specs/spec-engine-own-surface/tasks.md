@@ -27,7 +27,7 @@ no capability is surfaceless for longer than a wave.
     - Seed the allowlist with the legitimately shared files: the app-store manifest key table, the localization catalogs, the manifest-sync script, and the spec documents
     - Plant violations assembled at runtime (a path under the Prior_App tree; an undeclared new root) and assert each is reported; prove the fail-closed branch by driving the Merge_Base computation to fail in a fixture repo
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
-- [ ] 3. Agent surface for setup and configuration
+- [x] 3. Agent surface for setup and configuration
   - [x] 3.1 Setup assistant tools on the Engine_MCP_Server
     - Add `inspect_setup`, `plan_setup`, and `apply_setup` to the TOOLS table, delegating to `engine/setup.py`; `inspect_setup` returns evidence, inferences, open questions, and preset offers including each preset's declared programs
     - `plan_setup` computes and returns a SetupPlanEnvelope with a deterministic content-hash `plan_id` and applies nothing; `apply_setup` recomputes the plan, refuses on `plan_id` mismatch, requires a non-empty `approver`, and surfaces `SetupApprovalRequired` and `InferredSubjectRefused` as structured refusals
@@ -38,12 +38,12 @@ no capability is surfaceless for longer than a wave.
     - Add `get_config` and `write_config` to the TOOLS table; `get_config` elides secret-classified values by key name; `write_config` delegates to the existing fenced `EngineOperations.write_config` and rejects everything the Config_Store refuses, including vendored-provider bindings on every transport
     - Config writes run off the event loop
     - _Requirements: 4.1, 4.2, 4.3, 4.5_
-  - [ ] 3.3 Conformance for the five new tools
+  - [x] 3.3 Conformance for the five new tools
     - Drive all five through the existing stdio conformance harness: tools/list advertises them with schemas, tools/call round-trips each, error shapes are structured refusals not stack traces
     - Non-vacuity: a positive control per tool proving the harness observes a real effect (a written config, a returned plan), not merely a 200-shaped reply
     - _Requirements: 3.1, 3.2, 3.3, 4.1, 4.2_
 - [ ] 4. The app's own surface plumbing
-  - [ ] 4.1 Join BUILTIN_NAMES deliberately
+  - [x] 4.1 Join BUILTIN_NAMES deliberately
     - Add `spec_engine` to `BUILTIN_NAMES`; rewrite the pin test's recorded reasoning to state what the entry now buys (the dashboard route-registration loop) and keep the test failing for an entry added without reading it
     - _Requirements: 5.1, 5.3_
   - [ ] 4.2 Backend routes under the Spec_App
@@ -57,7 +57,7 @@ no capability is surfaceless for longer than a wave.
     - Planted cases in both directions: an aiohttp import inside `engine/` is reported, and an outbound constructor reference inside `backend/` is reported
     - Extend the frontend provenance scan roots to `website/src/apps/spec-engine/`
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
-  - [ ] 4.4 Manifest page and localization
+  - [x] 4.4 Manifest page and localization
     - Add `ui.pages` (route `/spec-engine`) and `backend.routes` to the manifest; retire `test_declares_no_ui` with a reasoned replacement; keep `defaultEnabled` false
     - Add `page_label` and any new strings to all thirteen catalogs (generated pseudo-locale via the script, countless strings, Korean dual particles, context entries for short strings); restore `pageLabel` to the app-store key table for spec-engine; manifest-sync gate green by real exit status
     - _Requirements: 5.1, 5.2, 5.5_
@@ -119,3 +119,7 @@ no capability is surfaceless for longer than a wave.
 - **R1.4 final-report item (from 1.1's review):** no reverted hunk fixed a genuine Merge_Base defect of the Prior_App. One observation for its owner: the Prior_App's `_seed_prompt` docstring claims a builtin's declared skills "are NOT on the agent's skill path", but `bridges.reconcile_app_skills` links manifest-declared skills for enabled non-self-managed apps, so the claim appears factually wrong at the Merge_Base. Not fixed (byte-identity forbids it); report to the owner.
 - **For 1.2's gate sweep:** two Prior_App files (`backend/routes.py`, `tests/test_routes.py`) are black-dirty AT the Merge_Base; the sweep must treat them as pre-existing, not reformat them.
 - **For 3.2 (owns the config door):** (a) the approver identity demanded by `apply_setup` is echoed but recorded nowhere durable — `ConfigStore.write` logs only surface name and key count; give the write path a durable approver record. (b) `apply_setup` drops `ConfigStore.write`'s merge advisories from the tool reply (pre-existing engine shape, newly exposed) — plumb the warn recorder into the reply. (c) `CONFIGURATION_ONLY` in the library-equivalence fence lacks the completeness pin its sibling categories have — add it so a future tool cannot join the partition undriven.
+
+- **For 6.1 (from 4.4's review, two unrecorded shared-file obligations):** `website/src/apps/builtinIcons.tsx` must register `Cog` (unregistered today — the app store falls back to the generic Package glyph) and `website/src/apps/builtinRegistry.ts` must map `/spec-engine` (unmapped today — the route redirects to /chat). Both files sit outside the declared roots, so each needs its own reviewed BOUNDARY_ALLOWLIST entry with a one-line justification.
+- **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
+- **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.
