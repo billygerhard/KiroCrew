@@ -16,11 +16,14 @@ each tool's description and full input schema, and
 drives an injected and a removed tool through the same fingerprint so a passing
 equality is known to be an observation rather than two empty sets meeting.
 
-*Nothing leaves the machine unless an operator asked for it.* Proven three ways,
+*Nothing leaves the machine unless an operator asked for it.* Proven four ways,
 because each is observable in a different place: every zero-configuration binding
 resolves to a builtin over the in-process transport, the default spec-processing
-path completes with sockets and child processes sealed off, and the app's own
-modules import no network client and no telemetry emitter.
+path completes with sockets and child processes sealed off, the app's own modules
+import no network client and no telemetry emitter, and the one tree that is
+allowed a web framework at all — the inbound HTTP surface — is read for outbound
+constructor references, so that permission to serve a page is not permission to
+transmit.
 
 *Nothing non-public is in the tree.* This app is authored clean-room for a public
 repository, so the rule is not "no secrets" but "no non-public reference at all":
@@ -32,13 +35,22 @@ pins the inventory of shipped prompt text. What that scan can and cannot see is
 stated on :class:`TestNoNonPublicReferenceIsInTheTree`, because a scanner is worth
 only the spellings it was driven against.
 
-One boundary worth naming, so this module is not mistaken for it:
+Two boundaries worth naming, so this module is not mistaken for either:
 
 * "Spawns no child" is a claim about the **default spec-processing path** only —
   validation, phase reads, task listing, and a capability call served by its
   builtin. The delivery pipeline, the watch poll, and the external capability
   transports all execute operator-configured commands by design, and sealing them
   would be asserting the opposite of what they are for.
+* **Inbound serving is not outbound transmission**, and that distinction is the
+  only reason a network library appears in this app at all. The engine trees
+  (``engine/``, ``engine_mcp/``) may import none; ``backend/`` may import the
+  gateway's own web framework, because there the framework is used to DECLARE
+  handlers for bytes a browser on this machine already sent, never to CONSTRUCT a
+  client that sends bytes elsewhere. The distinction is drawn mechanically rather
+  than assumed — see :data:`_INBOUND_SERVING_TREE` for the full statement and its
+  residual — and where it cannot be drawn from the source, the check reports
+  rather than permits.
 """
 
 from __future__ import annotations
@@ -507,8 +519,9 @@ class TestTelemetryIsOffAndUnimplemented:
         # The import-level half of "all spec processing local": a module that
         # cannot construct a client cannot transmit through one. The app's inbound
         # HTTP surface is exempted by name and directory -- see
-        # :data:`_INBOUND_SERVING_TREE` for the distinction drawn, the residual
-        # this leaves, and the AST check that replaces it.
+        # :data:`_INBOUND_SERVING_TREE` for the distinction drawn, and
+        # :class:`TestTheInboundSurfaceCannotTransmit` for the code-level half that
+        # keeps the exemption from being a transmission path.
         offenders = _without_inbound_serving(_scan_app_imports(_NETWORK_MODULES))
         assert offenders == [], f"the app now imports a network client: {offenders}"
 
@@ -536,24 +549,27 @@ class TestTelemetryIsOffAndUnimplemented:
             ]
         ) == ["backend/client.py: httpx", "engine/state.py: aiohttp"]
 
-    def test_the_inbound_tree_holds_only_the_route_surface(self) -> None:
-        """The exemption is scoped to a directory, so what lives there matters.
+    def test_an_aiohttp_import_in_an_engine_tree_is_reported_by_the_real_scan(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The engine-tree direction, driven through the scan rather than the predicate.
 
-        A module that grew into ``backend/`` would inherit the aiohttp exemption
-        without anybody granting it one, so the directory's contents are pinned
-        until 4.3's AST check makes the exemption about the CODE rather than about
-        the location.
+        The predicate above is a function; this is the assertion that actually
+        guards the build, so a planted engine module is put where the scan walks
+        and the exemption filter is given its real chance to swallow it. The
+        permitted spelling is planted alongside it in the same run, so the pair
+        proves the filter discriminates rather than reporting everything.
         """
-        inbound = APP_ROOT / _INBOUND_SERVING_TREE
-        if not inbound.is_dir():
-            pytest.skip("the app has no inbound tree yet")
-        modules = sorted(
-            path.name for path in inbound.glob("*.py") if not path.name.startswith("__")
-        )
-        assert modules == ["routes.py"], (
-            f"{_INBOUND_SERVING_TREE}/ now holds {modules}; every module there is "
-            "exempt from the network denylist, so a new one needs reading first"
-        )
+        engine_module = tmp_path / "engine" / "state.py"
+        engine_module.parent.mkdir(parents=True)
+        engine_module.write_text("import aiohttp\n", encoding="utf-8")
+        inbound_module = tmp_path / _INBOUND_SERVING_TREE / "routes.py"
+        inbound_module.parent.mkdir(parents=True)
+        inbound_module.write_text("from aiohttp import web\n", encoding="utf-8")
+        monkeypatch.setattr(f"{__name__}.APP_ROOT", tmp_path)
+        monkeypatch.setattr(f"{__name__}._app_modules", lambda: [engine_module, inbound_module])
+        offenders = _without_inbound_serving(_scan_app_imports(_NETWORK_MODULES))
+        assert offenders == ["engine/state.py: aiohttp"], offenders
 
     def test_the_import_scanner_actually_detects(self, tmp_path: Path) -> None:
         # The scan above passes on an app that imports nothing at all, so the
@@ -606,21 +622,53 @@ _TELEMETRY_MODULES = frozenset({"kiro_crew.beacon", "kiro_crew.telemetry"})
 #: ``engine_mcp/``) may import it at all, because there the same import could only
 #: be the first half of an outbound transmission path.
 #:
-#: **This accommodation is deliberately weaker than the rule it replaces, and
-#: temporary.** It is keyed on the import NAME and the directory, so it cannot yet
-#: tell a handler declaration from a ``ClientSession`` built in the same file: an
-#: outbound client constructed inside ``backend/`` would pass. Task 4.3 replaces
-#: this with an AST check asserting that ``backend/`` references no outbound
-#: constructor (``ClientSession``, ``request``, ``TCPConnector``,
-#: ``UnixConnector``), which is what actually draws the distinction rather than
-#: assuming it. Until then the residual is stated here rather than implied, and
-#: the exemption is bounded to one directory and one module root so it cannot
-#: quietly grow into "the app may import network clients".
+#: The distinction is drawn by two checks that have to hold together, because
+#: either alone would be a hole:
+#:
+#: 1. **The import**, by name and directory (:func:`_is_inbound_serving_import`):
+#:    one module root, in one tree. So neither "aiohttp anywhere" nor "anything
+#:    under ``backend/``" is admitted, and a second network library appearing in
+#:    the inbound tree is reported like any other.
+#: 2. **The code** (:func:`_outbound_reach`, driven by
+#:    :class:`TestTheInboundSurfaceCannotTransmit`): every module of the inbound
+#:    tree is parsed, and a reference through an aiohttp binding to any of
+#:    :data:`_OUTBOUND_CONSTRUCTORS` is reported. This is the half that makes the
+#:    exemption about what the code DOES rather than about where it sits: an
+#:    outbound client constructed inside ``backend/`` is caught even though its
+#:    import is the permitted one.
+#:
+#: Where the distinction cannot be drawn from the source, the check REPORTS rather
+#: than permits — a star import, an aiohttp submodule other than the inbound one,
+#: and an aiohttp binding reached as a value rather than by attribute (which is
+#: what ``getattr(x, "Client" + "Session")`` is) are all findings, because through
+#: any of them absence cannot be proven.
+#:
+#: The residual, stated rather than implied: the walk follows names bound to
+#: aiohttp BY AN IMPORT IN THE SAME MODULE. A binding re-exported from another
+#: module of the inbound tree and imported relatively is invisible to it — which is
+#: why the tree scanned is the whole of ``backend/`` and not one file, so the
+#: re-exporting module is itself read and its own escape reported there.
 _INBOUND_SERVING_TREE = "backend"
 
 #: Module roots the inbound tree may import. One entry, on purpose: this is the
 #: framework the gateway that mounts these handlers is itself built on.
 _INBOUND_SERVING_ROOTS = frozenset({"aiohttp"})
+
+#: aiohttp paths whose members :func:`_aiohttp_bindings` will classify: the root
+#: package and the inbound submodule. Any other submodule (``aiohttp.client``,
+#: ``aiohttp.connector``) is the outbound half by construction, and what it yields
+#: cannot be enumerated from the import, so importing one is reported.
+_INBOUND_AIOHTTP_MODULES = frozenset({"aiohttp", "aiohttp.web"})
+
+#: The aiohttp names that construct or drive an OUTBOUND request. A reference to
+#: any of them is the second half of a transmission path whatever tree it sits in.
+#:
+#: Case matters and is the subtle part: ``aiohttp.request`` is the one-shot
+#: outbound helper and is listed, while ``web.Request`` is the INBOUND request type
+#: the handlers annotate against and is not. Matching case-insensitively would
+#: report every handler signature in the tree, which is the false-positive shape
+#: that gets a gate switched off.
+_OUTBOUND_CONSTRUCTORS = frozenset({"ClientSession", "request", "TCPConnector", "UnixConnector"})
 
 
 def _is_inbound_serving_import(relative: Path, name: str) -> bool:
@@ -651,6 +699,123 @@ def _without_inbound_serving(offenders: list[str]) -> list[str]:
             continue
         kept.append(row)
     return kept
+
+
+def _inbound_modules() -> list[Path]:
+    """Every module of the inbound serving tree, whatever it is named.
+
+    Read off the directory rather than listed, so a module that appears in
+    ``backend/`` later is parsed by the outbound check without anyone having to
+    remember to add it. An empty result is not a clean tree — see
+    :meth:`TestTheInboundSurfaceCannotTransmit.test_the_check_reads_every_inbound_module`.
+    """
+    tree = APP_ROOT / _INBOUND_SERVING_TREE
+    if not tree.is_dir():
+        return []
+    return sorted(path for path in tree.rglob("*.py") if "__pycache__" not in path.parts)
+
+
+def _aiohttp_bindings(tree: ast.Module) -> tuple[dict[str, str], list[str]]:
+    """Local names bound to part of aiohttp, plus imports that defeat the walk.
+
+    Returns ``(bindings, undrawable)``. *bindings* maps a local name to the dotted
+    aiohttp path it stands for, which is what lets the reference pass tell
+    ``web.Response`` from ``aiohttp.ClientSession``. *undrawable* holds one entry
+    per import through which a static reader cannot say what is reachable; those
+    are findings, not exemptions, because absence cannot be proven through them.
+    """
+    bindings: dict[str, str] = {}
+    undrawable: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in _INBOUND_SERVING_ROOTS:
+                    continue
+                if alias.name in _INBOUND_AIOHTTP_MODULES:
+                    # ``import aiohttp.web`` binds the ROOT name, not the leaf.
+                    bindings[alias.asname or alias.name.split(".")[0]] = alias.name
+                else:
+                    undrawable.append(f"import {alias.name}: not the inbound submodule")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                continue  # relative: names this app's own modules, not aiohttp
+            if node.module.split(".")[0] not in _INBOUND_SERVING_ROOTS:
+                continue
+            if node.module not in _INBOUND_AIOHTTP_MODULES:
+                undrawable.append(f"from {node.module} import ...: not the inbound submodule")
+                continue
+            for alias in node.names:
+                target = f"{node.module}.{alias.name}"
+                if alias.name == "*":
+                    undrawable.append(f"from {node.module} import *: names not enumerable")
+                elif alias.name in _OUTBOUND_CONSTRUCTORS or target in _INBOUND_AIOHTTP_MODULES:
+                    bindings[alias.asname or alias.name] = target
+                elif node.module == "aiohttp":
+                    # A top-level aiohttp member that is neither the inbound
+                    # submodule nor a known outbound constructor: whether it
+                    # reaches the client half is not decidable from the name.
+                    undrawable.append(f"from aiohttp import {alias.name}: unclassifiable member")
+                else:
+                    bindings[alias.asname or alias.name] = target
+    return bindings, undrawable
+
+
+def _aiohttp_name_uses(tree: ast.Module, bindings: Mapping[str, str]) -> tuple[set[str], set[str]]:
+    """Attributes read off each aiohttp binding, and bindings used as bare values.
+
+    The attribute set holds every ``local.attr`` pair in a chain, so
+    ``aiohttp.web.request`` contributes ``aiohttp.request`` and the outbound leaf
+    is found however deeply it is spelled. A binding that appears anywhere OTHER
+    than at the root of an attribute access lands in the second set: passed as an
+    argument, rebound, or handed to ``getattr``, it has escaped where a static
+    reader can follow it.
+    """
+    attributes: set[str] = set()
+    rooted: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        attrs: list[str] = []
+        current: ast.expr = node
+        while isinstance(current, ast.Attribute):
+            attrs.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name) and current.id in bindings:
+            rooted.add(id(current))
+            attributes.update(f"{current.id}.{attr}" for attr in attrs)
+    bare = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in bindings and id(node) not in rooted
+    }
+    return attributes, bare
+
+
+def _outbound_reach(source: str) -> list[str]:
+    """Every way *source* could reach aiohttp's outbound half.
+
+    The companion to :func:`_is_inbound_serving_import`: that one decides whether
+    the IMPORT is the permitted inbound framework, this one decides whether the
+    CODE stays on the declaring side of it. An empty list means the module both
+    imports only what it may and reaches no client constructor through it.
+    """
+    tree = ast.parse(source)
+    bindings, findings = _aiohttp_bindings(tree)
+    for local, dotted in sorted(bindings.items()):
+        if dotted.rsplit(".", 1)[-1] in _OUTBOUND_CONSTRUCTORS:
+            findings.append(f"outbound constructor imported as {local!r}: {dotted}")
+    attributes, bare = _aiohttp_name_uses(tree, bindings)
+    findings.extend(
+        f"outbound constructor reference {reference!r}"
+        for reference in sorted(attributes)
+        if reference.rsplit(".", 1)[-1] in _OUTBOUND_CONSTRUCTORS
+    )
+    findings.extend(
+        f"aiohttp binding {local!r} reached as a value, not by attribute: "
+        "what it yields cannot be read statically"
+        for local in sorted(bare)
+    )
+    return sorted(findings)
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -701,6 +866,179 @@ def _scan_app_imports(deny: frozenset[str]) -> list[str]:
         for name in _offending(_imported_modules(path), deny):
             offenders.append(f"{path.relative_to(APP_ROOT)}: {name}")
     return sorted(offenders)
+
+
+# --- the inbound surface serves; it does not transmit -----------------------
+
+
+class TestTheInboundSurfaceCannotTransmit:
+    """The tree allowed a web framework is read for what it does with one.
+
+    The distinction and both halves of the mechanism are stated on
+    :data:`_INBOUND_SERVING_TREE`; what is asserted here is that the code half
+    holds over the real tree and has teeth in both directions.
+
+    **What this can see.** Every ``.py`` file under :data:`_INBOUND_SERVING_TREE`,
+    parsed: an import of an outbound constructor, a reference to one through any
+    name bound to aiohttp however deeply the attribute chain is spelled, and the
+    forms through which the distinction cannot be drawn at all — a star import, an
+    aiohttp submodule other than the inbound one, and an aiohttp binding used as a
+    value rather than as the root of an attribute access.
+
+    **What this cannot see**, stated because it bounds the guarantee:
+
+    * **Any tree other than the inbound one.** That is not a hole but a division
+      of labour: the engine trees may not import aiohttp AT ALL, so a
+      ``ClientSession`` reference there needs an import that
+      :meth:`TestTelemetryIsOffAndUnimplemented.test_the_app_imports_no_network_client`
+      already reports. The code check exists precisely for the one tree where the
+      import is permitted and therefore reports nothing.
+    * **An outbound client from a library that is not aiohttp.** Also the import
+      check's job: no other network module is exempt anywhere, inbound tree
+      included.
+    * **A binding reached through this app's own indirection** — a module of the
+      inbound tree re-exporting the framework, imported relatively by a sibling.
+      The walk is per-module and does not follow relative imports. What closes it
+      is scope rather than cleverness: the re-exporting module is itself in the
+      scanned tree, and handing a binding on is the escape-as-a-value case, so it
+      is reported where it happens.
+    * **A constructor reached by name at runtime from a string this module never
+      sees** — an ``importlib.import_module`` result, or an attribute pulled off
+      an object obtained elsewhere. Undecidable from text; the escape-as-a-value
+      rule catches the spellings that start from an aiohttp binding, which is the
+      reachable half.
+    """
+
+    def test_the_check_reads_every_inbound_module(self) -> None:
+        # The non-vacuity guard for the assertion below: it holds trivially over
+        # an empty tree, and an empty tree is not a clean result here, because the
+        # manifest declares backend routes and something has to serve them.
+        modules = _inbound_modules()
+        assert modules, (
+            f"no modules under {_INBOUND_SERVING_TREE}/: the app declares backend "
+            "routes, so either the serving tree moved and this check now reads "
+            "nothing, or the exemption on it should be withdrawn"
+        )
+        assert "routes.py" in {path.name for path in modules}
+        # Every one of them parses, so none is skipped silently by the walk.
+        for path in modules:
+            ast.parse(path.read_text(encoding="utf-8"))
+
+    def test_the_inbound_tree_reaches_no_outbound_constructor(self) -> None:
+        offenders: list[str] = []
+        for path in _inbound_modules():
+            relative = path.relative_to(APP_ROOT).as_posix()
+            for finding in _outbound_reach(path.read_text(encoding="utf-8")):
+                offenders.append(f"{relative}: {finding}")
+        assert offenders == [], (
+            f"the inbound serving tree can now transmit: {offenders}. That tree is "
+            "exempt from the network denylist only because it DECLARES handlers; a "
+            "client constructed there is an outbound path the exemption was never "
+            "granted for."
+        )
+
+    def test_the_real_inbound_module_is_seen_as_using_the_framework(self) -> None:
+        # Without this, the emptiness above would be satisfied by a tree the walk
+        # finds no aiohttp binding in at all -- which is how a check reads a file
+        # and proves nothing about it.
+        routes = APP_ROOT / _INBOUND_SERVING_TREE / "routes.py"
+        bindings, undrawable = _aiohttp_bindings(ast.parse(routes.read_text(encoding="utf-8")))
+        assert bindings, "no aiohttp binding found in the route module; the walk missed the import"
+        assert undrawable == []
+        attributes, bare = _aiohttp_name_uses(
+            ast.parse(routes.read_text(encoding="utf-8")), bindings
+        )
+        assert attributes, "the binding is never used; the reference pass examined nothing"
+        assert bare == set()
+
+    @pytest.mark.parametrize(
+        "planted",
+        [
+            pytest.param("import aiohttp\naiohttp.ClientSession()\n", id="root-attribute"),
+            pytest.param("import aiohttp as x\nx.ClientSession()\n", id="aliased-root"),
+            pytest.param(
+                "from aiohttp import ClientSession\nClientSession()\n", id="imported-directly"
+            ),
+            pytest.param(
+                "from aiohttp import ClientSession as S\nS()\n", id="imported-under-an-alias"
+            ),
+            pytest.param("import aiohttp\naiohttp.request('GET', u)\n", id="one-shot-request"),
+            pytest.param("import aiohttp\naiohttp.TCPConnector()\n", id="tcp-connector"),
+            pytest.param("import aiohttp\naiohttp.UnixConnector(path=p)\n", id="unix-connector"),
+            pytest.param(
+                "import aiohttp.web\naiohttp.web.request\n", id="deep-chain-through-the-submodule"
+            ),
+            pytest.param(
+                "import aiohttp\n\n\nasync def h(request):\n"
+                "    async with aiohttp.ClientSession() as s:\n        return s\n",
+                id="hidden-inside-a-handler",
+            ),
+        ],
+    )
+    def test_each_planted_outbound_reference_is_reported(self, planted: str) -> None:
+        assert _outbound_reach(planted), f"the check missed this spelling: {planted!r}"
+
+    @pytest.mark.parametrize(
+        "planted",
+        [
+            pytest.param(
+                "import aiohttp as x\ns = getattr(x, 'Client' + 'Session')()\n",
+                id="dynamic-getattr",
+            ),
+            pytest.param("from aiohttp import client\n", id="from-aiohttp-import-client"),
+            pytest.param("from aiohttp.client import ClientSession\n", id="from-the-client-module"),
+            pytest.param("import aiohttp.connector\n", id="import-another-submodule"),
+            pytest.param("from aiohttp import *\n", id="star-import"),
+            pytest.param("from aiohttp import ClientTimeout\n", id="unclassifiable-member"),
+            pytest.param("import aiohttp\nmake_session(aiohttp)\n", id="module-passed-as-a-value"),
+            pytest.param("from aiohttp import web\nweb = shim\n", id="binding-rebound"),
+        ],
+    )
+    def test_an_undrawable_distinction_is_reported_rather_than_permitted(
+        self, planted: str
+    ) -> None:
+        # The fail-closed half. None of these NAMES an outbound constructor, and
+        # every one of them is a route to becoming one that reading cannot follow,
+        # so the check reports instead of assuming the best.
+        assert _outbound_reach(planted), f"the check permitted an unreadable form: {planted!r}"
+
+    @pytest.mark.parametrize(
+        "legitimate",
+        [
+            pytest.param("from aiohttp import web\n\nR = web.Response\n", id="response-type"),
+            pytest.param(
+                "from aiohttp import web\n\n\nasync def h(request: web.Request) -> web.Response:\n"
+                "    return web.json_response({'ok': True})\n",
+                id="handler-signature-and-reply",
+            ),
+            pytest.param(
+                "from aiohttp import web\n\n\ndef register(app: web.Application) -> None:\n"
+                "    app.router.add_get('/x', h)\n",
+                id="mounting-handlers",
+            ),
+            pytest.param(
+                "from aiohttp import web\n\n\nasync def h(request):\n"
+                "    body = await request.json()\n    return body\n",
+                id="a-local-named-request",
+            ),
+            pytest.param(
+                "def request(path):\n    return path\n\n\nrequest('/x')\n",
+                id="an-app-function-named-request",
+            ),
+            pytest.param("from aiohttp.web import Response, json_response\n", id="named-inbound"),
+            pytest.param(
+                "import logging\n\nlogger = logging.getLogger(__name__)\n", id="no-aiohttp"
+            ),
+        ],
+    )
+    def test_the_check_is_silent_on_the_inbound_spellings_this_tree_uses(
+        self, legitimate: str
+    ) -> None:
+        # ``request`` is both an outbound aiohttp helper and the name of every
+        # handler's first parameter, so the false-positive half is pinned as hard
+        # as the teeth: a check that reported handler signatures would be switched
+        # off within a day, and switching it off is worse than the hole.
+        assert _outbound_reach(legitimate) == [], f"false positive on {legitimate!r}"
 
 
 # --- the bundled resources actually ship -----------------------------------
@@ -786,16 +1124,23 @@ PROVENANCE_SUFFIXES = frozenset({".py", ".json", ".md"})
 #: The repository root, derived from this module's own location rather than spelled.
 REPO_ROOT = APP_ROOT.parents[3].parent
 
-#: The Spec_Builder_UI's trees. Requirement 28's subject is THE Spec_App, and the
-#: UI is a component of it: it ships its own agent-directed prompt text
-#: (``prompts.ts``) and its own fixtures. Rooting the scan at :data:`APP_ROOT`
-#: alone would licence a clean-tree belief for a whole component nobody reads,
-#: which is the false negative this module exists to prevent. The rules are NOT
-#: restated for TypeScript — the same :func:`_non_public_references` runs over
-#: these files, because a second spelling of a rule is a second thing to get wrong.
+#: The Spec_App's frontend trees. Requirement 28's subject is THE Spec_App, and a
+#: user interface is a component of it: the Prior_App's UI ships its own
+#: agent-directed prompt text (``prompts.ts``) and its own fixtures, and this app's
+#: own tree ships the Operator_Surface's design artifacts and, as it is built, its
+#: components. Rooting the scan at :data:`APP_ROOT` alone would licence a
+#: clean-tree belief for a whole component nobody reads, which is the false
+#: negative this module exists to prevent. The rules are NOT restated for
+#: TypeScript — the same :func:`_non_public_references` runs over these files,
+#: because a second spelling of a rule is a second thing to get wrong.
+#:
+#: Both roots are asserted present by
+#: :meth:`TestNoNonPublicReferenceIsInTheTree.test_the_user_interface_tree_is_scanned_too`,
+#: which names a file from each: a root silently dropped from this tuple would
+#: otherwise leave the whole tree unread while every assertion still passed.
 UI_ROOTS = (
     REPO_ROOT / "website" / "src" / "apps" / "spec-builder",
-    REPO_ROOT / "website" / "src" / "apps" / "spec-engine",  # absent today; scanned if added
+    REPO_ROOT / "website" / "src" / "apps" / "spec-engine",
 )
 
 #: The UI's own test files, which live in the shared website test directory rather
@@ -1005,16 +1350,20 @@ def _provenance_files() -> list[Path]:
 
 
 def _ui_files() -> list[Path]:
-    """The Spec_Builder_UI's own files, scanned by the same rules as the app tree.
+    """The Spec_App's frontend files, scanned by the same rules as the app tree.
 
     A component of the Spec_App that the scan never reads is a hole in the
-    guarantee, not a smaller guarantee: requirement 28 is about the app, and the
-    UI ships prompt text and fixtures of its own.
+    guarantee, not a smaller guarantee: requirement 28 is about the app, and both
+    frontend trees carry text — the Prior_App's UI ships prompt text and fixtures,
+    this app's tree ships the Operator_Surface's design artifacts and components.
     """
     found: list[Path] = []
     for root in UI_ROOTS:
         if not root.is_dir():
-            continue  # spec-engine has no UI today; scanned the moment it gains one
+            # Absence is not silence: the named-file assertions in
+            # test_the_user_interface_tree_is_scanned_too fail if a root that
+            # should exist has gone missing, so skipping here cannot hide one.
+            continue
         found.extend(
             path for path in root.rglob("*") if path.is_file() and path.suffix in UI_SUFFIXES
         )
@@ -1409,10 +1758,10 @@ class TestNoNonPublicReferenceIsInTheTree:
       non-public system name used as a filename passes. Contiguous with the
       ordinary-word gap above, and stated because it is not obvious.
     * Anything outside the trees scanned: this app (:data:`APP_ROOT`) and the
-      Spec_Builder_UI (:data:`UI_ROOTS`, :data:`UI_TEST_ROOT`). The UI is scanned
-      because requirement 28's subject is the Spec_App, of which it is a
-      component; earlier this class read only the app tree, which meant it
-      licensed a clean-tree belief for a whole component it never opened.
+      Spec_App's frontend trees (:data:`UI_ROOTS`, :data:`UI_TEST_ROOT`). A
+      frontend tree is scanned because requirement 28's subject is the Spec_App,
+      of which it is a component; earlier this class read only the app tree, which
+      meant it licensed a clean-tree belief for a whole component it never opened.
     """
 
     def test_the_scan_reads_the_whole_tree(self) -> None:
@@ -1455,11 +1804,13 @@ class TestNoNonPublicReferenceIsInTheTree:
         )
 
     def test_the_user_interface_tree_is_scanned_too(self) -> None:
-        """The UI is a component of the Spec_App, so the same rules must reach it.
+        """Both frontend trees are components of the Spec_App, so the rules reach them.
 
         Asserted separately from the scan above because that one passes vacuously
-        if the UI file list is empty — which is exactly how a whole component
-        stays unread while the gate reports a clean tree.
+        if the file list is empty — which is exactly how a whole component stays
+        unread while the gate reports a clean tree. One file is named per root, so
+        a root dropped from :data:`UI_ROOTS` fails here rather than quietly
+        shrinking what is read.
         """
         files = _ui_files()
         assert len(files) > 10, f"the UI tree is barely scanned: {[_display(p) for p in files]}"
@@ -1468,8 +1819,16 @@ class TestNoNonPublicReferenceIsInTheTree:
             "website/src/apps/spec-builder/prompts.ts",
             "website/src/apps/spec-builder/api.ts",
             "website/src/apps/spec-builder/SpecBuilderPage.tsx",
+            # This app's own frontend tree. Its design artifacts are checked in to
+            # a public repository, which is the condition this scan cares about,
+            # and the Operator_Surface's components land beside them.
+            "website/src/apps/spec-engine/design/selection.md",
+            "website/src/apps/spec-engine/design/mockup-b.html",
         ):
             assert expected in names, f"{expected} is outside the provenance scan"
+        assert any(
+            name.startswith("website/src/apps/spec-engine/") for name in names
+        ), "this app's own frontend tree is outside the provenance scan"
         assert any(
             name.startswith("website/src/test/SpecBuilder") for name in names
         ), "the UI's own test fixtures are outside the provenance scan"
