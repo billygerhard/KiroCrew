@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,7 +49,10 @@ from hypothesis import strategies as st
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.apps.builtins.spec_engine.engine.audit import AuditLog, audit_root
 from kiro_crew.apps.builtins.spec_engine.engine.config import ConfigStore
-from kiro_crew.apps.builtins.spec_engine.engine.config.store import CONFIG_FILENAME
+from kiro_crew.apps.builtins.spec_engine.engine.config.store import (
+    CONFIG_FILENAME,
+    elide_secrets,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.cross_document import (
     validate_spec as validate_spec_documents,
 )
@@ -71,6 +75,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.state import (
     state_root,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.structure import parse_tasks
+from kiro_crew.apps.builtins.spec_engine.engine_mcp.operations import ENGINE_MCP_SURFACE
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.server import TOOLS
 
 from .conftest import spec_dir_snapshot
@@ -89,16 +94,28 @@ GUIDANCE_ONLY = ("get_authoring_prompt", "get_orchestrator_prompt", "get_review_
 #: state untouched, which ``test_diagnostic_tools_write_no_state`` does.
 DIAGNOSTIC_ONLY = ("run_doctor", "check_run_prerequisites")
 
-#: The setup assistant's tools. They DO reach the engine adapter, so they are not
-#: guidance and not diagnostics -- but they touch neither the state store nor the
-#: audit log. They read a project's own files and, for the one that writes, write
-#: the configuration document. So their equivalence claim is about ``config.json``
-#: rather than about rows, and the ``Step`` machinery below cannot express them
-#: anyway: every step it builds is ``(project, spec)``-shaped and these tools
-#: declare no spec. ``test_setup_tools_write_the_same_configuration_as_the_library``
-#: makes the claim in the form that fits: same document from both paths, and the
-#: reads leaving the state at the untouched baseline.
-CONFIGURATION_ONLY = ("inspect_setup", "plan_setup", "apply_setup")
+#: Tools whose equivalence claim is about the configuration document rather than
+#: about rows. They DO reach the engine adapter, so they are neither guidance nor
+#: diagnostics -- but they touch neither the state store nor the audit log. They
+#: read a project's own files or the saved document and, for the two that write,
+#: write configuration. The ``Step`` machinery below cannot express them anyway:
+#: every step it builds is ``(project, spec)``-shaped and these tools declare no
+#: spec. The claim is made in the form that fits -- same document from both paths,
+#: and the reads leaving the state at the untouched baseline.
+CONFIGURATION_ONLY = ("inspect_setup", "plan_setup", "apply_setup", "get_config", "write_config")
+
+#: Which test drives each configuration tool. The completeness pin its sibling
+#: categories get from their argument tables: a tool added to
+#: :data:`CONFIGURATION_ONLY` without a test that drives it fails
+#: :func:`test_every_configuration_tool_is_driven`, so the partition cannot grow a
+#: member whose two paths were never compared.
+CONFIGURATION_DRIVEN_BY: dict[str, str] = {
+    "inspect_setup": "test_setup_reads_write_no_state",
+    "plan_setup": "test_setup_reads_write_no_state",
+    "apply_setup": "test_setup_tools_write_the_same_configuration_as_the_library",
+    "get_config": "test_the_config_read_returns_what_the_library_reads",
+    "write_config": "test_the_config_write_tool_writes_what_the_library_writes",
+}
 
 #: Arguments for the diagnostic tools, so the no-state proof can call them.
 DIAGNOSTIC_ARGUMENTS: dict[str, dict[str, Any]] = {
@@ -527,6 +544,18 @@ def test_every_tool_is_a_state_operation_or_guidance() -> None:
     assert set(SEQUENCES) == set(OPERATIONS), "a state operation has no sequence"
 
 
+def test_every_configuration_tool_is_driven() -> None:
+    # The completeness pin the configuration partition lacked: its siblings get one
+    # from their argument tables, and without it a tool could join
+    # CONFIGURATION_ONLY -- satisfying the fence above -- while no test compared its
+    # two paths. The named test has to exist in this module, so renaming one moves
+    # the failure here rather than silently dropping the coverage.
+    assert set(CONFIGURATION_DRIVEN_BY) == set(CONFIGURATION_ONLY)
+    module = sys.modules[__name__]
+    for tool, test_name in CONFIGURATION_DRIVEN_BY.items():
+        assert callable(getattr(module, test_name, None)), f"{tool} names a test that is gone"
+
+
 def test_guidance_tools_write_no_state(tmp_path: Path, baseline: dict[str, Any]) -> None:
     # The exclusion above is proven, not assumed: the guidance tools are actually
     # called, and the state they leave is the untouched baseline.
@@ -671,6 +700,99 @@ def test_setup_tools_write_the_same_configuration_as_the_library(
         baseline["files"]
     ), "the baseline already holds a configuration document, so its absence proves nothing"
     assert any(name.endswith(CONFIG_FILENAME) for name in mcp_state["files"])
+
+
+# --- the configuration tools: one document, read and written one way ------
+
+#: A patch an unconfirmed surface may write: an ordinary limit, plus a project
+#: entry carrying a value the store classifies as a credential so the read tool's
+#: elision is exercised against a real document rather than a contrived one.
+_CONFIG_PATCH: dict[str, Any] = {
+    "limits": {"task_retry_limit": 4},
+    "projects": {
+        "acme": {"path": "/w/acme", "variables": {"api_key": "SENTINEL", "token_bucket_size": "9"}}
+    },
+}
+
+
+def test_the_config_write_tool_writes_what_the_library_writes(
+    tmp_path: Path, baseline: dict[str, Any]
+) -> None:
+    """The write tool is the library's write path, not a second one beside it.
+
+    Both paths write the same patch on the same surface against their own pinned
+    home, and the document each produces is compared byte for byte. A tool that
+    assembled its own patch, stamped its own version, wrote through another
+    surface, or formatted the file differently diverges here.
+    """
+    mcp_home = tmp_path / "config-write-mcp-home"
+    with stdio_server(mcp_home) as running:
+        running.initialize()
+        written = running.tool_payload("write_config", {"patch": _CONFIG_PATCH, "actor": ACTOR})
+    assert written["written"] is True, f"the write tool reported no write: {written}"
+
+    library_home = tmp_path / "config-write-library-home"
+    with _pinned_home(library_home):
+        ConfigStore().write(_CONFIG_PATCH, surface=ENGINE_MCP_SURFACE, actor=ACTOR)
+
+    with _pinned_home(mcp_home):
+        mcp_document = ConfigStore().path
+    with _pinned_home(library_home):
+        library_document = ConfigStore().path
+
+    assert mcp_document.is_file(), "the write tool wrote no configuration document"
+    assert library_document.is_file(), "the library path wrote no configuration document"
+    assert mcp_document.read_bytes() == library_document.read_bytes()
+
+    # The reply is elided even though the file is not: the tool is a read path too.
+    assert "SENTINEL" not in json.dumps(written)
+    assert "SENTINEL" in mcp_document.read_text(encoding="utf-8")
+
+    # And it wrote ONLY configuration: no row, no audit record, compared against a
+    # home where the server merely started.
+    mcp_state = _dump_state(mcp_home)
+    assert mcp_state["tables"] == baseline["tables"], "the write tool wrote state rows"
+    assert mcp_state["audit"] == baseline["audit"], "the write tool wrote audit records"
+
+    # Both paths recorded who wrote, in the same shape. The record is the durable
+    # answer to "who armed this host", so a path that stopped writing it must fail
+    # even though the documents would still match.
+    for home in (mcp_home, library_home):
+        with _pinned_home(home):
+            records = ConfigStore().writes()
+        assert len(records) == 1, f"{home.name} recorded {len(records)} writes, expected one"
+        assert records[0]["actor"] == ACTOR
+        assert records[0]["surface"] == ENGINE_MCP_SURFACE.name
+        assert records[0]["keys"] == sorted(_CONFIG_PATCH)
+
+
+def test_the_config_read_returns_what_the_library_reads(tmp_path: Path) -> None:
+    """The read tool returns the library's document, minus the classified values.
+
+    Compared against the library's own read with the store's own elision applied,
+    so the tool cannot pass by eliding differently, by reading a second root, or by
+    returning a document nobody saved.
+    """
+    home = tmp_path / "config-read-home"
+    with stdio_server(home) as running:
+        running.initialize()
+        running.tool_payload("write_config", {"patch": _CONFIG_PATCH, "actor": ACTOR})
+        read = running.tool_payload("get_config", {})
+
+    with _pinned_home(home):
+        store = ConfigStore()
+        expected = elide_secrets(store.document())
+        expected_path = str(store.path)
+
+    assert read["configured"] is True
+    assert read["document"] == expected.document
+    assert read["elided"] == list(expected.paths)
+    assert read["path"] == expected_path
+    # Non-vacuity in both directions: something WAS elided, and the ordinary
+    # settings beside it came through.
+    assert read["elided"] == ["projects.acme.variables.api_key"]
+    assert read["document"]["projects"]["acme"]["variables"]["token_bucket_size"] == "9"
+    assert read["document"]["limits"]["task_retry_limit"] == 4
 
 
 # --- the claim: identical resulting state ---------------------------------

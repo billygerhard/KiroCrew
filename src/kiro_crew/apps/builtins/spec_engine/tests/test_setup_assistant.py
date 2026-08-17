@@ -18,6 +18,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.autonomy import AUTONOMY_FIELD, 
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import Untrusted
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     CURRENT_VERSION,
+    PUBLIC_SOURCE_AUTONOMY,
     VERSION_KEY,
     ConfigStore,
     ConfigValidationError,
@@ -646,6 +647,90 @@ class TestProjectFilesAlone:
         practice = plan.inference(SUBJECT_WORKFLOW_PRACTICE)
         assert practice is not None
         assert practice.evidence[0].render()["located_at"].startswith("memory:")
+
+
+class TestTheApproverAndWhatTheyWereTold:
+    """An approved apply names a human and tells them what they armed.
+
+    Both halves used to stop at the call boundary. The approver an agent-facing
+    apply demands was echoed in a reply and recorded nowhere, and the advisories
+    the write earned were raised into a log line the caller never saw — including
+    the one that requires an acknowledgment because a stranger can start the run it
+    authorizes.
+    """
+
+    def approved(self, plan) -> frozenset[str]:
+        return frozenset(item.subject for item in plan.inferences)
+
+    def test_the_approver_is_recorded_where_it_outlives_the_call(
+        self, store: ConfigStore, github_project: Path
+    ):
+        plan = propose_setup(github_project, project="acme", which=all_programs)
+        apply_setup(
+            store,
+            plan,
+            SetupAnswers(
+                cost_profile="budget",
+                confirmations=declined(),
+                approved_subjects=self.approved(plan),
+                watch_source="github",
+            ),
+            actor="ada@example",
+        )
+        # Read through a store built from the root alone, because "durable" means
+        # the record is on disk rather than in the object that wrote it.
+        records = ConfigStore(store.root).writes()
+        assert [record["actor"] for record in records] == ["ada@example"]
+        assert records[0]["surface"] == SETUP_ASSISTANT_SURFACE.name
+        assert records[0]["operator_confirmed"] is True
+
+    def test_the_advisories_the_write_earned_come_back_on_the_result(
+        self, store: ConfigStore, github_project: Path
+    ):
+        # Confirming execution on a source whose items anyone may submit is the
+        # advisory that requires an acknowledgment. The caller is the last thing
+        # between it and the operator, so it travels rather than being logged.
+        plan = propose_setup(github_project, project="acme", which=all_programs)
+        result = apply_setup(
+            store,
+            plan,
+            SetupAnswers(
+                cost_profile="budget",
+                confirmations={
+                    AutonomyLevel.EXECUTION: True,
+                    AutonomyLevel.DELIVERY: False,
+                    AutonomyLevel.INTEGRATION: False,
+                },
+                approved_subjects=self.approved(plan),
+                watch_source="github",
+            ),
+            actor="ada@example",
+        )
+        codes = [advisory.code for advisory in result.advisories]
+        assert PUBLIC_SOURCE_AUTONOMY in codes
+        armed = next(item for item in result.advisories if item.code == PUBLIC_SOURCE_AUTONOMY)
+        assert armed.requires_acknowledgment is True
+        assert "acknowledge this" in armed.message
+        assert "advisory:" in result.describe()
+
+    def test_an_apply_that_arms_nothing_carries_no_advisory(
+        self, store: ConfigStore, github_project: Path
+    ):
+        # Non-vacuity for the case above: with every rung declined the document
+        # earns nothing, so a result that always listed something would fail here.
+        plan = propose_setup(github_project, project="acme", which=all_programs)
+        result = apply_setup(
+            store,
+            plan,
+            SetupAnswers(
+                cost_profile="budget",
+                confirmations=declined(),
+                approved_subjects=self.approved(plan),
+                watch_source="github",
+            ),
+        )
+        assert result.advisories == ()
+        assert ConfigStore(store.root).writes()[0]["actor"] is None
 
 
 class TestReadingTheProject:

@@ -18,6 +18,11 @@ tool takes a project, answers, an identity and an approver, and nothing else.
 ``test_engine_mcp_setup_tools`` hold that shape; an arbitrary configuration write
 still has only the unconfirmed door below.
 
+``write_config`` is that door, made reachable from a tool. It takes a
+caller-supplied patch and is therefore the thing this file is about: it writes on
+the unconfirmed surface, so every case below is driven through it, and
+``test_engine_mcp_config_tools`` holds the rest of its contract.
+
 The tests ask the question the task insists on: what ELSE reaches the same
 effect? A whole-document write, a nested partial-map merge, the quality-gates
 section that once carried the same executable argv while the workflow beside it
@@ -61,10 +66,18 @@ _EXPECTED_TOOLS = {
     "inspect_setup",
     "plan_setup",
     "apply_setup",
+    # The configuration door. `get_config` reads and elides; `write_config` takes
+    # a caller-supplied patch, which is why it is the tool this file is about. It
+    # is listed here having been read: it writes through `EngineOperations.
+    # write_config` on the unconfirmed `ENGINE_MCP_SURFACE`, so the shared fence
+    # below refuses every config-only object it could name, on every transport,
+    # and there is no second write path for it to take.
+    "get_config",
+    "write_config",
 }
 
-#: Tools that only read: they answer from the project's files and must leave the
-#: configuration document absent.
+#: Setup tools that only read: they answer from the project's files and must
+#: leave the configuration document absent.
 _READ_ONLY_SETUP_TOOLS = ("inspect_setup", "plan_setup")
 
 
@@ -128,7 +141,10 @@ def test_ordinary_settings_still_write_through_the_same_door(tmp_path: Path) -> 
 def test_no_tool_dispatch_reaches_a_configuration_write(tmp_path: Path, monkeypatch: Any) -> None:
     # Dispatch every operational tool and prove none of them touches the config
     # door. This catches a future tool wired to write_config regardless of what
-    # its name suggests.
+    # its name suggests. `write_config` itself is excluded because it IS the door;
+    # that exclusion is not a hole, because
+    # `test_the_write_tool_reaches_the_door_and_nothing_else_does` proves the door
+    # is reached from exactly that one tool.
     project = tmp_path / "project"
     spec_dir = project / ".kiro" / "specs" / "s"
     spec_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +154,7 @@ def test_no_tool_dispatch_reaches_a_configuration_write(tmp_path: Path, monkeypa
 
     ops = EngineOperations(state_root=tmp_path / "state", audit_root=tmp_path / "audit")
     calls: list[Any] = []
-    monkeypatch.setattr(ops, "write_config", lambda patch: calls.append(patch))
+    monkeypatch.setattr(ops, "write_config", lambda patch, **kwargs: calls.append(patch))
 
     key = {"project": str(project), "spec": "s"}
     invocations = [
@@ -154,6 +170,8 @@ def test_no_tool_dispatch_reaches_a_configuration_write(tmp_path: Path, monkeypa
         # about dispatch, not about the tool's name.
         ("inspect_setup", {"project": str(project)}),
         ("plan_setup", {"project": str(project), "answers": {"cost_profile": "budget"}}),
+        # And the configuration read, for the same reason.
+        ("get_config", {}),
     ]
     for name, arguments in invocations:
         handle(
@@ -166,6 +184,41 @@ def test_no_tool_dispatch_reaches_a_configuration_write(tmp_path: Path, monkeypa
             ops=ops,
         )
     assert calls == []
+
+
+def test_the_write_tool_reaches_the_door_and_nothing_else_does(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The positive control the sweep above needs. If `write_config` stopped
+    # reaching `EngineOperations.write_config` -- by writing through its own store,
+    # say -- the sweep would still pass while the fence had been left behind, so
+    # the one tool allowed through the door has to be observed going through it.
+    ops = EngineOperations(config_root=tmp_path / "config")
+    calls: list[Any] = []
+
+    def door(patch: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append((patch, kwargs))
+        return {"version": 1}
+
+    monkeypatch.setattr(ops, "write_config", door)
+    handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_config",
+                "arguments": {"patch": {"limits": {"task_retry_limit": 4}}, "actor": "ada"},
+            },
+        },
+        ops=ops,
+    )
+    assert len(calls) == 1
+    patch, kwargs = calls[0]
+    assert patch == {"limits": {"task_retry_limit": 4}}
+    # The actor the caller named travels to the door, where it is recorded. A tool
+    # that dropped it would leave the write attributed to nobody.
+    assert kwargs["actor"] == "ada"
 
 
 def test_the_setup_reads_write_no_configuration_document(tmp_path: Path) -> None:

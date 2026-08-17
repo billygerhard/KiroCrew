@@ -222,6 +222,12 @@ class TestToolSurfaceIsInvariantAcrossBindings:
                 "inspect_setup",
                 "plan_setup",
                 "apply_setup",
+                # The configuration door. Listed here for the same reason: what a
+                # caller may read and write is decided by the engine's own schema
+                # and its config-only fence, not by which provider a capability is
+                # bound to, so binding one externally must not add or remove a tool.
+                "get_config",
+                "write_config",
             }
         )
 

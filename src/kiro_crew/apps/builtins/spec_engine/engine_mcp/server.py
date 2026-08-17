@@ -21,7 +21,10 @@ from typing import Any, Callable
 
 from kiro_crew.security import redact
 
+from ..engine.config import ConfigWarning
+from ..engine.config.store import ConfigLoadError, ConfigValidationError, ConfigWriteRefused
 from ..engine.setup import InferredSubjectRefused, SetupApprovalRequired
+from .config_surface import write_payload, write_refusal
 from .guidance import GuidanceUnavailable, get_authoring_guidance, get_guidance
 from .operations import EngineOperations
 from .setup_surface import refusal_payload
@@ -247,6 +250,54 @@ def _tool_apply_setup(args: dict[str, Any], ops: EngineOperations | None) -> dic
     )
 
 
+def _refusing_config(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run *call*, returning a structured refusal for a configuration refusal.
+
+    Traced against what :meth:`ConfigStore.write` and
+    :meth:`ConfigStore.document` raise, not against the class names:
+    ``ConfigWriteRefused`` derives ``PermissionError``, ``ConfigValidationError``
+    derives ``ValueError``, and ``ConfigLoadError`` derives ``RuntimeError``.
+    Catching them inside the handler is what puts them ahead of the dispatcher's
+    ``(ValueError, KeyError)`` clause, which would report a fenced path as
+    malformed arguments and a corrupt file as an internal error.
+
+    ``ConfigRecordError`` is deliberately absent: it means the document was
+    persisted and nothing recorded who wrote it, so it must reach the caller as a
+    tool error rather than as a decision the engine made.
+    """
+    try:
+        return call()
+    except (ConfigWriteRefused, ConfigValidationError, ConfigLoadError) as exc:
+        refusal = write_refusal(exc)
+        if refusal is None:  # pragma: no cover - all three are in REFUSAL_CODES
+            raise
+        return refusal
+
+
+def _tool_get_config(_args: dict[str, Any], ops: EngineOperations | None) -> dict[str, Any]:
+    """Read the persisted configuration, with secret-classified values elided."""
+    return _refusing_config(lambda: _adapter(ops).get_config())
+
+
+def _tool_write_config(args: dict[str, Any], ops: EngineOperations | None) -> dict[str, Any]:
+    """Merge a configuration patch through the engine's one fenced write path."""
+    patch = args.get("patch")
+    if not isinstance(patch, dict):
+        raise ValueError("patch must be an object holding the configuration to merge")
+    actor = args.get("actor")
+    advisories: list[ConfigWarning] = []
+
+    def write() -> dict[str, Any]:
+        merged = _adapter(ops).write_config(
+            patch,
+            actor=str(actor) if actor is not None else None,
+            warn=advisories.append,
+        )
+        return write_payload(patch, merged, advisories)
+
+    return _refusing_config(write)
+
+
 def _tool_run_doctor(args: dict[str, Any], _ops: EngineOperations | None) -> dict[str, Any]:
     """Every Finding the Doctor found, as the UI panel's own path returns them.
 
@@ -288,9 +339,12 @@ def _tool_check_run_prerequisites(
 
 #: The registered tool surface. A stock Host_Agent holding only this server
 #: reads the guidance tools to learn the workflow, then drives it through the
-#: operational tools. There is deliberately no tool that writes the Autonomy_
-#: Policy or the Delivery_Workflow: those are configuration only, and the
-#: adapter's single configuration door is fenced by the engine's write path.
+#: operational tools. The Autonomy_Policy and the Delivery_Workflow are still
+#: unreachable from here: ``write_config`` is the adapter's one configuration
+#: door, and it writes on a surface no operator confirmed, so the engine's shared
+#: fence refuses every config-only object through it on every transport. The one
+#: path onto the confirmed surface is ``apply_setup``, which writes a patch the
+#: engine built from an offered plan on a named human's authority.
 TOOLS: dict[str, ToolSpec] = {
     "get_authoring_prompt": ToolSpec(
         _tool_get_authoring_prompt,
@@ -431,6 +485,49 @@ TOOLS: dict[str, ToolSpec] = {
             },
         },
         ("project", "answers", "plan_id", "approver"),
+        needs_ops=True,
+    ),
+    "get_config": ToolSpec(
+        _tool_get_config,
+        "Read the engine's persisted configuration: whether any exists yet, the document "
+        "itself with every secret-classified value elided, the dotted paths that were "
+        "elided, any validation error the saved document holds, and any advisory it earns. "
+        "Read-only and spends nothing. Call this before setup to find out whether the "
+        "project is configured at all.",
+        needs_ops=True,
+    ),
+    "write_config": ToolSpec(
+        _tool_write_config,
+        "Merge a configuration patch into the engine's document through its single "
+        "validated write path. Nested objects merge key by key and a null value returns a "
+        "setting to its bundled default. Refuses, naming the paths, any config-only "
+        "object — the autonomy grid, the delivery workflow, capability bindings on every "
+        "transport, quality gates, intake guidance, and the unattended-integration "
+        "switch — because those are writable only from a surface a human confirmed. "
+        "Returns the merged document with secret values elided, plus any advisory the "
+        "result earns.",
+        {
+            "patch": {
+                "type": "object",
+                "description": (
+                    "The configuration to merge, shaped like the document itself. A null "
+                    "value at a key removes it, restoring that setting's default."
+                ),
+                # Free-form on purpose: the patch IS configuration, and enumerating
+                # the document's schema here would be a second schema to drift from
+                # the validator that actually decides what is accepted.
+                "additionalProperties": True,
+            },
+            "actor": {
+                **_STRING,
+                "description": (
+                    "Who authorized this write (optional). Recorded with the write; the "
+                    "caller asserts it, so it names an accountable human rather than "
+                    "proving one."
+                ),
+            },
+        },
+        ("patch",),
         needs_ops=True,
     ),
     "run_doctor": ToolSpec(

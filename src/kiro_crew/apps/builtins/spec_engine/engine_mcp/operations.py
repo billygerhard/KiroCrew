@@ -23,7 +23,7 @@ from typing import Any, Mapping, Sequence
 
 from ..engine.analysis import AnalysisReport
 from ..engine.composition import EngineGraph, build_engine
-from ..engine.config import ConfigWriteSurface
+from ..engine.config import ConfigWriteSurface, WarningRecorder
 from ..engine.config.store import SETUP_ASSISTANT_SURFACE
 from ..engine.cross_document import validate_spec as validate_spec_documents
 from ..engine.phases import RunMode, advance, approve, derive_phase
@@ -33,6 +33,7 @@ from ..engine.setup import apply_setup as apply_setup_plan
 from ..engine.setup import propose_setup, setup_patch
 from ..engine.state import SpecRef
 from ..engine.structure import parse_tasks
+from .config_surface import config_payload
 from .setup_surface import (
     SetupPlanEnvelope,
     answers_from_arguments,
@@ -157,7 +158,7 @@ class EngineOperations:
     """Adapter binding tool calls to engine library calls.
 
     Built over the engine's one composition root rather than over collaborators
-    of its own. Today's six operations touch documents, phases, approvals and
+    of its own. These operations touch documents, phases, approvals and
     configuration — no run row and no capability — so a private store and audit
     log would still *work*; they would also be a second, partial object graph,
     and the first run-touching or capability-touching tool added here would
@@ -351,6 +352,7 @@ class EngineOperations:
             plan,
             answers_from_arguments(answers),
             surface=SETUP_ASSISTANT_SURFACE,
+            actor=identity,
         )
         return apply_payload(envelope, result, identity)
 
@@ -371,19 +373,56 @@ class EngineOperations:
 
     # --- the guarded configuration door ------------------------------------
 
-    def write_config(self, patch: Mapping[str, Any]) -> dict[str, Any]:
+    def get_config(self) -> dict[str, Any]:
+        """Return the persisted configuration, with secret values elided.
+
+        Reads through the graph's own store, so a caller reads the document the
+        rest of the app writes rather than one resolved from a second root. The
+        elision is the Config_Store's classification, applied here because this is
+        a path onto a model's context: see
+        :mod:`~.config_surface` for what travels and why.
+        """
+        return config_payload(self._config)
+
+    def write_config(
+        self,
+        patch: Mapping[str, Any],
+        *,
+        actor: str | None = None,
+        warn: WarningRecorder | None = None,
+    ) -> dict[str, Any]:
         """Persist a configuration *patch* through the engine's single write path.
 
-        This is the ONLY door this adapter has onto configuration, and it is
-        fenced by construction: the write goes through :meth:`ConfigStore.write`
-        on :data:`ENGINE_MCP_SURFACE`, which is not operator-confirmed, so the
-        engine refuses every config-only path — the autonomy policy, the delivery
-        workflow, and everything else the shared fence guards. No tool is wired
-        to this method; it exists so that any configuration this adapter ever
-        needs to write cannot escape the fence the rest of the app relies on.
+        This is the ONLY door this adapter has onto arbitrary configuration, and
+        it is fenced by construction: the write goes through
+        :meth:`ConfigStore.write` on :data:`ENGINE_MCP_SURFACE`, which is not
+        operator-confirmed, so the engine refuses every config-only path — the
+        autonomy policy, the delivery workflow, capability bindings on any
+        transport, quality gates, intake guidance, and the auto-integrate switch.
+        The refusal is the shared fence's, not a second one here, so a path added
+        to that fence protects this door without an edit.
+
+        *actor* is recorded beside the surface name in the store's durable write
+        record. It is what the caller SAYS authorized the write; the surface name
+        beside it is what no caller chooses, which is why the two are recorded
+        together and neither alone.
+
+        *warn* receives the advisories the persisted document earns, so a caller
+        can relay them. Returns the merged document, unelided: this is the library
+        seam, and the tool that displays a result elides through
+        :func:`~.config_surface.write_payload`.
 
         Writes through the graph's own store, so this adapter reads and writes
         configuration through one object rather than through a second store whose
         root could drift from the one everything else resolved.
+
+        Synchronous and safe to hand to a worker thread. The MCP server is
+        line-oriented stdio with no event loop, so nothing here is awaited; the
+        async boundary lives in the gateway, where the app's HTTP routes call this
+        method through ``asyncio.to_thread``. That works because the read-modify-
+        write is serialized by a lock file opened per call rather than by a module
+        global: no lock object outlives the call, so no lock can be held across an
+        await, and two threads writing at once serialize on the filesystem the same
+        way two processes do.
         """
-        return self._config.write(patch, surface=ENGINE_MCP_SURFACE)
+        return self._config.write(patch, surface=ENGINE_MCP_SURFACE, actor=actor, warn=warn)

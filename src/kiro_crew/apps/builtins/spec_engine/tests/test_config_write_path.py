@@ -2,17 +2,21 @@
 
 What these tests hold: every surface writes through one door, that door
 validates the merged result before anything lands on disk, a failed write leaves
-the previous document intact, and the config-only objects — the autonomy policy,
-the delivery workflow, capability bindings — cannot be written by a surface no
-human confirmed.
+the previous document intact, the config-only objects — the autonomy policy, the
+delivery workflow, capability bindings — cannot be written by a surface no human
+confirmed, every accepted write leaves a durable record of who made it, and a
+value the store classifies as a credential is elided on the way back out.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
@@ -20,8 +24,11 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     CONFIG_FILENAME,
     CURRENT_VERSION,
     DASHBOARD_SURFACE,
+    ELIDED,
     SETUP_ASSISTANT_SURFACE,
+    WRITE_LOG_FILENAME,
     ConfigLoadError,
+    ConfigRecordError,
     ConfigStore,
     ConfigValidationError,
     ConfigWriteRefused,
@@ -29,6 +36,9 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     ValueOrigin,
     config_only_paths,
     default_root,
+    elide_secrets,
+    is_secret_key,
+    key_segments,
 )
 
 #: A surface with no human watching. Stands in for any future non-interactive
@@ -205,6 +215,288 @@ class TestConfigOnlyObjects:
             surface=SETUP_ASSISTANT_SURFACE,
         )
         assert store.document()["workflow"]["stages"]["verify"] == [["make", "test"]]
+
+
+class TestSecretClassification:
+    """Which values a read path must not hand out, and which it must keep.
+
+    Both directions matter equally. A classification that misses a token leaks it
+    into a model's context; a classification that elides ``token_bucket_size``
+    teaches every caller that the marker means nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "token",
+            "api_key",
+            "API_KEY",
+            "GITHUB_TOKEN",
+            "apiToken",
+            "client-secret",
+            "password",
+            "passwd",
+            "passphrase",
+            "credentials",
+            "aws_secret_access_key",
+        ],
+    )
+    def test_a_key_naming_a_credential_is_classified_secret(self, key: str):
+        assert is_secret_key(key)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # The lookalikes. Each mentions a credential noun and holds none: the
+            # last segment is what the value IS, and here it is a size, an order,
+            # a count, a path or a flag.
+            "token_bucket_size",
+            "secret_scanning_enabled",
+            "key_order",
+            "password_policy_url",
+            "credentials_path",
+            "tokens_per_minute",
+            "limits",
+            "base_branch",
+            "transport",
+        ],
+    )
+    def test_a_key_merely_mentioning_a_credential_is_not(self, key: str):
+        assert not is_secret_key(key)
+
+    def test_segments_split_on_punctuation_and_case(self):
+        assert key_segments("GITHUB_TOKEN") == ("github", "token")
+        assert key_segments("apiToken") == ("api", "token")
+        assert key_segments("client-secret.v2") == ("client", "secret", "v2")
+
+    def test_elision_replaces_the_value_and_reports_the_path(self):
+        elided = elide_secrets(
+            {
+                "capabilities": {"analysis": {"env": {"GITHUB_TOKEN": "ghp_sentinel"}}},
+                "projects": {"acme": {"variables": {"api_key": "AKIA_sentinel"}}},
+                "limits": {"task_retry_limit": 4},
+            }
+        )
+        assert elided.document["capabilities"]["analysis"]["env"]["GITHUB_TOKEN"] == ELIDED
+        assert elided.document["projects"]["acme"]["variables"]["api_key"] == ELIDED
+        assert elided.document["limits"]["task_retry_limit"] == 4
+        assert elided.paths == (
+            "capabilities.analysis.env.GITHUB_TOKEN",
+            "projects.acme.variables.api_key",
+        )
+
+    def test_a_secret_container_is_elided_whole(self):
+        # Descending into it would publish the field names of the thing being
+        # withheld, which is itself half the credential.
+        elided = elide_secrets({"credentials": {"username": "ada", "password": "hunter2"}})
+        assert elided.document == {"credentials": ELIDED}
+        assert "ada" not in json.dumps(elided.document)
+
+    def test_lists_are_walked(self):
+        # Quality gates are a list of objects, so a secret can sit at an index
+        # rather than under a key.
+        elided = elide_secrets({"gates": [{"name": "lint"}, {"token": "sentinel"}]})
+        assert elided.document["gates"][1]["token"] == ELIDED
+        assert elided.paths == ("gates[1].token",)
+
+    def test_the_persisted_document_still_holds_the_value(self, store: ConfigStore):
+        # Elision is a read-path concern. A write that dropped the value would
+        # break the capability that needs it on the next run.
+        store.write(
+            {"projects": {"acme": {"path": "/w/acme", "variables": {"api_key": "sentinel"}}}},
+            surface=DASHBOARD_SURFACE,
+        )
+        assert store.document()["projects"]["acme"]["variables"]["api_key"] == "sentinel"
+        assert elide_secrets(store.document()).paths == ("projects.acme.variables.api_key",)
+
+
+#: Leaf values a generated document carries. A string that looks like a
+#: credential and a number, so a leak shows up as the sentinel itself.
+_LEAVES = st.one_of(st.just("SENTINEL-CREDENTIAL"), st.integers(min_value=0, max_value=99))
+
+#: Keys drawn from both sides of the classification, so a generated document
+#: mixes secrets with lookalikes rather than testing one branch.
+_KEYS = st.sampled_from(
+    [
+        "api_key",
+        "GITHUB_TOKEN",
+        "password",
+        "credentials",
+        "token_bucket_size",
+        "limits",
+        "task_retry_limit",
+        "transport",
+    ]
+)
+
+
+class TestSecretClassificationProperties:
+    """The elision rule over generated documents, not only the shapes chosen above.
+
+    Two halves of one property, because either alone is satisfiable by a useless
+    implementation: eliding everything satisfies the first, eliding nothing
+    satisfies the second.
+    """
+
+    @settings(max_examples=200, deadline=None)
+    @given(
+        document=st.dictionaries(
+            _KEYS,
+            st.recursive(
+                _LEAVES,
+                lambda children: st.one_of(
+                    st.dictionaries(_KEYS, children, max_size=3),
+                    st.lists(children, max_size=3),
+                ),
+                max_leaves=6,
+            ),
+            max_size=4,
+        )
+    )
+    def test_a_secret_branch_collapses_to_the_marker_and_nothing_else_moves(self, document: dict):
+        elided = elide_secrets(document)
+
+        # The characterization, as a path-to-value map so it says both halves at
+        # once: every leaf NOT under a secret-classified key survives at its own
+        # path with its own value, every secret-classified key holds exactly the
+        # marker, and no leaf appears anywhere it was not. Comparing values as sets
+        # instead would be defeated by a document that legitimately repeats one
+        # string under a visible key.
+        expected = {
+            path: value for path, value in _leaves(document).items() if not _under_secret(path)
+        }
+        expected.update({path: ELIDED for path in _secret_paths(document)})
+        assert _leaves(elided.document) == expected
+
+        # And the reported paths are exactly the elided ones, so a surface can
+        # tell an operator what was withheld.
+        assert set(elided.paths) == _secret_paths(document)
+
+
+def _leaves(node: object, prefix: str = "") -> dict[str, object]:
+    """Every leaf in a document, keyed by its dotted path."""
+    found: dict[str, object] = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            name = str(key)
+            found.update(_leaves(value, f"{prefix}.{name}" if prefix else name))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found.update(_leaves(item, f"{prefix}[{index}]"))
+    elif prefix:
+        found[prefix] = node
+    return found
+
+
+def _under_secret(path: str) -> bool:
+    """Whether any key segment of *path* is itself classified secret."""
+    return any(is_secret_key(part.split("[", 1)[0]) for part in path.split(".") if part)
+
+
+def _secret_paths(node: object, prefix: str = "") -> set[str]:
+    """The dotted path of every secret-classified key, outermost only."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            name = str(key)
+            path = f"{prefix}.{name}" if prefix else name
+            if is_secret_key(name):
+                found.add(path)
+            else:
+                found |= _secret_paths(value, path)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found |= _secret_paths(item, f"{prefix}[{index}]")
+    return found
+
+
+class TestWriteRecord:
+    """Who wrote configuration, recorded somewhere that outlives the process.
+
+    The engine demands a named human before it applies a setup plan. Before this
+    record existed, that name was echoed in a reply and kept nowhere, so the one
+    question an incident asks — who authorized the autonomy this host is running
+    at — had no answer on disk.
+    """
+
+    def test_a_write_records_the_surface_and_the_actor(self, store: ConfigStore):
+        store.write(
+            {"limits": {"task_retry_limit": 2}}, surface=DASHBOARD_SURFACE, actor=" ada@example "
+        )
+        records = store.writes()
+        assert len(records) == 1
+        assert records[0]["surface"] == DASHBOARD_SURFACE.name
+        assert records[0]["operator_confirmed"] is True
+        assert records[0]["actor"] == "ada@example"
+        assert records[0]["keys"] == ["limits"]
+        assert records[0]["ts"]
+
+    def test_the_record_survives_the_store_object(self, store: ConfigStore):
+        # The point of the record is that it outlives the process that wrote it,
+        # so it is read back through a store built from nothing but the root.
+        store.write({"limits": {"task_retry_limit": 2}}, surface=DASHBOARD_SURFACE, actor="ada")
+        store.write({"limits": {"verify_retry_limit": 1}}, surface=DASHBOARD_SURFACE, actor="bo")
+        reopened = ConfigStore(store.root)
+        assert [record["actor"] for record in reopened.writes()] == ["ada", "bo"]
+        assert reopened.write_log_path.name == WRITE_LOG_FILENAME
+
+    def test_a_surface_with_no_identity_records_that_rather_than_inventing_one(
+        self, store: ConfigStore
+    ):
+        store.write({"limits": {"task_retry_limit": 2}}, surface=UNCONFIRMED_SURFACE)
+        assert store.writes()[0]["actor"] is None
+        assert store.writes()[0]["operator_confirmed"] is False
+
+    def test_a_confirmed_write_records_which_fenced_paths_it_exercised(self, store: ConfigStore):
+        store.write(
+            {"workflow": {"stages": {"verify": [["make", "test"]]}}},
+            surface=SETUP_ASSISTANT_SURFACE,
+            actor="ada",
+        )
+        assert store.writes()[0]["config_only_paths"] == ["workflow"]
+
+    def test_the_record_carries_no_written_value(self, store: ConfigStore):
+        # A record that copied the patch would be a second place credentials
+        # live, and one no read path elides.
+        store.write(
+            {"projects": {"acme": {"path": "/w/acme", "variables": {"api_key": "sentinel"}}}},
+            surface=DASHBOARD_SURFACE,
+            actor="ada",
+        )
+        assert "sentinel" not in store.write_log_path.read_text(encoding="utf-8")
+
+    def test_a_refused_write_records_nothing(self, store: ConfigStore):
+        with pytest.raises(ConfigWriteRefused):
+            store.write({"workflow": {"stages": {}}}, surface=UNCONFIRMED_SURFACE, actor="ada")
+        with pytest.raises(ConfigValidationError):
+            store.write({"limits": {"task_retry_limit": -1}}, surface=DASHBOARD_SURFACE)
+        assert store.writes() == ()
+
+    def test_a_record_that_cannot_land_fails_the_write_loudly(
+        self, store: ConfigStore, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Loud rather than logged: a document that changed with nothing saying who
+        # changed it is exactly the state the record exists to prevent, so the
+        # caller is told both facts instead of reading an ordinary success.
+        def refuse(path: str, flags: int, mode: int = 0o777) -> int:
+            if path.endswith(WRITE_LOG_FILENAME):
+                raise OSError(13, "permission denied")
+            return real_open(path, flags, mode)
+
+        real_open = os.open
+        monkeypatch.setattr(os, "open", refuse)
+        with pytest.raises(ConfigRecordError) as caught:
+            store.write({"limits": {"task_retry_limit": 2}}, surface=DASHBOARD_SURFACE, actor="a")
+        monkeypatch.undo()
+        assert str(store.path) in str(caught.value)
+        assert store.document()["limits"]["task_retry_limit"] == 2
+
+    def test_a_truncated_line_does_not_hide_the_rest(self, store: ConfigStore):
+        store.write({"limits": {"task_retry_limit": 2}}, surface=DASHBOARD_SURFACE, actor="ada")
+        with store.write_log_path.open("a", encoding="utf-8") as log:
+            log.write('{"ts": "2026-0\n')
+        store.write({"limits": {"verify_retry_limit": 1}}, surface=DASHBOARD_SURFACE, actor="bo")
+        assert [record["actor"] for record in store.writes()] == ["ada", "bo"]
 
 
 class TestStateLocation:

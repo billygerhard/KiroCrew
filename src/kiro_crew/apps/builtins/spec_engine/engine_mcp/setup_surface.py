@@ -60,6 +60,7 @@ from ..engine.setup import (
     SetupResult,
 )
 from ..engine.watch.sources import POLL_KEY, watch_source_presets
+from .config_surface import render_advisory
 
 __all__ = [
     "ApproverRequired",
@@ -485,6 +486,12 @@ def apply_payload(
     configuration read tool's job; returning the whole document here would put an
     unelided copy on a path that never learned the classification. The patch and
     the written paths say what changed, which is what an approver needs to check.
+
+    ``advisories`` carries what the Config_Store raised about the document this
+    write produced. They travel because the caller is the last thing between them
+    and a human: an apply that arms execution autonomy on a publicly submittable
+    source earns an acknowledgment-requiring advisory, and an agent that never saw
+    it cannot tell the operator what they just turned on.
     """
     return {
         "applied": True,
@@ -495,4 +502,5 @@ def apply_payload(
         "config_patch": dict(envelope.config_patch),
         "prerequisites": render_prerequisites(result.prerequisites),
         "notes": list(result.notes),
+        "advisories": [render_advisory(advisory) for advisory in result.advisories],
     }

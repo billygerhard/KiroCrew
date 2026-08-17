@@ -54,6 +54,7 @@ from typing import Any
 from .autonomy import AUTONOMY_FIELD, AutonomyLevel
 from .capabilities.contracts import Untrusted, sanitized
 from .config import ConfigStore
+from .config.advisories import ConfigWarning
 from .config.agent_surface import PROJECT_PATH_FIELD
 from .config.profiles import (
     COST_PROFILE_PRESET_NAMES,
@@ -483,6 +484,11 @@ class SetupResult:
     written_paths: tuple[str, ...]
     prerequisites: PrerequisiteReport = field(default_factory=PrerequisiteReport)
     notes: tuple[str, ...] = ()
+    #: Advisories the persisted document earned, as the config store raised them.
+    #: Carried out of the write rather than dropped at it: an apply that arms
+    #: execution autonomy on a publicly submittable source earns one, and the
+    #: surface relaying the result is where a human can still be told.
+    advisories: tuple[ConfigWarning, ...] = ()
 
     def describe(self) -> str:
         lines = [
@@ -490,6 +496,7 @@ class SetupResult:
         ]
         lines.extend(f"unmet: {check.describe()}" for check in self.prerequisites.unmet)
         lines.extend(f"note: {note}" for note in self.notes)
+        lines.extend(f"advisory: {advisory}" for advisory in self.advisories)
         return "\n".join(lines)
 
 
@@ -704,6 +711,7 @@ def apply_setup(
     answers: SetupAnswers,
     *,
     surface: ConfigWriteSurface = SETUP_ASSISTANT_SURFACE,
+    actor: str | None = None,
     which: ProgramResolver | None = None,
 ) -> SetupResult:
     """Write *plan*'s approved parts through the validated config path.
@@ -713,9 +721,16 @@ def apply_setup(
 
     The patch goes to :meth:`~.config.ConfigStore.write`, which validates the
     merged document and persists it under the lock. Nothing here touches the file.
+
+    *actor* is the human the calling surface says approved the plan; the store
+    records it, so the approver an agent-facing apply demands survives the call
+    rather than being echoed back and forgotten. The advisories the write earns
+    are carried on the result for the same reason: the caller is the last thing
+    standing between them and the person who should read them.
     """
     proposed = setup_patch(plan, answers)
-    document = store.write(proposed.patch, surface=surface)
+    advisories: list[ConfigWarning] = []
+    document = store.write(proposed.patch, surface=surface, actor=actor, warn=advisories.append)
 
     checks: list[Prerequisite] = []
     if answers.watch_source is not None:
@@ -728,6 +743,7 @@ def apply_setup(
         written_paths=proposed.written_paths,
         prerequisites=PrerequisiteReport(checks=tuple(checks)),
         notes=proposed.notes,
+        advisories=tuple(advisories),
     )
 
 

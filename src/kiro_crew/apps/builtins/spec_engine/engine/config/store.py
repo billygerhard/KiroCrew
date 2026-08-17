@@ -20,10 +20,23 @@ The write path holds three properties:
   decide how far a run proceeds unattended, which commands it runs, and who
   answers for its judgment. They are writable only from an operator-confirmed
   surface, so no engine or tool path can widen its own authority.
+* **Record who wrote, durably.** Every accepted write appends one line to
+  :data:`WRITE_LOG_FILENAME` naming the surface, the actor the surface says
+  authorized it, and which paths were touched. A log line in the gateway's
+  output is not that record: it rotates, it is not there on a host that ran the
+  MCP server as its own process, and the approver a setup apply demands would
+  survive nowhere.
 
 The document lives in the app's data directory, never inside a spec directory:
 the Kiro IDE and CLI read the same ``.kiro/specs/<name>/`` trees, so anything
 the engine adds there would be a foreign file in someone else's contract.
+
+Reading the document back out to somewhere it can be displayed is the other half
+of this module's job, and it is why the secret classification lives here rather
+than at a surface: a value this document can hold — an access token in a
+capability's environment, a credential in a project's variables — must be elided
+by whoever hands the document to an agent or a page, and a classification each
+surface spelled for itself is a classification one of them gets wrong.
 """
 
 from __future__ import annotations
@@ -31,14 +44,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
 
+from ..state import utc_now_iso
 from .advisories import ConfigWarning, WarningRecorder, document_warnings, record_config_warnings
 from .effective import EffectiveValue, resolve, resolve_all
 from .schema import (
@@ -60,6 +75,10 @@ APP_NAME = "spec-engine"
 CONFIG_FILENAME = "config.json"
 _LOCK_FILENAME = ".config.lock"
 
+#: Append-only record of every accepted write: one JSON object per line, holding
+#: who wrote and what they touched, never a written value.
+WRITE_LOG_FILENAME = "config-writes.jsonl"
+
 #: Owner-only: the document names the projects a user works on, their branch
 #: layout, and the commands the app may run on their behalf.
 _DIR_MODE = 0o700
@@ -68,6 +87,41 @@ _FILE_MODE = 0o600
 #: Path segments that mark a spec directory. Engine state must never resolve
 #: inside one.
 _SPEC_DIR_SEGMENTS = (".kiro", "specs")
+
+#: Substituted for a value classified as secret. A marker rather than an omitted
+#: key, so a caller can tell "this document holds a token" from "this document
+#: holds no such setting" -- the second would send an operator looking for a
+#: value that is already there.
+ELIDED = "<elided>"
+
+#: Key segments that name a credential. Matched against the LAST segment of a
+#: key, because the last segment is what the value IS: ``api_key`` and
+#: ``GITHUB_TOKEN`` hold a credential, while ``token_bucket_size`` holds a size
+#: and ``key_order`` holds an order. A substring test would elide both of those,
+#: and once a caller sees ordinary settings elided it stops reading the marker as
+#: meaning anything.
+SECRET_KEY_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "credential",
+        "credentials",
+        "key",
+        "keys",
+        "passphrase",
+        "passwd",
+        "password",
+        "passwords",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+    }
+)
+
+#: Splits a key into segments: on any non-alphanumeric run (``api_key``,
+#: ``api-key``, ``api.key``) and at a lower-to-upper transition (``apiKey``), so
+#: one classification covers the snake_case this schema uses, the SCREAMING_SNAKE
+#: of an environment map, and a camelCase key a caller pasted in.
+_SEGMENT_BOUNDARY = re.compile(r"[^0-9A-Za-z]+|(?<=[a-z0-9])(?=[A-Z])")
 
 
 @dataclass(frozen=True)
@@ -104,6 +158,85 @@ class ConfigWriteRefused(PermissionError):
 
 class ConfigLoadError(RuntimeError):
     """Raised when the persisted document cannot be read or parsed."""
+
+
+class ConfigRecordError(RuntimeError):
+    """Raised when an accepted write could not be recorded.
+
+    Loud on purpose, and the message says the document WAS persisted: the record
+    is what names the human a setup apply demanded an approver for, so a write
+    that lands unrecorded must not read as an ordinary success. A caller that
+    sees this knows both facts -- the configuration changed, and nothing says who
+    changed it -- which is the only pair of facts that leads to the right
+    reaction.
+    """
+
+
+def key_segments(key: str) -> tuple[str, ...]:
+    """Split *key* into its lowercased segments.
+
+    Segment-wise rather than substring, because a substring rule cannot tell
+    ``api_key`` from ``token_bucket_size``.
+    """
+    return tuple(part.lower() for part in _SEGMENT_BOUNDARY.split(key) if part)
+
+
+def is_secret_key(key: str) -> bool:
+    """Whether a value stored under *key* is classified as a credential.
+
+    True when the key's LAST segment names a credential. The last segment is the
+    noun the key is about: ``env.GITHUB_TOKEN`` is a token, ``variables.api_key``
+    is a key, and ``limits.token_bucket_size`` is a size that merely mentions one.
+    """
+    segments = key_segments(key)
+    return bool(segments) and segments[-1] in SECRET_KEY_SEGMENTS
+
+
+@dataclass(frozen=True)
+class ElidedDocument:
+    """A document safe to display, plus the dotted paths whose value was removed.
+
+    The paths are reported rather than left implicit so a surface can tell an
+    operator *what* was withheld. Without them, a page showing ``<elided>`` in
+    three places and a caller checking whether a token is configured cannot tell
+    an elision from a literal value someone typed.
+    """
+
+    document: dict[str, Any]
+    paths: tuple[str, ...]
+
+
+def elide_secrets(document: Mapping[str, Any]) -> ElidedDocument:
+    """Return *document* with every secret-classified value replaced by :data:`ELIDED`.
+
+    A secret-classified key elides its whole value, container included: a
+    ``credentials`` object holding three fields is three secrets, and descending
+    into it to elide the leaves would leak the field names of the thing being
+    withheld.
+    """
+    found: list[str] = []
+    elided = _elide(document, "", found)
+    return ElidedDocument(document=elided if isinstance(elided, dict) else {}, paths=tuple(found))
+
+
+def _elide(node: Any, prefix: str, found: list[str]) -> Any:
+    """Rebuild *node* with secret-classified values replaced, recording paths."""
+    if isinstance(node, Mapping):
+        rebuilt: dict[str, Any] = {}
+        for raw_key, value in node.items():
+            name = str(raw_key)
+            path = f"{prefix}.{name}" if prefix else name
+            if is_secret_key(name):
+                found.append(path)
+                rebuilt[name] = ELIDED
+            else:
+                rebuilt[name] = _elide(value, path, found)
+        return rebuilt
+    if isinstance(node, Sequence) and not isinstance(node, (str, bytes)):
+        # Lists are walked too: quality gates are a list of objects, so a secret
+        # under one of them is at `quality_gates[1].token`, not under a key.
+        return [_elide(item, f"{prefix}[{index}]", found) for index, item in enumerate(node)]
+    return node
 
 
 def default_root() -> Path:
@@ -205,6 +338,7 @@ class ConfigStore:
         patch: Mapping[str, Any],
         *,
         surface: ConfigWriteSurface,
+        actor: str | None = None,
         warn: WarningRecorder | None = None,
     ) -> dict[str, Any]:
         """Merge *patch* into the document, validate, and persist it.
@@ -213,6 +347,13 @@ class ConfigStore:
         have to resend every other. A ``None`` value removes its key, which is
         how a setting is returned to its bundled default — distinct from writing
         the default's current value, which would pin it.
+
+        *actor* is the identity the surface says authorized the write: the
+        approver a setup apply required, the signed-in operator behind a panel.
+        It is recorded, not trusted — the surface name beside it in the record is
+        the part no caller chooses — and it is optional because a surface that
+        genuinely has no identity to give must record that fact rather than
+        invent one.
 
         *warn* receives each advisory the persisted document earns. Advisories
         are raised here because this is the moment a human is present and looking
@@ -241,16 +382,20 @@ class ConfigStore:
                 errors = validate_config_document(merged)
                 if errors:
                     raise ConfigValidationError(errors)
-                atomic_write(
-                    self.path,
-                    json.dumps(merged, indent=2, sort_keys=True) + "\n",
-                    mode=_FILE_MODE,
+                serialized = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+                atomic_write(self.path, serialized, mode=_FILE_MODE)
+                # Recorded under the same lock and after the write, so the record
+                # cannot claim a change the document does not carry, and two
+                # surfaces saving at once cannot interleave a half-written line.
+                self._record(
+                    surface=surface, actor=actor, patch=patch, restricted=restricted, saved=merged
                 )
         finally:
             os.close(fd)
         logger.info(
-            "spec engine configuration updated by %s (%d top-level keys)",
+            "spec engine configuration updated by %s as %s (%d top-level keys)",
             surface.name,
+            actor or "an unnamed actor",
             len(patch),
         )
         for warning in record_config_warnings(document_warnings(merged), warn):
@@ -258,6 +403,81 @@ class ConfigStore:
                 "spec engine configuration advisory %s at %s", warning.code, warning.path
             )
         return merged
+
+    # --- the durable record of who wrote -----------------------------------
+
+    @property
+    def write_log_path(self) -> Path:
+        """Path of the append-only write record, whether or not it exists yet."""
+        return self._root / WRITE_LOG_FILENAME
+
+    def writes(self) -> tuple[dict[str, Any], ...]:
+        """Every recorded write, oldest first; empty when nothing was written.
+
+        Unparseable lines are skipped rather than raising: the record's purpose is
+        to say what it can about what happened, and one truncated line (a host
+        that lost power mid-append) must not make the rest unreadable.
+        """
+        path = self.write_log_path
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ()
+        except OSError as exc:
+            raise ConfigLoadError(f"cannot read {path}: {exc}") from exc
+        records: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                records.append(parsed)
+        return tuple(records)
+
+    def _record(
+        self,
+        *,
+        surface: ConfigWriteSurface,
+        actor: str | None,
+        patch: Mapping[str, Any],
+        restricted: tuple[str, ...],
+        saved: Mapping[str, Any],
+    ) -> None:
+        """Append one line naming who wrote and what they touched.
+
+        Deliberately no values: a patch can carry a token in a capability's
+        environment, and a record that copied it would turn the audit trail into a
+        second place credentials live — one that no read path elides. What is kept
+        is the shape of the change (top-level keys, and any config-only path the
+        confirmed surface exercised) plus who claimed it.
+        """
+        identity = (actor or "").strip()
+        record = {
+            "ts": utc_now_iso(),
+            "surface": surface.name,
+            "operator_confirmed": surface.operator_confirmed,
+            "actor": identity or None,
+            "keys": sorted(str(key) for key in patch),
+            "config_only_paths": list(restricted),
+            "version": saved.get(VERSION_KEY),
+        }
+        line = json.dumps(record, sort_keys=True) + "\n"
+        path = self.write_log_path
+        try:
+            descriptor = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, _FILE_MODE)
+            try:
+                os.write(descriptor, line.encode("utf-8"))
+            finally:
+                os.close(descriptor)
+            platform_compat.chmod_safe(path, _FILE_MODE)
+        except OSError as exc:
+            raise ConfigRecordError(
+                f"the configuration document at {self.path} was persisted but the write could "
+                f"not be recorded in {path}: {exc}"
+            ) from exc
 
 
 def _merge(base: dict[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
