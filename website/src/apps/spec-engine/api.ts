@@ -58,14 +58,18 @@ export class SpecEngineApiError extends Error {
 /**
  * The refusal codes the page branches on today, as a lookup rather than a
  * union of string literals used inline. NOT the full set the handlers emit:
- * the queue-action failure codes (`release_refused`, `release_failed`,
+ * the remaining queue-action failure codes (`release_failed`,
  * `redispatch_failed`, `cleanup_failed`, `teardown_failed`), the kill-switch
  * `engage_failed`, and the malformed-request family (`bad_json`, `bad_patch`,
- * `bad_action`, `bad_reason`) have no branch on this shell — the panels that
- * act on them arrive with the queue and kill-switch tasks, and each code
- * should be added HERE when its branch is written, not spelled inline.
- * `release_refused` in particular is a 409 engine refusal, not a failure, and
- * the queue panel must distinguish the two.
+ * `bad_action`, `bad_reason`) have no branch yet — each is reported through the
+ * refusal block by code and text without the caller deciding anything on the
+ * code, and each should be added HERE when its branch is written, not spelled
+ * inline.
+ *
+ * `releaseRefused` is the one queue-action code with a branch: a 409 from the
+ * engine is a RULE (this run's machine records the release nowhere), while
+ * `release_failed` is a 503 from the store that a retry may clear. Telling an
+ * operator to retry the first would send them back forever.
  *
  * Kept because the page's behaviour differs per code in ways a status cannot
  * express: `app_disabled` and `unauthorized` are both a 403/401 the operator
@@ -88,6 +92,7 @@ export const REFUSAL = {
   spendUnreadable: 'spend_unreadable',
   runUnknown: 'run_unknown',
   fieldRequired: 'field_required',
+  releaseRefused: 'release_refused',
 } as const
 
 // ── payload shapes, transcribed from the handlers ──────────────────────────

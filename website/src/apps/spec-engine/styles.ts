@@ -157,6 +157,81 @@ export const SE_CSS = `
   border:1px solid var(--border-strong);background:var(--bg-elevated);color:var(--text)}
 .se-btn:hover{background:var(--bg-hover);border-color:var(--border-hover)}
 .se-btn:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+.se-btn[disabled]{opacity:.45;cursor:not-allowed}
+.se-btn.se-sm{padding:3px 8px;font-size:11px}
+.se-btn.se-danger{background:var(--danger-subtle);border-color:var(--danger);color:var(--text-strong)}
+.se-acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+dl.se-kv{display:grid;grid-template-columns:118px minmax(0,1fr);gap:4px 10px;margin:0;font-size:12px}
+dl.se-kv dt{color:var(--muted)}
+dl.se-kv dd{margin:0;font-family:var(--mono);color:var(--text-strong);overflow-wrap:anywhere}
+
+/* Row-level state words. One class per meaning, keyed by a data attribute rather
+   than by colour alone: each flag licenses a different action, and one shared
+   style for two meanings is how a reader learns to ignore both. */
+.se-flag{display:inline-block;font-size:10px;font-weight:700;padding:0 5px;border-radius:3px;
+  margin-left:6px;border:1px solid currentColor;text-transform:uppercase;letter-spacing:.03em}
+.se-flag[data-flag="exhausted"]{color:var(--danger)}
+.se-flag[data-flag="held"]{color:var(--warn)}
+.se-flag[data-flag="human"]{color:var(--warn)}
+.se-flag[data-flag="kept"]{color:var(--danger)}
+
+/* An identifier the queue projection withholds, asked for rather than invented. */
+.se-idfield{display:flex;flex-direction:column;gap:3px;margin:8px 0}
+.se-idfield label{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+  font-weight:600}
+.se-input{background:var(--bg-accent);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:4px 7px;font-size:12px;color:var(--text);min-width:0}
+.se-input:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+
+/* Findings. Every message is arbitrarily long outside-authored prose, so each one
+   is bounded by the untrusted block below rather than by this list. */
+ul.se-findings{margin:0;padding:0;list-style:none;font-size:12px}
+ul.se-findings li{padding:7px 0;border-bottom:1px solid var(--border);min-width:0}
+ul.se-findings li:last-child{border-bottom:none}
+.se-fc{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:700;
+  color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 5px;margin-right:6px}
+.se-fc[data-keyed="false"]{color:var(--muted);border-color:var(--border-strong)}
+.se-sev{font-style:normal;font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.04em;color:var(--warn);margin-right:6px}
+.se-fkind{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-right:6px;
+  overflow-wrap:anywhere}
+
+/* Outside-authored prose.
+   Collapsed to two lines by clamp; expanded to a FIXED-height scroll region, not
+   a max-height cap — a cap still grows with line count until it binds, so a long
+   comment would move whatever sits below it. Nothing here is parsed as markup:
+   the text arrives through the engine's display contract and is rendered as a
+   text child, never through dangerouslySetInnerHTML. */
+.se-untrusted{background:var(--bg-accent);border:1px solid var(--border);
+  border-left:2px solid var(--muted-strong);border-radius:var(--radius-sm);padding:7px 9px;
+  margin-top:6px}
+.se-untrusted-tag{display:flex;align-items:center;gap:5px;font-size:10px;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--muted);margin-bottom:4px}
+.se-untrusted-tag svg{width:11px;height:11px;flex:none}
+.se-untrusted-body{font-size:11.5px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text);
+  margin:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.se-untrusted[data-open="true"] .se-untrusted-body{display:block;height:104px;overflow:auto}
+.se-untrusted-more{background:none;border:none;color:var(--accent);font-size:11px;font-weight:600;
+  padding:3px 0 0;text-decoration:underline}
+.se-untrusted-more:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+
+/* Held feedback, a kept teardown, and the arm step before a destructive one. */
+.se-held{display:flex;gap:8px;align-items:flex-start;background:var(--warn-subtle);
+  border:1px solid var(--warn);border-radius:var(--radius-sm);padding:8px;margin-bottom:7px;
+  font-size:11.5px}
+.se-kept{background:var(--danger-subtle);border:1px solid var(--danger);
+  border-radius:var(--radius-sm);padding:9px;font-size:12px}
+.se-kept ul{margin:6px 0 0;padding:0;list-style:none}
+.se-kept li{display:flex;align-items:center;gap:8px;padding:3px 0;font-family:var(--mono);
+  font-size:11.5px}
+.se-torn{background:var(--ok-subtle);border:1px solid var(--ok);border-radius:var(--radius-sm);
+  padding:9px;font-size:12px}
+/* The confirmation is a sibling block, never an overlay: a dialog here would
+   reintroduce exactly the failure the no-overlay rule above exists to prevent. */
+.se-arm{background:var(--danger-subtle);border:1px solid var(--danger);
+  border-radius:var(--radius-sm);padding:9px;font-size:12px;margin-top:7px}
+.se-arm p{margin:0 0 8px;display:flex;gap:6px;align-items:flex-start}
+.se-arm svg{width:14px;height:14px;flex:none;color:var(--danger)}
 
 /* Config pane, in the same split: the document on the left where the list was,
    its read on the right where the inspector was. */

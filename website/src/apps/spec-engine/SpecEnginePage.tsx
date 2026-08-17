@@ -36,18 +36,20 @@
  *
  * ## What this shell owns, and what the panels own
  *
- * This task owns the shell: the grid, the rail, the ordered table with real rows
- * and keyboard selection, the docked inspector's identity header, the config
- * pane's read of the persisted document, the setup pane as the first-run landing,
- * and the status strip's reading of the kill switch. The panel INTERIORS — the
- * verdict and feedback actions, the documents-and-findings view, configuration
- * editing, the setup flow, and the kill-switch and spend controls — are later
- * tasks. Their regions render an honest statement that they are not built rather
- * than a mock of what they will be: an inert control that looks live is worse on
+ * This shell owns the grid, the rail, the ordered table with real rows and
+ * keyboard selection, the docked inspector's identity header, the config pane's
+ * read of the persisted document, the setup pane as the first-run landing, and
+ * the status strip's reading of the kill switch.
+ *
+ * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
+ * selected run so its state cannot outlive the selection. Configuration editing,
+ * the setup flow, and the kill-switch and spend controls are still later tasks;
+ * their regions render an honest statement that they are not built rather than a
+ * mock of what they will be, because an inert control that looks live is worse on
  * this surface than a sentence saying it is absent.
  *
- * The inspector's tab strip belongs with those panels for the same reason — four
- * tabs over four unbuilt panes would be navigation to nothing.
+ * The inspector's tab strip belongs with those remaining panels for the same
+ * reason — tabs over unbuilt panes would be navigation to nothing.
  *
  * ## Backend contract
  *
@@ -74,6 +76,7 @@ import {
   type WaitingOn,
 } from './api'
 import { SE_CSS } from './styles'
+import { RowFlags, RunInspectorBody } from './ReviewQueuePanel'
 
 /** Which pane the work area shows. Panes, not destinations: one list, one document. */
 type Pane = 'queue' | 'config' | 'setup'
@@ -227,6 +230,22 @@ export default function SpecEnginePage() {
   const [filter, setFilter] = useState<Filter>('all')
   const [selectedRunId, setSelectedRunId] = useState<string>('')
   const rowRefs = useRef(new Map<string, HTMLDivElement>())
+
+  /**
+   * Workspace ids a teardown reported it KEPT, by run.
+   *
+   * Lifted to the page because it is read in two places that are not nested: the
+   * row's state words and the inspector's teardown block. It is not a `QueueEntry`
+   * field and cannot be — the queue projection has no notion of a kept workspace,
+   * and the count only comes into existence when a teardown reports one. Held for
+   * the life of the page rather than persisted: it says "this session tore down
+   * that run and these ids survived it", which is exactly the claim the operator
+   * needs and the only one this data supports.
+   */
+  const [keptByRun, setKeptByRun] = useState<Record<string, number[]>>({})
+  const noteKept = useCallback((runId: string, kept: number[]) => {
+    setKeptByRun((current) => ({ ...current, [runId]: kept }))
+  }, [])
 
   /**
    * First run: the configuration read says no document exists.
@@ -532,6 +551,15 @@ export default function SpecEnginePage() {
                         <span role="gridcell">
                           <span className="se-spec">{entry.spec}</span>
                           <span className="se-id">{SEP}{entry.project}</span>
+                          {/* The row's own state words. Absent from the shell as
+                              shipped, and the reason they belong on the ROW is
+                              that they change which actions are legitimate: a
+                              reader scanning the list must not have to select a
+                              run to learn its revision cycles are spent. */}
+                          <RowFlags
+                            entry={entry}
+                            keptCount={keptByRun[entry.run_id]?.length ?? 0}
+                          />
                         </span>
                         <span role="gridcell">{entry.gate || NONE}</span>
                         <span role="gridcell" className="se-id">{entry.run_id}</span>
@@ -572,9 +600,12 @@ export default function SpecEnginePage() {
                   </span>
                 </div>
                 <div className="se-insp-body">
-                  <Pending>
-                    {i18nT('apps.specEngine.specEnginePage.run_controls_not_built_yet')}
-                  </Pending>
+                  {/* Keyed by run, so every piece of the panel's local state — an
+                      armed teardown, a typed identifier, a previous result —
+                      belongs to the run on screen. The mockup's inspector was
+                      static below its header, which left the first run's detail in
+                      place when a different row was selected. */}
+                  <RunInspectorBody key={selected.run_id} entry={selected} onKept={noteKept} />
                 </div>
               </>
             ) : (
