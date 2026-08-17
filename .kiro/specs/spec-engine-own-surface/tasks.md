@@ -9,20 +9,20 @@ no capability is surfaceless for longer than a wave.
 
 ## Tasks
 
-- [ ] 1. Restore the Prior App
+- [x] 1. Restore the Prior App
   - [x] 1.1 Revert every Prior_App file to the Merge_Base
     - Compute the Merge_Base (`git merge-base origin/main HEAD`) and inventory every modified or added file under `src/kiro_crew/apps/builtins/spec_builder/`, `website/src/apps/spec-builder/`, and `website/src/test/SpecBuilder*` from `git diff --name-status`, never from notes
     - Restore modified files with `git checkout <merge-base> -- <path>`; delete files this branch added under those trees
     - Verify the Prior_App's own backend test suite passes at its Merge_Base count (measure the count from the Merge_Base tree, do not assume it)
     - For each reverted hunk, record the Requirement 1.4 verdict: did it fix a defect present in the Prior_App at the Merge_Base, or only adapt the Prior_App to our engine? Record the verdict and reasoning in the task record; the expected answer is that no genuine Prior_App defect was fixed
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
-  - [ ] 1.2 Post-removal gate sweep
+  - [x] 1.2 Post-removal gate sweep
     - With the Prior_App restored and the run surface deleted, run every gate: spec_engine pytest suite, spec_builder pytest suite (Merge_Base count), flake8/isort/black/mypy including tests, `tsc -b`, vitest, and the manifest-sync script checked by its real exit status
     - Remove any spec_engine test or import that depended on the deleted `engine_ops.py` surface; the engine library itself must lose no test
     - Confirm the app-store entry for spec-engine still satisfies the manifest-sync gate while the app has no page
     - _Requirements: 1.1, 1.5_
-- [ ] 2. Fence the boundary
-  - [ ] 2.1 App_Boundary_Fence build gate
+- [x] 2. Fence the boundary
+  - [x] 2.1 App_Boundary_Fence build gate
     - New test in the spec_engine suite: compute the Merge_Base and FAIL (never pass) when it cannot be computed; list every branch-changed file; assert each lies under a declared Spec_App root or matches `BOUNDARY_ALLOWLIST`, a literal tuple of (path-prefix, one-line justification)
     - Seed the allowlist with the legitimately shared files: the app-store manifest key table, the localization catalogs, the manifest-sync script, and the spec documents
     - Plant violations assembled at runtime (a path under the Prior_App tree; an undeclared new root) and assert each is reported; prove the fail-closed branch by driving the Merge_Base computation to fail in a fixture repo
@@ -34,7 +34,7 @@ no capability is surfaceless for longer than a wave.
     - Property test: `plan_id` equality is total over canonical plan inputs, and a stale `plan_id` always refuses (design Property 2)
     - Trace every new catch clause against the class chain the setup module actually raises
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
-  - [ ] 3.2 Configuration tools on the Engine_MCP_Server
+  - [x] 3.2 Configuration tools on the Engine_MCP_Server
     - Add `get_config` and `write_config` to the TOOLS table; `get_config` elides secret-classified values by key name; `write_config` delegates to the existing fenced `EngineOperations.write_config` and rejects everything the Config_Store refuses, including vendored-provider bindings on every transport
     - Config writes run off the event loop
     - _Requirements: 4.1, 4.2, 4.3, 4.5_
@@ -111,6 +111,10 @@ no capability is surfaceless for longer than a wave.
 - The config file remains JSON by the owner's explicit decision.
 
 ### Findings carried forward by the review gate
+
+- **For 7.2 (owns "all gates green"):** 38 black-dirty files inside spec_engine's own tree were ADDED by this branch (13 engine modules + 25 test modules, cosmetic wrapping under the pinned black==26.3.1) — branch-contributed debt, not inherited repo dirt; CI has black commented out, so nothing blocks mechanically. 7.2 decides: format them or record why not.
+- **For 4.2 (owns the config surface's consumers):** `config_payload()` assembles its reply from three unlocked reads (document, validate, advisories) — a write landing between them yields a torn REPORT (never a torn document). Pass the already-read document into validate/advisories when building the routes.
+- **Small documentation debts, fix opportunistically in whichever task next touches the file:** (a) state the secret classifier's residual in `engine/config/store.py` (a credential under an innocent last segment with a low-entropy value is not withheld; the repo's "What this cannot see" convention applies); (b) `_unschedule`'s docstring says "from the graph block" but replaces document-wide — scope it to `plan.graph_block.body`; (c) the no-scheduled-leaves rot path raises a bare StopIteration — give it a message.
 
 - **R1.4 final-report item (from 1.1's review):** no reverted hunk fixed a genuine Merge_Base defect of the Prior_App. One observation for its owner: the Prior_App's `_seed_prompt` docstring claims a builtin's declared skills "are NOT on the agent's skill path", but `bridges.reconcile_app_skills` links manifest-declared skills for enabled non-self-managed apps, so the claim appears factually wrong at the Merge_Base. Not fixed (byte-identity forbids it); report to the owner.
 - **For 1.2's gate sweep:** two Prior_App files (`backend/routes.py`, `tests/test_routes.py`) are black-dirty AT the Merge_Base; the sweep must treat them as pre-existing, not reformat them.
