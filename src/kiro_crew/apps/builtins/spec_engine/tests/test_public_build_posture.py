@@ -645,9 +645,12 @@ _TELEMETRY_MODULES = frozenset({"kiro_crew.beacon", "kiro_crew.telemetry"})
 #:
 #: The residual, stated rather than implied: the walk follows names bound to
 #: aiohttp BY AN IMPORT IN THE SAME MODULE. A binding re-exported from another
-#: module of the inbound tree and imported relatively is invisible to it — which is
-#: why the tree scanned is the whole of ``backend/`` and not one file, so the
-#: re-exporting module is itself read and its own escape reported there.
+#: module of the inbound tree and imported relatively is invisible to it, and the
+#: re-exporting module itself may show NOTHING — a bare ``import aiohttp`` with
+#: no use creates no ``ast.Name`` node, so the escape rule has nothing to
+#: report. What bounds the exposure is that both modules are in this scanned
+#: tree, so the moment either one USES the binding the reference is judged
+#: here; a re-export chain whose modules never use it is dormant, not caught.
 _INBOUND_SERVING_TREE = "backend"
 
 #: Module roots the inbound tree may import. One entry, on purpose: this is the
@@ -912,10 +915,13 @@ class TestTheInboundSurfaceCannotTransmit:
       included.
     * **A binding reached through this app's own indirection** — a module of the
       inbound tree re-exporting the framework, imported relatively by a sibling.
-      The walk is per-module and does not follow relative imports. What closes it
-      is scope rather than cleverness: the re-exporting module is itself in the
-      scanned tree, and handing a binding on is the escape-as-a-value case, so it
-      is reported where it happens.
+      The walk is per-module and does not follow relative imports, and the
+      re-exporting module can be SILENT: a bare ``import aiohttp`` with no use
+      creates no ``ast.Name``, so nothing is reported at either end until one
+      of the two modules actually uses the binding — at which point the use is
+      judged, because both live in this scanned tree. A dormant re-export is a
+      real residual, kept because closing it means resolving relative imports,
+      and this module deliberately reads text, not import graphs.
     * **A constructor reached by name at runtime from a string this module never
       sees** — an ``importlib.import_module`` result, or an attribute pulled off
       an object obtained elsewhere. Undecidable from text; the escape-as-a-value
@@ -959,10 +965,10 @@ class TestTheInboundSurfaceCannotTransmit:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The backend half of the both-directions requirement, driven through the
-        # same directory walk the real check uses -- the engine half already has
-        # its real-scan twin. Exercising only _outbound_reach would leave the
-        # walk's wiring unproven in this direction: a walk that skipped a file
-        # would report clean while the function-level test kept passing.
+        # REAL directory walk by pointing APP_ROOT at a tmp tree -- the same
+        # patch the engine direction's real-scan twin uses. Replacing
+        # _inbound_modules itself would bypass the walk's rglob and
+        # __pycache__ filter, so a bug in the walk could not fail this test.
         planted = tmp_path / "backend"
         planted.mkdir()
         (planted / "__init__.py").write_text("", encoding="utf-8")
@@ -971,11 +977,7 @@ class TestTheInboundSurfaceCannotTransmit:
             "    async with aiohttp.ClientSession() as s:\n        return s\n",
             encoding="utf-8",
         )
-        monkeypatch.setattr(
-            f"{__name__}._inbound_modules",
-            lambda: sorted(planted.rglob("*.py")),
-            raising=True,
-        )
+        monkeypatch.setattr(f"{__name__}.APP_ROOT", tmp_path, raising=True)
         offenders: list[str] = []
         for path in _inbound_modules():
             for finding in _outbound_reach(path.read_text(encoding="utf-8")):
