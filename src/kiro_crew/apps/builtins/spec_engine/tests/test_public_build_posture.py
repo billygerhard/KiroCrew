@@ -769,6 +769,16 @@ def _aiohttp_name_uses(tree: ast.Module, bindings: Mapping[str, str]) -> tuple[s
     than at the root of an attribute access lands in the second set: passed as an
     argument, rebound, or handed to ``getattr``, it has escaped where a static
     reader can follow it.
+
+    A chain containing a DUNDER attribute is treated as an escape too, not as an
+    ordinary attribute read. ``aiohttp.__dict__[...]`` and
+    ``aiohttp.__getattribute__(...)`` reach the module's namespace reflectively,
+    so what they yield cannot be read from the leaf names — the same reason a
+    binding passed to ``getattr`` is reported. A review demonstrated that judging
+    such a chain by the four-name denylist permitted
+    ``aiohttp.__dict__["ClientSession"]()`` while the docstrings claimed the
+    check reports where the distinction cannot be drawn; routing dunder chains
+    into the escape set makes that claim true.
     """
     attributes: set[str] = set()
     rooted: set[int] = set()
@@ -781,6 +791,10 @@ def _aiohttp_name_uses(tree: ast.Module, bindings: Mapping[str, str]) -> tuple[s
             attrs.append(current.attr)
             current = current.value
         if isinstance(current, ast.Name) and current.id in bindings:
+            if any(attr.startswith("__") and attr.endswith("__") for attr in attrs):
+                # Reflective access: leave the root out of ``rooted`` so it is
+                # reported as a value escape below.
+                continue
             rooted.add(id(current))
             attributes.update(f"{current.id}.{attr}" for attr in attrs)
     bare = {
@@ -905,8 +919,12 @@ class TestTheInboundSurfaceCannotTransmit:
     * **A constructor reached by name at runtime from a string this module never
       sees** — an ``importlib.import_module`` result, or an attribute pulled off
       an object obtained elsewhere. Undecidable from text; the escape-as-a-value
-      rule catches the spellings that start from an aiohttp binding, which is the
-      reachable half.
+      rule catches the spellings that start from an aiohttp binding — including
+      reflective ones, because a chain containing a dunder attribute
+      (``aiohttp.__dict__``, ``aiohttp.__getattribute__``) is routed into the
+      escape set rather than judged by the four-name denylist. A non-dunder
+      attribute chain IS judged by that denylist alone, which is exactly the
+      four-constructor guarantee and no wider.
     """
 
     def test_the_check_reads_every_inbound_module(self) -> None:
@@ -936,6 +954,35 @@ class TestTheInboundSurfaceCannotTransmit:
             "client constructed there is an outbound path the exemption was never "
             "granted for."
         )
+
+    def test_a_planted_outbound_module_in_the_inbound_tree_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The backend half of the both-directions requirement, driven through the
+        # same directory walk the real check uses -- the engine half already has
+        # its real-scan twin. Exercising only _outbound_reach would leave the
+        # walk's wiring unproven in this direction: a walk that skipped a file
+        # would report clean while the function-level test kept passing.
+        planted = tmp_path / "backend"
+        planted.mkdir()
+        (planted / "__init__.py").write_text("", encoding="utf-8")
+        (planted / "leak.py").write_text(
+            "from aiohttp import web\nimport aiohttp\n\n\nasync def h(request):\n"
+            "    async with aiohttp.ClientSession() as s:\n        return s\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            f"{__name__}._inbound_modules",
+            lambda: sorted(planted.rglob("*.py")),
+            raising=True,
+        )
+        offenders: list[str] = []
+        for path in _inbound_modules():
+            for finding in _outbound_reach(path.read_text(encoding="utf-8")):
+                offenders.append(f"{path.name}: {finding}")
+        assert any(
+            "leak.py" in offender and "ClientSession" in offender for offender in offenders
+        ), f"a planted client in the inbound tree went unreported by the walk: {offenders}"
 
     def test_the_real_inbound_module_is_seen_as_using_the_framework(self) -> None:
         # Without this, the emptiness above would be satisfied by a tree the walk
@@ -992,6 +1039,14 @@ class TestTheInboundSurfaceCannotTransmit:
             pytest.param("from aiohttp import ClientTimeout\n", id="unclassifiable-member"),
             pytest.param("import aiohttp\nmake_session(aiohttp)\n", id="module-passed-as-a-value"),
             pytest.param("from aiohttp import web\nweb = shim\n", id="binding-rebound"),
+            pytest.param(
+                "import aiohttp\ns = aiohttp.__dict__['ClientSession']()\n",
+                id="reflective-dunder-dict",
+            ),
+            pytest.param(
+                "import aiohttp\ns = aiohttp.__getattribute__('ClientSession')\n",
+                id="reflective-dunder-getattribute",
+            ),
         ],
     )
     def test_an_undrawable_distinction_is_reported_rather_than_permitted(
