@@ -215,9 +215,14 @@ with an identical signature. None is branch work; none is fixed here.
   removed and **zero** changed. Not fixed: the key belongs to another page,
   upstream has already removed it, and an edit here would be a boundary crossing
   needing its own allowlist entry and would conflict on the eventual rebase.
-- **`src/test/App.test.tsx` "Kiro credits pill"**, 2 failures (`opens a details
-  modal…`, `closes the modal on Escape`). The Merge_Base worktree fails the same
-  two, `2 failed | 74 passed (76)` on both sides. The branch touches no
+- **`src/test/App.test.tsx` "Kiro credits pill"**, 3 failures (`opens a details
+  modal…`, `closes the modal on Escape`, `defaults covered/overage to 0 and
+  renders sub-1000 values without K suffix`). The Merge_Base worktree fails the
+  same three, `3 failed | 73 passed (76)` on both sides (the review gate
+  re-measured this at HEAD and at a clean `git archive` extraction of the
+  Merge_Base; all three trace to one pre-existing defect — the resolved-data
+  modal never opens — and the file passes in isolation with `-t credits`,
+  so it is intra-file pollution). The branch touches no
   `App.tsx`, no credits component and no `App.test.tsx`, and its catalog change is
   additive-only, so it cannot reach them.
 - **Repo-wide mypy, 3 errors in `src/kiro_crew/hooks.py`** (lines 1752, 1753,
@@ -268,8 +273,9 @@ Decided against, on measurement rather than preference:
   pure engine call with no path handling. A future task adding the document route
   re-opens the per-document view.
 - **`.se-pending` is NOT dead — kept.** The finding predates 6.4's edit of the
-  same file. `SafetyPanel.tsx:603` renders the spend pane's pending state with
-  that class today, so removing the rule would have unstyled a live state. No
+  same file. The spend pane's pending state in `SafetyPanel.tsx` renders with
+  that class today (grep `se-pending` — line numbers shift under this same
+  task's own edits), so removing the rule would have unstyled a live state. No
   test pins the class (it is styling), which is why the grep the finding asked
   for was the right check.
 - **Three-way manifest terminal coherence: already closed by 4.2, nothing
