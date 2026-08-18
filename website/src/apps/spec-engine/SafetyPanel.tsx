@@ -59,7 +59,7 @@
  * page-wide meter would be a number this surface invented. The narrowing is
  * recorded in the spec's task record rather than filled in with an estimate.
  */
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle } from 'lucide-react'
 
@@ -259,6 +259,14 @@ export function KillSwitchControls() {
   const reading: SwitchReading = read.isError ? 'unknown' : switchReading(state)
   const stoppable = read.data?.stoppable.length ?? 0
   const stoppableCredits = read.data?.stoppable_credits ?? 0
+  // The payload being PRESENT is not the same as its figures being current: the
+  // cache retains the last one across a failed refetch, so `read.data` outlives
+  // the reading that produced it. A blast radius is a claim about what a stop
+  // would reach right now, so it is quoted only from a read that succeeded —
+  // the same rule the dot and the release offer already follow. Without the
+  // `isError` half, a stale count reads as a current one at the moment an
+  // operator decides whether to throw the switch.
+  const radiusKnown = !read.isError && read.data !== undefined
 
   const outcome = operate.data
   const confirmed = outcome ? confirmsIntent(outcome.action, outcome.persisted) : false
@@ -267,6 +275,19 @@ export function KillSwitchControls() {
   // consulted only one of them would call the other's disagreement a success.
   const reportedAgrees = outcome ? confirmsIntent(outcome.action, outcome.reported) : false
   const settled = confirmed && reportedAgrees
+
+  // An armed RELEASE outlives the reading that licensed it unless it is withdrawn.
+  // The offer is made only from an `engaged` reading, because a release is a claim
+  // about what is in force; but a pane already open keeps rendering the engaged
+  // record — initiator, reason, timestamp — from retained data after the reading
+  // stops being engaged, and keeps offering the confirm beside it. Withdrawing it
+  // here applies the offer's own rule for as long as the pane is up, in both
+  // degradations: a read that failed (doubt), and a switch another operator already
+  // released. The verdict block is not affected — it renders on `outcome`, so a
+  // completed operation's read-back confirmation stays on screen.
+  useEffect(() => {
+    if (armed === 'release' && reading !== 'engaged') setArmed(null)
+  }, [armed, reading])
 
   const onConfirm = useCallback(() => {
     if (armed === null) return
@@ -427,12 +448,12 @@ export function KillSwitchControls() {
                   the queue holds only runs waiting on a person, and a stop reaches
                   every run that is neither finished nor already parked. */}
               <p className="se-note">
-                {read.data === undefined
-                  ? i18nT('apps.specEngine.safetyPanel.the_blast_radius_could_not_be_read')
-                  : i18nT('apps.specEngine.safetyPanel.runs_this_stop_would_park', {
+                {radiusKnown
+                  ? i18nT('apps.specEngine.safetyPanel.runs_this_stop_would_park', {
                       runs: fmtNumber(stoppable),
                       credits: fmtNumber(stoppableCredits, CREDITS),
-                    })}
+                    })
+                  : i18nT('apps.specEngine.safetyPanel.the_blast_radius_could_not_be_read')}
               </p>
               <div className="se-idfield">
                 <label htmlFor="se-ks-reason">

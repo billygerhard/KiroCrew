@@ -334,6 +334,24 @@ describe('engaging', () => {
     ).toBeInTheDocument()
   })
 
+  it('stops quoting a blast radius the last read left behind', async () => {
+    // The retained-data hazard on the figures rather than on the dot. The cache
+    // keeps the previous payload across a failed refetch, so `read.data` is still
+    // there after a read that failed — and a count quoted from it reads as the
+    // reach of the stop the operator is about to throw. It has to fall back to the
+    // doubt sentence, the same way the dot does.
+    await arm()
+    await screen.findByText(/2.*412\.6/)
+    stub({ killSwitch: [{ status: 503, body: { code: 'kill_switch_unreadable', error: 'no db' } }] })
+    await client.refetchQueries({ queryKey: QK.killSwitch })
+
+    expect(await screen.findByText(T.the_blast_radius_could_not_be_read)).toBeInTheDocument()
+    expect(screen.queryByText(/2.*412\.6/)).toBeNull()
+    // The engage pane itself stays: stopping is the fail-closed direction, so doubt
+    // licenses it. Only the figures beside it were retracted.
+    expect(screen.getByRole('button', { name: T.confirm_the_stop })).toBeInTheDocument()
+  })
+
   it('refuses to send a stop with no reason, and sends nothing', async () => {
     await arm()
     fireEvent.click(await screen.findByRole('button', { name: T.confirm_the_stop }))
@@ -651,6 +669,46 @@ describe('releasing', () => {
       'data-state',
       'unknown',
     )
+  })
+
+  it('withdraws an open release pane when the reading stops being engaged', async () => {
+    // The offer rule applied for as long as the pane is up. A release is a claim
+    // about what is in force, so it is offered only from an `engaged` reading — but
+    // an already-open pane kept rendering the engaged record (initiator, reason,
+    // timestamp) from retained data after the read failed, with a confirm beside it.
+    await armRelease({
+      engaged: true,
+      initiator: 'billy',
+      reason: 'runaway watch loop',
+      engaged_ts: '2026-08-17T10:00:00Z',
+    })
+    await screen.findByText(/billy/)
+    stub({ killSwitch: [{ status: 503, body: { code: 'kill_switch_unreadable', error: 'no db' } }] })
+    await client.refetchQueries({ queryKey: QK.killSwitch })
+
+    await screen.findByText(P.could_not_read_the_kill_switch)
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: T.confirm_the_release })).toBeNull(),
+    )
+    // The record it was rendering goes with it: the stop it described is no longer
+    // a reading, so naming its author is a claim nothing here can make.
+    expect(screen.queryByText(/runaway watch loop/)).toBeNull()
+  })
+
+  it('withdraws an open release pane when the switch is already released', async () => {
+    // The same rule for the other degradation, which is a successful read rather
+    // than a failure: another operator released it, so there is no stop to release
+    // and the pane's record describes a state that has ended.
+    await armRelease({ engaged: true, initiator: 'billy', reason: 'runaway watch loop' })
+    await screen.findByText(/billy/)
+    stub({ killSwitch: [{ body: snapshot({ engaged: false }) }] })
+    await client.refetchQueries({ queryKey: QK.killSwitch })
+
+    await screen.findByText(P.kill_switch_released)
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: T.confirm_the_release })).toBeNull(),
+    )
+    expect(screen.queryByText(/runaway watch loop/)).toBeNull()
   })
 
   it('says a release changed nothing when the switch was not engaged', async () => {
