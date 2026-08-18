@@ -215,14 +215,16 @@ with an identical signature. None is branch work; none is fixed here.
   removed and **zero** changed. Not fixed: the key belongs to another page,
   upstream has already removed it, and an edit here would be a boundary crossing
   needing its own allowlist entry and would conflict on the eventual rebase.
-- **`src/test/App.test.tsx` "Kiro credits pill"**, 3 failures (`opens a details
-  modal…`, `closes the modal on Escape`, `defaults covered/overage to 0 and
-  renders sub-1000 values without K suffix`). The Merge_Base worktree fails the
-  same three, `3 failed | 73 passed (76)` on both sides (the review gate
-  re-measured this at HEAD and at a clean `git archive` extraction of the
-  Merge_Base; all three trace to one pre-existing defect — the resolved-data
+- **`src/test/App.test.tsx` "Kiro credits pill"** — a VARYING 2–3 failures per
+  run at a single commit (`opens a details modal…`, `closes the modal on
+  Escape`, sometimes `defaults covered/overage to 0 and renders sub-1000 values
+  without K suffix`). The Merge_Base worktree shows the same nondeterministic
+  signature (the review gate measured 2/74 and 3/73 across consecutive runs at
+  the SAME HEAD, and 3/73 at a clean `git archive` extraction of the
+  Merge_Base; all failures trace to one pre-existing defect — the resolved-data
   modal never opens — and the file passes in isolation with `-t credits`,
-  so it is intra-file pollution). The branch touches no
+  so it is intra-file pollution). Do not diff a new failure against a pinned
+  count here; diff against the named tests. The branch touches no
   `App.tsx`, no credits component and no `App.test.tsx`, and its catalog change is
   additive-only, so it cannot reach them.
 - **Repo-wide mypy, 3 errors in `src/kiro_crew/hooks.py`** (lines 1752, 1753,
