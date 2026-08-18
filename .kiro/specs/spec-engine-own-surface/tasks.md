@@ -161,3 +161,194 @@ no capability is surfaceless for longer than a wave.
 - **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
 - **For 7.2 (from 6.4's round-3 review, approved):** two minor retained-data-during-isError instances on ADVISORY copy in `SafetyPanel.tsx` — (a) the arm-engage blast radius is gated on `read.data === undefined`, not `read.isError`, so `stoppable`/`stoppableCredits` render retained figures as a current claim after a failed refetch (`the_blast_radius_could_not_be_read` fires only on the never-read case); (b) `armed` is not cleared when the reading degrades to `'unknown'`, so an already-open release pane keeps rendering the engaged record from retained data and keeps offering the confirm (the release itself stays read-back-confirmed). Sweep or record. **Closed by 6.4 (verify, do not re-chase):** the failed-read dot/tint now force the doubt state (`read.isError ? 'unknown' : …` in both SafetyPanel and SpecEnginePage, pinned by "shows doubt on the dot…" and "stops asserting the stop on the strip…"), and the `pane === null` pending shell is covered by "holds the work area until the configuration read decides the pane" in SpecEngineSafety.test.tsx.
 - **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.
+
+### 7.2's dispositions and the final gate sweep (recorded 2026-08-17)
+
+Appended, not substituted: every finding above stays as written, and this
+section records what was DONE with each. Exit codes below are real — read with
+`PIPESTATUS` or with no pipe, never through a `-q` that hides the failure line.
+
+#### Gate sweep, on the finished branch
+
+| Gate | Command | Exit |
+|---|---|---|
+| Spec_App pytest | `python -m pytest .../spec_engine/tests/` | **0** — 3376 passed |
+| Prior_App pytest | `python -m pytest .../spec_builder/tests/` | **0** — 269 passed |
+| flake8 (incl. tests) | `flake8 src/kiro_crew test` | **0** |
+| isort (incl. tests) | `isort --check-only src/kiro_crew test` | **0** |
+| mypy, app trees incl. tests | `mypy .../spec_engine .../spec_builder` | **0** — 210 files |
+| mypy, repo-wide | `mypy src/kiro_crew` | **1** — 3 inherited errors, below |
+| black | `black --check --fast src/kiro_crew test` | **1** — repo-wide condition, below |
+| tsc | `cd website && npx tsc -b` | **0** |
+| vitest, the six SpecEngine suites | `npx vitest run src/test/SpecEngine` | **0** — 143 tests (140 + 3 added here) |
+| manifest-sync | `node scripts/check-app-manifest-sync.mjs` | **0** — 20 manifests, 171 strings |
+| i18n aggregate | `npm run i18n:check` | **1** — one inherited finding, below |
+| App_Boundary_Fence | `pytest .../test_app_boundary_fence.py` | **0** — 38 passed |
+| docs-lint | `bash scripts/docs-lint.sh` | **0** — 190 files |
+
+Requirement 1 re-verified rather than assumed, at Merge_Base
+`adbec83be0787fbbbd14af40eaaf44e627553d27`:
+`git diff <mb>..HEAD -- spec_builder/ website/src/apps/spec-builder/ website/src/test/SpecBuilder*`
+is EMPTY, and no path matching `spec.builder` appears anywhere in the branch
+diff (1.1, 1.2, 1.3). The Prior_App suite was run in a detached worktree at the
+Merge_Base and passed **269**, the count it also passes on the branch, so 1.5 is
+a measured equality rather than an assumption.
+
+#### The three inherited failures, each PROVEN at the Merge_Base
+
+Every one was reproduced in a detached worktree checked out at the Merge_Base,
+with an identical signature. None is branch work; none is fixed here.
+
+- **`npm run i18n:check` exits 1** on `[source-strings]`, one badly-shaped key:
+  `pages.artifactDeployPage.domain` = `"domain —"` (trailing-connector). The key
+  is present AT the Merge_Base, ABSENT from `origin/main`'s tip, and byte-identical
+  at HEAD — upstream deleted it after we diverged, so the check reports it as
+  "new vs origin/main" purely from that drift. The Merge_Base worktree fails the
+  same check on the same key. Additionally proven: this branch's `en.json` change
+  is purely additive — 249 keys added, all `specEngine`-namespaced, **zero**
+  removed and **zero** changed. Not fixed: the key belongs to another page,
+  upstream has already removed it, and an edit here would be a boundary crossing
+  needing its own allowlist entry and would conflict on the eventual rebase.
+- **`src/test/App.test.tsx` "Kiro credits pill"**, 2 failures (`opens a details
+  modal…`, `closes the modal on Escape`). The Merge_Base worktree fails the same
+  two, `2 failed | 74 passed (76)` on both sides. The branch touches no
+  `App.tsx`, no credits component and no `App.test.tsx`, and its catalog change is
+  additive-only, so it cannot reach them.
+- **Repo-wide mypy, 3 errors in `src/kiro_crew/hooks.py`** (lines 1752, 1753,
+  1874: `os.listxattr`/`getxattr`/`setxattr` do not exist on macOS). `hooks.py`
+  is untouched by the branch (empty `git diff`), and the Merge_Base worktree
+  reports the same 3 errors at the same lines. mypy over the two app trees, tests
+  included, is clean.
+
+#### black: the 38 branch-added dirty files are NOT reformatted
+
+Decided against, on measurement rather than preference:
+
+- The condition is repo-wide, not ours: **1178 of 2189** files fail
+  `black --check --fast` under the pinned `black==26.3.1`, and an inherited file
+  untouched for months wants plain slice spacing (`[len(FLAG) :]`). The repo's
+  committed code was never formatted with this version, CI has black commented
+  out, and the two Prior_App files are dirty AT the Merge_Base and deliberately
+  left that way — the project's own precedent that byte-stability outranks
+  format. Conforming 38 files would leave them the only conforming files in the
+  tree.
+- The reformat was nevertheless RUN and measured before being reverted, so this
+  is a known quantity rather than a guess: `black --fast` on the 38 → 38
+  reformatted, `flake8` 0, `isort` 0, spec_engine pytest **3376 passed**. Then
+  reverted with `git checkout --`; byte-identity confirmed by a clean
+  `git status` and by AST dumps captured beforehand comparing equal.
+- **The one finding worth carrying:** an AST comparison over the 38 showed
+  `tests/test_review_feedback_watcher.py` changing SEMANTICALLY — black inserts a
+  space after `"""` in a docstring that begins with a quote, altering the
+  docstring's value. That is precisely what `--fast` skips, and `--fast` is
+  mandatory here (the safety check cannot parse py314-targeted output on py312).
+  So whoever clears this debt should do it repo-wide, in one commit, on a py314
+  interpreter where the safety check actually runs.
+
+#### Items swept, with what was found
+
+- **Document-body read route (6.2's correction 5): omission RECORDED, no route
+  added.** The design's backend route list scopes document bodies out, and the
+  spec already recorded the same disposition for five of the six verdict ACTIONS.
+  Adding it is not a sweep-sized change either: reading a spec document means a
+  path-confined file read on a path derived from run state, a size bound, an
+  operator guard, route-level tests and thirteen catalogs — security-sensitive
+  work that wants a reviewer, which the final task does not have. The in-UI note
+  (`document_bodies_have_no_route_note`) states the omission truthfully and was
+  re-verified against the route table: `config`, `config/resolved`, `setup/*`,
+  `kill-switch`, `run-spend`, `queue` and the four queue actions, and nothing
+  serving a document body. NOTE the asymmetry deliberately: 6.3 CLOSED its
+  resolved-config item by adding `GET /config/resolved`, because that read is a
+  pure engine call with no path handling. A future task adding the document route
+  re-opens the per-document view.
+- **`.se-pending` is NOT dead — kept.** The finding predates 6.4's edit of the
+  same file. `SafetyPanel.tsx:603` renders the spend pane's pending state with
+  that class today, so removing the rule would have unstyled a live state. No
+  test pins the class (it is styling), which is why the grep the finding asked
+  for was the right check.
+- **Three-way manifest terminal coherence: already closed by 4.2, nothing
+  added.** `test_all_three_legs_of_the_route_contract_agree` resolves the
+  manifest's dotted `backend.routes` through the import system and asserts the
+  object it yields IS the attribute the gateway loop calls off the package;
+  `test_the_three_way_gate_would_notice_each_leg_going_missing` drives each leg's
+  predicate against a violating value so the conjunction is falsifiable. Both run
+  green here by name.
+- **The manifest-sync allowlist justification is refreshed.** It read "made
+  bidirectional for a card with no page"; all 20 shipped builtin manifests now
+  declare a page (measured), so the pageless else-branch is driven by no shipped
+  manifest — only by `appManifest.test.ts`'s `pageless-probe-app`. It now reads
+  "taught to demand a page_label exactly when a page exists".
+- **`tmp/` hygiene: verified harmless, not swept.** The entry admits scratch that
+  cannot reach a build artifact, and this is now checked rather than assumed:
+  **0** files under `tmp/` are tracked by git; `MANIFEST.in` grafts no repo-root
+  directory (the sdist is assembled from named root files plus
+  `recursive-include src/kiro_crew/...`); and `setuptools_scm` is not in use, so
+  no tracked-file set is auto-included. The `.py` copies of engine modules are
+  therefore scratch, not shipped source. Not deleted: the directory is shared
+  between concurrent sessions, and removing another session's scratch is the one
+  thing a sweep must not do. This task's own merge-base worktree WAS removed
+  (`git worktree remove`, with the `node_modules` symlink unlinked first so the
+  real tree was never at risk).
+- **Equivalence suite's credential-key reach: extended.** The `hypothesis.find`
+  non-vacuity block gained a fifth shape, `"a credential-classified key"`, whose
+  predicate asks the engine's own `is_secret_key` rather than carrying a copy of
+  the rule. It was pinned only by a hand-written case that names its own key, so
+  narrowing `_VARIABLE_KEYS` would have left byte-identity proven only where the
+  reply and the file agree.
+- **6.4's two approved-round minors: FIXED, with pinned tests.** (a) The
+  arm-engage blast radius now claims its figures from a read that SUCCEEDED
+  (`radiusKnown`), not merely from a payload being present, so a retained count
+  is no longer quoted as the reach of a stop about to be thrown. (b) An armed
+  RELEASE is withdrawn when the reading stops being `engaged` — in both
+  degradations, a failed read and a switch another operator already released —
+  which applies the offer site's own rule for as long as the pane is up. The
+  read-back confirmation property is untouched: the verdict block renders on
+  `outcome`, so a completed operation still reports against the flag it read back.
+- **`api.ts`'s REFUSAL docstring undercounted.** It said three codes have real
+  branches; 6.4 added a fourth (`runUnknown`, the spend pane). Corrected. The same
+  finding's dead `__testing` re-export of REFUSAL is already gone — that export
+  now carries `waitedParts`/`WHY_KEY`/`WHY_EXHAUSTED_KEY`/`WAIT_LABEL_KEY`, all
+  consumed by `SpecEngineShell.test.tsx`.
+- **The three documentation debts are closed.** `is_secret_key` now carries a
+  "What this cannot see" note (the classification reads the NAME, so a credential
+  under an innocent last segment is not withheld, and the file holds every value
+  verbatim either way — elision is a display convenience over a naming
+  convention, not a containment boundary). `_unschedule` no longer claims a scope
+  it did not have: the search and the splice are confined to the parsed graph
+  block's body. The no-scheduled-leaves rot path says which condition the corpus
+  stopped meeting instead of raising a bare `StopIteration`.
+- **"Closed by 6.4 (verify, do not re-chase)": verified by name, not re-chased.**
+  `shows doubt on the dot…`, `stops asserting the stop on the strip…` and `holds
+  the work area until the configuration read decides the pane` each run green
+  individually.
+
+#### Mutation probes run by this task
+
+Four, each committed first, then neutered with a grepped `MUTATION_PROBE`
+marker, then restored byte-identical with zero markers left in the tree:
+
+| Mechanism neutered | Named test that failed |
+|---|---|
+| `radiusKnown` reverted to the payload-absent gate | `engaging > stops quoting a blast radius the last read left behind` |
+| the armed-release withdrawal made unreachable | `releasing > withdraws an open release pane when the reading stops being engaged` **and** `… when the switch is already released` |
+| `_unschedule` made a no-op | `test_unscheduling_a_real_task_is_caught` |
+| `_VARIABLE_KEYS` narrowed to non-credential keys | `test_the_generators_really_can_draw_the_shapes_the_docstring_claims` — "the generators can no longer draw a credential-classified key" |
+
+#### Carried to the final report
+
+- **The mockup selection is VETO-PENDING for Billy.** A reviewer agent selected
+  `mockup-b.html` ("Operator Console") over `mockup-a.html` ("Triage Board");
+  criteria, per-criterion comparison, post-selection corrections and open holes
+  are in `website/src/apps/spec-engine/design/selection.md`. Overturning it
+  re-runs tasks 6.1–6.4 only.
+- **Requirement 1.4: no reverted hunk fixed a genuine Merge_Base defect of the
+  Prior_App.** One observation for its owner, deliberately NOT fixed because
+  byte-identity forbids it: `_seed_prompt`'s docstring claims a builtin's declared
+  skills "are NOT on the agent's skill path", but `bridges.reconcile_app_skills`
+  links manifest-declared skills for enabled non-self-managed apps. Report, do
+  not patch.
+- **Recorded in the prior spec.** `.kiro/specs/agent-agnostic-spec-engine/tasks.md`
+  gains a dated section stating that its one-app design intent — and the two-app
+  shape it ratified in that intent's place — are superseded by this spec, that the
+  second app was in fact another team's, and that its delivery-isolation
+  obligation remains open there. A pure append; nothing else in that file changed.

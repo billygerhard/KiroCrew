@@ -83,7 +83,7 @@ export class SpecEngineApiError extends Error {
  * on the code, and each should be added HERE when its branch is written, not
  * spelled inline.
  *
- * Three have real branches today, and each differs from its neighbours in a way a
+ * Four have real branches today, and each differs from its neighbours in a way a
  * status cannot express:
  *
  * - `configUnreadable` means a document exists and is broken, which is emphatically
@@ -92,6 +92,9 @@ export class SpecEngineApiError extends Error {
  * - `releaseRefused` is a 409 the engine decided (this run's machine records the
  *   release nowhere), while `release_failed` is a 503 a retry may clear. Telling an
  *   operator to retry the first sends them back forever.
+ * - `runUnknown` means the run id itself is not one the engine has, so the spend
+ *   pane says so instead of offering the refusal block: a read that failed invites
+ *   a retry, and there is nothing here to retry for.
  * - `setupRefused` is every refusal of the setup flow, and the panel reads
  *   {@link SETUP_REFUSAL} out of `refused` to decide which control to point at.
  */
