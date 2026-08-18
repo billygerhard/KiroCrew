@@ -211,6 +211,12 @@ export function KillSwitchControls() {
         // failed operation would be as wrong as reporting it as a successful one.
         readBackFailure = failure
       }
+      // The engine distinguishes halted from parked: every entry in `halted` may
+      // open no further turn, but `parked` is false for a run another writer held
+      // or a row that could not be moved. The confirmation sentence says "runs
+      // parked", so it counts — and costs — only the entries the engine says are
+      // in the parked state now; the audit record carries the rest.
+      const parked = (response.halted ?? []).filter((run) => run.parked)
       return {
         action,
         reported: response.switch,
@@ -218,8 +224,8 @@ export function KillSwitchControls() {
         readBackFailure,
         changed: response.changed,
         alreadyEngaged: response.already_engaged,
-        halted: response.halted?.length ?? 0,
-        haltedCredits: response.total_credits ?? 0,
+        halted: parked.length,
+        haltedCredits: parked.reduce((sum, run) => sum + run.cost_credits, 0),
       }
     },
     onSuccess: () => {
@@ -244,7 +250,13 @@ export function KillSwitchControls() {
   )
 
   const state = read.data?.switch
-  const reading = switchReading(state)
+  // React Query keeps the last data across a failed refetch, so `state` alone
+  // still names the PREVIOUS reading after a read that failed — including the
+  // post-write read-back, which fetches through this same cache entry. The dot
+  // and the re-read offer branch on `reading`, and doubt must not read as
+  // released, so a failed read forces the doubt state regardless of what the
+  // cache still holds.
+  const reading: SwitchReading = read.isError ? 'unknown' : switchReading(state)
   const stoppable = read.data?.stoppable.length ?? 0
   const stoppableCredits = read.data?.stoppable_credits ?? 0
 
@@ -286,8 +298,11 @@ export function KillSwitchControls() {
                 : i18nT('apps.specEngine.specEnginePage.kill_switch_released')}
         </span>
         {/* A stop in force because its own record could not be parsed is a repair,
-            not an operator's decision, and the two must not read alike. */}
-        {state?.unreadable && (
+            not an operator's decision, and the two must not read alike. Gated on
+            the read having succeeded: after a failed read `state` is retained
+            data, and a claim about the record in force would be as stale as the
+            reading the guard above just refused to render. */}
+        {!read.isError && state?.unreadable && (
           <span className="se-lbl">
             {i18nT('apps.specEngine.specEnginePage.kill_switch_record_unreadable')}
           </span>

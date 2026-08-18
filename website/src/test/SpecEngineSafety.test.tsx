@@ -454,6 +454,70 @@ describe('engaging', () => {
     expect(screen.queryByText(T.the_stop_was_refused)).toBeNull()
   })
 
+  it('shows doubt on the dot, not the last reading, when the read-back failed', async () => {
+    // React Query keeps the previous data across a failed refetch, so the strip
+    // still HOLDS the released state the first read found when the read-back
+    // 503s. The dot must render the doubt the text states — not the retained
+    // reading — and the re-read control must be offered: this is the one state
+    // whose own words tell the operator to read the switch again.
+    const { container } = await arm({
+      killSwitch: [
+        { body: snapshot({}, [stoppableRun]) },
+        { status: 503, body: { code: 'kill_switch_unreadable', error: 'no db' } },
+      ],
+      post: { body: { ok: true, action: 'engage', switch: switchState({ engaged: true }) } },
+    })
+    fireEvent.change(screen.getByLabelText(T.why_the_engine_is_being_stopped), {
+      target: { value: 'runaway' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: T.confirm_the_stop }))
+
+    await screen.findByText(T.the_switch_could_not_be_read_back)
+    expect(container.querySelector('.se-status .se-ks-text')).toHaveTextContent(
+      P.could_not_read_the_kill_switch,
+    )
+    expect(container.querySelector('.se-status .se-ks-dot')).toHaveAttribute(
+      'data-state',
+      'unknown',
+    )
+    expect(screen.getByRole('button', { name: T.read_the_switch_again })).toBeInTheDocument()
+  })
+
+  it('counts only the runs the engine parked, with their own credits', async () => {
+    await arm({
+      killSwitch: [
+        { body: snapshot({}, [stoppableRun]) },
+        { body: snapshot({ engaged: true }) },
+      ],
+      post: {
+        body: {
+          ok: true,
+          action: 'engage',
+          switch: switchState({ engaged: true }),
+          // One run parked, one the engine could NOT move — another writer held
+          // the spec. Both are stopped, in that no further turn may open, but the
+          // sentence says "parked": it must not count the second run, and its
+          // credits must be the parked run's own rather than the total across both.
+          halted: [
+            { run_id: 'run_1', parked: true, cost_credits: 200 },
+            { run_id: 'run_2', parked: false, cost_credits: 55 },
+          ],
+          total_credits: 255,
+        },
+      },
+    })
+    fireEvent.change(screen.getByLabelText(T.why_the_engine_is_being_stopped), {
+      target: { value: 'runaway' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: T.confirm_the_stop }))
+
+    await screen.findByText(T.the_stop_is_in_force)
+    const note = screen.getByText(/Runs parked/)
+    expect(note).toHaveTextContent('Runs parked: 1')
+    expect(note).toHaveTextContent('200')
+    expect(note.textContent).not.toContain('255')
+  })
+
   it('states the refusal when the stop is refused', async () => {
     await arm({
       post: { status: 503, body: { code: 'engage_failed', error: 'cannot persist the flag' } },
@@ -550,6 +614,43 @@ describe('releasing', () => {
     expect(await screen.findByText(T.not_confirmed)).toBeInTheDocument()
     expect(screen.getByText(T.the_flag_still_reads_engaged)).toBeInTheDocument()
     expect(screen.queryByText(T.new_work_may_start_again)).toBeNull()
+  })
+
+  it('stops asserting the stop on the strip when the read-back failed', async () => {
+    // The retained-data hazard in the other direction: the strip was tinted by an
+    // engaged read, the release's read-back failed, and the cache still holds
+    // "engaged". The tint is a positive claim that a stop is in force, and after
+    // that failed read nothing on this surface knows what is — so the tint must
+    // drop and the dot must show doubt, rather than keep rendering the reading
+    // the failed read left behind.
+    const { container } = await armRelease(
+      { engaged: true },
+      {
+        killSwitch: [
+          { body: snapshot({ engaged: true }) },
+          { status: 503, body: { code: 'kill_switch_unreadable', error: 'no db' } },
+        ],
+        post: {
+          body: {
+            ok: true,
+            action: 'release',
+            changed: true,
+            switch: switchState({ engaged: false }),
+            resumed: [],
+          },
+        },
+      },
+    )
+    const strip = container.querySelector('.se-status')
+    expect(strip).toHaveAttribute('data-engaged', 'true')
+    fireEvent.click(screen.getByRole('button', { name: T.confirm_the_release }))
+
+    await screen.findByText(T.the_switch_could_not_be_read_back)
+    await waitFor(() => expect(strip).toHaveAttribute('data-engaged', 'false'))
+    expect(container.querySelector('.se-status .se-ks-dot')).toHaveAttribute(
+      'data-state',
+      'unknown',
+    )
   })
 
   it('says a release changed nothing when the switch was not engaged', async () => {

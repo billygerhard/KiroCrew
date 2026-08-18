@@ -306,7 +306,15 @@ export default function SpecEnginePage() {
     [rows, focusRow],
   )
 
-  const engaged = switchReading(killSwitch.data?.switch) === 'engaged'
+  // The same guard the panel applies to its own reading: React Query keeps the
+  // last data across a failed refetch, so an unguarded reading would keep
+  // asserting whatever the previous read found. The tint is a positive claim
+  // that a stop is in force — doubt un-tints, and the doubt itself is carried
+  // by the dot and text the strip renders through KillSwitchControls.
+  const ksReading = killSwitch.isError
+    ? 'unknown'
+    : switchReading(killSwitch.data?.switch)
+  const engaged = ksReading === 'engaged'
 
   return (
     <div className="se-root">
