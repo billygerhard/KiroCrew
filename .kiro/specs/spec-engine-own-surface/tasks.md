@@ -67,7 +67,7 @@ no capability is surfaceless for longer than a wave.
     - Cover: run review and operation as the primary activity, first-run setup entry, review queue with bounded untrusted text, config editing, kill switch and spend
     - A REVIEWER agent selects one against recorded criteria; commit mockups plus the written rationale; mark the selection VETO-PENDING for the owner in the task record and final report
     - _Requirements: 6.1, 6.3_
-- [ ] 6. The Operator_Surface, from the selected mockup
+- [x] 6. The Operator_Surface, from the selected mockup
   - [x] 6.1 Page shell, routing, and API client
     - `website/src/apps/spec-engine/`: `SpecEnginePage.tsx` matching the selected mockup's layout, an `api.ts` for `/api/apps/spec-engine/*` written against the real route handlers, and first-run detection that leads with the setup flow when `get_config` reports no configuration
     - _Requirements: 5.4, 6.2, 6.5_
@@ -77,7 +77,7 @@ no capability is surfaceless for longer than a wave.
   - [x] 6.3 Config editor and setup flow
     - Config editing over the backend config route with segment-wise role matching and accurately labeled per-role reset; the setup flow drives inspect/plan/apply through the backend and requires the human approver identity before apply
     - _Requirements: 6.2, 6.5, 5.4, 3.3_
-  - [ ] 6.4 Kill switch and spend panel
+  - [x] 6.4 Kill switch and spend panel
     - Kill-switch engage/release and per-run spend display over the backend routes; engage/release confirmed by reading back persisted state, not by response status alone
     - _Requirements: 6.2, 6.5_
 - [ ] 7. End-to-end verification
@@ -159,4 +159,5 @@ no capability is surfaceless for longer than a wave.
 - **Disposition (absent verdict controls, from 6.2's round-2 review):** five of the selected mockup's six verdict ACTIONS (approve gate, request changes, cancel run, raise ceiling, resume) shipped as prose notes naming their real transport (or, for cancel, the absence of any) because no HTTP route exists — the design's backend route list scoped them out. Recorded here so requirement 6.2 fidelity is decided in the open: the departure is a route-surface decision inherited from the design, not a panel bug; a future task adding those routes re-opens the controls.
 - **Disposition (criteria checkability, from 5.1's review):** criteria.md's "checkable rather than asserted" ordering claim is overstated — all five design files land in one commit, so criteria-before-judging is not verifiable from history. Process-conformant (disclosed, owner-vetoable) and the selection stands; recorded so the claim is not repeated as fact.
 - **For 7.2's sweep (from 4.1's and 4.4's reviews):** (a) assert three-way terminal coherence — manifest `backend.routes` field ⟷ `backend/routes.py` on disk ⟷ package attribute — once 4.2 lands (4.2 may close it itself); (b) `node scripts/i18n-check.mjs` exits 1 on `pages.artifactDeployPage.domain` (trailing-connector), upstream drift inherited from the merge-base, not branch work — disposition it (fix or record as inherited); (c) the fence's allowlist justification for `check-app-manifest-sync.mjs` reads "made bidirectional for a card with no page" but 4.4 removed the last pageless card — refresh the justification; the gate's pageless else-branch is now driven by no shipped manifest (vitest pairing covers that direction).
+- **For 7.2 (from 6.4's round-3 review, approved):** two minor retained-data-during-isError instances on ADVISORY copy in `SafetyPanel.tsx` — (a) the arm-engage blast radius is gated on `read.data === undefined`, not `read.isError`, so `stoppable`/`stoppableCredits` render retained figures as a current claim after a failed refetch (`the_blast_radius_could_not_be_read` fires only on the never-read case); (b) `armed` is not cleared when the reading degrades to `'unknown'`, so an already-open release pane keeps rendering the engaged record from retained data and keeps offering the confirm (the release itself stays read-back-confirmed). Sweep or record. **Closed by 6.4 (verify, do not re-chase):** the failed-read dot/tint now force the doubt state (`read.isError ? 'unknown' : …` in both SafetyPanel and SpecEnginePage, pinned by "shows doubt on the dot…" and "stops asserting the stop on the strip…"), and the `pane === null` pending shell is covered by "holds the work area until the configuration read decides the pane" in SpecEngineSafety.test.tsx.
 - **Bookkeeping (no action):** commit `aa201071d` swept 3.3's two conformance modules in under 4.4's message — content verified intact by 4.4's reviewer (reflog traced, 3166 green); attribution note only.
