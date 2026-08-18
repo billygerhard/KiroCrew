@@ -111,7 +111,7 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ),
     (
         "website/scripts/check-app-manifest-sync.mjs",
-        "The manifest-sync gate, made bidirectional for a card with no page.",
+        "The manifest-sync gate, taught to demand a page_label exactly when a page exists.",
     ),
     (
         "website/src/apps/builtinRegistry.ts",

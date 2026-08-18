@@ -273,6 +273,25 @@ def _contains_non_ascii(node: Any) -> bool:
     return False
 
 
+def _contains_secret_key(node: Any) -> bool:
+    """Whether any key in *node* classifies as a credential.
+
+    Asks the engine's own classifier rather than carrying a copy of the rule: a
+    predicate with its own list of names would keep agreeing after the
+    classification changed, and the shape this identifies is exactly the one the
+    classifier decides — a key whose DISPLAYED form differs from its STORED form.
+    """
+    from kiro_crew.apps.builtins.spec_engine.engine.config.store import is_secret_key
+
+    if isinstance(node, dict):
+        return any(
+            is_secret_key(str(key)) or _contains_secret_key(value) for key, value in node.items()
+        )
+    if isinstance(node, list):
+        return any(_contains_secret_key(item) for item in node)
+    return False
+
+
 # --- the two write paths, driven ---------------------------------------------
 
 
@@ -603,6 +622,14 @@ class TestSequencesOfPatchesConvergeOnOneFile:
             "a deletion": lambda seq: any(_contains_none(patch) for patch in seq),
             "a nested project entry": lambda seq: any(_has_project_entry(patch) for patch in seq),
             "non-ASCII text": lambda seq: any(_contains_non_ascii(patch) for patch in seq),
+            # The shape the byte-identity claim rests on: for every other key the
+            # reply and the file agree, so a corpus that reached no credential key
+            # would prove equivalence only where the two forms are the same. Pinned
+            # here as well as by a hand-written case, because that case names its own
+            # key and so keeps passing after `_VARIABLE_KEYS` stops drawing one.
+            "a credential-classified key": lambda seq: any(
+                _contains_secret_key(patch) for patch in seq
+            ),
         }
         for shape, predicate in reaches.items():
             try:

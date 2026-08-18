@@ -198,7 +198,13 @@ def _with_an_unfinished_leaf(tasks: str) -> tuple[str, str, int]:
     scheduled = {
         task for wave in json.loads(plan.graph_block.body)["waves"] for task in wave["tasks"]
     }
-    target = next(task for task in plan.leaves if task.number in scheduled)
+    target = next((task for task in plan.leaves if task.number in scheduled), None)
+    assert target is not None, (
+        "the corpus spec schedules no leaf, so no leaf can be marked incomplete and "
+        "GRAPH_TASK_UNASSIGNED has nothing to fire on. A bare `next()` here raised "
+        "StopIteration with no message, which reads as a harness crash rather than as "
+        "the corpus having rotted."
+    )
     lines = tasks.splitlines(keepends=True)
     lines[target.line - 1] = lines[target.line - 1].replace("- [x] ", "- [ ] ", 1)
     return "".join(lines), target.number, target.line
@@ -207,13 +213,22 @@ def _with_an_unfinished_leaf(tasks: str) -> tuple[str, str, int]:
 def _unschedule(tasks: str, number: str) -> str:
     """Drop ``number`` from the graph block, leaving the JSON body well-formed.
 
+    The search and the edit are both confined to ``plan.graph_block.body``, which
+    is what makes the name honest: a document-wide replace would take the first
+    match anywhere, and a task number is only unquoted in the checklist above by
+    today's formatting — a body that ever quoted one would send the edit to the
+    wrong place and leave the check measuring a document nobody meant to write.
+
     The trailing-separator form is tried first so that removing a task from the
     middle of a wave does not leave a doubled comma; the bare form covers a wave
     that scheduled the task alone.
     """
+    plan = parse_tasks(tasks)
+    assert plan.graph_block is not None, "the corpus spec declares a dependency graph"
+    body = plan.graph_block.body
     for occurrence in (f'"{number}", ', f', "{number}"', f'"{number}"'):
-        if occurrence in tasks:
-            return tasks.replace(occurrence, "", 1)
+        if occurrence in body:
+            return tasks.replace(body, body.replace(occurrence, "", 1), 1)
     raise AssertionError(f"task {number} is not scheduled in the graph block")
 
 

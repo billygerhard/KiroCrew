@@ -187,6 +187,16 @@ def is_secret_key(key: str) -> bool:
     True when the key's LAST segment names a credential. The last segment is the
     noun the key is about: ``env.GITHUB_TOKEN`` is a token, ``variables.api_key``
     is a key, and ``limits.token_bucket_size`` is a size that merely mentions one.
+
+    **What this cannot see**, stated because it bounds what elision protects: the
+    classification reads the NAME only, never the value. A credential stored under
+    an innocent last segment — ``variables.deploy_target``, ``env.MY_SETTING`` —
+    is not withheld, and no entropy or format test is applied that might catch it,
+    because a value test that guessed would either withhold ordinary settings or
+    give a caller reason to believe an unwithheld value was checked. Elision is
+    therefore a display convenience over a naming convention, not a containment
+    boundary: the FILE holds every value verbatim, so the file's own permissions
+    remain what actually protects a credential.
     """
     segments = key_segments(key)
     return bool(segments) and segments[-1] in SECRET_KEY_SEGMENTS
