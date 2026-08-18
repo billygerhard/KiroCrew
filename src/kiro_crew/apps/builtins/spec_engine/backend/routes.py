@@ -285,7 +285,7 @@ def _operator_only(handler: Handler, *, operation: str) -> Handler:
             )
             return _refuse(
                 "dashboard_user_required",
-                "this control is only writable from a signed-in dashboard session",
+                "this control is only reachable from a signed-in dashboard session",
                 status=403,
             )
         return await handler(request)
@@ -299,7 +299,13 @@ def _read(handler: Handler) -> Handler:
 
 
 def _mutate(handler: Handler, *, operation: str) -> Handler:
-    """Compose the gates a MUTATION passes: enabled, then operator-only.
+    """Compose the gates an operator-only route passes: enabled, then the guard.
+
+    Mutations all pass through here, and so do the two setup READS
+    (``/setup/inspect``, ``/setup/plan``): they write nothing, but they read a
+    project path the caller names, so an app-minted token would gain a
+    filesystem reader inside this app's namespace — the module docstring
+    carries the full reasoning.
 
     The composed handler carries :data:`OPERATOR_GUARD_MARK` so the guard can be
     read back off the registered route rather than taken on trust. Stamped on the

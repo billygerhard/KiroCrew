@@ -23,8 +23,10 @@
  * token — but a save that echoed the marker back would replace a live credential
  * with it, and nothing downstream would report that: the document stays valid, the
  * write is recorded as ordinary, and the capability that needed the token fails
- * later somewhere else. So the marker is dropped from every patch, wherever it
- * appears.
+ * later somewhere else. So the marker is dropped from every OBJECT position in a
+ * patch — the only positions an accepted document can carry it; see
+ * :func:`withoutElided` for why arrays are outside the guarantee and why that
+ * costs nothing.
  *
  * The marker is a PARAMETER rather than a constant here, and that is the point: it
  * is the store's own value, relayed by the read. A copy of the string on this side
@@ -160,7 +162,16 @@ export function mergePatch(base: unknown, edited: unknown, elidedMarker: string)
   return patch
 }
 
-/** *value* with every occurrence of the elision marker removed, at any depth. */
+/** *value* with the elision marker removed from every OBJECT position.
+ *
+ * Arrays are passed through whole: dropping an element would silently
+ * renumber its siblings, and no schema-valid document can hold a
+ * secret-classified key inside an array (the free-form maps — variables,
+ * field_map, capability env — are all objects), so a marker inside an array
+ * cannot arrive through an accepted write. If one is hand-edited into an
+ * invalid document, the store refuses the merged document rather than
+ * losing a credential silently.
+ */
 function withoutElided(value: Document, elidedMarker: string): Document {
   const kept: Document = {}
   for (const [key, inner] of Object.entries(value)) {
