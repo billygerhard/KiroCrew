@@ -37,29 +37,33 @@
  * ## What this shell owns, and what the panels own
  *
  * This shell owns the grid, the rail, the ordered table with real rows and
- * keyboard selection, the docked inspector's identity header, the config pane's
- * read of the persisted document, the setup pane as the first-run landing, and
- * the status strip's reading of the kill switch.
+ * keyboard selection, the docked inspector's identity header, first-run routing,
+ * and the status strip's reading of the kill switch.
  *
  * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
- * selected run so its state cannot outlive the selection. Configuration editing,
- * the setup flow, and the kill-switch and spend controls are still later tasks;
- * their regions render an honest statement that they are not built rather than a
- * mock of what they will be, because an inert control that looks live is worse on
- * this surface than a sentence saying it is absent.
+ * selected run so its state cannot outlive the selection. The configuration pane
+ * (the document as the write path, its resolved read beside it) belongs to
+ * `ConfigPanel.tsx`, and the four-step setup flow to `SetupFlowPanel.tsx` — the
+ * step rail lives there rather than here because its state IS the flow's state, and
+ * a rail rendered from the shell would have to be told what step it was on. The
+ * kill-switch and spend controls are still a later task; the strip below reads the
+ * switch and does not operate it.
  *
- * The inspector's tab strip belongs with those remaining panels for the same
- * reason — tabs over unbuilt panes would be navigation to nothing.
+ * The inspector's tab strip belongs with that remaining panel for the same reason —
+ * tabs over unbuilt panes would be navigation to nothing.
  *
  * ## Backend contract
  *
  * `src/kiro_crew/apps/builtins/spec_engine/backend/routes.py`, through `api.ts`.
- * Three reads run here: the configuration (which is also the first-run signal),
- * the review queue, and the kill switch. The configuration read is the one whose
- * FAILURE mode matters: `config_unreadable` means a document exists and cannot be
- * parsed, which is not "nothing is configured", and an operator sent to the setup
+ * Three reads run in this shell: the configuration (which is also the first-run
+ * signal), the review queue, and the kill switch. The configuration read is the one
+ * whose FAILURE mode matters: `config_unreadable` means a document exists and cannot
+ * be parsed, which is not "nothing is configured", and an operator sent to the setup
  * assistant on that signal would meet a flow that refuses to overwrite a file it
- * cannot read.
+ * cannot read. The panels add their own calls — the resolved configuration read, and
+ * the setup flow's three steps — and the config read is handed DOWN to the config
+ * pane rather than repeated there, so first-run routing and the pane cannot disagree
+ * about whether a document exists.
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -75,7 +79,9 @@ import {
   type WaitingOn,
 } from './api'
 import { SE_CSS } from './styles'
+import { ConfigPane } from './ConfigPanel'
 import { RowFlags, RunInspectorBody } from './ReviewQueuePanel'
+import { SetupFlowPanel } from './SetupFlowPanel'
 
 /** Which pane the work area shows. Panes, not destinations: one list, one document. */
 type Pane = 'queue' | 'config' | 'setup'
@@ -151,14 +157,6 @@ const FILTERS: ReadonlyArray<{ id: Filter; labelKey: string }> = [
   { id: 'stall', labelKey: WAIT_LABEL_KEY.stall },
 ]
 
-/** The setup assistant's four steps, in the order it walks them. */
-const SETUP_STEPS: readonly string[] = [
-  'apps.specEngine.specEnginePage.step_inspect_the_project',
-  'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
-  'apps.specEngine.specEnginePage.step_review_the_plan',
-  'apps.specEngine.specEnginePage.step_approve_and_apply',
-]
-
 /**
  * A wait, split into the two coarsest units that carry information.
  *
@@ -195,11 +193,6 @@ function Refusal({ title, error }: { title: string; error: unknown }) {
       <code>{code ? `${code}${SEP}${refusalText(error)}` : refusalText(error)}</code>
     </div>
   )
-}
-
-/** A region a later task fills in. Stated, never mocked. */
-function Pending({ children }: { children: string }) {
-  return <p className="se-pending">{children}</p>
 }
 
 export default function SpecEnginePage() {
@@ -378,74 +371,11 @@ export default function SpecEnginePage() {
         </div>
       ) : pane === 'setup' ? (
         <div className="se-setup">
-          <aside
-            className="se-steps"
-            aria-label={i18nT('apps.specEngine.specEnginePage.setup_progress')}
-          >
-            <h2>{i18nT('apps.specEngine.specEnginePage.setup_assistant')}</h2>
-            {SETUP_STEPS.map((key, index) => (
-              <div key={key} className="se-step" data-state={index === 0 ? 'now' : 'todo'}>
-                <span className="se-dot" aria-hidden="true">
-                  {fmtNumber(index + 1)}
-                </span>
-                <span>{i18nT(key)}</span>
-              </div>
-            ))}
-          </aside>
-          <section className="se-setup-body">
-            <h1>{i18nT('apps.specEngine.specEnginePage.nothing_is_configured_yet')}</h1>
-            <p className="se-setup-lead">
-              {i18nT('apps.specEngine.specEnginePage.setup_lead')}
-            </p>
-            <Pending>{i18nT('apps.specEngine.specEnginePage.setup_flow_not_built_yet')}</Pending>
-          </section>
+          <SetupFlowPanel />
         </div>
       ) : pane === 'config' ? (
         <div className="se-work">
-          <section className="se-cfg">
-            <div className="se-cfg-head">
-              {/* A filename, not copy: translating it would name a file that does not exist. */}
-              <h1 className="se-m">config.json</h1>
-              <span className="se-sort">
-                {i18nT('apps.specEngine.specEnginePage.the_write_path_validated_on_save')}
-              </span>
-            </div>
-            <div className="se-cfg-body">
-              {config.isError ? (
-                <Refusal
-                  title={i18nT('apps.specEngine.specEnginePage.could_not_read_the_configuration')}
-                  error={config.error}
-                />
-              ) : (
-                <>
-                  <pre className="se-json">{JSON.stringify(config.data?.document ?? {}, null, 2)}</pre>
-                  <p className="se-note">
-                    {i18nT(
-                      'apps.specEngine.specEnginePage.secret_values_are_withheld_from_this_read',
-                    )}
-                  </p>
-                  <Pending>
-                    {i18nT('apps.specEngine.specEnginePage.config_editing_not_built_yet')}
-                  </Pending>
-                </>
-              )}
-            </div>
-          </section>
-          <section
-            className="se-inspector"
-            aria-label={i18nT('apps.specEngine.specEnginePage.resolved_configuration')}
-          >
-            <div className="se-insp-head">
-              <span className="se-insp-title">
-                {i18nT('apps.specEngine.specEnginePage.resolved_configuration')}
-              </span>
-            </div>
-            <div className="se-insp-body">
-              <Pending>
-                {i18nT('apps.specEngine.specEnginePage.resolved_view_not_built_yet')}
-              </Pending>
-            </div>
-          </section>
+          <ConfigPane config={config.data} error={config.error} pending={config.isPending} />
         </div>
       ) : (
         <div className="se-work">

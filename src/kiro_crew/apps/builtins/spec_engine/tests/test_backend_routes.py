@@ -893,6 +893,13 @@ class TestTheConfigurationRoutes:
             reply = await _get(client, f"{routes.PREFIX}/config")
         assert "s3cret" not in json.dumps(reply.body)
         assert "projects.acme.variables.api_key" in reply.body["elided"]
+        # The substituted value travels too, and it is the store's own constant: an
+        # editor has to recognise it to keep it out of a patch, and a client-side
+        # copy of the string is a second spelling of one constant that can drift.
+        from kiro_crew.apps.builtins.spec_engine.engine.config.store import ELIDED
+
+        assert reply.body["elided_marker"] == ELIDED
+        assert reply.body["document"]["projects"]["acme"]["variables"]["api_key"] == ELIDED
 
     @pytest.mark.asyncio
     async def test_the_report_is_built_from_one_read_of_the_document(

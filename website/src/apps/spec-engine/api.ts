@@ -24,12 +24,20 @@
  * what happened, the status says who can fix it, and the text is for a human
  * reading a report. Callers MUST branch on `code`, never on the message.
  *
- * **What this module does not have a client for.** The setup assistant. Its three
- * operations (`inspect_setup`, `plan_setup`, `apply_setup`) are MCP tools with no
- * HTTP route, and the config surface here serves the PERSISTED document only —
- * there is no route vending an effective/resolved view. Both gaps are real, not
- * oversights: a function here for a route that does not exist would fail at the
- * first call, and inventing one would hide the gap from whoever has to close it.
+ * The setup routes add one level to that: every refusal of the flow arrives as
+ * `setup_refused` with the engine's own refusal code in `refused`, which is the
+ * SAME vocabulary the Engine_MCP_Server's setup tools return. One status for all
+ * four (`approver-required`, `plan-stale`, `setup-approval-required`,
+ * `inferred-subject-refused`) because they differ in what the operator must do
+ * next and not in who may act: every one means the flow did not proceed and
+ * nothing was written.
+ *
+ * **The configuration is read twice, and only one of the two is a write path.**
+ * `config` is the persisted document, which `writeConfig` sends patches to.
+ * `resolvedConfig` is the value in force for every setting with the origin of
+ * each, resolved through the same store — a read of the document beside it, never
+ * a second place to write. A surface showing only the document cannot answer
+ * "what is actually in force here", which is the question every edit is about.
  */
 import { i18nT } from '../../i18n/t'
 
@@ -46,37 +54,46 @@ const API = '/api/apps/spec-engine'
 export class SpecEngineApiError extends Error {
   readonly code: string
   readonly status: number
+  /**
+   * The engine's own refusal code, for a refusal that carries one.
+   *
+   * Only the setup routes do: their `code` is always `setup_refused` and the
+   * actionable part is here. `''` everywhere else, so a caller reading this
+   * cannot mistake "not a setup refusal" for a refusal it does not know.
+   */
+  readonly refused: string
 
-  constructor(message: string, code: string, status: number) {
+  constructor(message: string, code: string, status: number, refused = '') {
     super(message)
     this.name = 'SpecEngineApiError'
     this.code = code
     this.status = status
+    this.refused = refused
   }
 }
 
 /**
- * The refusal codes the page branches on today, as a lookup rather than a
- * union of string literals used inline. NOT the full set the handlers emit:
- * the remaining queue-action failure codes (`release_failed`,
- * `redispatch_failed`, `cleanup_failed`, `teardown_failed`), the kill-switch
- * `engage_failed`, and the malformed-request family (`bad_json`, `bad_patch`,
- * `bad_action`, `bad_reason`) have no branch yet — each is reported through the
- * refusal block by code and text without the caller deciding anything on the
- * code, and each should be added HERE when its branch is written, not spelled
- * inline.
+ * The refusal codes a caller branches on, as a lookup rather than a union of
+ * string literals used inline. NOT the full set the handlers emit: the remaining
+ * queue-action failure codes (`release_failed`, `redispatch_failed`,
+ * `cleanup_failed`, `teardown_failed`), the kill-switch `engage_failed`, the
+ * setup read/apply failures, and the malformed-request family (`bad_json`,
+ * `bad_patch`, `bad_action`, `bad_reason`) have no branch yet — each is reported
+ * through the refusal block by code and text without the caller deciding anything
+ * on the code, and each should be added HERE when its branch is written, not
+ * spelled inline.
  *
- * `releaseRefused` is the one queue-action code with a branch: a 409 from the
- * engine is a RULE (this run's machine records the release nowhere), while
- * `release_failed` is a 503 from the store that a retry may clear. Telling an
- * operator to retry the first would send them back forever.
+ * Three have real branches today, and each differs from its neighbours in a way a
+ * status cannot express:
  *
- * Kept because the page's behaviour differs per code in ways a status cannot
- * express: `app_disabled` and `unauthorized` are both a 403/401 the operator
- * cannot act on from this page, `config_unreadable` means a document exists and
- * is broken — which is emphatically NOT "nothing is configured yet", and sending
- * that operator to the setup assistant would point them at a flow that then
- * refuses to overwrite a file it cannot parse.
+ * - `configUnreadable` means a document exists and is broken, which is emphatically
+ *   NOT "nothing is configured yet": sending that operator to the setup assistant
+ *   points them at a flow that then refuses to overwrite a file it cannot parse.
+ * - `releaseRefused` is a 409 the engine decided (this run's machine records the
+ *   release nowhere), while `release_failed` is a 503 a retry may clear. Telling an
+ *   operator to retry the first sends them back forever.
+ * - `setupRefused` is every refusal of the setup flow, and the panel reads
+ *   {@link SETUP_REFUSAL} out of `refused` to decide which control to point at.
  */
 export const REFUSAL = {
   appDisabled: 'app_disabled',
@@ -93,6 +110,28 @@ export const REFUSAL = {
   runUnknown: 'run_unknown',
   fieldRequired: 'field_required',
   releaseRefused: 'release_refused',
+  /** Every refusal of the setup flow. Which one it was is in `refused`. */
+  setupRefused: 'setup_refused',
+  badAnswers: 'bad_answers',
+  badProject: 'bad_project',
+} as const
+
+/**
+ * The engine's refusal codes for the setup flow, as they arrive in `refused`.
+ *
+ * These are the four decisions the flow can report, and the panel branches on
+ * three of them: an absent approver is a field the operator has not filled, a
+ * stale plan means the plan on screen no longer describes what would be written
+ * (so it must be recomputed rather than retried), and an approval gate names a
+ * question that is still unanswered. `inferredSubject` is the engine refusing to
+ * have inferred a subject it only ever asks about; it cannot arise from this
+ * panel's own calls and is spelled here so a caller that meets it can name it.
+ */
+export const SETUP_REFUSAL = {
+  approverRequired: 'approver-required',
+  planStale: 'plan-stale',
+  approvalRequired: 'setup-approval-required',
+  inferredSubject: 'inferred-subject-refused',
 } as const
 
 // ── payload shapes, transcribed from the handlers ──────────────────────────
@@ -202,9 +241,210 @@ export interface ConfigSnapshot {
   document: Record<string, unknown>
   /** Dotted paths whose value was withheld, so an elision is never read as a literal. */
   elided: string[]
+  /**
+   * The value substituted for each withheld one, as the store spells it.
+   *
+   * Relayed rather than hardcoded here: an editor must recognise it to keep it out
+   * of a patch, and a copy of the string on this side is a second spelling of one
+   * constant. If the two drift, a save silently replaces a live credential with the
+   * marker and the document stays valid.
+   */
+  elided_marker: string
   errors: Array<{ path: string; message: string }>
   advisories: ConfigAdvisory[]
   config_only_paths: string[]
+}
+
+/**
+ * One setting's value in force, from `EffectiveValue.to_json_object`.
+ *
+ * `origin` and `declared_at` are the reason this read exists. A surface showing
+ * `2` cannot tell an operator whether somebody chose 2 or whether the app ships 2,
+ * and those call for opposite actions — so the origin travels and no caller infers
+ * "looks like the default, must be the default", which is wrong exactly when
+ * someone has pinned a value that happens to equal it.
+ */
+export interface EffectiveSetting {
+  key: string
+  value: unknown
+  origin: 'bundled_default' | 'app_config' | 'cost_profile' | 'project_config' | 'source_config'
+  /** Dotted path of the explicit declaration, `''` for a bundled default. */
+  declared_at: string
+  is_default: boolean
+  default?: unknown
+  summary?: string
+  kind?: string
+  scopes?: string[]
+  minimum?: number | null
+  maximum?: number | null
+  choices?: unknown[]
+}
+
+/**
+ * One role's resolved routing, from `ResolvedRole.detail()`.
+ *
+ * The engine's own resolution, relayed. Every optional field is optional in the
+ * payload too — `detail()` omits what it has nothing to say about — so a reader
+ * must not treat an absent `declared_at` as an empty string that means something.
+ *
+ * `profile` and `role` are what a per-role reset addresses, and they are read from
+ * HERE rather than by splitting `declared_at`: a profile may legitimately be named
+ * `thrifty.roles`, and splitting the dotted path would then name a node that does
+ * not exist.
+ */
+export interface ResolvedRole {
+  role: string
+  source: 'cost_profile' | 'session_default'
+  agent: string
+  model: string
+  effort: string
+  profile?: string
+  declared_at?: string
+  /** Why this role fell back: four conditions, fixed in four different places. */
+  fallback?:
+    | 'no_cost_profile_selected'
+    | 'selected_cost_profile_not_defined'
+    | 'role_unassigned'
+    | 'role_model_unassigned'
+  report?: string
+  /** An effort the profile pinned that the resolved model cannot accept. */
+  dropped_effort?: string
+}
+
+/** The role plan for one project, from `RolePlan.detail()`. */
+export interface RolePlanDetail {
+  profile: string
+  roles: Record<string, ResolvedRole>
+  project?: string
+  /** The name a project selected when that profile is not defined. */
+  requested_profile?: string
+}
+
+/**
+ * The resolved read, from `_resolved_snapshot`.
+ *
+ * `role_order` travels because a JSON object has no order a client may rely on and
+ * the engine's role order is meaningful — it is the order the profiles declare and
+ * the audit records.
+ */
+export interface ResolvedConfig {
+  configured: boolean
+  project: string | null
+  source: string | null
+  settings: EffectiveSetting[]
+  roles: RolePlanDetail
+  role_order: string[]
+}
+
+/** One piece of file text an inference was drawn from, from `Evidence.render`. */
+export interface SetupEvidence {
+  subject?: string
+  located_at: string
+  /** Outside-authored text, already through the engine's display contract. */
+  excerpt: string
+}
+
+/** Something read out of the project, from `Inference.render`. */
+export interface SetupInference {
+  subject: string
+  value: string
+  rationale: string
+  evidence: SetupEvidence[]
+}
+
+/**
+ * Something the assistant asks rather than infers, from `render_question`.
+ *
+ * `answer_kind` is stated rather than inferred from an empty `options`: a caller
+ * that guesses wrong asks a human to pick from nothing.
+ */
+export interface SetupQuestion {
+  subject: string
+  prompt: string
+  because: string
+  options: string[]
+  answer_kind: 'choice' | 'confirmation'
+}
+
+/** A prerequisite report, from `render_prerequisites`. */
+export interface SetupPrerequisites {
+  met: boolean
+  checks: Array<Record<string, unknown>>
+  unmet: Array<Record<string, unknown>>
+}
+
+/**
+ * A bundled preset the project's evidence makes applicable, from `render_offer`.
+ *
+ * `programs` and `commands` are read out of the same bundled tables the write
+ * copies from, so what an operator approves is what would land in configuration.
+ */
+export interface SetupOffer {
+  kind: string
+  name: string
+  inference: SetupInference
+  programs: string[]
+  commands: Array<{ stage: string; argv: string[] }>
+  prerequisites: SetupPrerequisites
+  definition?: Record<string, unknown>
+  copy_note?: string
+}
+
+/** What the inspection returns, from `inspection_payload`. */
+export interface SetupInspection {
+  project: { name: string; root: string }
+  /** Whether memory was available. False is a smaller plan, never a silent one. */
+  memory_consulted: boolean
+  evidence: SetupEvidence[]
+  inferences: SetupInference[]
+  questions: SetupQuestion[]
+  offers: SetupOffer[]
+  prerequisites: SetupPrerequisites
+  /** Subjects that are asked and never inferred, so a retry is never the answer. */
+  asked_subjects: string[]
+  confirmed_levels: string[]
+  autonomy_field: string
+}
+
+/** The operator's answers, as both the plan and the apply take them. */
+export interface SetupAnswers {
+  cost_profile: string
+  /** One true/false per rung. A MISSING rung is unanswered, not "no". */
+  confirmations: Record<string, boolean>
+  approved_subjects: string[]
+  workflow_preset: string | null
+  watch_source: string | null
+}
+
+/**
+ * A computed plan and its identity, from `SetupPlanEnvelope.to_json_object`.
+ *
+ * `config_patch` is the patch itself and not a summary: an approval given against
+ * a summary is an approval of something else. `plan_id` is a content hash of the
+ * subject, the answers used and that patch — the apply recomputes it and refuses
+ * on a mismatch, so a plan whose inputs have moved is never applied unread.
+ */
+export interface SetupPlanEnvelope {
+  plan_id: string
+  project: { name: string; root: string }
+  inferences: SetupInference[]
+  answers_used: Record<string, unknown>
+  config_patch: Record<string, unknown>
+  written_paths: string[]
+  warnings: string[]
+}
+
+/** What an apply returns, from `apply_payload`. */
+export interface SetupApplied {
+  applied: boolean
+  plan_id: string
+  approver: string
+  project: { name: string; root: string }
+  written_paths: string[]
+  config_patch: Record<string, unknown>
+  prerequisites: SetupPrerequisites
+  notes: string[]
+  advisories: ConfigAdvisory[]
 }
 
 /**
@@ -285,13 +525,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
   }
   if (!response.ok) {
-    const body = (parsed ?? {}) as { code?: unknown; error?: unknown }
+    const body = (parsed ?? {}) as { code?: unknown; error?: unknown; refused?: unknown }
     const code = typeof body.code === 'string' ? body.code : ''
+    const refused = typeof body.refused === 'string' ? body.refused : ''
     const message =
       typeof body.error === 'string' && body.error !== ''
         ? body.error
         : i18nT('apps.specEngine.api.the_request_was_refused')
-    throw new SpecEngineApiError(message, code, response.status)
+    throw new SpecEngineApiError(message, code, response.status, refused)
   }
   return parsed as T
 }
@@ -303,7 +544,7 @@ const postJson = <T>(path: string, body: unknown): Promise<T> =>
     body: JSON.stringify(body),
   })
 
-// ── the ten routes ────────────────────────────────────────────────────────
+// ── the fourteen routes ───────────────────────────────────────────────────
 
 export const specEngineApi = {
   /**
@@ -435,6 +676,69 @@ export const specEngineApi = {
   /** GET one run's attributed spend, with the ceiling it is judged against. */
   runSpend: (runId: string): Promise<RunSpend> =>
     request<RunSpend>(`${API}/run-spend?run_id=${encodeURIComponent(runId)}`),
+
+  /**
+   * GET the value in force for every setting, with the origin of each.
+   *
+   * A READ of the document `config` returns and `writeConfig` writes — never a
+   * second write path. `project` and `source` narrow the resolution, because most
+   * of the precedence only exists once a project is named: without one, a
+   * project-scoped value and a profile a project selected are both invisible, and
+   * the reply says so by resolving to the wider layers rather than by omitting
+   * them.
+   */
+  resolvedConfig: (project?: string, source?: string): Promise<ResolvedConfig> => {
+    const query = new URLSearchParams()
+    if (project) query.set('project', project)
+    if (source) query.set('source', source)
+    const suffix = query.toString()
+    return request<ResolvedConfig>(`${API}/config/resolved${suffix ? `?${suffix}` : ''}`)
+  },
+
+  /**
+   * Inspect a project: the evidence read, the values inferred, the questions left.
+   *
+   * Writes nothing, and is a POST anyway: the project path is the CALLER's, so the
+   * route is operator-guarded rather than a general-purpose read. `name` overrides
+   * the configuration name, which otherwise falls back to the directory's — and it
+   * is part of the plan identity, so passing it later changes the `plan_id`.
+   */
+  setupInspect: (args: { project: string; name?: string }): Promise<SetupInspection> =>
+    postJson(`${API}/setup/inspect`, args),
+
+  /**
+   * Compute the plan a set of answers produces. Writes nothing.
+   *
+   * Every gate the apply would fail is evaluated here, so an operator learns that a
+   * rung is unanswered or a preset was never offered BEFORE they put their name to
+   * it. A refusal arrives as `setup_refused` with the specific code in `refused`.
+   */
+  setupPlan: (args: {
+    project: string
+    answers: SetupAnswers
+    name?: string
+  }): Promise<SetupPlanEnvelope> => postJson(`${API}/setup/plan`, args),
+
+  /**
+   * Apply a plan by its identity, on a named human approver's authority.
+   *
+   * `approver` is required and is NOT the session: an operator may apply a plan a
+   * colleague approved, and the engine records the approver in its durable write
+   * record while the session is recorded in the security event. An empty one is
+   * refused with `approver-required` and writes nothing.
+   *
+   * `plan_id` must be the one `setupPlan` returned for these same answers. The
+   * server recomputes the plan and refuses a mismatch with `plan-stale` — so a
+   * caller that changed an answer after planning must plan again rather than
+   * re-sending; the id is not a token to hold, it is a claim about the inputs.
+   */
+  setupApply: (args: {
+    project: string
+    answers: SetupAnswers
+    plan_id: string
+    approver: string
+    name?: string
+  }): Promise<SetupApplied> => postJson(`${API}/setup/apply`, args),
 }
 
 /** React Query keys, shared so two panels reading one route share one cache entry. */
@@ -443,4 +747,16 @@ export const QK = {
   config: ['spec-engine', 'config'] as const,
   killSwitch: ['spec-engine', 'kill-switch'] as const,
   runSpend: (runId: string) => ['spec-engine', 'run-spend', runId] as const,
+  /**
+   * The resolved read, keyed by the project it was resolved FOR.
+   *
+   * The project is part of the key rather than a filter applied after the fact: two
+   * projects resolve two different documents' worth of precedence, and one cache
+   * entry for both would show a value in force under a project it is not in force
+   * for.
+   */
+  resolved: (project: string) => ['spec-engine', 'config', 'resolved', project] as const,
 }
+
+/** The prefix every resolved-read key shares, for invalidating them together. */
+export const QK_RESOLVED_ROOT = ['spec-engine', 'config', 'resolved'] as const

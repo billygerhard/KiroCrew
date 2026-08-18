@@ -245,8 +245,7 @@ ul.se-findings li:last-child{border-bottom:none}
   padding:11px;font-size:12px;line-height:1.6;overflow:auto;margin:0;tab-size:2;color:var(--text);
   white-space:pre-wrap;overflow-wrap:anywhere;height:320px}
 
-/* Setup pane: a stepper across the work area, and the first-run landing pane. */
-.se-setup{grid-area:work;display:grid;grid-template-columns:196px minmax(0,1fr);
+/* Setup pane: a stepper across the work area, and the first-run landing pane. */.se-setup{grid-area:work;display:grid;grid-template-columns:196px minmax(0,1fr);
   min-height:0;overflow:hidden}
 .se-steps{border-right:1px solid var(--border);padding:14px 12px;background:var(--panel-strong);
   overflow:auto}
@@ -257,9 +256,70 @@ ul.se-findings li:last-child{border-bottom:none}
   border:1px solid var(--border-strong);display:grid;place-items:center;font-size:10px;font-weight:700}
 .se-step[data-state="now"]{color:var(--text-strong);font-weight:600}
 .se-step[data-state="now"] .se-dot{border-color:var(--accent);color:var(--accent)}
+/* A step behind the flow is DONE, not merely past: the four steps are four calls,
+   and a step marked done is one whose call actually returned. */
+.se-step[data-state="done"]{color:var(--text)}
+.se-step[data-state="done"] .se-dot{border-color:var(--ok);color:var(--ok)}
 .se-setup-body{overflow:auto;min-height:0;padding:16px 18px 24px}
 .se-setup-body h1{font-size:17px;margin-bottom:5px}
 .se-setup-lead{color:var(--muted);font-size:12.5px;margin:0 0 16px;max-width:66ch}
+
+/* Config pane: the roles table, and the segment-wise match trace under it.
+   Model and Effort are separate columns rather than one joined string — they are
+   two independent decisions and a reviewer scans down one of them — which is the
+   losing mockup's shape, carried over by post-selection correction 6. */
+table.se-roles{width:100%;border-collapse:collapse;font-size:12px}
+table.se-roles th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);font-weight:600;padding:0 8px 5px 0;border-bottom:1px solid var(--border)}
+table.se-roles td{padding:7px 8px 7px 0;border-bottom:1px solid var(--border);vertical-align:top}
+table.se-roles tr:last-child td{border-bottom:none}
+table.se-roles tr[aria-selected="true"] td{background:var(--accent-subtle)}
+.se-r{font-weight:600;color:var(--text-strong)}
+.se-src{font-family:var(--mono);font-size:10.5px;color:var(--muted);overflow-wrap:anywhere}
+.se-rolebtn{background:none;border:none;padding:0;color:var(--text-strong);font-weight:600;
+  text-align:left}
+.se-rolebtn[aria-pressed="true"]{color:var(--accent);text-decoration:underline}
+.se-rolebtn:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+/* The match trace. One line per layer consulted, hit or miss, so the precedence is
+   read rather than remembered. */
+.se-seg{font-family:var(--mono);font-size:11px;line-height:1.85;color:var(--muted);
+  background:var(--bg-accent);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:8px 9px;overflow-wrap:anywhere}
+.se-hit{color:var(--ok);font-weight:700}
+.se-miss{color:var(--muted-strong);text-decoration:line-through}
+.se-seg-note{font-family:var(--font-body);color:var(--text);text-decoration:none}
+/* Advisories. The acknowledgment-requiring ones are marked, because an advisory a
+   human must answer for is a different obligation from one they only read. */
+ul.se-advisories{margin:6px 0 0;padding:0;list-style:none;font-size:11.5px}
+ul.se-advisories li{padding:5px 0;border-bottom:1px solid var(--border)}
+ul.se-advisories li:last-child{border-bottom:none}
+ul.se-advisories li[data-ack="true"]{color:var(--text-strong)}
+.se-adv-text{display:block;margin-top:3px;color:var(--text);overflow-wrap:anywhere}
+.se-flag[data-flag="ack"]{color:var(--warn)}
+.se-flag[data-flag="dropped"]{color:var(--warn)}
+.se-flag[data-flag="unanswered"]{color:var(--danger)}
+.se-flag[data-flag="unmet"]{color:var(--warn)}
+/* The document editor. A FIXED height, not a cap: a document that grew with its
+   line count would push the save controls off the pane. */
+textarea.se-json{width:100%;resize:vertical;min-height:220px}
+
+/* Setup flow: one box per question, evidence rows above them. */
+.se-qbox{border:1px solid var(--border);border-radius:var(--radius-md);padding:11px 12px;
+  margin-bottom:12px;background:var(--panel)}
+.se-qbox h3{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  margin-bottom:8px}
+.se-evid{display:flex;flex-direction:column;gap:2px}
+.se-evid-row{display:grid;grid-template-columns:150px minmax(0,1fr) auto;gap:10px;
+  align-items:start;padding:7px 0;border-bottom:1px solid var(--border);font-size:12px}
+.se-evid-row:last-child{border-bottom:none}
+.se-evid-row[data-approved="true"]{color:var(--text-strong)}
+.se-subj{font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.se-evid-item{display:block;margin-top:5px}
+.se-offer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;
+  border-bottom:1px solid var(--border)}
+.se-offer:last-of-type{border-bottom:none}
+.se-rung{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;font-size:12px}
+.se-rung .se-note{flex:1 1 100%;margin:0}
 
 /* The status strip. A grid row, never an overlay: this is the one thing on the
    page that must never be occluded, and the whole strip turns danger-coloured

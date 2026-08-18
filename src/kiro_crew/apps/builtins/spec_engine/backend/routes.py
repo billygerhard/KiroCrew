@@ -115,6 +115,7 @@ from ..engine.config import (
     APP_NAME,
     CONFIG_ONLY_PATHS,
     DASHBOARD_SURFACE,
+    ELIDED,
     ROLES,
     SETUP_ASSISTANT_SURFACE,
     ConfigLoadError,
@@ -433,8 +434,15 @@ def _config_snapshot(store: ConfigStore) -> dict[str, Any]:
     "offer the setup assistant".
 
     ``elided`` lists the dotted paths whose value was withheld, so a page can
-    tell an elision from a literal ``<elided>`` somebody typed, and can report
+    tell an elision from a literal marker somebody typed, and can report
     "a token is configured here" without ever holding the token.
+
+    ``elided_marker`` is the substituted value itself, relayed rather than left for
+    a client to hardcode. An editor has to recognise it to keep it out of a patch --
+    saving the marker back would replace a live credential with it, and the
+    document would stay valid, so nothing downstream would report the loss. A
+    client-side copy of the string is a second spelling of one constant, and the
+    two drifting apart breaks exactly that protection.
     """
     document = store.document()
     elided = elide_secrets(document)
@@ -443,6 +451,7 @@ def _config_snapshot(store: ConfigStore) -> dict[str, Any]:
         "path": str(store.path),
         "document": elided.document,
         "elided": list(elided.paths),
+        "elided_marker": ELIDED,
         "errors": [
             {"path": error.path, "message": error.message}
             for error in validate_config_document(document)
