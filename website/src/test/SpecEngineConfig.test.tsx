@@ -221,6 +221,14 @@ describe('the merge patch a save sends', () => {
     })
     const added = { fresh: { token: ELIDED, name: 'x' } }
     expect(mergePatch({}, added, ELIDED)).toEqual({ fresh: { name: 'x' } })
+    // The case a path-list rule cannot cover, and the reason the rule is on the
+    // VALUE: the operator renamed a key while its value was still withheld, so the
+    // marker arrives at a path the read never listed as elided. It must not be
+    // written, and the old key must still be deleted.
+    const renamed = { projects: { acme: { variables: { apiKey: ELIDED } } } }
+    expect(mergePatch(base, renamed, ELIDED)).toEqual({
+      projects: { acme: { variables: { api_key: null } } },
+    })
   })
 
   it('sends a typed replacement for a withheld value', () => {
@@ -414,10 +422,28 @@ describe('the resolved read beside the document', () => {
 
   it('offers no reset when the declaring profile is not the one in force', async () => {
     // The segment-wise rule, at the control it protects. The role's node is under a
-    // profile NAMED `thrifty.roles`; the profile in force is `thrifty`. A
-    // string-prefix match reads the first as a path inside the second and would
-    // offer a reset that clears another project's profile.
+    // profile NAMED `thrifty.roles`, which EXISTS in the document; the profile in
+    // force is `thrifty`. A string-prefix match reads the first as a path inside the
+    // second, and the reset it then offers would clear the role assignment of a
+    // profile some other project selected.
     stub({
+      config: {
+        body: {
+          configured: true,
+          path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
+          document: {
+            cost_profiles: {
+              'thrifty.roles': { roles: { review: { model: 'auto', effort: 'high' } } },
+            },
+            projects: { acme: { path: '/src/acme', cost_profile: 'thrifty' } },
+          },
+          elided: [],
+          elided_marker: ELIDED,
+          errors: [],
+          advisories: [],
+          config_only_paths: [],
+        },
+      },
       resolved: {
         body: resolved({
           roles: {
