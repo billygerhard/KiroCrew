@@ -365,7 +365,11 @@ textarea.se-json{width:100%;resize:vertical;min-height:220px}
    and the label overrides are re-stated at higher specificity for the same reason. */
 .se-ks-panel{flex:1 0 100%;order:-1;margin:9px 0 3px;padding:10px 11px;
   background:var(--panel);color:var(--text);border:1px solid var(--border-strong);
-  border-radius:var(--radius-md);font-size:12px}
+  border-radius:var(--radius-md);font-size:12px;
+  /* Bounded, in the strip's own defense: a long stored engage reason would
+     otherwise grow this panel and shrink the work row above it — and the
+     strip is the one region the design forbids being displaced. */
+  max-height:200px;overflow:auto}
 .se-ks-panel>*+*{margin-top:8px}
 .se-ks-panel .se-arm{margin-top:0}
 .se-status[data-engaged="true"] .se-ks-panel .se-lbl{color:var(--muted)}

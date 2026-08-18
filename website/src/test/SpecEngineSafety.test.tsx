@@ -368,6 +368,16 @@ describe('engaging', () => {
     // write. The second is the whole property — a confirmation derived from the
     // reply alone would need only the first.
     await waitFor(() => expect(switchReads().length).toBeGreaterThanOrEqual(2))
+    // The other half of the same-cache-entry claim: the STRIP's own indicator
+    // flips, because the confirming read landed in the entry the strip renders.
+    // A private fetch would leave the verdict right and the dot green.
+    await waitFor(() => {
+      const stripDot = document.querySelector('.se-status .se-ks-dot')
+      expect(stripDot).toHaveAttribute('data-state', 'engaged')
+    })
+    expect(
+      screen.getByText(en.apps.specEngine.specEnginePage.kill_switch_engaged),
+    ).toBeInTheDocument()
   })
 
   it('treats a 200 whose read-back still shows the old state as NOT confirmed', async () => {
@@ -415,6 +425,13 @@ describe('engaging', () => {
 
     expect(await screen.findByText(T.not_confirmed)).toBeInTheDocument()
     expect(screen.queryByText(T.the_stop_is_in_force)).toBeNull()
+    // The sentence names the state the READ-BACK found — engaged — never the
+    // one the requested action implies. Deriving it from the action printed
+    // "still reads released, so nothing is stopped" beside a flag and a strip
+    // both showing engaged: a false statement in the unsafe direction, in the
+    // exact branch built to catch half-landed writes.
+    expect(screen.getByText(T.the_flag_still_reads_engaged)).toBeInTheDocument()
+    expect(screen.queryByText(T.the_flag_still_reads_released)).toBeNull()
   })
 
   it('reports a failed read-back as unknown rather than as either outcome', async () => {

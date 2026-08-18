@@ -376,11 +376,17 @@ export function KillSwitchControls() {
                 <>
                   <strong>{i18nT('apps.specEngine.safetyPanel.not_confirmed')}</strong>
                   <p className="se-note" data-unconfirmed={outcome.action}>
-                    {outcome.readBackFailure !== null
+                    {outcome.readBackFailure !== null || outcome.persisted === undefined
                       ? i18nT('apps.specEngine.safetyPanel.the_switch_could_not_be_read_back')
-                      : outcome.action === 'engage'
-                        ? i18nT('apps.specEngine.safetyPanel.the_flag_still_reads_released')
-                        : i18nT('apps.specEngine.safetyPanel.the_flag_still_reads_engaged')}
+                      : /* The sentence names the state the READ-BACK found, never
+                           the one the request implies. Deriving it from the action
+                           printed "still reads released, so nothing is stopped"
+                           beside a flag and a strip both showing engaged — a false
+                           statement in the unsafe direction, in the exact branch
+                           built to catch half-landed writes. */
+                        outcome.persisted.engaged
+                        ? i18nT('apps.specEngine.safetyPanel.the_flag_still_reads_engaged')
+                        : i18nT('apps.specEngine.safetyPanel.the_flag_still_reads_released')}
                   </p>
                   {outcome.readBackFailure !== null && (
                     <Refused
@@ -587,10 +593,17 @@ export function RunSpendBlock({ entry }: { entry: QueueEntry }) {
           <dl className="se-kv">
             <dt>{i18nT('apps.specEngine.safetyPanel.total')}</dt>
             <dd>
-              {i18nT('apps.specEngine.safetyPanel.total_of_ceiling', {
-                total: fmtNumber(data.credits, CREDITS),
-                ceiling: fmtNumber(ceiling?.value ?? 0, CREDITS),
-              })}
+              {/* The paired form only when a ceiling exists: "163.2 of 0" would
+                  state a false limit, and the Ceiling row below already renders
+                  the no-ceiling case in words. Unreachable today (the route
+                  always sets a ceiling), aligned so the two rows cannot
+                  disagree if that ever changes. */}
+              {ceiling
+                ? i18nT('apps.specEngine.safetyPanel.total_of_ceiling', {
+                    total: fmtNumber(data.credits, CREDITS),
+                    ceiling: fmtNumber(ceiling.value, CREDITS),
+                  })
+                : fmtNumber(data.credits, CREDITS)}
             </dd>
             <dt>{i18nT('apps.specEngine.safetyPanel.metered')}</dt>
             <dd>{fmtNumber(data.metered_credits, CREDITS)}</dd>
