@@ -1,6 +1,6 @@
 """The stdio JSON-RPC dispatch for the Engine_MCP_Server.
 
-Line-delimited JSON-RPC 2.0 on stdin/stdout, the shape a KiroCrew builtin vends
+Line-delimited JSON-RPC 2.0 on stdin/stdout, the shape a Kiro Crew builtin vends
 an MCP server as (a command entry, not a URL: a builtin runs in-process and has
 no backend port to dial). The methods a client's init sequence sends all answer
 conformantly — `initialize`, `tools/list`, and the empty `prompts/list` and

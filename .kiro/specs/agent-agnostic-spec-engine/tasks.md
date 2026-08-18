@@ -242,7 +242,7 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 
 - [x] 14. Setup assistant
   - [x] 14.1 Agent-assisted setup flow
-    - Inspect KiroCrew memory, steering files, docs, and CI/build configs to infer workflow, watch sources, and tooling; present each inference with evidence; ask conversationally for what cannot be inferred; operate from project files alone when memory is absent
+    - Inspect Kiro Crew memory, steering files, docs, and CI/build configs to infer workflow, watch sources, and tooling; present each inference with evidence; ask conversationally for what cannot be inferred; operate from project files alone when memory is absent
     - Write through the validated config path on approval; ask (never infer) the Cost_Profile; per-level confirmation for execution, delivery, and integration; offer applicable Workflow_Presets and run the prerequisite checks, reporting each unmet check with its resolving action
     - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7, 15.7_
 
@@ -395,8 +395,10 @@ Ships the spec-engine app in dependency order: gateway enablers and engine found
 This spec's **one-app design intent, and the two-app shape it ratified in its
 place, are both superseded** by the later spec at
 `.kiro/specs/spec-engine-own-surface/`. Recorded here so a reader of this
-document does not act on either. Nothing else in this file is changed: the
-entries above remain the record of what this spec decided at the time.
+document does not act on either. No entry above is rewritten: they remain the
+record of what this spec decided at the time. (The only other edit these
+documents took is a brand-spelling correction — `KiroCrew` to `Kiro Crew` — that
+the repo's brand gate requires of every line this branch adds.)
 
 - **What is superseded.** The disposition above — "The design still describes ONE app; the shipped shape is two" — was closed against the wrong option. The later spec found that the second app was not a new app at all: roughly 7,700 lines of engine-driving code had been added to `spec-builder`, a **pre-existing builtin owned by another team**, present on `origin/main` before this project began, whose interface this project was started to replace. Seven of its files were modified (including a manifest line retiring one of its declared skills) and eleven files were added inside its trees.
 - **How it was resolved.** `spec_builder` is restored byte-identical to the merge-base and fenced by an App_Boundary_Fence build gate; `spec_engine` now declares its own page (`/spec-engine`) and its own backing routes, with an operator surface designed from mockups rather than inherited. The one-app *outcome* therefore holds again — one app packages the engine, the MCP server, the skill and the UI — but not by the route this design named.

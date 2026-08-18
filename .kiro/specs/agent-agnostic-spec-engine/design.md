@@ -2,9 +2,9 @@
 
 ## Overview
 
-This feature ships one KiroCrew app, working name `spec-engine` (final name needs explicit sign-off; names are one-way doors), that packages a rules-as-code Spec_Engine library, a thin MCP wrapper exposing it to any agent, a set of zero-token drivers (watchers, delivery runner, dispatcher), and the absorbed Spec Builder UI. Two small core changes land as a prerequisite PR: per-app tool-approval grants for app-seeded sessions, and verification of the builtin registration path for app-vended MCP servers.
+This feature ships one Kiro Crew app, working name `spec-engine` (final name needs explicit sign-off; names are one-way doors), that packages a rules-as-code Spec_Engine library, a thin MCP wrapper exposing it to any agent, a set of zero-token drivers (watchers, delivery runner, dispatcher), and the absorbed Spec Builder UI. Two small core changes land as a prerequisite PR: per-app tool-approval grants for app-seeded sessions, and verification of the builtin registration path for app-vended MCP servers.
 
-The design follows three verified constraints from the KiroCrew codebase:
+The design follows three verified constraints from the Kiro Crew codebase:
 
 - `ROLE_MODEL_KEYS` in `src/kiro_crew/config/loader.py` is a closed allowlist (`background`, `subagent`); `coerce_role_models` drops unknown keys. Spec role routing therefore uses per-dispatch model/effort parameters (already supported by subagent spawn and workflow `ctx.agent()` calls) driven by app-owned Cost_Profile config, not core `role_models` keys.
 - `src/kiro_crew/apps/discovery.py` copies the typed `agents`, `skills`, and `mcpServers` manifest fields into the persisted app snapshot for builtin and installed apps alike; the contrary comment in the Spec Builder backend is stale. The app relies on this path to vend its skill and MCP server.
@@ -79,7 +79,7 @@ Thin stdio JSON-RPC wrapper over the library; every tool call maps 1:1 onto a li
 - **Spec Builder UI (absorbed)** — the existing app's backend collapses to thin endpoints over the engine library: list specs, render docs, relay chat turns, Review_Queue with approve/request-changes actions, run detail with per-run cost from the ledger, configuration surface with effective-value display, kill switch. `_seed_prompt`, `_TYPE_PLAN`/`_TYPE_GUIDANCE`, and `_derive_phase` are deleted in favor of engine calls. The new app replaces the `spec-builder` builtin; prior specs remain valid artifacts because the format is unchanged.
 - **Watcher cron** — one gateway script cron per instance tick invoking `engine.watchers.tick()`; zero model calls while idle.
 - **Headless run driver** — seeds ordinary agent sessions through the existing chat-runner path with the run id stamped and the app's granted approval posture applied; refuses the run on posture mismatch. Sessions appear in the dashboard session list like any chat.
-- **Setup_Assistant** — an agent session seeded with a setup skill; inspects KiroCrew memory, `.kiro/steering/`, project docs, and CI configs; proposes config with per-setting evidence through a validated config-write endpoint; asks conversationally for what it cannot infer; requires per-level confirmation for execution/delivery/integration and asks (never infers) the Cost_Profile.
+- **Setup_Assistant** — an agent session seeded with a setup skill; inspects Kiro Crew memory, `.kiro/steering/`, project docs, and CI configs; proposes config with per-setting evidence through a validated config-write endpoint; asks conversationally for what it cannot infer; requires per-level confirmation for execution/delivery/integration and asks (never infers) the Cost_Profile.
 - **Review-feedback watcher** — per-project opt-in poll of the run's review artifact for new comments (configured commands, zero-token idle); new comments dispatch fix tasks bounded by retry limit and budget ceiling.
 
 ### Core enablers (separate prerequisite PR to kiro_crew)

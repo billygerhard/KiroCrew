@@ -4,7 +4,7 @@
 
 The `agent-agnostic-spec-engine` spec shipped a working engine and then put its
 operator surface in the wrong place. Its design opened with "this feature ships
-**one** KiroCrew app... and the absorbed Spec Builder UI", but what shipped is two
+**one** Kiro Crew app... and the absorbed Spec Builder UI", but what shipped is two
 apps: a new `spec-engine` app with no user interface, and roughly 7,700 lines of
 engine-driving code added to `spec-builder` — a **pre-existing app owned by
 another team**, present on `origin/main` since PR #518, whose interface this
@@ -34,7 +34,7 @@ recorded there.
 
 ## Glossary
 
-- **Spec_App**: The KiroCrew builtin app this project owns, directory name `spec_engine`, which packages the Spec_Engine library, the Engine_MCP_Server, the discovery skill, and — after this spec — the Operator_Surface.
+- **Spec_App**: The Kiro Crew builtin app this project owns, directory name `spec_engine`, which packages the Spec_Engine library, the Engine_MCP_Server, the discovery skill, and — after this spec — the Operator_Surface.
 - **Prior_App**: The pre-existing `spec-builder` builtin app, owned by another team and present on the repository's default branch before this project began. Not ours to modify.
 - **Spec_Engine**: The rules-as-code library under the Spec_App that derives phases, validates documents, records approvals, and owns run state.
 - **Engine_MCP_Server**: The stdio MCP server the Spec_App declares, which exposes Spec_Engine capabilities as tools to any agent.

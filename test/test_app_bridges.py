@@ -2225,7 +2225,7 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
 class TestBuiltinVendedResourcesReachASession:
     """A builtin's declared MCP server and skill must reach an agent session.
 
-    A session's tool surface is the ``mcpServers`` map in KiroCrew's own agent
+    A session's tool surface is the ``mcpServers`` map in Kiro Crew's own agent
     config (the file kiro-cli loads) plus the skills the loader finds under the
     data home. Registration populates both from the SHIPPED manifest, and every
     way it can fail to do so is silent — a declared resource that never lands only

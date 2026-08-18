@@ -2,16 +2,16 @@
 
 ## Introduction
 
-KiroCrew replicates the full Kiro spec-driven development process (requirements -> design -> tasks -> execution) as an open, agent-agnostic system. Today the process is fragmented: the Kiro IDE owns one implementation, the Spec Builder app embeds its rules as prompt text in its own backend (reachable only through its embedded chat), and a separately hosted MCP server carries a third copy. This feature extracts the rules into a single Spec_Engine (rules as code), exposes it to any agent through an MCP tool surface that carries its own instructions, and packages the whole thing as a KiroCrew app in the public repository. The result supports both interactive authoring ("Spec this out" in any chat) and headless authoring (a watcher fires a spec run when an issue arrives), with a policy-governed review gate before execution (human review by default, configurable up to full autonomy per source), an optional autonomous delivery pipeline that carries results through the project's own delivery workflow, whether that is a pull request with CI, an internal code review, or plain local builds, and orchestrated execution that routes design/review work to a smart model and implementation work to a cheaper one.
+Kiro Crew replicates the full Kiro spec-driven development process (requirements -> design -> tasks -> execution) as an open, agent-agnostic system. Today the process is fragmented: the Kiro IDE owns one implementation, the Spec Builder app embeds its rules as prompt text in its own backend (reachable only through its embedded chat), and a separately hosted MCP server carries a third copy. This feature extracts the rules into a single Spec_Engine (rules as code), exposes it to any agent through an MCP tool surface that carries its own instructions, and packages the whole thing as a Kiro Crew app in the public repository. The result supports both interactive authoring ("Spec this out" in any chat) and headless authoring (a watcher fires a spec run when an issue arrives), with a policy-governed review gate before execution (human review by default, configurable up to full autonomy per source), an optional autonomous delivery pipeline that carries results through the project's own delivery workflow, whether that is a pull request with CI, an internal code review, or plain local builds, and orchestrated execution that routes design/review work to a smart model and implementation work to a cheaper one.
 
 ## Glossary
 
 - **Spec_Artifacts**: The on-disk contract for a spec: `requirements.md`, `design.md`, `tasks.md`, and the `.config.kiro` sidecar under `<project>/.kiro/specs/<name>/`.
 - **Spec_Engine**: The library that implements spec rules as code: document validation, phase state machine, dependency-graph analysis, approval recording, and task status persistence. The single source of truth for spec discipline.
 - **Engine_MCP_Server**: The MCP wrapper over the Spec_Engine that exposes its operations as tools to any agent.
-- **Spec_App**: The KiroCrew app that packages the Spec_Engine, the Engine_MCP_Server, the discovery skill, and the Spec_Builder_UI for installation.
+- **Spec_App**: The Kiro Crew app that packages the Spec_Engine, the Engine_MCP_Server, the discovery skill, and the Spec_Builder_UI for installation.
 - **Host_Agent**: Any agent session (default agent, subagent, cron, third-party agent) that consumes the Engine_MCP_Server tools. Requires no spec-specific configuration.
-- **Gateway**: The KiroCrew gateway process that hosts agent sessions and owns tool-approval decisions.
+- **Gateway**: The Kiro Crew gateway process that hosts agent sessions and owns tool-approval decisions.
 - **Review_Gate**: The structural boundary between spec authoring and spec execution. Execution starts only through this gate, governed by the Autonomy_Policy.
 - **Autonomy_Policy**: Per-source, per-spec-type, and optionally per-submitter-class configuration that sets how far a triggered run proceeds without human action: authoring only, through execution, through delivery, or through integration. Loaded from configuration only.
 - **Delivery_Pipeline**: The post-execution flow of a run, executing the stages of the configured Delivery_Workflow: isolate, submit, verify, publish, and teardown. Available to autonomous and interactive runs alike.
@@ -21,7 +21,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 - **Watcher_Dispatcher**: The headless trigger component that observes external sources (issue trackers) and starts headless spec runs for newly detected items.
 - **Watched_Item**: A newly detected external item (for example a GitHub issue) that the Watcher_Dispatcher may turn into a headless spec run.
 - **Spec_Builder_UI**: The dashboard application surface for browsing specs, reviewing documents, approving phases, and starting execution. A driver of the Spec_Engine, not an engine.
-- **Setup_Assistant**: An agent-driven interactive setup flow that inspects existing project context, such as KiroCrew memory, Kiro steering files, and project documentation, to infer and propose the Spec_App configuration.
+- **Setup_Assistant**: An agent-driven interactive setup flow that inspects existing project context, such as Kiro Crew memory, Kiro steering files, and project documentation, to infer and propose the Spec_App configuration.
 - **Review_Queue**: The engine-exposed set of runs waiting at human-reserved gates, renderable by any driver.
 - **Cost_Profile**: A named, per-project-selectable bundle of role assignments, an optional Host_Agent plus a model and a reasoning effort per role, with a subagent concurrency cap and a default per-run budget ceiling.
 - **Quality_Gate**: A verify-stage command declared with a severity: blocking, where failure stops the run and dispatches fix tasks, or advisory, where failure is recorded and surfaced without stopping the run.
@@ -173,7 +173,7 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 ### Requirement 11: Public app with pluggable providers
 
-**User Story:** As a maintainer, I want the app published in the public KiroCrew repository with proprietary capabilities pluggable, so that public consumers get a working engine while internal builds add enhanced analysis.
+**User Story:** As a maintainer, I want the app published in the public Kiro Crew repository with proprietary capabilities pluggable, so that public consumers get a working engine while internal builds add enhanced analysis.
 
 #### Acceptance Criteria
 
@@ -230,10 +230,10 @@ KiroCrew replicates the full Kiro spec-driven development process (requirements 
 
 #### Acceptance Criteria
 
-1. WHEN a user starts the interactive setup, THE Setup_Assistant SHALL inspect the available project context, including KiroCrew memory, Kiro steering files, project documentation, and CI or build configuration files, to infer the project's delivery workflow, watch sources, and tooling.
+1. WHEN a user starts the interactive setup, THE Setup_Assistant SHALL inspect the available project context, including Kiro Crew memory, Kiro steering files, project documentation, and CI or build configuration files, to infer the project's delivery workflow, watch sources, and tooling.
 2. WHEN the Setup_Assistant infers a proposed configuration, THE Setup_Assistant SHALL present each inferred setting together with the evidence it was inferred from before applying anything.
 3. IF the Setup_Assistant cannot infer a required setting from the available context, THEN THE Setup_Assistant SHALL ask the user for that setting conversationally.
-4. WHERE prior KiroCrew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
+4. WHERE prior Kiro Crew memory and steering files are absent, THE Setup_Assistant SHALL operate from project files alone.
 5. WHEN the user approves a proposed configuration, THE Setup_Assistant SHALL write it through the same validated configuration path used by the configuration surface of the Spec_Builder_UI, and THE Setup_Assistant SHALL NOT write any configuration before the user approves it.
 6. THE Setup_Assistant SHALL propose the authoring level as the Autonomy_Policy floor, and SHALL NOT enable the execution, delivery, or integration levels without explicit user confirmation of each level being enabled.
 7. WHEN the interactive setup runs, THE Setup_Assistant SHALL offer the applicable Workflow_Presets, SHALL run the Doctor against the proposed configuration, and SHALL report each Finding with the action that resolves it.

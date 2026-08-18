@@ -185,6 +185,12 @@ section records what was DONE with each. Exit codes below are real — read with
 | i18n aggregate | `npm run i18n:check` | **1** — one inherited finding, below |
 | App_Boundary_Fence | `pytest .../test_app_boundary_fence.py` | **0** — 38 passed |
 | docs-lint | `bash scripts/docs-lint.sh` | **0** — 190 files |
+| brand name | `BRAND_BASE_REF=origin/main python3 scripts/check_brand_name.py` | **0** after the fix below (was 1) |
+| scrub-lint | `bash scripts/scrub-lint.sh` | **141** — local scratch + repo history, below |
+
+This task's own merge-base worktree, used for the pre-existence proofs, was
+removed afterwards (`git worktree remove`, with the `node_modules` symlink
+unlinked first so the real tree was never at risk).
 
 Requirement 1 re-verified rather than assumed, at Merge_Base
 `adbec83be0787fbbbd14af40eaaf44e627553d27`:
@@ -278,17 +284,28 @@ Decided against, on measurement rather than preference:
   declare a page (measured), so the pageless else-branch is driven by no shipped
   manifest — only by `appManifest.test.ts`'s `pageless-probe-app`. It now reads
   "taught to demand a page_label exactly when a page exists".
-- **`tmp/` hygiene: verified harmless, not swept.** The entry admits scratch that
-  cannot reach a build artifact, and this is now checked rather than assumed:
-  **0** files under `tmp/` are tracked by git; `MANIFEST.in` grafts no repo-root
-  directory (the sdist is assembled from named root files plus
+- **`tmp/` hygiene: sharper than recorded, and NOT swept.** The entry admits
+  scratch that cannot reach a build artifact, and that half is now checked rather
+  than assumed: **0** files under `tmp/` are tracked by git; `MANIFEST.in` grafts
+  no repo-root directory (the sdist is assembled from named root files plus
   `recursive-include src/kiro_crew/...`); and `setuptools_scm` is not in use, so
-  no tracked-file set is auto-included. The `.py` copies of engine modules are
-  therefore scratch, not shipped source. Not deleted: the directory is shared
-  between concurrent sessions, and removing another session's scratch is the one
-  thing a sweep must not do. This task's own merge-base worktree WAS removed
-  (`git worktree remove`, with the `node_modules` symlink unlinked first so the
-  real tree was never at risk).
+  no tracked-file set is auto-included. But the scratch is not inert either, which
+  the earlier finding did not know: `scripts/scrub-lint.sh` scans the WORKING TREE,
+  and an earlier task's copy at `tmp/mb-black/test_test_security.py` trips its
+  credential-pattern check 25 times. The check allowlists `./test/` and
+  `./website/src/test/` by ANCHORED prefix, so a copy of an allowlisted fixture
+  placed anywhere else is a failure by construction. CI is unaffected — `tmp/` is
+  untracked and absent from a fresh checkout — so this is a local-tree cost, not a
+  build one. Not deleted: the directory is shared between concurrent sessions and
+  removing another session's scratch is the one thing a sweep must not do. For the
+  owner: sweep `tmp/` between runs, or add it to `.gitignore` (a shared-file change
+  needing its own fence allowlist entry, hence not done here).
+- **`scripts/scrub-lint.sh`'s other failure is the repo's history, and its exit
+  code is not 1.** Step 5 reports **1310** commits carrying internal author
+  references — including `origin/main`'s own tip — so it is inherited and
+  unfixable from this branch. Note for whoever wires it into a gate: the script
+  exits **141** (SIGPIPE from an internal `| head`), not 1, so a caller reading
+  the status as signal-death rather than failure would misread it.
 - **Equivalence suite's credential-key reach: extended.** The `hypothesis.find`
   non-vacuity block gained a fifth shape, `"a credential-classified key"`, whose
   predicate asks the engine's own `is_secret_key` rather than carrying a copy of
@@ -351,4 +368,16 @@ marker, then restored byte-identical with zero markers left in the tree:
   gains a dated section stating that its one-app design intent — and the two-app
   shape it ratified in that intent's place — are superseded by this spec, that the
   second app was in fact another team's, and that its delivery-isolation
-  obligation remains open there. A pure append; nothing else in that file changed.
+  obligation remains open there. No entry of its own is rewritten.
+- **The brand gate was failing on the branch and is now green.** Not on this
+  task's list, found while sweeping: `BRAND_BASE_REF=origin/main python3
+  scripts/check_brand_name.py` exited 1 on **16 lines** spelling the product
+  `KiroCrew`. Scoped to 7.2's own commits (`BRAND_BASE_REF=3dbbe0139`) it was
+  already green, so every one was earlier-wave content — 12 in the prior spec's
+  three documents, which this branch ADDS (they are absent from both the
+  Merge_Base and `origin/main`, so the gate is right to count them), plus this
+  spec's glossary, `engine_mcp/server.py`'s module docstring and one line of
+  `test/test_app_bridges.py`. All 15 distinct lines are corrected. The one that
+  needed care is this spec's requirements.md:7, which quotes the prior design
+  verbatim: both sides were corrected together, so the quotation still matches
+  its source word for word.
