@@ -74,6 +74,7 @@ import {
   type QueueEntry,
   type WaitingOn,
 } from './api'
+import { RunSpendBlock } from './SafetyPanel'
 
 /** Separator between two identifiers on one line. Punctuation, not copy. */
 const SEP = ' \u00b7 '
@@ -798,6 +799,10 @@ export function RowFlags({ entry, keptCount }: { entry: QueueEntry; keptCount: n
  * clearing state in an effect because it cannot miss a field added later.
  *
  * Block order is load-bearing: the untrusted prose is last. See the header.
+ *
+ * The spend block comes from `SafetyPanel.tsx` and sits in the stack rather than
+ * behind the mockup's tab, so the figure the ceiling compares is beside the reason
+ * the run is waiting — a budget-parked run's spend is the whole reason it is here.
  */
 export function RunInspectorBody({
   entry,
@@ -811,6 +816,7 @@ export function RunInspectorBody({
       <ActBlock entry={entry} />
       <HeldBlock entry={entry} />
       <RedispatchBlock entry={entry} />
+      <RunSpendBlock entry={entry} />
       <TeardownBlock entry={entry} onKept={onKept} />
       {/* Last, because it is the only block holding outside-authored prose. */}
       <FindingsBlock entry={entry} />

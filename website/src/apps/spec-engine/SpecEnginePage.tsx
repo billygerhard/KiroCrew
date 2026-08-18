@@ -38,7 +38,7 @@
  *
  * This shell owns the grid, the rail, the ordered table with real rows and
  * keyboard selection, the docked inspector's identity header, first-run routing,
- * and the status strip's reading of the kill switch.
+ * and the status strip's queue-scoped figures.
  *
  * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
  * selected run so its state cannot outlive the selection. The configuration pane
@@ -46,11 +46,16 @@
  * `ConfigPanel.tsx`, and the four-step setup flow to `SetupFlowPanel.tsx` — the
  * step rail lives there rather than here because its state IS the flow's state, and
  * a rail rendered from the shell would have to be told what step it was on. The
- * kill-switch and spend controls are still a later task; the strip below reads the
- * switch and does not operate it.
+ * kill switch — its reading, its dot and its arm-then-confirm control — and the
+ * per-run spend block belong to `SafetyPanel.tsx`; this shell reads the same
+ * `QK.killSwitch` cache entry only to colour the strip when the stop is in force,
+ * so the dot and the words beside it cannot come from two readings of one flag.
  *
- * The inspector's tab strip belongs with that remaining panel for the same reason —
- * tabs over unbuilt panes would be navigation to nothing.
+ * The mockup's inspector TAB STRIP is deliberately not built. Every pane it
+ * switched between is here, stacked, because the queue panel shipped them that way
+ * and moving shipped blocks behind navigation is what the selection criteria argue
+ * against: an operator would have to find a tab to learn that a run's revision
+ * cycles are spent.
  *
  * ## Backend contract
  *
@@ -81,6 +86,7 @@ import {
 import { SE_CSS } from './styles'
 import { ConfigPane } from './ConfigPanel'
 import { RowFlags, RunInspectorBody } from './ReviewQueuePanel'
+import { KillSwitchControls, switchReading } from './SafetyPanel'
 import { SetupFlowPanel } from './SetupFlowPanel'
 
 /** Which pane the work area shows. Panes, not destinations: one list, one document. */
@@ -300,8 +306,7 @@ export default function SpecEnginePage() {
     [rows, focusRow],
   )
 
-  const switchState = killSwitch.data?.switch
-  const engaged = switchState?.engaged === true
+  const engaged = switchReading(killSwitch.data?.switch) === 'engaged'
 
   return (
     <div className="se-root">
@@ -563,12 +568,21 @@ export default function SpecEnginePage() {
           <span className="se-lbl" data-strip-error="queue">
             {i18nT('apps.specEngine.specEnginePage.could_not_read_the_run_queue')}
           </span>
+        ) : queue.isPending ? (
+          /* The same argument one state earlier. Before the read lands the figures
+             are not zero, they are unknown, and "Spend 0 / Waiting 0" is a
+             confident claim this surface has no basis for — on the config and setup
+             panes it would be the only spend figure on screen. */
+          <span className="se-lbl" data-strip-pending="queue">
+            {i18nT('apps.specEngine.specEnginePage.reading_the_queue')}
+          </span>
         ) : (
           <>
             {/* Scoped label: total_credits sums ONLY runs waiting on a person
                 (the queue route's population), not runs working or closed. An
                 unqualified "Spend" would under-report by an unbounded amount.
-                The all-runs figure belongs to the spend panel, a later task. */}
+                The per-run figure, with the ceiling it is judged against, is in
+                the inspector's spend block. */}
             <span className="se-lbl">
               {i18nT('apps.specEngine.specEnginePage.spend_on_waiting_runs')}
             </span>
@@ -583,23 +597,11 @@ export default function SpecEnginePage() {
             <span className="se-val">{fmtNumber(entries.length)}</span>
           </>
         )}
-        <span className="se-ks">
-          <span className="se-ks-dot" />
-          <span className="se-ks-text">
-            {killSwitch.isError
-              ? i18nT('apps.specEngine.specEnginePage.could_not_read_the_kill_switch')
-              : engaged
-                ? i18nT('apps.specEngine.specEnginePage.kill_switch_engaged')
-                : i18nT('apps.specEngine.specEnginePage.kill_switch_released')}
-          </span>
-          {/* A stop in force because its own record could not be parsed is a repair,
-              not an operator's decision, and the two must not read alike. */}
-          {switchState?.unreadable && (
-            <span className="se-lbl">
-              {i18nT('apps.specEngine.specEnginePage.kill_switch_record_unreadable')}
-            </span>
-          )}
-        </span>
+        {/* The reading AND the control, from one component reading one cache entry.
+            The shell keeps the strip's engaged styling and nothing else about the
+            switch, so the dot, the words and the button cannot come from two
+            different readings of one flag. */}
+        <KillSwitchControls />
       </div>
     </div>
   )

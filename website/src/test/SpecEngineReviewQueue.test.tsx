@@ -120,6 +120,27 @@ function stub(answers: { queue?: Answer; post?: Record<string, Answer> }) {
             stoppable_credits: 0,
           },
         }
+      } else if (url.startsWith('/api/apps/spec-engine/run-spend')) {
+        // The inspector's spend block reads this per selected run. Answered with a
+        // real shape rather than left to fall through to the queue reply, so a
+        // panel assertion here is never reading a spend rendered from the wrong
+        // payload.
+        answer = {
+          body: {
+            run_id: 'run_8f2a41',
+            project: '/home/me/src/checkout-svc',
+            spec: 'idempotent-refunds',
+            state: 'awaiting_review',
+            source: '',
+            credits: 163.2,
+            metered_credits: 163.2,
+            declared_credits: 0,
+            turns: 41,
+            sessions: 3,
+            recorded_credits: 163.2,
+            ceiling: { value: 600, origin: 'app_config', declared_at: 'budget.run_ceiling_credits' },
+          },
+        }
       } else {
         answer = answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
       }

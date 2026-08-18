@@ -46,7 +46,10 @@ export const SE_CSS = `
   height:100%;min-height:0;
   display:grid;
   grid-template-columns:186px minmax(0,1fr);
-  grid-template-rows:minmax(0,1fr) 34px;
+  /* The status row is content-sized rather than pinned to the strip's own height:
+     the kill switch's confirmation and verdict are in-flow lines of that strip, so
+     the row grows for them instead of a dialog opening over the page. */
+  grid-template-rows:minmax(0,1fr) auto;
   grid-template-areas:"rail work" "rail status";
   background:var(--bg);color:var(--text);
   font-family:var(--font-body);font-size:13px;line-height:1.45;
@@ -323,18 +326,54 @@ textarea.se-json{width:100%;resize:vertical;min-height:220px}
 
 /* The status strip. A grid row, never an overlay: this is the one thing on the
    page that must never be occluded, and the whole strip turns danger-coloured
-   when the stop is in force so the engaged state is not a badge you can miss. */
+   when the stop is in force so the engaged state is not a badge you can miss.
+
+   The row is auto-sized rather than fixed at the strip's own height because the
+   kill switch's arm-then-confirm step and its verdict take a full line INSIDE the
+   strip. That is the only shape available: a popover, drawer or dialog would put
+   the confirmation over the page, which is the failure the no-overlay rule above
+   exists to prevent, and the one control it matters most for. */
 .se-status{grid-area:status;background:var(--chrome);border-top:1px solid var(--border);
-  display:flex;align-items:center;gap:14px;padding:0 14px;font-size:11.5px;overflow-x:auto}
+  display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:0 14px;min-height:34px;
+  font-size:11.5px;overflow-x:auto}
 .se-status .se-sep{width:1px;height:16px;background:var(--border);flex:none}
 .se-lbl{color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-size:10px}
 .se-val{font-family:var(--mono);color:var(--text-strong)}
 .se-ks{display:flex;align-items:center;gap:7px;margin-left:auto;flex:none}
+/* Inherits its colour, so one declaration works on the ordinary strip and on the
+   danger-coloured one. */
+.se-ks button{background:transparent;border:1px solid currentColor;color:inherit;
+  border-radius:3px;padding:1px 8px;font-size:11px;font-weight:600}
+.se-ks button:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+.se-ks button[disabled]{opacity:.5;cursor:not-allowed}
+/* Three states, because doubt must not read as released. Solid green is go, solid
+   danger is stopped, and a hollow danger ring is "not read" — a pending or failed
+   read, which the engine's own reader treats as engaged. All three are
+   distinguishable from each other, so the dot never says what the text denies. */
 .se-ks-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+.se-ks-dot[data-state="engaged"]{background:var(--danger)}
+.se-ks-dot[data-state="unknown"]{background:transparent;
+  box-shadow:inset 0 0 0 2px var(--danger)}
 .se-ks-text{font-weight:600;color:var(--text-strong)}
 .se-status[data-engaged="true"]{background:var(--danger);border-top-color:var(--danger)}
 .se-status[data-engaged="true"] .se-lbl,
 .se-status[data-engaged="true"] .se-val,
 .se-status[data-engaged="true"] .se-ks-text{color:var(--danger-fg)}
 .se-status[data-engaged="true"] .se-ks-dot{background:var(--danger-fg)}
+/* The confirmation and the verdict: a full line of the strip, in flow, above the
+   reading. Its own surface colour so it stays legible when the strip goes danger,
+   and the label overrides are re-stated at higher specificity for the same reason. */
+.se-ks-panel{flex:1 0 100%;order:-1;margin:9px 0 3px;padding:10px 11px;
+  background:var(--panel);color:var(--text);border:1px solid var(--border-strong);
+  border-radius:var(--radius-md);font-size:12px}
+.se-ks-panel>*+*{margin-top:8px}
+.se-ks-panel .se-arm{margin-top:0}
+.se-status[data-engaged="true"] .se-ks-panel .se-lbl{color:var(--muted)}
+.se-status[data-engaged="true"] .se-ks-panel .se-val{color:var(--text-strong)}
+/* A release is not a teardown: the arm block keeps its shape but drops the danger
+   tint, because the destructive direction here is the one that STOPS work. */
+.se-ks-panel[data-armed="release"] .se-arm{background:var(--warn-subtle);
+  border-color:var(--warn)}
+.se-ks-panel[data-armed="release"] .se-arm svg{color:var(--warn)}
+.se-ks-panel .se-idfield{margin:8px 0 0}
 `
