@@ -30,6 +30,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
+import { QK } from '../apps/spec-engine/api'
 import { confirmsIntent, switchReading } from '../apps/spec-engine/SafetyPanel'
 import { SE_CSS } from '../apps/spec-engine/styles'
 import en from '../i18n/locales/en.json'
@@ -156,8 +157,11 @@ function stub(answers: {
   )
 }
 
+/** The client the last render used, so a test can read what the cache is keyed by. */
+let client: QueryClient
+
 function renderPage() {
-  const client = new QueryClient({
+  client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, refetchInterval: false },
       mutations: { retry: false },
@@ -596,6 +600,15 @@ describe('the run spend block', () => {
     rows[1].focus()
     await waitFor(() => expect(screen.getByText('599.5 of 600')).toBeInTheDocument())
     expect(screen.queryByText('10 of 600')).toBeNull()
+
+    // And the two reads are cached APART, keyed by run. One entry for both runs
+    // would still render correctly here — the query function closes over the
+    // selected id, so a refetch would land the right figures a moment later — but
+    // until it did, one run's spend would be on screen under another run's name,
+    // which is the static-inspector defect wearing a different mechanism.
+    const keys = client.getQueryCache().getAll().map((query) => query.queryKey)
+    expect(keys).toContainEqual(QK.runSpend('run_a'))
+    expect(keys).toContainEqual(QK.runSpend('run_b'))
   })
 
   it('reports a stale row as stale rather than as a broken read', async () => {
