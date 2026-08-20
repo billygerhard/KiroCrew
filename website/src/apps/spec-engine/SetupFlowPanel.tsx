@@ -82,10 +82,11 @@
  * popover with no scrim and no focus trap. Anchor placement alone does NOT keep it
  * off the safety strip — on a short viewport the picker's downward layout runs to
  * within a few pixels of the viewport bottom — so the pane passes the picker a
- * reserved bottom band (`STRIP_CLEARANCE_PX`) that its geometry may never extend
- * into; a popover that cannot fit above the band flips upward instead. The safety
- * strip therefore stays visible, focusable and clickable while the picker is open,
- * by construction rather than by luck of window height.
+ * reserved bottom band (`STRIP_CLEARANCE_PX`) that its DOWNWARD layout never
+ * extends into; a popover that cannot fit above the band flips upward instead. A
+ * flipped popover ends above its anchor, and the anchor sits in the pane's work
+ * area above the strip, which is what keeps that branch clear. The safety strip
+ * therefore stays visible, focusable and clickable while the picker is open.
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
@@ -126,6 +127,13 @@ const TOOLING_SUBJECT = 'tooling'
  */
 const FIRST_STEP_KEY = 'apps.specEngine.specEnginePage.step_inspect_the_project'
 
+/** The remaining steps' keys, named so every map below keys off the step's
+ *  IDENTITY rather than its rail position — reordering `SETUP_STEPS` then
+ *  cannot silently attach one step's gating condition to another's row. */
+const ANSWER_STEP_KEY = 'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred'
+const REVIEW_STEP_KEY = 'apps.specEngine.specEnginePage.step_review_the_plan'
+const APPROVE_STEP_KEY = 'apps.specEngine.specEnginePage.step_approve_and_apply'
+
 /**
  * Viewport pixels above the bottom edge the directory picker may never cover:
  * the safety strip's row (~34px) plus breathing room. Handed to the picker as
@@ -137,9 +145,9 @@ const STRIP_CLEARANCE_PX = 48
 /** The four steps, in the order the flow walks them. Shared with the page's rail. */
 export const SETUP_STEPS: readonly string[] = [
   FIRST_STEP_KEY,
-  'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
-  'apps.specEngine.specEnginePage.step_review_the_plan',
-  'apps.specEngine.specEnginePage.step_approve_and_apply',
+  ANSWER_STEP_KEY,
+  REVIEW_STEP_KEY,
+  APPROVE_STEP_KEY,
 ]
 
 /**
@@ -343,14 +351,15 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   }, [])
 
   /**
-   * Open the shared directory picker, and read the directories once ourselves.
+   * Open the shared directory picker with a clean failure slate.
    *
-   * The second read is the only way this pane can STATE a failed browse: the
-   * shared picker swallows its own directory-read rejection (it renders an empty
-   * list), and it is imported rather than edited, so a browse that cannot be
-   * performed would otherwise look like a host with no directories on it. The
-   * statement is beside the field, and the field is never touched from here —
-   * typing the path stays the fallback whether the read worked or not.
+   * The pane performs no directory read of its own: the picker reports the
+   * outcome of every read it makes through `onBrowseResult` (a fence-allowlisted
+   * addition to the shared component), so a failed drill-in states itself
+   * exactly like a failed first read, and there is no second probe whose result
+   * could disagree with the list actually on screen. The statement is beside the
+   * field, and the field is never touched from here — typing the path stays the
+   * fallback whether the read worked or not.
    */
   const openPicker = useCallback(() => {
     // The failure statement resets on open and is then driven by the picker's
@@ -435,10 +444,10 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   // required no answers: a rail statement an adjacent control contradicts is a
   // false statement in the exact mechanism built to prevent grey-row mystery.
   const stepBlocked: Record<string, boolean> = {
-    [SETUP_STEPS[0]]: false,
-    [SETUP_STEPS[1]]: !inspection,
-    [SETUP_STEPS[2]]: !inspection,
-    [SETUP_STEPS[3]]: plan === null,
+    [FIRST_STEP_KEY]: false,
+    [ANSWER_STEP_KEY]: !inspection,
+    [REVIEW_STEP_KEY]: !inspection,
+    [APPROVE_STEP_KEY]: plan === null,
   }
 
   return (

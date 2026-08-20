@@ -52,6 +52,14 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     return anchorRectRef.current
   }, [btnRef])
 
+  // Latched so `browse` keeps its empty dep list: a parent that recreates the
+  // callback every render (an inline arrow) must not re-run the open-effect —
+  // that effect resets the tab, the recents search, the drilled-in directory and
+  // the typed input, and re-fires both reads. The ref always holds the latest
+  // handler, so outcome reporting still reaches the current closure.
+  const onBrowseResultRef = useRef(onBrowseResult)
+  onBrowseResultRef.current = onBrowseResult
+
   const browse = useCallback((path?: string, preserveInput = false) => {
     api.browseDirs(path).then(d => {
       setBrowsePath(d.path); setBrowseParent(d.parent); setBrowseDirs(d.dirs); setBrowseSel(0)
@@ -72,9 +80,9 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
       }
       // Keep the combobox input focused so arrow/Enter nav continues after a drill.
       requestAnimationFrame(() => inputRef.current?.focus())
-      onBrowseResult?.(true)
-    }).catch(() => { onBrowseResult?.(false) })
-  }, [onBrowseResult])
+      onBrowseResultRef.current?.(true)
+    }).catch(() => { onBrowseResultRef.current?.(false) })
+  }, [])
 
   useEffect(() => {
     if (!open) return

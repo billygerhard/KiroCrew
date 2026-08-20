@@ -592,6 +592,27 @@ describe('the project path', () => {
     await waitFor(() => expect(lastBody('/setup/inspect')).toEqual({ project: '/src/acme' }))
   })
 
+  it('does not reset the open picker when the pane re-renders', async () => {
+    // The pane re-renders constantly — every keystroke in the path field, every
+    // queue poll of the page above it. The picker's open-effect resets its tab,
+    // search, directory and input and re-fires both reads, so it must not re-run
+    // on a parent render: an inline `onBrowseResult` arrow is a NEW function
+    // each render, and only the picker's internal latching keeps the effect
+    // stable. One read per open, whatever the parent does.
+    stub({})
+    const browse = stubPicker({ recent: ['/home/me/src/acme'] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: T.browse }))
+    await screen.findByRole('listbox', { name: PICKER.recent_projects })
+    expect(browse).toHaveBeenCalledTimes(1)
+    expect(api.recentProjects).toHaveBeenCalledTimes(1)
+    fireEvent.change(screen.getByLabelText(T.project_path), { target: { value: '/re/render' } })
+    fireEvent.change(screen.getByLabelText(T.project_path), { target: { value: '/re/render/x' } })
+    await waitFor(() => expect(screen.getByLabelText(T.project_path)).toHaveValue('/re/render/x'))
+    expect(browse).toHaveBeenCalledTimes(1)
+    expect(api.recentProjects).toHaveBeenCalledTimes(1)
+  })
+
   it('leaves the kill switch on screen and operable while the picker is open', async () => {
     stub({})
     stubPicker({ recent: ['/home/me/src/acme'] })
