@@ -31,7 +31,7 @@ no backend route is added or changed; removal rides the existing guarded PUT's
     - _Requirements: 1.1, 1.2, 1.5, 1.8_
 
 - [ ] 2. Setup pane
-  - [ ] 2.1 Orientation block and project picker
+  - [x] 2.1 Orientation block and project picker
     - Orientation block at the top of `SetupFlowPanel.tsx` while first-run: what the Spec_Engine does, what completing setup produces, inspect named as the first action; one operator-verb description per setup step alongside the existing guard-rail copy; collapses once a project exists; unreachable steps state which prior step must complete, interpolated (no trailing-connector strings)
     - Browse button anchoring the shared `ProjectPicker` (`website/src/components/ProjectPicker.tsx`, same props as `FolderConfigModal`'s usage — import it, never modify it); selection fills the path field with the absolute path; manual entry stays live; a failed directory browse states itself and leaves manual entry usable; the picker popover must not cover the kill-switch strip
     - All new strings through `en.json` and every supported catalog plus pseudo; setup tests for orientation presence/absence, step descriptions, picker fill, and browse failure
