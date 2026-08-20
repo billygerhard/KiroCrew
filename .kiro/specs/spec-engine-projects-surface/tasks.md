@@ -43,8 +43,8 @@ no backend route is added or changed; removal rides the existing guarded PUT's
     - Assert the apply patch shape touches only the new project's entry (prior entries unchanged through the merge) and that the named-approver gate is exercised identically for an additional project
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
 
-- [ ] 3. Projects surface
-  - [ ] 3.1 Projects table, per-project resolved view, and removal
+- [x] 3. Projects surface
+  - [x] 3.1 Projects table, per-project resolved view, and removal
     - Projects section in `ConfigPanel.tsx`: one row per `document.projects` entry (name, pinned cost profile, override count) plus an App defaults row; queue-table keyboard conventions; no overlays
     - Selecting a row fetches `GET /config/resolved?project=<name>` (App defaults row omits the parameter), rendering each setting's value with its origin scope; queries keyed per project name; a failed resolved read states the failure and renders neither app defaults nor retained values as current (branch on `isError` before data)
     - Arm-then-confirm removal per row (SafetyPanel's two-step pattern); confirm submits `PUT /config` with `{"projects": {"<name>": null}}` through the existing guarded client; table re-renders from the reply document; a refused write renders the refusal and keeps the entry
