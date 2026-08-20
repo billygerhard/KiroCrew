@@ -39,6 +39,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
+import { SE_CSS } from '../apps/spec-engine/styles'
 import { api } from '../api/client'
 import en from '../i18n/locales/en.json'
 
@@ -845,5 +846,23 @@ describe('running it again for another project', () => {
       await screen.findByText(forProject(T.already_configured_unknown, 'acme')),
     ).toBeInTheDocument()
     expect(screen.queryByText(forProject(T.already_configured, 'acme'))).not.toBeInTheDocument()
+  })
+})
+
+describe('answer feedback', () => {
+  /* Every answer control in the setup flow (cost-profile chips, the per-rung
+   * yes/no pair, preset offers, subject approval) is a `se-btn` carrying
+   * `aria-pressed`. jsdom applies no stylesheet, so the attribute alone proved
+   * nothing about pixels: the sheet styled `.se-filter[aria-pressed="true"]`
+   * and `.se-rolebtn[aria-pressed="true"]` but never `.se-btn`, leaving a
+   * chosen answer visually identical to its unchosen siblings — the only
+   * on-screen feedback was the UNANSWERED flag disappearing. This pins the
+   * pixel channel the same way the kill-switch dot test does: against the
+   * stylesheet text itself. */
+  it('styles a pressed answer button apart from its siblings', () => {
+    const css = SE_CSS.replace(/\s+/g, '')
+    expect(css).toContain(
+      '.se-btn[aria-pressed="true"]{background:var(--accent-subtle);border-color:var(--accent);color:var(--text-strong)}',
+    )
   })
 })

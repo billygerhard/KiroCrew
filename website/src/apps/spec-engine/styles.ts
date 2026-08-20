@@ -160,6 +160,8 @@ export const SE_CSS = `
   border:1px solid var(--border-strong);background:var(--bg-elevated);color:var(--text)}
 .se-btn:hover{background:var(--bg-hover);border-color:var(--border-hover)}
 .se-btn:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+.se-btn[aria-pressed="true"]{background:var(--accent-subtle);border-color:var(--accent);
+  color:var(--text-strong)}
 .se-btn[disabled]{opacity:.45;cursor:not-allowed}
 .se-btn.se-sm{padding:3px 8px;font-size:11px}
 .se-btn.se-danger{background:var(--danger-subtle);border-color:var(--danger);color:var(--text-strong)}
