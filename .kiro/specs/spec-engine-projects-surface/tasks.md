@@ -74,6 +74,45 @@ list-refresh behavior is only testable once 3.1's projects table exists.
 
 ### Findings carried forward by the review gate
 
+### 4.1's gate sweep and dispositions (recorded 2026-08-20)
+
+Appended, not substituted: the findings below this section stay as written.
+Sweep run at `94760db77`; exit codes are real (unpiped or `${PIPESTATUS[0]}`,
+no quiet flags).
+
+| Gate | Exit | Result |
+|---|---|---|
+| vitest — six SpecEngine suites + ProjectPicker + FolderConfigModal | **0** | 251 passed |
+| `npx tsc -b` | **0** | — |
+| eslint over every TS file this spec touched (spec's own git range) | **0** | 4 pre-existing jsx-a11y warnings, same rule/count as before the spec |
+| `node scripts/check-i18n-keys.mjs --report` | **0** | `SpecEnginePage.tsx` no longer listed (FILTERS converted, `94760db77`); 3 pre-dating dynamic sites remain (SafetyPanel origin key, SetupFlowPanel refusal sentence + step-rail key), all prior-spec work with literal-keyed maps behind them |
+| `node scripts/check-app-manifest-sync.mjs` | **0** | 20 manifests, 171 strings |
+| `npm run i18n:check` | **1** | sole finding is the INHERITED `pages.artifactDeployPage.domain` trailing-connector (below); `changed-values` 0 on everything this branch added or changed |
+| fence pytest (`test_app_boundary_fence.py`) | **0** | 38 passed; the only out-of-territory files this spec touched are the two fence-allowlisted ProjectPicker entries |
+| spec_engine pytest (full app suite) | **0** | 3379 passed |
+| spec_builder pytest (regression) | **0** | 269 passed |
+
+Catalog completeness: the 32 keys this spec added (configPanel + setupFlowPanel
+namespaces, derived from the spec's own git range, not a hand list) are present
+in en + all 12 language catalogs + en-XA, none identical-to-English in a
+translated catalog, `{{project}}`/`{{count}}`/`{{step}}` intact everywhere.
+
+**Disposition — inherited i18n:check failure:** `pages.artifactDeployPage.domain`
+("domain —") is the single `source-strings` finding. It predates this branch
+(rollout commit `c1a691238`), lives in a page outside spec-engine territory, and
+the prior spec proved the same key inherited at a merge-base worktree. Recorded
+as inherited; not fixed here because the edit would be an out-of-territory
+change with no connection to this spec's requirements.
+
+**Disposition — FILTERS dynamic-key site:** FIXED rather than accepted, in
+`94760db77`: the queue filter chips' labels moved off the per-row `labelKey`
+field to a call-site-indexed literal map (`FILTER_LABEL_KEY` idiom matching
+`PANE_LABEL_KEY`), with two new tests pinning resolved labels in scan order and
+pressed-chip wiring, and three mutation probes (broken key, swapped order,
+decoupled click) each failing a named test. Correction for the record: 1.1's
+round-2 report claimed the file had left the key report entirely — it had not
+(the FILTERS site remained until this fix); it has now.
+
 - **Record (from 2.2's review, approved):** R4.4's prior-entries-unchanged
   guarantee is engine-side, pinned by name in
   `test_config_write_path.py::test_writes_merge_rather_than_replace` (a second
