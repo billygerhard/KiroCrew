@@ -32,5 +32,10 @@
         "icon": "FolderPlus"
       }
     ]
-  }
+  },
+  "iconUrl": "/app-assets/project-scaffolder/icon.svg",
+  "heroImage": "/app-assets/project-scaffolder/hero-light.svg",
+  "heroImageDark": "/app-assets/project-scaffolder/hero-dark.svg",
+  "heroImageDetail": "/app-assets/project-scaffolder/hero-detail-light.svg",
+  "heroImageDetailDark": "/app-assets/project-scaffolder/hero-detail-dark.svg"
 }
