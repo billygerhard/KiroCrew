@@ -866,3 +866,63 @@ describe('answer feedback', () => {
     )
   })
 })
+
+describe('the autonomy ladder', () => {
+  /* The rungs are a ladder: an enabled level authorizes every level below it,
+   * and the engine refuses to write a Yes above a No. The panel makes that
+   * contradiction unconstructable rather than waiting for the plan's refusal,
+   * and names the blocking rung beside the disabled button. */
+  const rung = (level: string) =>
+    screen.getByText(level).closest('.se-rung') as HTMLElement
+
+  it('blocks granting a rung above a declined one, naming the blocker', async () => {
+    stub({})
+    await inspectProject()
+    fireEvent.click(within(rung('execution')).getByRole('button', { name: T.no }))
+    const yes = within(rung('delivery')).getByRole('button', { name: T.yes })
+    expect(yes).toBeDisabled()
+    expect(
+      screen.getByText(T.yes_blocked_by_declined.replace('{{level}}', 'execution')),
+    ).toBeInTheDocument()
+  })
+
+  it('blocks declining a rung below a granted one, naming the blocker', async () => {
+    stub({})
+    await inspectProject()
+    fireEvent.click(within(rung('delivery')).getByRole('button', { name: T.yes }))
+    const no = within(rung('execution')).getByRole('button', { name: T.no })
+    expect(no).toBeDisabled()
+    expect(
+      screen.getByText(T.no_blocked_by_granted.replace('{{level}}', 'delivery')),
+    ).toBeInTheDocument()
+  })
+
+  it('locks only the rungs a choice actually constrains, and unwinding releases them', async () => {
+    stub({})
+    await inspectProject()
+    fireEvent.click(within(rung('execution')).getByRole('button', { name: T.yes }))
+    fireEvent.click(within(rung('delivery')).getByRole('button', { name: T.yes }))
+    // The top rung has nothing above it: both of its buttons stay live.
+    expect(within(rung('delivery')).getByRole('button', { name: T.yes })).toBeEnabled()
+    expect(within(rung('delivery')).getByRole('button', { name: T.no })).toBeEnabled()
+    // The lower rung's No is the click that would put a grant above a decline,
+    // so it is locked — and the lock names the granted rung above.
+    expect(within(rung('execution')).getByRole('button', { name: T.no })).toBeDisabled()
+    expect(
+      screen.getByText(T.no_blocked_by_granted.replace('{{level}}', 'delivery')),
+    ).toBeInTheDocument()
+    // Unwinding from the top releases the lock: the guard never wedges a set.
+    fireEvent.click(within(rung('delivery')).getByRole('button', { name: T.no }))
+    expect(within(rung('execution')).getByRole('button', { name: T.no })).toBeEnabled()
+    expect(document.querySelector('[data-rung-blocked]')).toBeNull()
+  })
+})
+
+describe('the approver field', () => {
+  it('says what belongs in it before anything is typed', async () => {
+    stub({})
+    await inspectProject()
+    const field = screen.getByLabelText(T.approver_identity)
+    expect(field).toHaveAttribute('placeholder', T.approver_placeholder)
+  })
+})

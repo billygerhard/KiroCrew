@@ -3932,6 +3932,7 @@
         "approve": "Genehmigen",
         "approved": "Genehmigt",
         "approver_identity": "Identität der genehmigenden Person",
+        "approver_placeholder": "Ihr Name oder Alias — wer diesen Schreibvorgang autorisiert",
         "autonomy_rungs_you_grant": "Autonomiestufen, die du gewährst",
         "blocked_until": "Noch nicht erreichbar. Dieser Schritt muss zuerst abgeschlossen sein: {{step}}",
         "browse": "Durchsuchen",
@@ -3944,6 +3945,7 @@
         "inspecting": "Wird untersucht…",
         "memory_was_not_consulted": "Es war kein Gedächtnis verfügbar, daher stammen diese Schlüsse allein aus den Projektdateien.",
         "no": "Nein",
+        "no_blocked_by_granted": "Nein ist nicht verfügbar, solange {{level}} gewährt ist: diese Stufe autorisiert auch die hiesige.",
         "no_plan_has_been_computed_yet": "Es wurde noch kein Plan berechnet.",
         "nothing_could_be_inferred": "Aus diesem Projekt ließ sich nichts schließen, daher wird jede Antwort gefragt.",
         "nothing_is_written_until_step_four": "Bis Schritt 4 wird nichts geschrieben, und Schritt 4 verweigert ohne genannte genehmigende Person.",
@@ -3977,7 +3979,8 @@
         "what_the_assistant_read": "Was der Assistent gelesen hat",
         "would_write": "Würde schreiben",
         "wrote": "Geschrieben",
-        "yes": "Ja"
+        "yes": "Ja",
+        "yes_blocked_by_declined": "Ja ist nicht verfügbar, solange {{level}} abgelehnt ist: eine aktivierte Stufe autorisiert jede darunterliegende Stufe."
       },
       "specEnginePage": {
         "all": "Alle",

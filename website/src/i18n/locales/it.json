@@ -3993,6 +3993,7 @@
         "approve": "Approva",
         "approved": "Approvato",
         "approver_identity": "Identità di chi approva",
+        "approver_placeholder": "Il tuo nome o alias — chi autorizza questa scrittura",
         "autonomy_rungs_you_grant": "Livelli di autonomia che concedi",
         "blocked_until": "Non ancora raggiungibile. Questo passo deve prima concludersi: {{step}}",
         "browse": "Sfoglia",
@@ -4005,6 +4006,7 @@
         "inspecting": "Esame in corso…",
         "memory_was_not_consulted": "Non era disponibile alcuna memoria, quindi queste deduzioni vengono solo dai file del progetto.",
         "no": "No",
+        "no_blocked_by_granted": "No non è disponibile finché {{level}} è concesso: quel livello autorizza questo.",
         "no_plan_has_been_computed_yet": "Nessun piano è stato ancora calcolato.",
         "nothing_could_be_inferred": "Da questo progetto non si è potuto dedurre nulla, quindi ogni risposta viene chiesta.",
         "nothing_is_written_until_step_four": "Nulla viene scritto fino al passo 4, e il passo 4 rifiuta senza una persona indicata che approvi.",
@@ -4038,7 +4040,8 @@
         "what_the_assistant_read": "Ciò che l'assistente ha letto",
         "would_write": "Scriverebbe",
         "wrote": "Scritto",
-        "yes": "Sì"
+        "yes": "Sì",
+        "yes_blocked_by_declined": "Sì non è disponibile finché {{level}} è rifiutato: un livello abilitato autorizza ogni livello inferiore."
       },
       "specEnginePage": {
         "all": "Tutti",

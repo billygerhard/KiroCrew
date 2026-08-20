@@ -3871,6 +3871,7 @@
         "approve": "승인",
         "approved": "승인됨",
         "approver_identity": "승인자 신원",
+        "approver_placeholder": "이름 또는 별칭 — 이 쓰기를 승인하는 사람",
         "autonomy_rungs_you_grant": "허용하는 자율성 단계",
         "blocked_until": "아직 진행할 수 없습니다. 먼저 완료해야 하는 단계: {{step}}",
         "browse": "찾아보기",
@@ -3883,6 +3884,7 @@
         "inspecting": "살펴보는 중…",
         "memory_was_not_consulted": "사용할 메모리가 없어 이 추론은 프로젝트 파일만으로 이루어졌습니다.",
         "no": "아니오",
+        "no_blocked_by_granted": "{{level}}이(가) 허용된 동안에는 아니요를 선택할 수 없습니다. 해당 단계가 이 단계를 승인합니다.",
         "no_plan_has_been_computed_yet": "아직 계산된 계획이 없습니다.",
         "nothing_could_be_inferred": "이 프로젝트에서는 아무것도 추론할 수 없어 모든 답을 묻습니다.",
         "nothing_is_written_until_step_four": "4단계까지는 아무것도 기록되지 않고, 4단계는 이름이 적힌 승인자가 없으면 거부합니다.",
@@ -3916,7 +3918,8 @@
         "what_the_assistant_read": "어시스턴트가 읽은 것",
         "would_write": "기록할 대상",
         "wrote": "기록함",
-        "yes": "예"
+        "yes": "예",
+        "yes_blocked_by_declined": "{{level}}이(가) 거부된 동안에는 예를 선택할 수 없습니다. 활성화된 단계는 그 아래 모든 단계를 승인합니다."
       },
       "specEnginePage": {
         "all": "전체",

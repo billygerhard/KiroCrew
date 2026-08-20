@@ -3871,6 +3871,7 @@
         "approve": "承認",
         "approved": "承認済み",
         "approver_identity": "承認者の識別名",
+        "approver_placeholder": "あなたの名前またはエイリアス — この書き込みを承認する人",
         "autonomy_rungs_you_grant": "許可する自律性の段",
         "blocked_until": "まだ進めません。先に完了が必要な手順: {{step}}",
         "browse": "参照",
@@ -3883,6 +3884,7 @@
         "inspecting": "調査中…",
         "memory_was_not_consulted": "メモリーが利用できなかったため、これらの推定はプロジェクトのファイルのみに基づきます。",
         "no": "いいえ",
+        "no_blocked_by_granted": "{{level}} が許可されている間は「いいえ」を選べません。そのランクはこのランクも許可します。",
         "no_plan_has_been_computed_yet": "まだ計画は計算されていません。",
         "nothing_could_be_inferred": "このプロジェクトからは何も推定できなかったため、すべての回答を尋ねます。",
         "nothing_is_written_until_step_four": "手順 4 までは何も書き込まれず、手順 4 は承認者の名前がなければ拒否します。",
@@ -3916,7 +3918,8 @@
         "what_the_assistant_read": "アシスタントが読んだ内容",
         "would_write": "書き込む対象",
         "wrote": "書き込み済み",
-        "yes": "はい"
+        "yes": "はい",
+        "yes_blocked_by_declined": "{{level}} が拒否されている間は「はい」を選べません。有効化されたランクはその下のすべてのランクを許可します。"
       },
       "specEnginePage": {
         "all": "すべて",

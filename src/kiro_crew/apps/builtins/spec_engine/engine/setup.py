@@ -163,8 +163,10 @@ LEVEL_PROMPTS: Mapping[AutonomyLevel, str] = {
         "commits and pushes changes and raises a review."
     ),
     AutonomyLevel.INTEGRATION: (
-        "May the engine integrate approved work into a protected branch unattended? "
-        "This is the one rung whose mistake cannot be undone."
+        "May the engine merge approved work into your protected branch (main or its "
+        "equivalent) unattended? Everything below this rung stops at a review a human "
+        "still merges; this rung removes that last human step, and a wrong merge lands "
+        "in the branch everyone builds from."
     ),
 }
 

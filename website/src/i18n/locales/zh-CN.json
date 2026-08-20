@@ -3871,6 +3871,7 @@
         "approve": "批准",
         "approved": "已批准",
         "approver_identity": "批准人身份",
+        "approver_placeholder": "您的姓名或别名 — 授权此次写入的人",
         "autonomy_rungs_you_grant": "你授予的自治层级",
         "blocked_until": "尚不可进行。必须先完成的步骤：{{step}}",
         "browse": "浏览",
@@ -3883,6 +3884,7 @@
         "inspecting": "正在检视…",
         "memory_was_not_consulted": "没有可用的记忆，因此这些推断仅来自项目文件。",
         "no": "否",
+        "no_blocked_by_granted": "在 {{level}} 被允许期间无法选择“否”：该级别会授权此级别。",
         "no_plan_has_been_computed_yet": "还没有计算过任何计划。",
         "nothing_could_be_inferred": "无法从该项目推断出任何内容，因此每个答案都会询问。",
         "nothing_is_written_until_step_four": "第 4 步之前不会写入任何内容，而第 4 步没有具名批准人就会拒绝。",
@@ -3916,7 +3918,8 @@
         "what_the_assistant_read": "助手读到的内容",
         "would_write": "将会写入",
         "wrote": "已写入",
-        "yes": "是"
+        "yes": "是",
+        "yes_blocked_by_declined": "在 {{level}} 被拒绝期间无法选择“是”：启用某一级别即授权其下所有级别。"
       },
       "specEnginePage": {
         "all": "全部",

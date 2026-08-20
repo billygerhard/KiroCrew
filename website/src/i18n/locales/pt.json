@@ -3993,6 +3993,7 @@
         "approve": "Aprovar",
         "approved": "Aprovado",
         "approver_identity": "Identidade de quem aprova",
+        "approver_placeholder": "Seu nome ou alias — quem autoriza esta gravação",
         "autonomy_rungs_you_grant": "Níveis de autonomia que você concede",
         "blocked_until": "Ainda não acessível. Este passo precisa terminar primeiro: {{step}}",
         "browse": "Procurar",
@@ -4005,6 +4006,7 @@
         "inspecting": "Inspecionando…",
         "memory_was_not_consulted": "Não havia memória disponível, então estas inferências vêm apenas dos arquivos do projeto.",
         "no": "Não",
+        "no_blocked_by_granted": "Não está indisponível enquanto {{level}} estiver concedido: esse nível autoriza este.",
         "no_plan_has_been_computed_yet": "Nenhum plano foi calculado ainda.",
         "nothing_could_be_inferred": "Nada pôde ser inferido deste projeto, então cada resposta é perguntada.",
         "nothing_is_written_until_step_four": "Nada é escrito até o passo 4, e o passo 4 recusa sem alguém nomeado que aprove.",
@@ -4038,7 +4040,8 @@
         "what_the_assistant_read": "O que o assistente leu",
         "would_write": "Escreveria",
         "wrote": "Escreveu",
-        "yes": "Sim"
+        "yes": "Sim",
+        "yes_blocked_by_declined": "Sim está indisponível enquanto {{level}} estiver recusado: um nível habilitado autoriza todos os níveis abaixo dele."
       },
       "specEnginePage": {
         "all": "Todos",

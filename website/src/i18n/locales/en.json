@@ -3249,6 +3249,7 @@
         "approve": "Approve",
         "approved": "Approved",
         "approver_identity": "Approver identity",
+        "approver_placeholder": "Your name or alias — who is authorizing this write",
         "autonomy_rungs_you_grant": "Autonomy rungs you grant",
         "blocked_until": "Not reachable yet. This step must complete first: {{step}}",
         "browse": "Browse",
@@ -3261,6 +3262,7 @@
         "inspecting": "Inspecting…",
         "memory_was_not_consulted": "No memory was available, so these inferences come from project files alone.",
         "no": "No",
+        "no_blocked_by_granted": "No is unavailable while {{level}} is granted: that rung authorizes this one.",
         "no_plan_has_been_computed_yet": "No plan has been computed yet.",
         "nothing_could_be_inferred": "Nothing could be inferred from this project, so every answer is asked.",
         "nothing_is_written_until_step_four": "Nothing is written until step 4, and step 4 refuses without a named approver.",
@@ -3294,7 +3296,8 @@
         "what_the_assistant_read": "What the assistant read",
         "would_write": "Would write",
         "wrote": "Wrote",
-        "yes": "Yes"
+        "yes": "Yes",
+        "yes_blocked_by_declined": "Yes is unavailable while {{level}} is declined: an enabled rung authorizes every rung below it."
       },
       "specEnginePage": {
         "all": "All",

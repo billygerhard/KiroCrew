@@ -796,51 +796,84 @@ export function SetupFlowPanel({
 
             <div className="se-qbox">
               <h3>{i18nT('apps.specEngine.setupFlowPanel.autonomy_rungs_you_grant')}</h3>
-              {levels.map((level) => (
-                <div className="se-rung" key={level}>
-                  <span className="se-m">{level}</span>
-                  {rungs[level] === undefined && (
-                    <span className="se-flag" data-flag="unanswered">
-                      {i18nT('apps.specEngine.setupFlowPanel.unanswered')}
+              {levels.map((level, index) => {
+                /* The rungs are a ladder, lowest first, and an enabled level
+                   authorizes every level below it — the engine refuses to write a
+                   grant above a decline. These two guards make that contradiction
+                   unconstructable here instead of leaving it to the plan's
+                   refusal: a grant is blocked while a lower rung is declined, and
+                   a decline is blocked while a higher rung is granted. The guards
+                   cannot both apply to one rung, because each blocks the click
+                   that would create the other's condition. The blocker is named
+                   beside the buttons, in the step rail's blocked-until idiom. */
+                const declinedBelow = levels
+                  .slice(0, index)
+                  .find((lower) => rungs[lower] === false)
+                const grantedAbove = levels
+                  .slice(index + 1)
+                  .find((higher) => rungs[higher] === true)
+                return (
+                  <div className="se-rung" key={level}>
+                    <span className="se-m">{level}</span>
+                    {rungs[level] === undefined && (
+                      <span className="se-flag" data-flag="unanswered">
+                        {i18nT('apps.specEngine.setupFlowPanel.unanswered')}
+                      </span>
+                    )}
+                    <span className="se-acts">
+                      <button
+                        type="button"
+                        className="se-btn se-sm"
+                        aria-pressed={rungs[level] === true}
+                        disabled={declinedBelow !== undefined}
+                        onClick={() => {
+                          setRungs((current) => ({ ...current, [level]: true }))
+                          invalidatePlan()
+                        }}
+                      >
+                        {i18nT('apps.specEngine.setupFlowPanel.yes')}
+                      </button>
+                      <button
+                        type="button"
+                        className="se-btn se-sm"
+                        aria-pressed={rungs[level] === false}
+                        disabled={grantedAbove !== undefined}
+                        onClick={() => {
+                          setRungs((current) => ({ ...current, [level]: false }))
+                          invalidatePlan()
+                        }}
+                      >
+                        {i18nT('apps.specEngine.setupFlowPanel.no')}
+                      </button>
                     </span>
-                  )}
-                  <span className="se-acts">
-                    <button
-                      type="button"
-                      className="se-btn se-sm"
-                      aria-pressed={rungs[level] === true}
-                      onClick={() => {
-                        setRungs((current) => ({ ...current, [level]: true }))
-                        invalidatePlan()
-                      }}
-                    >
-                      {i18nT('apps.specEngine.setupFlowPanel.yes')}
-                    </button>
-                    <button
-                      type="button"
-                      className="se-btn se-sm"
-                      aria-pressed={rungs[level] === false}
-                      onClick={() => {
-                        setRungs((current) => ({ ...current, [level]: false }))
-                        invalidatePlan()
-                      }}
-                    >
-                      {i18nT('apps.specEngine.setupFlowPanel.no')}
-                    </button>
-                  </span>
-                  {/* The prompt for this rung, as the engine words it: each rung
-                      grants something different, and a shared sentence would let one
-                      answer stand for three. */}
-                  <span className="se-note">
-                    {
-                      questions.find(
-                        (question) =>
-                          question.subject === `${inspection.autonomy_field}.${level}`,
-                      )?.prompt
-                    }
-                  </span>
-                </div>
-              ))}
+                    {declinedBelow !== undefined && (
+                      <span className="se-note" data-rung-blocked="yes">
+                        {i18nT('apps.specEngine.setupFlowPanel.yes_blocked_by_declined', {
+                          level: declinedBelow,
+                        })}
+                      </span>
+                    )}
+                    {grantedAbove !== undefined && (
+                      <span className="se-note" data-rung-blocked="no">
+                        {i18nT('apps.specEngine.setupFlowPanel.no_blocked_by_granted', {
+                          level: grantedAbove,
+                        })}
+                      </span>
+                    )}
+                    {/* The prompt for this rung, as the engine words it: each rung
+                        grants something different, and a shared sentence would let one
+                        answer stand for three. */}
+                    <span className="se-note">
+                      {
+                        questions.find(
+                          (question) =>
+                            question.subject === `${inspection.autonomy_field}.${level}`,
+                        )?.prompt
+                      }
+                    </span>
+                  </div>
+                )
+              })}
               <p className="se-note">
                 {i18nT('apps.specEngine.setupFlowPanel.a_missing_answer_is_unanswered')}
               </p>
@@ -938,6 +971,7 @@ export function SetupFlowPanel({
                   id="se-setup-approver"
                   className="se-input se-m"
                   value={approver}
+                  placeholder={i18nT('apps.specEngine.setupFlowPanel.approver_placeholder')}
                   onChange={(event) => setApprover(event.target.value)}
                 />
                 <span className="se-note">
