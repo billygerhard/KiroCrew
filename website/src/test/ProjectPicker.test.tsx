@@ -83,6 +83,70 @@ describe('ProjectPicker', () => {
       expect(drop.style.top).toBe('')
     })
 
+    it('keeps its bottom edge out of a reserved bottom band', async () => {
+      // A 768-tall viewport with the anchor at top=316 (bottom=340, upper half,
+      // opens downward). Unreserved, the downward height is min(460, 768-340-8)
+      // = 420, putting the bottom edge at 344+420 = 764 — four pixels from the
+      // viewport bottom, over any control row living there. With 48px reserved,
+      // the height is min(460, 768-340-8-48) = 372 and the bottom edge is
+      // 344+372 = 716 = innerHeight - 48 - 4: the band is never entered. Both
+      // cases asserted so the reservation is proven load-bearing, not incidental.
+      Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true })
+      Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true })
+      const { unmount } = renderWithProviders(
+        <ProjectPicker open={true} onOpenChange={vi.fn()} anchorRect={rect(316, 200)} onSelect={vi.fn()} />
+      )
+      let drop = (await screen.findByText('Recent')).closest('div.fixed') as HTMLElement
+      expect(parseInt(drop.style.top) + parseInt(drop.style.height)).toBe(764)
+      unmount()
+      renderWithProviders(
+        <ProjectPicker
+          open={true}
+          onOpenChange={vi.fn()}
+          anchorRect={rect(316, 200)}
+          reservedBottom={48}
+          onSelect={vi.fn()}
+        />
+      )
+      drop = (await screen.findByText('Recent')).closest('div.fixed') as HTMLElement
+      expect(parseInt(drop.style.top) + parseInt(drop.style.height)).toBeLessThanOrEqual(768 - 48)
+    })
+
+    it('flips upward rather than shrink into a reserved band it cannot clear', async () => {
+      // Anchor in the upper half (bottom=340 < 384), but the reservation leaves
+      // less than the 200px minimum below (768-340-8-360 = 60): the picker must
+      // flip above the anchor, not render a 200px floor into the reserved band.
+      Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true })
+      Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true })
+      renderWithProviders(
+        <ProjectPicker
+          open={true}
+          onOpenChange={vi.fn()}
+          anchorRect={rect(316, 200)}
+          reservedBottom={360}
+          onSelect={vi.fn()}
+        />
+      )
+      const drop = (await screen.findByText('Recent')).closest('div.fixed') as HTMLElement
+      expect(drop.style.bottom).not.toBe('')
+      expect(drop.style.top).toBe('')
+    })
+
+    it('reports every browse outcome through onBrowseResult', async () => {
+      const outcomes: boolean[] = []
+      vi.spyOn(api, 'browseDirs').mockRejectedValueOnce(new Error('EACCES'))
+      renderWithProviders(
+        <ProjectPicker
+          open={true}
+          onOpenChange={vi.fn()}
+          anchorRect={rect(100, 200)}
+          onBrowseResult={(ok) => outcomes.push(ok)}
+          onSelect={vi.fn()}
+        />
+      )
+      await waitFor(() => expect(outcomes).toEqual([false]))
+    })
+
     it('clamps left position to keep dropdown inside viewport', async () => {
       // Anchor at right edge: innerWidth=1280, anchorR.right=1278 → left = min(1278-400, 1280-408) = 872
       Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true })

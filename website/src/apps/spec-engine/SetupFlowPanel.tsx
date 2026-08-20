@@ -79,12 +79,13 @@
  *
  * The directory picker is the ONE portal this pane opens, and it is the dashboard's
  * shared one rather than a second implementation of browsing. It is an anchored
- * popover with no scrim and no focus trap, and it anchors to the Browse button
- * beside the path field — the TOP of the pane — so it opens downward into the work
- * area with a height bounded by the space below that anchor. The safety strip stays
- * a grid row of the shell underneath it: visible, focusable and clickable while the
- * picker is open. Anchoring it to anything lower down the pane would aim it at the
- * one region this design forbids being covered.
+ * popover with no scrim and no focus trap. Anchor placement alone does NOT keep it
+ * off the safety strip — on a short viewport the picker's downward layout runs to
+ * within a few pixels of the viewport bottom — so the pane passes the picker a
+ * reserved bottom band (`STRIP_CLEARANCE_PX`) that its geometry may never extend
+ * into; a popover that cannot fit above the band flips upward instead. The safety
+ * strip therefore stays visible, focusable and clickable while the picker is open,
+ * by construction rather than by luck of window height.
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
@@ -92,7 +93,6 @@ import { AlertTriangle, FolderOpen } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
-import { api } from '../../api/client'
 import ProjectPicker from '../../components/ProjectPicker'
 import {
   QK,
@@ -126,6 +126,14 @@ const TOOLING_SUBJECT = 'tooling'
  */
 const FIRST_STEP_KEY = 'apps.specEngine.specEnginePage.step_inspect_the_project'
 
+/**
+ * Viewport pixels above the bottom edge the directory picker may never cover:
+ * the safety strip's row (~34px) plus breathing room. Handed to the picker as
+ * `reservedBottom`, which subtracts it from the downward layout's available
+ * space BEFORE the flip decision — the bound the pane's docstring relies on.
+ */
+const STRIP_CLEARANCE_PX = 48
+
 /** The four steps, in the order the flow walks them. Shared with the page's rail. */
 export const SETUP_STEPS: readonly string[] = [
   FIRST_STEP_KEY,
@@ -156,17 +164,20 @@ const STEP_DESCRIPTION_KEY: Record<string, string> = {
 }
 
 /**
- * The step each step waits on: a blocked step's key to its predecessor's key.
+ * The step each step waits on: a blocked step's key to the key of the step that
+ * ACTUALLY gates it, matching the conditions on the steps' own controls.
  *
- * Declared rather than computed from `SETUP_STEPS` by index, for the same
- * resolvability reason as the map above — and the first step is absent because
- * nothing precedes it, which is why the flow's own state decides whether to look
- * a blocker up at all.
+ * Answering and reviewing both wait on the inspection alone — the plan can be
+ * computed with unanswered questions left at their defaults, so naming the
+ * answer step here would state a blocker the enabled plan button beside it
+ * contradicts. Approve waits on the plan being on screen, which is what its
+ * own control requires. Declared as whole literal keys rather than computed
+ * from `SETUP_STEPS` by index, for the key-gate resolvability reason the map
+ * above records — and the first step is absent because nothing precedes it.
  */
 const STEP_BLOCKER_KEY: Record<string, string> = {
   'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred': FIRST_STEP_KEY,
-  'apps.specEngine.specEnginePage.step_review_the_plan':
-    'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
+  'apps.specEngine.specEnginePage.step_review_the_plan': FIRST_STEP_KEY,
   'apps.specEngine.specEnginePage.step_approve_and_apply':
     'apps.specEngine.specEnginePage.step_review_the_plan',
 }
@@ -342,9 +353,12 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
    * typing the path stays the fallback whether the read worked or not.
    */
   const openPicker = useCallback(() => {
+    // The failure statement resets on open and is then driven by the picker's
+    // own reads through `onBrowseResult` — every read it makes (initial,
+    // drill-in, parent), not a separate probe that could disagree with the list
+    // actually on screen.
     setBrowseFailed(false)
     setPickerOpen(true)
-    void api.browseDirs().catch(() => setBrowseFailed(true))
   }, [])
 
   const inspect = useMutation({
@@ -415,6 +429,18 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   const step = !inspection ? 0 : plan === null ? 1 : applied ? 4 : 3
   const canApply = plan !== null && approver.trim() !== '' && !apply.isPending
 
+  // Whether a step is genuinely unreachable, from the SAME state that gates its
+  // own controls — never from rail position. `index > step` claimed the review
+  // step was blocked on answering while the enabled plan button beside it
+  // required no answers: a rail statement an adjacent control contradicts is a
+  // false statement in the exact mechanism built to prevent grey-row mystery.
+  const stepBlocked: Record<string, boolean> = {
+    [SETUP_STEPS[0]]: false,
+    [SETUP_STEPS[1]]: !inspection,
+    [SETUP_STEPS[2]]: !inspection,
+    [SETUP_STEPS[3]]: plan === null,
+  }
+
   return (
     <>
       <aside
@@ -442,12 +468,13 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
                   {i18nT(STEP_DESCRIPTION_KEY[key])}
                 </span>
               )}
-              {/* A step the flow has not reached names its blocker rather than
-                  rendering as a grey row with no reason. The named step is the
-                  immediate predecessor, so the chain reads correctly from any
-                  position — and it is interpolated, because a sentence assembled
-                  from a fragment plus a name cannot be translated. */}
-              {index > step && (
+              {/* A step the flow cannot reach names its blocker rather than
+                  rendering as a grey row with no reason. Driven by the same
+                  conditions that gate the step's own controls, so the rail can
+                  never claim a blocker an enabled button contradicts — and it is
+                  interpolated, because a sentence assembled from a fragment plus
+                  a name cannot be translated. */}
+              {stepBlocked[key] && (
                 <span className="se-note" data-step-blocked="true">
                   {i18nT('apps.specEngine.setupFlowPanel.blocked_until', {
                     step: i18nT(STEP_BLOCKER_KEY[key]),
@@ -534,6 +561,13 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
                 if (!open) setPickerOpen(false)
               }}
               anchorRef={browseRef}
+              // The popover may never extend into the strip's band at the bottom
+              // of the viewport; the picker flips upward when it cannot fit
+              // above it. The reservation, not anchor placement, is the bound.
+              reservedBottom={STRIP_CLEARANCE_PX}
+              // Every read the picker makes reports here, so a failed drill-in
+              // states itself exactly like a failed first read.
+              onBrowseResult={(ok) => setBrowseFailed(!ok)}
               onSelect={(path) => {
                 setProject(path)
                 invalidatePlan()

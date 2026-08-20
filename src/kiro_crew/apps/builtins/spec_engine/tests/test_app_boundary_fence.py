@@ -98,6 +98,17 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "The spec records this project is executed from: requirements, design, tasks.",
     ),
     (
+        "website/src/components/ProjectPicker.tsx",
+        "The shared directory picker: additive reservedBottom/onBrowseResult props "
+        "so an embedding surface can keep its safety strip clear and observe browse "
+        "failures; behavior unchanged when the props are absent.",
+    ),
+    (
+        "website/src/test/ProjectPicker.test.tsx",
+        "That picker's own suite: the reserved-band geometry is asserted where the "
+        "geometry lives.",
+    ),
+    (
         "website/src/components/appstore/appManifest.ts",
         "The shared store key table; an app has no card without its own row here.",
     ),

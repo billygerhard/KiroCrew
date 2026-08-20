@@ -492,19 +492,37 @@ describe('the orientation', () => {
     stub({})
     renderPage()
     await screen.findByText(T.orientation_engine)
-    // Nothing is inspected yet, so steps 2, 3 and 4 are all unreachable and each
-    // names its own immediate blocker rather than rendering as a grey row.
-    for (const step of [
-      P.step_inspect_the_project,
-      P.step_answer_what_could_not_be_inferred,
-      P.step_review_the_plan,
-    ]) {
-      expect(screen.getByText(filled(T.blocked_until, step))).toBeInTheDocument()
-    }
+    // Nothing is inspected yet. Answering and reviewing BOTH wait on the
+    // inspection (the plan can be computed with defaults left unanswered, so
+    // naming the answer step would state a blocker the plan button contradicts),
+    // and approve waits on a plan being on screen.
+    expect(screen.getAllByText(filled(T.blocked_until, P.step_inspect_the_project))).toHaveLength(2)
+    expect(
+      screen.getByText(filled(T.blocked_until, P.step_review_the_plan)),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(filled(T.blocked_until, P.step_answer_what_could_not_be_inferred)),
+    ).not.toBeInTheDocument()
     // The step the flow IS on is not blocked by anything.
     expect(
       screen.queryByText(filled(T.blocked_until, P.step_approve_and_apply)),
     ).not.toBeInTheDocument()
+  })
+
+  it('does not claim a step is blocked while its own control is live', async () => {
+    // The state the false claim lived in: after a successful inspect, the plan
+    // button is enabled and requires no answers — so neither the answer step nor
+    // the review step may render a blocker the button beside them contradicts.
+    // Only approve stays blocked, on the plan it genuinely waits for.
+    stub({})
+    await inspectProject()
+    expect(await screen.findByRole('button', { name: T.show_the_exact_patch })).toBeEnabled()
+    expect(
+      screen.queryByText(filled(T.blocked_until, P.step_inspect_the_project)),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByText(filled(T.blocked_until, P.step_review_the_plan)),
+    ).toBeInTheDocument()
   })
 
   it('is gone once a project is configured, and the pane still takes a path', async () => {
@@ -518,10 +536,11 @@ describe('the orientation', () => {
     expect(screen.queryByText(T.orientation_produces)).not.toBeInTheDocument()
     expect(screen.queryByText(T.step_desc_inspect)).not.toBeInTheDocument()
     // The blocker statement is NOT part of the orientation: an operator adding a
-    // second project needs it as much as the first one did.
+    // second project needs it as much as the first one did. Two steps wait on
+    // the inspection (answering and reviewing), so the sentence appears twice.
     expect(
-      screen.getByText(filled(T.blocked_until, P.step_inspect_the_project)),
-    ).toBeInTheDocument()
+      screen.getAllByText(filled(T.blocked_until, P.step_inspect_the_project)),
+    ).toHaveLength(2)
   })
 })
 
@@ -579,12 +598,19 @@ describe('the project path', () => {
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: T.browse }))
     await screen.findByRole('listbox', { name: PICKER.recent_projects })
-    // The picker is the one portal this pane opens, and it is an anchored popover
-    // with no scrim: the strip is still a grid row of the page, and its control is
-    // still enabled rather than covered.
+    // Operated, not just present: arming the stop while the picker is open is
+    // the interaction the requirement protects. jsdom computes no layout, so
+    // OCCLUSION is out of this test's reach — the geometric bound lives in the
+    // picker itself (`reservedBottom`, asserted in ProjectPicker.test.tsx), and
+    // this test covers the DOM half: the strip is not hidden, trapped, or
+    // disabled by the open popover.
     const stop = screen.getByRole('button', { name: KS.engage_the_kill_switch })
     expect(stop).toBeEnabled()
     expect(stop.closest('.se-status')).not.toBeNull()
     expect(document.querySelector('.se-status')?.getAttribute('aria-hidden')).toBeNull()
+    fireEvent.click(stop)
+    expect(
+      await screen.findByRole('button', { name: KS.confirm_the_stop }),
+    ).toBeInTheDocument()
   })
 })

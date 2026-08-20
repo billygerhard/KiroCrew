@@ -11,9 +11,25 @@ interface Props {
   anchorRef?: RefObject<HTMLElement | null>
   anchorRect?: DOMRect | null
   onSelect: (path: string) => void
+  /**
+   * Viewport pixels above the bottom edge the popover must never extend into.
+   * For embedding surfaces that keep an always-operable control row at the
+   * bottom of the page (e.g. a safety strip): the downward layout subtracts
+   * this from the available space, and the flip-up decision sees the reduced
+   * space, so a popover that cannot fit above the band flips up instead of
+   * covering it. Defaults to 0 — existing call sites are unchanged.
+   */
+  reservedBottom?: number
+  /**
+   * Reports the outcome of EVERY directory read (initial open, drill-in, and
+   * parent navigation), so an embedding surface can state a browse failure the
+   * picker itself renders only as an unchanged list. Optional and purely
+   * observational — the picker's own behavior does not change.
+   */
+  onBrowseResult?: (ok: boolean) => void
 }
 
-export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect }: Props) {
+export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect, reservedBottom = 0, onBrowseResult }: Props) {
   const [tab, setTab] = useState<'recent' | 'browse'>('recent')
   const [input, setInput] = useState('')
   const [browsePath, setBrowsePath] = useState('')
@@ -56,8 +72,9 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
       }
       // Keep the combobox input focused so arrow/Enter nav continues after a drill.
       requestAnimationFrame(() => inputRef.current?.focus())
-    }).catch(() => {})
-  }, [])
+      onBrowseResult?.(true)
+    }).catch(() => { onBrowseResult?.(false) })
+  }, [onBrowseResult])
 
   useEffect(() => {
     if (!open) return
@@ -154,7 +171,11 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   return createPortal(
     <div ref={dropRef} className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl w-[400px] flex flex-col overflow-hidden animate-slide-up" style={(() => {
       const dropMinH = 200
-      const spaceBelow = window.innerHeight - anchorR.bottom - 8
+      // The reserved band is subtracted BEFORE the flip decision: a popover that
+      // cannot fit above the band flips upward instead of covering it, and the
+      // downward branch only runs when spaceBelow >= dropMinH, so its bottom edge
+      // (anchor.bottom + 4 + height) never passes innerHeight - reservedBottom - 4.
+      const spaceBelow = window.innerHeight - anchorR.bottom - 8 - reservedBottom
       const flipUp = spaceBelow < dropMinH || anchorR.bottom > window.innerHeight / 2
       const left = Math.max(8, Math.min(anchorR.right - 400, window.innerWidth - 408))
       if (flipUp) {
