@@ -219,13 +219,25 @@ const WAIT_LABEL_KEY: Record<WaitingOn, string> = {
   stall: 'apps.specEngine.specEnginePage.stall',
 }
 
+/**
+ * The filter chip label per filter, and separately the order a reader scans them.
+ *
+ * A keyed map indexed at the call site (`FILTER_LABEL_KEY[id]`) rather than a
+ * `labelKey` field carried on each row: a key read off a loop variable widens to
+ * `string`, which puts the site beyond every gate that checks the key exists —
+ * the same reasoning that keeps `PANE_LABEL_KEY` beside the rail's order. The
+ * three waiting reasons reuse `WAIT_LABEL_KEY` so a chip and the cell it filters
+ * on cannot drift apart.
+ */
+const FILTER_LABEL_KEY: Record<Filter, string> = {
+  all: 'apps.specEngine.specEnginePage.all',
+  review: WAIT_LABEL_KEY.review,
+  budget: WAIT_LABEL_KEY.budget,
+  stall: WAIT_LABEL_KEY.stall,
+}
+
 /** The filter chips, in the order a reader scans them. */
-const FILTERS: ReadonlyArray<{ id: Filter; labelKey: string }> = [
-  { id: 'all', labelKey: 'apps.specEngine.specEnginePage.all' },
-  { id: 'review', labelKey: WAIT_LABEL_KEY.review },
-  { id: 'budget', labelKey: WAIT_LABEL_KEY.budget },
-  { id: 'stall', labelKey: WAIT_LABEL_KEY.stall },
-]
+const FILTER_ORDER: readonly Filter[] = ['all', 'review', 'budget', 'stall']
 
 /**
  * A wait, split into the two coarsest units that carry information.
@@ -500,7 +512,7 @@ export default function SpecEnginePage() {
                 cell value here, so a run cannot be missed by looking in the wrong
                 container. */}
             <div className="se-filters">
-              {FILTERS.map(({ id, labelKey }) => (
+              {FILTER_ORDER.map((id) => (
                 <button
                   key={id}
                   type="button"
@@ -508,7 +520,7 @@ export default function SpecEnginePage() {
                   aria-pressed={filter === id}
                   onClick={() => setFilter(id)}
                 >
-                  {i18nT(labelKey)}
+                  {i18nT(FILTER_LABEL_KEY[id])}
                   <span className="se-filter-count">{fmtNumber(counts[id])}</span>
                 </button>
               ))}

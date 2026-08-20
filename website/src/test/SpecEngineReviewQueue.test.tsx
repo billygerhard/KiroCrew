@@ -180,6 +180,48 @@ afterEach(() => {
   calls.length = 0
 })
 
+describe('the filter chips', () => {
+  /**
+   * The chip labels come from a keyed map indexed at the call site, not from a
+   * `labelKey` field carried on each row. A key read off a loop variable widens
+   * to `string`, which exempts the site from every gate that checks the key
+   * exists — and an unchecked key renders as its own dotted path to an operator
+   * rather than failing. So this asserts the RESOLVED words in scan order:
+   * a chip showing `apps.specEngine.…` fails here, and so does a reordering.
+   */
+  it('renders one chip per filter, in scan order, each with a resolved label', async () => {
+    const { container } = renderWith([entry()])
+    await screen.findByRole('grid')
+
+    const chips = Array.from(container.querySelectorAll('.se-filter'))
+    const labels = chips.map((chip) => chip.firstChild?.textContent)
+    expect(labels).toEqual([
+      en.apps.specEngine.specEnginePage.all,
+      en.apps.specEngine.specEnginePage.verdict,
+      en.apps.specEngine.specEnginePage.budget,
+      en.apps.specEngine.specEnginePage.stall,
+    ])
+    // No label may be a key path: that is what an unresolved key looks like.
+    for (const label of labels) expect(label).not.toContain('apps.specEngine')
+  })
+
+  it('presses exactly the chip that is active', async () => {
+    const { container } = renderWith([entry()])
+    await screen.findByRole('grid')
+
+    // The chip order and the filter each chip sets are two facts; a map keyed by
+    // filter plus a separate order list can disagree, so the wiring is read too.
+    const chips = Array.from(container.querySelectorAll('.se-filter'))
+    expect(chips.map((chip) => chip.getAttribute('aria-pressed')))
+      .toEqual(['true', 'false', 'false', 'false'])
+
+    fireEvent.click(chips[2])
+    expect(Array.from(container.querySelectorAll('.se-filter'))
+      .map((chip) => chip.getAttribute('aria-pressed')))
+      .toEqual(['false', 'false', 'true', 'false'])
+  })
+})
+
 describe('row-level state words', () => {
   /** The flag element for one meaning, read by its own data attribute.
    *
