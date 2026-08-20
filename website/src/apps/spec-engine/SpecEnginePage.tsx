@@ -40,11 +40,13 @@
  * keyboard selection, the docked inspector's identity header, first-run routing,
  * and the status strip's queue-scoped figures.
  *
- * First-run routing is ONE derivation. The landing pane and the rail's order both
- * read the same `firstRun` value, so the rail cannot lead with the assistant while
- * the landing rule opens the queue; and because that value is guarded against a
- * failed read, neither the routing nor the alarm on the setup entry can keep
- * claiming "nothing is configured" from data a later read failed to confirm.
+ * First-run routing is ONE derivation. The landing pane, the rail's order and the
+ * setup pane's orientation all read the same `firstRun` value — the last of them by
+ * being handed it rather than reading the configuration again — so the rail cannot
+ * lead with the assistant while the landing rule opens the queue, or the assistant
+ * greet a configured engine as an empty one; and because that value is guarded
+ * against a failed read, none of the three can keep claiming "nothing is
+ * configured" from data a later read failed to confirm.
  *
  * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
  * selected run so its state cannot outlive the selection. The configuration pane
@@ -460,7 +462,7 @@ export default function SpecEnginePage() {
         </div>
       ) : pane === 'setup' ? (
         <div className="se-setup">
-          <SetupFlowPanel />
+          <SetupFlowPanel firstRun={firstRun} />
         </div>
       ) : pane === 'config' ? (
         <div className="se-work">

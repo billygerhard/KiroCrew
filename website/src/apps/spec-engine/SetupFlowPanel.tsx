@@ -51,19 +51,49 @@
  * are configured later in the document. Stated in the UI rather than silently
  * dropped.
  *
+ * ## Orientation, and why it is only on the first run
+ *
+ * An operator who has never seen this engine needs three facts before a path
+ * field means anything: what the engine does, what finishing this flow produces,
+ * and which step to press first. Those are stated at the top of the pane while no
+ * project is configured, and each step carries a line saying what the operator
+ * DOES there and what they GET back — the guard-rail sentences beside them say
+ * what the flow refuses, which is a different question. Once a project exists the
+ * orientation is gone: the operator returning to add a second project has read it,
+ * and repeating it would push the field they came for below the fold.
+ *
+ * Whether this is the first run is decided ONCE, by the page, and handed down. A
+ * second derivation here could disagree with the one that routes the landing pane
+ * and orders the rail, and both readings would look correct on their own.
+ *
+ * A step the flow cannot reach yet says which step must complete first, in both
+ * states: an operator looking at a disabled-looking step needs the blocker named,
+ * not a greyed row to interpret.
+ *
  * ## Layout rules this file must not break
  *
  * No drawer, no modal, no scrim — see `styles.ts`. The evidence excerpts are
  * outside-authored prose (a steering note, a vendored CI file), so they render
  * through the bounded untrusted block the review queue uses: same threat, same
  * treatment, one implementation.
+ *
+ * The directory picker is the ONE portal this pane opens, and it is the dashboard's
+ * shared one rather than a second implementation of browsing. It is an anchored
+ * popover with no scrim and no focus trap, and it anchors to the Browse button
+ * beside the path field — the TOP of the pane — so it opens downward into the work
+ * area with a height bounded by the space below that anchor. The safety strip stays
+ * a grid row of the shell underneath it: visible, focusable and clickable while the
+ * picker is open. Anchoring it to anything lower down the pane would aim it at the
+ * one region this design forbids being covered.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle } from 'lucide-react'
+import { AlertTriangle, FolderOpen } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
+import { api } from '../../api/client'
+import ProjectPicker from '../../components/ProjectPicker'
 import {
   QK,
   QK_RESOLVED_ROOT,
@@ -89,13 +119,57 @@ const SOURCES_KIND = 'sources'
 /** The subject the engine asks about but takes no answer for. */
 const TOOLING_SUBJECT = 'tooling'
 
+/**
+ * The step the orientation names as the first action, as its own binding so the
+ * orientation and the rail cannot name different steps: `SETUP_STEPS` is built
+ * from it below.
+ */
+const FIRST_STEP_KEY = 'apps.specEngine.specEnginePage.step_inspect_the_project'
+
 /** The four steps, in the order the flow walks them. Shared with the page's rail. */
 export const SETUP_STEPS: readonly string[] = [
-  'apps.specEngine.specEnginePage.step_inspect_the_project',
+  FIRST_STEP_KEY,
   'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
   'apps.specEngine.specEnginePage.step_review_the_plan',
   'apps.specEngine.specEnginePage.step_approve_and_apply',
 ]
+
+/**
+ * What the operator does at each step, and what they get back — one entry per step,
+ * keyed by the step's own label key.
+ *
+ * A map of whole literal keys rather than a parallel array, because the
+ * key-reference gate resolves a non-literal index into a module-level object
+ * literal by unioning its values but cannot see through an array index: an array
+ * would exempt all four descriptions from every check that the key exists, and a
+ * missing key renders as its own dotted path in the UI rather than failing.
+ */
+const STEP_DESCRIPTION_KEY: Record<string, string> = {
+  'apps.specEngine.specEnginePage.step_inspect_the_project':
+    'apps.specEngine.setupFlowPanel.step_desc_inspect',
+  'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred':
+    'apps.specEngine.setupFlowPanel.step_desc_answer',
+  'apps.specEngine.specEnginePage.step_review_the_plan':
+    'apps.specEngine.setupFlowPanel.step_desc_review',
+  'apps.specEngine.specEnginePage.step_approve_and_apply':
+    'apps.specEngine.setupFlowPanel.step_desc_approve',
+}
+
+/**
+ * The step each step waits on: a blocked step's key to its predecessor's key.
+ *
+ * Declared rather than computed from `SETUP_STEPS` by index, for the same
+ * resolvability reason as the map above — and the first step is absent because
+ * nothing precedes it, which is why the flow's own state decides whether to look
+ * a blocker up at all.
+ */
+const STEP_BLOCKER_KEY: Record<string, string> = {
+  'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred': FIRST_STEP_KEY,
+  'apps.specEngine.specEnginePage.step_review_the_plan':
+    'apps.specEngine.specEnginePage.step_answer_what_could_not_be_inferred',
+  'apps.specEngine.specEnginePage.step_approve_and_apply':
+    'apps.specEngine.specEnginePage.step_review_the_plan',
+}
 
 /**
  * A rung's answer. `undefined` is a state, not a missing value: the engine refuses an
@@ -223,8 +297,13 @@ function InferenceRow({
   )
 }
 
-/** The panel. One flow, four steps, and no state that outlives the project it is for. */
-export function SetupFlowPanel() {
+/**
+ * The panel. One flow, four steps, and no state that outlives the project it is for.
+ *
+ * `firstRun` is the page's single derivation, not a second reading of the
+ * configuration: it decides only what this pane SAYS, never what it can do.
+ */
+export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   const client = useQueryClient()
   const [project, setProject] = useState('')
   const [approver, setApprover] = useState('')
@@ -235,6 +314,9 @@ export function SetupFlowPanel() {
   const [source, setSource] = useState<string | null>(null)
   const [plan, setPlan] = useState<SetupPlanEnvelope | null>(null)
   const [applied, setApplied] = useState<SetupApplied | null>(null)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [browseFailed, setBrowseFailed] = useState(false)
+  const browseRef = useRef<HTMLButtonElement>(null)
 
   /**
    * Discard the plan on screen.
@@ -247,6 +329,22 @@ export function SetupFlowPanel() {
   const invalidatePlan = useCallback(() => {
     setPlan(null)
     setApplied(null)
+  }, [])
+
+  /**
+   * Open the shared directory picker, and read the directories once ourselves.
+   *
+   * The second read is the only way this pane can STATE a failed browse: the
+   * shared picker swallows its own directory-read rejection (it renders an empty
+   * list), and it is imported rather than edited, so a browse that cannot be
+   * performed would otherwise look like a host with no directories on it. The
+   * statement is beside the field, and the field is never touched from here —
+   * typing the path stays the fallback whether the read worked or not.
+   */
+  const openPicker = useCallback(() => {
+    setBrowseFailed(false)
+    setPickerOpen(true)
+    void api.browseDirs().catch(() => setBrowseFailed(true))
   }, [])
 
   const inspect = useMutation({
@@ -333,7 +431,30 @@ export function SetupFlowPanel() {
             <span className="se-dot" aria-hidden="true">
               {fmtNumber(index + 1)}
             </span>
-            <span>{i18nT(key)}</span>
+            <span>
+              {i18nT(key)}
+              {/* What the operator does here and gets back. Part of the
+                  orientation, so it leaves with it: a returning operator already
+                  knows the four steps and needs the pane's controls, not its
+                  tutorial. */}
+              {firstRun && (
+                <span className="se-note" data-step-desc="true">
+                  {i18nT(STEP_DESCRIPTION_KEY[key])}
+                </span>
+              )}
+              {/* A step the flow has not reached names its blocker rather than
+                  rendering as a grey row with no reason. The named step is the
+                  immediate predecessor, so the chain reads correctly from any
+                  position — and it is interpolated, because a sentence assembled
+                  from a fragment plus a name cannot be translated. */}
+              {index > step && (
+                <span className="se-note" data-step-blocked="true">
+                  {i18nT('apps.specEngine.setupFlowPanel.blocked_until', {
+                    step: i18nT(STEP_BLOCKER_KEY[key]),
+                  })}
+                </span>
+              )}
+            </span>
           </div>
         ))}
         <p className="se-keys">
@@ -345,6 +466,25 @@ export function SetupFlowPanel() {
         <h1>{i18nT('apps.specEngine.specEnginePage.nothing_is_configured_yet')}</h1>
         <p className="se-setup-lead">{i18nT('apps.specEngine.specEnginePage.setup_lead')}</p>
 
+        {/* Orientation: the three facts a first-time reader needs before a path
+            field means anything — what the engine does, what finishing this
+            produces, and which step to press first. Absent once a project exists,
+            so the pane a returning operator opens starts at the field. */}
+        {firstRun && (
+          <section
+            className="se-orient"
+            aria-label={i18nT('apps.specEngine.setupFlowPanel.orientation_label')}
+          >
+            <p>{i18nT('apps.specEngine.setupFlowPanel.orientation_engine')}</p>
+            <p>{i18nT('apps.specEngine.setupFlowPanel.orientation_produces')}</p>
+            <p className="se-orient-lead">
+              {i18nT('apps.specEngine.setupFlowPanel.orientation_first_action', {
+                step: i18nT(FIRST_STEP_KEY),
+              })}
+            </p>
+          </section>
+        )}
+
         {/* Step 1 */}
         <div className="se-qbox">
           <h3>{i18nT('apps.specEngine.specEnginePage.step_inspect_the_project')}</h3>
@@ -352,19 +492,55 @@ export function SetupFlowPanel() {
             <label htmlFor="se-setup-project">
               {i18nT('apps.specEngine.setupFlowPanel.project_path')}
             </label>
-            <input
-              id="se-setup-project"
-              className="se-input se-m"
-              value={project}
-              onChange={(event) => {
-                setProject(event.target.value)
-                invalidatePlan()
-              }}
-            />
+            {/* The field and the picker's trigger on one line, and the field stays
+                editable: browsing is an alternative to typing a host path from
+                memory, never a replacement for it. */}
+            <span className="se-pathrow">
+              <input
+                id="se-setup-project"
+                className="se-input se-m"
+                value={project}
+                onChange={(event) => {
+                  setProject(event.target.value)
+                  invalidatePlan()
+                }}
+              />
+              <button
+                type="button"
+                ref={browseRef}
+                className="se-btn se-sm"
+                onClick={openPicker}
+              >
+                <FolderOpen className="lucide-inline" aria-hidden="true" />
+                {i18nT('apps.specEngine.setupFlowPanel.browse')}
+              </button>
+            </span>
             <span className="se-note">
               {i18nT('apps.specEngine.setupFlowPanel.the_path_is_read_on_the_gateway_host')}
             </span>
+            {browseFailed && (
+              <span className="se-note" data-browse-error="true" role="status">
+                {i18nT('apps.specEngine.setupFlowPanel.browse_failed')}
+              </span>
+            )}
           </p>
+          {/* The dashboard's picker, reused rather than reimplemented, anchored to
+              the button above. Selection fills the field with the absolute path,
+              which is an answer change like any other and so discards the plan. */}
+          {pickerOpen && (
+            <ProjectPicker
+              open={true}
+              onOpenChange={(open) => {
+                if (!open) setPickerOpen(false)
+              }}
+              anchorRef={browseRef}
+              onSelect={(path) => {
+                setProject(path)
+                invalidatePlan()
+                setPickerOpen(false)
+              }}
+            />
+          )}
           <div className="se-acts">
             <button
               type="button"

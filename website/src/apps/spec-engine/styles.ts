@@ -266,6 +266,19 @@ ul.se-findings li:last-child{border-bottom:none}
 .se-setup-body{overflow:auto;min-height:0;padding:16px 18px 24px}
 .se-setup-body h1{font-size:17px;margin-bottom:5px}
 .se-setup-lead{color:var(--muted);font-size:12.5px;margin:0 0 16px;max-width:66ch}
+/* Orientation. In flow at the top of the pane, so it pushes the flow down rather
+   than covering any of it — and it is bounded by measure rather than by height,
+   because prose that scrolls inside its own box is prose nobody finishes. */
+.se-orient{border:1px solid var(--border);border-left:2px solid var(--accent);
+  border-radius:var(--radius-md);background:var(--panel);padding:11px 12px;margin:0 0 14px;
+  font-size:12.5px;max-width:78ch}
+.se-orient p{margin:0 0 7px}
+.se-orient p:last-child{margin-bottom:0}
+.se-orient-lead{color:var(--text-strong);font-weight:600}
+/* The step's own lines, under its name rather than beside it: a description and a
+   blocker are sentences, and a flex row would set them in the dot's column. */
+.se-step .se-note{display:block;margin:3px 0 0}
+.se-step .se-note[data-step-blocked="true"]{color:var(--warn)}
 
 /* Config pane: the roles table, and the segment-wise match trace under it.
    Model and Effort are separate columns rather than one joined string — they are
@@ -323,6 +336,13 @@ textarea.se-json{width:100%;resize:vertical;min-height:220px}
 .se-offer:last-of-type{border-bottom:none}
 .se-rung{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;font-size:12px}
 .se-rung .se-note{flex:1 1 100%;margin:0}
+/* The path field and the picker's trigger on one line. The trigger stays at its
+   own width so the field takes the rest: the field is the fallback that must work
+   whether or not the directory read does. */
+.se-pathrow{display:flex;align-items:center;gap:6px}
+.se-pathrow .se-input{flex:1 1 auto}
+.se-pathrow .se-btn{flex:none;display:inline-flex;align-items:center;gap:5px}
+.se-note[data-browse-error="true"]{color:var(--warn)}
 
 /* The status strip. A grid row, never an overlay: this is the one thing on the
    page that must never be occluded, and the whole strip turns danger-coloured

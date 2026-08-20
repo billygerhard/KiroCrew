@@ -19,16 +19,45 @@
  *     the engine refuses — and a panel that kept it would turn a correct refusal
  *     into a dead end.
  *   - **An unanswered rung is a state**, not a false: only answered rungs travel.
+ *   - **The pane orients a first-time operator**, and stops doing it once a project
+ *     exists: what the engine does, what finishing produces, which step is first,
+ *     and what the operator does and gets at each step. A step the flow cannot
+ *     reach names its blocker, interpolated rather than assembled from fragments.
+ *   - **The project path is browsable.** The shared picker fills the field with an
+ *     absolute path, typing stays live, and a directory read that FAILED says so
+ *     instead of looking like a host with no directories on it.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
+import { api } from '../api/client'
 import en from '../i18n/locales/en.json'
 
 const T = en.apps.specEngine.setupFlowPanel
 const P = en.apps.specEngine.specEnginePage
+const KS = en.apps.specEngine.safetyPanel
+const PICKER = en.components.projectPicker
+
+/** A configuration read that carries one project entry — the not-first-run state. */
+const CONFIGURED: Answer = {
+  body: {
+    configured: true,
+    path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
+    document: { projects: { acme: { cost_profile: 'budget' } } },
+    elided: [],
+    elided_marker: '<elided>',
+    errors: [],
+    advisories: [],
+    config_only_paths: [],
+  },
+}
+
+/** A catalog sentence with its one variable filled in, as the panel renders it. */
+function filled(sentence: string, step: string): string {
+  return sentence.replace('{{step}}', step)
+}
 
 type Answer = { status?: number; body: unknown }
 
@@ -132,7 +161,7 @@ function applied(over: Record<string, unknown> = {}) {
   }
 }
 
-function stub(answers: { inspect?: Answer; plan?: Answer; apply?: Answer }) {
+function stub(answers: { inspect?: Answer; plan?: Answer; apply?: Answer; config?: Answer }) {
   vi.stubGlobal(
     'fetch',
     vi.fn((url: string, init?: RequestInit) => {
@@ -146,19 +175,22 @@ function stub(answers: { inspect?: Answer; plan?: Answer; apply?: Answer }) {
       } else if (url.endsWith('/setup/apply')) {
         answer = answers.apply ?? { body: applied() }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        // Unconfigured, which is what routes the page to the assistant.
-        answer = {
-          body: {
-            configured: false,
-            path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
-            document: {},
-            elided: [],
-            elided_marker: '<elided>',
-            errors: [],
-            advisories: [],
-            config_only_paths: [],
-          },
-        }
+        // Unconfigured, which is what routes the page to the assistant. A caller
+        // that cares about the CONFIGURED state passes its own answer: first run is
+        // "no project entry", so a document carrying one is the other state.
+        answer =
+          answers.config ?? {
+            body: {
+              configured: false,
+              path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
+              document: {},
+              elided: [],
+              elided_marker: '<elided>',
+              errors: [],
+              advisories: [],
+              config_only_paths: [],
+            },
+          }
       } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
         answer = {
           body: {
@@ -232,6 +264,9 @@ function lastBody(path: string): Record<string, unknown> {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // The picker's reads are spied on the shared client rather than stubbed through
+  // fetch, so they have to be put back or the next test inherits them.
+  vi.restoreAllMocks()
   calls.length = 0
 })
 
@@ -421,5 +456,135 @@ describe('the flow', () => {
     stub({})
     await inspectProject()
     expect(screen.getByText(T.nothing_is_written_until_step_four)).toBeInTheDocument()
+  })
+})
+
+describe('the orientation', () => {
+  it('says what the engine does, what finishing produces, and which step is first', async () => {
+    stub({})
+    renderPage()
+    expect(await screen.findByText(T.orientation_engine)).toBeInTheDocument()
+    expect(screen.getByText(T.orientation_produces)).toBeInTheDocument()
+    // The first action is NAMED, and named by interpolating the step's own label —
+    // a sentence glued to a fragment cannot be translated into a language that
+    // orders them differently.
+    expect(
+      screen.getByText(filled(T.orientation_first_action, P.step_inspect_the_project)),
+    ).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('{{step}}')
+  })
+
+  it('says what the operator does and gets at each of the four steps', async () => {
+    stub({})
+    renderPage()
+    await screen.findByText(T.orientation_engine)
+    for (const description of [
+      T.step_desc_inspect,
+      T.step_desc_answer,
+      T.step_desc_review,
+      T.step_desc_approve,
+    ]) {
+      expect(screen.getByText(description)).toBeInTheDocument()
+    }
+  })
+
+  it('names the step that must complete before an unreachable one', async () => {
+    stub({})
+    renderPage()
+    await screen.findByText(T.orientation_engine)
+    // Nothing is inspected yet, so steps 2, 3 and 4 are all unreachable and each
+    // names its own immediate blocker rather than rendering as a grey row.
+    for (const step of [
+      P.step_inspect_the_project,
+      P.step_answer_what_could_not_be_inferred,
+      P.step_review_the_plan,
+    ]) {
+      expect(screen.getByText(filled(T.blocked_until, step))).toBeInTheDocument()
+    }
+    // The step the flow IS on is not blocked by anything.
+    expect(
+      screen.queryByText(filled(T.blocked_until, P.step_approve_and_apply)),
+    ).not.toBeInTheDocument()
+  })
+
+  it('is gone once a project is configured, and the pane still takes a path', async () => {
+    stub({ config: CONFIGURED })
+    renderPage()
+    // A configured engine lands on the queue, so the assistant is reached from the
+    // rail — and it opens on the field rather than on the tutorial.
+    fireEvent.click(await screen.findByRole('button', { name: P.setup_assistant }))
+    expect(await screen.findByLabelText(T.project_path)).toBeInTheDocument()
+    expect(screen.queryByText(T.orientation_engine)).not.toBeInTheDocument()
+    expect(screen.queryByText(T.orientation_produces)).not.toBeInTheDocument()
+    expect(screen.queryByText(T.step_desc_inspect)).not.toBeInTheDocument()
+    // The blocker statement is NOT part of the orientation: an operator adding a
+    // second project needs it as much as the first one did.
+    expect(
+      screen.getByText(filled(T.blocked_until, P.step_inspect_the_project)),
+    ).toBeInTheDocument()
+  })
+})
+
+describe('the project path', () => {
+  /** The picker's two reads, answered on the shared client it calls them through. */
+  function stubPicker(options: { recent?: string[]; browse?: 'fail' | Record<string, unknown> }) {
+    vi.spyOn(api, 'recentProjects').mockResolvedValue({ dirs: options.recent ?? [] })
+    const browse = vi.spyOn(api, 'browseDirs')
+    if (options.browse === 'fail') browse.mockRejectedValue(new Error('EACCES'))
+    else {
+      browse.mockResolvedValue(
+        (options.browse ?? { path: '/home/me/src', parent: '/home/me', dirs: [] }) as Awaited<
+          ReturnType<typeof api.browseDirs>
+        >,
+      )
+    }
+    return browse
+  }
+
+  it('fills the field with the absolute path the shared picker returns', async () => {
+    stub({})
+    stubPicker({ recent: ['/home/me/src/acme'] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: T.browse }))
+    // The dashboard's own picker, not a second directory browser: these are its
+    // recents list and its own labels.
+    await screen.findByRole('listbox', { name: PICKER.recent_projects })
+    fireEvent.mouseDown(screen.getByText('/home/me/src/acme'))
+    await waitFor(() =>
+      expect(screen.getByLabelText(T.project_path)).toHaveValue('/home/me/src/acme'),
+    )
+    // And the field it filled is the same one an operator types into: inspecting is
+    // now offered against the picked path.
+    expect(screen.getByRole('button', { name: T.inspect_the_project })).toBeEnabled()
+  })
+
+  it('states a failed directory read and leaves typing available', async () => {
+    stub({})
+    stubPicker({ browse: 'fail' })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: T.browse }))
+    // The shared picker swallows this rejection and renders an empty list, so the
+    // pane says it: a browse that could not be performed must not read as a host
+    // with no directories on it.
+    expect(await screen.findByText(T.browse_failed)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText(T.project_path), { target: { value: '/src/acme' } })
+    expect(screen.getByLabelText(T.project_path)).toHaveValue('/src/acme')
+    fireEvent.click(screen.getByRole('button', { name: T.inspect_the_project }))
+    await waitFor(() => expect(lastBody('/setup/inspect')).toEqual({ project: '/src/acme' }))
+  })
+
+  it('leaves the kill switch on screen and operable while the picker is open', async () => {
+    stub({})
+    stubPicker({ recent: ['/home/me/src/acme'] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: T.browse }))
+    await screen.findByRole('listbox', { name: PICKER.recent_projects })
+    // The picker is the one portal this pane opens, and it is an anchored popover
+    // with no scrim: the strip is still a grid row of the page, and its control is
+    // still enabled rather than covered.
+    const stop = screen.getByRole('button', { name: KS.engage_the_kill_switch })
+    expect(stop).toBeEnabled()
+    expect(stop.closest('.se-status')).not.toBeNull()
+    expect(document.querySelector('.se-status')?.getAttribute('aria-hidden')).toBeNull()
   })
 })
