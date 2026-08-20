@@ -85,7 +85,7 @@ no quiet flags).
 | vitest — six SpecEngine suites + ProjectPicker + FolderConfigModal | **0** | 251 passed |
 | `npx tsc -b` | **0** | — |
 | eslint over every TS file this spec touched (spec's own git range) | **0** | 4 pre-existing jsx-a11y warnings, same rule/count as before the spec |
-| `node scripts/check-i18n-keys.mjs --report` | **0** | `SpecEnginePage.tsx` no longer listed (FILTERS converted, `94760db77`); 3 pre-dating dynamic sites remain (SafetyPanel origin key, SetupFlowPanel refusal sentence + step-rail key), all prior-spec work with literal-keyed maps behind them |
+| `node scripts/check-i18n-keys.mjs --report` | **0** | `SpecEnginePage.tsx` no longer listed (FILTERS converted, `94760db77`); 3 spec-engine dynamic sites remain (SafetyPanel origin key, SetupFlowPanel refusal sentence + step-rail key) — each site's mechanism pre-dates this spec (the step-rail line was only rewrapped by `75a82e4a1`), with literal-keyed maps behind them |
 | `node scripts/check-app-manifest-sync.mjs` | **0** | 20 manifests, 171 strings |
 | `npm run i18n:check` | **1** | sole finding is the INHERITED `pages.artifactDeployPage.domain` trailing-connector (below); `changed-values` 0 on everything this branch added or changed |
 | fence pytest (`test_app_boundary_fence.py`) | **0** | 38 passed; the only out-of-territory files this spec touched are the two fence-allowlisted ProjectPicker entries |
@@ -94,8 +94,16 @@ no quiet flags).
 
 Catalog completeness: the 32 keys this spec added (configPanel + setupFlowPanel
 namespaces, derived from the spec's own git range, not a hand list) are present
-in en + all 12 language catalogs + en-XA, none identical-to-English in a
-translated catalog, `{{project}}`/`{{count}}`/`{{step}}` intact everywhere.
+in en + the 11 translated catalogs + en-XA, none identical-to-English in a
+translated catalog, `{{project}}`/`{{count}}`/`{{step}}` intact everywhere
+(`en.manual.json` is a partial override catalog and correctly carries none).
+The vitest row above counts the 8 suites named; the review gate's own run with
+`ProjectPicker.pathDelimiter` included totals 259.
+
+**Coverage note (pre-existing, not charged to this spec):** the queue suite
+pins the filter chips' labels, order, and pressed-state wiring, but nothing
+asserts that a selected filter narrows the visible rows — the filter predicate
+is byte-unchanged across this spec's whole range and pre-dates it.
 
 **Disposition — inherited i18n:check failure:** `pages.artifactDeployPage.domain`
 ("domain —") is the single `source-strings` finding. It predates this branch
