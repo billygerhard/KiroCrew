@@ -4235,6 +4235,7 @@
         "n_created": "{{n}} erstellt",
         "n_failed": "{{n}} fehlgeschlagen",
         "n_selected": "{{n}} ausgewählt",
+        "nested_inside_name": "Verschachtelt in {{name}}",
         "no_sub_projects_found": "Keine Teilprojekte gefunden",
         "nothing_under_this_directory_looked_like_a_proje": "Nichts in diesem Verzeichnis sah wie ein Projekt aus. Sie können dennoch einen Ordner für das Verzeichnis selbst erstellen.",
         "preview": "Vorschau",

@@ -4140,6 +4140,7 @@
         "n_created": "已创建 {{n}} 个",
         "n_failed": "{{n}} 个失败",
         "n_selected": "已选择 {{n}} 个",
+        "nested_inside_name": "嵌套在 {{name}} 内",
         "no_sub_projects_found": "未找到子项目",
         "nothing_under_this_directory_looked_like_a_proje": "此目录下没有任何内容看起来像一个项目。你仍然可以为该目录本身创建一个文件夹。",
         "preview": "预览",

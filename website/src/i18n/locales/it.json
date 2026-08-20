@@ -4266,6 +4266,7 @@
         "n_created": "{{n}} create",
         "n_failed": "{{n}} non riuscite",
         "n_selected": "{{n}} selezionate",
+        "nested_inside_name": "Annidato in {{name}}",
         "no_sub_projects_found": "Nessun sottoprogetto trovato",
         "nothing_under_this_directory_looked_like_a_proje": "Nulla in questa directory sembrava un progetto. Puoi comunque creare una cartella per la directory stessa.",
         "preview": "Anteprima",

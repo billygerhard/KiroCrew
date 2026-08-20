@@ -4172,6 +4172,7 @@
         "n_created": "{{n}} 件作成",
         "n_failed": "{{n}} 件失敗",
         "n_selected": "{{n}} 件選択中",
+        "nested_inside_name": "{{name}} の内側にネスト",
         "no_sub_projects_found": "サブプロジェクトが見つかりません",
         "nothing_under_this_directory_looked_like_a_proje": "このディレクトリの中にプロジェクトらしいものはありませんでした。このディレクトリ自身のフォルダーは作成できます。",
         "preview": "プレビュー",

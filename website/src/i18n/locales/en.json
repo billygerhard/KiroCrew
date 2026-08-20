@@ -3182,6 +3182,7 @@
         "n_created": "{{n}} created",
         "n_failed": "{{n}} failed",
         "n_selected": "{{n}} selected",
+        "nested_inside_name": "Nested inside {{name}}",
         "no_sub_projects_found": "No sub-projects found",
         "nothing_under_this_directory_looked_like_a_proje": "Nothing under this directory looked like a project. You can still create a folder for the directory itself.",
         "preview": "Preview",

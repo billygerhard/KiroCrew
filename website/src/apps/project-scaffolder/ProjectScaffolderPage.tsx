@@ -50,6 +50,31 @@ interface Group {
   rows: Candidate[]
 }
 
+/** Sort rank per tier: confident rows lead, offered rows follow. */
+const TIER_RANK: Record<Candidate['tier'], number> = { auto: 0, offered: 1 }
+
+/**
+ * Order rows by confidence, keeping the server's path order inside each tier.
+ *
+ * The two orderings are complementary rather than competing: confidence picks
+ * which block a row sits in, and the server's path order picks its position
+ * within that block. A stable sort is what makes the second half true, so this
+ * relies on `Array#sort` being stable rather than comparing paths as a
+ * tiebreak — comparing them would impose a *string* order where the server
+ * already supplied a tree order.
+ *
+ * Presentation only: the tier a row carries and the set that is ticked are both
+ * the server's, and neither is touched here.
+ */
+function byConfidence(rows: Candidate[]): Candidate[] {
+  return [...rows].sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier])
+}
+
+/** Whether a group holds anything the server was confident about. */
+function hasConfident(group: Group): boolean {
+  return group.rows.some((row) => row.tier === 'auto')
+}
+
 /**
  * Resolve the server's `groups` (parent -> paths) into rows.
  *
@@ -58,6 +83,13 @@ interface Group {
  * themselves are agreed on. Any candidate the buckets somehow omit is appended
  * as its own trailing group rather than dropped, so a row can never become
  * invisible-but-selectable.
+ *
+ * Rows and groups are then ordered by confidence, because the preview is read
+ * top-down and the ticked rows are the ones the user is deciding about: a group
+ * of purely offered candidates is an opt-in, and burying the ticked ones below
+ * it makes the default selection look like it is somewhere else. The
+ * partitioning is stable, so within each class the server's path order — and
+ * therefore parent-before-child — survives.
  */
 function toGroups(scan: ScanResult): Group[] {
   const byPath = new Map(scan.candidates.map((c) => [c.path, c]))
@@ -71,11 +103,11 @@ function toGroups(scan: ScanResult): Group[] {
       rows.push(row)
       placed.add(path)
     }
-    if (rows.length) grouped.push({ parentPath: bucket.parent_path, rows })
+    if (rows.length) grouped.push({ parentPath: bucket.parent_path, rows: byConfidence(rows) })
   }
   const orphans = scan.candidates.filter((c) => !placed.has(c.path))
-  if (orphans.length) grouped.push({ parentPath: null, rows: orphans })
-  return grouped
+  if (orphans.length) grouped.push({ parentPath: null, rows: byConfidence(orphans) })
+  return [...grouped.filter(hasConfident), ...grouped.filter((g) => !hasConfident(g))]
 }
 
 /** The server's own default tick state, which already excludes existing folders. */
@@ -135,8 +167,49 @@ function CandidateRow({ row, checked, onToggle }: {
   )
 }
 
-function PreviewGroup({ group, selected, onToggle, onBulk }: {
+/** Last segment of an absolute directory path, on either separator. */
+function baseName(path: string): string {
+  const segments = path.split(/[/\\]+/).filter(Boolean)
+  return segments[segments.length - 1] ?? path
+}
+
+/**
+ * Say what a group IS, not just where it is.
+ *
+ * A bare absolute path is ambiguous here: the same directory appears both as a
+ * ticked row near the top of the preview and as the heading of the group holding
+ * the sub-packages found inside it, so a heading that is only a path reads as if
+ * that package had been moved out of the list rather than as a container for
+ * what sits under it. Naming the relationship is what disambiguates the two
+ * roles; the full path stays as secondary text because it is what tells apart
+ * two directories sharing a basename.
+ *
+ * The scan root keeps its own wording: nothing is nested inside it in the sense
+ * this label means, and its rows are the top level of what was found.
+ */
+function GroupHeading({ parentPath, root }: { parentPath: string | null; root: string }) {
+  if (parentPath === null || parentPath === root) {
+    return (
+      <span className="text-[11.5px] font-semibold text-muted">
+        {i18nT('apps.projectScaffolder.projectScaffolderPage.directly_under_the_root')}
+      </span>
+    )
+  }
+  return (
+    <span className="flex flex-col min-w-0" data-testid="group-heading">
+      <span className="text-[11.5px] font-semibold text-muted">
+        {i18nT('apps.projectScaffolder.projectScaffolderPage.nested_inside_name', {
+          name: baseName(parentPath),
+        })}
+      </span>
+      <span className="text-[11px] text-muted font-mono break-all">{parentPath}</span>
+    </span>
+  )
+}
+
+function PreviewGroup({ group, root, selected, onToggle, onBulk }: {
   group: Group
+  root: string
   selected: Set<string>
   onToggle: (path: string, next: boolean) => void
   onBulk: (paths: string[], next: boolean) => void
@@ -147,10 +220,8 @@ function PreviewGroup({ group, selected, onToggle, onBulk }: {
   const togglePaths = group.rows.filter((r) => !r.existing).map((r) => r.path)
   return (
     <fieldset className="border-0 p-0 m-0 mb-4" data-testid="preview-group">
-      <legend className="flex items-center gap-2 flex-wrap w-full mb-1">
-        <span className="text-[11.5px] font-semibold text-muted font-mono break-all">
-          {group.parentPath ?? i18nT('apps.projectScaffolder.projectScaffolderPage.directly_under_the_root')}
-        </span>
+      <legend className="flex items-start gap-2 flex-wrap w-full mb-1">
+        <GroupHeading parentPath={group.parentPath} root={root} />
         {togglePaths.length > 0 && (
           <span className="flex items-center gap-1.5">
             <Btn type="button" onClick={() => onBulk(togglePaths, true)}>
@@ -433,6 +504,7 @@ export default function ProjectScaffolderPage() {
               <PreviewGroup
                 key={group.parentPath ?? ''}
                 group={group}
+                root={scan.root}
                 selected={selected}
                 onToggle={toggle}
                 onBulk={bulk}

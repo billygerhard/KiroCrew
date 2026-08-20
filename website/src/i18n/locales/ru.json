@@ -4329,6 +4329,7 @@
         "n_created": "создано: {{n}}",
         "n_failed": "не удалось: {{n}}",
         "n_selected": "выбрано: {{n}}",
+        "nested_inside_name": "Вложено в {{name}}",
         "no_sub_projects_found": "Подпроекты не найдены",
         "nothing_under_this_directory_looked_like_a_proje": "Ничто внутри этого каталога не выглядит как проект. Вы всё же можете создать папку для самого каталога.",
         "preview": "Предпросмотр",

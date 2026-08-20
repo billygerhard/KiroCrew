@@ -12,8 +12,9 @@
  * `calls[n]` by index.
  *
  * Covers: the picker-driven root, preview rendering with mixed tiers, existing
- * rows disabled, per-group select-all/none, the empty status, an inline root
- * refusal, the stale-selection rescan prompt, and failed-row rendering.
+ * rows disabled, per-group select-all/none, confidence-first row and group
+ * ordering, the nested-group heading, the empty status, an inline root refusal,
+ * the stale-selection rescan prompt, and failed-row rendering.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
@@ -60,6 +61,62 @@ const SCAN = {
 const EMPTY_SCAN = {
   root: ROOT, root_name: 'monorepo', root_existing: false, status: 'empty',
   candidates: [], groups: [], warnings: [],
+}
+
+/**
+ * A tree whose server order is deliberately the WRONG presentation order.
+ *
+ * The offered-only `tools` bucket is delivered first, and the `services` bucket
+ * interleaves its tiers, so any assertion that confident rows and
+ * confident-bearing groups come first is measuring the page's own ordering
+ * rather than the order it was handed.
+ */
+const MIXED_SCAN = {
+  root: ROOT,
+  root_name: 'monorepo',
+  root_existing: false,
+  status: 'ok',
+  candidates: [
+    {
+      path: `${ROOT}/services`, name: 'services', parent_path: null,
+      tier: 'auto', signals: ['git'], existing: false, selected: true,
+    },
+    {
+      path: `${ROOT}/services/api`, name: 'api', parent_path: `${ROOT}/services`,
+      tier: 'auto', signals: ['git'], existing: false, selected: true,
+    },
+    {
+      path: `${ROOT}/services/legacy`, name: 'legacy', parent_path: `${ROOT}/services`,
+      tier: 'offered', signals: ['manifest:package.json'], existing: false, selected: false,
+    },
+    {
+      path: `${ROOT}/services/zzz`, name: 'zzz', parent_path: `${ROOT}/services`,
+      tier: 'auto', signals: ['.kiro'], existing: false, selected: true,
+    },
+    {
+      path: `${ROOT}/tools`, name: 'tools', parent_path: null,
+      tier: 'offered', signals: ['manifest:package.json'], existing: false, selected: false,
+    },
+    {
+      path: `${ROOT}/tools/gen`, name: 'gen', parent_path: `${ROOT}/tools`,
+      tier: 'offered', signals: ['manifest:package.json'], existing: false, selected: false,
+    },
+    {
+      path: `${ROOT}/tools/lint`, name: 'lint', parent_path: `${ROOT}/tools`,
+      tier: 'offered', signals: ['manifest:package.json'], existing: false, selected: false,
+    },
+  ],
+  groups: [
+    // Offered-only, and delivered first.
+    { parent_path: `${ROOT}/tools`, paths: [`${ROOT}/tools/gen`, `${ROOT}/tools/lint`] },
+    { parent_path: null, paths: [`${ROOT}/services`, `${ROOT}/tools`] },
+    // Path order interleaves the tiers: api (auto), legacy (offered), zzz (auto).
+    {
+      parent_path: `${ROOT}/services`,
+      paths: [`${ROOT}/services/api`, `${ROOT}/services/legacy`, `${ROOT}/services/zzz`],
+    },
+  ],
+  warnings: [],
 }
 
 /** Queue of responses `fetch` hands out, in call order. */
@@ -331,5 +388,53 @@ describe('ProjectScaffolderPage', () => {
     await waitFor(() => expect(screen.getAllByTestId('candidate-row')).toHaveLength(1))
     expect(calls[2]).toEqual({ url: '/api/chat/folders/scan', body: { root: ROOT } })
     expect(screen.queryByTestId('stale-selection')).not.toBeInTheDocument()
+  })
+
+  it('renders confident rows and confident-bearing groups before offered ones', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: MIXED_SCAN })
+    render(<ProjectScaffolderPage />)
+    await scan(user)
+
+    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(3))
+    const groups = screen.getAllByTestId('preview-group')
+
+    // Group order: the two groups holding a confident row first, in the server's
+    // own order, then the offered-only group that was delivered ahead of both.
+    expect(groups[0]).toHaveTextContent('Directly under the root')
+    expect(groups[1]).toHaveTextContent('Nested inside services')
+    expect(groups[2]).toHaveTextContent('Nested inside tools')
+
+    // Row order inside the interleaved group: both confident rows first, and
+    // their delivered path order (api before zzz) survives the tier sort.
+    const names = within(groups[1])
+      .getAllByTestId('candidate-row')
+      .map((row) => row.querySelector('span')?.textContent)
+    expect(names).toEqual(['api', 'zzz', 'legacy'])
+
+    // Presentation only: the server's own default selection is untouched.
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('3 selected')
+  })
+
+  it('names what a nested group is nested inside and keeps the path as detail', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: MIXED_SCAN })
+    render(<ProjectScaffolderPage />)
+    await scan(user)
+
+    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(3))
+
+    // A nested group says what it holds, with the full path as secondary text: a
+    // heading that is only a path reads as if the parent package had been demoted
+    // out of the list it is in fact still ticked in.
+    const headings = screen.getAllByTestId('group-heading')
+    expect(headings).toHaveLength(2)
+    expect(headings[0]).toHaveTextContent('Nested inside services')
+    expect(headings[0]).toHaveTextContent(`${ROOT}/services`)
+
+    // The scan-root group keeps its own wording and gets no nested heading.
+    const root = screen.getAllByTestId('preview-group')[0]
+    expect(root).toHaveTextContent('Directly under the root')
+    expect(within(root).queryByTestId('group-heading')).not.toBeInTheDocument()
   })
 })

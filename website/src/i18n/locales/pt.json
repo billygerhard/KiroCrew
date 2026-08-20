@@ -4266,6 +4266,7 @@
         "n_created": "{{n}} criadas",
         "n_failed": "{{n}} com falha",
         "n_selected": "{{n}} selecionadas",
+        "nested_inside_name": "Aninhado em {{name}}",
         "no_sub_projects_found": "Nenhum subprojeto encontrado",
         "nothing_under_this_directory_looked_like_a_proje": "Nada dentro deste diretório parecia um projeto. Você ainda pode criar uma pasta para o próprio diretório.",
         "preview": "Pré-visualização",

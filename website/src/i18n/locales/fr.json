@@ -4298,6 +4298,7 @@
         "n_created": "{{n}} créés",
         "n_failed": "{{n}} en échec",
         "n_selected": "{{n}} sélectionnés",
+        "nested_inside_name": "Imbriqué dans {{name}}",
         "no_sub_projects_found": "Aucun sous-projet trouvé",
         "nothing_under_this_directory_looked_like_a_proje": "Rien dans ce répertoire ne ressemblait à un projet. Vous pouvez tout de même créer un dossier pour le répertoire lui-même.",
         "preview": "Aperçu",

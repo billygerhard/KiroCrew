@@ -4203,6 +4203,7 @@
         "n_created": "{{n}} बनाए गए",
         "n_failed": "{{n}} विफल",
         "n_selected": "{{n}} चुने गए",
+        "nested_inside_name": "{{name}} के अंदर नेस्टेड",
         "no_sub_projects_found": "कोई सब-प्रोजेक्ट नहीं मिला",
         "nothing_under_this_directory_looked_like_a_proje": "इस डायरेक्टरी के अंदर कुछ भी प्रोजेक्ट जैसा नहीं लगा। आप फिर भी इस डायरेक्टरी के लिए एक फ़ोल्डर बना सकते हैं।",
         "preview": "प्रीव्यू",

@@ -4266,6 +4266,7 @@
         "n_created": "{{n}} creadas",
         "n_failed": "{{n}} con error",
         "n_selected": "{{n}} seleccionadas",
+        "nested_inside_name": "Anidado dentro de {{name}}",
         "no_sub_projects_found": "No se encontraron subproyectos",
         "nothing_under_this_directory_looked_like_a_proje": "Nada dentro de este directorio parecía un proyecto. Aun así puedes crear una carpeta para el propio directorio.",
         "preview": "Vista previa",
