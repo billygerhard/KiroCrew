@@ -29,7 +29,7 @@
  * without any key handling of its own.
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { FolderPlus, FolderCheck, FolderOpen, AlertTriangle, RefreshCw } from 'lucide-react'
+import { FolderPlus, FolderCheck, FolderOpen, AlertTriangle, RefreshCw, ChevronDown, ChevronRight } from 'lucide-react'
 import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState, PageHeader } from '../../components/ui'
 import ProjectPicker from '../../components/ProjectPicker'
 import { i18nT } from '../../i18n/t'
@@ -44,11 +44,20 @@ import {
   type ScaffoldResult,
 } from './api'
 
-/** Rows of one preview group, resolved from the server's path buckets. */
-interface Group {
-  parentPath: string | null
-  rows: Candidate[]
+/** A candidate found below another candidate, with the package it sits inside. */
+interface NestedRow {
+  row: Candidate
+  parentPath: string
 }
+
+/** The preview's two lists: what hangs off the scan root, and what sits deeper. */
+interface Split {
+  top: Candidate[]
+  nested: NestedRow[]
+}
+
+/** Ties the disclosure button to the list it reveals, for `aria-controls`. */
+const NESTED_LIST_ID = 'scaffolder-nested-list'
 
 /** Sort rank per tier: confident rows lead, offered rows follow. */
 const TIER_RANK: Record<Candidate['tier'], number> = { auto: 0, offered: 1 }
@@ -70,44 +79,40 @@ function byConfidence(rows: Candidate[]): Candidate[] {
   return [...rows].sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier])
 }
 
-/** Whether a group holds anything the server was confident about. */
-function hasConfident(group: Group): boolean {
-  return group.rows.some((row) => row.tier === 'auto')
-}
-
 /**
- * Resolve the server's `groups` (parent -> paths) into rows.
+ * Split the scan into the rows the preview leads with and the ones it defers.
  *
- * The buckets and their order come from the server so every surface renders the
- * same grouping — a per-group select-all control is only coherent if the groups
- * themselves are agreed on. Any candidate the buckets somehow omit is appended
- * as its own trailing group rather than dropped, so a row can never become
- * invisible-but-selectable.
+ * A candidate hanging off the scan root is a top-level answer to "what is in this
+ * project". A candidate found *inside* another candidate is a different kind of
+ * claim: usually a build layout that keeps a manifest below the package root
+ * (`Tests/src/package.json`), which is a directory the user almost never wants a
+ * folder for. Presenting the two as peers is what made the preview misread —
+ * when exactly one package contains a nested manifest, a section titled after
+ * that package reads as if the package had been demoted out of the list it is in
+ * fact still ticked at the top of.
  *
- * Rows and groups are then ordered by confidence, because the preview is read
- * top-down and the ticked rows are the ones the user is deciding about: a group
- * of purely offered candidates is an opt-in, and burying the ticked ones below
- * it makes the default selection look like it is somewhere else. The
- * partitioning is stable, so within each class the server's path order — and
- * therefore parent-before-child — survives.
+ * So the split is by depth, not by parent: there is one deferred bucket for the
+ * whole scan rather than one section per containing package, and no heading ever
+ * repeats a package name that already appears as a row.
+ *
+ * Every candidate lands in exactly one list, keyed off the candidate's own
+ * `parent_path` rather than the server's `groups` buckets — a row that no bucket
+ * mentioned would otherwise be invisible but still selectable. Both lists are
+ * then ordered by confidence with a stable sort, so the ticked rows lead and the
+ * server's path order survives inside each tier.
  */
-function toGroups(scan: ScanResult): Group[] {
-  const byPath = new Map(scan.candidates.map((c) => [c.path, c]))
-  const grouped: Group[] = []
-  const placed = new Set<string>()
-  for (const bucket of scan.groups) {
-    const rows: Candidate[] = []
-    for (const path of bucket.paths) {
-      const row = byPath.get(path)
-      if (!row) continue
-      rows.push(row)
-      placed.add(path)
-    }
-    if (rows.length) grouped.push({ parentPath: bucket.parent_path, rows: byConfidence(rows) })
+function splitCandidates(scan: ScanResult): Split {
+  const top: Candidate[] = []
+  const nested: NestedRow[] = []
+  for (const row of scan.candidates) {
+    if (row.parent_path === null || row.parent_path === scan.root) top.push(row)
+    else nested.push({ row, parentPath: row.parent_path })
   }
-  const orphans = scan.candidates.filter((c) => !placed.has(c.path))
-  if (orphans.length) grouped.push({ parentPath: null, rows: byConfidence(orphans) })
-  return [...grouped.filter(hasConfident), ...grouped.filter((g) => !hasConfident(g))]
+  const nestedByPath = new Map(nested.map((n) => [n.row.path, n]))
+  const nestedOrdered = byConfidence(nested.map((n) => n.row))
+    .map((row) => nestedByPath.get(row.path))
+    .filter((n): n is NestedRow => n !== undefined)
+  return { top: byConfidence(top), nested: nestedOrdered }
 }
 
 /** The server's own default tick state, which already excludes existing folders. */
@@ -121,10 +126,12 @@ function TierBadge({ tier }: { tier: Candidate['tier'] }) {
     : <Badge variant="muted">{i18nT('apps.projectScaffolder.projectScaffolderPage.tier_offered')}</Badge>
 }
 
-function CandidateRow({ row, checked, onToggle }: {
+function CandidateRow({ row, checked, onToggle, parentName }: {
   row: Candidate
   checked: boolean
   onToggle: (path: string, next: boolean) => void
+  /** Basename of the candidate this row was found inside, for deferred rows only. */
+  parentName?: string
 }) {
   const alreadySetUp = i18nT('apps.projectScaffolder.projectScaffolderPage.already_set_up')
   return (
@@ -146,6 +153,15 @@ function CandidateRow({ row, checked, onToggle }: {
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-[13px] font-medium text-text-strong">{row.name}</span>
           <TierBadge tier={row.tier} />
+          {parentName && (
+            // Which package this was found inside. The checkbox's own label is the
+            // full path, so this is sighted-user affordance rather than new
+            // information for a screen reader.
+            <span className="inline-flex items-center gap-1 text-[11.5px] text-muted" data-testid="nested-inside">
+              <FolderOpen size={12} className="lucide-inline" />
+              {i18nT('apps.projectScaffolder.projectScaffolderPage.inside_name', { name: parentName })}
+            </span>
+          )}
           {row.existing && (
             <span className="inline-flex items-center gap-1 text-[11.5px] text-muted" data-testid="already-set-up">
               <FolderCheck size={12} className="lucide-inline" />
@@ -173,68 +189,42 @@ function baseName(path: string): string {
   return segments[segments.length - 1] ?? path
 }
 
-/**
- * Say what a group IS, not just where it is.
- *
- * A bare absolute path is ambiguous here: the same directory appears both as a
- * ticked row near the top of the preview and as the heading of the group holding
- * the sub-packages found inside it, so a heading that is only a path reads as if
- * that package had been moved out of the list rather than as a container for
- * what sits under it. Naming the relationship is what disambiguates the two
- * roles; the full path stays as secondary text because it is what tells apart
- * two directories sharing a basename.
- *
- * The scan root keeps its own wording: nothing is nested inside it in the sense
- * this label means, and its rows are the top level of what was found.
- */
-function GroupHeading({ parentPath, root }: { parentPath: string | null; root: string }) {
-  if (parentPath === null || parentPath === root) {
-    return (
-      <span className="text-[11.5px] font-semibold text-muted">
-        {i18nT('apps.projectScaffolder.projectScaffolderPage.directly_under_the_root')}
-      </span>
-    )
-  }
+/** Paths a bulk toggle may actually change: an existing folder is never created. */
+function tickablePaths(rows: Candidate[]): string[] {
+  return rows.filter((r) => !r.existing).map((r) => r.path)
+}
+
+function BulkButtons({ paths, onBulk }: { paths: string[]; onBulk: (paths: string[], next: boolean) => void }) {
+  if (!paths.length) return null
   return (
-    <span className="flex flex-col min-w-0" data-testid="group-heading">
-      <span className="text-[11.5px] font-semibold text-muted">
-        {i18nT('apps.projectScaffolder.projectScaffolderPage.nested_inside_name', {
-          name: baseName(parentPath),
-        })}
-      </span>
-      <span className="text-[11px] text-muted font-mono break-all">{parentPath}</span>
+    <span className="flex items-center gap-1.5">
+      <Btn type="button" onClick={() => onBulk(paths, true)}>
+        {i18nT('apps.projectScaffolder.projectScaffolderPage.select_all')}
+      </Btn>
+      <Btn type="button" onClick={() => onBulk(paths, false)}>
+        {i18nT('apps.projectScaffolder.projectScaffolderPage.select_none')}
+      </Btn>
     </span>
   )
 }
 
-function PreviewGroup({ group, root, selected, onToggle, onBulk }: {
-  group: Group
-  root: string
+/** The rows hanging off the scan root — the preview's answer to what this project holds. */
+function RootList({ rows, selected, onToggle, onBulk }: {
+  rows: Candidate[]
   selected: Set<string>
   onToggle: (path: string, next: boolean) => void
   onBulk: (paths: string[], next: boolean) => void
 }) {
-  // Only rows that can actually change state are worth bulk-toggling; an
-  // existing folder is never created, so including it would make "select all"
-  // claim more than it did.
-  const togglePaths = group.rows.filter((r) => !r.existing).map((r) => r.path)
   return (
     <fieldset className="border-0 p-0 m-0 mb-4" data-testid="preview-group">
       <legend className="flex items-start gap-2 flex-wrap w-full mb-1">
-        <GroupHeading parentPath={group.parentPath} root={root} />
-        {togglePaths.length > 0 && (
-          <span className="flex items-center gap-1.5">
-            <Btn type="button" onClick={() => onBulk(togglePaths, true)}>
-              {i18nT('apps.projectScaffolder.projectScaffolderPage.select_all')}
-            </Btn>
-            <Btn type="button" onClick={() => onBulk(togglePaths, false)}>
-              {i18nT('apps.projectScaffolder.projectScaffolderPage.select_none')}
-            </Btn>
-          </span>
-        )}
+        <span className="text-[11.5px] font-semibold text-muted">
+          {i18nT('apps.projectScaffolder.projectScaffolderPage.directly_under_the_root')}
+        </span>
+        <BulkButtons paths={tickablePaths(rows)} onBulk={onBulk} />
       </legend>
       <ul className="list-none p-0 m-0 divide-y divide-border">
-        {group.rows.map((row) => (
+        {rows.map((row) => (
           <CandidateRow
             key={row.path}
             row={row}
@@ -243,6 +233,75 @@ function PreviewGroup({ group, root, selected, onToggle, onBulk }: {
           />
         ))}
       </ul>
+    </fieldset>
+  )
+}
+
+/**
+ * The deferred rows, behind one collapsed disclosure.
+ *
+ * Collapsed by default because these are speculative: a manifest below a package
+ * root is usually a build artifact of that package rather than a project in its
+ * own right, so the common answer is "none of these" and the list is noise in the
+ * way of the decision the user came to make. It is a disclosure rather than a
+ * filter because the server did offer them and a few are real.
+ *
+ * Two consequences are deliberate. The count is in the summary so a collapsed
+ * section still says how much it is hiding, and a ticked deferred row is counted
+ * there too — the create step acts on the ticked set whether or not it is on
+ * screen, so the summary is the only place that can admit it. And the bulk
+ * buttons appear only while expanded, so no control can silently change rows the
+ * reader cannot see.
+ */
+function NestedSuggestions({ rows, open, onOpenChange, selected, onToggle, onBulk }: {
+  rows: NestedRow[]
+  open: boolean
+  onOpenChange: (next: boolean) => void
+  selected: Set<string>
+  onToggle: (path: string, next: boolean) => void
+  onBulk: (paths: string[], next: boolean) => void
+}) {
+  const selectedHere = rows.filter((n) => selected.has(n.row.path)).length
+  return (
+    <fieldset className="border-0 p-0 m-0 mb-4 border-t border-border pt-3" data-testid="nested-suggestions">
+      <legend className="flex items-center gap-2 flex-wrap w-full mb-1">
+        {/* A native button, so the disclosure is reachable by Tab and operable by
+            Enter and Space without any key handling of its own. */}
+        <button
+          type="button"
+          data-testid="nested-toggle"
+          aria-expanded={open}
+          aria-controls={open ? NESTED_LIST_ID : undefined}
+          onClick={() => onOpenChange(!open)}
+          className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-muted hover:text-text rounded cursor-pointer bg-transparent border-0 p-0"
+        >
+          {open
+            ? <ChevronDown size={13} className="lucide-inline shrink-0" />
+            : <ChevronRight size={13} className="lucide-inline shrink-0" />}
+          {i18nT('apps.projectScaffolder.projectScaffolderPage.n_possible_sub_folders_inside_packages_above', {
+            n: rows.length,
+          })}
+        </button>
+        {selectedHere > 0 && (
+          <Badge variant="muted" data-testid="nested-selected">
+            {i18nT('apps.projectScaffolder.projectScaffolderPage.n_selected', { n: selectedHere })}
+          </Badge>
+        )}
+        {open && <BulkButtons paths={tickablePaths(rows.map((n) => n.row))} onBulk={onBulk} />}
+      </legend>
+      {open && (
+        <ul id={NESTED_LIST_ID} className="list-none p-0 m-0 divide-y divide-border" data-testid="nested-list">
+          {rows.map(({ row, parentPath }) => (
+            <CandidateRow
+              key={row.path}
+              row={row}
+              parentName={baseName(parentPath)}
+              checked={selected.has(row.path)}
+              onToggle={onToggle}
+            />
+          ))}
+        </ul>
+      )}
     </fieldset>
   )
 }
@@ -311,10 +370,13 @@ export default function ProjectScaffolderPage() {
   const [stale, setStale] = useState<string[] | null>(null)
   const [busy, setBusy] = useState<'' | 'scan' | 'create'>('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  // Owned by the page rather than the section so a fresh scan re-collapses it:
+  // the deferred rows of the previous tree are not the deferred rows of this one.
+  const [nestedOpen, setNestedOpen] = useState(false)
   const rootInputRef = useRef<HTMLInputElement>(null)
   const browseRef = useRef<HTMLButtonElement>(null)
 
-  const groups = useMemo(() => (scan ? toGroups(scan) : []), [scan])
+  const split = useMemo(() => (scan ? splitCandidates(scan) : null), [scan])
   const selectedCount = selected.size
 
   const runScan = useCallback(async (path: string) => {
@@ -329,6 +391,7 @@ export default function ProjectScaffolderPage() {
     setResult(null)
     setScan(null)
     setSelected(new Set())
+    setNestedOpen(false)
     try {
       const next = await scanProject(trimmed)
       setScan(next)
@@ -500,16 +563,26 @@ export default function ProjectScaffolderPage() {
                 </Badge>
               )}
             </div>
-            {groups.map((group) => (
-              <PreviewGroup
-                key={group.parentPath ?? ''}
-                group={group}
-                root={scan.root}
-                selected={selected}
-                onToggle={toggle}
-                onBulk={bulk}
-              />
-            ))}
+            {split && (
+              <>
+                <RootList
+                  rows={split.top}
+                  selected={selected}
+                  onToggle={toggle}
+                  onBulk={bulk}
+                />
+                {split.nested.length > 0 && (
+                  <NestedSuggestions
+                    rows={split.nested}
+                    open={nestedOpen}
+                    onOpenChange={setNestedOpen}
+                    selected={selected}
+                    onToggle={toggle}
+                    onBulk={bulk}
+                  />
+                )}
+              </>
+            )}
             {stale && (
               <div className="bg-warn-subtle text-warn rounded-md px-3 py-2 mb-3" data-testid="stale-selection">
                 <div className="text-[12px]">

@@ -12,9 +12,10 @@
  * `calls[n]` by index.
  *
  * Covers: the picker-driven root, preview rendering with mixed tiers, existing
- * rows disabled, per-group select-all/none, confidence-first row and group
- * ordering, the nested-group heading, the empty status, an inline root refusal,
- * the stale-selection rescan prompt, and failed-row rendering.
+ * rows disabled, select-all/none scoped to its own list, confidence-first row
+ * ordering, the one collapsed section deeper candidates are deferred into, the
+ * empty status, an inline root refusal, the stale-selection rescan prompt, and
+ * failed-row rendering.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
@@ -167,6 +168,12 @@ async function scanViaPicker(user: ReturnType<typeof userEvent.setup>, root = RO
   await user.click(screen.getByRole('button', { name: 'Scan' }))
 }
 
+/** Open the deferred section, which starts collapsed, and hand back its list. */
+async function expandDeferred(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByTestId('nested-toggle'))
+  return screen.getByTestId('nested-list')
+}
+
 describe('ProjectScaffolderPage', () => {
   it('fills the root from the shared project picker without scanning on selection', async () => {
     const user = userEvent.setup()
@@ -192,7 +199,7 @@ describe('ProjectScaffolderPage', () => {
     expect(field).toHaveFocus()
 
     await user.keyboard('{Enter}')
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
     expect(calls[0]).toEqual({ url: '/api/chat/folders/scan', body: { root: ROOT } })
   })
 
@@ -228,7 +235,7 @@ describe('ProjectScaffolderPage', () => {
     render(<ProjectScaffolderPage />)
     await scanViaPicker(user)
 
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
     expect(calls[0]).toEqual({ url: '/api/chat/folders/scan', body: { root: ROOT } })
     expect(screen.getByTestId('selected-count')).toHaveTextContent('2 selected')
   })
@@ -239,19 +246,28 @@ describe('ProjectScaffolderPage', () => {
     render(<ProjectScaffolderPage />)
     await scan(user)
 
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
     expect(calls[0].url).toBe('/api/chat/folders/scan')
     expect(calls[0].body).toEqual({ root: ROOT })
 
-    // Both tiers are visible and distinguishable, and each row shows its signals.
+    // Only the root list is on screen at first, so the deferred rows' tiers and
+    // signals arrive with the disclosure rather than ahead of it.
+    expect(screen.getAllByText('Confident')).toHaveLength(1)
+    expect(screen.queryByText('Offered')).not.toBeInTheDocument()
+    expect(screen.queryByText('pyproject.toml')).not.toBeInTheDocument()
+
+    // The server's own default selection is honored: the two non-existing AUTO
+    // rows, one of them deferred and therefore counted on the summary too.
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('2 selected')
+    expect(screen.getByTestId('nested-selected')).toHaveTextContent('1 selected')
+    // Warnings are surfaced rather than swallowed.
+    expect(screen.getByTestId('scan-warnings')).toHaveTextContent('depth cap reached')
+
+    // Both tiers are distinguishable, and each row shows its signals, once open.
+    await expandDeferred(user)
     expect(screen.getAllByText('Confident')).toHaveLength(3)
     expect(screen.getByText('Offered')).toBeInTheDocument()
     expect(screen.getByText('pyproject.toml')).toBeInTheDocument()
-
-    // The server's own default selection is honored: the two non-existing AUTO rows.
-    expect(screen.getByTestId('selected-count')).toHaveTextContent('2 selected')
-    // Warnings are surfaced rather than swallowed.
-    expect(screen.getByTestId('scan-warnings')).toHaveTextContent('depth cap reached')
   })
 
   it('shows an already-scaffolded row with a disabled checkbox it cannot tick', async () => {
@@ -260,6 +276,7 @@ describe('ProjectScaffolderPage', () => {
     render(<ProjectScaffolderPage />)
     await scan(user)
 
+    await expandDeferred(user)
     await waitFor(() => expect(screen.getAllByTestId('candidate-row')).toHaveLength(4))
     const existing = screen.getByLabelText(`${ROOT}/services/done (Already set up)`)
     expect(existing).toBeDisabled()
@@ -267,23 +284,22 @@ describe('ProjectScaffolderPage', () => {
     expect(screen.getByTestId('already-set-up')).toBeInTheDocument()
   })
 
-  it('select-all adds only the tickable rows of its own group, select-none clears them', async () => {
+  it('select-all adds only the tickable rows of its own list, select-none clears them', async () => {
     const user = userEvent.setup()
     queued.push({ status: 200, body: SCAN })
     render(<ProjectScaffolderPage />)
     await scan(user)
 
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
-    const nested = screen.getAllByTestId('preview-group')[1]
+    const nested = await expandDeferred(user)
 
-    // The nested group holds api + legacy + done; select-all must reach the first
+    // The deferred list holds api + legacy + done; select-all must reach the first
     // two and leave the already-scaffolded one alone.
-    await user.click(within(nested).getByRole('button', { name: 'Select all' }))
+    await user.click(within(screen.getByTestId('nested-suggestions')).getByRole('button', { name: 'Select all' }))
     expect(screen.getByTestId('selected-count')).toHaveTextContent('3 selected')
-    expect(screen.getByLabelText(`${ROOT}/services/done (Already set up)`)).not.toBeChecked()
+    expect(within(nested).getByLabelText(`${ROOT}/services/done (Already set up)`)).not.toBeChecked()
 
-    await user.click(within(nested).getByRole('button', { name: 'Select none' }))
-    // The root-level group keeps its own selection, proving the bulk action is scoped.
+    await user.click(within(screen.getByTestId('nested-suggestions')).getByRole('button', { name: 'Select none' }))
+    // The root list keeps its own selection, proving the bulk action is scoped.
     expect(screen.getByTestId('selected-count')).toHaveTextContent('1 selected')
     expect(screen.getByLabelText(`${ROOT}/services`)).toBeChecked()
   })
@@ -307,10 +323,12 @@ describe('ProjectScaffolderPage', () => {
     })
     render(<ProjectScaffolderPage />)
     await scan(user)
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
 
     // Untick one of the two defaults, so the posted set is provably the live one.
-    await user.click(screen.getByLabelText(`${ROOT}/services/api`))
+    // It is a deferred row, so the disclosure has to be opened to reach it.
+    const nested = await expandDeferred(user)
+    await user.click(within(nested).getByLabelText(`${ROOT}/services/api`))
     await user.click(screen.getByRole('button', { name: 'Create folders' }))
 
     await waitFor(() => expect(screen.getByTestId('scaffold-results')).toBeInTheDocument())
@@ -373,7 +391,7 @@ describe('ProjectScaffolderPage', () => {
     })
     render(<ProjectScaffolderPage />)
     await scan(user)
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: 'Create folders' }))
     await waitFor(() => expect(screen.getByTestId('stale-selection')).toBeInTheDocument())
@@ -390,51 +408,133 @@ describe('ProjectScaffolderPage', () => {
     expect(screen.queryByTestId('stale-selection')).not.toBeInTheDocument()
   })
 
-  it('renders confident rows and confident-bearing groups before offered ones', async () => {
+  it('renders confident rows before offered ones in a single root list', async () => {
     const user = userEvent.setup()
     queued.push({ status: 200, body: MIXED_SCAN })
     render(<ProjectScaffolderPage />)
     await scan(user)
 
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(3))
-    const groups = screen.getAllByTestId('preview-group')
+    // Exactly one titled list, however many packages contain a nested manifest.
+    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(1))
+    const root = screen.getByTestId('preview-group')
+    expect(root).toHaveTextContent('Directly under the root')
 
-    // Group order: the two groups holding a confident row first, in the server's
-    // own order, then the offered-only group that was delivered ahead of both.
-    expect(groups[0]).toHaveTextContent('Directly under the root')
-    expect(groups[1]).toHaveTextContent('Nested inside services')
-    expect(groups[2]).toHaveTextContent('Nested inside tools')
-
-    // Row order inside the interleaved group: both confident rows first, and
-    // their delivered path order (api before zzz) survives the tier sort.
-    const names = within(groups[1])
+    // Root-level row order: the confident row leads the offered one, and the
+    // server's delivered order survives inside each tier.
+    const names = within(root)
       .getAllByTestId('candidate-row')
       .map((row) => row.querySelector('span')?.textContent)
-    expect(names).toEqual(['api', 'zzz', 'legacy'])
+    expect(names).toEqual(['services', 'tools'])
 
     // Presentation only: the server's own default selection is untouched.
     expect(screen.getByTestId('selected-count')).toHaveTextContent('3 selected')
   })
 
-  it('names what a nested group is nested inside and keeps the path as detail', async () => {
+  it('defers deeper candidates to one collapsed section instead of a titled group each', async () => {
     const user = userEvent.setup()
     queued.push({ status: 200, body: MIXED_SCAN })
     render(<ProjectScaffolderPage />)
     await scan(user)
 
-    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(3))
+    await waitFor(() => expect(screen.getByTestId('nested-suggestions')).toBeInTheDocument())
 
-    // A nested group says what it holds, with the full path as secondary text: a
-    // heading that is only a path reads as if the parent package had been demoted
-    // out of the list it is in fact still ticked in.
-    const headings = screen.getAllByTestId('group-heading')
-    expect(headings).toHaveLength(2)
-    expect(headings[0]).toHaveTextContent('Nested inside services')
-    expect(headings[0]).toHaveTextContent(`${ROOT}/services`)
+    // The two containing packages produce no sections of their own: naming one in
+    // a heading reads as if that package had been demoted out of the root list it
+    // is in fact still ticked in.
+    expect(screen.getAllByTestId('preview-group')).toHaveLength(1)
+    expect(screen.queryByText('Nested inside services')).not.toBeInTheDocument()
+    expect(screen.queryByText('Nested inside tools')).not.toBeInTheDocument()
 
-    // The scan-root group keeps its own wording and gets no nested heading.
-    const root = screen.getAllByTestId('preview-group')[0]
-    expect(root).toHaveTextContent('Directly under the root')
-    expect(within(root).queryByTestId('group-heading')).not.toBeInTheDocument()
+    // One summary for the whole scan, counting what it hides — including the rows
+    // the server pre-ticked, which the create step would otherwise act on unseen.
+    const toggle = screen.getByTestId('nested-toggle')
+    expect(toggle).toHaveTextContent('5 possible sub-folders inside packages above')
+    expect(screen.getByTestId('nested-selected')).toHaveTextContent('2 selected')
+
+    // Collapsed by default: no deferred row, and no control that could tick one.
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByTestId('nested-list')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(`${ROOT}/services/api`)).not.toBeInTheDocument()
+    expect(within(screen.getByTestId('nested-suggestions'))
+      .queryByRole('button', { name: 'Select all' })).not.toBeInTheDocument()
+
+    // Reachable and operable from the keyboard alone, as a native button.
+    toggle.focus()
+    await user.keyboard('{Enter}')
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+
+    // Expanded, each row says which package it was found inside and keeps the
+    // full path as the disambiguating detail. Confident rows lead here too, so
+    // the pre-ticked ones are what the reader meets first.
+    const list = screen.getByTestId('nested-list')
+    expect(within(list).getAllByTestId('candidate-row')).toHaveLength(5)
+    expect(within(list).getAllByTestId('nested-inside')[0]).toHaveTextContent('Inside services')
+    expect(within(list).getByLabelText(`${ROOT}/services/api`)).toBeInTheDocument()
+  })
+
+  it('keeps the root list select-all out of the deferred section', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: MIXED_SCAN })
+    render(<ProjectScaffolderPage />)
+    await scan(user)
+
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
+    const root = screen.getByTestId('preview-group')
+
+    // Root select-all reaches services + tools only; the two deferred rows the
+    // server pre-ticked stay exactly as many as they were.
+    await user.click(within(root).getByRole('button', { name: 'Select all' }))
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('4 selected')
+    expect(screen.getByTestId('nested-selected')).toHaveTextContent('2 selected')
+
+    // Root select-none likewise leaves the deferred selection alone: the total
+    // drops by the two root rows and by nothing else.
+    await user.click(within(root).getByRole('button', { name: 'Select none' }))
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('2 selected')
+    expect(screen.getByTestId('nested-selected')).toHaveTextContent('2 selected')
+  })
+
+  it('posts a ticked deferred path exactly as it posts a root one', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: MIXED_SCAN })
+    queued.push({
+      status: 200,
+      body: {
+        root: ROOT, root_folder_id: 'f0',
+        created: [{ path: `${ROOT}/tools/lint`, folder_id: 'f1', name: 'lint' }],
+        skipped_existing: [], failed: [], warnings: [],
+      },
+    })
+    render(<ProjectScaffolderPage />)
+    await scan(user)
+
+    const list = await expandDeferred(user)
+    const section = screen.getByTestId('nested-suggestions')
+    // Clear both lists, then tick one offered row inside the disclosure, so the
+    // posted set is provably the deferred one.
+    await user.click(within(section).getByRole('button', { name: 'Select none' }))
+    await user.click(within(screen.getByTestId('preview-group')).getByRole('button', { name: 'Select none' }))
+    await user.click(within(list).getByLabelText(`${ROOT}/tools/lint`))
+
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('1 selected')
+    await user.click(screen.getByRole('button', { name: 'Create folders' }))
+
+    await waitFor(() => expect(screen.getByTestId('scaffold-results')).toBeInTheDocument())
+    expect(calls[1].url).toBe('/api/chat/folders/scaffold')
+    expect(calls[1].body).toEqual({ root: ROOT, selected: [`${ROOT}/tools/lint`] })
+  })
+
+  it('omits the deferred section entirely when nothing is nested deeper', async () => {
+    const user = userEvent.setup()
+    queued.push({
+      status: 200,
+      body: { ...SCAN, candidates: [SCAN.candidates[0]], groups: [SCAN.groups[0]], warnings: [] },
+    })
+    render(<ProjectScaffolderPage />)
+    await scan(user)
+
+    await waitFor(() => expect(screen.getByTestId('preview-group')).toBeInTheDocument())
+    expect(screen.queryByTestId('nested-suggestions')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('nested-toggle')).not.toBeInTheDocument()
   })
 })
