@@ -22,8 +22,8 @@ no backend route is added or changed; removal rides the existing guarded PUT's
 
 ## Tasks
 
-- [ ] 1. Shell landing and navigation
-  - [ ] 1.1 First-run nav ordering and the retained-data guard
+- [x] 1. Shell landing and navigation
+  - [x] 1.1 First-run nav ordering and the retained-data guard
     - Derive `firstRun` in `SpecEnginePage.tsx` from the requirement's own definition — a successful config read whose `document.projects` holds ZERO entries (`configured` alone says only that the file exists; a document created by an app-scoped save still configures no project) — guarded by `!config.isError`; one derivation consumed by BOTH the landing rule and the nav order, so the two cannot disagree
     - Render the nav rail from an ordered pane list: Setup, Queue, Configuration while first-run; Queue, Configuration, Setup otherwise; keep the existing `data-alarm` marker on the setup button, off whenever the read is in error
     - Keep the existing landing rule (`chosenPane ?? (pending ? null : firstRun ? 'setup' : 'queue')`) and the pending hold; a failed config read lands on queue with no first-run claim and the failure stated where the config query renders
