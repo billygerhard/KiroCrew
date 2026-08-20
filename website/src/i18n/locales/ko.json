@@ -3861,6 +3861,9 @@
       },
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "답이 없는 것은 아니오가 아니라 미응답입니다. 모든 단계에 명확한 예 또는 아니오가 있을 때까지 적용은 거부됩니다.",
+        "already_configured": "{{project}} 프로젝트는 이미 설정되어 있습니다. 이 문서에 같은 이름의 항목이 있습니다.",
+        "already_configured_reinspection": "계속하면 기존 항목을 다시 검사합니다. 계획을 적용하면 {{project}} 프로젝트의 항목이 새로 추가되지 않고 덮어써집니다.",
+        "already_configured_unknown": "설정된 프로젝트 목록을 읽지 못했으므로 {{project}} 프로젝트에 항목이 이미 있는지 알 수 없습니다. 적용하면 기존 항목을 덮어씁니다.",
         "an_approver_is_required": "적용하기 전에 승인자를 적어 주세요.",
         "applied_by": "{{approver}}의 권한으로 적용했습니다.",
         "apply_the_plan": "계획 적용",
@@ -3874,6 +3877,7 @@
         "browse_failed": "게이트웨이 호스트의 디렉터리를 읽을 수 없습니다. 프로젝트 경로를 직접 입력하세요.",
         "compute_a_plan_first": "먼저 계획을 계산하세요.",
         "computing_the_plan": "계획 계산 중…",
+        "configure_another_project": "다른 프로젝트 설정",
         "cost_profile": "비용 프로필",
         "inspect_the_project": "프로젝트 살펴보기",
         "inspecting": "살펴보는 중…",

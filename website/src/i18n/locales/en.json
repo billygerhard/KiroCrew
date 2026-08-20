@@ -3239,6 +3239,9 @@
       },
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "A missing answer is unanswered, not no. The apply refuses until every rung has an explicit yes or no.",
+        "already_configured": "{{project}} is already configured: this document holds an entry under that name.",
+        "already_configured_reinspection": "Continuing re-inspects the existing entry. Applying a plan rewrites {{project}}'s entry rather than adding a second one.",
+        "already_configured_unknown": "The configured projects could not be read, so whether {{project}} already has an entry is unknown. An apply would rewrite an existing entry.",
         "an_approver_is_required": "Name the approver before applying.",
         "applied_by": "Applied on the authority of {{approver}}.",
         "apply_the_plan": "Apply the plan",
@@ -3252,6 +3255,7 @@
         "browse_failed": "The directories on the gateway host could not be read. Type the project path instead.",
         "compute_a_plan_first": "Compute a plan first.",
         "computing_the_plan": "Computing the plan…",
+        "configure_another_project": "Configure another project",
         "cost_profile": "Cost profile",
         "inspect_the_project": "Inspect the project",
         "inspecting": "Inspecting…",

@@ -3983,6 +3983,9 @@
       },
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "Une réponse absente n'est pas un non, elle est sans réponse. L'application refuse jusqu'à ce que chaque niveau ait un oui ou un non explicite.",
+        "already_configured": "{{project}} est déjà configuré : ce document contient une entrée sous ce nom.",
+        "already_configured_reinspection": "Continuer réexamine l'entrée existante. Appliquer un plan réécrit l'entrée de {{project}} au lieu d'en ajouter une seconde.",
+        "already_configured_unknown": "Les projets configurés n'ont pas pu être lus : on ignore donc si {{project}} possède déjà une entrée. Appliquer réécrirait une entrée existante.",
         "an_approver_is_required": "Nommez l'approbateur avant d'appliquer.",
         "applied_by": "Appliqué sous l'autorité de {{approver}}.",
         "apply_the_plan": "Appliquer le plan",
@@ -3996,6 +3999,7 @@
         "browse_failed": "Les répertoires sur l'hôte de la passerelle n'ont pas pu être lus. Saisissez le chemin du projet à la place.",
         "compute_a_plan_first": "Calculez d'abord un plan.",
         "computing_the_plan": "Calcul du plan…",
+        "configure_another_project": "Configurer un autre projet",
         "cost_profile": "Profil de coût",
         "inspect_the_project": "Inspecter le projet",
         "inspecting": "Inspection…",

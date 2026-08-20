@@ -70,6 +70,24 @@
  * states: an operator looking at a disabled-looking step needs the blocker named,
  * not a greyed row to interpret.
  *
+ * ## Running it again, for the next project
+ *
+ * Nothing about the flow is first-run-only. The same four steps configure the
+ * second project and the tenth, and the apply's named-approver gate is the same
+ * gate — there is no "already trusted" path that skips it. Only the pane's WORDS
+ * change with `firstRun`: the heading, and the orientation.
+ *
+ * Two things make repeating it safe. The apply invalidates the configuration read,
+ * so the projects table and the first-run derivation follow the write instead of
+ * waiting for a reload. And when the inspection names a project that already has
+ * an entry, the pane says so: the entry key is the name the ENGINE derived, so
+ * continuing re-inspects that entry and applying rewrites it. The comparison is
+ * name-to-key against the keys handed down from the page's read; this pane derives
+ * no name from a path, because the engine owns that derivation and a second one
+ * here could disagree with the key an apply actually writes. When that read is in
+ * doubt the answer is UNKNOWN and says so — treating doubt as "no entry" is what
+ * would let an apply overwrite a project the operator was never told about.
+ *
  * ## Layout rules this file must not break
  *
  * No drawer, no modal, no scrim — see `styles.ts`. The evidence excerpts are
@@ -330,9 +348,22 @@ function InferenceRow({
  * The panel. One flow, four steps, and no state that outlives the project it is for.
  *
  * `firstRun` is the page's single derivation, not a second reading of the
- * configuration: it decides only what this pane SAYS, never what it can do.
+ * configuration: it decides only what this pane SAYS, never what it can do. The
+ * pane is fully usable in both states — adding the second project is the same
+ * four steps as the first, and the apply's own gate is the same gate.
+ *
+ * `configuredProjects` is the same read's project keys, with `null` for "not
+ * known" (the read failed, or has not landed). Handed down for the same reason:
+ * a second read here could name a different set than the projects table one pane
+ * over.
  */
-export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
+export function SetupFlowPanel({
+  firstRun,
+  configuredProjects,
+}: {
+  firstRun: boolean
+  configuredProjects: readonly string[] | null
+}) {
   const client = useQueryClient()
   const [project, setProject] = useState('')
   const [approver, setApprover] = useState('')
@@ -447,8 +478,11 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
       }),
     onSuccess: (result) => {
       setApplied(result)
-      // The page's first-run detection and the config pane both read these, and the
-      // apply is exactly the moment "nothing is configured" stops being true.
+      // The page's first-run detection, the projects table and the resolved views
+      // all read these, and the apply is exactly the moment "nothing is
+      // configured" stops being true — and the moment a new row exists. Without
+      // the invalidation the operator would have to reload to see the project
+      // they just configured.
       void client.invalidateQueries({ queryKey: QK.config })
       void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
     },
@@ -466,6 +500,26 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   // tracked: a counter and the real state disagree the first time a call fails.
   const step = !inspection ? 0 : plan === null ? 1 : applied ? 4 : 3
   const canApply = plan !== null && approver.trim() !== '' && !apply.isPending
+
+  /**
+   * The name the ENGINE derived for the inspected project — never a name this
+   * pane derived from the path. The engine owns that derivation and the name it
+   * returns is the exact key an apply writes the entry under, so comparing it to
+   * the document's keys can neither miss a match on path spelling nor invent a
+   * normalization of its own.
+   */
+  const inspectedName = inspection?.project.name ?? ''
+
+  /**
+   * Whether that name already has an entry — and the third state, which is the
+   * one worth spelling out: with the configuration unread, whether this project
+   * is already configured is UNKNOWN, not "no". Presenting doubt as "new
+   * project" is the failure mode here, because the apply that follows would
+   * overwrite an entry the operator was never told about.
+   */
+  const alreadyConfigured =
+    inspectedName !== '' && configuredProjects !== null && configuredProjects.includes(inspectedName)
+  const duplicateUnknown = inspectedName !== '' && configuredProjects === null
 
   // Whether a step is genuinely unreachable, from the SAME state that gates its
   // own controls — never from rail position. `index > step` claimed the review
@@ -528,7 +582,16 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
       </aside>
 
       <section className="se-setup-body">
-        <h1>{i18nT('apps.specEngine.specEnginePage.nothing_is_configured_yet')}</h1>
+        {/* Two states, two honest headings. "Nothing is configured yet" is a claim
+            about the whole engine, and it is false the moment one project exists —
+            an operator adding their second project would be told the first one is
+            not there. The heading rides the page's `firstRun`, so it cannot
+            disagree with the rail or the orientation below it. */}
+        <h1>
+          {firstRun
+            ? i18nT('apps.specEngine.specEnginePage.nothing_is_configured_yet')
+            : i18nT('apps.specEngine.setupFlowPanel.configure_another_project')}
+        </h1>
         <p className="se-setup-lead">{i18nT('apps.specEngine.specEnginePage.setup_lead')}</p>
 
         {/* Orientation: the three facts a first-time reader needs before a path
@@ -626,6 +689,34 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
             </button>
           </div>
           {inspect.isError && <Refused error={inspect.error} />}
+          {/* The inspected project already has an entry. Not an error and not a
+              block: the entry key IS the name the engine derived, so continuing
+              re-inspects that entry and an apply rewrites it — it cannot produce a
+              second entry for the same project. Said out loud, because a silent
+              merge-overwrite is the one outcome an operator cannot see coming. */}
+          {alreadyConfigured && (
+            <p className="se-note" data-already-configured="true" role="status">
+              {i18nT('apps.specEngine.setupFlowPanel.already_configured', {
+                project: inspectedName,
+              })}
+              <span className="se-note">
+                {i18nT('apps.specEngine.setupFlowPanel.already_configured_reinspection', {
+                  project: inspectedName,
+                })}
+              </span>
+            </p>
+          )}
+          {/* The configuration could not be read, so whether this project has an
+              entry is unknown. Stated rather than collapsed into "no entry": the
+              apply would overwrite an entry nobody was told about, and retained
+              data from an earlier read is not a current answer. */}
+          {duplicateUnknown && (
+            <p className="se-note" data-already-configured="unknown" role="status">
+              {i18nT('apps.specEngine.setupFlowPanel.already_configured_unknown', {
+                project: inspectedName,
+              })}
+            </p>
+          )}
           {inspection && !inspection.memory_consulted && (
             <p className="se-note">
               {i18nT('apps.specEngine.setupFlowPanel.memory_was_not_consulted')}

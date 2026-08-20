@@ -310,6 +310,26 @@ export default function SpecEnginePage() {
   }, [])
 
   /**
+   * The configured projects' names, or `null` for "not known".
+   *
+   * `null` is the doubt state, and both arms of doubt collapse into it: a read in
+   * error, or no read landed yet. React Query RETAINS the last data across a
+   * failed refetch, so a projectless snapshot followed by a failed read would go
+   * on asserting things nothing currently confirms — the same defect class the
+   * kill-switch dot closed one component over. A `[]` says a read succeeded and
+   * named no project, which is a fact; `null` says nothing is known.
+   *
+   * Every consumer of the configuration's project set reads THIS: first run
+   * below, and the assistant's already-configured check, which is handed the
+   * list rather than reading the document again.
+   */
+  const projectNames = useMemo<readonly string[] | null>(() => {
+    if (config.isError || config.data === undefined) return null
+    const node = config.data.document.projects
+    return node !== null && typeof node === 'object' ? Object.keys(node) : []
+  }, [config.data, config.isError])
+
+  /**
    * First run: the configuration read succeeded and holds no project entry.
    *
    * Project entries, not the `configured` flag: `configured` says only that the
@@ -319,13 +339,10 @@ export default function SpecEnginePage() {
    * An absent file trivially holds no project entry, so both arms of the
    * definition are one rule.
    *
-   * The `isError` half is not redundant: React Query RETAINS the last data
-   * across a failed refetch, so a projectless snapshot followed by a failed
-   * read would go on asserting first run from a reading nothing currently
-   * confirms — the same defect class the kill-switch dot closed one component
-   * over. Doubt is not absence. A read that FAILED is not first run — a
-   * document that cannot be parsed is a repair, and the assistant would refuse
-   * to write over it.
+   * Doubt is not absence: a read that FAILED is not first run — a document that
+   * cannot be parsed is a repair, and the assistant would refuse to write over
+   * it. That guard is carried by `projectNames`' `null`, so the two readings
+   * cannot drift apart.
    *
    * This is the single derivation. The landing rule below and the rail's order
    * both read THIS value, so the two cannot disagree about whether the engine is
@@ -333,10 +350,7 @@ export default function SpecEnginePage() {
    * alarm marker as well, which asserts "unconfigured" and must fall silent on a
    * read nobody could complete.
    */
-  const projects = config.data?.document.projects
-  const projectCount =
-    projects !== null && typeof projects === 'object' ? Object.keys(projects).length : 0
-  const firstRun = !config.isError && config.data !== undefined && projectCount === 0
+  const firstRun = projectNames !== null && projectNames.length === 0
 
   const pane: Pane | null =
     chosenPane ?? (config.isPending ? null : firstRun ? 'setup' : 'queue')
@@ -462,7 +476,12 @@ export default function SpecEnginePage() {
         </div>
       ) : pane === 'setup' ? (
         <div className="se-setup">
-          <SetupFlowPanel firstRun={firstRun} />
+          {/* The assistant is handed both readings of the configuration it needs —
+              whether anything is configured, and WHICH projects are — so it never
+              opens a second config read that could disagree with the rail beside
+              it. `null` travels as null: the pane says "not known" rather than
+              "not configured". */}
+          <SetupFlowPanel firstRun={firstRun} configuredProjects={projectNames} />
         </div>
       ) : pane === 'config' ? (
         <div className="se-work">

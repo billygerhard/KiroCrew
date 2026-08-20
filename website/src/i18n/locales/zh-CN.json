@@ -3861,6 +3861,9 @@
       },
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "缺失的答案是未回答，而不是否。只要有任一层级未回答，应用就会被拒绝。",
+        "already_configured": "{{project}} 已配置：该文档中存在同名条目。",
+        "already_configured_reinspection": "继续将重新检查现有条目。应用方案会改写 {{project}} 的条目，而不是新增第二个条目。",
+        "already_configured_unknown": "无法读取已配置的项目，因此 {{project}} 是否已有条目未知。应用会改写已有条目。",
         "an_approver_is_required": "应用前请写明批准人。",
         "applied_by": "已依据 {{approver}} 的授权应用。",
         "apply_the_plan": "应用该计划",
@@ -3874,6 +3877,7 @@
         "browse_failed": "无法读取网关主机上的目录。请改为直接输入项目路径。",
         "compute_a_plan_first": "请先计算计划。",
         "computing_the_plan": "正在计算计划…",
+        "configure_another_project": "配置另一个项目",
         "cost_profile": "成本档案",
         "inspect_the_project": "检视该项目",
         "inspecting": "正在检视…",

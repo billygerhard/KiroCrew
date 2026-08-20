@@ -26,6 +26,13 @@
  *   - **The project path is browsable.** The shared picker fills the field with an
  *     absolute path, typing stays live, and a directory read that FAILED says so
  *     instead of looking like a host with no directories on it.
+ *   - **The flow repeats for the next project.** The pane is fully usable once
+ *     something is configured, heads itself honestly there, and puts the additional
+ *     project behind the same named-approver gate. An apply makes the new entry
+ *     visible in the projects table without a reload, and an inspection that names
+ *     an already-configured project says so and frames continuing as re-inspection
+ *     of that entry — with the read in doubt, that question is UNKNOWN rather than
+ *     answered "no".
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -39,13 +46,14 @@ const T = en.apps.specEngine.setupFlowPanel
 const P = en.apps.specEngine.specEnginePage
 const KS = en.apps.specEngine.safetyPanel
 const PICKER = en.components.projectPicker
+const C = en.apps.specEngine.configPanel
 
-/** A configuration read that carries one project entry — the not-first-run state. */
-const CONFIGURED: Answer = {
+/** The document store as it answers before anything is configured. */
+const UNCONFIGURED: Answer = {
   body: {
-    configured: true,
+    configured: false,
     path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
-    document: { projects: { acme: { cost_profile: 'budget' } } },
+    document: {},
     elided: [],
     elided_marker: '<elided>',
     errors: [],
@@ -54,9 +62,34 @@ const CONFIGURED: Answer = {
   },
 }
 
+/** A configuration read that carries one project entry — the not-first-run state. */
+const CONFIGURED: Answer = {
+  body: {
+    ...(UNCONFIGURED.body as Record<string, unknown>),
+    configured: true,
+    document: { projects: { acme: { cost_profile: 'budget' } } },
+  },
+}
+
+/**
+ * A configuration read carrying a project the inspection will NOT name, so the
+ * pane is in the repeat state with no duplicate: adding a second project.
+ */
+const OTHER_PROJECT: Answer = {
+  body: {
+    ...(CONFIGURED.body as Record<string, unknown>),
+    document: { projects: { widgets: { cost_profile: 'budget' } } },
+  },
+}
+
 /** A catalog sentence with its one variable filled in, as the panel renders it. */
 function filled(sentence: string, step: string): string {
   return sentence.replace('{{step}}', step)
+}
+
+/** The same, for the sentences whose one variable is the project's name. */
+function forProject(sentence: string, project: string): string {
+  return sentence.split('{{project}}').join(project)
 }
 
 type Answer = { status?: number; body: unknown }
@@ -161,7 +194,13 @@ function applied(over: Record<string, unknown> = {}) {
   }
 }
 
-function stub(answers: { inspect?: Answer; plan?: Answer; apply?: Answer; config?: Answer }) {
+function stub(answers: {
+  inspect?: Answer
+  plan?: Answer
+  apply?: Answer
+  /** A function is answered per request, so a read can change after a write. */
+  config?: Answer | (() => Answer)
+}) {
   vi.stubGlobal(
     'fetch',
     vi.fn((url: string, init?: RequestInit) => {
@@ -178,19 +217,8 @@ function stub(answers: { inspect?: Answer; plan?: Answer; apply?: Answer; config
         // Unconfigured, which is what routes the page to the assistant. A caller
         // that cares about the CONFIGURED state passes its own answer: first run is
         // "no project entry", so a document carrying one is the other state.
-        answer =
-          answers.config ?? {
-            body: {
-              configured: false,
-              path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
-              document: {},
-              elided: [],
-              elided_marker: '<elided>',
-              errors: [],
-              advisories: [],
-              config_only_paths: [],
-            },
-          }
+        const given = typeof answers.config === 'function' ? answers.config() : answers.config
+        answer = given ?? UNCONFIGURED
       } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
         answer = {
           body: {
@@ -659,5 +687,145 @@ describe('the project path', () => {
     expect(
       await screen.findByRole('button', { name: KS.confirm_the_stop }),
     ).toBeInTheDocument()
+  })
+})
+
+describe('running it again for another project', () => {
+  /**
+   * Reach the assistant the way a returning operator does — from the rail, since a
+   * configured engine lands on the queue — and inspect a project.
+   */
+  async function inspectFromRail(path = '/src/acme') {
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: P.setup_assistant }))
+    const field = await screen.findByLabelText(T.project_path)
+    fireEvent.change(field, { target: { value: path } })
+    fireEvent.click(screen.getByRole('button', { name: T.inspect_the_project }))
+    return screen.findByRole('button', { name: T.show_the_exact_patch })
+  }
+
+  it('heads the pane honestly once something is configured', async () => {
+    stub({ config: OTHER_PROJECT })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: P.setup_assistant }))
+    // "Nothing is configured yet" is a claim about the engine, and it is false the
+    // moment one project exists — an operator adding their second project must not
+    // be told the first one is absent.
+    expect(await screen.findByText(T.configure_another_project)).toBeInTheDocument()
+    expect(screen.queryByText(P.nothing_is_configured_yet)).not.toBeInTheDocument()
+  })
+
+  it('runs the whole flow for an additional project behind the same approver gate', async () => {
+    stub({ config: OTHER_PROJECT })
+    const plan = await inspectFromRail()
+    answerEverything()
+    fireEvent.click(plan)
+    await screen.findByText(new RegExp(T.recomputed_on_apply))
+    // Identical gate, not a relaxed one: no "already trusted" path exists for the
+    // second project, so the apply is refused on screen until a name is typed.
+    expect(screen.getByRole('button', { name: T.apply_the_plan })).toBeDisabled()
+    expect(screen.getByText(T.an_approver_is_required)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText(T.approver_identity), {
+      target: { value: 'colleague@example' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: T.apply_the_plan }))
+    await waitFor(() => expect(calls.some((call) => call.url.endsWith('/setup/apply'))).toBe(true))
+    expect(lastBody('/setup/apply').approver).toBe('colleague@example')
+  })
+
+  it('reviews a patch scoped to the new project and sends no document of its own', async () => {
+    stub({
+      config: OTHER_PROJECT,
+      plan: {
+        body: envelope({
+          config_patch: { projects: { acme: { cost_profile: 'budget' } } },
+          written_paths: ['projects.acme.cost_profile'],
+        }),
+      },
+    })
+    const plan = await inspectFromRail()
+    answerEverything()
+    fireEvent.click(plan)
+    // The patch on screen is the engine's, rendered verbatim: it touches the new
+    // project's entry and names no other, so `widgets` survives the merge because
+    // nothing in the write addresses it.
+    const patch = await screen.findByText(/"projects"/)
+    expect(patch).toHaveTextContent('acme')
+    expect(patch).not.toHaveTextContent('widgets')
+    expect(screen.getByText(/projects\.acme\.cost_profile/)).toBeInTheDocument()
+    // And the panel cannot widen that write: what it sends is the project subject
+    // and the answers, never a document or a patch of its own construction.
+    expect(Object.keys(lastBody('/setup/plan')).sort()).toEqual(['answers', 'project'])
+    fireEvent.change(screen.getByLabelText(T.approver_identity), { target: { value: 'x' } })
+    fireEvent.click(screen.getByRole('button', { name: T.apply_the_plan }))
+    await waitFor(() => expect(calls.some((call) => call.url.endsWith('/setup/apply'))).toBe(true))
+    expect(Object.keys(lastBody('/setup/apply')).sort()).toEqual([
+      'answers',
+      'approver',
+      'plan_id',
+      'project',
+    ])
+  })
+
+  it('shows the applied project in the projects list without a reload', async () => {
+    // The store answers the new entry once the apply has gone through, which is
+    // what the invalidation has to pick up: no reload happens in this test.
+    stub({
+      config: () =>
+        calls.some((call) => call.url.endsWith('/setup/apply')) ? CONFIGURED : UNCONFIGURED,
+    })
+    const plan = await inspectProject()
+    answerEverything()
+    fireEvent.click(plan)
+    await screen.findByText(new RegExp(T.recomputed_on_apply))
+    fireEvent.change(screen.getByLabelText(T.approver_identity), { target: { value: 'x' } })
+    const readsBefore = calls.filter((call) => call.url.startsWith('/api/apps/spec-engine/config'))
+    fireEvent.click(screen.getByRole('button', { name: T.apply_the_plan }))
+    await screen.findByText(new RegExp(T.wrote))
+    // The apply invalidates the configuration read, so a fresh one goes out.
+    await waitFor(() =>
+      expect(
+        calls.filter((call) => call.url.startsWith('/api/apps/spec-engine/config')).length,
+      ).toBeGreaterThan(readsBefore.length),
+    )
+    // And the projects table one pane over lists the entry that write created.
+    fireEvent.click(screen.getByRole('button', { name: P.configuration }))
+    const grid = await screen.findByRole('grid', { name: C.configured_projects })
+    await waitFor(() => expect(grid).toHaveTextContent('acme'))
+  })
+
+  it('states that an inspected project is already configured, and frames continuing as re-inspection', async () => {
+    // `acme` is the name the ENGINE derived in the inspect reply and the key its
+    // entry is stored under. The pane compares those two and says so; it derives no
+    // name from the path itself.
+    stub({ config: CONFIGURED })
+    await inspectFromRail()
+    expect(await screen.findByText(forProject(T.already_configured, 'acme'))).toBeInTheDocument()
+    expect(
+      screen.getByText(forProject(T.already_configured_reinspection, 'acme')),
+    ).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('{{project}}')
+    // Not an error and not a block: the flow continues onto the existing entry.
+    expect(screen.getByRole('button', { name: T.show_the_exact_patch })).toBeEnabled()
+  })
+
+  it('says nothing about duplication for a project that has no entry', async () => {
+    stub({ config: OTHER_PROJECT })
+    await inspectFromRail()
+    expect(screen.queryByText(forProject(T.already_configured, 'acme'))).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(forProject(T.already_configured_unknown, 'acme')),
+    ).not.toBeInTheDocument()
+  })
+
+  it('calls the duplicate question unknown when the configuration could not be read', async () => {
+    // The failure mode this closes: an unreadable configuration read as "no entry",
+    // which would present an overwrite as a new project. Doubt is not absence.
+    stub({ config: { status: 500, body: { code: 'config_unreadable', error: 'broken' } } })
+    await inspectFromRail()
+    expect(
+      await screen.findByText(forProject(T.already_configured_unknown, 'acme')),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(forProject(T.already_configured, 'acme'))).not.toBeInTheDocument()
   })
 })
