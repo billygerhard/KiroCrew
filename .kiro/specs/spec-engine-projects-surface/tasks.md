@@ -30,13 +30,13 @@ no backend route is added or changed; removal rides the existing guarded PUT's
     - Shell tests: nav order in both states, landing in both states, retained `configured===false` data under a failed refetch claims neither first-run landing nor alarm; mutation probes on the guard and the order derivation
     - _Requirements: 1.1, 1.2, 1.5, 1.8_
 
-- [ ] 2. Setup pane
+- [x] 2. Setup pane
   - [x] 2.1 Orientation block and project picker
     - Orientation block at the top of `SetupFlowPanel.tsx` while first-run: what the Spec_Engine does, what completing setup produces, inspect named as the first action; one operator-verb description per setup step alongside the existing guard-rail copy; collapses once a project exists; unreachable steps state which prior step must complete, interpolated (no trailing-connector strings)
     - Browse button anchoring the shared `ProjectPicker` (`website/src/components/ProjectPicker.tsx`, same props as `FolderConfigModal`'s usage — import it, never modify it); selection fills the path field with the absolute path; manual entry stays live; a failed directory browse states itself and leaves manual entry usable; the picker popover must not cover the kill-switch strip
     - All new strings through `en.json` and every supported catalog plus pseudo; setup tests for orientation presence/absence, step descriptions, picker fill, and browse failure
     - _Requirements: 1.3, 1.4, 1.6, 1.7, 2.1, 2.2, 2.3, 2.4, 2.5_
-  - [ ] 2.2 Repeatable setup and duplicate detection
+  - [x] 2.2 Repeatable setup and duplicate detection
     - Setup pane fully usable when projects already exist (not first-run-only); apply success invalidates the config query so the projects table and first-run derivation update without a reload
     - The pane's `<h1>` currently renders "Nothing is configured yet" unconditionally (carried from 2.1's round-3 review): give the configured state its own honest heading — the panel already receives `firstRun` — with the new string in every catalog
     - Compare the inspect reply's derived project name against `document.projects` keys from the already-loaded config query; on a match, state the project is already configured and frame continuing as re-inspection of the existing entry — the UI derives no names from paths itself
