@@ -70,3 +70,13 @@ no backend route is added or changed; removal rides the existing guarded PUT's
 
 Waves are serial: every task edits the shared localization catalogs, and 2.2's
 list-refresh behavior is only testable once 3.1's projects table exists.
+
+### Findings carried forward by the review gate
+
+- **For 4.1 (from 1.1's round-2 review):** `check-i18n-keys.mjs --report` lists
+  `SpecEnginePage.tsx` at the pre-existing FILTERS destructure
+  (`i18nT(labelKey)` in the filter row render) — present before this spec's
+  work, report-only, and out of 1.1's scope. Disposition it: convert to a flat
+  call-site-indexed map like `PANE_LABEL_KEY`, or record as accepted. Also
+  note: 1.1's round-2 report wrongly claimed the file left the report entirely;
+  the pane-label site is resolved, the FILTERS site remains.

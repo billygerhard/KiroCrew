@@ -49,10 +49,12 @@ config read (GET /config)
   ├─ error    → firstRun forced FALSE (guard), landing 'queue',
   │             read failure stated — doubt never reads as "not configured"
   └─ ok
-      ├─ configured === false → firstRun
+      ├─ document.projects holds NO entry → firstRun
+      │     (an absent file trivially holds none — `configured` is only "the
+      │      file exists" and is read by nothing here)
       │     landing pane: setup   nav order: Setup, Queue, Configuration
       │     setup pane leads with the orientation block
-      └─ configured === true
+      └─ document.projects holds at least one entry
             landing pane: queue   nav order: Queue, Configuration, Setup
 ```
 
@@ -89,12 +91,12 @@ must not cover the strip.
   kill-switch dot fix closed; the guard is applied at the single derivation
   both the landing rule and the nav order consume, so the two cannot disagree.
 - **Failure statement**: when the config read is in error and no pane was
-  chosen, the shell already lands on queue; the config-read failure is stated
-  on the setup pane itself (which reads the same query) and the setup nav
-  button keeps its alarm off (an alarm asserts "unconfigured", which is not
-  known). No new banner is introduced on the queue pane — the strip and panes
-  already own their own failure statements, and a second global banner would
-  duplicate them.
+  chosen, the shell lands on queue; the config-read failure is stated on the
+  Configuration pane (through `ConfigPane`'s error prop — the surface where
+  the config query renders) and the setup nav button keeps its alarm off (an
+  alarm asserts "unconfigured", which is not known). No new banner is
+  introduced on the queue pane — the strip and panes already own their own
+  failure statements, and a second global banner would duplicate them.
 
 ### SetupFlowPanel.tsx (orientation, picker, re-entry)
 
