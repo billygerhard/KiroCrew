@@ -111,7 +111,7 @@ function stub(answers: { queue?: Answer; post?: Record<string, Answer> }) {
         const path = url.replace('/api/apps/spec-engine/queue/', '')
         answer = answers.post?.[path] ?? { body: { ok: true } }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = { body: { configured: true, document: {}, elided: [] } }
+        answer = { body: { configured: true, document: { projects: { acme: {} } }, elided: [] } }
       } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
         answer = {
           body: {

@@ -234,9 +234,12 @@ export interface ConfigAdvisory {
 /**
  * The persisted configuration as an operator may see it, from `_config_snapshot`.
  *
- * `configured` is the field first-run detection reads, and it is deliberately not
- * derivable from `document`: an absent file and an empty one both serialize to
- * `{}`, and only one of them means "offer the setup assistant".
+ * `configured` states only that the document FILE exists. First-run detection
+ * deliberately does NOT read it: a file can exist while configuring no project,
+ * and the surface's first-run question is "is there a project entry", answered
+ * from `document.projects`. The flag stays in the payload because "no file" and
+ * "a file with nothing in it" are different facts about the store even when the
+ * surface treats both as unconfigured.
  */
 export interface ConfigSnapshot {
   configured: boolean

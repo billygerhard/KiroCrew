@@ -81,7 +81,14 @@ function stubReads(answers: {
 }) {
   const config = Array.isArray(answers.config)
     ? [...answers.config]
-    : [answers.config ?? { body: { configured: true, document: {}, elided: [] } }]
+    : [
+        answers.config ?? {
+          // The configured default carries a project ENTRY, not just a file:
+          // first-run is "no project entry", so a bare `document: {}` here would
+          // put every unrelated test on the first-run rail.
+          body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
+        },
+      ]
   const pick = (url: string): Answer => {
     if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
       // The resolved read shares the document read's answer (this suite is not
@@ -274,13 +281,26 @@ describe('the pane rail', () => {
     expect(setupNav(container)).not.toHaveAttribute('data-alarm')
   })
 
+  it('treats a document with no project entry as first run, not as configured', async () => {
+    // `configured` says only that the FILE exists — one app-scoped save from the
+    // configuration pane creates it without configuring any project. An engine
+    // in that state still has nothing to run against, so the assistant still
+    // leads and still carries its alarm. This is the arm of the first-run
+    // definition that file-existence alone cannot see.
+    stubReads({ config: { body: { configured: true, document: { limits: {} }, elided: [] } } })
+    const { container } = renderPage()
+    await screen.findByText(T.nothing_is_configured_yet)
+    expect(railPanes(container)).toEqual(['setup', 'queue', 'config'])
+    expect(setupNav(container)).toHaveAttribute('data-alarm', 'true')
+  })
+
   it('derives its order from the first-run reading, stranding no pane in either', () => {
     expect(__testing.paneOrder(true)).toEqual(['setup', 'queue', 'config'])
     expect(__testing.paneOrder(false)).toEqual(['queue', 'config', 'setup'])
     // The order decides which pane is loudest, never which are reachable. An
     // order that dropped one would strand its content with no way in, and the
     // rendered assertions above would still pass on the two panes that remained.
-    const panes = Object.keys(__testing.PANE_NAV).sort()
+    const panes = Object.keys(__testing.PANE_LABEL_KEY).sort()
     expect([...__testing.paneOrder(true)].sort()).toEqual(panes)
     expect([...__testing.paneOrder(false)].sort()).toEqual(panes)
   })

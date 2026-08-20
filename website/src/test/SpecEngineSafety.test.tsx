@@ -140,7 +140,9 @@ function stub(answers: {
         const runId = new URL(url, 'http://x').searchParams.get('run_id') ?? ''
         answer = answers.runSpend?.[runId] ?? { body: spend({ run_id: runId }) }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = answers.config ?? { body: { configured: true, document: {}, elided: [] } }
+        answer = answers.config ?? {
+          body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
+        }
       } else {
         answer = answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
       }

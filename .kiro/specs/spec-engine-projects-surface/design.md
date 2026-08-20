@@ -12,11 +12,15 @@ changes shape.
 
 Grounding facts this design is built on (verified in source):
 
-1. `SpecEnginePage.tsx` already computes `firstRun = config.data?.configured
-   === false` and lands on `'setup'` during first-run (`chosenPane ??
-   (config.isPending ? null : firstRun ? 'setup' : 'queue')`). The nav rail,
-   however, always lists Queue, Configuration, Setup in that order, and the
-   setup pane opens on the bare path field with guard-rail copy only.
+1. `SpecEnginePage.tsx` already computes a first-run flag and lands on
+   `'setup'` during first-run (`chosenPane ?? (config.isPending ? null :
+   firstRun ? 'setup' : 'queue')`). The backend's `configured` field is set
+   from `store.path.is_file()` alone, so it cannot express the requirement's
+   definition (a file created by one app-scoped save still configures no
+   project) — first-run derives from `document.projects` being empty, which
+   covers the absent-file arm trivially. The nav rail, however, always lists
+   Queue, Configuration, Setup in that order, and the setup pane opens on the
+   bare path field with guard-rail copy only.
 2. `ConfigStore._merge` deletes a key when a patch value is `null`
    ("A ``None`` value removes its key"), so removing a `projects.<name>` entry
    is an ordinary guarded `PUT /config` with `{"projects": {"<name>": null}}`
@@ -77,13 +81,13 @@ must not cover the strip.
   derived from `firstRun` — `['setup', 'queue', 'config']` while first-run,
   `['queue', 'config', 'setup']` otherwise — instead of a hardcoded order.
   The existing `data-alarm` marker on the setup button is kept.
-- **Retained-data guard**: `firstRun` becomes `!config.isError &&
-  config.data?.configured === false`. React Query retains the last data across
-  a failed refetch, so without the guard a configured===false snapshot plus a
-  later failed read would keep claiming first-run. This is the same defect
-  class the kill-switch dot fix closed; the guard is applied at the single
-  derivation both the landing rule and the nav order consume, so the two
-  cannot disagree.
+- **Retained-data guard and the widened derivation**: `firstRun` is a
+  successful read (`!config.isError`, data present) whose `document.projects`
+  holds zero entries. React Query retains the last data across a failed
+  refetch, so without the guard a projectless snapshot plus a later failed
+  read would keep claiming first-run. This is the same defect class the
+  kill-switch dot fix closed; the guard is applied at the single derivation
+  both the landing rule and the nav order consume, so the two cannot disagree.
 - **Failure statement**: when the config read is in error and no pane was
   chosen, the shell already lands on queue; the config-read failure is stated
   on the setup pane itself (which reads the same query) and the setup nav

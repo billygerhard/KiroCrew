@@ -106,18 +106,26 @@ import { SetupFlowPanel } from './SetupFlowPanel'
 type Pane = 'queue' | 'config' | 'setup'
 
 /**
- * What the rail renders for a pane: its glyph and its label key.
- *
- * A table rather than three literal buttons, because the ORDER of the rail is a
- * first-run decision (below) and a hand-written sequence of buttons cannot be
- * reordered without duplicating each one. Holds the label KEY, not the resolved
- * string, for the same reason `WHY_KEY` does: a module-level `i18nT()` would run
- * once at import and freeze the rail in whatever language was active then.
+ * The rail's label key per pane, indexed at the call site so the key-reference
+ * gate can resolve every key this map can produce. A flat `Record<Pane, string>`
+ * rather than a field on `PANE_ICON`, because the checker resolves a non-literal
+ * index into a module-level string map by unioning its values — a destructured
+ * field off a nested map is invisible to it, which would exempt these three keys
+ * from every key check. Holds the KEY, not the resolved string, for the same
+ * reason `WHY_KEY` does: a module-level `i18nT()` would run once at import and
+ * freeze the rail in whatever language was active then.
  */
-const PANE_NAV: Record<Pane, { labelKey: string; Icon: LucideIcon }> = {
-  queue: { labelKey: 'apps.specEngine.specEnginePage.queue', Icon: ListOrdered },
-  config: { labelKey: 'apps.specEngine.specEnginePage.configuration', Icon: Cog },
-  setup: { labelKey: 'apps.specEngine.specEnginePage.setup_assistant', Icon: Wand2 },
+const PANE_LABEL_KEY: Record<Pane, string> = {
+  queue: 'apps.specEngine.specEnginePage.queue',
+  config: 'apps.specEngine.specEnginePage.configuration',
+  setup: 'apps.specEngine.specEnginePage.setup_assistant',
+}
+
+/** The rail's glyph per pane. A table, so the ordered rail render stays one loop. */
+const PANE_ICON: Record<Pane, LucideIcon> = {
+  queue: ListOrdered,
+  config: Cog,
+  setup: Wand2,
 }
 
 /**
@@ -300,19 +308,22 @@ export default function SpecEnginePage() {
   }, [])
 
   /**
-   * First run: the configuration read says no document exists.
+   * First run: the configuration read succeeded and holds no project entry.
    *
-   * `configured` rather than an empty `document`, because an absent file and an
-   * empty one both serialize to `{}` and only the first means "offer the
-   * assistant". A config read that FAILED is not first run either — a document
-   * that cannot be parsed is a repair, and the assistant would refuse to write
-   * over it.
+   * Project entries, not the `configured` flag: `configured` says only that the
+   * FILE exists, and a document can exist while configuring no project — one
+   * app-scoped save from the configuration pane creates the file. An engine in
+   * that state still has nothing to run against, so the assistant still leads.
+   * An absent file trivially holds no project entry, so both arms of the
+   * definition are one rule.
    *
-   * The `isError` half is not redundant with that: React Query RETAINS the last
-   * data across a failed refetch, so a `configured === false` snapshot followed
-   * by a failed read would go on asserting first run from a reading nothing
-   * currently confirms — the same defect class the kill-switch dot closed one
-   * component over. Doubt is not absence.
+   * The `isError` half is not redundant: React Query RETAINS the last data
+   * across a failed refetch, so a projectless snapshot followed by a failed
+   * read would go on asserting first run from a reading nothing currently
+   * confirms — the same defect class the kill-switch dot closed one component
+   * over. Doubt is not absence. A read that FAILED is not first run — a
+   * document that cannot be parsed is a repair, and the assistant would refuse
+   * to write over it.
    *
    * This is the single derivation. The landing rule below and the rail's order
    * both read THIS value, so the two cannot disagree about whether the engine is
@@ -320,7 +331,10 @@ export default function SpecEnginePage() {
    * alarm marker as well, which asserts "unconfigured" and must fall silent on a
    * read nobody could complete.
    */
-  const firstRun = !config.isError && config.data?.configured === false
+  const projects = config.data?.document.projects
+  const projectCount =
+    projects !== null && typeof projects === 'object' ? Object.keys(projects).length : 0
+  const firstRun = !config.isError && config.data !== undefined && projectCount === 0
 
   const pane: Pane | null =
     chosenPane ?? (config.isPending ? null : firstRun ? 'setup' : 'queue')
@@ -398,7 +412,7 @@ export default function SpecEnginePage() {
             from: a label-text ordering assertion would break on translation and
             says nothing about which pane a button reaches. */}
         {paneOrder(firstRun).map((id) => {
-          const { labelKey, Icon } = PANE_NAV[id]
+          const Icon = PANE_ICON[id]
           return (
             <button
               key={id}
@@ -415,7 +429,7 @@ export default function SpecEnginePage() {
               onClick={() => setChosenPane(id)}
             >
               <Icon className="lucide-inline" aria-hidden="true" />
-              {i18nT(labelKey)}
+              {i18nT(PANE_LABEL_KEY[id])}
               {id === 'queue' && <span className="se-badge">{fmtNumber(entries.length)}</span>}
               {id === 'setup' && firstRun && (
                 <span className="se-badge">
@@ -684,5 +698,5 @@ export const __testing = {
   WHY_EXHAUSTED_KEY,
   WAIT_LABEL_KEY,
   paneOrder,
-  PANE_NAV,
+  PANE_LABEL_KEY,
 }
