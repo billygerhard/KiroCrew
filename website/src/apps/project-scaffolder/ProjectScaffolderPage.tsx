@@ -17,13 +17,21 @@
  *    selection it no longer offers; that is the user's tree having changed under
  *    an open page, so it resolves to a re-scan prompt rather than an error.
  *
+ *  - **The root is chosen with the same picker as every other project
+ *    directory.** A scan root is a project directory, so it is picked from the
+ *    shared `ProjectPicker` (recent + browse) rather than pasted. Reusing it
+ *    rather than reimplementing means a directory reachable in the sidebar's
+ *    folder settings is reachable here too, spelled the same way. Free typing
+ *    stays available for a path that is faster to say than to browse to.
+ *
  * Everything interactive is a native control (`input type=checkbox`, `button`,
  * `input type=text`), which is what makes the whole preview keyboard-operable
  * without any key handling of its own.
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
-import { FolderPlus, FolderCheck, AlertTriangle, RefreshCw } from 'lucide-react'
+import { FolderPlus, FolderCheck, FolderOpen, AlertTriangle, RefreshCw } from 'lucide-react'
 import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState, PageHeader } from '../../components/ui'
+import ProjectPicker from '../../components/ProjectPicker'
 import { i18nT } from '../../i18n/t'
 import {
   scanProject,
@@ -231,7 +239,9 @@ export default function ProjectScaffolderPage() {
   const [rootError, setRootError] = useState('')
   const [stale, setStale] = useState<string[] | null>(null)
   const [busy, setBusy] = useState<'' | 'scan' | 'create'>('')
+  const [pickerOpen, setPickerOpen] = useState(false)
   const rootInputRef = useRef<HTMLInputElement>(null)
+  const browseRef = useRef<HTMLButtonElement>(null)
 
   const groups = useMemo(() => (scan ? toGroups(scan) : []), [scan])
   const selectedCount = selected.size
@@ -319,7 +329,7 @@ export default function ProjectScaffolderPage() {
             {i18nT('apps.projectScaffolder.projectScaffolderPage.project_directory')}
           </CardTitle>
           {/* A form so Enter in the field submits, which is the shortest keyboard
-              path from typing a path to seeing the preview. */}
+              path from a chosen path to seeing the preview. */}
           <form
             className="flex items-center gap-2"
             onSubmit={(e) => { e.preventDefault(); void runScan(root) }}
@@ -335,6 +345,16 @@ export default function ProjectScaffolderPage() {
               spellCheck={false}
               autoComplete="off"
             />
+            {/* type=button so it never submits the form it sits inside. */}
+            <Btn
+              type="button"
+              ref={browseRef}
+              data-testid="scaffolder-browse"
+              onClick={() => setPickerOpen(true)}
+            >
+              <FolderOpen size={13} className="lucide-inline" />
+              {i18nT('apps.projectScaffolder.projectScaffolderPage.browse')}
+            </Btn>
             <SendBtn type="submit" disabled={!root.trim() || busy !== ''}>
               {busy === 'scan'
                 ? i18nT('apps.projectScaffolder.projectScaffolderPage.scanning')
@@ -351,6 +371,28 @@ export default function ProjectScaffolderPage() {
             >
               {rootError}
             </div>
+          )}
+          {/* Portals to the body and anchors to the Browse button. Reused rather
+           *  than reimplemented so picking a scan root stays identical to picking
+           *  any other project directory.
+           *
+           *  A pick fills the field and stops there — it does not scan. That
+           *  mirrors the folder-settings picker, where a selection stages into the
+           *  draft and a separate action commits it. The scan is read-only, so
+           *  auto-running it would be harmless but would make one picker apply
+           *  immediately and the other not; instead focus returns to the field, so
+           *  the path is visible and editable and Enter scans it. */}
+          {pickerOpen && (
+            <ProjectPicker
+              open={true}
+              onOpenChange={(o) => { if (!o) setPickerOpen(false) }}
+              anchorRef={browseRef}
+              onSelect={(path) => {
+                setRoot(path)
+                setPickerOpen(false)
+                rootInputRef.current?.focus()
+              }}
+            />
           )}
         </Card>
 

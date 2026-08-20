@@ -4193,6 +4193,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "प्रोजेक्ट डायरेक्टरी का पूर्ण पथ",
         "already_set_up": "पहले से सेट है",
+        "browse": "ब्राउज़ करें",
         "create_folders": "फ़ोल्डर बनाएँ",
         "create_folders_from_project": "प्रोजेक्ट से फ़ोल्डर बनाएँ",
         "create_the_root_folder_only": "केवल रूट फ़ोल्डर बनाएँ",

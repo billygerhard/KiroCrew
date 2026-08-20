@@ -3172,6 +3172,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "Absolute path to a project directory",
         "already_set_up": "Already set up",
+        "browse": "Browse",
         "create_folders": "Create folders",
         "create_folders_from_project": "Create Folders From Project",
         "create_the_root_folder_only": "Create the root folder only",

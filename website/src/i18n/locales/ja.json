@@ -4162,6 +4162,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "プロジェクトディレクトリの絶対パス",
         "already_set_up": "設定済み",
+        "browse": "参照",
         "create_folders": "フォルダーを作成",
         "create_folders_from_project": "プロジェクトからフォルダーを作成",
         "create_the_root_folder_only": "ルートフォルダーのみ作成",

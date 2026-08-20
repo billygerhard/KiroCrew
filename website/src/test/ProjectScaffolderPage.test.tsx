@@ -6,14 +6,20 @@
  * the stale-selection branch is chosen by a `code` this test only ever supplies
  * inside a 400 body, which is where the server puts it.
  *
- * Covers: preview rendering with mixed tiers, existing rows disabled, per-group
- * select-all/none, the empty status, an inline root refusal, the stale-selection
- * rescan prompt, and failed-row rendering.
+ * The shared `ProjectPicker` reaches the network through `api/client` rather than
+ * a bare `fetch`, so its two GETs are spied there instead. That keeps the queue
+ * below strictly the scan/scaffold POSTs, which is what lets a test assert on
+ * `calls[n]` by index.
+ *
+ * Covers: the picker-driven root, preview rendering with mixed tiers, existing
+ * rows disabled, per-group select-all/none, the empty status, an inline root
+ * refusal, the stale-selection rescan prompt, and failed-row rendering.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ProjectScaffolderPage from '../apps/project-scaffolder/ProjectScaffolderPage'
+import { api } from '../api/client'
 
 const ROOT = '/work/monorepo'
 
@@ -77,10 +83,17 @@ beforeEach(() => {
   queued = []
   calls = []
   vi.stubGlobal('fetch', mockFetch())
+  // The picker's own directory listings. Spied on the shared client so they never
+  // consume from the POST queue above.
+  vi.spyOn(api, 'recentProjects').mockResolvedValue({ dirs: [ROOT, '/work/other'] })
+  vi.spyOn(api, 'browseDirs').mockResolvedValue({
+    path: '/work', parent: '/', dirs: [{ name: 'monorepo', path: ROOT }],
+  })
 })
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
 })
 
 /** Type a root and press Scan, then wait for the preview (or empty state) to land. */
@@ -89,7 +102,80 @@ async function scan(user: ReturnType<typeof userEvent.setup>, root = ROOT) {
   await user.click(screen.getByRole('button', { name: 'Scan' }))
 }
 
+/** Choose the root from the picker instead of typing it, then press Scan. */
+async function scanViaPicker(user: ReturnType<typeof userEvent.setup>, root = ROOT) {
+  await user.click(screen.getByTestId('scaffolder-browse'))
+  await user.click(await screen.findByRole('option', { name: new RegExp(root) }))
+  await waitFor(() => expect(screen.getByLabelText('Project directory')).toHaveValue(root))
+  await user.click(screen.getByRole('button', { name: 'Scan' }))
+}
+
 describe('ProjectScaffolderPage', () => {
+  it('fills the root from the shared project picker without scanning on selection', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: SCAN })
+    render(<ProjectScaffolderPage />)
+
+    await user.click(screen.getByTestId('scaffolder-browse'))
+    // The same picker the sidebar's folder settings launches — recent + browse.
+    // Two "Browse" texts while it is open: the launcher and the picker's own tab,
+    // so the tab is counted rather than fetched by text alone.
+    expect(await screen.findByText('Recent')).toBeInTheDocument()
+    expect(screen.getAllByText('Browse')).toHaveLength(2)
+
+    await user.click(await screen.findByRole('option', { name: new RegExp(ROOT) }))
+
+    // A pick stages the path and stops: the field holds it, the picker is gone,
+    // and no scan has been requested yet.
+    const field = screen.getByLabelText('Project directory')
+    await waitFor(() => expect(field).toHaveValue(ROOT))
+    expect(screen.queryByText('Recent')).not.toBeInTheDocument()
+    expect(calls).toHaveLength(0)
+    // Focus lands back on the field, so the path is editable and Enter scans it.
+    expect(field).toHaveFocus()
+
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    expect(calls[0]).toEqual({ url: '/api/chat/folders/scan', body: { root: ROOT } })
+  })
+
+  it('opens the picker from the keyboard and leaves the root untouched on Escape', async () => {
+    const user = userEvent.setup()
+    render(<ProjectScaffolderPage />)
+
+    const browse = screen.getByTestId('scaffolder-browse')
+    await user.tab()
+    await user.tab()
+    expect(browse).toHaveFocus()
+
+    await user.keyboard('{Enter}')
+    expect(await screen.findByText('Recent')).toBeInTheDocument()
+
+    // Escape abandons the pick: nothing is chosen and focus is not stranded in a
+    // dropdown that no longer exists.
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByText('Recent')).not.toBeInTheDocument())
+    expect(screen.getByLabelText('Project directory')).toHaveValue('')
+    expect(calls).toHaveLength(0)
+
+    // Re-opening and choosing with the keyboard alone commits the highlighted row.
+    await user.click(browse)
+    expect(await screen.findByText('Recent')).toBeInTheDocument()
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(screen.getByLabelText('Project directory')).toHaveValue(ROOT))
+  })
+
+  it('scans a picked root end to end, same as a typed one', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: SCAN })
+    render(<ProjectScaffolderPage />)
+    await scanViaPicker(user)
+
+    await waitFor(() => expect(screen.getAllByTestId('preview-group')).toHaveLength(2))
+    expect(calls[0]).toEqual({ url: '/api/chat/folders/scan', body: { root: ROOT } })
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('2 selected')
+  })
+
   it('renders a grouped preview with tiers, signals, and the server default selection', async () => {
     const user = userEvent.setup()
     queued.push({ status: 200, body: SCAN })

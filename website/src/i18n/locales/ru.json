@@ -4319,6 +4319,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "Абсолютный путь к каталогу проекта",
         "already_set_up": "Уже настроено",
+        "browse": "Обзор",
         "create_folders": "Создать папки",
         "create_folders_from_project": "Создать папки из проекта",
         "create_the_root_folder_only": "Создать только корневую папку",

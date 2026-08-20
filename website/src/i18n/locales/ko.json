@@ -4162,6 +4162,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "프로젝트 디렉터리의 절대 경로",
         "already_set_up": "이미 설정됨",
+        "browse": "찾아보기",
         "create_folders": "폴더 만들기",
         "create_folders_from_project": "프로젝트에서 폴더 만들기",
         "create_the_root_folder_only": "루트 폴더만 만들기",

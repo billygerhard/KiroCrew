@@ -4288,6 +4288,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "Chemin absolu vers un répertoire de projet",
         "already_set_up": "Déjà configuré",
+        "browse": "Parcourir",
         "create_folders": "Créer les dossiers",
         "create_folders_from_project": "Créer des dossiers depuis un projet",
         "create_the_root_folder_only": "Créer seulement le dossier racine",

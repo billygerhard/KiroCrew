@@ -4130,6 +4130,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "项目目录的绝对路径",
         "already_set_up": "已设置",
+        "browse": "浏览",
         "create_folders": "创建文件夹",
         "create_folders_from_project": "从项目创建文件夹",
         "create_the_root_folder_only": "仅创建根文件夹",

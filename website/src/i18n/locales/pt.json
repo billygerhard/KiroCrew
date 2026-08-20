@@ -4256,6 +4256,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "Caminho absoluto para um diretório de projeto",
         "already_set_up": "Já configurado",
+        "browse": "Procurar",
         "create_folders": "Criar pastas",
         "create_folders_from_project": "Criar pastas a partir de um projeto",
         "create_the_root_folder_only": "Criar apenas a pasta raiz",

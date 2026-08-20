@@ -4225,6 +4225,7 @@
       "projectScaffolderPage": {
         "absolute_path_to_a_project_directory": "Absoluter Pfad zu einem Projektverzeichnis",
         "already_set_up": "Bereits eingerichtet",
+        "browse": "Durchsuchen",
         "create_folders": "Ordner erstellen",
         "create_folders_from_project": "Ordner aus Projekt erstellen",
         "create_the_root_folder_only": "Nur den Stammordner erstellen",
