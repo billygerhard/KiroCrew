@@ -74,6 +74,14 @@ list-refresh behavior is only testable once 3.1's projects table exists.
 
 ### Findings carried forward by the review gate
 
+- **For 4.1 (inherited i18n:check failure, from 2.1's rounds 2 and 4):** `npm run
+  i18n:check` exits 1 on exactly one finding — `pages.artifactDeployPage.domain`
+  ("domain —", trailing-connector), introduced by the i18n rollout commit
+  `c1a691238` long before this branch, in a page outside spec-engine territory.
+  The prior spec dispositioned the same key as inherited (proven at a merge-base
+  worktree). 4.1 must record it as inherited, not treat the exit 1 as its own
+  gate failure; `changed-values` scoped to this branch's additions passes 0.
+
 - **For 4.1 (from 1.1's round-2 review):** `check-i18n-keys.mjs --report` lists
   `SpecEnginePage.tsx` at the pre-existing FILTERS destructure
   (`i18nT(labelKey)` in the filter row render) — present before this spec's

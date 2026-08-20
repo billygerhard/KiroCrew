@@ -82,9 +82,10 @@
  * popover with no scrim and no focus trap. Anchor placement alone does NOT keep it
  * off the safety strip — on a short viewport the picker's downward layout runs to
  * within a few pixels of the viewport bottom — so the pane passes the picker a
- * reserved bottom band — the strip's MEASURED height at open plus margin,
- * floored at `STRIP_CLEARANCE_PX`, because an armed switch or a standing
- * verdict grows the strip well past its collapsed row — that the picker's
+ * reserved bottom band — measured at open from the strip's TOP edge to the
+ * viewport bottom, plus margin, floored at `STRIP_CLEARANCE_PX`, because an
+ * armed switch or a standing verdict grows the strip well past its collapsed
+ * row — that the picker's
  * DOWNWARD layout never extends into; a popover that cannot fit above the band
  * flips upward instead. A
  * flipped popover ends above its anchor, and the anchor sits in the pane's work
@@ -141,9 +142,10 @@ const APPROVE_STEP_KEY = 'apps.specEngine.specEnginePage.step_approve_and_apply'
  * The FLOOR of the picker's reserved bottom band: the collapsed strip's row
  * (~34px) plus breathing room. The strip is content-sized and GROWS when the
  * kill switch is armed or a verdict is on screen (its panel renders as in-flow
- * lines of the row), so the band actually handed to the picker is the strip's
- * measured height at open time plus margin, floored here — a constant sized
- * for the collapsed row would let the popover cover the confirm control.
+ * lines of the row), so the band actually handed to the picker is measured at
+ * open time — viewport bottom up to the strip's top edge, plus margin —
+ * floored here. A constant sized for the collapsed row would let the popover
+ * cover the confirm control.
  */
 const STRIP_CLEARANCE_PX = 48
 
@@ -379,15 +381,20 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
     // drill-in, parent), not a separate probe that could disagree with the list
     // actually on screen.
     setBrowseFailed(false)
-    // The reservation is the strip's height NOW, not the collapsed row's
-    // constant: an armed switch or a standing verdict renders as in-flow lines
-    // of the strip, growing it to ~100-250px, and the confirm control lives in
-    // that growth. Measured at open — the strip cannot grow underneath an open
-    // picker except through the switch's own controls, which close it via the
-    // outside-mousedown dismiss before the panel expands.
+    // The reservation is the band from the strip's TOP edge to the viewport
+    // bottom, measured now — not the collapsed row's constant: an armed switch
+    // or a standing verdict renders as in-flow lines of the strip, growing it
+    // to ~100-250px, and the confirm control lives in that growth. Top-edge
+    // arithmetic (rather than the strip's height) also absorbs any chrome
+    // below the app region, and the margin keeps slack for a wrapped line the
+    // open-time measurement cannot see. The strip cannot otherwise grow under
+    // an open picker: the switch's own controls expand it, and clicking them
+    // closes the picker via the outside-mousedown dismiss first.
     const strip = document.querySelector('.se-status')
     const measured =
-      strip instanceof HTMLElement ? strip.getBoundingClientRect().height + STRIP_MARGIN_PX : 0
+      strip instanceof HTMLElement
+        ? window.innerHeight - strip.getBoundingClientRect().top + STRIP_MARGIN_PX
+        : 0
     setStripReserve(Math.max(STRIP_CLEARANCE_PX, Math.ceil(measured)))
     setPickerOpen(true)
   }, [])
