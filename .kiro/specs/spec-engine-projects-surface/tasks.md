@@ -51,8 +51,8 @@ no backend route is added or changed; removal rides the existing guarded PUT's
     - Verify BY NAME the engine tests covering `_merge` null-deletion, sibling-entry independence, and write-log recording; pin the UI's patch shape with a test that fails if the null is dropped or the patch widens; mutation probes on the isError branch and the patch shape
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
 
-- [ ] 4. Verification
-  - [ ] 4.1 Gate sweep and record
+- [x] 4. Verification
+  - [x] 4.1 Gate sweep and record
     - All six SpecEngine vitest suites, `npx tsc -b`, eslint on touched files, `npm run i18n:check`, `node scripts/check-app-manifest-sync.mjs`, app-boundary fence pytest (no out-of-territory file modified), and both backend pytest suites as regression — real exit codes, never `$?` through a pipe, no quiet flags
     - Confirm every new string exists in all supported catalogs; record any dispositions in this tasks.md; leave `.tasks-meta.json` unstaged
     - _Requirements: 1.6, 2.3, 3.4_
