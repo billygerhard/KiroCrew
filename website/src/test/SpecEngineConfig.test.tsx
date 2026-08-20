@@ -738,7 +738,7 @@ describe('the projects table', () => {
     // the gateway can no longer produce as the one in force.
     stub({
       config: { body: snapshot(twoProjects()) },
-      configAfterPut: { body: snapshot(withoutAcme()) },
+      configAfterPut: { body: snapshot(withoutWidgets()) },
       resolvedFor: { acme: { body: resolved() } },
       resolvedAgain: {
         acme: { status: 503, body: { code: 'config_unreadable', error: 'disk gone' } },
@@ -841,6 +841,38 @@ describe('the projects table', () => {
     expect(
       screen.queryByText(T.resolved_for_project.replace('{{project}}', 'acme')),
     ).toBeNull()
+  })
+
+  it('returns the selection to app defaults when its entry leaves by another path', async () => {
+    // The selection is normalized against the document itself, not against how
+    // the entry left it. Here the operator removes ONE entry while ANOTHER —
+    // the selected one — disappears from the store's answer (an external write
+    // landing between the confirm and the refetch; the JSON editor beside the
+    // table is the same path). Without normalization no row matches: the grid
+    // loses its only tab stop, and the resolved pane renders app-wide layers
+    // under a heading naming a project the document no longer lists.
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutAcme()) },
+      resolvedFor: { acme: { body: resolved() } },
+    })
+    await openConfig()
+    fireEvent.click(within(grid()).getByText('acme'))
+    expect(
+      await screen.findByText(T.resolved_for_project.replace('{{project}}', 'acme')),
+    ).toBeInTheDocument()
+    fireEvent.click(removeButton('widgets'))
+    fireEvent.click(confirmButton('widgets'))
+    expect(await screen.findByText(T.resolved_app_wide)).toBeInTheDocument()
+    expect(
+      screen.queryByText(T.resolved_for_project.replace('{{project}}', 'acme')),
+    ).toBeNull()
+    // The app-defaults row holds the selection, so the grid keeps its tab stop.
+    await waitFor(() => {
+      const defaults = rows()[0]
+      expect(defaults).toHaveAttribute('aria-selected', 'true')
+      expect(defaults).toHaveAttribute('tabindex', '0')
+    })
   })
 
   it('withdraws an arm whose entry left the document', async () => {

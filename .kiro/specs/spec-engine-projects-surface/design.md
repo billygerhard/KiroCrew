@@ -154,9 +154,12 @@ must not cover the strip.
 - **Removal**: each project row offers an arm-then-confirm removal (the
   SafetyPanel's two-step pattern, not a browser confirm). Confirm submits
   `PUT /config` with `{"projects": {"<name>": null}}` through the existing
-  guarded client. The reply is the merged document; the table re-renders from
-  it, and the write log carries the write (engine behavior, verified by an
-  existing-route test).
+  guarded client. The write's reply is NOT adopted as the new snapshot — it
+  carries no elision list or validation errors to rebuild one from — so the
+  config and resolved queries are invalidated and the table re-renders from
+  what the store now returns; the write log carries the write (engine
+  behavior, verified by a named engine test). A selection whose entry left the
+  document by any path is normalized back to the App defaults row.
 
 ### api.ts (spec-engine client)
 

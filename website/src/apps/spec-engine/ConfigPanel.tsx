@@ -493,7 +493,9 @@ function ProjectsTable({
           const selected = row.id === project
           return (
             <div
-              key={row.id || APP_DEFAULTS_ROW_KEY}
+              // Disjoint key namespaces: a project literally named
+              // "app-defaults" must not collide with the defaults row's key.
+              key={row.id === APP_WIDE ? APP_DEFAULTS_ROW_KEY : `project:${row.id}`}
               ref={(node) => {
                 if (node) rowRefs.current.set(row.id, node)
                 else rowRefs.current.delete(row.id)
@@ -966,7 +968,27 @@ export function ConfigPane({
   // The selected project lives here, above both halves of the pane: the table on
   // the left is what selects it and the resolved read on the right is what it is
   // read FOR, and a copy on either side is how the two come to disagree.
-  const [project, setProject] = useState<string>(APP_WIDE)
+  const [chosenProject, setChosenProject] = useState<string>(APP_WIDE)
+  // Normalized against the document itself, not against how the entry left it:
+  // a selection whose entry is gone — removed through its row, deleted in the
+  // JSON editor beside the table, or dropped by an external write picked up on
+  // refetch — falls back to app defaults. Without this, no row matches, the
+  // grid loses its only tab stop, and the resolved view renders the app-wide
+  // layers under a heading naming a project the document no longer lists —
+  // which reads as "this project inherits everything" rather than "this
+  // project is gone".
+  const documentProjects = config?.document.projects
+  const chosenKnown =
+    chosenProject === APP_WIDE ||
+    (documentProjects !== null &&
+      typeof documentProjects === 'object' &&
+      Object.prototype.hasOwnProperty.call(documentProjects, chosenProject))
+  const project = chosenKnown ? chosenProject : APP_WIDE
+  // The stored state collapses too, so a later re-add of the same name cannot
+  // silently snap the selection back to it with no operator action.
+  useEffect(() => {
+    if (!chosenKnown) setChosenProject(APP_WIDE)
+  }, [chosenKnown])
   return (
     <>
       <section className="se-cfg">
@@ -992,7 +1014,7 @@ export function ConfigPane({
               {/* Above the document rather than below it: the question this pane
                   is opened with is "which configuration governs which project",
                   and the answer must not sit under a fixed-height editor. */}
-              <ProjectsTable config={config} project={project} onSelect={setProject} />
+              <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
               <DocumentEditor config={config} />
             </>
           )}

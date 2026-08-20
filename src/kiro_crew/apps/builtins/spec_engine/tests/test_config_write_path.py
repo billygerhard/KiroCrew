@@ -10,6 +10,7 @@ value the store classifies as a credential is elided on the way back out.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     is_secret_key,
     key_segments,
 )
+from kiro_crew.apps.builtins.spec_engine.engine.config.store import _merge
 
 #: A surface with no human watching. Stands in for any future non-interactive
 #: writer; the config-only guard must refuse it.
@@ -83,6 +85,40 @@ class TestWritePath:
         effective = store.effective("limits.task_retry_limit")
         assert effective.is_default
         assert "task_retry_limit" not in store.document().get("limits", {})
+
+    @given(
+        entries=st.dictionaries(
+            st.text(alphabet="abcdefghij-", min_size=1, max_size=8),
+            st.dictionaries(
+                st.sampled_from(["path", "cost_profile", "note"]),
+                st.one_of(st.text(max_size=8), st.integers(min_value=0, max_value=9)),
+                max_size=3,
+            ),
+            min_size=2,
+            max_size=5,
+        ),
+        data=st.data(),
+    )
+    def test_removing_any_project_entry_leaves_every_sibling_intact(
+        self, entries: dict, data: st.DataObject
+    ):
+        # The universal half of the guarantee, at the merge layer where it is
+        # decided: for EVERY set of project entries and EVERY chosen victim, a
+        # ``None`` at the victim's key removes exactly that entry, and every
+        # sibling's stored entry is unchanged. The validated write path, the
+        # resolved value, and the write log ride the representative store test
+        # below — the store cannot behave differently per name because the merge
+        # is the only place entries are combined.
+        victim = data.draw(st.sampled_from(sorted(entries)))
+        before = copy.deepcopy(entries)
+        merged = _merge({"projects": entries}, {"projects": {victim: None}})
+        assert set(merged["projects"]) == set(entries) - {victim}
+        for name, entry in entries.items():
+            if name != victim:
+                assert merged["projects"][name] == entry
+        # And the merge does not mutate its input: the caller's document is the
+        # store's live snapshot, which a mutating merge would corrupt in place.
+        assert entries == before
 
     def test_a_null_project_entry_removes_it_and_leaves_its_siblings_alone(
         self, store: ConfigStore
