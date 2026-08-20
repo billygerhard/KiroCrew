@@ -10,9 +10,12 @@
  *     no overlay, so the kill-switch strip cannot be covered. A drawer or modal
  *     added later would look like a feature and would reintroduce the rejected
  *     mockup's failure.
- *   - **First run leads with the assistant**, and a config read that FAILED is not
- *     first run — an unparseable document is a repair, and the assistant refuses
- *     to write over one.
+ *   - **First run leads with the assistant** — in the landing pane AND in the rail's
+ *     order, both read off one derivation so they cannot disagree — and a config
+ *     read that FAILED is not first run: an unparseable document is a repair, the
+ *     assistant refuses to write over one, and React Query's retention of the last
+ *     body across a failed refetch is what would otherwise keep the claim alive
+ *     after nothing confirms it.
  *   - **Rows are keyboard-operable.** The mockup put `aria-selected` on a plain
  *     `<tr>` with no role, no tabindex and no key handling, which announces a
  *     selection a keyboard cannot reach.
@@ -22,10 +25,11 @@
  *     or send it back" for a gate that will dispatch no further revision turn.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage, { __testing } from '../apps/spec-engine/SpecEnginePage'
+import { QK } from '../apps/spec-engine/api'
 import { SE_CSS } from '../apps/spec-engine/styles'
 import { getBuiltinIcon } from '../apps/builtinIcons'
 import { getBuiltinComponent } from '../apps/builtinRegistry'
@@ -64,15 +68,30 @@ type Answer = { status?: number; body: unknown }
  * Per-route rather than one body for all three, because the interesting states
  * are exactly the ones where the reads DISAGREE: an unreadable configuration
  * beside a healthy queue, an engaged switch beside an empty queue.
+ *
+ * `config` may be a QUEUE of answers, because the retained-data guard is only
+ * observable across TWO reads of that route: the second one fails while React
+ * Query still holds the first one's `configured === false`. The last entry
+ * sticks, so a test that only cares about a steady state passes one answer.
  */
 function stubReads(answers: {
-  config?: Answer
+  config?: Answer | Answer[]
   queue?: Answer
   killSwitch?: Answer
 }) {
+  const config = Array.isArray(answers.config)
+    ? [...answers.config]
+    : [answers.config ?? { body: { configured: true, document: {}, elided: [] } }]
   const pick = (url: string): Answer => {
+    if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
+      // The resolved read shares the document read's answer (this suite is not
+      // about resolution) but must not CONSUME a queued one: the queue exists to
+      // sequence reads of the document route, and a resolved fetch triggered by
+      // opening the configuration pane would otherwise silently advance it.
+      return config[0]
+    }
     if (url.startsWith('/api/apps/spec-engine/config')) {
-      return answers.config ?? { body: { configured: true, document: {}, elided: [] } }
+      return config.length > 1 ? config.shift()! : config[0]
     }
     if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
       return (
@@ -97,8 +116,11 @@ function stubReads(answers: {
   )
 }
 
+/** The client the last render used, so a test can force a refetch of one read. */
+let client: QueryClient
+
 function renderPage() {
-  const client = new QueryClient({
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   })
   return render(
@@ -107,6 +129,20 @@ function renderPage() {
     </QueryClientProvider>,
   )
 }
+
+/**
+ * The rail's panes in DOM order.
+ *
+ * Read from `data-pane` rather than from label text: the rail is translated, and
+ * an ordering assertion over rendered words would break in every catalog but one
+ * while saying nothing about which pane each button reaches.
+ */
+const railPanes = (container: HTMLElement) =>
+  Array.from(container.querySelectorAll('.se-rail .se-nav')).map((b) => b.getAttribute('data-pane'))
+
+/** The rail's setup entry, whose alarm marker claims the engine is unconfigured. */
+const setupNav = (container: HTMLElement) =>
+  container.querySelector('.se-rail .se-nav[data-pane="setup"]')
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -180,6 +216,73 @@ describe('first run', () => {
     // failure this was.
     expect(alert).toHaveTextContent('config_unreadable')
     expect(alert).toHaveTextContent('line 4: trailing comma')
+  })
+
+  it('does not re-assert first run from retained data when a later read fails', async () => {
+    // The guard's whole reason for existing. React Query RETAINS the last data
+    // across a failed refetch, so this sequence — a `configured === false` read,
+    // then a read that failed — leaves a snapshot on hand that says "nothing is
+    // configured" while nothing currently confirms it. Doubt is not absence, and
+    // every channel that spends that claim has to fall silent together.
+    stubReads({
+      config: [
+        { body: { configured: false, document: {}, elided: [] } },
+        { status: 409, body: { code: 'config_unreadable', error: 'line 4: trailing comma' } },
+      ],
+      queue: { body: { entries: [entry()], grouped: {}, total: 1, total_credits: 163.2 } },
+    })
+    const { container } = renderPage()
+    // Established first, so the retention under test is real rather than assumed:
+    // the claim is on screen before the read that fails.
+    expect(await screen.findByText(T.nothing_is_configured_yet)).toBeInTheDocument()
+    expect(setupNav(container)).toHaveAttribute('data-alarm', 'true')
+
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: QK.config, exact: true })
+    })
+
+    // Not the landing pane: a failed read lands on the queue.
+    expect(await screen.findByText(T.sorted_by_time_waiting_longest_first)).toBeInTheDocument()
+    expect(screen.queryByText(T.nothing_is_configured_yet)).toBeNull()
+    // Not the alarm either. It is a positive claim that the engine is
+    // unconfigured, which is exactly what is no longer known.
+    await waitFor(() => expect(setupNav(container)).not.toHaveAttribute('data-alarm'))
+    // And not the rail's order, which reads the same value: a rail still leading
+    // with the assistant would be the two halves disagreeing.
+    expect(railPanes(container)).toEqual(['queue', 'config', 'setup'])
+  })
+})
+
+describe('the pane rail', () => {
+  it('leads with the setup assistant while nothing is configured', async () => {
+    // The rail's order is the standing answer to "what do I do here": on an
+    // unconfigured engine the assistant is the only pane that can produce
+    // anything, so it cannot sit third behind a queue that must be empty.
+    stubReads({ config: { body: { configured: false, document: {}, elided: [] } } })
+    const { container } = renderPage()
+    await screen.findByText(T.nothing_is_configured_yet)
+    expect(railPanes(container)).toEqual(['setup', 'queue', 'config'])
+    expect(setupNav(container)).toHaveAttribute('data-alarm', 'true')
+  })
+
+  it('leads with the queue once a project is configured', async () => {
+    stubReads({ queue: { body: { entries: [entry()], grouped: {}, total: 1, total_credits: 163.2 } } })
+    const { container } = renderPage()
+    await screen.findByText(T.sorted_by_time_waiting_longest_first)
+    expect(railPanes(container)).toEqual(['queue', 'config', 'setup'])
+    // The assistant stays reachable for the next project; it just stops shouting.
+    expect(setupNav(container)).not.toHaveAttribute('data-alarm')
+  })
+
+  it('derives its order from the first-run reading, stranding no pane in either', () => {
+    expect(__testing.paneOrder(true)).toEqual(['setup', 'queue', 'config'])
+    expect(__testing.paneOrder(false)).toEqual(['queue', 'config', 'setup'])
+    // The order decides which pane is loudest, never which are reachable. An
+    // order that dropped one would strand its content with no way in, and the
+    // rendered assertions above would still pass on the two panes that remained.
+    const panes = Object.keys(__testing.PANE_NAV).sort()
+    expect([...__testing.paneOrder(true)].sort()).toEqual(panes)
+    expect([...__testing.paneOrder(false)].sort()).toEqual(panes)
   })
 })
 

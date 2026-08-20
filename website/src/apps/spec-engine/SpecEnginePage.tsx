@@ -40,6 +40,12 @@
  * keyboard selection, the docked inspector's identity header, first-run routing,
  * and the status strip's queue-scoped figures.
  *
+ * First-run routing is ONE derivation. The landing pane and the rail's order both
+ * read the same `firstRun` value, so the rail cannot lead with the assistant while
+ * the landing rule opens the queue; and because that value is guarded against a
+ * failed read, neither the routing nor the alarm on the setup entry can keep
+ * claiming "nothing is configured" from data a later read failed to confirm.
+ *
  * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
  * selected run so its state cannot outlive the selection. The configuration pane
  * (the document as the write path, its resolved read beside it) belongs to
@@ -72,7 +78,14 @@
  */
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, Cog, ListOrdered, ShieldCheck, Wand2 } from 'lucide-react'
+import {
+  AlertTriangle,
+  Cog,
+  ListOrdered,
+  ShieldCheck,
+  Wand2,
+  type LucideIcon,
+} from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtNumber, type FormatUnit } from '../../i18n/format'
@@ -91,6 +104,47 @@ import { SetupFlowPanel } from './SetupFlowPanel'
 
 /** Which pane the work area shows. Panes, not destinations: one list, one document. */
 type Pane = 'queue' | 'config' | 'setup'
+
+/**
+ * What the rail renders for a pane: its glyph and its label key.
+ *
+ * A table rather than three literal buttons, because the ORDER of the rail is a
+ * first-run decision (below) and a hand-written sequence of buttons cannot be
+ * reordered without duplicating each one. Holds the label KEY, not the resolved
+ * string, for the same reason `WHY_KEY` does: a module-level `i18nT()` would run
+ * once at import and freeze the rail in whatever language was active then.
+ */
+const PANE_NAV: Record<Pane, { labelKey: string; Icon: LucideIcon }> = {
+  queue: { labelKey: 'apps.specEngine.specEnginePage.queue', Icon: ListOrdered },
+  config: { labelKey: 'apps.specEngine.specEnginePage.configuration', Icon: Cog },
+  setup: { labelKey: 'apps.specEngine.specEnginePage.setup_assistant', Icon: Wand2 },
+}
+
+/**
+ * The rail's order while first run: the assistant leads, because it is the only
+ * pane that can produce anything on an unconfigured engine.
+ */
+const FIRST_RUN_PANE_ORDER: readonly Pane[] = Object.freeze<Pane[]>(['setup', 'queue', 'config'])
+
+/**
+ * The rail's order once a project is configured: the work the operator came for
+ * leads, and the assistant drops to last, where it stays reachable for the next
+ * project.
+ */
+const CONFIGURED_PANE_ORDER: readonly Pane[] = Object.freeze<Pane[]>(['queue', 'config', 'setup'])
+
+/**
+ * The rail's order, from the SAME `firstRun` value the landing rule reads.
+ *
+ * One derivation feeding both is the point: a rail computed from its own
+ * condition could put the assistant first while the landing rule sent the
+ * operator to the queue, and neither half would look wrong on its own. Every
+ * pane appears in both orders — the order changes which is loudest, never which
+ * are reachable.
+ */
+function paneOrder(firstRun: boolean): readonly Pane[] {
+  return firstRun ? FIRST_RUN_PANE_ORDER : CONFIGURED_PANE_ORDER
+}
 
 /** The queue filter. `all` plus one per `WaitingOn`, because those are three jobs. */
 type Filter = 'all' | WaitingOn
@@ -253,8 +307,20 @@ export default function SpecEnginePage() {
    * assistant". A config read that FAILED is not first run either — a document
    * that cannot be parsed is a repair, and the assistant would refuse to write
    * over it.
+   *
+   * The `isError` half is not redundant with that: React Query RETAINS the last
+   * data across a failed refetch, so a `configured === false` snapshot followed
+   * by a failed read would go on asserting first run from a reading nothing
+   * currently confirms — the same defect class the kill-switch dot closed one
+   * component over. Doubt is not absence.
+   *
+   * This is the single derivation. The landing rule below and the rail's order
+   * both read THIS value, so the two cannot disagree about whether the engine is
+   * unconfigured; and because the guard sits here, it covers the setup pane's
+   * alarm marker as well, which asserts "unconfigured" and must fall silent on a
+   * read nobody could complete.
    */
-  const firstRun = config.data?.configured === false
+  const firstRun = !config.isError && config.data?.configured === false
 
   const pane: Pane | null =
     chosenPane ?? (config.isPending ? null : firstRun ? 'setup' : 'queue')
@@ -326,43 +392,39 @@ export default function SpecEnginePage() {
           {i18nT('apps.specEngine.manifest.page_label')}
         </span>
 
-        <button
-          type="button"
-          className="se-nav"
-          aria-current={pane === 'queue' ? 'page' : undefined}
-          onClick={() => setChosenPane('queue')}
-        >
-          <ListOrdered className="lucide-inline" aria-hidden="true" />
-          {i18nT('apps.specEngine.specEnginePage.queue')}
-          <span className="se-badge">{fmtNumber(entries.length)}</span>
-        </button>
-        <button
-          type="button"
-          className="se-nav"
-          aria-current={pane === 'config' ? 'page' : undefined}
-          onClick={() => setChosenPane('config')}
-        >
-          <Cog className="lucide-inline" aria-hidden="true" />
-          {i18nT('apps.specEngine.specEnginePage.configuration')}
-        </button>
-        <button
-          type="button"
-          className="se-nav"
-          aria-current={pane === 'setup' ? 'page' : undefined}
-          // The first-run alarm marks the pane an unconfigured engine has to visit,
-          // so the entry is the loudest thing in the rail rather than one of four
-          // equals.
-          data-alarm={firstRun ? 'true' : undefined}
-          onClick={() => setChosenPane('setup')}
-        >
-          <Wand2 className="lucide-inline" aria-hidden="true" />
-          {i18nT('apps.specEngine.specEnginePage.setup_assistant')}
-          {firstRun && (
-            <span className="se-badge">
-              <AlertTriangle className="lucide-inline" aria-hidden="true" />
-            </span>
-          )}
-        </button>
+        {/* Rendered from the ordered pane list rather than written out three times,
+            so the first-run rail and the configured rail are one sequence with one
+            source of truth. `data-pane` is what the shell's tests read the order
+            from: a label-text ordering assertion would break on translation and
+            says nothing about which pane a button reaches. */}
+        {paneOrder(firstRun).map((id) => {
+          const { labelKey, Icon } = PANE_NAV[id]
+          return (
+            <button
+              key={id}
+              type="button"
+              className="se-nav"
+              data-pane={id}
+              aria-current={pane === id ? 'page' : undefined}
+              // The first-run alarm marks the pane an unconfigured engine has to
+              // visit, so the entry is the loudest thing in the rail rather than
+              // one of three equals. It rides `firstRun`, which is false whenever
+              // the configuration read is in error — an alarm is a positive claim
+              // that nothing is configured, and a failed read is not that claim.
+              data-alarm={id === 'setup' && firstRun ? 'true' : undefined}
+              onClick={() => setChosenPane(id)}
+            >
+              <Icon className="lucide-inline" aria-hidden="true" />
+              {i18nT(labelKey)}
+              {id === 'queue' && <span className="se-badge">{fmtNumber(entries.length)}</span>}
+              {id === 'setup' && firstRun && (
+                <span className="se-badge">
+                  <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                </span>
+              )}
+            </button>
+          )
+        })}
 
         <div className="se-rail-foot">
           <div className="se-keys">
@@ -616,4 +678,11 @@ export default function SpecEnginePage() {
 }
 
 /** Exported for the shell's own tests, which assert the reading rather than re-deriving it. */
-export const __testing = { waitedParts, WHY_KEY, WHY_EXHAUSTED_KEY, WAIT_LABEL_KEY }
+export const __testing = {
+  waitedParts,
+  WHY_KEY,
+  WHY_EXHAUSTED_KEY,
+  WAIT_LABEL_KEY,
+  paneOrder,
+  PANE_NAV,
+}
