@@ -80,11 +80,11 @@ no capability is surfaceless for longer than a wave.
   - [x] 6.4 Kill switch and spend panel
     - Kill-switch engage/release and per-run spend display over the backend routes; engage/release confirmed by reading back persisted state, not by response status alone
     - _Requirements: 6.2, 6.5_
-- [ ] 7. End-to-end verification
+- [x] 7. End-to-end verification
   - [x] 7.1 Write-path equivalence and fence verification
     - Property test driving the same patches through the MCP tool and the backend route against identical starting stores, asserting byte-identical `config.json` (design Property 1); App_Boundary_Fence green on the finished branch; mutation probes for every property claimed in tasks 2.1, 3.1, and 4.3
     - _Requirements: 4.4, 2.1_
-  - [ ] 7.2 Final sweep and dispositions
+  - [x] 7.2 Final sweep and dispositions
     - All gates green (both pytest suites, lint/type gates including tests, tsc, vitest, manifest-sync, boundary fence); record in the prior spec's tasks.md that its one-app design intent is superseded by this spec; final report lists the VETO-PENDING mockup selection and any Requirement 1.4 findings
     - _Requirements: 1.1, 5.2, 6.1_
 
