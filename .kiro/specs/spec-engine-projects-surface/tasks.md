@@ -74,6 +74,13 @@ list-refresh behavior is only testable once 3.1's projects table exists.
 
 ### Findings carried forward by the review gate
 
+- **Disposition (from 3.1's round-2 review, approved):** the render-time half of
+  the selection normalization in `ConfigPanel.tsx` is deliberately unpinned —
+  the collapse effect alone satisfies the named test, and the render guard only
+  closes the one-frame window between commit and effect. Recorded rather than
+  tested: a test distinguishing the two halves would have to observe a single
+  React frame, which jsdom render cycles do not expose meaningfully.
+
 - **For 4.1 (inherited i18n:check failure, from 2.1's rounds 2 and 4):** `npm run
   i18n:check` exits 1 on exactly one finding — `pages.artifactDeployPage.domain`
   ("domain —", trailing-connector), introduced by the i18n rollout commit

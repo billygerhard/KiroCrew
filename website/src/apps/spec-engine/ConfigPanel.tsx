@@ -329,7 +329,9 @@ function DocumentEditor({ config }: { config: ConfigSnapshot }) {
 }
 
 /**
- * Fields of a project entry that have a column of their own in the table.
+ * Fields of a project entry presented as the entry's identity rather than as
+ * configuration: the pinned profile has its own column, and the path names the
+ * project rather than overriding a setting.
  *
  * Excluded from the override count for that reason, not because they are less
  * important: a reader who can see the pinned profile in its own column and then
@@ -980,8 +982,7 @@ export function ConfigPane({
   const documentProjects = config?.document.projects
   const chosenKnown =
     chosenProject === APP_WIDE ||
-    (documentProjects !== null &&
-      typeof documentProjects === 'object' &&
+    (isObject(documentProjects) &&
       Object.prototype.hasOwnProperty.call(documentProjects, chosenProject))
   const project = chosenKnown ? chosenProject : APP_WIDE
   // The stored state collapses too, so a later re-add of the same name cannot
