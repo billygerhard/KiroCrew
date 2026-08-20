@@ -3984,8 +3984,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "Une réponse absente n'est pas un non, elle est sans réponse. L'application refuse jusqu'à ce que chaque niveau ait un oui ou un non explicite.",
         "already_configured": "{{project}} est déjà configuré : ce document contient une entrée sous ce nom.",
-        "already_configured_reinspection": "Continuer réexamine l'entrée existante. Appliquer un plan réécrit l'entrée de {{project}} au lieu d'en ajouter une seconde.",
-        "already_configured_unknown": "Les projets configurés n'ont pas pu être lus : on ignore donc si {{project}} possède déjà une entrée. Appliquer réécrirait une entrée existante.",
+        "already_configured_reinspection": "Continuer réinspecte l'entrée existante. Appliquer un plan réécrit les champs portés par le plan dans l'entrée de {{project}} — jamais une seconde entrée, et les champs absents du plan sont conservés.",
+        "already_configured_unknown": "Impossible de savoir si {{project}} a déjà une entrée — les projets configurés n'ont pas été lus. Si une entrée existe, une application réécrirait les champs portés par le plan.",
         "an_approver_is_required": "Nommez l'approbateur avant d'appliquer.",
         "applied_by": "Appliqué sous l'autorité de {{approver}}.",
         "apply_the_plan": "Appliquer le plan",

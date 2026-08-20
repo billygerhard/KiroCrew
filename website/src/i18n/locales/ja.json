@@ -3862,8 +3862,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "答えがないのは「いいえ」ではなく未回答です。すべての段が明示的な「はい」か「いいえ」になるまで適用は拒否されます。",
         "already_configured": "{{project}} はすでに設定されています。この設定ドキュメントにはその名前の項目があります。",
-        "already_configured_reinspection": "続行すると既存の項目を再検査します。プランを適用すると、{{project}} の項目は二つ目が追加されるのではなく書き換えられます。",
-        "already_configured_unknown": "設定済みプロジェクトを読み取れなかったため、{{project}} の項目がすでにあるかどうかは不明です。適用すると既存の項目を書き換えます。",
+        "already_configured_reinspection": "続行すると既存のエントリを再検査します。プランを適用すると、{{project}} のエントリのうちプランに含まれるフィールドが書き換えられます。2 つ目のエントリが作られることはなく、プランに含まれないフィールドはそのまま残ります。",
+        "already_configured_unknown": "{{project}} に既存のエントリがあるかは不明です。設定済みプロジェクトが読み込まれていません。エントリが存在する場合、適用するとプランに含まれるフィールドが書き換えられます。",
         "an_approver_is_required": "適用する前に承認者を記入してください。",
         "applied_by": "{{approver}} の権限で適用しました。",
         "apply_the_plan": "計画を適用",

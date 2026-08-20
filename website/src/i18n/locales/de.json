@@ -3923,8 +3923,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "Eine fehlende Antwort ist unbeantwortet, nicht nein. Das Anwenden verweigert, bis jede Stufe ein ausdrückliches Ja oder Nein hat.",
         "already_configured": "{{project}} ist bereits konfiguriert: dieses Dokument enthält einen Eintrag unter diesem Namen.",
-        "already_configured_reinspection": "Wenn Sie fortfahren, wird der bestehende Eintrag erneut geprüft. Ein angewendeter Plan überschreibt den Eintrag von {{project}}, statt einen zweiten anzulegen.",
-        "already_configured_unknown": "Die konfigurierten Projekte konnten nicht gelesen werden, daher ist unbekannt, ob für {{project}} bereits ein Eintrag besteht. Ein Anwenden würde einen bestehenden Eintrag überschreiben.",
+        "already_configured_reinspection": "Beim Fortfahren wird der vorhandene Eintrag erneut inspiziert. Das Anwenden eines Plans überschreibt die im Plan enthaltenen Felder im Eintrag von {{project}} — nie einen zweiten Eintrag; Felder, die der Plan nicht enthält, bleiben erhalten.",
+        "already_configured_unknown": "Ob {{project}} bereits einen Eintrag hat, ist unbekannt — die konfigurierten Projekte wurden nicht gelesen. Falls ein Eintrag existiert, würde ein Anwenden die im Plan enthaltenen Felder überschreiben.",
         "an_approver_is_required": "Nenne die genehmigende Person, bevor du anwendest.",
         "applied_by": "Angewendet mit der Befugnis von {{approver}}.",
         "apply_the_plan": "Plan anwenden",

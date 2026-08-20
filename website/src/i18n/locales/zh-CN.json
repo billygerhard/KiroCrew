@@ -3862,8 +3862,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "缺失的答案是未回答，而不是否。只要有任一层级未回答，应用就会被拒绝。",
         "already_configured": "{{project}} 已配置：该文档中存在同名条目。",
-        "already_configured_reinspection": "继续将重新检查现有条目。应用方案会改写 {{project}} 的条目，而不是新增第二个条目。",
-        "already_configured_unknown": "无法读取已配置的项目，因此 {{project}} 是否已有条目未知。应用会改写已有条目。",
+        "already_configured_reinspection": "继续将重新检查现有条目。应用计划会重写 {{project}} 条目中计划包含的字段——绝不会创建第二个条目，计划未包含的字段将保留。",
+        "already_configured_unknown": "无法确定 {{project}} 是否已有条目——尚未读取已配置的项目。如果条目存在，应用将重写计划中包含的字段。",
         "an_approver_is_required": "应用前请写明批准人。",
         "applied_by": "已依据 {{approver}} 的授权应用。",
         "apply_the_plan": "应用该计划",

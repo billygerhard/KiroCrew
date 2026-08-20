@@ -74,6 +74,14 @@ list-refresh behavior is only testable once 3.1's projects table exists.
 
 ### Findings carried forward by the review gate
 
+- **Record (from 2.2's review, approved):** R4.4's prior-entries-unchanged
+  guarantee is engine-side, pinned by name in
+  `test_config_write_path.py::test_writes_merge_rather_than_replace` (a second
+  project written through `SETUP_ASSISTANT_SURFACE` over an existing entry
+  leaves the first entry's fields intact). The UI's half is the pinned request
+  shapes (`{project, answers}` / `{project, answers, plan_id, approver}`) — the
+  panel has no channel through which to widen the write.
+
 - **Disposition (from 3.1's round-2 review, approved):** the render-time half of
   the selection normalization in `ConfigPanel.tsx` is deliberately unpinned —
   the collapse effect alone satisfies the named test, and the render guard only

@@ -747,11 +747,12 @@ describe('running it again for another project', () => {
     answerEverything()
     fireEvent.click(plan)
     // The patch on screen is the engine's, rendered verbatim: it touches the new
-    // project's entry and names no other, so `widgets` survives the merge because
-    // nothing in the write addresses it.
+    // project's entry and names no other. Whether `widgets` truly survives the
+    // merge is the ENGINE's guarantee, pinned by name in
+    // test_config_write_path.py::test_writes_merge_rather_than_replace — an
+    // assertion here would only re-read this test's own fixture.
     const patch = await screen.findByText(/"projects"/)
     expect(patch).toHaveTextContent('acme')
-    expect(patch).not.toHaveTextContent('widgets')
     expect(screen.getByText(/projects\.acme\.cost_profile/)).toBeInTheDocument()
     // And the panel cannot widen that write: what it sends is the project subject
     // and the answers, never a document or a patch of its own construction.
@@ -807,6 +808,23 @@ describe('running it again for another project', () => {
     expect(document.body.textContent).not.toContain('{{project}}')
     // Not an error and not a block: the flow continues onto the existing entry.
     expect(screen.getByRole('button', { name: T.show_the_exact_patch })).toBeEnabled()
+  })
+
+  it('withdraws the already-configured note once the path is edited past it', async () => {
+    // The note is a positive claim about the INSPECTED path. Editing the field
+    // clears the plan but keeps the inspection's evidence on screen; the note
+    // must not ride that evidence and keep naming the old project while the
+    // next plan targets the new path.
+    stub({ config: CONFIGURED })
+    await inspectFromRail()
+    expect(await screen.findByText(forProject(T.already_configured, 'acme'))).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText(T.project_path), {
+      target: { value: '/src/somewhere-else' },
+    })
+    expect(screen.queryByText(forProject(T.already_configured, 'acme'))).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(forProject(T.already_configured_reinspection, 'acme')),
+    ).not.toBeInTheDocument()
   })
 
   it('says nothing about duplication for a project that has no entry', async () => {

@@ -3984,8 +3984,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "Una risposta assente è senza risposta, non è un no. L'applicazione rifiuta finché ogni livello non ha un sì o un no esplicito.",
         "already_configured": "{{project}} è già configurato: questo documento contiene una voce con quel nome.",
-        "already_configured_reinspection": "Continuando si riesamina la voce esistente. Applicare un piano riscrive la voce di {{project}} invece di aggiungerne una seconda.",
-        "already_configured_unknown": "Non è stato possibile leggere i progetti configurati, quindi non si sa se {{project}} abbia già una voce. Applicare riscriverebbe una voce esistente.",
+        "already_configured_reinspection": "Continuando si ispeziona di nuovo la voce esistente. Applicare un piano riscrive i campi contenuti nel piano nella voce di {{project}}: mai una seconda voce, e i campi non contenuti nel piano restano invariati.",
+        "already_configured_unknown": "Non è noto se {{project}} abbia già una voce: i progetti configurati non sono stati letti. Se una voce esiste, l'applicazione riscriverebbe i campi contenuti nel piano.",
         "an_approver_is_required": "Indica chi approva prima di applicare.",
         "applied_by": "Applicato sotto l'autorità di {{approver}}.",
         "apply_the_plan": "Applica il piano",

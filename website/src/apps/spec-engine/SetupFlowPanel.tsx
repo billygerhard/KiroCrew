@@ -516,10 +516,20 @@ export function SetupFlowPanel({
    * is already configured is UNKNOWN, not "no". Presenting doubt as "new
    * project" is the failure mode here, because the apply that follows would
    * overwrite an entry the operator was never told about.
+   *
+   * Both claims are gated on the field still holding the path the inspection
+   * ran against: once the operator edits past it, the note would name the OLD
+   * project while the next plan targets the new path — a positive claim riding
+   * evidence for a different subject.
    */
+  const inspectionCurrent = inspection !== undefined && inspect.variables === project
   const alreadyConfigured =
-    inspectedName !== '' && configuredProjects !== null && configuredProjects.includes(inspectedName)
-  const duplicateUnknown = inspectedName !== '' && configuredProjects === null
+    inspectionCurrent &&
+    inspectedName !== '' &&
+    configuredProjects !== null &&
+    configuredProjects.includes(inspectedName)
+  const duplicateUnknown =
+    inspectionCurrent && inspectedName !== '' && configuredProjects === null
 
   // Whether a step is genuinely unreachable, from the SAME state that gates its
   // own controls — never from rail position. `index > step` claimed the review

@@ -3984,8 +3984,8 @@
       "setupFlowPanel": {
         "a_missing_answer_is_unanswered": "Uma resposta ausente está sem resposta, não é um não. A aplicação recusa até que cada nível tenha um sim ou um não explícito.",
         "already_configured": "{{project}} já está configurado: este documento contém uma entrada com esse nome.",
-        "already_configured_reinspection": "Continuar reinspeciona a entrada existente. Aplicar um plano reescreve a entrada de {{project}} em vez de adicionar uma segunda.",
-        "already_configured_unknown": "Não foi possível ler os projetos configurados, portanto não se sabe se {{project}} já tem uma entrada. Aplicar reescreveria uma entrada existente.",
+        "already_configured_reinspection": "Continuar reinspeciona a entrada existente. Aplicar um plano reescreve os campos presentes no plano na entrada de {{project}} — nunca uma segunda entrada, e os campos ausentes do plano são preservados.",
+        "already_configured_unknown": "Não se sabe se {{project}} já tem uma entrada — os projetos configurados não foram lidos. Se uma entrada existir, aplicar reescreveria os campos presentes no plano.",
         "an_approver_is_required": "Diga quem aprova antes de aplicar.",
         "applied_by": "Aplicado sob a autoridade de {{approver}}.",
         "apply_the_plan": "Aplicar o plano",
