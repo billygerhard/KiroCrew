@@ -237,6 +237,16 @@ ul.se-findings li:last-child{border-bottom:none}
 .se-arm p{margin:0 0 8px;display:flex;gap:6px;align-items:flex-start}
 .se-arm svg{width:14px;height:14px;flex:none;color:var(--danger)}
 
+/* The projects table. The queue's grid rows verbatim — same header, same roving
+   focus, same selected tint — with four columns of its own, so the traversal a
+   reader learned on the queue is the traversal here. Declared at higher
+   specificity than the queue's own template rather than by a second class on
+   every row, and the action column is sized for the button rather than clamped
+   around it. */
+.se-projects .se-qhead,.se-projects .se-row{
+  grid-template-columns:minmax(0,1fr) 116px 84px 96px}
+.se-projects .se-row>span{padding:5px 10px}
+
 /* Config pane, in the same split: the document on the left where the list was,
    its read on the right where the inspector was. */
 .se-cfg{display:flex;flex-direction:column;min-height:0}

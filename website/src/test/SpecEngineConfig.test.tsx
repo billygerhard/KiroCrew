@@ -20,6 +20,21 @@
  *     `thrifty` and offer a reset that clears a different project's profile.
  *   - **The resolved view is a read.** It writes nothing on its own, and it fails
  *     as a refusal rather than as an empty table.
+ *
+ * The projects surface adds four more:
+ *
+ *   - **One query per project.** A shared key would leave one project's answer in
+ *     the cache and render it under a heading naming another, and a failed read
+ *     must state itself rather than presenting the retained answer — or the app
+ *     defaults — as what is in force.
+ *   - **A removal is a null at exactly one entry.** The store's merge keeps every
+ *     key a patch omits, so dropping the null sends a no-op the table would
+ *     render as a removal that happened; widening the patch deletes the section.
+ *   - **A refused removal keeps the entry.** A refused write returns no document,
+ *     so the row stays and nothing reports a removal that was only asked for.
+ *   - **An override count says what it counts.** A number beside a project is
+ *     worth nothing if a reader cannot tell whether the column next to it is one
+ *     of the things counted.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -113,11 +128,56 @@ function document() {
   }
 }
 
+/** The config read's shape around a given document. */
+function snapshot(doc: Record<string, unknown>) {
+  return {
+    configured: true,
+    path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
+    document: doc,
+    elided: [],
+    elided_marker: ELIDED,
+    errors: [],
+    advisories: [],
+    config_only_paths: [],
+  }
+}
+
+/**
+ * Two project entries, one of them carrying overrides beyond its own columns.
+ *
+ * `acme` declares a limit and a branch list; `widgets` declares nothing but its
+ * path. The branch list is what pins the count as a count of DECLARATIONS: it
+ * holds two elements and is one decision, so a count of leaves-in-arrays would
+ * make `acme` look more configured for having named a second branch.
+ */
+function twoProjects() {
+  return {
+    ...document(),
+    projects: {
+      acme: {
+        path: '/src/acme',
+        cost_profile: 'thrifty',
+        limits: { task_retry_limit: 3 },
+        protected_branches: ['main', 'release'],
+      },
+      widgets: { path: '/src/widgets' },
+    },
+  }
+}
+
 function stub(answers: {
   config?: Answer
+  /** The config read after a PUT lands, as the store would then answer it. */
+  configAfterPut?: Answer
   resolved?: Answer
+  /** Per-project resolved answers, keyed by the `project` parameter (`''` = none). */
+  resolvedFor?: Record<string, Answer>
+  /** The answer from the SECOND read of a project onwards, for a failed refetch. */
+  resolvedAgain?: Record<string, Answer>
   put?: Answer
 }) {
+  let written = false
+  const reads = new Map<string, number>()
   vi.stubGlobal(
     'fetch',
     vi.fn((url: string, init?: RequestInit) => {
@@ -126,22 +186,19 @@ function stub(answers: {
       let answer: Answer
       if (method === 'PUT') {
         answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
+        written = (answer.status ?? 200) < 300
       } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-        answer = answers.resolved ?? { body: resolved() }
+        const project = new URL(url, 'http://gateway.invalid').searchParams.get('project') ?? ''
+        const seen = (reads.get(project) ?? 0) + 1
+        reads.set(project, seen)
+        answer =
+          (seen > 1 ? answers.resolvedAgain?.[project] : undefined) ??
+          answers.resolvedFor?.[project] ??
+          answers.resolved ?? { body: resolved() }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
         answer =
-          answers.config ?? {
-            body: {
-              configured: true,
-              path: '/home/me/.kiro/crew/apps/spec-engine/config.json',
-              document: document(),
-              elided: [],
-              elided_marker: ELIDED,
-              errors: [],
-              advisories: [],
-              config_only_paths: [],
-            },
-          }
+          (written ? answers.configAfterPut : undefined) ??
+          answers.config ?? { body: snapshot(document()) }
       } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
         answer = {
           body: { switch: { engaged: false, unreadable: false }, stoppable: [], stoppable_credits: 0 },
@@ -504,5 +561,323 @@ describe('the resolved read beside the document', () => {
     // The resolved pane is a READ. Its only write is the reset, which is not
     // clicked here.
     expect(calls.filter((call) => call.method !== 'GET')).toEqual([])
+  })
+
+  it('shows a default-valued setting with its origin when every setting is asked for', async () => {
+    // A setting whose value equals the default because somebody PINNED it there is
+    // only distinguishable from an untouched one by its origin, so every setting
+    // has to be reachable — collapsed by default, never absent.
+    stub({})
+    await openConfig()
+    const toggle = await screen.findByRole('button', {
+      name: T.show_every_setting.replace('{{count}}', '2'),
+    })
+    fireEvent.click(toggle)
+    expect(await screen.findByText(T.every_setting_in_force)).toBeInTheDocument()
+    expect(screen.getByText('budget.warn_fraction')).toBeInTheDocument()
+    expect(screen.getByText(new RegExp(T.origin_bundled_default))).toBeInTheDocument()
+  })
+})
+
+describe('the projects table', () => {
+  /** The projects grid, which is not the roles table beside it. */
+  const grid = () => screen.getByRole('grid', { name: T.configured_projects })
+
+  /** Every row of it but the header. */
+  const rows = () => within(grid()).getAllByRole('row').slice(1)
+
+  /** The row-level removal control for one project, named by its target. */
+  const removeButton = (project: string) =>
+    within(grid()).getByRole('button', {
+      name: T.remove_project.replace('{{project}}', project),
+    })
+
+  /** The confirm inside the armed block, which names the entry it deletes. */
+  const confirmButton = (project: string) =>
+    screen.getByRole('button', { name: T.confirm_the_removal.replace('{{project}}', project) })
+
+  /** The document after `acme` is gone, as the store would answer it. */
+  function withoutAcme() {
+    return { ...twoProjects(), projects: { widgets: { path: '/src/widgets' } } }
+  }
+
+  /** The document after `widgets` is gone, as the store would answer it. */
+  function withoutWidgets() {
+    const doc = twoProjects()
+    return { ...doc, projects: { acme: doc.projects.acme } }
+  }
+
+  it('lists every entry with its pinned profile and override count, under an app-defaults row', async () => {
+    stub({ config: { body: snapshot(twoProjects()) } })
+    await openConfig()
+    const listed = rows()
+    expect(listed).toHaveLength(3)
+    // The app-wide resolution is a ROW, because it is one of the resolutions an
+    // operator compares against: it is what a project's values fall back to.
+    expect(listed[0]).toHaveTextContent(T.no_project_app_wide)
+    expect(within(listed[0]).queryByRole('button')).toBeNull()
+    expect(listed[1]).toHaveTextContent('acme')
+    expect(listed[1]).toHaveTextContent('thrifty')
+    // One limit and one branch list: the list is ONE declaration, so a longer
+    // branch list does not make the project look more configured.
+    expect(listed[1]).toHaveTextContent('2')
+    expect(listed[2]).toHaveTextContent('widgets')
+    expect(listed[2]).toHaveTextContent('0')
+  })
+
+  it('resolves for the project whose row is selected, and app-wide for the app-defaults row', async () => {
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      resolvedFor: {
+        widgets: {
+          body: resolved({
+            project: 'widgets',
+            settings: [
+              {
+                key: 'budget.run_credit_ceiling',
+                value: 12,
+                origin: 'project_config',
+                declared_at: 'projects.widgets.budget.run_credit_ceiling',
+                is_default: false,
+              },
+            ],
+          }),
+        },
+      },
+    })
+    await openConfig()
+    // The app-defaults row is selected first, and it names no project at all —
+    // the parameter is absent rather than empty.
+    await waitFor(() =>
+      expect(
+        calls.some((call) => call.url === '/api/apps/spec-engine/config/resolved'),
+      ).toBe(true),
+    )
+    expect(await screen.findByText(T.resolved_app_wide)).toBeInTheDocument()
+
+    fireEvent.click(within(grid()).getByText('widgets'))
+    // The heading follows the selection immediately; the values arrive with the
+    // read, so the assertion waits for the value rather than the label.
+    const key = await screen.findByText('budget.run_credit_ceiling')
+    expect(
+      screen.getByText(T.resolved_for_project.replace('{{project}}', 'widgets')),
+    ).toBeInTheDocument()
+    // The value and its origin scope on the same entry: a value without its
+    // origin cannot answer whether somebody chose it or the app ships it.
+    expect(key.nextElementSibling).toHaveTextContent('12')
+    expect(key.nextElementSibling).toHaveTextContent(T.origin_project_config)
+    expect(key.nextElementSibling).toHaveTextContent(
+      'projects.widgets.budget.run_credit_ceiling',
+    )
+    expect(
+      calls.some(
+        (call) => call.url === '/api/apps/spec-engine/config/resolved?project=widgets',
+      ),
+    ).toBe(true)
+  })
+
+  it('moves between rows with the arrow keys and with j/k', async () => {
+    stub({ config: { body: snapshot(twoProjects()) } })
+    await openConfig()
+    const press = (key: string) => {
+      const focused = rows().find(
+        (row) => row.getAttribute('aria-selected') === 'true',
+      ) as HTMLElement
+      focused.focus()
+      focused.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }))
+    }
+    // Exactly one row in the tab order, as the queue table does it: the rest are
+    // reachable by arrow key rather than costing a tab stop each.
+    expect(rows().filter((row) => row.getAttribute('tabindex') === '0')).toHaveLength(1)
+    press('ArrowDown')
+    await waitFor(() => expect(rows()[1]).toHaveAttribute('aria-selected', 'true'))
+    press('j')
+    await waitFor(() => expect(rows()[2]).toHaveAttribute('aria-selected', 'true'))
+    press('k')
+    await waitFor(() => expect(rows()[1]).toHaveAttribute('aria-selected', 'true'))
+    press('Home')
+    await waitFor(() => expect(rows()[0]).toHaveAttribute('aria-selected', 'true'))
+    press('End')
+    await waitFor(() => expect(rows()[2]).toHaveAttribute('aria-selected', 'true'))
+    // Selection follows focus, so traversal alone resolves for the row reached.
+    expect(
+      calls.some(
+        (call) => call.url === '/api/apps/spec-engine/config/resolved?project=widgets',
+      ),
+    ).toBe(true)
+  })
+
+  it('states a failed per-project resolution instead of another project\u2019s values', async () => {
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      resolvedFor: {
+        acme: { body: resolved() },
+        widgets: { status: 503, body: { code: 'config_unreadable', error: 'disk gone' } },
+      },
+    })
+    await openConfig()
+    fireEvent.click(within(grid()).getByText('acme'))
+    expect(await screen.findByText('limits.task_retry_limit')).toBeInTheDocument()
+
+    fireEvent.click(within(grid()).getByText('widgets'))
+    const alerts = await screen.findAllByRole('alert')
+    const refusal = alerts.find((node) =>
+      node.textContent?.includes(T.could_not_resolve_the_configuration),
+    )
+    expect(refusal).toBeDefined()
+    expect(refusal).toHaveTextContent('config_unreadable')
+    // One query per project. A single shared key would leave `acme`'s answer in
+    // the cache and render it under a heading naming `widgets`.
+    expect(screen.queryByText('limits.task_retry_limit')).toBeNull()
+  })
+
+  it('states a failed refetch instead of the values it had before', async () => {
+    // The retained-data trap, at the read most exposed to it: React Query keeps
+    // the last successful answer across a failed refetch, so a view that reached
+    // for the data before checking `isError` would keep presenting a resolution
+    // the gateway can no longer produce as the one in force.
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutAcme()) },
+      resolvedFor: { acme: { body: resolved() } },
+      resolvedAgain: {
+        acme: { status: 503, body: { code: 'config_unreadable', error: 'disk gone' } },
+      },
+    })
+    await openConfig()
+    fireEvent.click(within(grid()).getByText('acme'))
+    expect(await screen.findByText('limits.task_retry_limit')).toBeInTheDocument()
+
+    // A landed removal invalidates the resolved read; this refetch fails while
+    // the previous answer is still cached under the same key.
+    fireEvent.click(removeButton('widgets'))
+    fireEvent.click(confirmButton('widgets'))
+    await waitFor(() => expect(screen.queryByText('limits.task_retry_limit')).toBeNull())
+    const alerts = await screen.findAllByRole('alert')
+    expect(
+      alerts.some((node) =>
+        node.textContent?.includes(T.could_not_resolve_the_configuration),
+      ),
+    ).toBe(true)
+  })
+
+  it('arms before it removes, and sends a null at exactly the one entry', async () => {
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutAcme()) },
+    })
+    await openConfig()
+    fireEvent.click(removeButton('acme'))
+    // Arming writes nothing: the destructive step is two steps, and the first one
+    // is not a request.
+    expect(calls.some((call) => call.method === 'PUT')).toBe(false)
+
+    fireEvent.click(confirmButton('acme'))
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
+    expect(putBody()).toEqual({ projects: { acme: null } })
+    // Spelled out, because both halves of this are load-bearing: the null IS the
+    // deletion (the store's merge keeps every key a patch omits, so dropping it
+    // sends a no-op the table would render as a removal that happened), and the
+    // patch names ONE entry (a wider one would delete the whole section).
+    expect(JSON.stringify(putBody())).toBe('{"projects":{"acme":null}}')
+  })
+
+  it('re-renders from the document the store answers after the write', async () => {
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutAcme()) },
+    })
+    await openConfig()
+    fireEvent.click(removeButton('acme'))
+    fireEvent.click(confirmButton('acme'))
+    await waitFor(() => expect(rows()).toHaveLength(2))
+    expect(within(grid()).queryByText('acme')).toBeNull()
+    expect(
+      screen.getByText(T.removed_the_project_entry.replace('{{project}}', 'acme')),
+    ).toBeInTheDocument()
+  })
+
+  it('keeps the entry and states the refusal when the write is refused', async () => {
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      put: {
+        status: 403,
+        body: { code: 'config_write_refused', error: 'projects is not writable here' },
+      },
+    })
+    await openConfig()
+    fireEvent.click(removeButton('acme'))
+    fireEvent.click(confirmButton('acme'))
+    const alerts = await screen.findAllByRole('alert')
+    const refusal = alerts.find((node) =>
+      node.textContent?.includes(T.could_not_remove_the_project_entry),
+    )
+    expect(refusal).toBeDefined()
+    expect(refusal).toHaveTextContent('config_write_refused')
+    // A refused write returns no document, so the entry is still there — and the
+    // pane must not report a removal it only asked for.
+    expect(within(grid()).getByText('acme')).toBeInTheDocument()
+    expect(
+      screen.queryByText(T.removed_the_project_entry.replace('{{project}}', 'acme')),
+    ).toBeNull()
+  })
+
+  it('stops resolving for an entry it just removed', async () => {
+    // A selection pointing at a deleted entry resolves through the app-wide
+    // layers and would be LABELLED as that project, which reads as "this project
+    // inherits everything" rather than "this project is gone".
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutAcme()) },
+    })
+    await openConfig()
+    fireEvent.click(within(grid()).getByText('acme'))
+    expect(
+      await screen.findByText(T.resolved_for_project.replace('{{project}}', 'acme')),
+    ).toBeInTheDocument()
+    fireEvent.click(removeButton('acme'))
+    fireEvent.click(confirmButton('acme'))
+    expect(await screen.findByText(T.resolved_app_wide)).toBeInTheDocument()
+    expect(
+      screen.queryByText(T.resolved_for_project.replace('{{project}}', 'acme')),
+    ).toBeNull()
+  })
+
+  it('withdraws an arm whose entry left the document', async () => {
+    // The editor beside the table can delete the same entry while the confirm
+    // sits on screen, and a confirm would then send a deletion for a key that is
+    // no longer there — a recorded write for a change nobody made.
+    stub({
+      config: { body: snapshot(twoProjects()) },
+      configAfterPut: { body: snapshot(withoutWidgets()) },
+    })
+    await openConfig()
+    fireEvent.click(removeButton('widgets'))
+    expect(confirmButton('widgets')).toBeInTheDocument()
+
+    const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
+    fireEvent.change(editor, { target: { value: JSON.stringify(withoutWidgets(), null, 2) } })
+    fireEvent.click(screen.getByRole('button', { name: T.validate_and_save }))
+    await waitFor(() => expect(rows()).toHaveLength(2))
+    expect(
+      screen.queryByRole('button', {
+        name: T.confirm_the_removal.replace('{{project}}', 'widgets'),
+      }),
+    ).toBeNull()
+  })
+
+  it('says what the override count counts', async () => {
+    // A number beside a project is worth nothing if a reader cannot tell whether
+    // the pinned profile in the column next to it is one of the things counted.
+    stub({ config: { body: snapshot(twoProjects()) } })
+    await openConfig()
+    expect(await screen.findByText(T.overrides_counts_declared_values)).toBeInTheDocument()
+  })
+
+  it('says so when the document holds no project at all', async () => {
+    stub({ config: { body: snapshot({ limits: { task_retry_limit: 7 } }) } })
+    await openConfig()
+    expect(rows()).toHaveLength(1)
+    expect(await screen.findByText(T.no_project_is_configured_yet)).toBeInTheDocument()
   })
 })

@@ -84,6 +84,39 @@ class TestWritePath:
         assert effective.is_default
         assert "task_retry_limit" not in store.document().get("limits", {})
 
+    def test_a_null_project_entry_removes_it_and_leaves_its_siblings_alone(
+        self, store: ConfigStore
+    ):
+        # How a surface removes a project: an ordinary patch carrying ``None`` at
+        # the entry, through this one validated write path rather than a delete
+        # route of its own. What has to hold is what the dashboard states beside
+        # the control — the named entry goes, and no other project's stored entry
+        # or resolved value moves — so both halves are asserted here rather than
+        # inferred from the merge rule.
+        store.write(
+            {
+                "projects": {
+                    "acme": {"path": "/w/acme", "limits": {"task_retry_limit": 3}},
+                    "widgets": {"path": "/w/widgets", "limits": {"task_retry_limit": 5}},
+                }
+            },
+            surface=DASHBOARD_SURFACE,
+        )
+        before = store.effective("limits.task_retry_limit", project="widgets")
+        store.write({"projects": {"acme": None}}, surface=DASHBOARD_SURFACE)
+        saved = store.document()
+        assert set(saved["projects"]) == {"widgets"}
+        assert saved["projects"]["widgets"] == {
+            "path": "/w/widgets",
+            "limits": {"task_retry_limit": 5},
+        }
+        after = store.effective("limits.task_retry_limit", project="widgets")
+        assert (after.value, after.origin) == (before.value, before.origin)
+        # And the removed project keeps nothing of its own: it resolves through the
+        # wider layers, which is the difference between "removed" and "hidden".
+        gone = store.effective("limits.task_retry_limit", project="acme")
+        assert gone.origin is not ValueOrigin.PROJECT_CONFIG
+
     def test_an_invalid_patch_is_refused_and_leaves_the_document_untouched(
         self, store: ConfigStore
     ):
@@ -430,6 +463,21 @@ class TestWriteRecord:
         assert records[0]["actor"] == "ada@example"
         assert records[0]["keys"] == ["limits"]
         assert records[0]["ts"]
+
+    def test_a_removal_is_recorded_like_any_other_write(self, store: ConfigStore):
+        # A deletion is a write, and the question an incident asks about a project
+        # that vanished from the configuration is the same one it asks about a
+        # setting somebody changed: who did it. The record is what answers it, so
+        # the ``None``-valued patch must not slip through unrecorded.
+        store.write(
+            {"projects": {"acme": {"path": "/w/acme"}}}, surface=DASHBOARD_SURFACE, actor="ada"
+        )
+        store.write({"projects": {"acme": None}}, surface=DASHBOARD_SURFACE, actor="bo")
+        records = store.writes()
+        assert len(records) == 2
+        assert records[1]["actor"] == "bo"
+        assert records[1]["keys"] == ["projects"]
+        assert records[1]["ts"]
 
     def test_the_record_survives_the_store_object(self, store: ConfigStore):
         # The point of the record is that it outlives the process that wrote it,

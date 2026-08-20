@@ -42,6 +42,21 @@
  * the profile is shared — because clearing it changes every project that selected
  * that profile, which is exactly the fact a label reading `Reset` would hide.
  *
+ * ## Which configuration governs which project
+ *
+ * The left pane leads with a table of every entry in the document's `projects`
+ * section plus a fixed app-defaults row, and the row selected there is what the
+ * resolved read beside it resolves FOR. That is one flow rather than a list and
+ * an unrelated picker: a pane with two controls for one reading is a pane that
+ * can name one project in its heading while showing another's values.
+ *
+ * A row's removal is the same PUT every other edit uses, with `null` at the
+ * entry — `ConfigStore._merge` deletes a key whose patch value is null, so no
+ * delete route exists to review, and the removal is validated, locked and
+ * recorded exactly like a save. It is armed then confirmed in flow, and the
+ * confirm names the project, because "Remove" five times over five rows is how
+ * somebody removes the wrong one.
+ *
  * ## Layout rules this file must not break
  *
  * No drawer, no modal, no scrim: the selected design passes the "safety controls are
@@ -51,8 +66,9 @@
  * are — a document that grows with its line count would push the save controls off
  * the pane.
  */
-import { Fragment, useCallback, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AlertTriangle } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
@@ -88,6 +104,9 @@ const NONE = '\u2014'
 
 /** The resolved read with no project named. Not a project id, so not a valid one. */
 const APP_WIDE = ''
+
+/** React key for the app-defaults row, whose id is deliberately not a project. */
+const APP_DEFAULTS_ROW_KEY = 'app-defaults'
 
 /**
  * The origin of a value in force, in words, keyed by the engine's own enum.
@@ -309,6 +328,281 @@ function DocumentEditor({ config }: { config: ConfigSnapshot }) {
   )
 }
 
+/**
+ * Fields of a project entry that have a column of their own in the table.
+ *
+ * Excluded from the override count for that reason, not because they are less
+ * important: a reader who can see the pinned profile in its own column and then
+ * counts it again under "overrides" learns that the number means nothing.
+ */
+const ENTRY_OWN_COLUMNS: readonly string[] = ['path', 'cost_profile']
+
+/**
+ * How many values a document node declares, counting leaves.
+ *
+ * An array is one declaration rather than one per element: `protected_branches`
+ * is a single decision an operator made, and counting its elements would make a
+ * project look more configured the longer its branch list is.
+ */
+function declaredValues(node: unknown): number {
+  if (!isObject(node)) return 1
+  return Object.values(node).reduce((total: number, child) => total + declaredValues(child), 0)
+}
+
+/** The values a project entry declares beyond the fields shown beside the count. */
+function overrideCount(entry: unknown): number {
+  if (!isObject(entry)) return 0
+  let total = 0
+  for (const [key, value] of Object.entries(entry)) {
+    if (ENTRY_OWN_COLUMNS.includes(key)) continue
+    total += declaredValues(value)
+  }
+  return total
+}
+
+/** One row of the projects table: a stored entry, or the app-wide resolution. */
+interface ProjectRow {
+  /** The `projects` key, or `APP_WIDE` for the fixed app-defaults row. */
+  id: string
+  /** The cost profile the entry pins, `''` when it pins none. */
+  profile: string
+  /** Values the entry declares, apart from the ones with their own column. */
+  overrides: number
+  /** Whether the row addresses a stored entry, so a removal has a target. */
+  stored: boolean
+}
+
+/** The app-defaults row, then one row per stored entry in name order. */
+function projectRows(document: Document): ProjectRow[] {
+  const node = document.projects
+  const entries = isObject(node) ? node : {}
+  return [
+    { id: APP_WIDE, profile: '', overrides: 0, stored: false },
+    ...Object.keys(entries)
+      .sort()
+      .map((name) => {
+        const entry = entries[name]
+        const profile = isObject(entry) ? entry.cost_profile : undefined
+        return {
+          id: name,
+          profile: typeof profile === 'string' ? profile : '',
+          overrides: overrideCount(entry),
+          stored: true,
+        }
+      }),
+  ]
+}
+
+/**
+ * Every configured project, and the removal for one.
+ *
+ * The table is the surface's answer to "which configuration governs which
+ * project": the document beside it holds the same facts, but reading a project's
+ * pinned profile out of a JSON blob is not the same as seeing it in a column
+ * next to the other projects'. Selecting a row is what the resolved read beside
+ * it resolves FOR, so the two are one flow rather than a list and an unrelated
+ * picker.
+ *
+ * The app-defaults row is a row rather than a header link because it IS one of
+ * the resolutions an operator compares against: it is what a project's values
+ * fall back to, and what resolution looks like for a project this document has
+ * never heard of.
+ *
+ * Keyboard traversal is the queue table's: a roving tabindex over `role="row"`
+ * elements with selection following focus, so the rail's advertised `j`/`k` keys
+ * work here too and no row is reachable only by pointer.
+ */
+function ProjectsTable({
+  config,
+  project,
+  onSelect,
+}: {
+  config: ConfigSnapshot
+  project: string
+  onSelect: (project: string) => void
+}) {
+  const client = useQueryClient()
+  const [armed, setArmed] = useState<string | null>(null)
+  const [removed, setRemoved] = useState<string>('')
+  const rowRefs = useRef(new Map<string, HTMLDivElement>())
+
+  const rows = useMemo(() => projectRows(config.document), [config.document])
+
+  const remove = useMutation({
+    // A removal is an ordinary configuration write: `null` at the entry, through
+    // the same single write path a save uses. The engine's merge deletes a key
+    // whose patch value is null, so no delete route has to exist — and the write
+    // is validated, locked and recorded exactly like every other one.
+    mutationFn: (name: string) => specEngineApi.writeConfig({ projects: { [name]: null } }),
+    onSuccess: (_reply, name) => {
+      setArmed(null)
+      setRemoved(name)
+      // The read is the pane's one source for the document: the editor's
+      // baseline, this table and the resolved view all come from it, and the
+      // reply carries no elision list or validation errors to rebuild a snapshot
+      // from. So the reply is not adopted — the query is invalidated and the
+      // table re-renders from what the store now returns.
+      void client.invalidateQueries({ queryKey: QK.config })
+      void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
+      // A selection pointing at a deleted entry would resolve to the app-wide
+      // layers and be LABELLED as that project, which reads as "this project
+      // inherits everything" rather than "this project is gone".
+      if (project === name) onSelect(APP_WIDE)
+    },
+  })
+
+  // An arm outlives the entry it names unless it is withdrawn: another surface
+  // (or a document edit in the pane beside this one) can delete the entry while
+  // the confirm sits on screen, and a confirm then sends a deletion for a key
+  // that no longer exists.
+  useEffect(() => {
+    if (armed !== null && !rows.some((row) => row.id === armed)) setArmed(null)
+  }, [armed, rows])
+
+  const onRowKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>, index: number) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return
+      let next = -1
+      if (event.key === 'ArrowDown' || event.key === 'j') next = index + 1
+      else if (event.key === 'ArrowUp' || event.key === 'k') next = index - 1
+      else if (event.key === 'Home') next = 0
+      else if (event.key === 'End') next = rows.length - 1
+      else return
+      event.preventDefault()
+      const target = rows[Math.min(Math.max(next, 0), rows.length - 1)]
+      if (target) rowRefs.current.get(target.id)?.focus()
+    },
+    [rows],
+  )
+
+  return (
+    <div className="se-blk">
+      <h3>{i18nT('apps.specEngine.configPanel.projects')}</h3>
+      <div
+        className="se-q se-projects"
+        role="grid"
+        aria-label={i18nT('apps.specEngine.configPanel.configured_projects')}
+      >
+        <div className="se-qhead" role="row">
+          <span role="columnheader">{i18nT('apps.specEngine.configPanel.col_project')}</span>
+          <span role="columnheader">{i18nT('apps.specEngine.configPanel.col_cost_profile')}</span>
+          <span role="columnheader">{i18nT('apps.specEngine.configPanel.col_overrides')}</span>
+          <span role="columnheader">{i18nT('apps.specEngine.configPanel.remove')}</span>
+        </div>
+        {rows.map((row, index) => {
+          const selected = row.id === project
+          return (
+            <div
+              key={row.id || APP_DEFAULTS_ROW_KEY}
+              ref={(node) => {
+                if (node) rowRefs.current.set(row.id, node)
+                else rowRefs.current.delete(row.id)
+              }}
+              className="se-row"
+              role="row"
+              aria-selected={selected}
+              tabIndex={selected ? 0 : -1}
+              onFocus={(event) => {
+                // The ROW's own focus, not a control's inside it. React's `onFocus`
+                // rides `focusin`, which bubbles, so a click on the removal button
+                // would otherwise re-select the row and silently re-resolve for a
+                // project the operator was only about to delete.
+                if (event.target === event.currentTarget) onSelect(row.id)
+              }}
+              onClick={() => rowRefs.current.get(row.id)?.focus()}
+              onKeyDown={(event) => onRowKeyDown(event, index)}
+            >
+              <span role="gridcell" className={row.stored ? 'se-m' : undefined}>
+                {row.id || i18nT('apps.specEngine.configPanel.no_project_app_wide')}
+              </span>
+              <span role="gridcell" className="se-m">
+                {row.profile || NONE}
+              </span>
+              <span role="gridcell" className="se-cost">
+                {row.stored ? fmtNumber(row.overrides) : NONE}
+              </span>
+              <span role="gridcell">
+                {row.stored && (
+                  <button
+                    type="button"
+                    className="se-btn se-sm se-danger"
+                    // The accessible name carries the target even though the
+                    // visible label is one word: five rows of identical
+                    // "Remove" buttons are five identical announcements.
+                    aria-label={i18nT('apps.specEngine.configPanel.remove_project', {
+                      project: row.id,
+                    })}
+                    disabled={remove.isPending}
+                    onClick={(event) => {
+                      // Arming is not a request to resolve for this project: the
+                      // row click would select it, and a reader watching the pane
+                      // beside the table would see it change under a confirm.
+                      event.stopPropagation()
+                      setRemoved('')
+                      remove.reset()
+                      setArmed(row.id)
+                    }}
+                  >
+                    {i18nT('apps.specEngine.configPanel.remove')}
+                  </button>
+                )}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+      {rows.length === 1 && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.configPanel.no_project_is_configured_yet')}
+        </p>
+      )}
+      <p className="se-note">
+        {i18nT('apps.specEngine.configPanel.overrides_counts_declared_values')}
+      </p>
+
+      {armed !== null && (
+        /* In flow under the table, never a dialog: the confirmation for a
+           destructive edit is a sibling block for the same reason the kill
+           switch's is, and a browser `confirm()` would state the blast radius in
+           a string no catalog holds. */
+        <div className="se-arm">
+          <p>
+            <AlertTriangle className="lucide-inline" aria-hidden="true" />
+            {i18nT('apps.specEngine.configPanel.removing_deletes_the_entry', { project: armed })}
+          </p>
+          <p className="se-note">
+            {i18nT('apps.specEngine.configPanel.after_removal_work_falls_back_to_app_wide')}
+          </p>
+          <div className="se-acts">
+            <button
+              type="button"
+              className="se-btn se-danger"
+              disabled={remove.isPending}
+              onClick={() => remove.mutate(armed)}
+            >
+              {i18nT('apps.specEngine.configPanel.confirm_the_removal', { project: armed })}
+            </button>
+            <button type="button" className="se-btn" onClick={() => setArmed(null)}>
+              {i18nT('apps.specEngine.configPanel.keep_the_project_entry')}
+            </button>
+          </div>
+        </div>
+      )}
+      {remove.isError && (
+        <Refused
+          title={i18nT('apps.specEngine.configPanel.could_not_remove_the_project_entry')}
+          error={remove.error}
+        />
+      )}
+      {removed !== '' && (
+        <p className="se-note" role="status">
+          {i18nT('apps.specEngine.configPanel.removed_the_project_entry', { project: removed })}
+        </p>
+      )}
+    </div>
+  )
+}
+
 /** The value in force for one setting, rendered as JSON so a type is visible. */
 function settingValue(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value)
@@ -471,16 +765,15 @@ function MatchTrace({ role, document }: { role: ResolvedRole; document: Document
  * named — without one, a project-scoped value and the profile a project selected are
  * both invisible, and a table that showed the app-wide resolution as "the" answer
  * would be wrong for every project.
+ *
+ * The project is the table's selection rather than this pane's own state: two
+ * controls for one reading is how a pane comes to claim a resolution for a
+ * project other than the one whose row is highlighted.
  */
-function ResolvedPane({ config }: { config: ConfigSnapshot }) {
+function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: string }) {
   const client = useQueryClient()
-  const [project, setProject] = useState<string>(APP_WIDE)
   const [selectedRole, setSelectedRole] = useState<string>('')
-
-  const projects = useMemo(() => {
-    const node = config.document.projects
-    return isObject(node) ? Object.keys(node).sort() : []
-  }, [config.document])
+  const [everySetting, setEverySetting] = useState(false)
 
   const resolved = useQuery({
     queryKey: QK.resolved(project),
@@ -501,8 +794,10 @@ function ResolvedPane({ config }: { config: ConfigSnapshot }) {
 
   const order = resolved.data?.role_order ?? []
   const roles = resolved.data?.roles
-  const configured = (resolved.data?.settings ?? []).filter((value) => !value.is_default)
-  const defaults = (resolved.data?.settings ?? []).length - configured.length
+  const settings = resolved.data?.settings ?? []
+  const configured = settings.filter((value) => !value.is_default)
+  const defaults = settings.length - configured.length
+  const shownSettings = everySetting ? settings : configured
   const shownRole = roles?.roles[selectedRole || order[0] || '']
 
   return (
@@ -518,36 +813,11 @@ function ResolvedPane({ config }: { config: ConfigSnapshot }) {
         </span>
       </div>
       <div className="se-insp-body">
-        {/* Chips rather than a dropdown: the same control the queue's filters use, and
-            a dropdown here would be a popup drawn over the page — the one thing this
-            design's safety criterion rests on not existing. */}
-        <div className="se-filters" role="group" aria-label={i18nT('apps.specEngine.configPanel.resolve_for')}>
-          <button
-            type="button"
-            className="se-filter"
-            aria-pressed={project === APP_WIDE}
-            onClick={() => setProject(APP_WIDE)}
-          >
-            {i18nT('apps.specEngine.configPanel.no_project_app_wide')}
-          </button>
-          {projects.map((name) => (
-            <button
-              key={name}
-              type="button"
-              className="se-filter se-m"
-              aria-pressed={project === name}
-              onClick={() => setProject(name)}
-            >
-              {name}
-            </button>
-          ))}
-          {projects.length === 0 && (
-            <span className="se-note">
-              {i18nT('apps.specEngine.configPanel.no_project_is_configured_yet')}
-            </span>
-          )}
-        </div>
-
+        {/* `isError` is read BEFORE the data, because React Query keeps the last
+            successful answer across a failed refetch. A reading that reached for
+            the data first would render the previous project's values, or the
+            app-wide ones, as this project's resolution — with the head above
+            naming this project. Doubt has to look like doubt. */}
         {resolved.isError ? (
           <Refused
             title={i18nT('apps.specEngine.configPanel.could_not_resolve_the_configuration')}
@@ -617,14 +887,18 @@ function ResolvedPane({ config }: { config: ConfigSnapshot }) {
             {shownRole && <MatchTrace role={shownRole} document={config.document} />}
 
             <div className="se-blk">
-              <h3>{i18nT('apps.specEngine.configPanel.values_not_at_their_default')}</h3>
-              {configured.length === 0 ? (
+              <h3>
+                {everySetting
+                  ? i18nT('apps.specEngine.configPanel.every_setting_in_force')
+                  : i18nT('apps.specEngine.configPanel.values_not_at_their_default')}
+              </h3>
+              {shownSettings.length === 0 ? (
                 <p className="se-note">
                   {i18nT('apps.specEngine.configPanel.every_setting_is_at_its_bundled_default')}
                 </p>
               ) : (
                 <dl className="se-kv">
-                  {configured.map((value) => (
+                  {shownSettings.map((value) => (
                     <Fragment key={value.key}>
                       <dt className="se-m">{value.key}</dt>
                       <dd>
@@ -644,6 +918,25 @@ function ResolvedPane({ config }: { config: ConfigSnapshot }) {
                 {SEP}
                 <span className="se-m">{fmtNumber(Math.max(defaults, 0))}</span>
               </p>
+              {/* The default-valued settings are collapsed rather than absent: the
+                  origin is the whole point of this read, and a setting whose value
+                  equals the default because somebody PINNED it there is only
+                  distinguishable from an untouched one by reading its origin. In
+                  flow, so nothing is drawn over the page to show them. */}
+              <div className="se-acts" style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  className="se-btn se-sm"
+                  aria-pressed={everySetting}
+                  onClick={() => setEverySetting((shown) => !shown)}
+                >
+                  {everySetting
+                    ? i18nT('apps.specEngine.configPanel.show_only_values_not_at_their_default')
+                    : i18nT('apps.specEngine.configPanel.show_every_setting', {
+                        count: fmtNumber(settings.length),
+                      })}
+                </button>
+              </div>
             </div>
           </>
         )}
@@ -670,6 +963,10 @@ export function ConfigPane({
   error: unknown
   pending: boolean
 }) {
+  // The selected project lives here, above both halves of the pane: the table on
+  // the left is what selects it and the resolved read on the right is what it is
+  // read FOR, and a copy on either side is how the two come to disagree.
+  const [project, setProject] = useState<string>(APP_WIDE)
   return (
     <>
       <section className="se-cfg">
@@ -691,7 +988,13 @@ export function ConfigPane({
               {i18nT('apps.specEngine.specEnginePage.reading_the_configuration')}
             </p>
           ) : (
-            <DocumentEditor config={config} />
+            <>
+              {/* Above the document rather than below it: the question this pane
+                  is opened with is "which configuration governs which project",
+                  and the answer must not sit under a fixed-height editor. */}
+              <ProjectsTable config={config} project={project} onSelect={setProject} />
+              <DocumentEditor config={config} />
+            </>
           )}
         </div>
       </section>
@@ -706,7 +1009,7 @@ export function ConfigPane({
             </p>
           </div>
         ) : (
-          <ResolvedPane config={config} />
+          <ResolvedPane config={config} project={project} />
         )}
       </section>
     </>
