@@ -118,9 +118,15 @@ must not cover the strip.
 - **ProjectPicker adoption**: a Browse button next to the path field anchors
   the shared `ProjectPicker` (same props as `FolderConfigModal`'s usage);
   `onSelect` fills the path field with the absolute path and closes the
-  picker. Manual typing stays live. If `browseDirs` fails, the picker's own
-  error surface states it and the path field is untouched — typing remains the
-  fallback (fail-open to manual entry, fail-closed on nothing).
+  picker. Manual typing stays live. The shared component gains two ADDITIVE,
+  fence-allowlisted props — `reservedBottom` (the popover's downward layout
+  never enters the given bottom band; the pane passes the safety strip's
+  measured height at open, floored at a collapsed-row constant) and
+  `onBrowseResult` (reports every directory read's outcome, since the picker
+  itself swallows read rejections and renders an unchanged list). A failed
+  browse is stated by the PANE beside the field from that callback; the path
+  field is untouched — typing remains the fallback (fail-open to manual
+  entry, fail-closed on nothing).
 - **Duplicate detection (R4.3)**: the inspect reply's project name is compared
   against the keys of `document.projects` from the already-loaded config
   query. On a match, the panel states the project is already configured and
@@ -188,7 +194,7 @@ Design decisions and rationale:
 | Nav order derived from the same `firstRun` value as the landing rule | One derivation consumed by both prevents the landing and the rail from disagreeing (the class of two-rules-one-flag bugs the review gate caught in 6.4) |
 | Duplicate detection compares the inspect reply's project name to document keys | The engine owns name derivation; the UI comparing derived-name-to-stored-key can neither false-positive on path spelling nor invent its own normalization |
 | No new mockup round | The projects table + docked resolved view and the orientation block extend the recorded mockup-b design language (single ordered table, docked inspector, no overlays); the visual spec remains mockup-b as corrected in design/selection.md, and this decision is recorded here for the owner's veto alongside the still-pending mockup-b selection |
-| ProjectPicker reused as-is | The dashboard convention (documented at its other call sites) is one shared picker; a reimplementation would fork keyboard and recents behavior |
+| ProjectPicker reused, extended with two additive fence-allowlisted props | The dashboard convention (documented at its other call sites) is one shared picker; a reimplementation would fork keyboard and recents behavior. The strip-clearance bound and read-outcome reporting cannot live outside the component, so they were added to it with defaults that leave every existing call site unchanged |
 
 ## Error Handling
 
@@ -234,6 +240,7 @@ their own suites). Framework: vitest + Testing Library in
 - **Gates**: the six SpecEngine vitest suites, `npx tsc -b`, eslint on touched
   files, `npm run i18n:check` (catalog completeness, DNT, manifest-sync),
   `node scripts/check-app-manifest-sync.mjs`, and the app-boundary fence
-  pytest (no out-of-territory file is modified; ProjectPicker is imported, not
-  edited). Backend pytest suites run as regression confirmation; no backend
-  source change is expected.
+  pytest (ProjectPicker's two additive props and its own suite are the two
+  reviewed allowlist entries; everything else outside the territory is
+  import-only). Backend pytest suites run as regression confirmation; no
+  backend source change is expected.

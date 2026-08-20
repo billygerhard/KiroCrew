@@ -613,6 +613,32 @@ describe('the project path', () => {
     expect(api.recentProjects).toHaveBeenCalledTimes(1)
   })
 
+  it('reserves the strip\u2019s measured height, not just the collapsed row', async () => {
+    // An armed switch or a standing verdict grows the strip to ~100-250px (its
+    // panel renders as in-flow lines of the row), and the confirm control lives
+    // in that growth. The reservation handed to the picker is the strip's
+    // measured height at open plus margin — a constant sized for the collapsed
+    // row would let the popover cover the confirm control.
+    stub({})
+    stubPicker({ recent: ['/home/me/src/acme'] })
+    renderPage()
+    await screen.findByRole('button', { name: T.browse })
+    const strip = document.querySelector('.se-status') as HTMLElement
+    vi.spyOn(strip, 'getBoundingClientRect').mockReturnValue({
+      height: 250, width: 900, top: 250, bottom: 500, left: 0, right: 900, x: 0, y: 250,
+      toJSON: () => ({}),
+    } as DOMRect)
+    Object.defineProperty(window, 'innerHeight', { value: 500, configurable: true })
+    fireEvent.click(screen.getByRole('button', { name: T.browse }))
+    const drop = (
+      await screen.findByRole('listbox', { name: PICKER.recent_projects })
+    ).closest('div.fixed') as HTMLElement
+    // Downward layout: bottom edge = top + height must clear the 250px strip
+    // plus margin (reserve 264), i.e. stay at or above 500 - 264 = 236. The
+    // collapsed-row constant (48) would put it at 448, inside the strip.
+    expect(parseInt(drop.style.top) + parseInt(drop.style.height)).toBeLessThanOrEqual(236)
+  })
+
   it('leaves the kill switch on screen and operable while the picker is open', async () => {
     stub({})
     stubPicker({ recent: ['/home/me/src/acme'] })

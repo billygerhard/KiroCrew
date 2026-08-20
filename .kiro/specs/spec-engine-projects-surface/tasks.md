@@ -38,6 +38,7 @@ no backend route is added or changed; removal rides the existing guarded PUT's
     - _Requirements: 1.3, 1.4, 1.6, 1.7, 2.1, 2.2, 2.3, 2.4, 2.5_
   - [ ] 2.2 Repeatable setup and duplicate detection
     - Setup pane fully usable when projects already exist (not first-run-only); apply success invalidates the config query so the projects table and first-run derivation update without a reload
+    - The pane's `<h1>` currently renders "Nothing is configured yet" unconditionally (carried from 2.1's round-3 review): give the configured state its own honest heading — the panel already receives `firstRun` — with the new string in every catalog
     - Compare the inspect reply's derived project name against `document.projects` keys from the already-loaded config query; on a match, state the project is already configured and frame continuing as re-inspection of the existing entry — the UI derives no names from paths itself
     - Assert the apply patch shape touches only the new project's entry (prior entries unchanged through the merge) and that the named-approver gate is exercised identically for an additional project
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_

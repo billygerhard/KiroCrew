@@ -82,8 +82,11 @@
  * popover with no scrim and no focus trap. Anchor placement alone does NOT keep it
  * off the safety strip — on a short viewport the picker's downward layout runs to
  * within a few pixels of the viewport bottom — so the pane passes the picker a
- * reserved bottom band (`STRIP_CLEARANCE_PX`) that its DOWNWARD layout never
- * extends into; a popover that cannot fit above the band flips upward instead. A
+ * reserved bottom band — the strip's MEASURED height at open plus margin,
+ * floored at `STRIP_CLEARANCE_PX`, because an armed switch or a standing
+ * verdict grows the strip well past its collapsed row — that the picker's
+ * DOWNWARD layout never extends into; a popover that cannot fit above the band
+ * flips upward instead. A
  * flipped popover ends above its anchor, and the anchor sits in the pane's work
  * area above the strip, which is what keeps that branch clear. The safety strip
  * therefore stays visible, focusable and clickable while the picker is open.
@@ -135,12 +138,17 @@ const REVIEW_STEP_KEY = 'apps.specEngine.specEnginePage.step_review_the_plan'
 const APPROVE_STEP_KEY = 'apps.specEngine.specEnginePage.step_approve_and_apply'
 
 /**
- * Viewport pixels above the bottom edge the directory picker may never cover:
- * the safety strip's row (~34px) plus breathing room. Handed to the picker as
- * `reservedBottom`, which subtracts it from the downward layout's available
- * space BEFORE the flip decision — the bound the pane's docstring relies on.
+ * The FLOOR of the picker's reserved bottom band: the collapsed strip's row
+ * (~34px) plus breathing room. The strip is content-sized and GROWS when the
+ * kill switch is armed or a verdict is on screen (its panel renders as in-flow
+ * lines of the row), so the band actually handed to the picker is the strip's
+ * measured height at open time plus margin, floored here — a constant sized
+ * for the collapsed row would let the popover cover the confirm control.
  */
 const STRIP_CLEARANCE_PX = 48
+
+/** Margin added above the measured strip so the popover never sits flush on it. */
+const STRIP_MARGIN_PX = 14
 
 /** The four steps, in the order the flow walks them. Shared with the page's rail. */
 export const SETUP_STEPS: readonly string[] = [
@@ -335,6 +343,10 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
   const [applied, setApplied] = useState<SetupApplied | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [browseFailed, setBrowseFailed] = useState(false)
+  // The bottom band handed to the picker: the strip's measured height at open
+  // plus margin, floored at the collapsed row's clearance. State rather than a
+  // measurement in render, so the value is taken once per open.
+  const [stripReserve, setStripReserve] = useState(STRIP_CLEARANCE_PX)
   const browseRef = useRef<HTMLButtonElement>(null)
 
   /**
@@ -367,6 +379,16 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
     // drill-in, parent), not a separate probe that could disagree with the list
     // actually on screen.
     setBrowseFailed(false)
+    // The reservation is the strip's height NOW, not the collapsed row's
+    // constant: an armed switch or a standing verdict renders as in-flow lines
+    // of the strip, growing it to ~100-250px, and the confirm control lives in
+    // that growth. Measured at open — the strip cannot grow underneath an open
+    // picker except through the switch's own controls, which close it via the
+    // outside-mousedown dismiss before the panel expands.
+    const strip = document.querySelector('.se-status')
+    const measured =
+      strip instanceof HTMLElement ? strip.getBoundingClientRect().height + STRIP_MARGIN_PX : 0
+    setStripReserve(Math.max(STRIP_CLEARANCE_PX, Math.ceil(measured)))
     setPickerOpen(true)
   }, [])
 
@@ -573,7 +595,7 @@ export function SetupFlowPanel({ firstRun }: { firstRun: boolean }) {
               // The popover may never extend into the strip's band at the bottom
               // of the viewport; the picker flips upward when it cannot fit
               // above it. The reservation, not anchor placement, is the bound.
-              reservedBottom={STRIP_CLEARANCE_PX}
+              reservedBottom={stripReserve}
               // Every read the picker makes reports here, so a failed drill-in
               // states itself exactly like a failed first read.
               onBrowseResult={(ok) => setBrowseFailed(!ok)}
