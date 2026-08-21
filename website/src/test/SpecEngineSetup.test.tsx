@@ -214,6 +214,20 @@ function stub(answers: {
         answer = answers.plan ?? { body: envelope() }
       } else if (url.endsWith('/setup/apply')) {
         answer = answers.apply ?? { body: applied() }
+      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
+        // The config pane's sources section reads this route, and it must be
+        // answered BEFORE the generic '/config' prefix below: the prefix match
+        // would hand the section a ConfigSnapshot body, which crashes its render.
+        // Answered with no source at all — these tests are about the setup flow,
+        // and the grid's own properties live in `SpecEngineSources.test.tsx`.
+        answer = {
+          body: {
+            sources: [],
+            submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
+            spec_types: ['feature', 'bugfix', 'quick'],
+            levels: ['authoring', 'execution', 'delivery', 'integration'],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
         // Unconfigured, which is what routes the page to the assistant. A caller
         // that cares about the CONFIGURED state passes its own answer: first run is
