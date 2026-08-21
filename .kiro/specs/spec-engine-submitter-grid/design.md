@@ -65,7 +65,7 @@ ConfigPanel (existing)
         "external": {
           "feature": {
             "level": "authoring",
-            "declared_at": "sources.gh-issues.autonomy.*.feature",
+            "declared_at": "sources.gh-issues.autonomy.default.feature",
             "origin": "wildcard",
             "policy_covers_gates": false
           }
@@ -78,6 +78,13 @@ ConfigPanel (existing)
   "levels": ["authoring", "execution", "delivery", "integration"]
 }
 ```
+
+Contract facts confirmed at implementation (the sketch above reflects them):
+the engine's wildcard key is the literal `"default"` (schema `WILDCARD_KEY`),
+not `*`; an unconfigured cell ships `declared_at: ""` (matching the resolved
+read's spelling), never `null`; and the resolver entry point is
+`AutonomyPolicy.resolve(...)` — `AutonomyDecision` is its return type, not a
+method. Frontend types are written from this payload, not from any sketch.
 
 - Vocabularies come from `config/schema.py` constants so the UI renders the
   engine's axes rather than a hard-coded copy.

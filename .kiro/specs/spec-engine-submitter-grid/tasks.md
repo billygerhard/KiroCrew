@@ -15,11 +15,20 @@ consumes the previous one's contract; the review gate runs between waves.
   reviews are dispatched, per the project's standing discipline.
 - Every new operator-facing string ships in all 13 catalogs in the same task
   that introduces it, not in the sweep.
+- **Carried from 1.1's review (for 2.1):** TS types come from the actual
+  payload — `declared_at` is `""` when unconfigured (never `null`), the
+  wildcard key in paths is the literal `default`; branch on `origin`, not on
+  `declared_at` emptiness alone. Design's payload sketch has been corrected.
+- **Carried from 1.1's review (for 2.1, decide):** a hand-edited grid row
+  keyed outside the class vocabulary renders as all-default with no advisory
+  (faithful to gate behavior; the write door refuses such documents). Decide
+  whether the sources view surfaces the config read's validation errors
+  beside the grid, and record the disposition either way.
 
 ## Tasks
 
-- [ ] 1. Backend read surface
-  - [ ] 1.1 Sources route with resolved matrices and origins
+- [x] 1. Backend read surface
+  - [x] 1.1 Sources route with resolved matrices and origins
     - Add `GET {PREFIX}/config/sources` to `backend/routes.py` through the `_read` guard, module posture note updated for the new read.
     - Compute each source's full matrix via `AutonomyPolicy.decision()` per (class, type) pair against the engine's reader; include sources with no `autonomy` field (all-default matrices).
     - Derive per-cell `origin` (`exact` / `wildcard` / `default`) from `declared_at` versus the queried pair, and `policy_covers_gates` from `decision.permits(EXECUTION)`.

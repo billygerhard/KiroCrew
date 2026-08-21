@@ -1,0 +1,27 @@
+{
+  "statuses": {
+    "1.1": "completed",
+    "2.1": "queued",
+    "3.1": "queued",
+    "4.1": "queued"
+  },
+  "pbt": {},
+  "history": [
+    {
+      "ts": "2026-08-21T09:11:41",
+      "taskId": "*",
+      "status": "queued",
+      "count": 4
+    },
+    {
+      "ts": "2026-08-21T09:12:00",
+      "taskId": "1.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-21T09:31:12",
+      "taskId": "1.1",
+      "status": "completed"
+    }
+  ]
+}
