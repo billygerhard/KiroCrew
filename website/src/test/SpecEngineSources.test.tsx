@@ -764,6 +764,47 @@ describe('an edit is shown exactly before it is written', () => {
     expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
     expect(calls.some((call) => call.method === 'PUT')).toBe(false)
   })
+
+  it('lets go of a choice the refreshed answer no longer resolves', async () => {
+    // A choice is only honest while the answer still carries the pair it names: the
+    // review sentence quotes the level being replaced, and the patch would otherwise
+    // write a cell into a grid whose shape has moved. A choice kept past that point
+    // would sit under an unclearable "not written" mark that no confirm reaches,
+    // telling the operator a write is queued when none can be.
+    const { client } = await openConfigWith({
+      sources: { body: sources() },
+      sourcesAgain: {
+        body: sources({
+          sources: [
+            {
+              name: 'gh',
+              grid: {
+                ...grid(),
+                // The source stays, and so does the class — only the pair's own cell
+                // goes, which is the case the source-level reconciliation misses.
+                external: Object.fromEntries(
+                  TYPES.filter((specType) => specType !== 'feature').map((specType) => [
+                    specType,
+                    cell('authoring', 'default', '', false),
+                  ]),
+                ),
+              },
+            },
+          ],
+        }),
+      },
+    })
+    choose('external', 'feature', 'execution')
+    expect(screen.getAllByText(T.not_written)).toHaveLength(1)
+
+    await client.invalidateQueries({ queryKey: ['spec-engine', 'config', 'sources'] })
+
+    // No mark anywhere, and nothing left to review: the section is back to reading
+    // the store, which is the only state a confirm can act on.
+    await waitFor(() => expect(screen.queryByText(T.not_written)).toBeNull())
+    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(calls.some((call) => call.method === 'PUT')).toBe(false)
+  })
 })
 
 describe('a refused write leaves the grid showing the store', () => {

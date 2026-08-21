@@ -20,7 +20,13 @@ consumes the previous one's contract; the review gate runs between waves.
   present — stays in local edits with its "Not written" mark but is excluded
   from review and patch; clearable only by discard. Near-unreachable (the
   route ships full matrices) and degrades visibly rather than silently.
-  Disposition or fix in the sweep.
+  **Disposition (4.1): fixed, not excused.** The reconciliation that already
+  dropped a choice whose *source* had left the document now drops any choice
+  the current answer cannot resolve at all, so "shown as pending" is once
+  again the same set as "in the review" and "in the patch". Named test:
+  `SpecEngineSources.test.tsx` › "lets go of a choice the refreshed answer no
+  longer resolves"; probed (revert to the source-only filter → that test alone
+  fails → restored byte-identical).
 - **Recorded deviation (3.1, reviewer-verified):** the design's "per-cell
   level selects" became a cell pick + shared in-flow level control: the repo
   bans native `<select>` (eslint error) and the mandated Radix replacements
@@ -83,6 +89,98 @@ consumes the previous one's contract; the review gate runs between waves.
     - Confirm both correctness properties have executed mutation probes recorded (revert, named test fails, restore byte-identical).
     - Disposition every carried finding from tasks 1.1–3.1 in this file; verify catalogs complete for every new string.
     - _Requirements: 1.5, 3.4, 4.1, 4.2, 4.3_
+
+## Verification record (4.1)
+
+Swept 2026-08-21 on `feat/spec-engine-poc` at `5b179b3a3` + this task's changes.
+Pre-spec base for every attribution below: `081f1ea0c` (the commit before
+`4a2825ffd` authored this spec). Exit codes captured unpiped.
+
+### Gates
+
+| Gate | Command | Exit | Result |
+| --- | --- | --- | --- |
+| spec_engine pytest | `pytest .../spec_engine/tests -q` | 0 | 3407 passed |
+| app-boundary fence | `pytest .../tests/test_app_boundary_fence.py -q` | 0 | 38 passed |
+| spec_builder pytest | `pytest .../spec_builder/tests -q` | 0 | 269 passed |
+| isort | `isort --check-only .../spec_engine` | 0 | clean |
+| flake8 | `flake8 .../spec_engine` | 0 | clean |
+| mypy | `mypy .../spec_engine` | 0 | 205 files, no issues |
+| black | `black --check .../spec_engine` | 1 | **inherited**, see below |
+| tsc | `npx tsc -b` | 0 | clean |
+| eslint | `npx eslint src/apps/spec-engine + touched tests` | 0 | 0 errors, 8 warnings (all in files this spec never touched) |
+| vitest (full) | `npx vitest run` | 1 | 12021 passed, 1 failed — **inherited**, see below; no unhandled errors |
+| i18n:check, scoped | `I18N_BASE_REF=081f1ea0c node scripts/i18n-check.mjs` | 0 | 13/13 PASS |
+| i18n:check, whole-repo | `node scripts/i18n-check.mjs` | 1 | one finding, **inherited**, see below |
+| key-refs | inside i18n:check | pass | 11429 references resolve, 0 dangling |
+| manifest-sync | inside i18n:check | pass | 20 manifests, 171 strings in sync |
+| pseudolocale | inside i18n:check | pass | en-XA matches en, 10240 keys |
+
+### The three non-zero exits, each proven inherited
+
+- **black, 38 files.** The identical 38-file set reformats at `081f1ea0c`
+  (`git archive` of the base tree, same `pyproject.toml`, byte-compared file
+  lists). None of the three files this spec touched is in it. The backlog is a
+  black-version gap, not a regression here.
+- **vitest `hiStyle › does not use formal आप`.** Asserts ≤ 119; the catalog is
+  at 125. Swapping `origin/main`'s own `hi.json` in and running that one test
+  reproduces the failure at **121 > 119**, so the gate is red on mainline
+  before this branch exists (restored byte-identical afterwards). This spec
+  added zero आप values: applying the test's exact predicate to the base and
+  head catalogs gives 125 both times, added set empty. The 8 spec-engine keys
+  the branch did add belong to earlier tasks and need a Hindi-register pass
+  from someone who can conjugate for `तुम`; a mechanical substitution would
+  ship ungrammatical Hindi, so it is not done here.
+- **i18n:check `[source-strings] 1 badly shaped`**:
+  `pages.artifactDeployPage.domain` = `"domain —"`, a trailing connector. Absent
+  at `origin/main`, already present at `081f1ea0c` — introduced by an earlier
+  branch task. Scoped to this spec's base the check passes outright, which is
+  the same fact stated positively: this spec's 34 new keys are all well shaped.
+
+### zh-CN style regressions found and fixed
+
+The whole-suite run caught two `的`-stacking violations this spec introduced
+(`sourcesSection.an_edit_writes_the_pairs_own_cell`,
+`sourcesSection.this_raises_the_least_trusted_class`) — both rewritten. Two
+single-string violations from earlier branch tasks in the same app's copy were
+fixed alongside them, because both are mechanical and leaving them would keep
+`zhStyle` red for want of one clause each:
+`configPanel.overrides_counts_declared_values` (`的` stacking) and
+`setupFlowPanel.approver_placeholder` (honorific 您 → 你). `zhStyle` is now
+fully green, and `[changed-values]` reports 0 QA findings across everything
+changed.
+
+### Mutation probes re-executed in this sweep
+
+Each planted, the named test confirmed failing, then restored and
+`shasum`-compared byte-identical; the worktree was verified clean of probe
+residue afterwards.
+
+| Property | Probe planted | Named tests that failed | Restored |
+| --- | --- | --- | --- |
+| 2 — origin classification is total and faithful | `_cell_origin`: `==` → `!=` | `test_every_cell_carries_the_resolvers_own_level_and_an_agreeing_origin`, `test_an_exact_origin_means_the_operator_wrote_that_cell_and_nothing_broader` | byte-identical |
+| 1, TS half — a patch touches only its own cells | `buildGridPatch` also writes the `default` sibling | fast-check `has exactly one leaf per edited cell…` + `serialises every edited cell…`, and 3 unit tests incl. `never writes the wildcard key of a pair it was not asked for` | byte-identical |
+| 1, Python half — merge leaves every other path identical | `store._merge`: replace the subtree instead of merging into it | `test_merging_a_cell_patch_leaves_every_other_path_identical`, `test_a_patched_document_resolves_the_edited_cells_and_no_others_differently` (both hypothesis, both falsified) | byte-identical |
+| the 3.1 fix (above) | reconciliation back to source-membership only | `lets go of a choice the refreshed answer no longer resolves` | byte-identical |
+
+### Catalog completeness
+
+34 `apps.specEngine.sourcesSection.*` keys × 13 catalogs (`bn de en en-XA es fr
+hi it ja ko pt ru zh-CN`): every key present in every catalog, none empty, no
+extras, and zero values left byte-identical to English. `en.manual.json` is an
+override layer merged into `en`, not a catalog, so it carries none by design.
+
+### Carried findings, all closed
+
+- 1.1 → 2.1, contract corrections (`declared_at: ""`, literal `default`, branch
+  on `origin`): applied in 2.1, design sketch corrected — closed.
+- 1.1 → 2.1, out-of-vocabulary stored row: dispositioned in 2.1 (one sentence in
+  the section; document problems reported beside the document) — closed.
+- 3.1, deviation from per-cell selects to a cell pick plus a shared in-flow level
+  control: recorded and reviewer-verified, queue-then-review semantics unchanged
+  — closed as a recorded deviation.
+- 3.1, stale pending edit: fixed in this task with a named test and a probe —
+  closed.
 
 ## Task Dependency Graph
 

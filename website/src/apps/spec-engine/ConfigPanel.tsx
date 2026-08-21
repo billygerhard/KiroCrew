@@ -582,17 +582,28 @@ function SourcesSection() {
     [payload],
   )
 
-  // A choice whose source has left the document would RE-CREATE it: the patch
-  // writes `sources.<name>.autonomy.<class>.<type>`, and the merge would resurrect
-  // a source entry carrying an autonomy grid and none of the fields that make it a
-  // source. The removal can arrive from the editor below, from another surface, or
-  // on any refetch, so the choice is dropped rather than carried.
+  // A choice the current answer cannot resolve is dropped rather than carried, so a
+  // cell marked pending is always a cell the review accounts for and the patch
+  // writes. Two ways a choice stops resolving, both handled here:
+  //
+  // A source that has left the document would be RE-CREATED by the patch: it writes
+  // `sources.<name>.autonomy.<class>.<type>`, and the merge would resurrect a source
+  // entry carrying an autonomy grid and none of the fields that make it a source.
+  //
+  // A pair the answer no longer resolves under a source it still lists cannot be
+  // reviewed — the review needs the level being replaced — so keeping the choice
+  // would leave a "not written" mark on a cell no confirm could ever clear.
+  //
+  // Either removal can arrive from the editor below, from another surface, or on any
+  // refetch, which is why this reconciles against the answer instead of trusting the
+  // document to hold still between a choice and its confirm.
   useEffect(() => {
+    if (!payload) return
     setEdits((current) => {
-      const kept = current.filter((edit) => names.includes(edit.source))
+      const kept = current.filter((edit) => cellFor(payload, edit) !== undefined)
       return kept.length === current.length ? current : kept
     })
-  }, [names])
+  }, [payload])
 
   // Plain functions rather than `useCallback`: both close over the mutation object,
   // which React Query hands back fresh on every render, so a memo here would
