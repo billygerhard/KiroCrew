@@ -83,8 +83,8 @@ consumes the previous one's contract; the review gate runs between waves.
     - Vitest: edit flow end to end, exact patch shown, external warning, wildcard narrowing note, refusal retention, fresh-read refresh; strings in all catalogs.
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 4.3_
 
-- [ ] 4. Gate sweep
-  - [ ] 4.1 Full verification sweep and dispositions
+- [x] 4. Gate sweep
+  - [x] 4.1 Full verification sweep and dispositions
     - Run all gates: spec_engine pytest, spec_builder pytest, isort/flake8/mypy on touched trees, tsc, eslint, full vitest, manifest-sync, boundary fence, i18n:check, key-refs.
     - Confirm both correctness properties have executed mutation probes recorded (revert, named test fails, restore byte-identical).
     - Disposition every carried finding from tasks 1.1–3.1 in this file; verify catalogs complete for every new string.
@@ -101,7 +101,7 @@ Pre-spec base for every attribution below: `081f1ea0c` (the commit before
 | Gate | Command | Exit | Result |
 | --- | --- | --- | --- |
 | spec_engine pytest | `pytest .../spec_engine/tests -q` | 0 | 3407 passed |
-| app-boundary fence | `pytest .../tests/test_app_boundary_fence.py -q` | 0 | 38 passed |
+| app-boundary fence | `pytest src/kiro_crew/apps/builtins/spec_engine/tests/test_app_boundary_fence.py -q` | 0 | 38 passed |
 | spec_builder pytest | `pytest .../spec_builder/tests -q` | 0 | 269 passed |
 | isort | `isort --check-only .../spec_engine` | 0 | clean |
 | flake8 | `flake8 .../spec_engine` | 0 | clean |
