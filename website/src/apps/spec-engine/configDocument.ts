@@ -57,6 +57,12 @@ export const COST_PROFILES = 'cost_profiles'
 /** Key holding the role assignments inside a profile object. */
 export const ROLES_KEY = 'roles'
 
+/** Section holding the watch sources, whose autonomy grids live under it. */
+export const SOURCES = 'sources'
+
+/** Key holding the autonomy grid inside a source object. */
+export const AUTONOMY_KEY = 'autonomy'
+
 /** A JSON object as it arrives from the read. */
 export type Document = Record<string, unknown>
 
@@ -110,6 +116,92 @@ export function isDescendant(path: readonly string[], ancestor: readonly string[
  */
 export function roleSegments(profile: string, role: string): string[] {
   return [COST_PROFILES, profile, ROLES_KEY, role]
+}
+
+/**
+ * One autonomy-grid cell's address: the three names that identify it.
+ *
+ * Separate from the level so a lookup can ask "is there a choice for this cell"
+ * without inventing a level to ask with.
+ */
+export interface GridCellRef {
+  /** The watch source whose grid holds the cell. */
+  source: string
+  /** The submitter class, in the engine's vocabulary. */
+  klass: string
+  /** The spec type, in the engine's vocabulary. */
+  specType: string
+}
+
+/**
+ * One autonomy-grid cell an operator has chosen a level for and not yet written.
+ *
+ * The stored cell it replaces is deliberately NOT carried here: the level and the
+ * origin in force are read from the current answer at render time, so a change
+ * landing from another surface while a choice sits unwritten cannot leave the
+ * review describing a level nobody holds any more.
+ */
+export interface PendingEdit extends GridCellRef {
+  /** The level to store at the cell, in the engine's vocabulary. */
+  level: string
+}
+
+/** The segments addressing one grid cell's own stored level. */
+export function gridCellSegments(cell: GridCellRef): string[] {
+  return [SOURCES, cell.source, AUTONOMY_KEY, cell.klass, cell.specType]
+}
+
+/** Whether two addresses name the same cell. */
+export function sameCell(one: GridCellRef, other: GridCellRef): boolean {
+  return (
+    one.source === other.source &&
+    one.klass === other.klass &&
+    one.specType === other.specType
+  )
+}
+
+/**
+ * The minimal merge patch that stores *edits* and touches nothing else.
+ *
+ * Every leaf is a cell's own level at `sources.<name>.autonomy.<class>.<type>`, so
+ * the store's merge — nested objects merged key by key — leaves every other path in
+ * the document exactly as it was. That is what makes a grid edit provably isolated
+ * from every other source, every other cell, and every unrelated setting: the
+ * isolation is a property of the patch's shape rather than of care taken at the
+ * call site, which is why this is a pure function with a property test on it.
+ *
+ * A wildcard cell is never a target. An edit on a pair a broader rule answered
+ * writes the pair's OWN cell, leaving the broader rule in place for the pairs it
+ * still answers — modifying the wildcard would change cells nobody was looking at.
+ *
+ * Two edits inside one source share that source's object rather than the second
+ * replacing the first, and a second edit to one cell wins over the first: an
+ * operator's last choice is the one they are about to read in the review.
+ *
+ * Containers are created prototype-less. A source, class or type named
+ * `__proto__` would otherwise hit `Object.prototype`'s setter — the assignment
+ * would set a prototype instead of creating a key, the patch would serialize
+ * without that edit, and the review card would show a change the write then did
+ * not carry. Silent loss of an edit is the one failure this surface must not have.
+ */
+export function buildGridPatch(edits: readonly PendingEdit[]): Document {
+  const patch = emptyContainer()
+  for (const edit of edits) {
+    const segments = gridCellSegments(edit)
+    let node = patch
+    for (const segment of segments.slice(0, -1)) {
+      const child = node[segment]
+      if (!isObject(child)) node[segment] = emptyContainer()
+      node = node[segment] as Document
+    }
+    node[segments[segments.length - 1]] = edit.level
+  }
+  return patch
+}
+
+/** A container for patch nesting, with no prototype to shadow a key. */
+function emptyContainer(): Document {
+  return Object.create(null) as Document
 }
 
 /** A dotted rendering of *segments*, for display. Never parsed back. */

@@ -45,6 +45,9 @@ const WILDCARD = 'default'
 
 type Answer = { status?: number; body: unknown }
 
+/** Every request the page made, so an assertion can read the body that was sent. */
+const calls: Array<{ url: string; method: string; body: unknown }> = []
+
 /** One resolved cell, in `_source_grid`'s shape. */
 function cell(
   level: string,
@@ -118,16 +121,28 @@ function stub(answers: {
   sources?: Answer
   /** The answer from the SECOND sources read onwards, for a failing refetch. */
   sourcesAgain?: Answer
+  /** The answer to the sources read once a PUT has landed, as the store would then. */
+  sourcesAfterPut?: Answer
+  /** The write door's answer. Defaults to accepting the patch. */
+  put?: Answer
 }) {
   let reads = 0
+  let written = false
   vi.stubGlobal(
     'fetch',
-    vi.fn((url: string) => {
+    vi.fn((url: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET'
+      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
       let answer: Answer
-      if (url.startsWith('/api/apps/spec-engine/config/sources')) {
+      if (method === 'PUT') {
+        answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
+        written = (answer.status ?? 200) < 300
+      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
         reads += 1
         answer =
-          (reads > 1 ? answers.sourcesAgain : undefined) ?? answers.sources ?? { body: sources() }
+          (written ? answers.sourcesAfterPut : undefined) ??
+          (reads > 1 ? answers.sourcesAgain : undefined) ??
+          answers.sources ?? { body: sources() }
       } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
         answer = {
           body: {
@@ -202,8 +217,22 @@ function gridCell(klass: string, specType: string, source = 'gh'): HTMLElement {
   return cells[column]
 }
 
+/**
+ * The level the matrix states is in force for a pair.
+ *
+ * Read from the level element rather than from the cell's text, because the cell
+ * also holds the edit select, whose options spell every level in the ladder: a text
+ * assertion over the whole cell would pass for a level the cell does not show. That
+ * distinction is the point — the level is the store's, the select is a proposal.
+ */
+function levelInForce(klass: string, specType: string, source = 'gh'): string {
+  const shown = gridCell(klass, specType, source).querySelector('.se-glevel')
+  return shown?.textContent ?? ''
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
+  calls.length = 0
 })
 
 describe('the grid renders every pair with the origin that answered it', () => {
@@ -294,12 +323,12 @@ describe('the grid renders every pair with the origin that answered it', () => {
     stub({})
     await openConfig()
     const exact = gridCell('maintainer', 'feature')
-    expect(exact).toHaveTextContent('delivery')
+    expect(levelInForce('maintainer', 'feature')).toBe('delivery')
     expect(exact).toHaveTextContent(T.origin_exact)
     expect(exact).toHaveTextContent('sources.gh.autonomy.maintainer.feature')
 
     const wildcard = gridCell('contributor', 'bugfix')
-    expect(wildcard).toHaveTextContent('execution')
+    expect(levelInForce('contributor', 'bugfix')).toBe('execution')
     expect(wildcard).toHaveTextContent(T.origin_wildcard)
     // The wildcard segment is the engine's literal key, not a `*`: an edit built
     // against the wrong spelling would write a cell the resolver never consults.
@@ -313,7 +342,7 @@ describe('the grid renders every pair with the origin that answered it', () => {
     const unset = gridCell('external', 'feature')
     // The level is still shown — the default IS a resolution — and the wording is
     // what separates it from a rung somebody chose.
-    expect(unset).toHaveTextContent('authoring')
+    expect(levelInForce('external', 'feature')).toBe('authoring')
     expect(unset).toHaveTextContent(T.origin_unconfigured)
     expect(unset.textContent?.trim()).not.toBe('')
     // And no declaring path, because nothing declared it.
@@ -356,7 +385,7 @@ describe('doubt about the read never renders as authority', () => {
       sources: { body: sources() },
       sourcesAgain: { status: 503, body: { code: 'config_unreadable', error: 'disk gone' } },
     })
-    expect(gridCell('maintainer', 'feature')).toHaveTextContent('delivery')
+    expect(levelInForce('maintainer', 'feature')).toBe('delivery')
 
     await client.invalidateQueries({ queryKey: ['spec-engine', 'config', 'sources'] })
     await waitFor(() => {
@@ -462,3 +491,416 @@ async function openConfigWith(answers: Parameters<typeof stub>[0]) {
   stub(answers)
   return openConfig()
 }
+
+// --- the guarded edit path ---------------------------------------------------
+
+/**
+ * Choose a level for one pair: pick the cell, then press the rung.
+ *
+ * Two acts rather than one because the level control is shared and sits under the
+ * matrix in flow — a per-cell dropdown would draw its popup over the page, and this
+ * surface holds its safety guarantees by having no overlay at all.
+ */
+function choose(klass: string, specType: string, level: string, source = 'gh') {
+  fireEvent.click(
+    within(gridCell(klass, specType, source)).getByRole('button', {
+      name: T.change_the_level_for_pair
+        .replace('{{klass}}', klass)
+        .replace('{{specType}}', specType)
+        .replace('{{source}}', source),
+    }),
+  )
+  const control = screen.getByRole('group', {
+    name: T.level_for_pair
+      .replace('{{klass}}', klass)
+      .replace('{{specType}}', specType)
+      .replace('{{source}}', source),
+  })
+  fireEvent.click(within(control).getByRole('button', { name: level }))
+}
+
+/** Open the review card for whatever is pending. */
+function review() {
+  fireEvent.click(screen.getByRole('button', { name: T.review_the_exact_change }))
+}
+
+/** The patch on screen, parsed — the exact object a confirm would send. */
+function shownPatch(): unknown {
+  return JSON.parse(screen.getByText(/"autonomy"/).textContent ?? '')
+}
+
+/** The patch the one PUT carried. */
+function putPatch(): unknown {
+  const put = calls.filter((call) => call.method === 'PUT')
+  expect(put).toHaveLength(1)
+  return (put[0].body as { patch: unknown }).patch
+}
+
+/** Requests made after the PUT, so a refresh (or its absence) is observable. */
+function readsAfterThePut(): string[] {
+  const index = calls.findIndex((call) => call.method === 'PUT')
+  expect(index).toBeGreaterThanOrEqual(0)
+  return calls.slice(index + 1).map((call) => call.url)
+}
+
+describe('an edit is shown exactly before it is written', () => {
+  it('offers the ladder for a picked cell and presses the rung in force', async () => {
+    stub({})
+    await openConfig()
+    // Nothing is picked yet, so the control says how to get one rather than acting on
+    // a cell nobody chose.
+    expect(screen.getByText(T.choose_a_cell_to_change_its_level)).toBeInTheDocument()
+
+    fireEvent.click(
+      within(gridCell('maintainer', 'feature')).getByRole('button', {
+        name: T.change_the_level_for_pair
+          .replace('{{klass}}', 'maintainer')
+          .replace('{{specType}}', 'feature')
+          .replace('{{source}}', 'gh'),
+      }),
+    )
+    const control = screen.getByRole('group', {
+      name: T.level_for_pair
+        .replace('{{klass}}', 'maintainer')
+        .replace('{{specType}}', 'feature')
+        .replace('{{source}}', 'gh'),
+    })
+    // Every rung the payload shipped, and the pressed one is the level in force: a
+    // control that pressed nothing would leave the stored rung unreadable from it.
+    expect(within(control).getAllByRole('button').map((button) => button.textContent)).toEqual([
+      'authoring',
+      'execution',
+      'delivery',
+      'integration',
+    ])
+    expect(within(control).getByRole('button', { name: 'delivery' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(screen.queryByText(T.choose_a_cell_to_change_its_level)).toBeNull()
+  })
+
+  it('shows a choice in its cell without disturbing the level in force', async () => {
+    stub({})
+    await openConfig()
+    choose('maintainer', 'feature', 'authoring')
+    // The store still says `delivery`, and the cell says so: the choice is marked as
+    // unwritten beside it, never in place of it.
+    expect(levelInForce('maintainer', 'feature')).toBe('delivery')
+    const cellShown = gridCell('maintainer', 'feature')
+    expect(within(cellShown).getByText(T.not_written)).toBeInTheDocument()
+    expect(cellShown).toHaveTextContent('authoring')
+    expect(cellShown).toHaveAttribute('data-pending', 'true')
+    // And only that cell carries a mark.
+    expect(screen.getAllByText(T.not_written)).toHaveLength(1)
+  })
+
+  it('writes nothing until a confirm, then sends the minimal cell patch', async () => {
+    stub({})
+    await openConfig()
+    // The whole point of the flow: a choice is not a write. Nothing has been sent
+    // when the select changes, and nothing has been sent when the review opens.
+    choose('external', 'feature', 'execution')
+    expect(calls.some((call) => call.method === 'PUT')).toBe(false)
+    review()
+    expect(calls.some((call) => call.method === 'PUT')).toBe(false)
+
+    const patch = {
+      sources: { gh: { autonomy: { external: { feature: 'execution' } } } },
+    }
+    // The patch is shown as the payload itself, so approving the review is
+    // approving what will be written — and what was written is what was approved.
+    expect(shownPatch()).toEqual(patch)
+    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
+    expect(putPatch()).toEqual(patch)
+  })
+
+  it('names the pair, the level in force and the level replacing it', async () => {
+    stub({})
+    await openConfig()
+    choose('maintainer', 'feature', 'integration')
+    review()
+    // The exact cell already holds a level somebody chose, so the sentence says so
+    // and names the cell it replaces.
+    expect(
+      screen.getByText(
+        T.edit_replaces_the_pairs_own_level
+          .replace('{{klass}}', 'maintainer')
+          .replace('{{specType}}', 'feature')
+          .replace('{{source}}', 'gh')
+          .replace('{{path}}', 'sources.gh.autonomy.maintainer.feature')
+          .replace('{{oldLevel}}', 'delivery')
+          .replace('{{newLevel}}', 'integration'),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('says an unconfigured pair was waiting for a human rather than set to authoring', async () => {
+    stub({})
+    await openConfig()
+    choose('member', 'quick', 'delivery')
+    review()
+    expect(
+      screen.getByText(
+        T.edit_configures_an_unconfigured_pair
+          .replace('{{klass}}', 'member')
+          .replace('{{specType}}', 'quick')
+          .replace('{{source}}', 'gh')
+          .replace('{{path}}', 'sources.gh.autonomy.member.quick')
+          .replace('{{oldLevel}}', 'authoring')
+          .replace('{{newLevel}}', 'delivery'),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('states that a wildcard-answered pair is narrowed and the broader rule left alone', async () => {
+    stub({})
+    await openConfig()
+    // `contributor` is answered by a wildcard row, so this edit does NOT change the
+    // rule the operator can see in the cell — it writes the pair's own cell under
+    // it. Somebody expecting the broader rule to move would expect the other two
+    // spec types to move with it, and they do not.
+    choose('contributor', 'bugfix', 'authoring')
+    review()
+    expect(
+      screen.getByText(
+        T.edit_narrows_a_broader_rule
+          .replace('{{klass}}', 'contributor')
+          .replace('{{specType}}', 'bugfix')
+          .replace('{{source}}', 'gh')
+          .replace('{{declaredAt}}', `sources.gh.autonomy.contributor.${WILDCARD}`)
+          .replace('{{path}}', 'sources.gh.autonomy.contributor.bugfix')
+          .replace('{{oldLevel}}', 'execution')
+          .replace('{{newLevel}}', 'authoring'),
+      ),
+    ).toBeInTheDocument()
+    // And the patch proves it: the wildcard cell is not in it. The wildcard key is
+    // the engine's literal `default`, so a patch carrying it would rewrite the rule
+    // for every pair it answers.
+    expect(shownPatch()).toEqual({
+      sources: { gh: { autonomy: { contributor: { bugfix: 'authoring' } } } },
+    })
+  })
+
+  it('warns when an edit raises the class an unclassifiable author falls to', async () => {
+    stub({})
+    await openConfig()
+    choose('external', 'quick', 'delivery')
+    review()
+    // The consequence nothing in the JSON states: this class is where an author the
+    // engine cannot identify lands, so the rung is granted to anyone at all.
+    expect(
+      screen.getByText(
+        T.this_raises_the_least_trusted_class
+          .replace(/\{\{klass\}\}/g, 'external')
+          .replace('{{specType}}', 'quick')
+          .replace('{{oldLevel}}', 'authoring')
+          .replace('{{newLevel}}', 'delivery'),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('does not warn when the same class is lowered, or when another class is raised', async () => {
+    // The other direction of the same guard: a warning on every edit is a warning
+    // nobody reads, and the two edits below are the ones that must not carry it.
+    stub({
+      sources: {
+        body: sources({
+          sources: [
+            {
+              name: 'gh',
+              grid: {
+                ...grid(),
+                external: {
+                  ...defaultRow(TYPES),
+                  feature: cell('delivery', 'exact', 'sources.gh.autonomy.external.feature', true),
+                },
+              },
+            },
+          ],
+        }),
+      },
+    })
+    await openConfig()
+    choose('external', 'feature', 'authoring')
+    choose('maintainer', 'bugfix', 'integration')
+    review()
+    expect(screen.queryByText(new RegExp(T.this_raises_the_least_trusted_class.slice(0, 16)))).toBeNull()
+  })
+
+  it('withdraws a choice that matches what the pair already stores', async () => {
+    stub({})
+    await openConfig()
+    choose('maintainer', 'feature', 'integration')
+    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
+    // Back to the level the cell itself holds. Every write is recorded, so queueing
+    // this would put a line in the durable record for a change nobody made.
+    choose('maintainer', 'feature', 'delivery')
+    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(screen.queryByText(T.not_written)).toBeNull()
+  })
+
+  it('keeps a choice that matches the level a broader rule gave the pair', async () => {
+    stub({})
+    await openConfig()
+    // Not a no-op: it pins the pair at the level it happens to have now, which is
+    // what keeps it there when the broader rule moves.
+    choose('contributor', 'feature', 'execution')
+    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
+    review()
+    expect(shownPatch()).toEqual({
+      sources: { gh: { autonomy: { contributor: { feature: 'execution' } } } },
+    })
+  })
+
+  it('drops the whole pending change on a discard', async () => {
+    stub({})
+    await openConfig()
+    choose('external', 'feature', 'execution')
+    review()
+    fireEvent.click(screen.getByRole('button', { name: T.discard_the_pending_changes }))
+    expect(screen.queryByText(T.the_change_that_would_be_written)).toBeNull()
+    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(calls.some((call) => call.method === 'PUT')).toBe(false)
+  })
+})
+
+describe('a refused write leaves the grid showing the store', () => {
+  it('renders the refusal by path and keeps the stored level and origin on screen', async () => {
+    stub({
+      put: {
+        status: 422,
+        body: {
+          code: 'config_invalid',
+          error: 'sources.gh.autonomy.external.feature: unknown autonomy level',
+        },
+      },
+    })
+    await openConfig()
+    choose('external', 'feature', 'execution')
+    review()
+    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    await screen.findByText(T.could_not_write_the_grid_change)
+    // The engine's own words, against the path it named: this panel keeps no
+    // validation of its own to paraphrase them with.
+    expect(
+      screen.getByText(/config_invalid.*sources\.gh\.autonomy\.external\.feature/),
+    ).toBeInTheDocument()
+
+    // The matrix is still the store's. The cell reads `authoring`, unconfigured —
+    // NOT the `execution` that was submitted and refused.
+    const refusedCell = gridCell('external', 'feature')
+    expect(levelInForce('external', 'feature')).toBe('authoring')
+    expect(refusedCell).toHaveTextContent(T.origin_unconfigured)
+    expect(refusedCell).not.toHaveTextContent(T.unattended)
+    // And nothing was re-read, because nothing changed: a refetch here would be a
+    // request whose only purpose is to hide that the write did not happen.
+    expect(readsAfterThePut()).toEqual([])
+    // The choice is kept so it can be corrected and sent again, and it is marked as
+    // unwritten rather than presented as the level in force.
+    expect(screen.getByText(T.nothing_was_written_so_the_matrix_is_stored_state)).toBeInTheDocument()
+    expect(within(refusedCell).getByText(T.not_written)).toBeInTheDocument()
+    expect(shownPatch()).toEqual({
+      sources: { gh: { autonomy: { external: { feature: 'execution' } } } },
+    })
+  })
+})
+
+describe('an accepted write is re-read rather than assumed', () => {
+  it('re-renders the matrix from a fresh read, and re-reads the document beside it', async () => {
+    stub({
+      // The store's answer once the write has landed. Deliberately NOT the level
+      // that was submitted: what the grid shows afterwards has to come from this
+      // read, so a panel that adopted its own patch would show `execution` here.
+      sourcesAfterPut: {
+        body: sources({
+          sources: [
+            {
+              name: 'gh',
+              grid: {
+                ...grid(),
+                external: {
+                  ...defaultRow(TYPES),
+                  feature: cell(
+                    'delivery',
+                    'exact',
+                    'sources.gh.autonomy.external.feature',
+                    true,
+                  ),
+                },
+              },
+            },
+          ],
+        }),
+      },
+    })
+    await openConfig()
+    choose('external', 'feature', 'execution')
+    review()
+    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    await screen.findByText(T.wrote_the_change_and_re_read_the_matrix)
+
+    await waitFor(() => {
+      expect(gridCell('external', 'feature')).toHaveTextContent(T.origin_exact)
+    })
+    expect(levelInForce('external', 'feature')).toBe('delivery')
+    expect(gridCell('external', 'feature')).toHaveTextContent('sources.gh.autonomy.external.feature')
+    // The review card and the unwritten marks are gone: there is nothing pending,
+    // and a card left on screen would invite a second write of the same patch.
+    expect(screen.queryByText(T.the_change_that_would_be_written)).toBeNull()
+    expect(screen.queryByText(T.not_written)).toBeNull()
+
+    // The grid is a resolution OF the document, and the projects table beside it
+    // reads the same document: both are invalidated, so the two views cannot
+    // disagree on their next read.
+    const after = readsAfterThePut()
+    expect(after.some((url) => url.startsWith('/api/apps/spec-engine/config/sources'))).toBe(true)
+    expect(after.some((url) => url === '/api/apps/spec-engine/config')).toBe(true)
+    expect(after.some((url) => url.startsWith('/api/apps/spec-engine/config/resolved'))).toBe(true)
+  })
+
+  it('sends both cells when two pairs of one source are changed together', async () => {
+    stub({})
+    await openConfig()
+    choose('external', 'feature', 'execution')
+    choose('external', 'bugfix', 'execution')
+    review()
+    // One patch, two leaves under one source: a builder that replaced the source's
+    // node per choice would send half of what the card displayed.
+    expect(shownPatch()).toEqual({
+      sources: { gh: { autonomy: { external: { feature: 'execution', bugfix: 'execution' } } } },
+    })
+    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
+    expect(putPatch()).toEqual({
+      sources: { gh: { autonomy: { external: { feature: 'execution', bugfix: 'execution' } } } },
+    })
+  })
+
+  it('keeps a choice against the source it was made on when another is shown', async () => {
+    stub({
+      sources: {
+        body: sources({
+          sources: [
+            { name: 'gh', grid: grid() },
+            {
+              name: 'forgejo',
+              grid: Object.fromEntries(CLASSES.map((klass) => [klass, defaultRow(TYPES)])),
+            },
+          ],
+        }),
+      },
+    })
+    await openConfig()
+    choose('external', 'feature', 'execution')
+    fireEvent.click(screen.getByRole('button', { name: 'forgejo' }))
+    // The choice belongs to a cell, not to a screen position: switching the shown
+    // source must not silently move it onto the source now on screen.
+    expect(within(gridCell('external', 'feature', 'forgejo')).queryByText(T.not_written)).toBeNull()
+    review()
+    expect(shownPatch()).toEqual({
+      sources: { gh: { autonomy: { external: { feature: 'execution' } } } },
+    })
+  })
+})

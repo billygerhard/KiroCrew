@@ -82,11 +82,14 @@ import {
   type EffectiveSetting,
   type ResolvedRole,
   type SourceGridCell,
+  type SourcesPayload,
 } from './api'
 import {
   COST_PROFILES,
+  buildGridPatch,
   documentText,
   dotted,
+  gridCellSegments,
   isDescendant,
   isObject,
   mergePatch,
@@ -94,7 +97,10 @@ import {
   parseDocument,
   patchAt,
   roleSegments,
+  sameCell,
   type Document,
+  type GridCellRef,
+  type PendingEdit,
 } from './configDocument'
 
 /** Separator between two identifiers on one line. Punctuation, not copy. */
@@ -185,18 +191,60 @@ const CELL_ORIGIN_KEY: Record<SourceGridCell['origin'], string> = {
 }
 
 /**
- * One resolved cell: the level, where it was declared, and what it licenses.
+ * One resolved cell: the level, where it was declared, what it licenses, and the
+ * choice made for it and not yet written.
  *
  * `cell` is optional because the axes and the matrix arrive in one payload and this
  * renders the cross product of the axes: a pair the matrix does not carry can only
  * mean the two disagree, and the honest reading of a pair with no resolution is the
- * unconfigured one — which waits for a human — rather than a blank.
+ * unconfigured one — which waits for a human — rather than a blank. Such a pair is
+ * not selectable for editing either: a level written for a pair the resolver did not
+ * answer would be a grant nobody could read back.
+ *
+ * The level doubles as the button that picks the pair for the level control below the
+ * table — the roles table's idiom, for its reason: a button rather than a click on the
+ * cell keeps the traversal keyboard-reachable without inventing a grid pattern, and it
+ * is a small fixed vocabulary of levels rather than a dropdown because a dropdown here
+ * would draw a popup over the page. The strip carrying the stop is the one thing on
+ * this page that must never be covered.
+ *
+ * The resolved level and the pending choice are BOTH shown, and they show different
+ * things: the level is what the store holds, the choice is what would replace it.
+ * Collapsing the two would leave a refused write displaying the submitted value as
+ * though it were in force.
  */
-function GridCell({ cell }: { cell: SourceGridCell | undefined }) {
+function GridCell({
+  cell,
+  pending,
+  selected,
+  label,
+  onSelect,
+}: {
+  cell: SourceGridCell | undefined
+  /** The level chosen for this cell and not yet written, or `undefined`. */
+  pending: string | undefined
+  /** Whether the level control below the table is acting on this cell. */
+  selected: boolean
+  /** The accessible name of the cell's own button, which must name the pair. */
+  label: string
+  onSelect: () => void
+}) {
   const origin = cell?.origin ?? 'default'
   return (
-    <td data-origin={origin}>
-      <span className="se-glevel se-m">{cell ? cell.level : NONE}</span>
+    <td data-origin={origin} data-pending={pending !== undefined}>
+      {cell ? (
+        <button
+          type="button"
+          className="se-glevel se-m se-glevelbtn"
+          aria-label={label}
+          aria-pressed={selected}
+          onClick={onSelect}
+        >
+          {cell.level}
+        </button>
+      ) : (
+        <span className="se-glevel se-m">{NONE}</span>
+      )}
       {cell?.policy_covers_gates && (
         <span className="se-flag" data-flag="unattended">
           {i18nT('apps.specEngine.sourcesSection.unattended')}
@@ -207,14 +255,251 @@ function GridCell({ cell }: { cell: SourceGridCell | undefined }) {
           to change a cell needs to know whether the level is written at this pair
           or at a broader one, because only one of those two edits is a narrowing. */}
       {cell && cell.declared_at !== '' && <span className="se-src">{cell.declared_at}</span>}
+      {pending !== undefined && (
+        <span className="se-note">
+          <span className="se-flag" data-flag="pending">
+            {i18nT('apps.specEngine.sourcesSection.not_written')}
+          </span>
+          {/* Engine vocabulary, rendered as the identifier it is. */}
+          <span className="se-m">{pending}</span>
+        </span>
+      )}
     </td>
+  )
+}
+
+/**
+ * The level control for the cell picked in the matrix: one button per rung.
+ *
+ * The ladder is short and fixed, so every rung is on screen and choosing one is a
+ * single act. A dropdown would be the compact alternative and is the wrong one twice
+ * over: its popup is drawn over the page, and this app's layout holds because it has
+ * no overlay at all.
+ *
+ * Choosing writes nothing. It queues the choice, which reaches the engine only through
+ * the review card's confirm.
+ */
+function LevelChoice({
+  levels,
+  cell,
+  pair,
+  pending,
+  onChoose,
+}: {
+  levels: readonly string[]
+  cell: SourceGridCell
+  pair: GridCellRef
+  /** The level already chosen for the cell, or `undefined` when none is. */
+  pending: string | undefined
+  onChoose: (level: string) => void
+}) {
+  const label = i18nT('apps.specEngine.sourcesSection.level_for_pair', {
+    source: pair.source,
+    klass: pair.klass,
+    specType: pair.specType,
+  })
+  return (
+    <div className="se-gedit">
+      <span className="se-lbl">{label}</span>
+      <div className="se-acts" role="group" aria-label={label}>
+        {levelOptions(levels, cell.level).map((level) => (
+          <button
+            key={level}
+            type="button"
+            className="se-btn se-sm se-m"
+            // Pressed on the pending choice when there is one, otherwise on the
+            // level in force: the control has to show what a write would store,
+            // and after a choice that is no longer what the store holds.
+            aria-pressed={level === (pending ?? cell.level)}
+            onClick={() => onChoose(level)}
+          >
+            {level}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The levels a cell may be set to: the engine's ladder, plus the level in force
+ * when the ladder does not contain it.
+ *
+ * A control that offered only the ladder would leave a hand-edited level outside the
+ * vocabulary with no button pressed, so the cell in force would read as "none of
+ * these" — and the operator could not tell which rung is stored from the control. The
+ * out-of-vocabulary level is offered rather than hidden so what is stored is visible
+ * and can be replaced with a real rung; the write door refuses the invalid one either
+ * way.
+ */
+function levelOptions(levels: readonly string[], inForce: string): readonly string[] {
+  return levels.includes(inForce) ? levels : [inForce, ...levels]
+}
+
+/** The stored cell an address names, or `undefined` if the read no longer has it. */
+function cellFor(payload: SourcesPayload, pair: GridCellRef): SourceGridCell | undefined {
+  const source = payload.sources.find((entry) => entry.name === pair.source)
+  return source?.grid[pair.klass]?.[pair.specType]
+}
+
+/**
+ * One pending edit paired with the cell it replaces, as the review reads it.
+ *
+ * The pair is resolved against the CURRENT answer rather than captured when the
+ * choice was made, so a review sentence cannot describe a level the store stopped
+ * holding while the choice sat unwritten.
+ */
+interface ReviewedEdit {
+  edit: PendingEdit
+  cell: SourceGridCell
+}
+
+/**
+ * Whether *level* is further up the ladder than the cell's resolved level.
+ *
+ * The ladder's order is the payload's, because the engine ships it least to most
+ * autonomous; a copy of that order here would be a second ranking to keep in step.
+ * An unknown level on either side ranks nothing: a hand-edited document must not
+ * make this read as a raise, and it must not silence a raise either — an unrankable
+ * pair simply earns no claim about direction.
+ */
+function raisesLevel(levels: readonly string[], cell: SourceGridCell, level: string): boolean {
+  const from = levels.indexOf(cell.level)
+  const to = levels.indexOf(level)
+  return from >= 0 && to >= 0 && to > from
+}
+
+/**
+ * Which sentence describes an edit, keyed by the origin of the cell it replaces.
+ *
+ * Three sentences rather than one with the origin interpolated, because the three
+ * edits are three different acts: replacing a level somebody chose for this pair,
+ * NARROWING a broader rule that also answers other pairs, and configuring a pair
+ * nothing had answered. The wildcard sentence carries the narrowing statement
+ * itself — the write creates this pair's own cell and leaves the broader rule
+ * alone — because a separate line repeating the same pair is a line a reader skips.
+ *
+ * Keys, not resolved strings, for `ORIGIN_KEY`'s reason.
+ */
+const EDIT_SENTENCE_KEY: Record<SourceGridCell['origin'], string> = {
+  exact: 'apps.specEngine.sourcesSection.edit_replaces_the_pairs_own_level',
+  wildcard: 'apps.specEngine.sourcesSection.edit_narrows_a_broader_rule',
+  default: 'apps.specEngine.sourcesSection.edit_configures_an_unconfigured_pair',
+}
+
+/**
+ * The exact change a confirm would write, before it is written.
+ *
+ * The patch is shown as the payload itself, pretty-printed: approving a plan means
+ * approving what will be written, which is the setup flow's rule and the reason this
+ * card exists at all. The sentences beside it are not a second description of the
+ * patch — they say what each line MEANS, which the JSON cannot: the level that is in
+ * force now, the declaration that put it there, and the level replacing it.
+ *
+ * Two consequences get their own statement because neither is legible in the patch:
+ *
+ * 1. **Raising the least-trusted class.** That class is where an author the engine
+ *    cannot classify lands, so a rung granted there is a rung granted to anyone at
+ *    all. Nothing in the JSON says which class that is.
+ * 2. **Narrowing rather than modifying.** An edit on a pair a broader rule answered
+ *    writes the pair's own cell; the broader rule stays, and keeps answering the
+ *    pairs it answered before. A reader who assumed the broader rule was being
+ *    edited would expect other cells to move, and they do not.
+ */
+function GridReview({
+  reviewed,
+  patch,
+  levels,
+  leastTrusted,
+  writing,
+  error,
+  onConfirm,
+  onDiscard,
+}: {
+  reviewed: readonly ReviewedEdit[]
+  patch: Document
+  levels: readonly string[]
+  leastTrusted: string
+  writing: boolean
+  error: unknown
+  onConfirm: () => void
+  onDiscard: () => void
+}) {
+  const raising = reviewed.filter(
+    ({ edit, cell }) => edit.klass === leastTrusted && raisesLevel(levels, cell, edit.level),
+  )
+  return (
+    <div className="se-qbox">
+      <h3>{i18nT('apps.specEngine.sourcesSection.the_change_that_would_be_written')}</h3>
+      {/* The payload itself. Not a rendering of it: a summary an operator approves
+          is a summary the write can differ from without anybody noticing. */}
+      <pre className="se-json se-gpatch">{JSON.stringify(patch, null, 2)}</pre>
+      {reviewed.map(({ edit, cell }) => (
+        <p className="se-note" key={dotted(gridCellSegments(edit))}>
+          {i18nT(EDIT_SENTENCE_KEY[cell.origin], {
+            source: edit.source,
+            klass: edit.klass,
+            specType: edit.specType,
+            oldLevel: cell.level,
+            newLevel: edit.level,
+            declaredAt: cell.declared_at,
+            path: dotted(gridCellSegments(edit)),
+          })}
+        </p>
+      ))}
+      {raising.length > 0 && (
+        /* In flow under the patch, never a dialog: the same rule the removal
+           confirmation follows, and for the same reason — a consequence stated in
+           an overlay is a consequence stated where it can be dismissed. */
+        <div className="se-arm">
+          {raising.map(({ edit, cell }) => (
+            <p key={dotted(gridCellSegments(edit))}>
+              <AlertTriangle className="lucide-inline" aria-hidden="true" />
+              {i18nT('apps.specEngine.sourcesSection.this_raises_the_least_trusted_class', {
+                klass: edit.klass,
+                specType: edit.specType,
+                oldLevel: cell.level,
+                newLevel: edit.level,
+              })}
+            </p>
+          ))}
+        </div>
+      )}
+      <div className="se-acts" style={{ marginTop: 9 }}>
+        <button type="button" className="se-btn se-danger" disabled={writing} onClick={onConfirm}>
+          {writing
+            ? i18nT('apps.specEngine.configPanel.saving')
+            : i18nT('apps.specEngine.sourcesSection.write_the_change')}
+        </button>
+        <button type="button" className="se-btn" disabled={writing} onClick={onDiscard}>
+          {i18nT('apps.specEngine.sourcesSection.discard_the_pending_changes')}
+        </button>
+      </div>
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.a_confirm_writes_exactly_this_patch')}
+      </p>
+      {error !== null && (
+        <>
+          <Refused
+            title={i18nT('apps.specEngine.sourcesSection.could_not_write_the_grid_change')}
+            error={error}
+          />
+          {/* The refusal alone would leave open which of the two states the page is
+              in. Nothing was written, so the matrix above is still the store's, and
+              the choices are still here to be corrected and sent again. */}
+          <p className="se-note">
+            {i18nT('apps.specEngine.sourcesSection.nothing_was_written_so_the_matrix_is_stored_state')}
+          </p>
+        </>
+      )}
+    </div>
   )
 }
 
 /**
  * The autonomy grid of every Watch_Source: who may run how unattended.
  *
- * A READ, and the only one this pane has of the engine's resolver. Each cell is the
+ * A read of the engine's resolver, and a guarded edit path over it. Each cell is the
  * level `AutonomyPolicy` answered for that (submitter class, spec type) pair, with
  * the origin that answered it — so the matrix here and the decision a gate makes
  * come from one code path rather than from two implementations of class-first
@@ -234,17 +519,113 @@ function GridCell({ cell }: { cell: SourceGridCell | undefined }) {
  *    is the authoring rung, which covers no gate; the cell says the run waits for a
  *    human rather than leaving the reader to infer it from an empty box.
  *
+ * And three of the editing:
+ *
+ * 4. **A choice is not a write.** Level selects accumulate in local state and reach
+ *    the engine only through a confirm on a review card that shows the exact patch.
+ *    Nothing on this surface writes on change.
+ * 5. **The matrix always shows the store.** A cell's level and origin come from the
+ *    read; the pending choice sits in the select beside them, marked as unwritten.
+ *    So a refused write leaves the grid stating what is persisted rather than what
+ *    was submitted, and no invalidation happens on failure.
+ * 6. **A success re-reads.** The sources, document and resolved queries are
+ *    invalidated and the matrix re-renders from the fresh answer, never from the
+ *    values just sent — the merged document the write returns is not adopted.
+ *
  * The semantics sit once in the section rather than per cell: they are properties of
  * the resolution, not of any one pair, and twelve copies of a sentence teach a
  * reader to stop reading it.
  */
 function SourcesSection() {
+  const client = useQueryClient()
   const [chosen, setChosen] = useState('')
+  // The operator's choices, keyed by cell rather than by screen position, so
+  // switching the shown source does not lose them and cannot silently move one.
+  const [edits, setEdits] = useState<readonly PendingEdit[]>([])
+  // The cell the level control acts on. A cell, not a level: the level control is
+  // shared, and a copy of the choice on either side is how the two come to disagree.
+  const [picked, setPicked] = useState<GridCellRef | null>(null)
+  const [reviewing, setReviewing] = useState(false)
+  const [wrote, setWrote] = useState(false)
   const sources = useQuery({
     queryKey: QK.sources,
     queryFn: () => specEngineApi.sources(),
     retry: false,
   })
+
+  const write = useMutation({
+    // The engine's one write door, the same one a document save and a project
+    // removal go through: merged, schema-validated against the MERGED document,
+    // locked, and recorded. There is no grid-specific write path to review.
+    mutationFn: (patch: Document) => specEngineApi.writeConfig(patch),
+    onSuccess: () => {
+      setEdits([])
+      setReviewing(false)
+      setWrote(true)
+      // The reply's merged document is NOT adopted: the read is this pane's
+      // authority on what is persisted, and the grid is a resolution OF that
+      // document rather than a copy of the patch. `QK.sources` and the resolved
+      // keys sit under `QK.config`'s prefix, so the document invalidation already
+      // reaches them; all three are named because they are three readings a
+      // reader would otherwise have to know the key layout to see refreshed.
+      void client.invalidateQueries({ queryKey: QK.sources })
+      void client.invalidateQueries({ queryKey: QK.config })
+      void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
+    },
+    // No `onError`: a refusal must leave the choices in place and the queries
+    // untouched, so the matrix keeps showing the store's own state.
+  })
+
+  const payload = sources.data
+  const names = useMemo(
+    () => (payload ? payload.sources.map((source) => source.name) : []),
+    [payload],
+  )
+
+  // A choice whose source has left the document would RE-CREATE it: the patch
+  // writes `sources.<name>.autonomy.<class>.<type>`, and the merge would resurrect
+  // a source entry carrying an autonomy grid and none of the fields that make it a
+  // source. The removal can arrive from the editor below, from another surface, or
+  // on any refetch, so the choice is dropped rather than carried.
+  useEffect(() => {
+    setEdits((current) => {
+      const kept = current.filter((edit) => names.includes(edit.source))
+      return kept.length === current.length ? current : kept
+    })
+  }, [names])
+
+  // Plain functions rather than `useCallback`: both close over the mutation object,
+  // which React Query hands back fresh on every render, so a memo here would
+  // advertise a stability it cannot have.
+  const choose = (pair: GridCellRef, level: string, stored: SourceGridCell) => {
+    setWrote(false)
+    write.reset()
+    const edit: PendingEdit = { ...pair, level }
+    setEdits((current) => {
+      const index = current.findIndex((other) => sameCell(other, edit))
+      // Choosing the level the pair's OWN cell already stores is not a change, so
+      // it withdraws the pending one instead of queueing a write that would record
+      // an edit nobody made. For a wildcard-answered or unconfigured pair the same
+      // level IS a change: it pins the pair, which is what keeps it where it is
+      // when the broader rule moves.
+      if (stored.origin === 'exact' && stored.level === level) {
+        return index < 0 ? current : [...current.slice(0, index), ...current.slice(index + 1)]
+      }
+      if (index < 0) return [...current, edit]
+      // Replaced in place: the review reads in the order the choices were made,
+      // and re-choosing one cell must not reorder the account of the others.
+      const next = [...current]
+      next[index] = edit
+      return next
+    })
+  }
+
+  const discard = () => {
+    setEdits([])
+    setReviewing(false)
+    setWrote(false)
+    write.reset()
+  }
 
   // `isError` first, then the data: see property 2 above.
   if (sources.isError) {
@@ -258,7 +639,7 @@ function SourcesSection() {
       </div>
     )
   }
-  if (sources.isPending || !sources.data) {
+  if (sources.isPending || !payload) {
     // Distinct from the empty state on purpose: "nothing is configured" is a fact
     // about the document, and "not read yet" is a fact about this request.
     return (
@@ -269,8 +650,6 @@ function SourcesSection() {
     )
   }
 
-  const payload = sources.data
-  const names = payload.sources.map((source) => source.name)
   // Normalized against the answer rather than trusted: a source removed by another
   // surface (or in the editor below) must not leave the section rendering a matrix
   // under a name the document no longer lists.
@@ -281,6 +660,24 @@ function SourcesSection() {
   // author who cannot be classified falls to. Read from the payload rather than
   // spelled here, so the sentence names whatever class the engine puts last.
   const leastTrusted = classes.length > 0 ? classes[classes.length - 1] : ''
+  // The choices the current answer can still account for, and the patch built from
+  // exactly those. One list for both, because a review that showed a patch line it
+  // could not explain — or a write that carried one — is the failure this card
+  // exists to prevent.
+  const reviewed: ReviewedEdit[] = []
+  for (const edit of edits) {
+    const cell = cellFor(payload, edit)
+    if (cell) reviewed.push({ edit, cell })
+  }
+  const patch = buildGridPatch(reviewed.map((entry) => entry.edit))
+  // The picked cell, resolved against the current answer rather than trusted: a pick
+  // whose source or pair the document no longer carries would otherwise leave a level
+  // control on screen acting on a cell nothing resolves, and a choice made there
+  // would be a grant for a pair the engine has no answer for.
+  const pickedShown = picked !== null && picked.source === selected ? picked : null
+  const pickedResolved = pickedShown === null ? undefined : cellFor(payload, pickedShown)
+  const pickedCell =
+    pickedShown !== null && pickedResolved ? { pair: pickedShown, cell: pickedResolved } : null
 
   return (
     <div className="se-blk">
@@ -336,13 +733,78 @@ function SourcesSection() {
                   <th scope="row" className="se-m">
                     {klass}
                   </th>
-                  {payload.spec_types.map((specType) => (
-                    <GridCell key={specType} cell={source?.grid[klass]?.[specType]} />
-                  ))}
+                  {payload.spec_types.map((specType) => {
+                    const pair = { source: selected, klass, specType }
+                    const cell = source?.grid[klass]?.[specType]
+                    return (
+                      <GridCell
+                        key={specType}
+                        cell={cell}
+                        pending={edits.find((edit) => sameCell(edit, pair))?.level}
+                        selected={picked !== null && sameCell(picked, pair)}
+                        // The pair, in the accessible name: twelve buttons reading
+                        // only their level are twelve announcements of a word, and
+                        // the pair is the whole identity of the decision.
+                        label={i18nT('apps.specEngine.sourcesSection.change_the_level_for_pair', {
+                          source: selected,
+                          klass,
+                          specType,
+                        })}
+                        onSelect={() => setPicked(pair)}
+                      />
+                    )
+                  })}
                 </tr>
               ))}
             </tbody>
           </table>
+          {pickedCell ? (
+            <LevelChoice
+              levels={payload.levels}
+              cell={pickedCell.cell}
+              pair={pickedCell.pair}
+              pending={edits.find((edit) => sameCell(edit, pickedCell.pair))?.level}
+              onChoose={(level) => choose(pickedCell.pair, level, pickedCell.cell)}
+            />
+          ) : (
+            <p className="se-note">
+              {i18nT('apps.specEngine.sourcesSection.choose_a_cell_to_change_its_level')}
+            </p>
+          )}
+          <div className="se-acts" style={{ marginTop: 9 }}>
+            <button
+              type="button"
+              className="se-btn"
+              disabled={reviewed.length === 0}
+              onClick={() => setReviewing(true)}
+            >
+              {i18nT('apps.specEngine.sourcesSection.review_the_exact_change')}
+            </button>
+            {reviewed.length > 0 && (
+              <span className="se-lbl">
+                {i18nT('apps.specEngine.sourcesSection.unwritten_cell_changes')}
+                {SEP}
+                <span className="se-m">{fmtNumber(reviewed.length)}</span>
+              </span>
+            )}
+          </div>
+          {reviewing && reviewed.length > 0 && (
+            <GridReview
+              reviewed={reviewed}
+              patch={patch}
+              levels={payload.levels}
+              leastTrusted={leastTrusted}
+              writing={write.isPending}
+              error={write.isError ? write.error : null}
+              onConfirm={() => write.mutate(patch)}
+              onDiscard={discard}
+            />
+          )}
+          {wrote && (
+            <p className="se-note" role="status">
+              {i18nT('apps.specEngine.sourcesSection.wrote_the_change_and_re_read_the_matrix')}
+            </p>
+          )}
         </>
       )}
       {/* The semantics, beside the values they govern. Each of these is a rule an
@@ -366,6 +828,12 @@ function SourcesSection() {
       </p>
       <p className="se-note">
         {i18nT('apps.specEngine.sourcesSection.the_matrix_is_the_engines_own_resolution')}
+      </p>
+      {/* Stated where the edit is made, because the alternative reading is the
+          natural one: an operator changing a cell a broader rule answered would
+          otherwise expect that rule to move. */}
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.an_edit_writes_the_pairs_own_cell')}
       </p>
     </div>
   )

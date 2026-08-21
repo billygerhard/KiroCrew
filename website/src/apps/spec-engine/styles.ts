@@ -347,11 +347,34 @@ table.se-grid td{padding:7px 8px 7px 0;border-bottom:1px solid var(--border);ver
   min-width:0}
 table.se-grid tr:last-child th,table.se-grid tr:last-child td{border-bottom:none}
 table.se-grid td[data-origin="default"]{color:var(--muted)}
+/* A cell holding an unwritten choice is marked as a block, not only by the flag
+   inside it: the operator is about to approve a patch, and which cells are in it is
+   the first thing to be able to see. */
+table.se-grid td[data-pending="true"]{background:var(--accent-subtle)}
 .se-glevel{display:inline-block;font-weight:700;color:var(--text-strong);overflow-wrap:anywhere}
 table.se-grid td[data-origin="default"] .se-glevel{color:var(--muted-strong)}
 table.se-grid .se-note{margin:2px 0 0;display:block}
 table.se-grid .se-src{display:block;margin-top:2px}
+/* The level, doubling as the button that picks the pair for the level control below
+   the table. Styled as the level rather than as a control: the matrix is read far more
+   often than it is edited, and a row of buttons would read as a toolbar. */
+.se-glevelbtn{background:none;border:none;padding:0;text-align:left;font:inherit;
+  font-weight:700;color:var(--text-strong)}
+.se-glevelbtn[aria-pressed="true"]{color:var(--accent);text-decoration:underline}
+.se-glevelbtn:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+table.se-grid td[data-origin="default"] .se-glevelbtn{color:var(--muted-strong)}
 .se-flag[data-flag="unattended"]{color:var(--warn)}
+.se-flag[data-flag="pending"]{color:var(--accent)}
+/* The level control for the picked cell. In flow under the matrix, never a popup: the
+   ladder is short enough to show whole, and a dropdown's popup would be drawn over the
+   page — which is the one thing this layout does not do. */
+.se-gedit{margin-top:9px;padding:8px 9px;background:var(--bg-accent);
+  border:1px solid var(--border);border-radius:var(--radius-sm)}
+.se-gedit .se-lbl{display:block;margin-bottom:5px}
+/* The patch a confirm would write. Shorter than the document editor's box, which is
+   sized for a whole document: a cell patch is a handful of lines, and a fixed 320px
+   of mostly blank would push the confirm out of view. */
+pre.se-gpatch{height:auto;max-height:200px}
 /* The document editor. A FIXED height, not a cap: a document that grew with its
    line count would push the save controls off the pane. */
 textarea.se-json{width:100%;resize:vertical;min-height:220px}
