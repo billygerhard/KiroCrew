@@ -7,12 +7,12 @@ same-origin, already through the gateway's auth middleware, and there is no
 second process, port or proxy secret anywhere in this module.
 
 **What this surface is for.** One page's worth of operation: the Review_Queue
-and its four manual overrides, the configuration document and the resolved read
-beside it, the setup flow that produces a first document, the kill switch, and
-one run's attributed spend. Everything it does it does by calling the
-Spec_Engine library — no rule, no threshold and no state transition is decided
-here — so a surface reading a number reads the number the engine enforces
-against rather than one this module recomputed.
+and its four manual overrides, the configuration document with the resolved read
+and the per-source autonomy grid beside it, the setup flow that produces a first
+document, the kill switch, and one run's attributed spend. Everything it does it
+does by calling the Spec_Engine library — no rule, no threshold and no state
+transition is decided here — so a surface reading a number reads the number the
+engine enforces against rather than one this module recomputed.
 
 **Two gates, and why each exists.**
 
@@ -33,14 +33,19 @@ widen its own autonomy or lift its own stop. So every MUTATING handler refuses
 an app token with 403 and a security event, and refuses an unauthenticated
 caller with 401.
 
-Reads deliberately stop at 401. An app token may READ all five read routes,
+Reads deliberately stop at 401. An app token may READ all six read routes,
 and the rationale differs by route. The configuration reads are equivalence: the
 values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
-them here would buy nothing and diverge the two doors. The queue, run-spend and
-kill-switch reads have NO MCP equivalent — an app token gains reads here it
-could not otherwise obtain (queue rows with source and item ids, per-run spend,
-kill-switch state with stoppable run ids). That is accepted, not overlooked:
+them here would buy nothing and diverge the two doors. The per-source autonomy
+grid joins them: it carries resolved autonomy levels and the configuration paths
+that declared them, which is a projection of a document the same agent can
+already read, and no credential-classified value appears in it. Reading how far
+a source may run unattended is also not the authority to change it — that is the
+config write, which is operator-only. The queue, run-spend and kill-switch reads
+have NO MCP equivalent — an app token gains reads here it could not otherwise
+obtain (queue rows with source and item ids, per-run spend, kill-switch state
+with stoppable run ids). That is accepted, not overlooked:
 the requirement guards mutations, these payloads carry no credential-classified
 material, and an agent acting on a run legitimately needs to see the queue it
 is part of. If that acceptance is ever revisited, the guard mechanism below is
@@ -107,17 +112,26 @@ from ..engine import review_queue as engine_review_queue
 from ..engine import runs as engine_runs
 from ..engine import setup as engine_setup
 from ..engine import state as engine_state
+from ..engine.autonomy import (
+    AUTONOMY_FIELD,
+    AutonomyDecision,
+    AutonomyLevel,
+    AutonomyPolicy,
+)
 from ..engine.budget import ceiling as engine_ceiling
 from ..engine.budget import killswitch as engine_killswitch
 from ..engine.budget import ledger as engine_ledger
 from ..engine.budget import switch as engine_switch
 from ..engine.config import (
     APP_NAME,
+    AUTONOMY_LEVELS,
     CONFIG_ONLY_PATHS,
     DASHBOARD_SURFACE,
     ELIDED,
     ROLES,
     SETUP_ASSISTANT_SURFACE,
+    SPEC_TYPES,
+    SUBMITTER_CLASSES,
     ConfigLoadError,
     ConfigRecordError,
     ConfigStore,
@@ -129,6 +143,7 @@ from ..engine.config import (
     resolve_all,
     validate_config_document,
 )
+from ..engine.config.schema import SECTION_SOURCES
 from ..engine.roles import RolePlan
 from ..engine_mcp import setup_surface
 
@@ -618,6 +633,138 @@ async def handle_get_resolved_config(request: web.Request) -> web.Response:
         # arm keeps that distinction: the document has a value nobody can act on,
         # which is a repair, not an unreadable file and not an empty resolution.
         # It must precede any ValueError arm -- ConfigValidationError derives
+        # ValueError.
+        return _refuse("config_invalid", "; ".join(str(error) for error in exc.errors), status=422)
+    except ConfigLoadError as exc:
+        return _refuse("config_unreadable", str(exc), status=409)
+    except OSError as exc:
+        return _refuse("config_unreadable", str(exc), status=503)
+    return web.json_response(payload)
+
+
+# --- the per-source autonomy grid --------------------------------------------
+
+#: The pair's OWN stored cell answered it.
+ORIGIN_EXACT = "exact"
+
+#: A broader stored cell — wildcard in either dimension — answered it.
+ORIGIN_WILDCARD = "wildcard"
+
+#: Nothing stored answered it, so the unconfigured default is in force. That
+#: default covers no gate, which is why the distinction is worth carrying: an
+#: operator reading ``authoring`` cannot otherwise tell a rung somebody chose
+#: from the rung an absent declaration produces, and only one of those is a
+#: decision.
+ORIGIN_DEFAULT = "default"
+
+
+def _cell_origin(decision: AutonomyDecision) -> str:
+    """Which kind of declaration answered *decision*.
+
+    Derived by rebuilding the pair's own cell path and comparing whole strings
+    rather than by splitting ``declared_at`` into segments: a source may
+    legitimately be named with a dot in it, and a split would then read the tail
+    of the source name as the submitter class. Composed exactly as the resolver
+    composes it, so the two spellings of one path cannot drift.
+
+    Total by construction. An unconfigured decision carries no path at all, and
+    every path the resolver does return is either the queried pair's own cell or
+    a broader one — there is no fourth case and no parse to fail.
+    """
+    if not decision.is_configured:
+        return ORIGIN_DEFAULT
+    own_cell = (
+        f"{SECTION_SOURCES}.{decision.source}.{AUTONOMY_FIELD}"
+        f".{decision.submitter_class}.{decision.spec_type}"
+    )
+    return ORIGIN_EXACT if decision.declared_at == own_cell else ORIGIN_WILDCARD
+
+
+def _source_grid(policy: AutonomyPolicy, source: str) -> dict[str, dict[str, Any]]:
+    """*source*'s full matrix: one resolved cell per (submitter class, spec type).
+
+    Every cell is the engine's own resolution — one ``AutonomyPolicy.resolve``
+    call per pair against an already-loaded document — so a surface and the gates
+    read one resolver. A matrix re-derived from the raw grid would have to
+    re-implement class-first precedence and wildcard fallback, and the copy that
+    drifted would be the one an operator was reading before deciding who may run
+    unattended.
+
+    ``policy_covers_gates`` is ``permits(EXECUTION)``, which is what
+    ``gate_is_policy_covered`` reduces to for every document gate: it marks the
+    cells whose matching items have their gates approved by the policy with no
+    human in the loop.
+    """
+    grid: dict[str, dict[str, Any]] = {}
+    for submitter_class in SUBMITTER_CLASSES:
+        row: dict[str, Any] = {}
+        for spec_type in SPEC_TYPES:
+            decision = policy.resolve(
+                source=source, spec_type=spec_type, submitter_class=submitter_class
+            )
+            row[spec_type] = {
+                "level": decision.level.value,
+                # Empty rather than absent when nothing was configured, matching
+                # the resolved read's spelling of the same idea: a client branches
+                # on `origin`, and a key that came and went would read as a shape
+                # change rather than as "no declaration answered this".
+                "declared_at": decision.declared_at,
+                "origin": _cell_origin(decision),
+                "policy_covers_gates": decision.permits(AutonomyLevel.EXECUTION),
+            }
+        grid[submitter_class] = row
+    return grid
+
+
+def _sources_snapshot() -> dict[str, Any]:
+    """BLOCKING — every Watch_Source's fully resolved autonomy matrix.
+
+    Built from ONE read of the document, for the reason :func:`_resolved_snapshot`
+    is: a resolver that re-read the file per cell would let a write landing
+    mid-reply produce a matrix describing two different documents, and the two
+    halves would disagree about who may run unattended without saying so.
+
+    A source carrying no ``autonomy`` field is listed with its all-default matrix
+    rather than skipped. A configured source nobody wrote a grid for is exactly
+    the fail-closed case an operator most needs to see, and omitting it would read
+    as "this source is not configured".
+
+    The vocabularies travel with the payload so a surface renders the ENGINE's
+    axes: a class or spec type the schema adds appears without a client edit, and
+    a client cannot render an axis the resolver has no answer for.
+    """
+    document = _config_store().document()
+    policy = AutonomyPolicy.from_document(document)
+    section = document.get(SECTION_SOURCES)
+    # Sorted because a JSON object carries no order a client may rely on, and an
+    # operator scanning the list wants the same order on every read.
+    names = sorted(str(name) for name in section) if isinstance(section, Mapping) else []
+    return {
+        "sources": [{"name": name, "grid": _source_grid(policy, name)} for name in names],
+        "submitter_classes": list(SUBMITTER_CLASSES),
+        "spec_types": list(SPEC_TYPES),
+        "levels": list(AUTONOMY_LEVELS),
+    }
+
+
+async def handle_get_sources(request: web.Request) -> web.Response:
+    """GET every Watch_Source's autonomy grid, resolved cell by cell.
+
+    Refusals mirror the resolved read's, because both are reads of the same
+    document through the same store: a stored grid the resolver cannot read is a
+    422 naming the path, an unparseable file is a 409, and a disk failure is a
+    503. A malformed grid must never come back as values — a surface that
+    rendered a partial matrix would show an operator authority the engine would
+    refuse to act on.
+    """
+    try:
+        payload = await asyncio.to_thread(_sources_snapshot)
+    except ConfigValidationError as exc:
+        # A hand-edited grid the resolver refuses to read: a level outside the
+        # ladder, or a class row that is not an object. Resolution RAISES on both
+        # rather than falling through to a broader cell, and this arm keeps that
+        # distinction visible instead of reporting a repair as an empty matrix. It
+        # must precede any ValueError arm -- ConfigValidationError derives
         # ValueError.
         return _refuse("config_invalid", "; ".join(str(error) for error in exc.errors), status=422)
     except ConfigLoadError as exc:
@@ -1260,6 +1407,7 @@ def register_routes(app: web.Application) -> None:
     add("GET", f"{PREFIX}/config", _read(handle_get_config))
     add("PUT", f"{PREFIX}/config", _mutate(handle_put_config, operation="config_write"))
     add("GET", f"{PREFIX}/config/resolved", _read(handle_get_resolved_config))
+    add("GET", f"{PREFIX}/config/sources", _read(handle_get_sources))
 
     # The setup flow. All three are POSTs behind the operator guard, and the first
     # two write nothing: they read a project path the CALLER names, so leaving them

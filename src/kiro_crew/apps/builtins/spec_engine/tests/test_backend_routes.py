@@ -43,9 +43,18 @@ from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.backend import routes
+from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
+    AutonomyDecision,
+    AutonomyLevel,
+)
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
+    AUTONOMY_LEVELS,
     CONFIG_FILENAME,
+    LEAST_TRUSTED_CLASS,
     ROLES,
+    SPEC_TYPES,
+    SUBMITTER_CLASSES,
+    WILDCARD_KEY,
     ConfigStore,
     ConfigWriteSurface,
     default_root,
@@ -115,6 +124,7 @@ def test_the_derived_blocking_set_still_sees_the_known_helpers() -> None:
         "_queue_snapshot",
         "_release_feedback",
         "_resolved_snapshot",
+        "_sources_snapshot",
         "_inspect_setup",
         "_plan_envelope",
         "_plan_setup",
@@ -553,6 +563,7 @@ class TestTheRegisteredSurface:
             ("GET", f"{routes.PREFIX}/config"),
             ("PUT", f"{routes.PREFIX}/config"),
             ("GET", f"{routes.PREFIX}/config/resolved"),
+            ("GET", f"{routes.PREFIX}/config/sources"),
             ("POST", f"{routes.PREFIX}/setup/inspect"),
             ("POST", f"{routes.PREFIX}/setup/plan"),
             ("POST", f"{routes.PREFIX}/setup/apply"),
@@ -1308,6 +1319,323 @@ class TestTheResolvedReadIsAReadOfTheDocumentBesideIt:
             reply = await _get(client, f"{routes.PREFIX}/config/resolved")
         assert reply.status == 409
         assert reply.code == "config_unreadable"
+
+
+# --- the per-source autonomy grid --------------------------------------------
+
+
+#: A source entry the schema accepts. ``poll`` is required, so a grid cannot be
+#: written without one.
+def _source(grid: Any = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"poll": ["watch", "issues"]}
+    if grid is not None:
+        entry["autonomy"] = grid
+    return entry
+
+
+def _write_document(document: dict[str, Any]) -> None:
+    """Put *document* on disk verbatim, bypassing the write path's validation.
+
+    For the shapes the write path REFUSES: a hand-edited grid is exactly what the
+    malformed-grid arm exists for, and it cannot be produced through the door.
+    """
+    config_dir = default_root()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / CONFIG_FILENAME).write_text(json.dumps(document), encoding="utf-8")
+
+
+def _cell(body: Any, source: str, submitter_class: str, spec_type: str) -> dict[str, Any]:
+    entries = {entry["name"]: entry for entry in body["sources"]}
+    assert source in entries, f"{source} is missing from {sorted(entries)}"
+    return dict(entries[source]["grid"][submitter_class][spec_type])
+
+
+class TestTheSourcesReadResolvesEveryCellThroughTheEngine:
+    """The autonomy grid, matrix by matrix, resolved by the policy the gates use.
+
+    The claim worth defending is not that the JSON has the right shape: it is that
+    a cell an operator reads is the cell a RUN would resolve. So these drive the
+    real route against a real document and assert on the level, the declaring path
+    and the origin together — a matrix that resolved correctly but attributed a
+    wildcard cell to the pair itself would tell an operator they had written a rule
+    they had not, and the next edit would be made on that belief.
+
+    The 401 floor and the disabled-app refusal are not repeated here: both are
+    parametrized over the route table, so registering this path enrolled it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_stored_cell_reports_its_own_path_as_an_exact_origin(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {"patch": {"sources": {"gh": _source({"maintainer": {"feature": "delivery"}})}}},
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.status == 200
+        cell = _cell(reply.body, "gh", "maintainer", "feature")
+        assert cell == {
+            "level": "delivery",
+            "declared_at": "sources.gh.autonomy.maintainer.feature",
+            "origin": "exact",
+            # delivery is above execution, and an enabled rung implies every rung
+            # below it, so the policy covers the document gates.
+            "policy_covers_gates": True,
+        }
+        # The pair the operator wrote nothing for is untouched by that cell.
+        assert _cell(reply.body, "gh", "maintainer", "bugfix")["origin"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_a_wildcard_row_answers_every_spec_type_and_says_it_was_a_wildcard(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The origin an edit depends on: a cell answered by a wildcard must be
+        narrowed rather than overwritten, and the surface can only offer that if
+        the read distinguishes the two."""
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "sources": {"gh": _source({"contributor": {WILDCARD_KEY: "execution"}})}
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        for spec_type in SPEC_TYPES:
+            cell = _cell(reply.body, "gh", "contributor", spec_type)
+            assert cell["level"] == "execution"
+            assert cell["origin"] == "wildcard"
+            assert cell["declared_at"] == f"sources.gh.autonomy.contributor.{WILDCARD_KEY}"
+            assert cell["policy_covers_gates"] is True
+        # Class-first precedence is the engine's, and the read inherits it: a row
+        # written for one class says nothing about another.
+        assert _cell(reply.body, "gh", "external", "feature")["origin"] == "default"
+
+    @pytest.mark.asyncio
+    async def test_the_least_trusted_class_defaults_to_a_cell_that_covers_no_gate(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The fail-closed case, reported as a decision rather than as a blank."""
+        async with _client() as client:
+            await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {"patch": {"sources": {"gh": _source({"maintainer": {"feature": "integration"}})}}},
+            )
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        cell = _cell(reply.body, "gh", LEAST_TRUSTED_CLASS, "feature")
+        assert cell == {
+            "level": "authoring",
+            "declared_at": "",
+            "origin": "default",
+            "policy_covers_gates": False,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grid", [None, {}], ids=["absent", "empty"])
+    async def test_a_source_with_no_grid_is_listed_with_an_all_default_matrix(
+        self, grid: Any, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Listed, not skipped. A configured source nobody wrote a grid for is the
+        fail-closed case an operator most needs to see, and omitting it would read
+        as "this source is not configured"."""
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {"patch": {"sources": {"gh": _source(grid)}}},
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert [entry["name"] for entry in reply.body["sources"]] == ["gh"]
+        matrix = reply.body["sources"][0]["grid"]
+        assert set(matrix) == set(SUBMITTER_CLASSES)
+        for submitter_class in SUBMITTER_CLASSES:
+            assert set(matrix[submitter_class]) == set(SPEC_TYPES)
+            for cell in matrix[submitter_class].values():
+                assert cell["origin"] == "default"
+                assert cell["level"] == "authoring"
+                assert cell["policy_covers_gates"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_document_with_no_sources_reports_none_rather_than_an_axis_only_matrix(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.status == 200
+        assert reply.body["sources"] == []
+        # The vocabularies still travel: the surface needs them to say what it is
+        # not showing.
+        assert reply.body["submitter_classes"] == list(SUBMITTER_CLASSES)
+
+    @pytest.mark.asyncio
+    async def test_the_axes_are_the_engines_own_vocabularies(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Shipped rather than hard-coded downstream, so a schema change shows up
+        in the surface without a client edit — and in the schema's own ORDER,
+        which is meaningful: submitter classes run least trusted last and levels
+        run least autonomous first."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.body["submitter_classes"] == list(SUBMITTER_CLASSES)
+        assert reply.body["spec_types"] == list(SPEC_TYPES)
+        assert reply.body["levels"] == list(AUTONOMY_LEVELS)
+        assert reply.body["submitter_classes"][-1] == LEAST_TRUSTED_CLASS
+
+    @pytest.mark.asyncio
+    async def test_several_sources_are_listed_in_a_stable_order(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "sources": {
+                            "zeta": _source({"member": {"quick": "execution"}}),
+                            "alpha": _source(),
+                        }
+                    }
+                },
+            )
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert [entry["name"] for entry in reply.body["sources"]] == ["alpha", "zeta"]
+        # One source's grid never answers another's cell.
+        assert _cell(reply.body, "alpha", "member", "quick")["origin"] == "default"
+        assert _cell(reply.body, "zeta", "member", "quick")["origin"] == "exact"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("grid", "expected_path"),
+        [
+            ("execution", "sources.gh.autonomy"),
+            ({"external": "execution"}, "sources.gh.autonomy.external"),
+            ({"external": {"feature": "root"}}, "sources.gh.autonomy.external.feature"),
+        ],
+        ids=["grid-not-an-object", "row-not-an-object", "level-off-the-ladder"],
+    )
+    async def test_a_malformed_stored_grid_is_refused_by_path_not_rendered(
+        self,
+        grid: Any,
+        expected_path: str,
+        recorded_sel: RecordedSel,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """Resolution RAISES on each of these rather than falling through to a
+        broader cell, and the route keeps that: a partial matrix would show an
+        operator authority the engine would refuse to act on. Written to disk
+        directly, because the write path would have refused all three."""
+        _write_document({"version": 1, "sources": {"gh": _source(grid)}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.status == 422
+        assert reply.code == "config_invalid"
+        assert expected_path in reply.body["error"]
+        assert "sources" not in reply.body, "a refused read must carry no values"
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_document_is_reported_not_read_as_no_sources(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.status == 409
+        assert reply.code == "config_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_the_whole_matrix_is_built_from_one_read_of_the_document(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Twelve resolutions per source against a live store would each re-read
+        the file, so a write landing mid-reply would produce a matrix describing
+        two different documents — with the two halves disagreeing about who may
+        run unattended and nothing saying so."""
+        reads: list[int] = []
+        original = ConfigStore.document
+
+        def _counting(self: ConfigStore) -> dict[str, Any]:
+            reads.append(1)
+            return original(self)
+
+        _write_document(
+            {
+                "version": 1,
+                "sources": {
+                    "gh": _source({"maintainer": {"feature": "delivery"}}),
+                    "gl": _source({WILDCARD_KEY: {WILDCARD_KEY: "execution"}}),
+                },
+            }
+        )
+        monkeypatch.setattr(ConfigStore, "document", _counting)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/sources")
+        assert reply.status == 200
+        assert sum(reads) == 1, f"the sources read read the document {sum(reads)} times"
+
+
+class TestTheOriginOfACellIsClassifiedFromTheDeclaringPath:
+    """Unit-level, against the real ``AutonomyDecision`` shape.
+
+    Origin is the field an edit is built on — a wildcard-answered cell is narrowed
+    rather than overwritten — so it is classified here from the decision the
+    resolver returns rather than inferred from the raw grid.
+    """
+
+    @staticmethod
+    def _decision(declared_at: str, *, source: str = "gh") -> AutonomyDecision:
+        return AutonomyDecision(
+            level=AutonomyLevel.EXECUTION,
+            source=source,
+            spec_type="feature",
+            submitter_class="external",
+            declared_at=declared_at,
+        )
+
+    def test_no_declaration_is_the_unconfigured_default(self) -> None:
+        assert routes._cell_origin(self._decision("")) == routes.ORIGIN_DEFAULT
+
+    def test_the_pairs_own_cell_is_exact(self) -> None:
+        assert (
+            routes._cell_origin(self._decision("sources.gh.autonomy.external.feature"))
+            == routes.ORIGIN_EXACT
+        )
+
+    @pytest.mark.parametrize(
+        "declared_at",
+        [
+            f"sources.gh.autonomy.external.{WILDCARD_KEY}",
+            f"sources.gh.autonomy.{WILDCARD_KEY}.feature",
+            f"sources.gh.autonomy.{WILDCARD_KEY}.{WILDCARD_KEY}",
+        ],
+        ids=["type-wildcard", "class-wildcard", "both-wildcard"],
+    )
+    def test_a_broader_cell_is_a_wildcard(self, declared_at: str) -> None:
+        assert routes._cell_origin(self._decision(declared_at)) == routes.ORIGIN_WILDCARD
+
+    def test_a_source_name_holding_a_dot_still_classifies_its_own_cell_as_exact(self) -> None:
+        """Whole-path comparison rather than a segment split.
+
+        A source may legitimately be named ``gh.issues``, and a classifier that
+        split the dotted path would read ``issues`` as the submitter class — then
+        report every exact cell of that source as a wildcard, and the UI would
+        offer to narrow a cell that is already as narrow as it gets.
+        """
+        decision = self._decision("sources.gh.issues.autonomy.external.feature", source="gh.issues")
+        assert routes._cell_origin(decision) == routes.ORIGIN_EXACT
 
 
 # --- the setup flow ----------------------------------------------------------
