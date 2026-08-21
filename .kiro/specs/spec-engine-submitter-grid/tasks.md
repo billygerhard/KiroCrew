@@ -15,6 +15,17 @@ consumes the previous one's contract; the review gate runs between waves.
   reviews are dispatched, per the project's standing discipline.
 - Every new operator-facing string ships in all 13 catalogs in the same task
   that introduces it, not in the sweep.
+- **Carried from 3.1's review (for 4.1, disposition):** a pending edit whose
+  (class, type) pair the refreshed payload no longer resolves — source still
+  present — stays in local edits with its "Not written" mark but is excluded
+  from review and patch; clearable only by discard. Near-unreachable (the
+  route ships full matrices) and degrades visibly rather than silently.
+  Disposition or fix in the sweep.
+- **Recorded deviation (3.1, reviewer-verified):** the design's "per-cell
+  level selects" became a cell pick + shared in-flow level control: the repo
+  bans native `<select>` (eslint error) and the mandated Radix replacements
+  portal popups, which would violate the app's tested no-overlay invariant.
+  Queue-then-review semantics preserved exactly.
 - **Carried from 1.1's review (for 2.1):** TS types come from the actual
   payload — `declared_at` is `""` when unconfigured (never `null`), the
   wildcard key in paths is the literal `default`; branch on `origin`, not on
@@ -56,8 +67,8 @@ consumes the previous one's contract; the review gate runs between waves.
     - Vitest: matrix rendering with all three origins, default wording, failed-read doubt state, empty state, semantics copy presence, vocabulary-driven axes.
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 2.1, 2.2, 2.3, 2.4_
 
-- [ ] 3. Guarded editing
-  - [ ] 3.1 Cell edits with exact-patch review through the guarded write
+- [x] 3. Guarded editing
+  - [x] 3.1 Cell edits with exact-patch review through the guarded write
     - Per-cell level selects accumulating `PendingEdit`s in local state; nothing written before review.
     - `buildGridPatch` as a pure function producing the minimal nested patch; fast-check property that its only paths are the edited cells (TS half of Property 1).
     - Review card: the exact pretty-printed patch, one sentence per edit (cell, old level and origin, new level), the external-raise warning when an edit raises the least-trusted class's resolved level, the narrowing note when the edited cell was wildcard-answered (the wildcard is never modified).
