@@ -143,8 +143,10 @@ property is directly testable: the patch's only paths are
 
 ## Data Models
 
-- `SourceGridCell` (TS): `{ level, declared_at: string | null, origin:
-  'exact' | 'wildcard' | 'default', policy_covers_gates: boolean }`.
+- `SourceGridCell` (TS): `{ level, declared_at: string, origin: 'exact' |
+  'wildcard' | 'default', policy_covers_gates: boolean }` — `declared_at` is
+  `""` when unconfigured (matching the resolved read's spelling), never
+  `null`; consumers branch on `origin`.
 - `SourcesPayload` (TS): mirrors the route response; vocabulary arrays typed
   as `readonly string[]` and rendered, not assumed.
 - `PendingEdit` (TS): `{ source, klass, specType, level }`.

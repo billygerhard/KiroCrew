@@ -21,9 +21,14 @@ consumes the previous one's contract; the review gate runs between waves.
   `declared_at` emptiness alone. Design's payload sketch has been corrected.
 - **Carried from 1.1's review (for 2.1, decide):** a hand-edited grid row
   keyed outside the class vocabulary renders as all-default with no advisory
-  (faithful to gate behavior; the write door refuses such documents). Decide
-  whether the sources view surfaces the config read's validation errors
-  beside the grid, and record the disposition either way.
+  (faithful to gate behavior; the write door refuses such documents).
+  **Disposition (2.1, reviewed and approved):** the sources view does NOT
+  duplicate the config read's validation errors beside the grid — they
+  already render in this same pane with the document editor, and a grid the
+  resolver cannot read arrives as the route's own refusal. Instead the
+  section carries one sentence stating that an unrecognized stored row
+  answers no cell and shows as not configured, with document problems
+  reported beside the document.
 
 ## Tasks
 
@@ -39,8 +44,8 @@ consumes the previous one's contract; the review gate runs between waves.
     - Hypothesis property: merging a minimal cell patch through the real `_merge` leaves every other path identical (Python half of Property 1).
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.4, 4.1, 4.2_
 
-- [ ] 2. Read-only sources view
-  - [ ] 2.1 Sources section rendering the grid with origins and semantics
+- [x] 2. Read-only sources view
+  - [x] 2.1 Sources section rendering the grid with origins and semantics
     - Add the Sources section to the Configuration pane: source list, per-source matrix (classes × spec types in schema order), per-cell level + origin annotation + policy-covers-gates marker.
     - Default-answered cells render the Unconfigured_Default wording ("waits for a human"), never blank or zero.
     - Failed read forces the stated-failure state with no values rendered from retained or default data; loading state is distinct from empty.
