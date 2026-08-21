@@ -4043,6 +4043,24 @@
         "yes": "Sim",
         "yes_blocked_by_declined": "Sim está indisponível enquanto {{level}} estiver recusado: um nível habilitado autoriza todos os níveis abaixo dele."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "Um nível autoriza todos os níveis abaixo dele, então uma célula concede o próprio nível e todos os que estão sob ele.",
+        "an_unclassifiable_author_is_least_trusted": "Um autor que o motor não consegue classificar conta como {{klass}}, a classe menos confiável, então não identificar quem enviou algo não concede nada.",
+        "autonomy_for_source": "Autonomia de {{source}}, por classe de remetente e tipo de spec",
+        "col_submitter_class": "Classe de remetente",
+        "could_not_read_the_watch_sources": "Não foi possível ler as fontes monitoradas",
+        "execution_or_above_needs_no_human_at_a_gate": "Onde uma célula concede execution ou acima, a política de autonomia aprova os portões de documento de um item correspondente sem nenhuma pessoa envolvida. Qualquer outra célula deixa a execução esperando por uma pessoa.",
+        "no_watch_source_is_configured": "Nenhuma fonte monitorada está configurada, então nada é ingerido de fora. Uma fonte é adicionada pelo assistente de configuração, como parte do plano que um aprovador nomeado aceita; esta visão lê grades e nunca cria uma fonte.",
+        "origin_exact": "Definido para este par",
+        "origin_unconfigured": "Não configurado, então esta célula espera por uma pessoa",
+        "origin_wildcard": "Definido por uma regra mais ampla",
+        "reading_the_watch_sources": "Lendo as fontes monitoradas…",
+        "screening_caps_a_flagged_item_to_authoring": "A triagem de entrada limita um item sinalizado ao nível authoring, diga o que disser esta grade. O limite só reduz a autoridade; nunca a aumenta.",
+        "select_a_watch_source": "Selecionar uma fonte monitorada",
+        "the_matrix_is_the_engines_own_resolution": "A matriz é a resolução do próprio motor, par por par, então ela se lê exatamente como os portões a leem. Uma linha salva que o motor não reconhece não responde a nenhuma célula e aparece aqui como não configurada; problemas no documento salvo são relatados junto ao documento.",
+        "unattended": "Sem supervisão",
+        "watch_sources": "Fontes monitoradas"
+      },
       "specEnginePage": {
         "all": "Todos",
         "budget": "Orçamento",

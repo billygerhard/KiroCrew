@@ -3921,6 +3921,24 @@
         "yes": "예",
         "yes_blocked_by_declined": "{{level}}이(가) 거부된 동안에는 예를 선택할 수 없습니다. 활성화된 단계는 그 아래 모든 단계를 승인합니다."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "한 단계는 그 아래 모든 단계를 승인하므로, 셀은 자기 단계와 그 아래 모든 단계를 함께 허용합니다.",
+        "an_unclassifiable_author_is_least_trusted": "엔진이 분류할 수 없는 작성자는 가장 신뢰도가 낮은 클래스인 {{klass}}(으)로 처리됩니다. 제출자를 식별하지 못한다고 해서 권한이 생기지는 않습니다.",
+        "autonomy_for_source": "{{source}}의 자율성 — 제출자 클래스와 스펙 유형별",
+        "col_submitter_class": "제출자 클래스",
+        "could_not_read_the_watch_sources": "감시 소스를 읽을 수 없습니다",
+        "execution_or_above_needs_no_human_at_a_gate": "셀이 execution 이상을 허용하면, 해당 항목의 문서 게이트는 자율성 정책이 사람 없이 승인합니다. 그 밖의 셀은 실행을 사람이 볼 때까지 세워 둡니다.",
+        "no_watch_source_is_configured": "구성된 감시 소스가 없어 외부에서 아무것도 수집되지 않습니다. 소스는 설정 도우미가 이름이 적힌 승인자가 수락한 계획의 일부로 추가합니다. 이 화면은 그리드를 읽을 뿐이며 소스를 만들지 않습니다.",
+        "origin_exact": "이 조합에 직접 설정됨",
+        "origin_unconfigured": "구성되지 않아 이 셀은 사람을 기다립니다",
+        "origin_wildcard": "더 넓은 규칙으로 설정됨",
+        "reading_the_watch_sources": "감시 소스를 읽는 중…",
+        "screening_caps_a_flagged_item_to_authoring": "유입 심사는 이 그리드와 무관하게 표시된 항목을 authoring 단계로 제한합니다. 이 제한은 권한을 낮추기만 하며 절대 올리지 않습니다.",
+        "select_a_watch_source": "감시 소스 선택",
+        "the_matrix_is_the_engines_own_resolution": "이 행렬은 엔진이 조합마다 직접 해석한 결과이므로 게이트가 읽는 것과 정확히 같습니다. 엔진이 알지 못하는 저장된 행은 어떤 셀에도 답하지 않고 여기서는 구성되지 않음으로 표시됩니다. 저장된 문서의 문제는 문서 쪽에서 보고됩니다.",
+        "unattended": "무인",
+        "watch_sources": "감시 소스"
+      },
       "specEnginePage": {
         "all": "전체",
         "budget": "예산",

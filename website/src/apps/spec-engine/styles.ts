@@ -327,6 +327,31 @@ ul.se-advisories li[data-ack="true"]{color:var(--text-strong)}
 .se-flag[data-flag="dropped"]{color:var(--warn)}
 .se-flag[data-flag="unanswered"]{color:var(--danger)}
 .se-flag[data-flag="unmet"]{color:var(--warn)}
+/* The submitter-class autonomy grid: classes down, spec types across, one resolved
+   cell each. The roles table's density and rules, with the level, its origin and
+   the declaring path stacked INSIDE the cell rather than spread across columns —
+   a matrix that grew a column per fact would need horizontal scroll to read one
+   pair, and the pair is the unit of the decision.
+
+   The origin is carried on a data attribute as well as in words so the unconfigured
+   cells are scannable as a block: that is where authority is absent, which is the
+   shape an operator preparing for outside intake is looking for. Colour is never
+   the only carrier — every cell states its origin in a sentence. */
+table.se-grid{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
+table.se-grid th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);font-weight:600;padding:0 8px 5px 0;border-bottom:1px solid var(--border);
+  overflow-wrap:anywhere}
+table.se-grid tbody th{text-transform:none;font-size:11.5px;color:var(--text-strong);
+  padding:7px 8px 7px 0;vertical-align:top}
+table.se-grid td{padding:7px 8px 7px 0;border-bottom:1px solid var(--border);vertical-align:top;
+  min-width:0}
+table.se-grid tr:last-child th,table.se-grid tr:last-child td{border-bottom:none}
+table.se-grid td[data-origin="default"]{color:var(--muted)}
+.se-glevel{display:inline-block;font-weight:700;color:var(--text-strong);overflow-wrap:anywhere}
+table.se-grid td[data-origin="default"] .se-glevel{color:var(--muted-strong)}
+table.se-grid .se-note{margin:2px 0 0;display:block}
+table.se-grid .se-src{display:block;margin-top:2px}
+.se-flag[data-flag="unattended"]{color:var(--warn)}
 /* The document editor. A FIXED height, not a cap: a document that grew with its
    line count would push the save controls off the pane. */
 textarea.se-json{width:100%;resize:vertical;min-height:220px}

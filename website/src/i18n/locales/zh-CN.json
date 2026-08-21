@@ -3921,6 +3921,24 @@
         "yes": "是",
         "yes_blocked_by_declined": "在 {{level}} 被拒绝期间无法选择“是”：启用某一级别即授权其下所有级别。"
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "某一级别会授权其下的所有级别，因此一个单元格既授予自身层级，也授予其下的每个层级。",
+        "an_unclassifiable_author_is_least_trusted": "引擎无法归类的作者按 {{klass}} 处理，也就是信任度最低的类别，所以无法识别提交者并不会带来任何权限。",
+        "autonomy_for_source": "{{source}} 的自治情况（按提交者类别与 spec 类型）",
+        "col_submitter_class": "提交者类别",
+        "could_not_read_the_watch_sources": "无法读取监视来源",
+        "execution_or_above_needs_no_human_at_a_gate": "单元格授予 execution 及以上时，匹配条目的文档关卡由自治策略在无人参与的情况下批准。其他单元格都会让运行停下等人。",
+        "no_watch_source_is_configured": "尚未配置任何监视来源，因此不会从外部接收任何内容。来源由设置助手添加，作为具名审批人接受的计划的一部分；本视图只读取网格，从不创建来源。",
+        "origin_exact": "为该组合直接设置",
+        "origin_unconfigured": "未配置，因此该单元格等待人工处理",
+        "origin_wildcard": "由更宽的规则设置",
+        "reading_the_watch_sources": "正在读取监视来源…",
+        "screening_caps_a_flagged_item_to_authoring": "无论网格怎么写，入站筛查都会把被标记的条目限制在 authoring 层级。该限制只会降低权限，绝不会提高。",
+        "select_a_watch_source": "选择监视来源",
+        "the_matrix_is_the_engines_own_resolution": "该矩阵是引擎逐个组合自行解析的结果，因此与关卡读到的完全一致。引擎不认识的已保存行不会回答任何单元格，在这里显示为未配置；已保存文档自身的问题会随文档一起报告。",
+        "unattended": "无人值守",
+        "watch_sources": "监视来源"
+      },
       "specEnginePage": {
         "all": "全部",
         "budget": "预算",

@@ -81,6 +81,7 @@ import {
   type ConfigSnapshot,
   type EffectiveSetting,
   type ResolvedRole,
+  type SourceGridCell,
 } from './api'
 import {
   COST_PROFILES,
@@ -164,6 +165,209 @@ export function Advisories({ advisories }: { advisories: ConfigAdvisory[] }) {
         </li>
       ))}
     </ul>
+  )
+}
+
+/**
+ * Which kind of declaration answered a grid cell, in words, keyed by the engine's
+ * own classification.
+ *
+ * Keys rather than resolved strings, for `ORIGIN_KEY`'s reason. The `default` entry
+ * carries the whole of the fail-closed reading: an absent declaration resolves to
+ * the authoring rung, which covers no gate, so the run waits for a person. A cell
+ * that showed only the word `authoring` would be indistinguishable from a rung
+ * somebody chose, and only one of those two is a decision.
+ */
+const CELL_ORIGIN_KEY: Record<SourceGridCell['origin'], string> = {
+  exact: 'apps.specEngine.sourcesSection.origin_exact',
+  wildcard: 'apps.specEngine.sourcesSection.origin_wildcard',
+  default: 'apps.specEngine.sourcesSection.origin_unconfigured',
+}
+
+/**
+ * One resolved cell: the level, where it was declared, and what it licenses.
+ *
+ * `cell` is optional because the axes and the matrix arrive in one payload and this
+ * renders the cross product of the axes: a pair the matrix does not carry can only
+ * mean the two disagree, and the honest reading of a pair with no resolution is the
+ * unconfigured one — which waits for a human — rather than a blank.
+ */
+function GridCell({ cell }: { cell: SourceGridCell | undefined }) {
+  const origin = cell?.origin ?? 'default'
+  return (
+    <td data-origin={origin}>
+      <span className="se-glevel se-m">{cell ? cell.level : NONE}</span>
+      {cell?.policy_covers_gates && (
+        <span className="se-flag" data-flag="unattended">
+          {i18nT('apps.specEngine.sourcesSection.unattended')}
+        </span>
+      )}
+      <span className="se-note">{i18nT(CELL_ORIGIN_KEY[origin])}</span>
+      {/* The declaring path, for the two origins that have one: an operator about
+          to change a cell needs to know whether the level is written at this pair
+          or at a broader one, because only one of those two edits is a narrowing. */}
+      {cell && cell.declared_at !== '' && <span className="se-src">{cell.declared_at}</span>}
+    </td>
+  )
+}
+
+/**
+ * The autonomy grid of every Watch_Source: who may run how unattended.
+ *
+ * A READ, and the only one this pane has of the engine's resolver. Each cell is the
+ * level `AutonomyPolicy` answered for that (submitter class, spec type) pair, with
+ * the origin that answered it — so the matrix here and the decision a gate makes
+ * come from one code path rather than from two implementations of class-first
+ * precedence.
+ *
+ * Three properties of the rendering are load-bearing:
+ *
+ * 1. **The axes are the payload's.** Rows and columns are the vocabularies the
+ *    engine shipped, in its order, so a class or spec type added to the schema
+ *    appears here without a frontend edit — and this surface cannot offer an axis
+ *    the resolver has no answer for.
+ * 2. **A failed read renders no values.** React Query keeps the last successful
+ *    answer across a failing refetch, so `isError` is read BEFORE the data. A matrix
+ *    rendered from a retained answer would state who may run unattended on the
+ *    strength of a read that did not happen.
+ * 3. **An unconfigured cell is a statement, not a blank.** The unconfigured default
+ *    is the authoring rung, which covers no gate; the cell says the run waits for a
+ *    human rather than leaving the reader to infer it from an empty box.
+ *
+ * The semantics sit once in the section rather than per cell: they are properties of
+ * the resolution, not of any one pair, and twelve copies of a sentence teach a
+ * reader to stop reading it.
+ */
+function SourcesSection() {
+  const [chosen, setChosen] = useState('')
+  const sources = useQuery({
+    queryKey: QK.sources,
+    queryFn: () => specEngineApi.sources(),
+    retry: false,
+  })
+
+  // `isError` first, then the data: see property 2 above.
+  if (sources.isError) {
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
+        <Refused
+          title={i18nT('apps.specEngine.sourcesSection.could_not_read_the_watch_sources')}
+          error={sources.error}
+        />
+      </div>
+    )
+  }
+  if (sources.isPending || !sources.data) {
+    // Distinct from the empty state on purpose: "nothing is configured" is a fact
+    // about the document, and "not read yet" is a fact about this request.
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
+        <p className="se-note">{i18nT('apps.specEngine.sourcesSection.reading_the_watch_sources')}</p>
+      </div>
+    )
+  }
+
+  const payload = sources.data
+  const names = payload.sources.map((source) => source.name)
+  // Normalized against the answer rather than trusted: a source removed by another
+  // surface (or in the editor below) must not leave the section rendering a matrix
+  // under a name the document no longer lists.
+  const selected = names.includes(chosen) ? chosen : (names[0] ?? '')
+  const source = payload.sources.find((entry) => entry.name === selected)
+  const classes = payload.submitter_classes
+  // The schema orders the classes most to least trusted, so the last is the one an
+  // author who cannot be classified falls to. Read from the payload rather than
+  // spelled here, so the sentence names whatever class the engine puts last.
+  const leastTrusted = classes.length > 0 ? classes[classes.length - 1] : ''
+
+  return (
+    <div className="se-blk">
+      <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
+      {names.length === 0 ? (
+        /* Not an empty matrix: a grid with no source to belong to reads as "no
+           authority is granted", when the fact is that nothing is being ingested at
+           all. The offer flow is named because that is the only place a source comes
+           from — this section edits grids and never creates one. */
+        <p className="se-note">
+          {i18nT('apps.specEngine.sourcesSection.no_watch_source_is_configured')}
+        </p>
+      ) : (
+        <>
+          <div
+            className="se-acts"
+            role="group"
+            aria-label={i18nT('apps.specEngine.sourcesSection.select_a_watch_source')}
+          >
+            {names.map((name) => (
+              <button
+                key={name}
+                type="button"
+                className="se-btn se-sm se-m"
+                aria-pressed={name === selected}
+                onClick={() => setChosen(name)}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+          <table
+            className="se-grid"
+            aria-label={i18nT('apps.specEngine.sourcesSection.autonomy_for_source', {
+              source: selected,
+            })}
+          >
+            <thead>
+              <tr>
+                <th>{i18nT('apps.specEngine.sourcesSection.col_submitter_class')}</th>
+                {payload.spec_types.map((specType) => (
+                  /* Engine vocabulary, rendered as the identifier it is: a
+                     translated axis would name a spec type no document holds. */
+                  <th key={specType} className="se-m">
+                    {specType}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {classes.map((klass) => (
+                <tr key={klass}>
+                  <th scope="row" className="se-m">
+                    {klass}
+                  </th>
+                  {payload.spec_types.map((specType) => (
+                    <GridCell key={specType} cell={source?.grid[klass]?.[specType]} />
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+      {/* The semantics, beside the values they govern. Each of these is a rule an
+          operator would otherwise have to infer from a matrix, and inferring the
+          wrong one means granting authority nobody meant to grant. */}
+      {leastTrusted !== '' && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.sourcesSection.an_unclassifiable_author_is_least_trusted', {
+            klass: leastTrusted,
+          })}
+        </p>
+      )}
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.a_level_authorizes_every_level_below_it')}
+      </p>
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.screening_caps_a_flagged_item_to_authoring')}
+      </p>
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.execution_or_above_needs_no_human_at_a_gate')}
+      </p>
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourcesSection.the_matrix_is_the_engines_own_resolution')}
+      </p>
+    </div>
   )
 }
 
@@ -1016,6 +1220,10 @@ export function ConfigPane({
                   is opened with is "which configuration governs which project",
                   and the answer must not sit under a fixed-height editor. */}
               <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
+              {/* Beside the projects table for the same reason it is above the
+                  editor: who may run how unattended is a reading, and reading it
+                  out of the JSON below is not the same as seeing the matrix. */}
+              <SourcesSection />
               <DocumentEditor config={config} />
             </>
           )}

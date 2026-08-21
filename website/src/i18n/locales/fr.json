@@ -4043,6 +4043,24 @@
         "yes": "Oui",
         "yes_blocked_by_declined": "Oui est indisponible tant que {{level}} est refusé : un niveau activé autorise tous les niveaux inférieurs."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "Un niveau autorise tous les niveaux inférieurs : une cellule accorde donc son propre niveau et tous ceux en dessous.",
+        "an_unclassifiable_author_is_least_trusted": "Un auteur que le moteur ne peut pas classer compte comme {{klass}}, la classe la moins fiable : ne pas identifier un contributeur n'accorde rien.",
+        "autonomy_for_source": "Autonomie de {{source}}, par classe de contributeur et type de spec",
+        "col_submitter_class": "Classe de contributeur",
+        "could_not_read_the_watch_sources": "Impossible de lire les sources surveillées",
+        "execution_or_above_needs_no_human_at_a_gate": "Lorsqu'une cellule accorde execution ou plus, la politique d'autonomie approuve les portes de document d'un élément correspondant sans intervention humaine. Toute autre cellule met l'exécution en attente d'une personne.",
+        "no_watch_source_is_configured": "Aucune source surveillée n'est configurée : rien n'est ingéré de l'extérieur. Une source est ajoutée par l'assistant de configuration, dans le plan qu'un approbateur nommé accepte ; cette vue lit les grilles et ne crée jamais de source.",
+        "origin_exact": "Défini pour cette paire",
+        "origin_unconfigured": "Non configuré : cette cellule attend une personne",
+        "origin_wildcard": "Défini par une règle plus large",
+        "reading_the_watch_sources": "Lecture des sources surveillées…",
+        "screening_caps_a_flagged_item_to_authoring": "Le filtrage à l'entrée plafonne un élément signalé au niveau authoring quoi que dise cette grille. Le plafond ne fait que réduire l'autorité ; il ne l'augmente jamais.",
+        "select_a_watch_source": "Sélectionner une source surveillée",
+        "the_matrix_is_the_engines_own_resolution": "La matrice est la résolution du moteur lui-même, paire par paire : elle se lit exactement comme les portes la lisent. Une ligne enregistrée que le moteur ne reconnaît pas ne répond à aucune cellule et s'affiche ici comme non configurée ; les problèmes du document enregistré sont signalés avec le document.",
+        "unattended": "Sans surveillance",
+        "watch_sources": "Sources surveillées"
+      },
       "specEnginePage": {
         "all": "Tout",
         "budget": "Budget",

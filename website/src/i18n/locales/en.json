@@ -3299,6 +3299,24 @@
         "yes": "Yes",
         "yes_blocked_by_declined": "Yes is unavailable while {{level}} is declined: an enabled rung authorizes every rung below it."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "A level authorizes every level below it, so a cell grants its own rung and every rung under it.",
+        "an_unclassifiable_author_is_least_trusted": "An author the engine cannot classify counts as {{klass}}, the least-trusted class, so nothing is granted by failing to identify a submitter.",
+        "autonomy_for_source": "Autonomy for {{source}}, by submitter class and spec type",
+        "col_submitter_class": "Submitter class",
+        "could_not_read_the_watch_sources": "Could not read the watch sources",
+        "execution_or_above_needs_no_human_at_a_gate": "Where a cell grants execution or above, the autonomy policy approves the document gates of a matching item with no human in the loop. Every other cell parks the run for a person.",
+        "no_watch_source_is_configured": "No watch source is configured, so nothing is ingested from outside. A source is added by the setup assistant, as part of the plan a named approver accepts; this view reads grids and never creates a source.",
+        "origin_exact": "Set for this pair",
+        "origin_unconfigured": "Not configured, so this cell waits for a human",
+        "origin_wildcard": "Set by a broader rule",
+        "reading_the_watch_sources": "Reading the watch sources…",
+        "screening_caps_a_flagged_item_to_authoring": "Intake screening caps a flagged item to the authoring rung whatever this grid says. The cap only ever lowers authority; it never raises it.",
+        "select_a_watch_source": "Select a watch source",
+        "the_matrix_is_the_engines_own_resolution": "The matrix is the engine's own resolution, pair by pair, so it reads exactly as the gates do. A stored row the engine does not recognise answers no cell and shows here as not configured; problems in the saved document are reported with the document.",
+        "unattended": "Unattended",
+        "watch_sources": "Watch sources"
+      },
       "specEnginePage": {
         "all": "All",
         "budget": "Budget",

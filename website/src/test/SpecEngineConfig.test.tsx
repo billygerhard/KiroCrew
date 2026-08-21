@@ -195,6 +195,19 @@ function stub(answers: {
           (seen > 1 ? answers.resolvedAgain?.[project] : undefined) ??
           answers.resolvedFor?.[project] ??
           answers.resolved ?? { body: resolved() }
+      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
+        // The pane's sources section reads this route. Answered with no source at
+        // all, because these tests are about the document and its resolution: the
+        // grid's own properties are asserted in `SpecEngineSources.test.tsx`, and a
+        // fixture here would be a second place the payload shape is spelled.
+        answer = {
+          body: {
+            sources: [],
+            submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
+            spec_types: ['feature', 'bugfix', 'quick'],
+            levels: ['authoring', 'execution', 'delivery', 'integration'],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
         answer =
           (written ? answers.configAfterPut : undefined) ??

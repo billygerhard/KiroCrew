@@ -4043,6 +4043,24 @@
         "yes": "Sì",
         "yes_blocked_by_declined": "Sì non è disponibile finché {{level}} è rifiutato: un livello abilitato autorizza ogni livello inferiore."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "Un livello autorizza ogni livello inferiore, quindi una cella concede il proprio livello e tutti quelli sotto di esso.",
+        "an_unclassifiable_author_is_least_trusted": "Un autore che il motore non riesce a classificare vale come {{klass}}, la classe meno affidabile: non identificare chi invia qualcosa non concede nulla.",
+        "autonomy_for_source": "Autonomia di {{source}}, per classe di mittente e tipo di spec",
+        "col_submitter_class": "Classe di mittente",
+        "could_not_read_the_watch_sources": "Non è stato possibile leggere le sorgenti monitorate",
+        "execution_or_above_needs_no_human_at_a_gate": "Dove una cella concede execution o più, la politica di autonomia approva i gate documentali di un elemento corrispondente senza una persona. Ogni altra cella mette l'esecuzione in attesa di una persona.",
+        "no_watch_source_is_configured": "Nessuna sorgente monitorata è configurata, quindi non viene acquisito nulla dall'esterno. Una sorgente la aggiunge l'assistente di configurazione, come parte del piano che un approvatore con nome accetta; questa vista legge le griglie e non crea mai una sorgente.",
+        "origin_exact": "Impostato per questa coppia",
+        "origin_unconfigured": "Non configurato, quindi questa cella attende una persona",
+        "origin_wildcard": "Impostato da una regola più ampia",
+        "reading_the_watch_sources": "Lettura delle sorgenti monitorate…",
+        "screening_caps_a_flagged_item_to_authoring": "Il controllo in ingresso limita un elemento segnalato al livello authoring qualunque cosa dica questa griglia. Il limite abbassa soltanto l'autorità; non la alza mai.",
+        "select_a_watch_source": "Seleziona una sorgente monitorata",
+        "the_matrix_is_the_engines_own_resolution": "La matrice è la risoluzione del motore stesso, coppia per coppia, quindi si legge esattamente come la leggono i gate. Una riga salvata che il motore non riconosce non risponde ad alcuna cella e qui compare come non configurata; i problemi del documento salvato sono segnalati insieme al documento.",
+        "unattended": "Senza presidio",
+        "watch_sources": "Sorgenti monitorate"
+      },
       "specEnginePage": {
         "all": "Tutti",
         "budget": "Budget",

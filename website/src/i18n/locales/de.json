@@ -3982,6 +3982,24 @@
         "yes": "Ja",
         "yes_blocked_by_declined": "Ja ist nicht verfügbar, solange {{level}} abgelehnt ist: eine aktivierte Stufe autorisiert jede darunterliegende Stufe."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "Eine Stufe autorisiert jede darunterliegende Stufe, eine Zelle gewährt also ihre eigene Stufe und jede Stufe darunter.",
+        "an_unclassifiable_author_is_least_trusted": "Ein Autor, den die Engine nicht einordnen kann, gilt als {{klass}}, die am wenigsten vertraute Klasse — eine nicht erkannte Herkunft gewährt also nichts.",
+        "autonomy_for_source": "Autonomie für {{source}}, nach Einsenderklasse und Spec-Typ",
+        "col_submitter_class": "Einsenderklasse",
+        "could_not_read_the_watch_sources": "Die beobachteten Quellen konnten nicht gelesen werden",
+        "execution_or_above_needs_no_human_at_a_gate": "Wo eine Zelle execution oder höher gewährt, genehmigt die Autonomie-Richtlinie die Dokument-Gates eines passenden Vorgangs ohne Menschen. Jede andere Zelle parkt den Lauf für eine Person.",
+        "no_watch_source_is_configured": "Es ist keine beobachtete Quelle konfiguriert, es wird also nichts von außen aufgenommen. Eine Quelle fügt der Einrichtungsassistent hinzu, als Teil des Plans, den eine benannte Person freigibt; diese Ansicht liest Raster und erstellt niemals eine Quelle.",
+        "origin_exact": "Für dieses Paar gesetzt",
+        "origin_unconfigured": "Nicht konfiguriert, diese Zelle wartet also auf einen Menschen",
+        "origin_wildcard": "Durch eine allgemeinere Regel gesetzt",
+        "reading_the_watch_sources": "Beobachtete Quellen werden gelesen …",
+        "screening_caps_a_flagged_item_to_authoring": "Die Eingangsprüfung begrenzt einen markierten Vorgang unabhängig von diesem Raster auf die Stufe authoring. Die Begrenzung senkt Befugnisse nur; sie erhöht sie nie.",
+        "select_a_watch_source": "Beobachtete Quelle auswählen",
+        "the_matrix_is_the_engines_own_resolution": "Die Matrix ist die Auflösung der Engine selbst, Paar für Paar, und liest sich damit genau wie die Gates. Eine gespeicherte Zeile, die die Engine nicht kennt, beantwortet keine Zelle und erscheint hier als nicht konfiguriert; Probleme im gespeicherten Dokument werden beim Dokument gemeldet.",
+        "unattended": "Unbeaufsichtigt",
+        "watch_sources": "Beobachtete Quellen"
+      },
       "specEnginePage": {
         "all": "Alle",
         "budget": "Budget",

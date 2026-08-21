@@ -4043,6 +4043,24 @@
         "yes": "Sí",
         "yes_blocked_by_declined": "Sí no está disponible mientras {{level}} esté rechazado: un nivel habilitado autoriza todos los niveles inferiores."
       },
+      "sourcesSection": {
+        "a_level_authorizes_every_level_below_it": "Un nivel autoriza todos los niveles inferiores, así que una celda concede su propio nivel y todos los que están por debajo.",
+        "an_unclassifiable_author_is_least_trusted": "Un autor que el motor no puede clasificar cuenta como {{klass}}, la clase menos confiable, así que no identificar a quien envía algo no concede nada.",
+        "autonomy_for_source": "Autonomía de {{source}}, por clase de remitente y tipo de spec",
+        "col_submitter_class": "Clase de remitente",
+        "could_not_read_the_watch_sources": "No se han podido leer las fuentes vigiladas",
+        "execution_or_above_needs_no_human_at_a_gate": "Donde una celda concede execution o más, la política de autonomía aprueba las puertas de documento de un elemento coincidente sin intervención humana. Cualquier otra celda deja la ejecución esperando a una persona.",
+        "no_watch_source_is_configured": "No hay ninguna fuente vigilada configurada, así que no se ingiere nada de fuera. Una fuente la añade el asistente de configuración, como parte del plan que aprueba una persona con nombre; esta vista lee cuadrículas y nunca crea una fuente.",
+        "origin_exact": "Definido para este par",
+        "origin_unconfigured": "Sin configurar, así que esta celda espera a una persona",
+        "origin_wildcard": "Definido por una regla más amplia",
+        "reading_the_watch_sources": "Leyendo las fuentes vigiladas…",
+        "screening_caps_a_flagged_item_to_authoring": "El filtrado de entrada limita un elemento marcado al nivel authoring diga lo que diga esta cuadrícula. El límite solo baja la autoridad; nunca la sube.",
+        "select_a_watch_source": "Seleccionar una fuente vigilada",
+        "the_matrix_is_the_engines_own_resolution": "La matriz es la resolución del propio motor, par por par, así que se lee igual que la leen las puertas. Una fila guardada que el motor no reconoce no responde a ninguna celda y aparece aquí como sin configurar; los problemas del documento guardado se informan junto al documento.",
+        "unattended": "Sin supervisión",
+        "watch_sources": "Fuentes vigiladas"
+      },
       "specEnginePage": {
         "all": "Todos",
         "budget": "Presupuesto",

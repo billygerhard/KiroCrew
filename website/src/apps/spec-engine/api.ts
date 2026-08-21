@@ -480,6 +480,57 @@ export interface TeardownReport {
   stage_reason: string
 }
 
+/**
+ * One (submitter class, spec type) pair's resolved autonomy, from `_source_grid`.
+ *
+ * `origin` is the field a reader branches on, and it is NOT derivable here: the
+ * engine resolves class-first with a wildcard fallback, so the level in a cell may
+ * have been declared for this exact pair, for a broader one, or nowhere at all.
+ * Re-deriving that from `declared_at` would mean re-implementing the resolver's
+ * path composition on this side — and a source name holding a dot defeats every
+ * split, which is why the backend classifies whole strings and sends the verdict.
+ *
+ * `declared_at` is `''` when nothing stored answered the pair, never `null` or
+ * absent, matching the resolved read's spelling of the same idea. An empty one is
+ * only meaningful together with `origin === 'default'`; a caller must not read
+ * emptiness as the classification.
+ *
+ * `policy_covers_gates` is the engine's own `permits(execution)` — what
+ * `gate_is_policy_covered` reduces to for a document gate — so the marker beside
+ * a cell cannot drift from what the gates actually do with it.
+ */
+export interface SourceGridCell {
+  /** The resolved level, in the engine's vocabulary. Rendered, never mapped. */
+  level: string
+  /** Dotted path of the stored cell that answered the pair, `''` when none did. */
+  declared_at: string
+  origin: 'exact' | 'wildcard' | 'default'
+  policy_covers_gates: boolean
+}
+
+/** One Watch_Source's full matrix, keyed submitter class then spec type. */
+export interface SourceGrid {
+  name: string
+  grid: Record<string, Record<string, SourceGridCell>>
+}
+
+/**
+ * Every Watch_Source's resolved autonomy matrix, from `_sources_snapshot`.
+ *
+ * The three vocabulary arrays are the ENGINE's axes, shipped so a surface renders
+ * them rather than carrying a copy: a class or spec type the schema adds shows up
+ * without a client edit, and a client cannot render an axis the resolver has no
+ * answer for. `submitter_classes` is in the schema's order, which runs from most
+ * to least trusted — so the last entry is the class an unclassifiable author
+ * falls to.
+ */
+export interface SourcesPayload {
+  sources: SourceGrid[]
+  submitter_classes: readonly string[]
+  spec_types: readonly string[]
+  levels: readonly string[]
+}
+
 /** One run's attributed spend and the ceiling in force for it, from `_run_spend`. */
 export interface RunSpend {
   run_id: string
@@ -550,7 +601,7 @@ const postJson = <T>(path: string, body: unknown): Promise<T> =>
     body: JSON.stringify(body),
   })
 
-// ── the fourteen routes ───────────────────────────────────────────────────
+// ── the fifteen routes ────────────────────────────────────────────────────
 
 export const specEngineApi = {
   /**
@@ -650,6 +701,22 @@ export const specEngineApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ patch }),
     }),
+
+  /**
+   * GET every Watch_Source's autonomy grid, resolved cell by cell.
+   *
+   * A read of the same document `config` returns, resolved through the same policy
+   * the gates read — not a second view of the grid a caller could compute itself.
+   * The matrix arrives already resolved BECAUSE class-first precedence and the
+   * wildcard fallback live in one place: a TS re-derivation would be a second
+   * resolver, and the copy that drifted would be the one an operator reads before
+   * deciding who may run unattended.
+   *
+   * Takes no source parameter: every configured source arrives, including one with
+   * no grid at all, because a configured source nobody wrote a grid for is exactly
+   * the fail-closed case an operator most needs to see.
+   */
+  sources: (): Promise<SourcesPayload> => request<SourcesPayload>(`${API}/config/sources`),
 
   /** GET the kill switch's state and the runs a stop would park. */
   killSwitch: (): Promise<KillSwitchSnapshot> => request<KillSwitchSnapshot>(`${API}/kill-switch`),
@@ -762,6 +829,16 @@ export const QK = {
    * for.
    */
   resolved: (project: string) => ['spec-engine', 'config', 'resolved', project] as const,
+  /**
+   * The per-source autonomy matrices.
+   *
+   * Under the config key's prefix on purpose: React Query matches keys by prefix,
+   * so invalidating the document after a write refreshes the grid too. The grid is
+   * a read OF that document, and a stale matrix beside a fresh document would tell
+   * an operator that a class may run unattended when the write they just made says
+   * otherwise.
+   */
+  sources: ['spec-engine', 'config', 'sources'] as const,
 }
 
 /** The prefix every resolved-read key shares, for invalidating them together. */
