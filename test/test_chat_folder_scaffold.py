@@ -993,10 +993,10 @@ class TestAdditiveScaffold:
 
 class TestRouteRegistration:
     """The handler must be reachable in the running dashboard, not just in
-    the private apps these tests build. Registration lives inline in
-    ``start_dashboard`` (no standalone route factory to invoke), so this
-    guard inspects that function's source the same way the repo's YAML
-    guard inspects call sites -- it fails if the ``add_post`` line for the
+    the private apps these tests build. Registration lives in the route
+    table (``dashboard/routes/``, one module per section; ``sessions``
+    carries the folder routes), so this guard inspects that module's source
+    the same way the repo's YAML guard inspects call sites -- it fails if the ``add_post`` line for the
     scan route is ever dropped."""
 
     def test_facade_reexports_the_scan_handler(self) -> None:
@@ -1009,22 +1009,22 @@ class TestRouteRegistration:
 
         assert chat.api_chat_folders_scaffold is api_chat_folders_scaffold
 
-    def test_start_dashboard_registers_the_scan_route(self) -> None:
+    def test_route_table_registers_the_scan_route(self) -> None:
         import inspect
 
-        from kiro_crew.dashboard.server import start_dashboard
+        from kiro_crew.dashboard.routes import sessions
 
-        source = inspect.getsource(start_dashboard)
+        source = inspect.getsource(sessions)
         assert (
             'add_post("/api/chat/folders/scan", chat.api_chat_folders_scan)' in source
-        ), "POST /api/chat/folders/scan is not registered in start_dashboard"
+        ), "POST /api/chat/folders/scan is not registered in the route table"
 
-    def test_start_dashboard_registers_the_scaffold_route(self) -> None:
+    def test_route_table_registers_the_scaffold_route(self) -> None:
         import inspect
 
-        from kiro_crew.dashboard.server import start_dashboard
+        from kiro_crew.dashboard.routes import sessions
 
-        source = inspect.getsource(start_dashboard)
+        source = inspect.getsource(sessions)
         assert (
             'add_post("/api/chat/folders/scaffold", chat.api_chat_folders_scaffold)' in source
-        ), "POST /api/chat/folders/scaffold is not registered in start_dashboard"
+        ), "POST /api/chat/folders/scaffold is not registered in the route table"
