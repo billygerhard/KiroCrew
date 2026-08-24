@@ -103,6 +103,21 @@ function stub(answers: {
             role_order: [],
           },
         }
+      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+        // The settings form is generated from this read, and it must be answered
+        // BEFORE the generic '/config' prefix below, which would otherwise hand it
+        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
+        // this suite is about which surface leads, and the generated form's own
+        // properties live in `SpecEngineSettingsForm.test.tsx`.
+        answer = {
+          body: {
+            settings: [],
+            source_presets: [],
+            profile_presets: [],
+            roles: [],
+            levels: [],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
         // No source at all: the grid's own properties are asserted in
         // `SpecEngineSources.test.tsx`, and a fixture here would be a second place

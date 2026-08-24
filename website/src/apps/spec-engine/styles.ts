@@ -383,6 +383,30 @@ pre.se-gpatch{height:auto;max-height:200px}
    line count would push the save controls off the pane. */
 textarea.se-json{width:100%;resize:vertical;min-height:220px}
 
+/* The registry-generated settings form. One block per setting rather than a table:
+   each row carries a label, the engine's own summary, the value in force with its
+   origin, a control and a scope chooser, and a table cell cannot hold that without
+   a column nothing else uses. Grows with the registry, because the rows are
+   generated from it. */
+.se-settings{display:flex;flex-direction:column;gap:2px;margin-bottom:9px}
+.se-setting{padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:0}
+.se-setting:last-child{border-bottom:none}
+/* A row holding an unwritten edit is marked as a block, not only by the flag inside
+   it: the operator is about to approve a patch, and which rows are in it is the
+   first thing to be able to see. The autonomy grid marks a pending cell the same
+   way, for the same reason. */
+.se-setting[data-staged="true"]{background:var(--accent-subtle)}
+.se-setting-name{display:block;font-weight:600;color:var(--text-strong);margin-bottom:4px;
+  overflow-wrap:anywhere}
+.se-setting .se-note{margin:3px 0 0}
+.se-setting .se-acts{margin-top:5px}
+.se-setting .se-input{max-width:220px}
+/* The two-state control for a boolean setting. A checkbox rather than a pair of
+   buttons: it is one control for one two-state value, and a native one is keyboard
+   reachable without a widget pattern of its own. */
+.se-check{width:14px;height:14px;accent-color:var(--accent)}
+.se-check:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+
 /* Setup flow: one box per question, evidence rows above them. */
 .se-qbox{border:1px solid var(--border);border-radius:var(--radius-md);padding:11px 12px;
   margin-bottom:12px;background:var(--panel)}

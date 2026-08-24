@@ -262,6 +262,72 @@ export interface ConfigSnapshot {
 }
 
 /**
+ * One registry setting as the facts a generated form control is built from,
+ * from `_setting_vocabulary`.
+ *
+ * `kind` is the type's NAME (`int`, `float`, `bool`, `str`) rather than an enum
+ * member, and `scopes` are the scope value strings in broadest-first order —
+ * the order a scope chooser reads, which is the reverse of the resolver's
+ * precedence. Both travel as strings because the payload is JSON, and a client
+ * that had to know Python's spelling of a type would be reading a language
+ * detail rather than a vocabulary.
+ *
+ * `minimum` and `maximum` are `null` rather than absent when the setting has no
+ * bound, so a numeric control branches on the value instead of on whether a key
+ * came and went.
+ *
+ * `choices` is deliberately NOT here: the projection omits it because every
+ * shipped setting's is empty, so a `str` setting is free text. A setting that
+ * ever declares choices needs this field and a closed-vocabulary control added
+ * together — until then neither exists, and nothing offers free text where the
+ * write door would enforce a fixed set.
+ */
+export interface RegistrySetting {
+  /** The dotted key: the leading segment is the group, the rest the leaf. */
+  key: string
+  kind: string
+  default: unknown
+  minimum: number | null
+  maximum: number | null
+  /** The scopes this setting may be overridden at, broadest first. */
+  scopes: string[]
+  summary: string
+}
+
+/**
+ * One bundled Watch_Source preset, from the registry projection.
+ *
+ * `host` is the bundled table's own key (`github`, `gitlab`) and NOT a domain
+ * name. `entry` is the deep copy `watch_source_presets` returns, which
+ * deliberately carries no `enabled` key, so a fresh copy is inert until an
+ * operator arms it.
+ */
+export interface SourcePreset {
+  host: string
+  /** The program the preset's commands run, derived from its own argv. */
+  program: string
+  entry: Record<string, unknown>
+}
+
+/**
+ * The vocabularies the configuration forms are generated FROM, from
+ * `_registry_payload`.
+ *
+ * A pure projection of the engine's own constants: no stored value, nothing a
+ * concurrent write can tear, and so none of the refusal-by-path contract the
+ * document reads carry. A surface generated from it offers exactly what the
+ * write door enforces against — a hard-coded field list is how a form comes to
+ * offer a setting the door rejects, or to omit one it accepts.
+ */
+export interface RegistryPayload {
+  settings: RegistrySetting[]
+  source_presets: SourcePreset[]
+  profile_presets: string[]
+  roles: string[]
+  levels: string[]
+}
+
+/**
  * One setting's value in force, from `EffectiveValue.to_json_object`.
  *
  * `origin` and `declared_at` are the reason this read exists. A surface showing
@@ -703,6 +769,17 @@ export const specEngineApi = {
     }),
 
   /**
+   * GET the vocabularies the configuration forms are generated from.
+   *
+   * Bundled constants only — the setting registry, the watch-source presets, the
+   * cost-profile preset names, the role and level names — so it reads no
+   * document and cannot refuse by path. A form built from this offers what the
+   * write door accepts, which a hard-coded field list cannot promise.
+   */
+  configRegistry: (): Promise<RegistryPayload> =>
+    request<RegistryPayload>(`${API}/config/registry`),
+
+  /**
    * GET every Watch_Source's autonomy grid, resolved cell by cell.
    *
    * A read of the same document `config` returns, resolved through the same policy
@@ -839,6 +916,17 @@ export const QK = {
    * otherwise.
    */
   sources: ['spec-engine', 'config', 'sources'] as const,
+  /**
+   * The form vocabularies.
+   *
+   * Deliberately OUTSIDE the config key's prefix, which is the opposite choice
+   * from {@link QK.sources} and for the same reason stated the other way round:
+   * the grid is a read OF the document and must refresh when the document
+   * changes, while this payload is a projection of constants no write can move.
+   * Under the prefix, every configuration write would refetch a vocabulary that
+   * cannot have changed.
+   */
+  registry: ['spec-engine', 'config-registry'] as const,
 }
 
 /** The prefix every resolved-read key shares, for invalidating them together. */

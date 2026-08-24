@@ -90,6 +90,15 @@ function stubReads(answers: {
         },
       ]
   const pick = (url: string): Answer => {
+    if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+      // The configuration pane's settings form is generated from this read. It is
+      // answered BEFORE the generic '/config' prefix below, which would otherwise
+      // hand it a ConfigSnapshot and crash its render, and it must not CONSUME a
+      // queued answer for the same reason the resolved read must not.
+      return {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      }
+    }
     if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
       // The resolved read shares the document read's answer (this suite is not
       // about resolution) but must not CONSUME a queued one: the queue exists to

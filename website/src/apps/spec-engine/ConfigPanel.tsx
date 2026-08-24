@@ -77,7 +77,7 @@
  * are — a document that grows with its line count would push the save controls off
  * the pane.
  */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle } from 'lucide-react'
 
@@ -91,6 +91,7 @@ import {
   type ConfigAdvisory,
   type ConfigSnapshot,
   type EffectiveSetting,
+  type RegistrySetting,
   type ResolvedRole,
   type SourceGridCell,
   type SourcesPayload,
@@ -99,6 +100,8 @@ import {
   COST_PROFILES,
   DELETE,
   PROJECTS,
+  SCOPE_PROJECT,
+  SCOPE_SOURCE,
   buildFormPatch,
   buildGridPatch,
   documentText,
@@ -112,10 +115,13 @@ import {
   patchAt,
   roleSegments,
   sameCell,
+  settingSegments,
   type Document,
   type GridCellRef,
   type PendingEdit,
+  type StagedEdit,
 } from './configDocument'
+import { useStagedEdits } from './useStagedEdits'
 
 /** Separator between two identifiers on one line. Punctuation, not copy. */
 const SEP = ' \u00b7 '
@@ -1007,6 +1013,686 @@ function SourcesSection() {
   )
 }
 
+// --- the settings form, generated from the engine's registry ------------------
+
+/**
+ * Which control edits a registry setting, keyed by the type NAME the registry
+ * projects.
+ *
+ * A table rather than a chain of comparisons, because the interesting case is the
+ * one that is NOT in it: a kind this form has no control for resolves to
+ * `undefined` and renders the read-only fallback, so a type the engine's registry
+ * gains shows its value and routes to the JSON view instead of crashing the pane
+ * or silently disappearing from it.
+ *
+ * A `str` setting is free text, and that is safe for exactly one reason worth
+ * writing down: the registry's `choices` are not part of the projection because no
+ * shipped setting declares any. A setting that ever does needs the vocabulary and
+ * a closed-choice control added in one change — free text against an enforced set
+ * would offer values the write door refuses.
+ */
+const CONTROL_BY_KIND: Record<string, string> = {
+  int: 'number',
+  float: 'number',
+  bool: 'checkbox',
+  str: 'text',
+}
+
+/**
+ * The granularity a numeric control steps in, by kind.
+ *
+ * Whole counts for `int` and any fraction for `float`: the engine refuses a
+ * fractional value for an int setting, so a control that stepped one by halves
+ * would hand the operator a value the write door then rejects.
+ */
+const STEP_BY_KIND: Record<string, string> = { int: '1', float: 'any' }
+
+/** The registry vocabulary before the read answers. One constant, so a memo over
+ *  it does not see a fresh array on every render. */
+const NO_SETTINGS: readonly RegistrySetting[] = []
+
+/** A value as a row shows it, with the stand-in for one the read has not got. */
+function shownValue(value: unknown): string {
+  return value === undefined ? NONE : settingValue(value)
+}
+
+/** Where a value in force was decided, in words, or the stand-in for nowhere. */
+function originText(inForce: EffectiveSetting | undefined): string {
+  // Indexed at the call site rather than through a local, so the key-reference
+  // gate resolves every entry in the map. The guard keeps the lookup total: an
+  // origin the payload gains before this table does earns the stand-in rather
+  // than an untranslated key.
+  if (!inForce || !ORIGIN_KEY[inForce.origin]) return NONE
+  return i18nT(ORIGIN_KEY[inForce.origin])
+}
+
+/**
+ * Whether *value* is what the document already stores AT *segments*.
+ *
+ * Both sides are composed the same way and neither is split, so the comparison is
+ * exact even for a project or source whose name holds a dot: the engine renders a
+ * stored setting's path as `<section>.<name>.<group>.<leaf>` and
+ * {@link settingSegments} builds those same segments. For one fixed registry key,
+ * two different names cannot render to one string.
+ *
+ * The declaring path is part of the question rather than the value alone, because
+ * the same value at a DIFFERENT path is a real change: it pins the setting where
+ * the layer that currently answers it can no longer move it.
+ */
+function storedAt(
+  inForce: EffectiveSetting | undefined,
+  segments: readonly string[],
+  value: unknown,
+): boolean {
+  if (!inForce || inForce.declared_at !== dotted(segments)) return false
+  return JSON.stringify(inForce.value ?? null) === JSON.stringify(value ?? null)
+}
+
+/** One scope a setting may be written at, with the path it would write. */
+interface ScopeOffer {
+  /** The scope name, in the registry's own vocabulary. */
+  scope: string
+  /** The path a write at this scope targets, or `null` when it has none. */
+  segments: readonly string[] | null
+}
+
+/**
+ * One generated row: the registry entry, everything resolved for it, and where a
+ * write would land.
+ *
+ * Built by {@link settingFields} rather than assembled in the render, so the
+ * mapping from a vocabulary to a form is a pure function a property can be stated
+ * over — the claim being that the form is TOTAL over the registry, which is not a
+ * claim about any one row.
+ */
+export interface SettingField {
+  setting: RegistrySetting
+  /** The value in force and its origin, or `undefined` when the read has none. */
+  inForce: EffectiveSetting | undefined
+  /** The scope a write targets. `''` when no permitted scope has a path. */
+  scope: string
+  /** The path the chosen scope writes, or `null` when there is none. */
+  segments: readonly string[] | null
+  /** Every scope the REGISTRY permits, writable or not. */
+  offers: readonly ScopeOffer[]
+}
+
+/** The names a project- or source-scoped write targets. */
+interface ScopeTargets {
+  /** The project selected on the pane, `''` when none is. */
+  project: string
+  /** The watch source the form writes source-scoped values into, `''` for none. */
+  source: string
+}
+
+/** The target name *scope* writes into, `''` when the scope names none. */
+function scopeTarget(scope: string, targets: ScopeTargets): string {
+  if (scope === SCOPE_PROJECT) return targets.project
+  if (scope === SCOPE_SOURCE) return targets.source
+  return ''
+}
+
+/**
+ * One row per registry setting, in the order the registry supplies them.
+ *
+ * Total by construction: every setting produces exactly one field whatever its
+ * kind, and a kind with no control is a field whose row renders read-only rather
+ * than a setting that vanishes. The scope offered is normalized against what is
+ * writable NOW — a scope held in state stops being writable when its target is
+ * deselected, and a chooser still pointing at it would compose
+ * `projects..limits.x`, a write into a project named the empty string.
+ */
+export function settingFields(
+  settings: readonly RegistrySetting[],
+  inForce: ReadonlyMap<string, EffectiveSetting>,
+  targets: ScopeTargets,
+  chosen: Readonly<Record<string, string>>,
+): SettingField[] {
+  return settings.map((setting) => {
+    const offers: ScopeOffer[] = setting.scopes.map((scope) => ({
+      scope,
+      segments: settingSegments(setting.key, scope, scopeTarget(scope, targets)),
+    }))
+    const writable = offers.filter((offer) => offer.segments !== null)
+    const held = chosen[setting.key]
+    const offer = writable.find((other) => other.scope === held) ?? writable[0]
+    return {
+      setting,
+      inForce: inForce.get(setting.key),
+      scope: offer?.scope ?? '',
+      segments: offer?.segments ?? null,
+      offers,
+    }
+  })
+}
+
+/**
+ * One setting: its meaning, the value in force, the control, and the scope a
+ * write would land at.
+ *
+ * Four things are on the row and none of them is decoration:
+ *
+ * 1. **The label leads and the registry key follows as the detail line.** The key
+ *    is what the document and the write log speak, so it stays on screen, but a
+ *    reader should not have to think in registry keys to change a timeout. A key
+ *    no label names renders as itself — the vocabulary is the engine's, and a
+ *    setting it adds must appear here without a frontend edit.
+ * 2. **The registry's own summary is the help text.** It is the sentence the
+ *    engine wrote about the setting; a second sentence maintained here would be a
+ *    second description to drift.
+ * 3. **The value in force and its ORIGIN.** A control showing `2` cannot tell an
+ *    operator whether somebody chose 2 or the app ships 2, and those call for
+ *    opposite actions.
+ * 4. **A staged edit is marked as unwritten, beside the value still in force.**
+ *    Collapsing the two would leave a refused write displaying the submitted value
+ *    as though it were stored.
+ *
+ * The scope chooser is a button group rather than a dropdown, for the level
+ * control's reason: the vocabulary is tiny and fixed, and a popup would be drawn
+ * over a page whose safety strip must never be covered. A scope the registry
+ * permits but this form cannot address is shown DISABLED rather than hidden, so
+ * the row does not quietly deny an override the engine accepts.
+ */
+function SettingRow({
+  field,
+  staged,
+  onScope,
+  onStage,
+  onWithdraw,
+}: {
+  field: SettingField
+  /** The edit staged at this row's path, or `undefined` when none is. */
+  staged: StagedEdit | undefined
+  onScope: (scope: string) => void
+  onStage: (value: unknown) => void
+  onWithdraw: () => void
+}) {
+  const id = useId()
+  const { setting, inForce, scope, segments, offers } = field
+  const control = CONTROL_BY_KIND[setting.kind]
+  const label = settingLabel(setting.key)
+  const named = label ? (
+    <>
+      {label}
+      <span className="se-kv-path">{setting.key}</span>
+    </>
+  ) : (
+    <span className="se-m">{setting.key}</span>
+  )
+  const numeric = control === 'number'
+  const twoState = control === 'checkbox'
+  const value = staged ? staged.value : inForce?.value
+  return (
+    <div className="se-setting" data-kind={setting.kind} data-staged={staged !== undefined}>
+      {control === undefined ? (
+        // No control to name, so no label element: a `for` pointing at nothing
+        // announces a form field that is not there.
+        <span className="se-setting-name">{named}</span>
+      ) : (
+        <label className="se-setting-name" htmlFor={id}>
+          {named}
+        </label>
+      )}
+      {control === undefined ? (
+        // The value is NOT repeated here: the in-force line below already states it
+        // with the origin that decided it, which is the honest reading of a row
+        // this form can only read.
+        <p className="se-note">
+          {i18nT('apps.specEngine.settingsForm.the_registry_kind_is_not_editable_here', {
+            kind: setting.kind,
+          })}
+        </p>
+      ) : (
+        <input
+          id={id}
+          type={control}
+          className={twoState ? 'se-check' : 'se-input'}
+          // A row whose chosen scope has no path can be read but not written.
+          disabled={segments === null}
+          // The registry's bounds, carried by the control itself rather than
+          // restated: the engine refuses an out-of-range value by path either way,
+          // and a second copy of a bound here is one that can drift from it.
+          min={numeric && setting.minimum !== null ? setting.minimum : undefined}
+          max={numeric && setting.maximum !== null ? setting.maximum : undefined}
+          step={numeric ? STEP_BY_KIND[setting.kind] : undefined}
+          checked={twoState ? value === true : undefined}
+          value={
+            twoState ? undefined : typeof value === 'number' || typeof value === 'string'
+              ? String(value)
+              : ''
+          }
+          onChange={(event) => {
+            if (twoState) {
+              onStage(event.target.checked)
+              return
+            }
+            const raw = event.target.value
+            // A number control reports an entry it cannot parse as the empty
+            // string, and an empty one has no value to stage: the edit is withdrawn
+            // rather than written as some number the operator did not type.
+            if (numeric && raw.trim() === '') {
+              onWithdraw()
+              return
+            }
+            onStage(numeric ? Number(raw) : raw)
+          }}
+        />
+      )}
+      <p className="se-note">{setting.summary}</p>
+      <p className="se-note">
+        {i18nT('apps.specEngine.settingsForm.in_force')}
+        {SEP}
+        <span className="se-m">{shownValue(inForce?.value)}</span>
+        {SEP}
+        {/* Its own element, because the origin is the half of this line a reader
+            acts on: a value of 2 somebody chose and a 2 the app ships call for
+            opposite actions, and only the origin distinguishes them. */}
+        <span>{originText(inForce)}</span>
+        {inForce && inForce.declared_at !== '' && (
+          <span className="se-src">
+            {SEP}
+            {inForce.declared_at}
+          </span>
+        )}
+      </p>
+      {control !== undefined && offers.length > 0 && (
+        <div
+          className="se-acts"
+          role="group"
+          aria-label={i18nT('apps.specEngine.settingsForm.scope_to_write_setting_at', {
+            setting: setting.key,
+          })}
+        >
+          {offers.map((offer) => (
+            <button
+              key={offer.scope}
+              type="button"
+              className="se-btn se-sm se-m"
+              aria-pressed={offer.scope === scope}
+              disabled={offer.segments === null}
+              // The path a write at this scope lands at, or why there is none. An
+              // operator choosing between app and project scope is choosing a blast
+              // radius, and the path is what states it.
+              title={
+                offer.segments === null
+                  ? i18nT('apps.specEngine.settingsForm.this_scope_cannot_be_written_here')
+                  : dotted(offer.segments)
+              }
+              onClick={() => onScope(offer.scope)}
+            >
+              {offer.scope}
+            </button>
+          ))}
+        </div>
+      )}
+      {staged !== undefined && segments !== null && (
+        <p className="se-note">
+          <span className="se-flag" data-flag="pending">
+            {i18nT('apps.specEngine.settingsForm.not_written')}
+          </span>
+          <span className="se-m">
+            {shownValue(staged.value)}
+            {SEP}
+            {dotted(segments)}
+          </span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Every generated row.
+ *
+ * Presentational and exported for one reason: the property that the form is total
+ * over the registry is a property of the RENDER, so it has to be stated over a
+ * generated vocabulary rendered synchronously rather than over a pane waiting on
+ * three reads.
+ */
+export function SettingsFields({
+  fields,
+  stagedAt,
+  onScope,
+  onStage,
+  onWithdraw,
+}: {
+  fields: readonly SettingField[]
+  stagedAt: (segments: readonly string[]) => StagedEdit | undefined
+  onScope: (field: SettingField, scope: string) => void
+  onStage: (field: SettingField, value: unknown) => void
+  onWithdraw: (segments: readonly string[]) => void
+}) {
+  return (
+    <div className="se-settings">
+      {fields.map((field) => (
+        <SettingRow
+          key={field.setting.key}
+          field={field}
+          staged={field.segments ? stagedAt(field.segments) : undefined}
+          onScope={(scope) => onScope(field, scope)}
+          onStage={(value) => onStage(field, value)}
+          onWithdraw={() => {
+            if (field.segments) onWithdraw(field.segments)
+          }}
+        />
+      ))}
+    </div>
+  )
+}
+
+/**
+ * Every setting the engine registers, as a form.
+ *
+ * The fields are GENERATED from the registry the read supplies — key, type,
+ * bounds, permitted scopes, summary — rather than listed here. That is the whole
+ * point of the read: a hard-coded field list is how a form comes to offer a
+ * setting the write door rejects, or to omit one it accepts, and neither failure
+ * shows up until somebody tries to change a value.
+ *
+ * Four properties of the editing, each mirroring the autonomy grid's:
+ *
+ * 1. **A change is not a write.** Every edit accumulates in the shared staged-edit
+ *    state and reaches the engine only through a confirm on the review card that
+ *    shows the exact patch. Nothing here writes on change.
+ * 2. **The rows always show the store.** The value in force and its origin come
+ *    from the resolved read; a staged edit sits in the control beside them, marked
+ *    unwritten. So a refused write leaves the form stating what is persisted, and
+ *    nothing is invalidated on failure.
+ * 3. **A success re-reads.** This mutation owns that: the review card is shared
+ *    and presentational, so it cannot invalidate for its callers. The document,
+ *    every resolved read and the grid all describe what is now stored, and one
+ *    settings write can move all three — `watch.interval_s` at source scope is
+ *    read by the sources section too.
+ * 4. **A failed read is doubt, not an empty form.** `isError` is read BEFORE the
+ *    data, because React Query keeps the last successful answer across a failing
+ *    refetch: rows filled from a retained answer would present values nobody
+ *    re-read as what is in force, and the registry's own defaults are emphatically
+ *    not that.
+ */
+function SettingsForm({ project }: { project: string }) {
+  const client = useQueryClient()
+  const edits = useStagedEdits()
+  // The scope each row writes at, keyed by registry key. Normalized on read
+  // rather than trusted: a target can be deselected while a choice sits here.
+  const [scopeChosen, setScopeChosen] = useState<Record<string, string>>({})
+  const [source, setSource] = useState('')
+  const [reviewing, setReviewing] = useState(false)
+  const [wrote, setWrote] = useState(false)
+
+  const registry = useQuery({
+    queryKey: QK.registry,
+    queryFn: () => specEngineApi.configRegistry(),
+    retry: false,
+    // Bundled vocabulary: it is a projection of the engine's own constants, so it
+    // cannot change while the page is open and no write can move it.
+    staleTime: Infinity,
+  })
+  // The SAME key and the same request as the resolved pane beside this form, so
+  // the two read one answer: a second cache entry for one reading is how a
+  // control comes to edit a value the pane says is not in force.
+  const resolved = useQuery({
+    queryKey: QK.resolved(project),
+    queryFn: () => specEngineApi.resolvedConfig(project || undefined),
+    retry: false,
+  })
+  // Only for the NAMES a source-scoped write can target; the grid below reads the
+  // same query, so this costs no second request.
+  const sources = useQuery({
+    queryKey: QK.sources,
+    queryFn: () => specEngineApi.sources(),
+    retry: false,
+  })
+
+  const write = useMutation({
+    mutationFn: (patch: Document) => specEngineApi.writeConfig(patch),
+    onSuccess: () => {
+      edits.clear()
+      setReviewing(false)
+      setWrote(true)
+      // The reply's merged document is NOT adopted: the reads are this pane's
+      // authority on what is persisted. All three are named because they are three
+      // readings a reader would otherwise have to know the key layout to see
+      // refreshed, even though the resolved and sources keys sit under the
+      // document key's prefix.
+      void client.invalidateQueries({ queryKey: QK.config })
+      void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
+      void client.invalidateQueries({ queryKey: QK.sources })
+    },
+    // No `onError`: a refusal must leave the staged edits in place and the queries
+    // untouched, so the rows keep showing the store's own state.
+  })
+
+  const settings = registry.data?.settings ?? NO_SETTINGS
+  const inForce = useMemo(() => {
+    const found = new Map<string, EffectiveSetting>()
+    for (const value of resolved.data?.settings ?? []) found.set(value.key, value)
+    return found
+  }, [resolved.data])
+  // `isError` before the data for property 4: a retained source list would name a
+  // write target nobody re-read.
+  const names = sources.isError ? [] : (sources.data?.sources.map((entry) => entry.name) ?? [])
+  const sourceTarget = names.includes(source) ? source : (names[0] ?? '')
+  const fields = useMemo(
+    () => settingFields(settings, inForce, { project, source: sourceTarget }, scopeChosen),
+    [settings, inForce, project, sourceTarget, scopeChosen],
+  )
+  // Every path a row can address right now, so a staged edit that no longer has a
+  // row can be dropped. Three ways an edit stops having one: the selected project
+  // moved, the source target moved, and the vocabulary changed under it — each
+  // from this pane, from another surface, or on any refetch. An edit no row shows
+  // is an edit no sentence describes and no confirm clears, and leaving it staged
+  // would put a path in the patch that the review card never accounted for.
+  const addressable = useMemo(() => {
+    const paths = new Set<string>()
+    for (const field of fields) {
+      for (const offer of field.offers) {
+        if (offer.segments) paths.add(JSON.stringify(offer.segments))
+      }
+    }
+    return paths
+  }, [fields])
+  const { reconcile } = edits
+  useEffect(() => {
+    reconcile((edit) => addressable.has(JSON.stringify(edit.segments)))
+  }, [addressable, reconcile])
+
+  // `isError` first, then the data: see property 4 above. Both reads are named
+  // because they fail for different reasons and only one of them is repairable
+  // from this pane.
+  if (registry.isError || resolved.isError) {
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
+        {registry.isError && (
+          <Refused
+            title={i18nT('apps.specEngine.settingsForm.could_not_read_the_setting_registry')}
+            error={registry.error}
+          />
+        )}
+        {resolved.isError && (
+          <Refused
+            title={i18nT('apps.specEngine.configPanel.could_not_resolve_the_configuration')}
+            error={resolved.error}
+          />
+        )}
+      </div>
+    )
+  }
+  if (registry.isPending || resolved.isPending || !registry.data || !resolved.data) {
+    // Distinct from the empty vocabulary on purpose: "the engine registers no
+    // setting" is a fact about the engine, and "not read yet" is a fact about this
+    // request.
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
+        <p className="se-note">
+          {i18nT('apps.specEngine.settingsForm.reading_the_setting_registry')}
+        </p>
+      </div>
+    )
+  }
+
+  // Plain functions rather than `useCallback`: all three close over the mutation
+  // object, which React Query hands back fresh on every render, so a memo here
+  // would advertise a stability it cannot have.
+  const stage = (field: SettingField, value: unknown) => {
+    if (!field.segments) return
+    setWrote(false)
+    write.reset()
+    // Typing back exactly what THIS path already stores is not a change, and every
+    // write is recorded: staging it would put a line in the durable write record
+    // for an edit nobody made. The same value at another path is a real change, so
+    // the withdrawal is conditioned on the declaring path and not on the value.
+    if (storedAt(field.inForce, field.segments, value)) edits.unstage(field.segments)
+    else edits.stage(field.segments, value)
+  }
+
+  const withdraw = (segments: readonly string[]) => {
+    setWrote(false)
+    write.reset()
+    edits.unstage(segments)
+  }
+
+  const chooseScope = (field: SettingField, scope: string) => {
+    setWrote(false)
+    write.reset()
+    const moving = field.segments ? edits.stagedAt(field.segments) : undefined
+    const target = field.offers.find((offer) => offer.scope === scope)?.segments ?? null
+    if (field.segments) edits.unstage(field.segments)
+    // The staged value MOVES with the scope rather than being dropped: an operator
+    // who typed a value and then decided it belongs to one project meant to keep
+    // the value. It is withdrawn instead when the scope it moved to already stores
+    // it, for `stage`'s reason.
+    if (moving && target && !storedAt(field.inForce, target, moving.value)) {
+      edits.stage(target, moving.value)
+    }
+    setScopeChosen((current) => ({ ...current, [field.setting.key]: scope }))
+  }
+
+  const discard = () => {
+    edits.clear()
+    setReviewing(false)
+    setWrote(false)
+    write.reset()
+  }
+
+  // The staged edits paired with the row that accounts for each, and the patch
+  // built from exactly those. One list for both, because a review that showed a
+  // patch line it could not explain — or a write that carried one — is the failure
+  // the review card exists to prevent.
+  const reviewed: Array<{ field: SettingField; edit: StagedEdit }> = []
+  for (const field of fields) {
+    if (!field.segments) continue
+    const staged = edits.stagedAt(field.segments)
+    if (staged) reviewed.push({ field, edit: staged })
+  }
+  const patch = buildFormPatch(reviewed.map((entry) => entry.edit))
+
+  return (
+    <div className="se-blk">
+      <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
+      {fields.length === 0 ? (
+        <p className="se-note">{i18nT('apps.specEngine.settingsForm.no_setting_is_registered')}</p>
+      ) : (
+        <>
+          {names.length > 0 && (
+            <div
+              className="se-acts"
+              role="group"
+              aria-label={i18nT('apps.specEngine.settingsForm.select_a_watch_source_to_write_at')}
+            >
+              {names.map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  className="se-btn se-sm se-m"
+                  aria-pressed={name === sourceTarget}
+                  onClick={() => setSource(name)}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          )}
+          <SettingsFields
+            fields={fields}
+            stagedAt={edits.stagedAt}
+            onScope={chooseScope}
+            onStage={stage}
+            onWithdraw={withdraw}
+          />
+          <div className="se-acts" style={{ marginTop: 9 }}>
+            <button
+              type="button"
+              className="se-btn"
+              disabled={reviewed.length === 0}
+              onClick={() => setReviewing(true)}
+            >
+              {i18nT('apps.specEngine.settingsForm.review_the_exact_change')}
+            </button>
+            {reviewed.length > 0 && (
+              <span className="se-lbl">
+                {i18nT('apps.specEngine.settingsForm.unwritten_setting_changes')}
+                {SEP}
+                <span className="se-m">{fmtNumber(reviewed.length)}</span>
+              </span>
+            )}
+          </div>
+          {reviewing && reviewed.length > 0 && (
+            <FormReview
+              changes={reviewed.map(({ field, edit }) => ({
+                path: dotted(edit.segments),
+                sentence: i18nT(
+                  'apps.specEngine.settingsForm.edit_replaces_the_value_in_force',
+                  {
+                    setting: settingLabel(field.setting.key) || field.setting.key,
+                    path: dotted(edit.segments),
+                    oldValue: shownValue(field.inForce?.value),
+                    newValue: shownValue(edit.value),
+                    origin: originText(field.inForce),
+                  },
+                ),
+              }))}
+              patch={patch}
+              labels={{
+                heading: i18nT('apps.specEngine.settingsForm.the_change_that_would_be_written'),
+                confirm: i18nT('apps.specEngine.settingsForm.write_the_change'),
+                writing: i18nT('apps.specEngine.configPanel.saving'),
+                discard: i18nT('apps.specEngine.settingsForm.discard_the_pending_changes'),
+                exactly: i18nT('apps.specEngine.settingsForm.a_confirm_writes_exactly_this_patch'),
+                refusalTitle: i18nT(
+                  'apps.specEngine.settingsForm.could_not_write_the_setting_change',
+                ),
+                retained: i18nT(
+                  'apps.specEngine.settingsForm.nothing_was_written_so_the_rows_are_stored_state',
+                ),
+              }}
+              writing={write.isPending}
+              error={write.isError ? write.error : null}
+              onConfirm={() => write.mutate(patch)}
+              onDiscard={discard}
+            />
+          )}
+          {wrote && (
+            <p className="se-note" role="status">
+              {i18nT('apps.specEngine.settingsForm.wrote_the_change_and_re_read_the_settings')}
+            </p>
+          )}
+          {/* The two facts a reader would otherwise have to infer from the
+              controls: where the fields come from, and what a scope's write
+              actually targets. */}
+          <p className="se-note">
+            {i18nT('apps.specEngine.settingsForm.every_field_comes_from_the_engines_registry')}
+          </p>
+          <p className="se-note">
+            {i18nT('apps.specEngine.settingsForm.a_scope_targets_the_selection_above')}
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 /**
  * Whether unsaved text differs from the document the read returned.
  *
@@ -1017,7 +1703,6 @@ function SourcesSection() {
 function isDirty(text: string | null, document: unknown): boolean {
   return text !== null && text !== documentText(document)
 }
-
 /**
  * The document, edited and saved through the engine's one write path.
  *
@@ -1985,6 +2670,11 @@ export function ConfigPane({
                   governs which project", and the answer must not sit under a
                   fixed-height editor. */}
               <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
+              {/* Beside the table because the row selected there is what these
+                  values are resolved FOR: a settings form and a resolution for two
+                  different projects is the disagreement the shared selection
+                  exists to prevent. */}
+              <SettingsForm project={project} />
               {/* Beside the projects table for the same reason: who may run how
                   unattended is a reading, and reading it out of JSON is not the
                   same as seeing the matrix. */}

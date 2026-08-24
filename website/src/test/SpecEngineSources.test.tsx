@@ -136,6 +136,21 @@ function stub(answers: {
       if (method === 'PUT') {
         answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
         written = (answer.status ?? 200) < 300
+      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+        // The settings form is generated from this read, and it must be answered
+        // BEFORE the generic '/config' prefix below, which would otherwise hand it
+        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
+        // this suite is about the autonomy grid, and the generated form's own
+        // properties live in `SpecEngineSettingsForm.test.tsx`.
+        answer = {
+          body: {
+            settings: [],
+            source_presets: [],
+            profile_presets: [],
+            roles: [],
+            levels: [],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
         reads += 1
         answer =
@@ -423,24 +438,32 @@ describe('doubt about the read never renders as authority', () => {
         if (url.startsWith('/api/apps/spec-engine/config/sources')) await held
         const body = url.startsWith('/api/apps/spec-engine/config/sources')
           ? sources()
-          : url.startsWith('/api/apps/spec-engine/config/resolved')
+          : url.startsWith('/api/apps/spec-engine/config/registry')
             ? {
-                configured: true,
-                project: null,
-                source: null,
                 settings: [],
-                roles: { profile: '', roles: {} },
-                role_order: [],
+                source_presets: [],
+                profile_presets: [],
+                roles: [],
+                levels: [],
               }
-            : url.startsWith('/api/apps/spec-engine/config')
-              ? snapshot()
-              : url.startsWith('/api/apps/spec-engine/kill-switch')
-                ? {
-                    switch: { engaged: false, unreadable: false },
-                    stoppable: [],
-                    stoppable_credits: 0,
-                  }
-                : { entries: [], grouped: {}, total: 0, total_credits: 0 }
+            : url.startsWith('/api/apps/spec-engine/config/resolved')
+              ? {
+                  configured: true,
+                  project: null,
+                  source: null,
+                  settings: [],
+                  roles: { profile: '', roles: {} },
+                  role_order: [],
+                }
+              : url.startsWith('/api/apps/spec-engine/config')
+                ? snapshot()
+                : url.startsWith('/api/apps/spec-engine/kill-switch')
+                  ? {
+                      switch: { engaged: false, unreadable: false },
+                      stoppable: [],
+                      stoppable_credits: 0,
+                    }
+                  : { entries: [], grouped: {}, total: 0, total_credits: 0 }
         return { ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) }
       }),
     )

@@ -115,6 +115,60 @@ export function isDescendant(path: readonly string[], ancestor: readonly string[
   return ancestor.every((segment, index) => path[index] === segment)
 }
 
+/** Whether two paths address the same node, compared segment for segment. */
+export function samePath(one: readonly string[], other: readonly string[]): boolean {
+  return one.length === other.length && one.every((segment, index) => segment === other[index])
+}
+
+/**
+ * Whether either path lies at or inside the other.
+ *
+ * The relation {@link buildFormPatch} cannot carry twice: it is last-edit-wins,
+ * so an ancestor and a descendant staged together leave only one of the two in
+ * the patch — and a review card built from the staged list would then describe a
+ * change the write does not make. Callers reconcile on this rather than trusting
+ * that a form only ever stages leaves.
+ */
+export function pathsOverlap(one: readonly string[], other: readonly string[]): boolean {
+  return samePath(one, other) || isDescendant(one, other) || isDescendant(other, one)
+}
+
+/** Scope a setting is written at, spelled as the registry projects it. */
+export const SCOPE_APP = 'app'
+
+/** Scope a setting is written at, spelled as the registry projects it. */
+export const SCOPE_PROJECT = 'project'
+
+/** Scope a setting is written at, spelled as the registry projects it. */
+export const SCOPE_SOURCE = 'source'
+
+/**
+ * The segments addressing one registry setting's stored value at one scope, or
+ * `null` when no path can be composed.
+ *
+ * The dotted registry key splits at its FIRST dot only, which is the engine's own
+ * split: `group` is the leading segment and `leaf` is everything after it, as one
+ * segment. So a key of `a.b.c` addresses `a` / `b.c` — two segments, not three —
+ * and the composed path matches what `stored_value` reads.
+ *
+ * `null` rather than a partial path for the three ways a scope has no address: an
+ * unknown scope name (a scope the engine gains has no composition here until one
+ * is written), a project- or source-scoped write with no target named, and a key
+ * with no group at all. A caller offers the scope only when a path exists,
+ * because `projects..limits.x` would write a project literally named the empty
+ * string.
+ */
+export function settingSegments(key: string, scope: string, target: string): string[] | null {
+  const dot = key.indexOf('.')
+  if (dot <= 0 || dot === key.length - 1) return null
+  const leaf = [key.slice(0, dot), key.slice(dot + 1)]
+  if (scope === SCOPE_APP) return leaf
+  if (target === '') return null
+  if (scope === SCOPE_PROJECT) return [PROJECTS, target, ...leaf]
+  if (scope === SCOPE_SOURCE) return [SOURCES, target, ...leaf]
+  return null
+}
+
 /**
  * The segments addressing one role's assignment inside one profile.
  *

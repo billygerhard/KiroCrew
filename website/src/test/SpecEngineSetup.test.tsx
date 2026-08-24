@@ -214,6 +214,20 @@ function stub(answers: {
         answer = answers.plan ?? { body: envelope() }
       } else if (url.endsWith('/setup/apply')) {
         answer = answers.apply ?? { body: applied() }
+      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+        // The configuration pane's settings form is generated from this read, and
+        // it must be answered BEFORE the generic '/config' prefix below, which
+        // would otherwise hand it a ConfigSnapshot and crash its render. Answered
+        // with an empty vocabulary — this suite is about the setup flow.
+        answer = {
+          body: {
+            settings: [],
+            source_presets: [],
+            profile_presets: [],
+            roles: [],
+            levels: [],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
         // The config pane's sources section reads this route, and it must be
         // answered BEFORE the generic '/config' prefix below: the prefix match

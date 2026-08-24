@@ -196,6 +196,21 @@ function stub(answers: {
           (seen > 1 ? answers.resolvedAgain?.[project] : undefined) ??
           answers.resolvedFor?.[project] ??
           answers.resolved ?? { body: resolved() }
+      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+        // The settings form is generated from this read, and it must be answered
+        // BEFORE the generic '/config' prefix below, which would otherwise hand it
+        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
+        // these tests are about the document and its resolution, and the generated
+        // form's own properties live in `SpecEngineSettingsForm.test.tsx`.
+        answer = {
+          body: {
+            settings: [],
+            source_presets: [],
+            profile_presets: [],
+            roles: [],
+            levels: [],
+          },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
         // The pane's sources section reads this route. Answered with no source at
         // all, because these tests are about the document and its resolution: the

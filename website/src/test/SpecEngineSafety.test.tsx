@@ -139,6 +139,13 @@ function stub(answers: {
       } else if (url.startsWith('/api/apps/spec-engine/run-spend')) {
         const runId = new URL(url, 'http://x').searchParams.get('run_id') ?? ''
         answer = answers.runSpend?.[runId] ?? { body: spend({ run_id: runId }) }
+      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
+        // The configuration pane's settings form is generated from this read, and
+        // it must be answered BEFORE the generic '/config' prefix below, which
+        // would otherwise hand it a ConfigSnapshot and crash its render.
+        answer = {
+          body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+        }
       } else if (url.startsWith('/api/apps/spec-engine/config')) {
         answer = answers.config ?? {
           body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
