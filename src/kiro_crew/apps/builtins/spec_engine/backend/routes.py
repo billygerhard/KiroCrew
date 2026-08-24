@@ -33,11 +33,15 @@ widen its own autonomy or lift its own stop. So every MUTATING handler refuses
 an app token with 403 and a security event, and refuses an unauthenticated
 caller with 401.
 
-Reads deliberately stop at 401. An app token may READ all six read routes,
+Reads deliberately stop at 401. An app token may READ all seven read routes,
 and the rationale differs by route. The configuration reads are equivalence: the
 values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
-them here would buy nothing and diverge the two doors. The per-source autonomy
+them here would buy nothing and diverge the two doors. The form-vocabulary read
+discloses less again: it projects the setting registry, the bundled source and
+cost-profile presets, and the role and level vocabularies — data the app package
+itself ships, carrying no stored value at all, so it is strictly less than the
+document read the same token already reaches. The per-source autonomy
 grid joins them: it carries resolved autonomy levels and the configuration paths
 that declared them, which is a projection of a document the same agent can
 already read, and no credential-classified value appears in it. Reading how far
@@ -65,7 +69,10 @@ table rather than resting on a comment.
 work — including constructing the stores, which opens SQLite and migrates the
 schema — happens inside one ``asyncio.to_thread`` call, and inside the ``try``
 that maps failures to a refusal. A store built on the loop would both stall the
-gateway and turn an unreadable database into a bare 500.
+gateway and turn an unreadable database into a bare 500. The one handler with no
+``to_thread`` is the form-vocabulary read, which assembles bundled constants in
+memory: it opens nothing, so there is nothing to move off the loop and no
+failure to map.
 
 **Catch clauses are traced against the raising code, not against the names.**
 ``StateStore`` wraps every ``sqlite3.Error``/``OSError`` into
@@ -126,9 +133,11 @@ from ..engine.config import (
     APP_NAME,
     AUTONOMY_LEVELS,
     CONFIG_ONLY_PATHS,
+    COST_PROFILE_PRESET_NAMES,
     DASHBOARD_SURFACE,
     ELIDED,
     ROLES,
+    SETTINGS,
     SETUP_ASSISTANT_SURFACE,
     SPEC_TYPES,
     SUBMITTER_CLASSES,
@@ -144,7 +153,13 @@ from ..engine.config import (
     validate_config_document,
 )
 from ..engine.config.schema import SECTION_SOURCES
+from ..engine.config.settings import SCOPE_PRECEDENCE, Setting
 from ..engine.roles import RolePlan
+from ..engine.watch.sources import (
+    WATCH_SOURCE_PRESET_HOSTS,
+    WATCH_SOURCE_PRESET_PROGRAMS,
+    watch_source_presets,
+)
 from ..engine_mcp import setup_surface
 
 logger = logging.getLogger(__name__)
@@ -642,7 +657,90 @@ async def handle_get_resolved_config(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
-# --- the per-source autonomy grid --------------------------------------------
+# --- the form vocabulary ------------------------------------------------------
+
+
+def _setting_vocabulary(setting: Setting) -> dict[str, Any]:
+    """One registry entry as the facts a generated form control is built from.
+
+    ``kind`` travels as the type's NAME and the scopes as their value strings: the
+    payload is JSON, and a client that had to know Python's spelling of a type or
+    of an enum member would be reading a language detail rather than a vocabulary.
+
+    Scopes are ordered broadest-first — the reverse of the resolver's precedence,
+    which runs narrowest-first — because a scope chooser reads app before project
+    before source while resolution walks the other way. Derived from
+    ``SCOPE_PRECEDENCE`` rather than listed, so a scope the registry gains appears
+    here without an edit, and ``scopes`` being a frozenset never leaks set
+    iteration order into the payload.
+    """
+    return {
+        "key": setting.key,
+        "kind": setting.kind.__name__,
+        "default": setting.default,
+        # Absent bounds travel as null rather than being omitted: a numeric input
+        # branches on whether a bound exists, and a key that came and went would
+        # read as a shape change rather than as "this setting has no ceiling".
+        "minimum": setting.minimum,
+        "maximum": setting.maximum,
+        "scopes": [scope.value for scope in reversed(SCOPE_PRECEDENCE) if setting.allows(scope)],
+        "summary": setting.summary,
+    }
+
+
+def _registry_payload() -> dict[str, Any]:
+    """The engine's own form vocabularies: settings, presets, roles, levels.
+
+    A pure projection of bundled constants. Nothing here reads the configuration
+    document, which is why this read carries none of the refusal-by-path contract
+    its sibling reads do: there is no stored value that can be missing,
+    unreadable or invalid, and nothing a concurrent write could tear. A surface
+    generated from it renders the vocabulary the ENGINE enforces against — a
+    hard-coded field list is how a form comes to offer a setting the write door
+    rejects, or to omit one it accepts.
+
+    Ordering is each owning module's declaration order throughout: registry order
+    for settings, :data:`WATCH_SOURCE_PRESET_HOSTS` for presets, and the declared
+    tuples for the profile, role and level names. A client rendering the payload
+    in the order it arrives therefore renders it the same way on every read.
+
+    Preset entries come from :func:`watch_source_presets`, which deep-copies and
+    deliberately carries no ``enabled`` key, so a copy an operator has not armed
+    yet is inert. Composing the entry here rather than in a client is what keeps a
+    poll argv the engine's own: the write door validates argv SHAPE and not the
+    program it names, so the preset tables are the boundary on what a form can
+    cause the engine to run.
+    """
+    return {
+        "settings": [_setting_vocabulary(setting) for setting in SETTINGS.values()],
+        "source_presets": [
+            {
+                "host": host,
+                # The program each preset needs on PATH, which is what a picker has
+                # to state before anything is copied into configuration. Read from
+                # the engine's own derivation of it rather than from the argv here,
+                # so the picker and the poll cannot name two different tools.
+                "program": WATCH_SOURCE_PRESET_PROGRAMS[host],
+                "entry": watch_source_presets(host),
+            }
+            for host in WATCH_SOURCE_PRESET_HOSTS
+        ],
+        "profile_presets": list(COST_PROFILE_PRESET_NAMES),
+        "roles": list(ROLES),
+        "levels": list(AUTONOMY_LEVELS),
+    }
+
+
+async def handle_get_config_registry(request: web.Request) -> web.Response:
+    """GET the vocabularies the configuration forms are generated from.
+
+    No ``asyncio.to_thread`` and no refusal arms, both for one reason: the payload
+    is bundled data assembled in memory. There is no store to construct, no file
+    to open, and so no failure to map onto a status — a try block here would name
+    exceptions this code cannot raise.
+    """
+    return web.json_response(_registry_payload())
+
 
 #: The pair's OWN stored cell answered it.
 ORIGIN_EXACT = "exact"
@@ -1407,6 +1505,7 @@ def register_routes(app: web.Application) -> None:
     add("GET", f"{PREFIX}/config", _read(handle_get_config))
     add("PUT", f"{PREFIX}/config", _mutate(handle_put_config, operation="config_write"))
     add("GET", f"{PREFIX}/config/resolved", _read(handle_get_resolved_config))
+    add("GET", f"{PREFIX}/config/registry", _read(handle_get_config_registry))
     add("GET", f"{PREFIX}/config/sources", _read(handle_get_sources))
 
     # The setup flow. All three are POSTs behind the operator guard, and the first

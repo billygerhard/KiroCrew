@@ -52,17 +52,24 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     CONFIG_FILENAME,
     LEAST_TRUSTED_CLASS,
     ROLES,
+    SETTINGS,
     SPEC_TYPES,
     SUBMITTER_CLASSES,
     WILDCARD_KEY,
     ConfigStore,
     ConfigWriteSurface,
+    Scope,
     default_root,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
     COST_PROFILE_PRESET_NAMES,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.setup import CONFIRMED_LEVELS
+from kiro_crew.apps.builtins.spec_engine.engine.watch.sources import (
+    WATCH_SOURCE_PRESET_HOSTS,
+    WATCH_SOURCE_PRESET_PROGRAMS,
+    watch_source_presets,
+)
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.operations import EngineOperations
 from kiro_crew.apps.builtins.spec_engine.engine_mcp.setup_surface import (
     REFUSAL_APPROVER_REQUIRED,
@@ -563,6 +570,7 @@ class TestTheRegisteredSurface:
             ("GET", f"{routes.PREFIX}/config"),
             ("PUT", f"{routes.PREFIX}/config"),
             ("GET", f"{routes.PREFIX}/config/resolved"),
+            ("GET", f"{routes.PREFIX}/config/registry"),
             ("GET", f"{routes.PREFIX}/config/sources"),
             ("POST", f"{routes.PREFIX}/setup/inspect"),
             ("POST", f"{routes.PREFIX}/setup/plan"),
@@ -1319,6 +1327,174 @@ class TestTheResolvedReadIsAReadOfTheDocumentBesideIt:
             reply = await _get(client, f"{routes.PREFIX}/config/resolved")
         assert reply.status == 409
         assert reply.code == "config_unreadable"
+
+
+# --- the form vocabulary ------------------------------------------------------
+
+
+class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
+    """The registry read, asserted against the constants it projects.
+
+    The claim worth defending is that a form generated from this payload is
+    generated from the vocabulary the ENGINE enforces against. So these compare
+    the payload with the owning modules' tables rather than with a literal copy of
+    them written here: a second spelling of the registry in this file would keep
+    passing after the registry moved on, which is precisely the drift the read
+    exists to prevent.
+
+    The 401 floor and the disabled-app refusal are not repeated here: both are
+    parametrized over the route table, so registering this path enrolled it. The
+    refusal-by-path contract its sibling config reads carry does not apply — this
+    read opens no document, so there is no stored value to be unreadable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_registry_setting_is_projected_in_registry_order(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.status == 200
+        keys = [entry["key"] for entry in reply.body["settings"]]
+        assert keys == list(SETTINGS), "the projection dropped, added or reordered a setting"
+        assert len(keys) == 21, (
+            "the setting registry changed size; a form is generated from this "
+            "vocabulary, so re-read the new setting's kind, bounds and scopes "
+            "before accepting the count"
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_entry_carries_its_whole_registry_record(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Field by field, on a setting whose record exercises every arm: an int
+        kind, a minimum, no maximum, two of the three scopes, and a summary."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        entries = {entry["key"]: entry for entry in reply.body["settings"]}
+        assert entries["concurrency.wave_max_tasks"] == {
+            "key": "concurrency.wave_max_tasks",
+            "kind": "int",
+            "default": 3,
+            "minimum": 1,
+            # Null rather than absent: a numeric input branches on whether a bound
+            # exists, and an omitted key reads as a shape change.
+            "maximum": None,
+            "scopes": ["app", "project"],
+            "summary": "Leaf tasks the orchestrator dispatches in parallel within one wave.",
+        }
+
+    @pytest.mark.asyncio
+    async def test_every_entry_agrees_with_its_own_setting_record(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The whole table, not only the pinned entry: a kind name that lost its
+        mapping or a scope set that leaked frozenset iteration order would send a
+        form a control the write door refuses."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        for entry in reply.body["settings"]:
+            setting = SETTINGS[entry["key"]]
+            assert entry["kind"] == setting.kind.__name__
+            assert entry["default"] == setting.default
+            assert entry["minimum"] == setting.minimum
+            assert entry["maximum"] == setting.maximum
+            assert entry["summary"] == setting.summary
+            # Broadest-first, and only the scopes the registry permits: offering a
+            # scope the setting forbids would stage a write the door rejects as a
+            # configuration error rather than ignoring it.
+            assert entry["scopes"] == [
+                scope.value
+                for scope in (Scope.APP, Scope.PROJECT, Scope.SOURCE)
+                if scope in setting.scopes
+            ]
+
+    @pytest.mark.asyncio
+    async def test_each_source_preset_is_byte_equal_to_the_bundled_table(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Including the program, which the picker states before anything is
+        copied, and the absence of ``enabled``, which is what makes a fresh copy
+        inert until an operator arms it."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        presets = reply.body["source_presets"]
+        assert [preset["host"] for preset in presets] == list(WATCH_SOURCE_PRESET_HOSTS)
+        for preset in presets:
+            host = preset["host"]
+            assert preset["program"] == WATCH_SOURCE_PRESET_PROGRAMS[host]
+            assert preset["entry"] == watch_source_presets(host)
+            assert "enabled" not in preset["entry"], (
+                f"the {host} preset arrived carrying enabled; a copied preset must "
+                "be inert until an operator enables it"
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_profile_role_and_level_vocabularies_are_the_owning_modules(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.body["profile_presets"] == list(COST_PROFILE_PRESET_NAMES)
+        assert reply.body["roles"] == list(ROLES)
+        assert reply.body["levels"] == list(AUTONOMY_LEVELS)
+
+    @pytest.mark.asyncio
+    async def test_the_read_opens_no_configuration_document(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sibling reads count ONE document read; this one must count zero.
+
+        A projection that reached for the document would inherit refusals it has no
+        answer for — an unreadable file would take the form vocabulary down with
+        it, leaving an operator a pane that cannot even describe its own fields.
+        Both the store construction and the document read are counted, so a read
+        through a second store is caught too.
+        """
+        reads: list[str] = []
+        original_document = ConfigStore.document
+        original_store = routes._config_store
+
+        def _counting_document(self: ConfigStore) -> dict[str, Any]:
+            reads.append("document")
+            return original_document(self)
+
+        def _counting_store() -> ConfigStore:
+            reads.append("store")
+            return original_store()
+
+        monkeypatch.setattr(ConfigStore, "document", _counting_document)
+        monkeypatch.setattr(routes, "_config_store", _counting_store)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.status == 200
+        assert reads == [], f"the vocabulary read touched the config store: {reads}"
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_home_still_answers_the_whole_vocabulary(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The case the forms are for. Nothing is configured yet — no document at
+        all — and the pane still has every field, preset and role it needs to offer
+        the operator a first edit."""
+        assert not (default_root() / CONFIG_FILENAME).exists()
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.status == 200
+        assert reply.body["settings"]
+        assert reply.body["source_presets"]
+        assert reply.body["profile_presets"]
+
+    @pytest.mark.asyncio
+    async def test_two_reads_return_the_identical_payload(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Stable ordering, asserted as bytes. A payload ordered by set iteration
+        would reorder a form's rows between reads while nothing had changed."""
+        async with _client() as client:
+            first = await _get(client, f"{routes.PREFIX}/config/registry")
+            second = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert json.dumps(first.body) == json.dumps(second.body)
 
 
 # --- the per-source autonomy grid --------------------------------------------

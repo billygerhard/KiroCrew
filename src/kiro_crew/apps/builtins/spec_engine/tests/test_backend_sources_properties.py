@@ -19,6 +19,14 @@ private on purpose, because the claim is about what THAT function does to a
 document, and a re-implementation here would prove a merge nobody runs — and
 asserts that every other path in the document survives the merge unchanged, in
 both directions: nothing else altered, nothing else added, nothing else dropped.
+
+**A projected source preset carries only the bundled argv.** The form-vocabulary
+read hands a surface the entry a new Watch_Source is composed from, and its
+``poll`` is argv the engine will execute. So for every bundled preset the
+projected argv is byte-equal to the table's own, and no edit a surface makes to a
+projected copy can change what the next read supplies — the deep copy is what
+stands between one operator's edit and every later projection, and the write door
+validates argv shape rather than the program it names.
 """
 
 from __future__ import annotations
@@ -42,6 +50,11 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config.schema import SECTION_SOURCES
 from kiro_crew.apps.builtins.spec_engine.engine.config.store import _merge
+from kiro_crew.apps.builtins.spec_engine.engine.watch.sources import (
+    POLL_KEY,
+    WATCH_SOURCE_PRESET_HOSTS,
+    WATCH_SOURCE_PRESETS,
+)
 
 #: Both properties are pure and in-memory, so examples are cheap. Well above the
 #: number of distinct grid shapes the scripted route tests reach.
@@ -312,3 +325,56 @@ def test_a_patched_document_resolves_the_edited_cells_and_no_others_differently(
                     declaring == _cell_path(source, edited_class, edited_type)
                     for edited_class, edited_type in touched
                 ), f"{source}.{submitter_class}.{spec_type} changed on no edit of its own"
+
+
+# --- a projected preset carries only the bundled argv -------------------------
+
+
+#: Argv a surface might write over a projected copy — including the empty list,
+#: which is the edit that would leave a source with no program at all. Generated
+#: rather than fixed because the claim is about ANY edit to the copy, and the one
+#: mutation somebody thought to write down is the one that would be avoided.
+_ARGV_EDITS = st.lists(st.text(max_size=8), max_size=4)
+
+
+@settings(max_examples=MAX_EXAMPLES)
+@given(st.sampled_from(list(WATCH_SOURCE_PRESET_HOSTS)), _ARGV_EDITS)
+def test_a_projected_preset_carries_the_bundled_argv_and_survives_an_edit_to_it(
+    host: str, edit: list[str]
+) -> None:
+    """Byte-equality, then independence from an arbitrary edit to the copy.
+
+    Two failures are closed here, and only the second needs generation. A
+    projection that composed argv of its own would run a program the preset tables
+    never sanctioned; a projection that handed out the table's own containers would
+    let one operator's edit — the ``OWNER/REPO`` placeholder is edited on every
+    real source — rewrite what every later read of this process supplies, silently,
+    for sources nobody was editing.
+    """
+    bundled = [str(argument) for argument in WATCH_SOURCE_PRESETS[host][POLL_KEY]]
+
+    projected = {preset["host"]: preset for preset in routes._registry_payload()["source_presets"]}
+    assert set(projected) == set(WATCH_SOURCE_PRESET_HOSTS)
+    assert projected[host]["entry"][POLL_KEY] == bundled
+
+    # Every OTHER preset in the same payload is its own table entry too, so a
+    # projection that leaked one host's argv into another's is caught by the same
+    # example rather than needing its own.
+    for other, preset in projected.items():
+        assert preset["entry"][POLL_KEY] == [
+            str(argument) for argument in WATCH_SOURCE_PRESETS[other][POLL_KEY]
+        ]
+
+    # The edit a surface makes to its own copy, applied in place — which is what a
+    # shallow projection would let reach the bundled table.
+    projected[host]["entry"][POLL_KEY][:] = edit
+
+    assert [str(argument) for argument in WATCH_SOURCE_PRESETS[host][POLL_KEY]] == bundled
+    refreshed = {
+        preset["host"]: preset["entry"][POLL_KEY]
+        for preset in routes._registry_payload()["source_presets"]
+    }
+    for other, argv in refreshed.items():
+        assert argv == [
+            str(argument) for argument in WATCH_SOURCE_PRESETS[other][POLL_KEY]
+        ], "an edit to a projected copy changed what a later read supplies"
