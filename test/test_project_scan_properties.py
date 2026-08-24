@@ -441,6 +441,45 @@ def test_two_scans_of_an_unchanged_tree_agree(
 
 
 @_SETTINGS
+@given(spec=_TREES, depth_cap=_DEPTH_CAPS, extra_signals=_EXTRA_SIGNALS, pick=st.integers(0, 7))
+def test_gitignoring_a_child_prunes_exactly_that_subtree(
+    scan_area: Path,
+    spec: _Dir,
+    depth_cap: int,
+    extra_signals: tuple[str, ...],
+    pick: int,
+) -> None:
+    """A ``.gitignore`` naming a root child removes that subtree and nothing new.
+
+    Whatever tree the generator built: after ignoring one child directory of
+    the root, no candidate sits at or under it (a repository inside cannot
+    rescue it), every surviving candidate existed before (an exclusion cannot
+    manufacture packages), and the scan stays deterministic — the ``.gitignore``
+    is filesystem input like everything else.
+    """
+
+    root, _ = _build_tree(scan_area, spec)
+    children = sorted(
+        entry.name for entry in os.scandir(root) if entry.is_dir(follow_symlinks=False)
+    )
+    if not children:
+        return
+    ignored = children[pick % len(children)]
+
+    before = scan(root, extra_signals=extra_signals, depth_cap=depth_cap)
+    (root / ".gitignore").write_text(f"{ignored}/\n", encoding="utf-8")
+    after = scan(root, extra_signals=extra_signals, depth_cap=depth_cap)
+
+    ignored_root = str(root / ignored)
+    for candidate in after.candidates:
+        assert candidate.path != ignored_root
+        assert not candidate.path.startswith(ignored_root + os.sep)
+    surviving = {candidate.path for candidate in after.candidates}
+    assert surviving <= {candidate.path for candidate in before.candidates}
+    assert scan(root, extra_signals=extra_signals, depth_cap=depth_cap) == after
+
+
+@_SETTINGS
 @given(spec=_TREES, depth_cap=_DEPTH_CAPS, extra_signals=_EXTRA_SIGNALS)
 def test_candidates_stay_inside_the_scan_root(
     scan_area: Path,

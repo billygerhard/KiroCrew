@@ -13,13 +13,27 @@ Two properties define the module and are worth stating up front:
   configuration, and on nothing else: no writes, no state, no editor workspace
   artifacts. That is what makes a scan safe to point at an unfamiliar tree, and
   what makes :class:`CandidateTree` reproducible across runs. The only files
-  *opened* are workspace declarations (see :data:`WORKSPACE_DECLARATIONS`), and
-  only when found as regular files while walking — never through a link.
+  *opened* are workspace declarations (see :data:`WORKSPACE_DECLARATIONS`) and
+  ``.gitignore`` files, and only when found as regular files while walking —
+  never through a link. A ``.gitignore`` is filesystem content like everything
+  else here, so honouring it keeps the scan a pure function of the tree: two
+  scans of an unchanged tree still compare equal.
 * **Prune beats every signal.** A name in :data:`PRUNE_DIRS` is rejected before
   it is ever classified, so a vendored ``node_modules/left-pad/package.json``
   cannot become a candidate no matter how well it matches. The precedence is
   one-directional on purpose — the alternative (classify, then filter) leaks a
   candidate the moment a new signal is added without a matching filter.
+* **Gitignored is pruned.** The project's own ``.gitignore`` already says which
+  trees are not its source, so the scan believes it instead of enumerating
+  every build tool's directory name: an ignored directory is never entered and
+  never classified — a ``.git`` inside it cannot rescue it, which is exactly
+  what defeats the SwiftPM/Xcode shape (``tmp/derived_data/SourcePackages/
+  checkouts/`` holds every dependency as a full clone) — and an ignored file
+  contributes nothing, neither a manifest signal nor a workspace declaration.
+  Matching follows git semantics (nested files stack, deeper files win,
+  ``!negation`` re-includes) via ``pathspec``. Only ``.gitignore`` files at or
+  below the scan root are read: a parent directory's file is outside the tree
+  the user pointed at, and the scanner never reads outside that tree.
 
 Classification is two-tiered rather than boolean because the confidence differs:
 a repository or manifest at the top of the scan root is what the user pointed at,
@@ -39,6 +53,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+import pathspec
 import yaml  # type: ignore[import-untyped]
 
 # `tomllib` is stdlib only from 3.11, and this project supports 3.10. The
@@ -55,6 +70,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 # Directory names that mark a package boundary by themselves.
 GIT_DIR = ".git"
 KIRO_DIR = ".kiro"
+
+# The one file honoured as an exclusion source. Read only when found as a
+# regular file at or below the scan root — see the module docstring.
+GITIGNORE_FILE = ".gitignore"
 
 # Filenames recognized as a package manifest. Extended per call by the
 # ``extra_signals`` argument rather than by editing this tuple, so an ecosystem
@@ -111,6 +130,12 @@ PRUNE_DIRS: tuple[str, ...] = (
     "venv",
     ".venv",
     "__pycache__",
+    # Xcode's build directory is the same class again: SwiftPM vendors every
+    # dependency as a full git clone under DerivedData/SourcePackages/checkouts,
+    # so one iOS project offers dozens of repositories that are not the user's
+    # packages. The name-prune is the belt for projects scanned without a
+    # .gitignore; projects that have one are covered by the gitignore rule too.
+    "DerivedData",
 )
 
 # Depth below the scan root that traversal will not pass. A cap is what keeps a
@@ -409,6 +434,92 @@ def declared_patterns(path: str) -> list[str]:
     return DECLARATION_PARSERS[os.path.basename(path)](text)
 
 
+@dataclass(frozen=True)
+class _IgnoreLayer:
+    """One ``.gitignore``'s patterns, tied to the directory that holds them.
+
+    Git scopes a file's patterns to its own subtree, so a layer carries its
+    base directory and every match is made against a path *relative to* that
+    base. Layers are ordered shallow-to-deep and the deepest layer with an
+    opinion wins, which is git's own precedence for nested files.
+    """
+
+    base: str
+    spec: pathspec.GitIgnoreSpec
+
+
+def _gitignore_spec(path: str) -> pathspec.GitIgnoreSpec:
+    """Parse the ``.gitignore`` at ``path`` into a matcher.
+
+    The same reading rules as :func:`declared_patterns`, because the risk is
+    the same: the file is tree content the user merely pointed at, so it is
+    size-capped rather than trusted, and undecodable bytes cost a line rather
+    than the file.
+
+    Raises:
+        DeclarationError: if the file is larger than the declaration cap.
+        OSError: if it cannot be read.
+    """
+
+    with open(path, "rb") as handle:
+        # One byte past the cap distinguishes "at the limit" from "truncated".
+        raw = handle.read(MAX_DECLARATION_BYTES + 1)
+    if len(raw) > MAX_DECLARATION_BYTES:
+        raise DeclarationError(f"larger than {MAX_DECLARATION_BYTES} bytes")
+    text = raw.decode("utf-8", errors="replace")
+    return pathspec.GitIgnoreSpec.from_lines(text.splitlines())
+
+
+def _ignored(path: str, *, is_dir: bool, layers: Sequence[_IgnoreLayer]) -> bool:
+    """Return whether the applicable ``.gitignore`` layers ignore ``path``.
+
+    ``layers`` arrive shallow-to-deep; each is consulted against the path
+    relative to its own base (git scoping), directories match with the
+    trailing-slash form so dir-only patterns (``tmp/``) behave, and the
+    deepest layer that expresses an opinion — ignore or ``!``-re-include —
+    decides. Git's "cannot re-include inside an excluded directory" rule is
+    not re-implemented here because the walk enforces it structurally: an
+    ignored directory is never entered, so nothing beneath it is ever asked
+    about.
+    """
+
+    verdict = False
+    for layer in layers:
+        rel = os.path.relpath(path, layer.base)
+        if rel.startswith(".."):
+            continue
+        rel_posix = rel.replace(os.sep, "/") + ("/" if is_dir else "")
+        opinion = layer.spec.check_file(rel_posix).include
+        if opinion is not None:
+            verdict = opinion
+    return verdict
+
+
+def _ignored_by_tree(path: str, root: str, specs: Mapping[str, pathspec.GitIgnoreSpec]) -> bool:
+    """Return whether any ancestor level's ``.gitignore`` prunes ``path``.
+
+    The walk answers this incrementally for the directories it enters; this is
+    the same judgement for a path that arrived by *name* instead — a workspace
+    declaration's member — where each ancestor must be checked in turn, because
+    a member inside an ignored directory is inside a tree the project already
+    disowned. ``specs`` maps a directory to the parsed ``.gitignore`` it holds.
+    """
+
+    rel = os.path.relpath(path, root)
+    if rel == "." or rel.startswith(".."):
+        return False
+    layers: list[_IgnoreLayer] = []
+    current = root
+    for part in rel.split(os.sep):
+        spec = specs.get(current)
+        if spec is not None:
+            layers.append(_IgnoreLayer(base=current, spec=spec))
+        current = os.path.join(current, part)
+        if layers and _ignored(current, is_dir=True, layers=layers):
+            return True
+    return False
+
+
 class Tier(Enum):
     """How confident detection is that a directory should become a folder.
 
@@ -529,6 +640,9 @@ class _DirContents:
     signals: tuple[str, ...]
     # Names of workspace declaration files present as regular files, sorted.
     declarations: tuple[str, ...] = ()
+    # Whether a ``.gitignore`` is present as a regular file — read (or refused)
+    # by the caller, the same split as declarations: listing never opens files.
+    has_gitignore: bool = False
 
 
 @dataclass(frozen=True)
@@ -546,6 +660,9 @@ class _Frame:
     # package the user pointed at" outside a package and "this may be an
     # implementation detail of the package above" inside one.
     inside_package: bool
+    # Every ``.gitignore`` in force here, shallow-to-deep — the ancestors' plus
+    # this directory's own, applied to children before they are ever pushed.
+    ignores: tuple[_IgnoreLayer, ...] = ()
 
 
 def _read_dir(directory: str, manifests: frozenset[str]) -> _DirContents:
@@ -562,6 +679,7 @@ def _read_dir(directory: str, manifests: frozenset[str]) -> _DirContents:
     has_kiro = False
     found_manifests: list[str] = []
     found_declarations: list[str] = []
+    has_gitignore = False
     with os.scandir(directory) as entries:
         for entry in entries:
             name = entry.name
@@ -598,6 +716,9 @@ def _read_dir(directory: str, manifests: frozenset[str]) -> _DirContents:
             # pointed at, and a parse error would quote its content back.
             if name in WORKSPACE_DECLARATIONS and entry.is_file(follow_symlinks=False):
                 found_declarations.append(name)
+            # Same rule for .gitignore, the other file the scan opens.
+            if name == GITIGNORE_FILE and entry.is_file(follow_symlinks=False):
+                has_gitignore = True
 
     signals: list[str] = []
     if has_git:
@@ -612,6 +733,7 @@ def _read_dir(directory: str, manifests: frozenset[str]) -> _DirContents:
         subdirs=tuple(sorted(subdirs)),
         signals=tuple(signals),
         declarations=tuple(sorted(found_declarations)),
+        has_gitignore=has_gitignore,
     )
 
 
@@ -892,6 +1014,10 @@ def scan(
     candidates: list[Candidate] = []
     members: list[str] = []
     warnings: list[str] = []
+    # Every .gitignore parsed during the walk, keyed by the directory holding
+    # it — the input _ignored_by_tree needs to give member paths (which arrive
+    # by name, not by walking) the same pruning the walk applies structurally.
+    gitignore_specs: dict[str, pathspec.GitIgnoreSpec] = {}
     stack = [_Frame(path=root_path, depth=0, parent_path=None, inside_package=False)]
 
     while stack:
@@ -903,12 +1029,49 @@ def scan(
             warnings.append(f"skipped unreadable directory {frame.path}: {exc.strerror or exc}")
             continue
 
+        # This directory's own .gitignore joins the layers in force before
+        # anything here is judged: its patterns govern its own files (git
+        # semantics), so a manifest it ignores must not count as a signal. An
+        # unreadable or oversized file costs the layer, never the scan.
+        layers = frame.ignores
+        if contents.has_gitignore:
+            gitignore_path = os.path.join(frame.path, GITIGNORE_FILE)
+            try:
+                spec = _gitignore_spec(gitignore_path)
+            except (OSError, DeclarationError) as exc:
+                warnings.append(f"skipped {gitignore_path}: {_warning_reason(exc)}")
+            else:
+                gitignore_specs[frame.path] = spec
+                layers = layers + (_IgnoreLayer(base=frame.path, spec=spec),)
+
+        # An ignored file contributes nothing: not a manifest signal, not a
+        # workspace declaration. Repository/.kiro signals are directories and
+        # stay — git itself never treats a repository's .git as ignorable.
+        signals = contents.signals
+        declarations = contents.declarations
+        if layers:
+            signals = tuple(
+                signal
+                for signal in signals
+                if not signal.startswith(_MANIFEST_SIGNAL_PREFIX)
+                or not _ignored(
+                    os.path.join(frame.path, signal[len(_MANIFEST_SIGNAL_PREFIX):]),
+                    is_dir=False,
+                    layers=layers,
+                )
+            )
+            declarations = tuple(
+                name
+                for name in declarations
+                if not _ignored(os.path.join(frame.path, name), is_dir=False, layers=layers)
+            )
+
         # Declarations are read wherever they are found, including at a scan root
         # that is not itself a package: a `go.work` or `pnpm-workspace.yaml` in a
         # directory of repositories still names the members the user cares about.
-        if contents.declarations:
+        if declarations:
             members.extend(
-                _declared_members(frame.path, contents.declarations, root_path, depth_cap, warnings)
+                _declared_members(frame.path, declarations, root_path, depth_cap, warnings)
             )
 
         parent_path = frame.parent_path
@@ -918,15 +1081,15 @@ def scan(
         # Requirement 2's "shown unticked" tier exists for. Requirement 1's
         # boundary tier is for the other shape — a root that is just a directory
         # holding unrelated repositories.
-        inside_package = frame.inside_package or bool(contents.signals)
-        if frame.depth > 0 and contents.signals:
+        inside_package = frame.inside_package or bool(signals)
+        if frame.depth > 0 and signals:
             candidates.append(
                 Candidate(
                     path=frame.path,
                     name=os.path.basename(frame.path),
                     parent_path=frame.parent_path,
-                    tier=_tier_for(contents.signals, inside_package=frame.inside_package),
-                    signals=contents.signals,
+                    tier=_tier_for(signals, inside_package=frame.inside_package),
+                    signals=signals,
                 )
             )
             # Children hang off this candidate, not off whatever is above it.
@@ -942,13 +1105,28 @@ def scan(
         # warning order does, and a scan that reports its problems in a different
         # sequence each run is not reproducible.
         for name in reversed(contents.subdirs):
+            child_path = os.path.join(frame.path, name)
+            # Gitignored is pruned, with the same one-directional precedence as
+            # PRUNE_DIRS: an ignored directory is never pushed, so it is never
+            # entered and never classified — a .git inside cannot rescue it.
+            if layers and _ignored(child_path, is_dir=True, layers=layers):
+                continue
             stack.append(
                 _Frame(
-                    path=os.path.join(frame.path, name),
+                    path=child_path,
                     depth=frame.depth + 1,
                     parent_path=parent_path,
                     inside_package=inside_package,
+                    ignores=layers,
                 )
             )
+
+    # Members arrive by name rather than by walking, so they get the pruning
+    # judgement the walk applied structurally: a member inside a gitignored
+    # directory is inside a tree the project already disowned.
+    if gitignore_specs:
+        members = [
+            path for path in members if not _ignored_by_tree(path, root_path, gitignore_specs)
+        ]
 
     return CandidateTree.build(root_path, _with_members(candidates, members, root_path), warnings)

@@ -265,6 +265,7 @@ class TestPruning:
             "venv",
             ".venv",
             "__pycache__",
+            "DerivedData",
         ],
     )
     def test_a_pruned_directory_carrying_a_manifest_is_still_pruned(
@@ -293,6 +294,104 @@ class TestPruning:
         _make(tmp_path, "app/.git/modules/sub/package.json")
 
         assert _relative_paths(scan(tmp_path), tmp_path) == ["app"]
+
+
+class TestGitignorePruning:
+    """The project's own ``.gitignore`` prunes with the same precedence as names.
+
+    The shape that motivated this is Xcode/SwiftPM: ``tmp/derived_data/
+    SourcePackages/checkouts/`` holds every dependency as a full git clone, so
+    each carries the strongest (repository) signal while being exactly what the
+    project's ``.gitignore`` already disowns.
+    """
+
+    def test_a_gitignored_dependency_store_of_git_clones_is_pruned(
+        self, tmp_path: Path
+    ) -> None:
+        _make(
+            tmp_path,
+            "tmp/derived_data/SourcePackages/checkouts/Alamofire/.git/",
+            "tmp/derived_data/SourcePackages/checkouts/BigInt/.git/",
+            "Sources/App/.git/",
+        )
+        (tmp_path / ".gitignore").write_text("tmp/\n", encoding="utf-8")
+
+        assert _relative_paths(scan(tmp_path), tmp_path) == ["Sources/App"]
+
+    def test_without_the_gitignore_the_same_clones_are_offered(self, tmp_path: Path) -> None:
+        # The control that keeps the test above honest: the clones DO carry the
+        # strongest signal, and only the .gitignore removes them.
+        _make(
+            tmp_path,
+            "tmp/derived_data/SourcePackages/checkouts/Alamofire/.git/",
+            "Sources/App/.git/",
+        )
+
+        assert "tmp/derived_data/SourcePackages/checkouts/Alamofire" in _relative_paths(
+            scan(tmp_path), tmp_path
+        )
+
+    def test_negation_re_includes_a_sibling(self, tmp_path: Path) -> None:
+        _make(tmp_path, "vendor/keep/.git/", "vendor/other/.git/")
+        (tmp_path / ".gitignore").write_text("vendor/*\n!vendor/keep\n", encoding="utf-8")
+
+        assert _relative_paths(scan(tmp_path), tmp_path) == ["vendor/keep"]
+
+    def test_a_nested_gitignore_prunes_only_its_own_subtree(self, tmp_path: Path) -> None:
+        _make(tmp_path, "a/sub/.git/", "b/sub/.git/")
+        (tmp_path / "a" / ".gitignore").write_text("sub/\n", encoding="utf-8")
+
+        assert _relative_paths(scan(tmp_path), tmp_path) == ["b/sub"]
+
+    def test_a_gitignore_above_the_scan_root_has_no_effect(self, tmp_path: Path) -> None:
+        # The scanner never reads outside the tree the user pointed at, so a
+        # parent directory's exclusions are invisible by construction.
+        _make(tmp_path, "repo/pkg/.git/")
+        (tmp_path / ".gitignore").write_text("pkg/\n", encoding="utf-8")
+
+        assert _relative_paths(scan(tmp_path / "repo"), tmp_path / "repo") == ["pkg"]
+
+    def test_an_ignored_manifest_is_no_signal_and_no_declaration(self, tmp_path: Path) -> None:
+        # `generated/` holds a package.json that both signals a package and
+        # declares members; ignoring the FILE (not the directory) must silence
+        # both roles while the directory itself stays walkable.
+        _make(tmp_path, "generated/lib/.git/", "app/.git/")
+        (tmp_path / "generated" / "package.json").write_text(
+            '{"workspaces": ["member"]}', encoding="utf-8"
+        )
+        (tmp_path / "generated" / "member").mkdir()
+        (tmp_path / ".gitignore").write_text("generated/package.json\n", encoding="utf-8")
+
+        paths = _relative_paths(scan(tmp_path), tmp_path)
+        assert "generated" not in paths  # no manifest signal
+        assert "generated/member" not in paths  # no declaration read
+        assert set(paths) == {"app", "generated/lib"}  # the subtree still walks
+
+    def test_a_declared_member_inside_an_ignored_directory_is_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        # Members arrive by name rather than by walking, so they need the same
+        # judgement: a root declaration naming a directory the project has
+        # disowned must not resurrect it.
+        _make(tmp_path, "app/.git/", "out/pkg/")
+        (tmp_path / "package.json").write_text(
+            '{"workspaces": ["out/pkg"]}', encoding="utf-8"
+        )
+        (tmp_path / ".gitignore").write_text("out/\n", encoding="utf-8")
+
+        assert "out/pkg" not in _relative_paths(scan(tmp_path), tmp_path)
+
+    def test_an_unreadable_gitignore_costs_the_layer_not_the_scan(
+        self, tmp_path: Path
+    ) -> None:
+        # Same recovery rule as declarations: the file is refused with a warning
+        # and the scan continues as if it were absent (oversized = unreadable).
+        _make(tmp_path, "tmp/pkg/.git/", "app/.git/")
+        (tmp_path / ".gitignore").write_text("tmp/\n" + "#" * (512 * 1024), encoding="utf-8")
+
+        tree = scan(tmp_path)
+        assert set(_relative_paths(tree, tmp_path)) == {"app", "tmp/pkg"}
+        assert any(".gitignore" in warning for warning in tree.warnings)
 
 
 class TestSymlinks:
