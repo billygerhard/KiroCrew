@@ -467,8 +467,12 @@ describe('the resolved read beside the document', () => {
     stub({})
     await openConfig()
     const table = await screen.findByRole('table')
+    // Prose leads but the path stays in the accessible name: a screen reader
+    // hears exactly which stored node the click deletes, same as the eye sees.
     const clear = await within(table).findByRole('button', {
-      name: T.clear_node.replace('{{path}}', 'cost_profiles.thrifty.roles.review'),
+      name:
+        T.clear_the_role_assignment.replace('{{role}}', 'review') +
+        ' cost_profiles.thrifty.roles.review',
     })
     fireEvent.click(clear)
     await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
@@ -677,12 +681,13 @@ describe('the projects table', () => {
       screen.getByText(T.resolved_for_project.replace('{{project}}', 'widgets')),
     ).toBeInTheDocument()
     // The value and its origin scope on the same entry: a value without its
-    // origin cannot answer whether somebody chose it or the app ships it.
-    expect(key.nextElementSibling).toHaveTextContent('12')
-    expect(key.nextElementSibling).toHaveTextContent(T.origin_project_config)
-    expect(key.nextElementSibling).toHaveTextContent(
-      'projects.widgets.budget.run_credit_ceiling',
-    )
+    // origin cannot answer whether somebody chose it or the app ships it. The
+    // key text may sit inside the term's fallback span, so the entry is reached
+    // from the enclosing term rather than assumed to be the text's own sibling.
+    const entry = key.closest('dt')?.nextElementSibling
+    expect(entry).toHaveTextContent('12')
+    expect(entry).toHaveTextContent(T.origin_project_config)
+    expect(entry).toHaveTextContent('projects.widgets.budget.run_credit_ceiling')
     expect(
       calls.some(
         (call) => call.url === '/api/apps/spec-engine/config/resolved?project=widgets',
@@ -938,5 +943,26 @@ describe('the key-value list', () => {
   it('contains a key that outgrows its column instead of painting under the value', () => {
     const css = SE_CSS.replace(/\s+/g, '')
     expect(css).toContain('dl.se-kv dt{color:var(--muted);overflow-wrap:anywhere}'.replace(/\s+/g, ''))
+  })
+
+  /* Both halves of the work-area split scroll their own overflow. The split is
+   * a grid with overflow:hidden, and a grid item's automatic minimum size is
+   * its content — without min-height:0 the columns grow past the pane and the
+   * overflow:auto bodies inside them never engage, clipping the settings list
+   * with no way to reach the rest. Another geometric fact jsdom cannot see. */
+  it('lets both work-area columns shrink so their own scrollbars engage', () => {
+    const css = SE_CSS.replace(/\s+/g, '')
+    expect(css).toContain('.se-inspector{display:flex;flex-direction:column;min-width:0;min-height:0')
+    expect(css).toContain('min-width:0;min-height:0}'.replace(/\s+/g, ''))
+    expect(/\.se-list\{[^}]*min-height:0/.test(css)).toBe(true)
+  })
+
+  it('leads with the human label and keeps the registry key as the detail line', async () => {
+    stub({})
+    await openConfig()
+    const label = await screen.findByText(T.setting_labels.limits_task_retry_limit)
+    // The key stays on screen inside the same term: it is what the document
+    // and the write log speak, demoted to detail rather than removed.
+    expect(label.closest('dt')).toHaveTextContent('limits.task_retry_limit')
   })
 })

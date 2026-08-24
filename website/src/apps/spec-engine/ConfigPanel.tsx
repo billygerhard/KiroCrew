@@ -129,6 +129,54 @@ const ORIGIN_KEY: Record<EffectiveSetting['origin'], string> = {
   source_config: 'apps.specEngine.configPanel.origin_source_config',
 }
 
+/**
+ * Human label per registry setting key, as whole literal catalog keys so the
+ * key-reference gate can resolve every entry. The registry key itself stays on
+ * screen as the detail line — it is what the document and the write log speak —
+ * but prose leads. A key absent here is NOT an error: the axes belong to the
+ * engine, and a setting added to its registry renders by key until a label is
+ * added, rather than hiding or crashing.
+ */
+const SETTING_LABEL_KEY: Record<string, string> = {
+  'concurrency.global_max_runs':
+    'apps.specEngine.configPanel.setting_labels.concurrency_global_max_runs',
+  'concurrency.project_max_runs':
+    'apps.specEngine.configPanel.setting_labels.concurrency_project_max_runs',
+  'concurrency.wave_max_tasks':
+    'apps.specEngine.configPanel.setting_labels.concurrency_wave_max_tasks',
+  'limits.task_retry_limit': 'apps.specEngine.configPanel.setting_labels.limits_task_retry_limit',
+  'limits.revision_cycle_limit':
+    'apps.specEngine.configPanel.setting_labels.limits_revision_cycle_limit',
+  'limits.verify_retry_limit':
+    'apps.specEngine.configPanel.setting_labels.limits_verify_retry_limit',
+  'timeouts.authoring_s': 'apps.specEngine.configPanel.setting_labels.timeouts_authoring_s',
+  'timeouts.awaiting_review_s':
+    'apps.specEngine.configPanel.setting_labels.timeouts_awaiting_review_s',
+  'timeouts.executing_s': 'apps.specEngine.configPanel.setting_labels.timeouts_executing_s',
+  'timeouts.delivering_s': 'apps.specEngine.configPanel.setting_labels.timeouts_delivering_s',
+  'timeouts.stage_command_s':
+    'apps.specEngine.configPanel.setting_labels.timeouts_stage_command_s',
+  'timeouts.capability_s': 'apps.specEngine.configPanel.setting_labels.timeouts_capability_s',
+  'timeouts.analysis_job_s': 'apps.specEngine.configPanel.setting_labels.timeouts_analysis_job_s',
+  'timeouts.poll_command_s': 'apps.specEngine.configPanel.setting_labels.timeouts_poll_command_s',
+  'budget.run_ceiling_credits':
+    'apps.specEngine.configPanel.setting_labels.budget_run_ceiling_credits',
+  'budget.warn_fraction': 'apps.specEngine.configPanel.setting_labels.budget_warn_fraction',
+  'watch.interval_s': 'apps.specEngine.configPanel.setting_labels.watch_interval_s',
+  'delivery.auto_integrate':
+    'apps.specEngine.configPanel.setting_labels.delivery_auto_integrate',
+  'delivery.review_feedback_enabled':
+    'apps.specEngine.configPanel.setting_labels.delivery_review_feedback_enabled',
+  'notify.channel': 'apps.specEngine.configPanel.setting_labels.notify_channel',
+  'telemetry.enabled': 'apps.specEngine.configPanel.setting_labels.telemetry_enabled',
+}
+
+/** The translated label for a registry key, or `''` for one no label names. */
+function settingLabel(key: string): string {
+  const catalogKey = SETTING_LABEL_KEY[key]
+  return catalogKey ? i18nT(catalogKey) : ''
+}
+
 /** The refusal code behind an error, or `''` when it is not one of ours. */
 function codeOf(error: unknown): string {
   return error instanceof SpecEngineApiError ? error.code : ''
@@ -1368,9 +1416,11 @@ function RoleRow({
             disabled={resetting}
             onClick={() => onReset(segments)}
           >
-            {/* Named with the node it clears, so nobody clears a profile believing
-                they cleared something narrower. */}
-            {i18nT('apps.specEngine.configPanel.clear_node', { path })}
+            {/* Prose leads, but the node it clears stays in the button itself as
+                the detail line, so nobody clears a profile believing they cleared
+                something narrower — the path is part of the accessible name. */}
+            {i18nT('apps.specEngine.configPanel.clear_the_role_assignment', { role: role.role })}
+            <span className="se-btn-detail">{path}</span>
           </button>
         ) : (
           <button
@@ -1585,19 +1635,38 @@ function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: st
                 </p>
               ) : (
                 <dl className="se-kv">
-                  {shownSettings.map((value) => (
-                    <Fragment key={value.key}>
-                      <dt className="se-m">{value.key}</dt>
-                      <dd>
-                        {settingValue(value.value)}
-                        <span className="se-note">
-                          {SEP}
-                          {i18nT(ORIGIN_KEY[value.origin])}
-                          {value.declared_at ? `${SEP}${value.declared_at}` : ''}
-                        </span>
-                      </dd>
-                    </Fragment>
-                  ))}
+                  {shownSettings.map((value) => {
+                    const label = settingLabel(value.key)
+                    return (
+                      <Fragment key={value.key}>
+                        {/* Prose leads and the registry key follows as the detail
+                            line: the key is what the document and the write log
+                            speak, so it stays visible, but a reader should not
+                            need to think in registry keys to scan the list. A key
+                            without a label renders as it always has — the axes
+                            are the engine's, and a setting added there must show
+                            up here without a frontend edit. */}
+                        <dt>
+                          {label ? (
+                            <>
+                              {label}
+                              <span className="se-kv-path">{value.key}</span>
+                            </>
+                          ) : (
+                            <span className="se-m">{value.key}</span>
+                          )}
+                        </dt>
+                        <dd>
+                          {settingValue(value.value)}
+                          <span className="se-note">
+                            {SEP}
+                            {i18nT(ORIGIN_KEY[value.origin])}
+                            {value.declared_at ? `${SEP}${value.declared_at}` : ''}
+                          </span>
+                        </dd>
+                      </Fragment>
+                    )
+                  })}
                 </dl>
               )}
               <p className="se-note">

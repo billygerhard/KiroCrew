@@ -85,7 +85,7 @@ export const SE_CSS = `
    never re-flows the reader's mental map. */
 .se-work{grid-area:work;display:grid;grid-template-columns:minmax(0,1.35fr) minmax(360px,1fr);
   min-height:0;overflow:hidden}
-.se-list{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0}
+.se-list{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0}
 .se-list-head{display:flex;align-items:center;gap:10px;padding:9px 14px;
   border-bottom:1px solid var(--border);background:var(--chrome)}
 .se-list-head h1{font-size:13px}
@@ -135,7 +135,7 @@ export const SE_CSS = `
 .se-empty{padding:22px 14px;color:var(--muted);font-size:12.5px}
 
 /* Inspector: a fixture of the layout. No summon, no dismiss, nothing to close. */
-.se-inspector{display:flex;flex-direction:column;min-width:0;background:var(--panel)}
+.se-inspector{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--panel)}
 .se-insp-head{padding:9px 14px;border-bottom:1px solid var(--border);background:var(--chrome)}
 .se-insp-title{font-size:13.5px;font-weight:600;color:var(--text-strong);display:block;
   overflow-wrap:anywhere}
@@ -168,6 +168,10 @@ export const SE_CSS = `
 .se-acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 dl.se-kv{display:grid;grid-template-columns:118px minmax(0,1fr);gap:4px 10px;margin:0;font-size:12px}
 dl.se-kv dt{color:var(--muted);overflow-wrap:anywhere}
+.se-kv-path{display:block;font-family:var(--mono);font-size:10px;color:var(--muted);
+  overflow-wrap:anywhere}
+.se-btn-detail{display:block;font-family:var(--mono);font-size:10px;font-weight:400;
+  color:var(--muted);overflow-wrap:anywhere}
 dl.se-kv dd{margin:0;font-family:var(--mono);color:var(--text-strong);overflow-wrap:anywhere}
 
 /* Row-level state words. One class per meaning, keyed by a data attribute rather
