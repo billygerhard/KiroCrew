@@ -20,11 +20,19 @@ sweep. The review gate runs between waves.
   come from `watch_source_presets()` deep copies carrying no `enabled` key;
   `WATCH_SOURCE_PRESET_PROGRAMS` derives each preset's program from its own
   argv; the write door validates argv shape only.
+- **Carried from 1.1 (contract facts for 2.1–5.1):** the registry route is
+  `GET {PREFIX}/config/registry`; source preset host keys are the bundled
+  table's own (`github`, `gitlab`), NOT domain names — type from the payload.
+- **Carried from 1.1's review (for 3.1 and 6.1):** `Setting.choices` is not
+  projected (every shipped setting has it empty). 3.1's unknown-kind fallback
+  must also treat a str setting as free-text-safe only because no shipped
+  setting declares choices; if one ever does, the vocabulary and the form gain
+  the choices arm together. Disposition in 6.1.
 
 ## Tasks
 
-- [ ] 1. Vocabulary read
-  - [ ] 1.1 Registry route projecting the engine's form vocabularies
+- [x] 1. Vocabulary read
+  - [x] 1.1 Registry route projecting the engine's form vocabularies
     - Add `GET {PREFIX}/config/registry` to `backend/routes.py` through the `_read` guard; module posture note updated (bundled vocabulary only, no stored values).
     - Project the setting registry (key, kind name, default, minimum, maximum, permitted scope names, summary) from `engine/config/settings.py`.
     - Project the bundled source presets (host, program from `WATCH_SOURCE_PRESET_PROGRAMS`, the deep-copied entry from `watch_source_presets`) and the cost-profile preset names, role names, and level names from their owning modules.

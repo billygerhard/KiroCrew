@@ -657,7 +657,7 @@ async def handle_get_resolved_config(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
-# --- the form vocabulary ------------------------------------------------------
+# --- the form vocabulary ----------------------------------------------------
 
 
 def _setting_vocabulary(setting: Setting) -> dict[str, Any]:
@@ -740,6 +740,9 @@ async def handle_get_config_registry(request: web.Request) -> web.Response:
     exceptions this code cannot raise.
     """
     return web.json_response(_registry_payload())
+
+
+# --- the per-source autonomy grid --------------------------------------------
 
 
 #: The pair's OWN stored cell answered it.
