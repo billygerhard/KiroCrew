@@ -41,6 +41,24 @@ sweep. The review gate runs between waves.
   must also treat a str setting as free-text-safe only because no shipped
   setting declares choices; if one ever does, the vocabulary and the form gain
   the choices arm together. Disposition in 6.1.
+- **Carried from 3.1's review (design gap, disposition in 6.1):** the settings
+  form's resolved read is taken without the `source` query parameter the route
+  accepts, so a source-scoped row shows the app/project resolution while its
+  write targets `sources.<name>.…`. The review sentence's wording stays honest
+  (it never claims the shown value is stored at the target path), but
+  `storedAt()` cannot withdraw a no-op re-entry of a source's own stored
+  value. Design-conformant ("the existing resolved read"), so the fix belongs
+  to the design, not this task.
+- **Fixed post-review (orchestrator, 3.1):** the watch-source picker is now
+  gated on some rendered setting permitting source scope, not on sources
+  merely existing; pinned by "offers the source picker only while a setting
+  can be written at source scope" (mutation-probed).
+- **Dispositioned (3.1, no code change):** an int row stages `Number(raw)`
+  verbatim, so a browser-reported fractional entry reaches the write door and
+  is refused as "expected an integer" by path. Left as-is deliberately: the
+  row's own comment already argues bounds live in the registry/door rather
+  than restated frontend copies that can drift, and the refusal is honest and
+  path-addressed. Same disposition class as the door's shape-only validation.
 
 ## Tasks
 
@@ -54,8 +72,8 @@ sweep. The review gate runs between waves.
     - Hypothesis property: every projected source preset's `poll` argv is byte-equal to the bundled table's (backend half of Property 3).
     - _Requirements: 2.1, 4.1, 4.2_
 
-- [ ] 2. Pane restructure and shared machinery
-  - [ ] 2.1 Forms lead, JSON on request, staged edits and the shared review card
+- [x] 2. Pane restructure and shared machinery
+  - [x] 2.1 Forms lead, JSON on request, staged edits and the shared review card
     - Restructure `ConfigPanel.tsx`: forms surface renders by default with the document editor (including its problems/advisories rendering) behind one explicit toggle control; opening it provides today's full editor behavior.
     - `buildFormPatch` in `configDocument.ts` generalizing `buildGridPatch`: staged `(segments, value | DELETE)` edits to a minimal nested patch, `DELETE` mapping to JSON `null`, prototype-safe containers.
     - `FormReview` generalizing `GridReview`: literal pretty-printed patch, one sentence per staged change from a caller-supplied sentence renderer, confirm through the existing `writeConfig`, refusals verbatim by path with stored state retained (no invalidation on failure), success invalidates config + resolved + sources queries.
@@ -64,8 +82,8 @@ sweep. The review gate runs between waves.
     - Vitest: JSON never rendered unbidden, the toggle opens the full editor, fresh-read refresh both directions, failed-read doubt state; strings in all 13 catalogs.
     - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 5.1, 5.2, 5.3, 5.4, 5.5_
 
-- [ ] 3. Settings form
-  - [ ] 3.1 Registry-generated typed settings editing
+- [x] 3. Settings form
+  - [x] 3.1 Registry-generated typed settings editing
     - Rows generated from the registry payload: control kind by registry `kind` (numeric with bounds, boolean toggle idiom, text), registry `summary` as help text, `SETTING_LABEL_KEY` labels leading with the key as detail line.
     - Scope offering limited to the setting's permitted scopes; project/source scope writes target the correct nested path.
     - In-force value + origin beside each control from the existing resolved read; staged edits visibly distinct from stored.

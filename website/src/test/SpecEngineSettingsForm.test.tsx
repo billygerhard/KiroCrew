@@ -33,7 +33,7 @@
  * `SpecEngineSettingsForm.property.test.tsx`.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
@@ -502,6 +502,25 @@ describe('the scope a write targets', () => {
     review()
     confirm()
     await waitFor(() => expect(putPatch()).toEqual({ sources: { gh: { watch: { interval_s: 600 } } } }))
+  })
+
+  it('offers the source picker only while a setting can be written at source scope', async () => {
+    // The picker chooses where source-scoped writes land, so it is gated on the
+    // registry rather than on sources merely existing: on a vocabulary with no
+    // source-scoped setting it would be a chooser that targets nothing.
+    await openRows()
+    expect(
+      within(block()).getByRole('group', { name: T.select_a_watch_source_to_write_at }),
+    ).toBeInTheDocument()
+    cleanup()
+    const vocabulary = registry()
+    vocabulary.settings = vocabulary.settings.filter(
+      (setting) => !setting.scopes.includes('source'),
+    )
+    await openRows({ registry: { body: vocabulary } })
+    expect(
+      within(block()).queryByRole('group', { name: T.select_a_watch_source_to_write_at }),
+    ).not.toBeInTheDocument()
   })
 
   it('moves a staged value with the scope, leaving one path in the patch', async () => {

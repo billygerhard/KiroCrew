@@ -1472,6 +1472,10 @@ function SettingsForm({ project }: { project: string }) {
   // write target nobody re-read.
   const names = sources.isError ? [] : (sources.data?.sources.map((entry) => entry.name) ?? [])
   const sourceTarget = names.includes(source) ? source : (names[0] ?? '')
+  // Whether ANY rendered setting can be written at source scope. The picker
+  // chooses where source-scoped writes land, so on a vocabulary with no such
+  // setting it would be a chooser that targets nothing.
+  const sourceScoped = settings.some((setting) => setting.scopes.includes(SCOPE_SOURCE))
   const fields = useMemo(
     () => settingFields(settings, inForce, { project, source: sourceTarget }, scopeChosen),
     [settings, inForce, project, sourceTarget, scopeChosen],
@@ -1595,7 +1599,7 @@ function SettingsForm({ project }: { project: string }) {
         <p className="se-note">{i18nT('apps.specEngine.settingsForm.no_setting_is_registered')}</p>
       ) : (
         <>
-          {names.length > 0 && (
+          {sourceScoped && names.length > 0 && (
             <div
               className="se-acts"
               role="group"
