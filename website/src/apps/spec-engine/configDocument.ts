@@ -16,6 +16,10 @@
  * shows a change that did not happen. {@link mergePatch} computes the patch from the
  * baseline instead, and a removed key becomes an explicit `null`.
  *
+ * A form does not diff a baseline — it stages the values an operator touched — so the
+ * same rule reaches it through {@link DELETE}: a staged removal is a sentinel that
+ * {@link buildFormPatch} writes out as that `null`, and nothing else ever emits one.
+ *
  * ## 2. An elided value must never be written back
  *
  * The read withholds credential-classified values, replacing each with a marker it
@@ -53,6 +57,9 @@
 
 /** Section holding the cost profiles, whose role assignments live under it. */
 export const COST_PROFILES = 'cost_profiles'
+
+/** Section holding the per-project entries. */
+export const PROJECTS = 'projects'
 
 /** Key holding the role assignments inside a profile object. */
 export const ROLES_KEY = 'roles'
@@ -161,42 +168,108 @@ export function sameCell(one: GridCellRef, other: GridCellRef): boolean {
 }
 
 /**
+ * The staged value that REMOVES the key at its path instead of storing something.
+ *
+ * A symbol rather than `null`, because `null` is a value a document may legitimately
+ * hold: a sentinel spelled `null` could not tell "store null here" from "delete this
+ * key", and the two are opposite writes. A symbol also cannot survive
+ * `JSON.stringify`, so it cannot reach the wire by accident —
+ * {@link buildFormPatch} is the only thing that translates it, and the `null` it
+ * emits is the store's own deletion spelling.
+ */
+export const DELETE = Symbol('remove the key at this path')
+
+/**
+ * One value an operator has changed on a form and not yet written.
+ *
+ * Segments rather than a dotted key, for rule 3 above: a profile or source name may
+ * hold a dot, and no split of the rendered path recovers the names.
+ *
+ * The stored value being replaced is deliberately NOT carried here, for
+ * {@link PendingEdit}'s reason: the review reads what is in force from the current
+ * answer, so a change landing from another surface while an edit sits unwritten
+ * cannot leave a sentence describing a value nobody holds any more.
+ */
+export interface StagedEdit {
+  /** The document path this edit addresses, one segment per name. */
+  readonly segments: readonly string[]
+  /** The value to store, or {@link DELETE} to remove the key. */
+  readonly value: unknown
+}
+
+/**
  * The minimal merge patch that stores *edits* and touches nothing else.
  *
- * Every leaf is a cell's own level at `sources.<name>.autonomy.<class>.<type>`, so
- * the store's merge — nested objects merged key by key — leaves every other path in
- * the document exactly as it was. That is what makes a grid edit provably isolated
- * from every other source, every other cell, and every unrelated setting: the
- * isolation is a property of the patch's shape rather than of care taken at the
- * call site, which is why this is a pure function with a property test on it.
+ * Every leaf is one staged edit's own path, so the store's merge — nested objects
+ * merged key by key — leaves every other path in the document exactly as it was.
+ * That is what makes a form write provably isolated from every value the operator
+ * did not touch: the isolation is a property of the patch's SHAPE rather than of
+ * care taken at the call site, which is why this is a pure function with a property
+ * test on it.
+ *
+ * A {@link DELETE} becomes an explicit `null`, which is how the store deletes. Note
+ * what that means for a path whose parent is not stored: the merge creates the
+ * parent and then removes nothing from it, leaving an empty container behind. So a
+ * caller stages a deletion for a value that exists, which is what a form does — it
+ * removes something it is displaying.
+ *
+ * Two edits sharing a prefix share that container rather than the second replacing
+ * the first, and a second edit to one path wins over the first: an operator's last
+ * choice is the one they are about to read in the review. Paths are expected to be
+ * pairwise non-overlapping — a form stages leaves — and when one edit's path lies
+ * INSIDE another's the later edit wins whole, dropping the earlier. A caller that
+ * staged both would be describing two changes the write cannot both carry.
+ *
+ * Containers are created prototype-less, and only a container this function made is
+ * descended into. Both halves matter and for different reasons. A name of
+ * `__proto__` would otherwise hit `Object.prototype`'s setter — the assignment would
+ * set a prototype instead of creating a key, the patch would serialize without that
+ * edit, and the review card would show a change the write then did not carry. And
+ * descending into a value a CALLER staged would mutate the caller's own object while
+ * building a patch of it. Silent loss of an edit is the one failure this surface
+ * must not have.
+ */
+export function buildFormPatch(edits: readonly StagedEdit[]): Document {
+  const patch = emptyContainer()
+  // Only these are safe to descend into: see the prototype note above.
+  const built = new WeakSet<Document>([patch])
+  for (const edit of edits) {
+    if (edit.segments.length === 0) {
+      throw new Error('a staged edit needs at least one segment to address')
+    }
+    let node = patch
+    for (const segment of edit.segments.slice(0, -1)) {
+      const child = node[segment]
+      if (isObject(child) && built.has(child)) {
+        node = child
+        continue
+      }
+      const fresh = emptyContainer()
+      built.add(fresh)
+      node[segment] = fresh
+      node = fresh
+    }
+    node[edit.segments[edit.segments.length - 1]] = edit.value === DELETE ? null : edit.value
+  }
+  return patch
+}
+
+/**
+ * The minimal merge patch that stores a set of grid choices.
+ *
+ * One cell's own level at `sources.<name>.autonomy.<class>.<type>`, through
+ * {@link buildFormPatch} — the same mechanism every form write uses, so the grid's
+ * isolation and a form's are one property with one proof rather than two builders
+ * that can drift.
  *
  * A wildcard cell is never a target. An edit on a pair a broader rule answered
  * writes the pair's OWN cell, leaving the broader rule in place for the pairs it
  * still answers — modifying the wildcard would change cells nobody was looking at.
- *
- * Two edits inside one source share that source's object rather than the second
- * replacing the first, and a second edit to one cell wins over the first: an
- * operator's last choice is the one they are about to read in the review.
- *
- * Containers are created prototype-less. A source, class or type named
- * `__proto__` would otherwise hit `Object.prototype`'s setter — the assignment
- * would set a prototype instead of creating a key, the patch would serialize
- * without that edit, and the review card would show a change the write then did
- * not carry. Silent loss of an edit is the one failure this surface must not have.
  */
 export function buildGridPatch(edits: readonly PendingEdit[]): Document {
-  const patch = emptyContainer()
-  for (const edit of edits) {
-    const segments = gridCellSegments(edit)
-    let node = patch
-    for (const segment of segments.slice(0, -1)) {
-      const child = node[segment]
-      if (!isObject(child)) node[segment] = emptyContainer()
-      node = node[segment] as Document
-    }
-    node[segments[segments.length - 1]] = edit.level
-  }
-  return patch
+  return buildFormPatch(
+    edits.map((edit) => ({ segments: gridCellSegments(edit), value: edit.level })),
+  )
 }
 
 /** A container for patch nesting, with no prototype to shadow a key. */

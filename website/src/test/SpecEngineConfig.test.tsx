@@ -230,7 +230,13 @@ function stub(answers: {
   )
 }
 
-/** Render the page and switch to the configuration pane. */
+/**
+ * Render the page and switch to the configuration pane.
+ *
+ * Waits on the projects table rather than on the editor, because the pane leads
+ * with the forms: the JSON view is not rendered until {@link openJson} asks for
+ * it, which is the property `SpecEngineFormSurface.test.tsx` asserts.
+ */
 async function openConfig() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -242,6 +248,12 @@ async function openConfig() {
   )
   const nav = await screen.findByRole('button', { name: new RegExp(P.configuration) })
   fireEvent.click(nav)
+  return screen.findByText(T.projects)
+}
+
+/** Open the JSON view, returning its save control. */
+async function openJson() {
+  fireEvent.click(screen.getByRole('button', { name: T.open_the_json_view }))
   return screen.findByRole('button', { name: T.validate_and_save })
 }
 
@@ -358,7 +370,8 @@ describe('paths are segments, not dotted strings', () => {
 describe('the document editor', () => {
   it('sends a patch, with a deletion spelled as null', async () => {
     stub({})
-    const save = await openConfig()
+    await openConfig()
+    const save = await openJson()
     const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
     const edited = document() as Record<string, unknown>
     delete (edited.limits as Record<string, unknown>).task_retry_limit
@@ -374,7 +387,8 @@ describe('the document editor', () => {
 
   it('sends nothing when the document matches what is saved', async () => {
     stub({})
-    const save = await openConfig()
+    await openConfig()
+    const save = await openJson()
     fireEvent.click(save)
     expect(await screen.findByText(T.nothing_to_save)).toBeInTheDocument()
     expect(calls.some((call) => call.method === 'PUT')).toBe(false)
@@ -382,7 +396,8 @@ describe('the document editor', () => {
 
   it('refuses invalid JSON locally, before any request', async () => {
     stub({})
-    const save = await openConfig()
+    await openConfig()
+    const save = await openJson()
     const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
     fireEvent.change(editor, { target: { value: '{ "a": ' } })
     fireEvent.click(save)
@@ -398,7 +413,8 @@ describe('the document editor', () => {
         body: { code: 'config_invalid', error: 'limits.task_retry_limit: must be at least 1' },
       },
     })
-    const save = await openConfig()
+    await openConfig()
+    const save = await openJson()
     const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
     fireEvent.change(editor, {
       target: { value: JSON.stringify({ limits: { task_retry_limit: -1 } }, null, 2) },
@@ -430,7 +446,8 @@ describe('the document editor', () => {
         },
       },
     })
-    const save = await openConfig()
+    await openConfig()
+    const save = await openJson()
     const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
     fireEvent.change(editor, { target: { value: JSON.stringify({ limits: {} }, null, 2) } })
     fireEvent.click(save)
@@ -444,6 +461,7 @@ describe('the document editor', () => {
   it('says a withheld value can be overwritten but never redisplayed', async () => {
     stub({})
     await openConfig()
+    await openJson()
     expect(screen.getByText(P.secret_values_are_withheld_from_this_read)).toBeInTheDocument()
     expect(screen.getByText(T.elided_values_are_never_written_back)).toBeInTheDocument()
     expect(screen.getByText(T.deletions_are_sent_as_explicit_nulls)).toBeInTheDocument()
@@ -906,7 +924,9 @@ describe('the projects table', () => {
     fireEvent.click(removeButton('widgets'))
     expect(confirmButton('widgets')).toBeInTheDocument()
 
-    const editor = screen.getByRole('textbox', { name: T.the_configuration_document })
+    const editor = await openJson().then(() =>
+      screen.getByRole('textbox', { name: T.the_configuration_document }),
+    )
     fireEvent.change(editor, { target: { value: JSON.stringify(withoutWidgets(), null, 2) } })
     fireEvent.click(screen.getByRole('button', { name: T.validate_and_save }))
     await waitFor(() => expect(rows()).toHaveLength(2))

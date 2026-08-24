@@ -20,6 +20,13 @@ document, and a re-implementation here would prove a merge nobody runs — and
 asserts that every other path in the document survives the merge unchanged, in
 both directions: nothing else altered, nothing else added, nothing else dropped.
 
+**A minimal DELETION patch removes only the key it names.** A form removes a
+stored value by staging it for deletion, and the patch builder writes that as the
+``null`` the merge deletes on. Omitting the key instead would leave the old value
+in place while the surface reported a removal, so the deletion form is asserted
+against the same real ``_merge``: the named key is gone and every path outside it
+survives untouched, whether the key held a scalar or a whole subtree.
+
 **A projected source preset carries only the bundled argv.** The form-vocabulary
 read hands a surface the entry a new Watch_Source is composed from, and its
 ``poll`` is argv the engine will execute. So for every bundled preset the
@@ -206,10 +213,8 @@ _SOURCE_CONTENT = _CONTENT.map(
 
 
 @st.composite
-def _documents_and_edits(
-    draw: st.DrawFn,
-) -> tuple[dict[str, Any], tuple[tuple[str, str, str], ...]]:
-    """A document holding several sources, and cells to edit on some of them."""
+def _documents(draw: st.DrawFn) -> tuple[dict[str, Any], list[str]]:
+    """A document holding several sources, and the names it gave them."""
     names = draw(st.lists(_SOURCE_NAMES, min_size=1, max_size=3, unique=True))
     sources: dict[str, Any] = {}
     for name in names:
@@ -218,6 +223,15 @@ def _documents_and_edits(
             entry[AUTONOMY_FIELD] = draw(_GRIDS)
         sources[name] = entry
     document: dict[str, Any] = {"version": 1, **draw(_CONTENT), SECTION_SOURCES: sources}
+    return document, names
+
+
+@st.composite
+def _documents_and_edits(
+    draw: st.DrawFn,
+) -> tuple[dict[str, Any], tuple[tuple[str, str, str], ...]]:
+    """A document holding several sources, and cells to edit on some of them."""
+    document, names = draw(_documents())
     edits = draw(
         st.lists(
             st.tuples(st.sampled_from(names), _CLASS_KEYS, _TYPE_KEYS),
@@ -325,6 +339,86 @@ def test_a_patched_document_resolves_the_edited_cells_and_no_others_differently(
                     declaring == _cell_path(source, edited_class, edited_type)
                     for edited_class, edited_type in touched
                 ), f"{source}.{submitter_class}.{spec_type} changed on no edit of its own"
+
+
+# --- a deletion patch removes only the key it names ---------------------------
+
+
+@st.composite
+def _documents_and_removals(
+    draw: st.DrawFn,
+) -> tuple[dict[str, Any], tuple[tuple[str, ...], ...]]:
+    """A document, and existing paths inside it staged for removal.
+
+    Paths that EXIST, because that is what a form removes: it deletes something it
+    is displaying. A deletion aimed at an absent nested key is a different shape —
+    the merge creates the parent on the way down and removes nothing from it — and
+    the patch builder's contract says a caller does not stage one.
+    """
+    document, _names = draw(_documents())
+    # Candidate targets at three depths: a whole top-level section, a whole source
+    # entry, and one leaf inside a source. A removal must be isolated whether the
+    # key held a scalar or a subtree, and only the deeper ones exercise the nesting.
+    candidates: list[tuple[str, ...]] = [(key,) for key in document if key != SECTION_SOURCES]
+    for name, entry in document[SECTION_SOURCES].items():
+        candidates.append((SECTION_SOURCES, name))
+        for field in entry:
+            candidates.append((SECTION_SOURCES, name, field))
+    removals = draw(st.lists(st.sampled_from(candidates), min_size=1, max_size=4, unique=True))
+    # Nested inside another removal is dropped: one edit's path never lies inside
+    # another's on a form, and keeping both would make "only the key it names"
+    # ambiguous about which key that is.
+    kept: list[tuple[str, ...]] = []
+    for path in sorted(removals, key=len):
+        if any(path[: len(other)] == other for other in kept):
+            continue
+        kept.append(path)
+    return document, tuple(kept)
+
+
+def _deletion_patch(removals: tuple[tuple[str, ...], ...]) -> dict[str, Any]:
+    """The minimal nested patch a set of staged removals is written as.
+
+    The shape the UI's patch builder produces for its ``DELETE`` sentinel, spelled
+    here from the paths alone: the point of the property is that this shape — and
+    nothing about the client that assembled it — is what bounds the write.
+    """
+    patch: dict[str, Any] = {}
+    for path in removals:
+        node = patch
+        for segment in path[:-1]:
+            node = node.setdefault(segment, {})
+        node[path[-1]] = None
+    return patch
+
+
+@settings(max_examples=MAX_EXAMPLES)
+@given(_documents_and_removals())
+def test_merging_a_deletion_patch_removes_only_the_named_key(
+    case: tuple[dict[str, Any], tuple[tuple[str, ...], ...]],
+) -> None:
+    document, removals = case
+    merged = _merge(document, _deletion_patch(removals))
+
+    for path in removals:
+        node: Any = merged
+        for segment in path[:-1]:
+            assert isinstance(node, Mapping), "a removal's parent must survive it"
+            node = node[segment]
+        assert path[-1] not in node, "the named key survived a patch that deleted it"
+
+    # Everything outside the removed subtrees, in both directions: nothing altered,
+    # nothing added, nothing dropped. Removing one source must not be able to
+    # disturb another's policy, and the merge is what makes that true by
+    # construction rather than by client care.
+    def _outside(leaves: dict[tuple[str, ...], Any]) -> dict[tuple[str, ...], Any]:
+        return {
+            leaf: value
+            for leaf, value in leaves.items()
+            if not any(leaf[: len(path)] == path for path in removals)
+        }
+
+    assert _outside(_leaves(merged)) == _outside(_leaves(document))
 
 
 # --- a projected preset carries only the bundled argv -------------------------

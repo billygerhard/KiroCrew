@@ -37,7 +37,6 @@ import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
 
 const T = en.apps.specEngine.sourcesSection
-const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 
 /** The engine's wildcard key, as it appears inside a declaring path. */
@@ -178,7 +177,13 @@ function stub(answers: {
   return { reads: () => reads }
 }
 
-/** Render the page, switch to the configuration pane, and wait for the section. */
+/** Render the page, switch to the configuration pane, and wait for the section.
+ *
+ * The pane leads with the forms, so there is no editor to wait on: the wait is for
+ * the sources read itself to have landed, which is what the pending note leaving
+ * says. Waiting only for the heading would resolve while the section is still
+ * reading, and the matrix would not be on screen yet.
+ */
 async function openConfig() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -190,8 +195,8 @@ async function openConfig() {
   )
   const nav = await screen.findByRole('button', { name: new RegExp(P.configuration) })
   fireEvent.click(nav)
-  await screen.findByRole('button', { name: C.validate_and_save })
   await screen.findByText(T.watch_sources)
+  await waitFor(() => expect(screen.queryByText(T.reading_the_watch_sources)).toBeNull())
   return { client, ...rendered }
 }
 

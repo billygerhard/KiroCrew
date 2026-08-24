@@ -1,19 +1,30 @@
 /**
- * The configuration pane: the document as the write path, the resolution beside it.
+ * The configuration pane: forms as the write surface, the resolution beside them.
  *
  * Built to `design/mockup-b.html`'s config pane, in the same split the queue uses —
- * the document on the left where the list was, its resolved read on the right where
- * the inspector was.
+ * the stored configuration on the left where the list was, its resolved read on the
+ * right where the inspector was.
+ *
+ * ## Forms lead, and the raw document is on request
+ *
+ * The left pane leads with the surfaces an operator can read and fill as a human,
+ * and the JSON editor sits behind one explicit control. That inversion is the point
+ * of the pane rather than a rearrangement of it: while the document WAS the pane,
+ * changing anything without its own control meant hand-editing JSON, so the raw view
+ * has to remain complete and reachable while no longer being the thing an operator
+ * meets first. Opening it gives the whole editor back, including the engine's
+ * problems and advisories for the persisted document.
  *
  * ## `config.json` is the write path, and there is only one
  *
- * The left pane edits the document and saves it through `PUT /config`, which is
- * `ConfigStore.write`: the engine merges, validates the MERGED document, and
- * persists it atomically under a lock. Every rule an operator can trip — an unknown
- * key, an out-of-range value, a setting written at a scope it is not overridable at
- * — is the engine's, reported back by path, so this panel keeps no validation of its
- * own beyond "is this JSON at all". The right pane writes NOTHING; it is a read, and
- * the only writes it offers are per-role resets that go through the same PUT.
+ * Every edit on this pane — a form, a grid cell, a removal, a per-role reset, a
+ * document save — funnels into `PUT /config`, which is `ConfigStore.write`: the
+ * engine merges, validates the MERGED document, and persists it atomically under a
+ * lock. Every rule an operator can trip — an unknown key, an out-of-range value, a
+ * setting written at a scope it is not overridable at — is the engine's, reported
+ * back by path, so this panel keeps no validation of its own beyond "is this JSON at
+ * all". The right pane writes NOTHING; it is a read, and the only writes it offers
+ * are per-role resets that go through the same PUT.
  *
  * ## Three properties of the write, none of them cosmetic
  *
@@ -86,6 +97,9 @@ import {
 } from './api'
 import {
   COST_PROFILES,
+  DELETE,
+  PROJECTS,
+  buildFormPatch,
   buildGridPatch,
   documentText,
   dotted,
@@ -420,14 +434,8 @@ function raisesLevel(levels: readonly string[], cell: SourceGridCell, level: str
 /**
  * Which sentence describes an edit, keyed by the origin of the cell it replaces.
  *
- * Three sentences rather than one with the origin interpolated, because the three
- * edits are three different acts: replacing a level somebody chose for this pair,
- * NARROWING a broader rule that also answers other pairs, and configuring a pair
- * nothing had answered. The wildcard sentence carries the narrowing statement
- * itself — the write creates this pair's own cell and leaves the broader rule
- * alone — because a separate line repeating the same pair is a line a reader skips.
- *
- * Keys, not resolved strings, for `ORIGIN_KEY`'s reason.
+ * Three sentences rather than one with the origin interpolated; {@link GridReview}
+ * says why. Keys, not resolved strings, for `ORIGIN_KEY`'s reason.
  */
 const EDIT_SENTENCE_KEY: Record<SourceGridCell['origin'], string> = {
   exact: 'apps.specEngine.sourcesSection.edit_replaces_the_pairs_own_level',
@@ -436,23 +444,134 @@ const EDIT_SENTENCE_KEY: Record<SourceGridCell['origin'], string> = {
 }
 
 /**
+ * One staged change as a review card reads it: where it lands, and what it means.
+ *
+ * The sentence is the CALLER's, because only the caller knows what its values mean —
+ * a level replacing a level, a timeout replacing a default, a source entry being
+ * removed. The card owns the shape of the confirmation, never the copy inside it.
+ */
+interface ReviewedChange {
+  /** The dotted path, for display and as the React key. Never parsed back. */
+  path: string
+  /** One plain-language sentence naming the old and the new state. */
+  sentence: string
+}
+
+/**
+ * The copy one form's review card renders with, resolved by its caller.
+ *
+ * Resolved strings rather than catalog keys: every key stays a whole literal at its
+ * own call site, so the key-reference gate can resolve it, and a form whose refusal
+ * or confirm needs to name its own subject can say so.
+ */
+interface FormReviewLabels {
+  /** The card's heading. */
+  heading: string
+  /** The confirm control. */
+  confirm: string
+  /** The confirm control while the write is in flight. */
+  writing: string
+  /** The control that drops every staged change. */
+  discard: string
+  /** The sentence stating a confirm sends exactly the patch above. */
+  exactly: string
+  /** The refusal block's title, when the write door refuses. */
+  refusalTitle: string
+  /** The sentence stating nothing was written, so the surface shows stored state. */
+  retained: string
+}
+
+/**
  * The exact change a confirm would write, before it is written.
  *
- * The patch is shown as the payload itself, pretty-printed: approving a plan means
- * approving what will be written, which is the setup flow's rule and the reason this
- * card exists at all. The sentences beside it are not a second description of the
- * patch — they say what each line MEANS, which the JSON cannot: the level that is in
- * force now, the declaration that put it there, and the level replacing it.
+ * Shared by every form on this pane and by the autonomy grid, because the guarantee
+ * is one guarantee: the patch is shown as the payload ITSELF, pretty-printed, since
+ * approving a plan means approving what will be written — the setup flow's rule and
+ * the reason this card exists at all. The sentences beside it are not a second
+ * description of the patch; they say what each line MEANS, which the JSON cannot.
  *
- * Two consequences get their own statement because neither is legible in the patch:
+ * Three properties belong to the card rather than to any caller:
  *
- * 1. **Raising the least-trusted class.** That class is where an author the engine
- *    cannot classify lands, so a rung granted there is a rung granted to anyone at
- *    all. Nothing in the JSON says which class that is.
- * 2. **Narrowing rather than modifying.** An edit on a pair a broader rule answered
- *    writes the pair's own cell; the broader rule stays, and keeps answering the
- *    pairs it answered before. A reader who assumed the broader rule was being
- *    edited would expect other cells to move, and they do not.
+ * 1. **The patch shown is the patch sent.** The caller hands over one object and
+ *    confirms with the same one, so a rendering cannot drift from a payload.
+ * 2. **A refusal retains stored state.** The engine's reason is rendered by the path
+ *    it names, the staged changes stay put to be corrected, and NOTHING is
+ *    invalidated — so the surface behind the card keeps stating what is persisted
+ *    rather than what was submitted.
+ * 3. **A consequence goes in flow, never in a dialog.** Callers pass consequences as
+ *    a node rendered under the patch, for the same reason the removal confirmation
+ *    is a sibling block: a consequence stated in an overlay is one that can be
+ *    dismissed, and the strip carrying the kill switch must never be covered.
+ */
+function FormReview({
+  changes,
+  patch,
+  labels,
+  consequences,
+  writing,
+  error,
+  onConfirm,
+  onDiscard,
+}: {
+  changes: readonly ReviewedChange[]
+  patch: Document
+  labels: FormReviewLabels
+  /** Statements the patch cannot carry, rendered under it. */
+  consequences?: React.ReactNode
+  writing: boolean
+  error: unknown
+  onConfirm: () => void
+  onDiscard: () => void
+}) {
+  return (
+    <div className="se-qbox">
+      <h3>{labels.heading}</h3>
+      {/* The payload itself. Not a rendering of it: a summary an operator approves
+          is a summary the write can differ from without anybody noticing. */}
+      <pre className="se-json se-gpatch">{JSON.stringify(patch, null, 2)}</pre>
+      {changes.map((change) => (
+        <p className="se-note" key={change.path}>
+          {change.sentence}
+        </p>
+      ))}
+      {consequences}
+      <div className="se-acts" style={{ marginTop: 9 }}>
+        <button type="button" className="se-btn se-danger" disabled={writing} onClick={onConfirm}>
+          {writing ? labels.writing : labels.confirm}
+        </button>
+        <button type="button" className="se-btn" disabled={writing} onClick={onDiscard}>
+          {labels.discard}
+        </button>
+      </div>
+      <p className="se-note">{labels.exactly}</p>
+      {error !== null && (
+        <>
+          <Refused title={labels.refusalTitle} error={error} />
+          {/* The refusal alone would leave open which of the two states the page is
+              in. Nothing was written, so the surface above is still the store's, and
+              the staged changes are still here to be corrected and sent again. */}
+          <p className="se-note">{labels.retained}</p>
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The grid's own reading of {@link FormReview}: the sentences and the consequences.
+ *
+ * Which sentence describes an edit depends on the origin of the cell it replaces —
+ * three sentences rather than one with the origin interpolated, because the three
+ * edits are three different acts: replacing a level somebody chose for this pair,
+ * NARROWING a broader rule that also answers other pairs, and configuring a pair
+ * nothing had answered. The wildcard sentence carries the narrowing statement itself
+ * — the write creates this pair's own cell and leaves the broader rule alone —
+ * because a separate line repeating the same pair is a line a reader skips.
+ *
+ * One consequence gets its own statement because it is not legible in the patch:
+ * raising the least-trusted class. That class is where an author the engine cannot
+ * classify lands, so a rung granted there is a rung granted to anyone at all, and
+ * nothing in the JSON says which class that is.
  */
 function GridReview({
   reviewed,
@@ -477,70 +596,56 @@ function GridReview({
     ({ edit, cell }) => edit.klass === leastTrusted && raisesLevel(levels, cell, edit.level),
   )
   return (
-    <div className="se-qbox">
-      <h3>{i18nT('apps.specEngine.sourcesSection.the_change_that_would_be_written')}</h3>
-      {/* The payload itself. Not a rendering of it: a summary an operator approves
-          is a summary the write can differ from without anybody noticing. */}
-      <pre className="se-json se-gpatch">{JSON.stringify(patch, null, 2)}</pre>
-      {reviewed.map(({ edit, cell }) => (
-        <p className="se-note" key={dotted(gridCellSegments(edit))}>
-          {i18nT(EDIT_SENTENCE_KEY[cell.origin], {
-            source: edit.source,
-            klass: edit.klass,
-            specType: edit.specType,
-            oldLevel: cell.level,
-            newLevel: edit.level,
-            declaredAt: cell.declared_at,
-            path: dotted(gridCellSegments(edit)),
-          })}
-        </p>
-      ))}
-      {raising.length > 0 && (
-        /* In flow under the patch, never a dialog: the same rule the removal
-           confirmation follows, and for the same reason — a consequence stated in
-           an overlay is a consequence stated where it can be dismissed. */
-        <div className="se-arm">
-          {raising.map(({ edit, cell }) => (
-            <p key={dotted(gridCellSegments(edit))}>
-              <AlertTriangle className="lucide-inline" aria-hidden="true" />
-              {i18nT('apps.specEngine.sourcesSection.this_raises_the_least_trusted_class', {
-                klass: edit.klass,
-                specType: edit.specType,
-                oldLevel: cell.level,
-                newLevel: edit.level,
-              })}
-            </p>
-          ))}
-        </div>
-      )}
-      <div className="se-acts" style={{ marginTop: 9 }}>
-        <button type="button" className="se-btn se-danger" disabled={writing} onClick={onConfirm}>
-          {writing
-            ? i18nT('apps.specEngine.configPanel.saving')
-            : i18nT('apps.specEngine.sourcesSection.write_the_change')}
-        </button>
-        <button type="button" className="se-btn" disabled={writing} onClick={onDiscard}>
-          {i18nT('apps.specEngine.sourcesSection.discard_the_pending_changes')}
-        </button>
-      </div>
-      <p className="se-note">
-        {i18nT('apps.specEngine.sourcesSection.a_confirm_writes_exactly_this_patch')}
-      </p>
-      {error !== null && (
-        <>
-          <Refused
-            title={i18nT('apps.specEngine.sourcesSection.could_not_write_the_grid_change')}
-            error={error}
-          />
-          {/* The refusal alone would leave open which of the two states the page is
-              in. Nothing was written, so the matrix above is still the store's, and
-              the choices are still here to be corrected and sent again. */}
-          <p className="se-note">
-            {i18nT('apps.specEngine.sourcesSection.nothing_was_written_so_the_matrix_is_stored_state')}
-          </p>
-        </>
-      )}
-    </div>
+    <FormReview
+      changes={reviewed.map(({ edit, cell }) => ({
+        path: dotted(gridCellSegments(edit)),
+        sentence: i18nT(EDIT_SENTENCE_KEY[cell.origin], {
+          source: edit.source,
+          klass: edit.klass,
+          specType: edit.specType,
+          oldLevel: cell.level,
+          newLevel: edit.level,
+          declaredAt: cell.declared_at,
+          path: dotted(gridCellSegments(edit)),
+        }),
+      }))}
+      patch={patch}
+      labels={{
+        heading: i18nT('apps.specEngine.sourcesSection.the_change_that_would_be_written'),
+        confirm: i18nT('apps.specEngine.sourcesSection.write_the_change'),
+        writing: i18nT('apps.specEngine.configPanel.saving'),
+        discard: i18nT('apps.specEngine.sourcesSection.discard_the_pending_changes'),
+        exactly: i18nT('apps.specEngine.sourcesSection.a_confirm_writes_exactly_this_patch'),
+        refusalTitle: i18nT('apps.specEngine.sourcesSection.could_not_write_the_grid_change'),
+        retained: i18nT(
+          'apps.specEngine.sourcesSection.nothing_was_written_so_the_matrix_is_stored_state',
+        ),
+      }}
+      consequences={
+        raising.length > 0 && (
+          /* In flow under the patch, never a dialog: the same rule the removal
+             confirmation follows, and for the same reason — a consequence stated in
+             an overlay is a consequence stated where it can be dismissed. */
+          <div className="se-arm">
+            {raising.map(({ edit, cell }) => (
+              <p key={dotted(gridCellSegments(edit))}>
+                <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                {i18nT('apps.specEngine.sourcesSection.this_raises_the_least_trusted_class', {
+                  klass: edit.klass,
+                  specType: edit.specType,
+                  oldLevel: cell.level,
+                  newLevel: edit.level,
+                })}
+              </p>
+            ))}
+          </div>
+        )
+      }
+      writing={writing}
+      error={error}
+      onConfirm={onConfirm}
+      onDiscard={onDiscard}
+    />
   )
 }
 
@@ -899,6 +1004,17 @@ function SourcesSection() {
 }
 
 /**
+ * Whether unsaved text differs from the document the read returned.
+ *
+ * Shared by the editor and the control that opens it, so the pane cannot claim
+ * unsaved edits the editor would call clean — or, worse, close over a draft
+ * without saying it is holding one.
+ */
+function isDirty(text: string | null, document: unknown): boolean {
+  return text !== null && text !== documentText(document)
+}
+
+/**
  * The document, edited and saved through the engine's one write path.
  *
  * The editor holds text rather than a parsed object, because half-typed JSON is a
@@ -906,17 +1022,31 @@ function SourcesSection() {
  * null` means "showing what the read returned", which is what makes the revert
  * exact: it drops local text and shows the document again rather than reconstructing
  * a copy of it.
+ *
+ * That text lives ABOVE this component, in the pane, because this view can be closed
+ * and reopened: state held here would be discarded by the unmount, so closing the
+ * view would silently throw away a half-written document. The rest of the state is
+ * local on purpose — a parse error, an empty-patch note and a save's advisories all
+ * describe the last attempt, and there is nothing to lose by asking again.
  */
-function DocumentEditor({ config }: { config: ConfigSnapshot }) {
+function DocumentEditor({
+  config,
+  text,
+  onText,
+}: {
+  config: ConfigSnapshot
+  /** The unsaved text, or `null` while the editor shows the read. */
+  text: string | null
+  onText: (text: string | null) => void
+}) {
   const client = useQueryClient()
-  const [text, setText] = useState<string | null>(null)
   const [localError, setLocalError] = useState('')
   const [saved, setSaved] = useState<ConfigAdvisory[] | null>(null)
   const [empty, setEmpty] = useState(false)
 
   const baseline = config.document
   const shown = text ?? documentText(baseline)
-  const dirty = text !== null && text !== documentText(baseline)
+  const dirty = isDirty(text, baseline)
 
   const save = useMutation({
     mutationFn: (patch: Document) => specEngineApi.writeConfig(patch),
@@ -924,8 +1054,9 @@ function DocumentEditor({ config }: { config: ConfigSnapshot }) {
       setSaved(result.advisories)
       // Dropped rather than replaced with the merged document: the read is the
       // authority on what is persisted (and on what is elided), so the editor goes
-      // back to showing it.
-      setText(null)
+      // back to showing it. Every surface on the pane reads the same query, so the
+      // invalidation below is what refreshes the forms beside this view too.
+      onText(null)
       void client.invalidateQueries({ queryKey: QK.config })
       void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
     },
@@ -961,7 +1092,7 @@ function DocumentEditor({ config }: { config: ConfigSnapshot }) {
         spellCheck={false}
         value={shown}
         onChange={(event) => {
-          setText(event.target.value)
+          onText(event.target.value)
           setLocalError('')
           setEmpty(false)
           setSaved(null)
@@ -983,7 +1114,7 @@ function DocumentEditor({ config }: { config: ConfigSnapshot }) {
           className="se-btn"
           disabled={!dirty || save.isPending}
           onClick={() => {
-            setText(null)
+            onText(null)
             setLocalError('')
             setEmpty(false)
           }}
@@ -1107,7 +1238,7 @@ interface ProjectRow {
 
 /** The app-defaults row, then one row per stored entry in name order. */
 function projectRows(document: Document): ProjectRow[] {
-  const node = document.projects
+  const node = document[PROJECTS]
   const entries = isObject(node) ? node : {}
   return [
     { id: APP_WIDE, profile: '', overrides: 0, stored: false },
@@ -1162,11 +1293,15 @@ function ProjectsTable({
   const rows = useMemo(() => projectRows(config.document), [config.document])
 
   const remove = useMutation({
-    // A removal is an ordinary configuration write: `null` at the entry, through
-    // the same single write path a save uses. The engine's merge deletes a key
-    // whose patch value is null, so no delete route has to exist — and the write
-    // is validated, locked and recorded exactly like every other one.
-    mutationFn: (name: string) => specEngineApi.writeConfig({ projects: { [name]: null } }),
+    // A removal is an ordinary configuration write: the entry's own path staged as
+    // a deletion, through the same single write path a save uses and the same
+    // patch builder every form write uses. The engine's merge deletes a key whose
+    // patch value is null, so no delete route has to exist — and the write is
+    // validated, locked and recorded exactly like every other one.
+    mutationFn: (name: string) =>
+      specEngineApi.writeConfig(
+        buildFormPatch([{ segments: [PROJECTS, name], value: DELETE }]),
+      ),
     onSuccess: (_reply, name) => {
       setArmed(null)
       setRemoved(name)
@@ -1702,13 +1837,88 @@ function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: st
 }
 
 /**
- * The whole configuration pane: the document, and the resolution beside it.
+ * The form surface's one door to the raw document, and what it is holding.
+ *
+ * A single control, because the JSON view is the escape hatch rather than a second
+ * mode: everything the forms express is edited on them, and this is what reaches a
+ * shape they cannot. It is a plain in-flow toggle for the pane's standing reason —
+ * no drawer, no modal, no scrim.
+ *
+ * Two facts travel with it, and neither is decoration. A draft the operator has not
+ * saved survives closing the view, so the control has to SAY it is holding one;
+ * otherwise a closed view looks like a clean pane and the draft reappears later with
+ * no explanation. And the engine's problems and advisories for the persisted document
+ * are rendered inside the view, so their counts are stated here: a form surface that
+ * silently withheld "this document has three problems" would read as a healthy
+ * configuration.
+ */
+function JsonViewToggle({
+  open,
+  dirty,
+  problems,
+  advisories,
+  onToggle,
+}: {
+  open: boolean
+  dirty: boolean
+  problems: number
+  advisories: number
+  onToggle: () => void
+}) {
+  return (
+    <div className="se-blk">
+      <div className="se-acts">
+        <button type="button" className="se-btn" aria-pressed={open} onClick={onToggle}>
+          {open
+            ? i18nT('apps.specEngine.configPanel.close_the_json_view')
+            : i18nT('apps.specEngine.configPanel.open_the_json_view')}
+        </button>
+        {dirty && (
+          <span className="se-lbl">{i18nT('apps.specEngine.configPanel.unsaved_edits')}</span>
+        )}
+      </div>
+      <p className="se-note">
+        {i18nT('apps.specEngine.configPanel.the_json_view_edits_what_no_form_expresses')}
+      </p>
+      {problems > 0 && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.configPanel.the_json_view_lists_the_documents_problems')}
+          {SEP}
+          <span className="se-m">{fmtNumber(problems)}</span>
+        </p>
+      )}
+      {advisories > 0 && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.configPanel.the_json_view_lists_the_documents_advisories')}
+          {SEP}
+          <span className="se-m">{fmtNumber(advisories)}</span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The whole configuration pane: the forms, the resolution beside them, and the
+ * document on request.
  *
  * Takes the config read rather than performing its own, so the page's first-run
  * detection and this pane cannot disagree about whether a document exists — and a
  * read that FAILED is rendered here as the refusal it is, because `config_unreadable`
  * means a document exists and cannot be parsed, which is a repair and not an empty
- * form to fill in.
+ * form to fill in. The refusal is read BEFORE the data for the SourcesSection's
+ * reason: React Query retains the last successful answer across a failing refetch,
+ * and a form filled from a retained answer would present values nobody re-read as
+ * what is in force.
+ *
+ * ## The forms lead and the document is on request
+ *
+ * The pane used to open on the raw document, which made JSON the only way to change
+ * most of what is stored. It now opens on the forms, and the document editor sits
+ * behind {@link JsonViewToggle} with its full behavior intact — the same textarea,
+ * the same patch-computing save, the same problems and advisories. Nothing is
+ * read-only and no shape has become unreachable; what changed is which of the two an
+ * operator meets first.
  */
 export function ConfigPane({
   config,
@@ -1723,6 +1933,9 @@ export function ConfigPane({
   // the left is what selects it and the resolved read on the right is what it is
   // read FOR, and a copy on either side is how the two come to disagree.
   const [chosenProject, setChosenProject] = useState<string>(APP_WIDE)
+  const [jsonOpen, setJsonOpen] = useState(false)
+  // The editor's unsaved text, held here so closing the view does not discard it.
+  const [draft, setDraft] = useState<string | null>(null)
   // Normalized against the document itself, not against how the entry left it:
   // a selection whose entry is gone — removed through its row, deleted in the
   // JSON editor beside the table, or dropped by an external write picked up on
@@ -1731,7 +1944,7 @@ export function ConfigPane({
   // layers under a heading naming a project the document no longer lists —
   // which reads as "this project inherits everything" rather than "this
   // project is gone".
-  const documentProjects = config?.document.projects
+  const documentProjects = config?.document[PROJECTS]
   const chosenKnown =
     chosenProject === APP_WIDE ||
     (isObject(documentProjects) &&
@@ -1764,15 +1977,22 @@ export function ConfigPane({
             </p>
           ) : (
             <>
-              {/* Above the document rather than below it: the question this pane
-                  is opened with is "which configuration governs which project",
-                  and the answer must not sit under a fixed-height editor. */}
+              {/* The question this pane is opened with is "which configuration
+                  governs which project", and the answer must not sit under a
+                  fixed-height editor. */}
               <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
-              {/* Beside the projects table for the same reason it is above the
-                  editor: who may run how unattended is a reading, and reading it
-                  out of the JSON below is not the same as seeing the matrix. */}
+              {/* Beside the projects table for the same reason: who may run how
+                  unattended is a reading, and reading it out of JSON is not the
+                  same as seeing the matrix. */}
               <SourcesSection />
-              <DocumentEditor config={config} />
+              <JsonViewToggle
+                open={jsonOpen}
+                dirty={isDirty(draft, config.document)}
+                problems={config.errors.length}
+                advisories={config.advisories.length}
+                onToggle={() => setJsonOpen((shown) => !shown)}
+              />
+              {jsonOpen && <DocumentEditor config={config} text={draft} onText={setDraft} />}
             </>
           )}
         </div>
