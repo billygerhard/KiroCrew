@@ -1,7 +1,7 @@
 {
   "statuses": {
     "1.1": "completed",
-    "2.1": "queued",
+    "2.1": "in_progress",
     "3.1": "queued",
     "4.1": "queued",
     "5.1": "queued",
@@ -24,6 +24,11 @@
       "ts": "2026-08-24T13:08:27",
       "taskId": "1.1",
       "status": "completed"
+    },
+    {
+      "ts": "2026-08-24T13:09:09",
+      "taskId": "2.1",
+      "status": "in_progress"
     }
   ]
 }

@@ -544,7 +544,11 @@ function FormReview({
         </button>
       </div>
       <p className="se-note">{labels.exactly}</p>
-      {error !== null && (
+      {/* Loose inequality on purpose: a caller handing over `mutation.error`
+          before any failure passes `undefined`, and a strict null check would
+          render an empty refusal beside "nothing was written" for a write that
+          was never attempted. */}
+      {error != null && (
         <>
           <Refused title={labels.refusalTitle} error={error} />
           {/* The refusal alone would leave open which of the two states the page is

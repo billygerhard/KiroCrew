@@ -23,6 +23,19 @@ sweep. The review gate runs between waves.
 - **Carried from 1.1 (contract facts for 2.1–5.1):** the registry route is
   `GET {PREFIX}/config/registry`; source preset host keys are the bundled
   table's own (`github`, `gitlab`), NOT domain names — type from the payload.
+- **Carried from 2.1's review (binding on 3.1, 4.1, 5.1):** (a) `FormReview`
+  is presentational — each form's mutation OWNS its `onSuccess` invalidation
+  (config + resolved + sources) and must pin it with a named fresh-read test,
+  since the shared piece cannot enforce it; (b) 3.1 introduces the shared
+  `useStagedEdits` hook the design names, and 4.1/5.1 consume it — three
+  ad-hoc staging states is the drift the design forbids; (c) the hook must
+  prevent or reconcile ancestor/descendant path overlaps in staged edits:
+  `buildFormPatch` is last-edit-wins, so an unreconciled overlap lets the
+  review card describe an edit the patch no longer carries. Property-check
+  the reconciliation.
+- **Fixed post-review (orchestrator):** `FormReview`'s refusal gate widened to
+  `error != null` so a caller passing `undefined` cannot render an empty
+  refusal for a write never attempted.
 - **Carried from 1.1's review (for 3.1 and 6.1):** `Setting.choices` is not
   projected (every shipped setting has it empty). 3.1's unknown-kind fallback
   must also treat a str setting as free-text-safe only because no shipped
