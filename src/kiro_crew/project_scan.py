@@ -93,13 +93,23 @@ _MAX_WARNING_REASON = 200
 # and never classified. Dot-directories are pruned by the rule in
 # :func:`is_pruned` instead of being enumerated here, because the interesting set
 # is open-ended (every tool adds one) while the exception is a single name.
+#
+# ``env``, ``venv`` and ``.venv`` are the three conventional names a Python
+# virtual environment is created under, and they are the same class of directory
+# as ``node_modules``: a vendored tree holding one third-party manifest per
+# installed package. One environment therefore offers dozens of directories that
+# look like packages and are not, which is why the names are pruned rather than
+# left to the classifier. ``.venv`` is also covered by the dot-directory rule in
+# :func:`is_pruned`; it is listed here as well so the three spellings of one
+# concept read together.
 PRUNE_DIRS: tuple[str, ...] = (
     "node_modules",
     "dist",
     "build",
     "target",
-    ".venv",
+    "env",
     "venv",
+    ".venv",
     "__pycache__",
 )
 

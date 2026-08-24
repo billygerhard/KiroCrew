@@ -139,6 +139,12 @@ def sibling_repos(tmp_path: Path) -> Path:
         "api/.git/HEAD",
         "api/src/service/__pycache__/handler.cpython-312.pyc",
         "api/.venv/lib/python3.12/site-packages/attrs/pyproject.toml",
+        # The undotted spelling of the same thing, and the one a real scan turned
+        # up dozens of false candidates from: an environment installs one
+        # third-party manifest per package, so a single tree offers more junk
+        # than the checkout around it holds real packages.
+        "api/env/lib/python3.12/site-packages/click/pyproject.toml",
+        "api/env/src/vendored-tool/.git/HEAD",
         "web/.git/HEAD",
         "web/dist/package.json",
         "web/node_modules/left-pad/package.json",
@@ -278,7 +284,10 @@ class TestDirectoryOfCheckouts:
     ) -> None:
         # Each of these holds a manifest that would otherwise match: pruning is
         # what keeps a scan of a working checkout from offering its dependencies.
-        pruned = ("node_modules", "dist", ".venv", "__pycache__")
+        # ``env`` additionally holds a vendored checkout with its own ``.git``,
+        # which is the AUTO tier's strongest signal — so pruning has to win over
+        # the tier that is never otherwise downgraded.
+        pruned = ("node_modules", "dist", "env", ".venv", "__pycache__")
 
         for candidate in scan(sibling_repos).candidates:
             segments = Path(candidate.path).parts

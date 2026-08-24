@@ -255,7 +255,17 @@ class TestPruning:
         assert _relative_paths(scan(tmp_path), tmp_path) == ["app"]
 
     @pytest.mark.parametrize(
-        "pruned", ["node_modules", "dist", "build", "target", ".venv", "venv", "__pycache__"]
+        "pruned",
+        [
+            "node_modules",
+            "dist",
+            "build",
+            "target",
+            "env",
+            "venv",
+            ".venv",
+            "__pycache__",
+        ],
     )
     def test_a_pruned_directory_carrying_a_manifest_is_still_pruned(
         self, tmp_path: Path, pruned: str

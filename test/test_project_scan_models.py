@@ -227,7 +227,16 @@ class TestIsPruned:
         # Pinned independently of PRUNE_DIRS: this is the minimum set a scan must
         # never traverse, so shrinking the constant has to fail a test that does
         # not read the constant.
-        for name in ("node_modules", "dist", "build", "target", ".venv", "venv", "__pycache__"):
+        for name in (
+            "node_modules",
+            "dist",
+            "build",
+            "target",
+            "env",
+            "venv",
+            ".venv",
+            "__pycache__",
+        ):
             assert is_pruned(name), name
 
     @pytest.mark.parametrize("name", [".git", ".tox", ".mypy_cache", ".idea", ".hidden"])

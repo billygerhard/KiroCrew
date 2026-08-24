@@ -99,6 +99,7 @@ _DIR_NAMES = st.sampled_from(
         "dist",
         "libs",
         "target",
+        "env",
         "venv",
         ".venv",
         "__pycache__",
