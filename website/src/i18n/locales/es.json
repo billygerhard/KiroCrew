@@ -3908,7 +3908,7 @@
         "a_confirm_writes_exactly_this_patch": "Confirmar escribe exactamente este parche, por la misma puerta protegida que usa guardar el documento, y la escritura queda registrada.",
         "a_pinned_effort_is_inert_while_the_model_is_auto": "El modelo es auto, así que el motor descarta este esfuerzo y registra haberlo descartado. Un esfuerzo fijado surte efecto solo cuando este rol nombra un modelo concreto.",
         "a_profile_may_pin_only_these_limits": "Un perfil de coste solo puede fijar estos límites. Cualquier otro ajuste se escribe en el formulario de arriba, donde el ámbito que elijas decide hasta dónde llega el cambio.",
-        "a_project_still_selects_the_profile": "{{projects}} sigue seleccionando {{profile}}, así que no se puede quitar: un proyecto cuyo perfil ha desaparecido resuelve cada rol al valor por defecto de la sesión mientras sigue informando de un perfil. Apunta primero esos proyectos a otro perfil.",
+        "a_project_still_selects_the_profile": "{{profile}} sigue seleccionado por estos proyectos: {{projects}}. No se puede eliminar mientras sea así — un proyecto cuyo perfil desaparece resuelve cada rol al valor predeterminado de sesión y aun así informa de un perfil. Primero apunte esos proyectos a otro perfil.",
         "add_a_cost_profile": "Añadir un perfil de coste",
         "an_add_is_always_a_copy": "Añadir es siempre copiar — una plantilla incluida, o un perfil que ya tienes, con un nombre nuevo. Un perfil vacío resolvería cada rol al valor por defecto de la sesión mientras informa de que hay un perfil seleccionado, así que no se ofrece.",
         "an_effort_needs_a_model": "Un esfuerzo necesita un modelo: el motor rechaza una asignación sin él, así que fijar un esfuerzo en un rol sin asignar también prepara {{model}} como su modelo.",
@@ -3946,7 +3946,9 @@
         "the_values_apply_to_every_project": "Estos valores se aplican a todos los proyectos que seleccionaron {{profile}}, y ahora mismo son {{count}}. Cambiar aquí un rol o un límite fijado cambia con qué se ejecutan todos ellos.",
         "unwritten_profile_changes": "Cambios de perfil sin escribir",
         "write_the_change": "Escribir el cambio",
-        "wrote_the_change_and_re_read_the_profiles": "Se escribió el cambio y se volvieron a leer los perfiles del almacén."
+        "wrote_the_change_and_re_read_the_profiles": "Se escribió el cambio y se volvieron a leer los perfiles del almacén.",
+        "the_removal_was_refused": "La eliminación fue rechazada.",
+        "the_staged_copy_was_withdrawn": "El perfil preparado {{profile}} se retiró: lo que copiaba cambió mientras la copia estaba preparada, por lo que la copia ya no coincide con ningún preajuste ni perfil que este formulario pudiera nombrar en la tarjeta de revisión."
       },
       "reviewQueuePanel": {
         "a_feedback_bound_parked_this_run": "Un límite de comentarios de revisión dejó esta ejecución en espera de una persona.",

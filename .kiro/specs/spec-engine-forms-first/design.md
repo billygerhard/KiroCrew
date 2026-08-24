@@ -44,7 +44,7 @@ ConfigPanel
 ├── FormSurface (default view)
 │   ├── ProjectsTable (existing, unchanged)
 │   ├── SettingsForm         ◄── vocabulary from GET .../config/registry (new read)
-│   ├── ProfilesForm         ◄── document + resolved roles (existing reads)
+│   ├── ProfilesForm         ◄── document + registry vocabularies
 │   ├── SourcesSection (existing grid) + SourceForm (new)
 │   │        └── preset picker ◄── source presets in the registry read
 │   └── FormReview (shared exact-patch card, generalized from GridReview)

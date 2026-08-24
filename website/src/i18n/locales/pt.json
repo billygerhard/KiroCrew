@@ -3908,7 +3908,7 @@
         "a_confirm_writes_exactly_this_patch": "Confirmar grava exatamente este patch, pela mesma porta protegida de um salvamento do documento, e a gravação fica registrada.",
         "a_pinned_effort_is_inert_while_the_model_is_auto": "O modelo é auto, então o motor descarta este esforço e registra tê-lo descartado. Um esforço fixado só passa a valer quando este papel nomeia um modelo concreto.",
         "a_profile_may_pin_only_these_limits": "Um perfil de custo pode fixar apenas estes limites. Qualquer outra configuração é gravada no formulário acima, onde o escopo escolhido decide até onde a alteração chega.",
-        "a_project_still_selects_the_profile": "{{projects}} ainda seleciona {{profile}}, então ele não pode ser removido: um projeto cujo perfil desapareceu resolve cada papel para o padrão da sessão e ainda assim relata um perfil. Aponte esses projetos para outro perfil primeiro.",
+        "a_project_still_selects_the_profile": "{{profile}} ainda está selecionado por estes projetos: {{projects}}. Ele não pode ser removido enquanto for assim — um projeto cujo perfil desapareceu resolve cada função para o padrão da sessão e ainda assim informa um perfil. Primeiro aponte esses projetos para outro perfil.",
         "add_a_cost_profile": "Adicionar um perfil de custo",
         "an_add_is_always_a_copy": "Adicionar é sempre copiar — um preset incluído, ou um perfil que você já tem, com um nome novo. Um perfil vazio resolveria cada papel para o padrão da sessão enquanto relata que há um perfil selecionado, por isso não é oferecido.",
         "an_effort_needs_a_model": "Um esforço precisa de um modelo: o motor recusa uma atribuição sem ele, então fixar um esforço em um papel sem atribuição também prepara {{model}} como seu modelo.",
@@ -3946,7 +3946,9 @@
         "the_values_apply_to_every_project": "Estes valores valem para todo projeto que selecionou {{profile}}, e agora são {{count}}. Alterar aqui um papel ou um limite fixado muda com o que todos eles rodam.",
         "unwritten_profile_changes": "Alterações de perfil não escritas",
         "write_the_change": "Gravar a alteração",
-        "wrote_the_change_and_re_read_the_profiles": "A alteração foi gravada e os perfis foram lidos de novo do armazenamento."
+        "wrote_the_change_and_re_read_the_profiles": "A alteração foi gravada e os perfis foram lidos de novo do armazenamento.",
+        "the_removal_was_refused": "A remoção foi recusada.",
+        "the_staged_copy_was_withdrawn": "O perfil preparado {{profile}} foi retirado: o que ele copiava mudou enquanto a cópia estava preparada, então a cópia não corresponde mais a nenhuma predefinição ou perfil que este formulário pudesse nomear no cartão de revisão."
       },
       "reviewQueuePanel": {
         "a_feedback_bound_parked_this_run": "Um limite de comentários de revisão deixou esta execução à espera de uma pessoa.",

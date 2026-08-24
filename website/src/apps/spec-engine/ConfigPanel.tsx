@@ -2182,6 +2182,12 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
   const [addName, setAddName] = useState('')
   const [reviewing, setReviewing] = useState(false)
   const [wrote, setWrote] = useState(false)
+  // The last removal click that was refused, and the staged copy the form had to
+  // withdraw. Both exist so an action's outcome is STATED rather than inferred
+  // from the absence of a change: a refused click with no new feedback looks
+  // inert, and a withdrawn edit with no sentence looks like it was never made.
+  const [removalRefused, setRemovalRefused] = useState(false)
+  const [orphanedCopy, setOrphanedCopy] = useState('')
 
   const registry = useQuery({
     queryKey: QK.registry,
@@ -2243,6 +2249,26 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
     )
   }, [names, pending, reconcile])
 
+  // A staged copy is reviewable only while its bytes still match the preset or
+  // profile it copied: provenance is derived from the bytes, and an edit with no
+  // provenance gets no sentence and reaches no patch. A write from another
+  // surface can change the source UNDER a staged copy, and leaving the edit
+  // staged would make it silently absent from both the card and the write — so
+  // it is withdrawn, and the withdrawal is stated where the edit was made.
+  const { edits: stagedNow, unstage } = edits
+  useEffect(() => {
+    const presetsNow = registry.data?.profile_presets
+    if (!presetsNow) return
+    for (const edit of stagedNow) {
+      if (edit.segments.length !== 2 || edit.segments[0] !== COST_PROFILES) continue
+      if (edit.value === DELETE) continue
+      if (copySourceOf(edit.value, presetsNow, names, document) === null) {
+        unstage(edit.segments)
+        setOrphanedCopy(edit.segments[1])
+      }
+    }
+  }, [stagedNow, unstage, registry.data, names, document])
+
   // `isError` before the data: React Query keeps the last successful answer across
   // a failing refetch, and rows generated from a retained vocabulary would offer
   // roles and limits nobody re-read.
@@ -2280,6 +2306,8 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
   // would advertise a stability it cannot have.
   const touched = () => {
     setWrote(false)
+    setRemovalRefused(false)
+    setOrphanedCopy('')
     write.reset()
   }
 
@@ -2337,8 +2365,12 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
     touched()
     // Refused, and not by a silent disable: the operator has to know WHICH projects
     // block the removal, because pointing them at another profile is the action
-    // that unblocks it.
-    if (projectsSelecting(document, profile).length > 0) return
+    // that unblocks it. The refusal is also ACKNOWLEDGED — the naming note is on
+    // screen before the click, so without this flag the click would look inert.
+    if (projectsSelecting(document, profile).length > 0) {
+      setRemovalRefused(true)
+      return
+    }
     edits.stage(profileSegments(profile), DELETE)
   }
 
@@ -2454,7 +2486,13 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
                 type="button"
                 className="se-btn se-sm se-m"
                 aria-pressed={name === selected}
-                onClick={() => setChosen(name)}
+                // The refusal acknowledgment is about a click on THIS profile's
+                // remove control; carried across a switch it would caption another
+                // profile's note with a refusal that never happened to it.
+                onClick={() => {
+                  setChosen(name)
+                  setRemovalRefused(false)
+                }}
               >
                 {name}
               </button>
@@ -2530,12 +2568,21 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
             /* The refusal names the projects, in flow beside the control. A
                `disabled` button with no reason would leave an operator with no next
                action, and the next action is precisely to point these projects at
-               another profile. */
+               another profile. The acknowledgment leads only after a refused click:
+               the note is on screen BEFORE the click, and a `role="status"` region
+               re-announces on content change, so the lead sentence is what makes
+               the refusal an event rather than a standing caption. */
             <p className="se-note" role="status">
-              {i18nT('apps.specEngine.profilesForm.a_project_still_selects_the_profile', {
-                projects: selecting.join(', '),
-                profile: selected,
-              })}
+              {removalRefused && (
+                <span>{i18nT('apps.specEngine.profilesForm.the_removal_was_refused')}</span>
+              )}
+              {removalRefused && SEP}
+              <span>
+                {i18nT('apps.specEngine.profilesForm.a_project_still_selects_the_profile', {
+                  projects: selecting.join(', '),
+                  profile: selected,
+                })}
+              </span>
             </p>
           )}
         </>
@@ -2603,6 +2650,17 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
         </div>
       )}
       <p className="se-note">{i18nT('apps.specEngine.profilesForm.an_add_is_always_a_copy')}</p>
+      {orphanedCopy !== '' && (
+        /* The withdrawal is an event this form caused, so it is stated: a staged
+           copy that silently stopped being counted would read as an edit that was
+           never made. `role="status"` so the announcement reaches a reader who is
+           not looking at the add block when the refetch lands. */
+        <p className="se-note" role="status">
+          {i18nT('apps.specEngine.profilesForm.the_staged_copy_was_withdrawn', {
+            profile: orphanedCopy,
+          })}
+        </p>
+      )}
 
       <div className="se-acts" style={{ marginTop: 9 }}>
         <button

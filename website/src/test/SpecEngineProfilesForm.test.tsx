@@ -418,6 +418,52 @@ describe('the rows are the engine\u2019s own vocabularies', () => {
     expect(within(block()).getByText(L.budget_run_ceiling_credits)).toBeInTheDocument()
   })
 
+  it('renders a pinnable limit of an unknown kind read-only, routed to the JSON view', async () => {
+    // A kind with no control is a limit this form can read but not edit; an
+    // untyped text box would stage a string into whatever the kind really is.
+    const base = registry()
+    await openRows({
+      registry: {
+        body: registry({
+          settings: [
+            ...base.settings,
+            {
+              key: 'notify.matrix',
+              kind: 'mapping',
+              default: {},
+              minimum: null,
+              maximum: null,
+              scopes: ['app'],
+              summary: 'Where each severity routes.',
+            },
+          ],
+          profile_settings: [...base.profile_settings, 'notify.matrix'],
+        }),
+      },
+    })
+    // No authored label, so the path IS the row's name — the `.se-m` fallback,
+    // not the labeled rows' `.se-kv-path` detail line.
+    const path = within(block()).getByText('cost_profiles.thrifty.notify.matrix', {
+      selector: '.se-m',
+    })
+    const row = path.closest('.se-setting') as HTMLElement
+    expect(row).not.toBeNull()
+    expect(
+      within(row).getByText(
+        T.the_registry_kind_is_not_editable_here.replace('{{kind}}', 'mapping'),
+      ),
+    ).toBeInTheDocument()
+    expect(within(row).queryByRole('textbox')).not.toBeInTheDocument()
+    expect(within(row).queryByRole('spinbutton')).not.toBeInTheDocument()
+  })
+
+  it('states that a profile may pin only the registry-listed limits', async () => {
+    await openRows()
+    expect(
+      within(block()).getByText(T.a_profile_may_pin_only_these_limits),
+    ).toBeInTheDocument()
+  })
+
   it('states an empty role vocabulary rather than rendering an empty form', async () => {
     await openConfig({ registry: { body: registry({ roles: [] }) } })
     expect(await within(block()).findByText(T.no_role_is_registered)).toBeInTheDocument()
@@ -529,6 +575,23 @@ describe('a staged edit is not a write', () => {
     fireEvent.change(modelInput('design'), { target: { value: 'claude-x' } })
     expect(unwritten()).toBe('')
     expect(roleRow('design')).toHaveAttribute('data-staged', 'false')
+  })
+
+  it('describes a pinned-limit edit with the label, both values and the path', async () => {
+    await openRows()
+    const row = pinnedRow('concurrency.wave_max_tasks')
+    fireEvent.change(within(row).getByRole('spinbutton'), { target: { value: '4' } })
+    review()
+    expect(
+      within(block()).getByText(
+        T.edit_replaces_the_pinned_limit
+          .replace('{{setting}}', en.apps.specEngine.configPanel.setting_labels.concurrency_wave_max_tasks)
+          .replace('{{profile}}', 'thrifty')
+          .replace('{{oldValue}}', '2')
+          .replace('{{newValue}}', '4')
+          .replace('{{path}}', 'cost_profiles.thrifty.concurrency.wave_max_tasks'),
+      ),
+    ).toBeInTheDocument()
   })
 
   it('stages the default model with an effort pinned on an unassigned role', async () => {
@@ -647,6 +710,30 @@ describe('adding a profile is always a copy', () => {
     expect(presetButton('budget')).toBeDisabled()
   })
 
+  it('withdraws a staged copy whose source changed under it, and says so', async () => {
+    // Provenance is derived from the staged bytes, so a copy whose source was
+    // rewritten by another surface can no longer be named on the review card and
+    // could never reach a patch. Leaving it silently staged would hide an edit
+    // the operator made; it is withdrawn instead, and the withdrawal is stated.
+    const client = await openRows()
+    nameTheAdd('fresh')
+    fireEvent.click(profileCopyButton('zesty'))
+    expect(unwritten()).toContain(T.unwritten_profile_changes)
+    const changed = stored()
+    changed.cost_profiles.zesty.roles.design.model = 'claude-q'
+    stub({ config: { body: snapshot(changed) } })
+    await client.invalidateQueries()
+    await waitFor(() =>
+      expect(
+        within(block()).getByText(
+          T.the_staged_copy_was_withdrawn.replace('{{profile}}', 'fresh'),
+        ),
+      ).toBeInTheDocument(),
+    )
+    expect(unwritten()).toBe('')
+    expect(reviewControl()).toBeDisabled()
+  })
+
   it('moves a staged copy to the new name rather than dropping it', async () => {
     await openRows()
     nameTheAdd('careful')
@@ -680,6 +767,23 @@ describe('removing a profile a project still selects', () => {
     // would leave it resolving every role to the session default.
     expect(unwritten()).toBe('')
     expect(reviewControl()).toBeDisabled()
+  })
+
+  it('acknowledges the refused click, and only after a click', async () => {
+    // The naming note is on screen BEFORE the click, so without an acknowledgment
+    // the click looks inert: nothing on the page changes in response to it.
+    await openRows()
+    expect(within(block()).queryByText(T.the_removal_was_refused)).not.toBeInTheDocument()
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: T.remove_the_profile.replace('{{profile}}', 'thrifty'),
+      }),
+    )
+    expect(within(block()).getByText(T.the_removal_was_refused)).toBeInTheDocument()
+    // The acknowledgment is about THIS profile's control: switching profiles
+    // must not caption another profile's note with a refusal it never had.
+    selectProfile('zesty')
+    expect(within(block()).queryByText(T.the_removal_was_refused)).not.toBeInTheDocument()
   })
 
   it('stages the deletion and states what it deletes when no project selects it', async () => {

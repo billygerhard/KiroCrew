@@ -59,6 +59,35 @@ sweep. The review gate runs between waves.
   row's own comment already argues bounds live in the registry/door rather
   than restated frontend copies that can drift, and the refusal is honest and
   path-addressed. Same disposition class as the door's shape-only validation.
+- **Accepted deviation (4.1, review-verified against requirements):** the
+  registry route now projects each cost-profile preset's entry beside its
+  name, plus `profile_settings` and the effort ladder — 3.5's add-as-copy was
+  unbuildable from names alone, and neither vocabulary is derivable from a
+  Setting record while both are door-enforced. Route stays a pure zero-
+  document-read projection; design.md updated in the same commit; two pinned
+  backend tests. Include in 6.1's disposition ledger.
+- **Carried from 4.1's review (for 6.1's ledger):** the effort-on-auto copy
+  ("takes effect only once this role names a concrete model") over-promises —
+  the engine's `model_supports_effort()` also drops effort for some concrete
+  models (haiku, nova, deepseek). Wording mirrors requirement 3.2 verbatim and
+  effort capability is not projected in the registry, so the fix belongs to
+  the requirement/registry, not the catalog. Disposition in 6.1.
+- **Fixed post-review (orchestrator, 4.1):** (a) stale ProfilesForm annotation
+  in design.md's diagram corrected to "document + registry vocabularies";
+  (b) a staged copy whose source changed under it is now withdrawn WITH a
+  stated announcement (was: silently absent from card and patch) — named test,
+  mutation-probed; (c) a refused removal click is now acknowledged with a
+  leading "The removal was refused." sentence that clears on profile switch —
+  named test, mutation-probed; (d) the naming note's copy rewritten across all
+  13 catalogs to fix subject-verb disagreement with multiple projects;
+  (e) render coverage added for `edit_replaces_the_pinned_limit`,
+  `the_registry_kind_is_not_editable_here` on a pinned row, and
+  `a_profile_may_pin_only_these_limits`.
+- **Dispositioned (4.1, leftovers):** the implementer's probe backups sit in
+  the shared untracked `./tmp` (ConfigPanel.bak.tsx, useStagedEdits.bak.ts,
+  add_profiles_form.py, sha-before.txt, commit-4.1.txt) per the shared-tmp
+  rule. Every commit in this spec stages explicit paths, never `git add .`,
+  so the stale-duplicate risk the review named does not arise in this flow.
 
 ## Tasks
 
@@ -93,8 +122,8 @@ sweep. The review gate runs between waves.
     - Vitest: generated rows for the shipped vocabulary, scope gating, staged distinction, refusal retention; strings in all 13 catalogs.
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 5.1, 5.4_
 
-- [ ] 4. Profiles form
-  - [ ] 4.1 Cost profile and role assignment editing with honest effort copy
+- [x] 4. Profiles form
+  - [x] 4.1 Cost profile and role assignment editing with honest effort copy
     - Per-profile role rows from the roles vocabulary: model free text defaulting to `auto`, effort via the level-buttons idiom, the inline effort-on-auto sentence while model is `auto`.
     - Profile-pinned settings (wave ceiling, run ceiling) editable on the same form via the registry vocabulary.
     - The every-project-that-selected-this-profile sentence with the count from the document.

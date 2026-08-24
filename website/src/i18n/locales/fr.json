@@ -3908,7 +3908,7 @@
         "a_confirm_writes_exactly_this_patch": "Une confirmation écrit exactement ce correctif, par la même porte protégée qu'un enregistrement du document, et l'écriture est consignée.",
         "a_pinned_effort_is_inert_while_the_model_is_auto": "Le modèle est auto : le moteur abandonne donc cet effort et consigne l'avoir abandonné. Un effort fixé ne prend effet qu'une fois que ce rôle nomme un modèle concret.",
         "a_profile_may_pin_only_these_limits": "Un profil de coût ne peut fixer que ces limites. Tout autre réglage s'écrit dans le formulaire ci-dessus, où la portée choisie décide jusqu'où va la modification.",
-        "a_project_still_selects_the_profile": "{{projects}} sélectionne encore {{profile}} : il ne peut donc pas être supprimé. Un projet dont le profil a disparu résout chaque rôle vers la valeur par défaut de la session tout en signalant un profil. Orientez d'abord ces projets vers un autre profil.",
+        "a_project_still_selects_the_profile": "{{profile}} est encore sélectionné par ces projets : {{projects}}. Il ne peut pas être supprimé tant que c'est le cas — un projet dont le profil a disparu résout chaque rôle vers la valeur par défaut de session tout en déclarant encore un profil. Pointez d'abord ces projets vers un autre profil.",
         "add_a_cost_profile": "Ajouter un profil de coût",
         "an_add_is_always_a_copy": "Un ajout est toujours une copie — d'un préréglage fourni ou d'un profil que vous avez déjà, sous un nouveau nom. Un profil vide résoudrait chaque rôle vers la valeur par défaut de la session tout en signalant qu'un profil est sélectionné ; il n'est donc pas proposé.",
         "an_effort_needs_a_model": "Un effort a besoin d'un modèle : le moteur refuse une affectation sans modèle, donc fixer un effort sur un rôle non affecté prépare aussi {{model}} comme son modèle.",
@@ -3946,7 +3946,9 @@
         "the_values_apply_to_every_project": "Ces valeurs s'appliquent à chaque projet qui a sélectionné {{profile}}, et ils sont {{count}} actuellement. Modifier ici un rôle ou une limite fixée change ce sur quoi ils tournent tous.",
         "unwritten_profile_changes": "Modifications de profil non écrites",
         "write_the_change": "Écrire la modification",
-        "wrote_the_change_and_re_read_the_profiles": "La modification a été écrite et les profils ont été relus depuis le magasin."
+        "wrote_the_change_and_re_read_the_profiles": "La modification a été écrite et les profils ont été relus depuis le magasin.",
+        "the_removal_was_refused": "La suppression a été refusée.",
+        "the_staged_copy_was_withdrawn": "Le profil préparé {{profile}} a été retiré : ce qu'il copiait a changé pendant que la copie était préparée, si bien que la copie ne correspond plus à aucun préréglage ni profil que ce formulaire pourrait nommer sur la carte de revue."
       },
       "reviewQueuePanel": {
         "a_feedback_bound_parked_this_run": "Une limite de retours de revue a mis cette exécution en attente d’une personne.",

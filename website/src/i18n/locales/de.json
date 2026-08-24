@@ -3847,7 +3847,7 @@
         "a_confirm_writes_exactly_this_patch": "Ein Bestätigen schreibt genau diesen Patch, durch dieselbe gesicherte Tür wie ein Speichern des Dokuments, und der Schreibvorgang wird aufgezeichnet.",
         "a_pinned_effort_is_inert_while_the_model_is_auto": "Das Modell ist auto, daher verwirft die Engine diesen Aufwand und zeichnet das Verwerfen auf. Ein festgelegter Aufwand wirkt erst, sobald diese Rolle ein konkretes Modell nennt.",
         "a_profile_may_pin_only_these_limits": "Ein Kostenprofil darf nur diese Grenzen festlegen. Jede andere Einstellung wird im Formular oben geschrieben, wo der gewählte Geltungsbereich entscheidet, wie weit die Änderung reicht.",
-        "a_project_still_selects_the_profile": "{{projects}} wählt weiterhin {{profile}}, daher kann es nicht entfernt werden: Ein Projekt, dessen Profil fehlt, löst jede Rolle auf den Sitzungsstandard auf und meldet dabei trotzdem ein Profil. Richten Sie diese Projekte zuerst auf ein anderes Profil aus.",
+        "a_project_still_selects_the_profile": "{{profile}} ist noch von diesen Projekten ausgewählt: {{projects}}. Solange das so ist, kann es nicht entfernt werden — ein Projekt ohne sein Profil löst jede Rolle auf den Sitzungsstandard auf und meldet dennoch ein Profil. Weisen Sie diesen Projekten zuerst ein anderes Profil zu.",
         "add_a_cost_profile": "Ein Kostenprofil hinzufügen",
         "an_add_is_always_a_copy": "Ein Hinzufügen ist immer eine Kopie — einer mitgelieferten Vorlage oder eines vorhandenen Profils, unter einem neuen Namen. Ein leeres Profil würde jede Rolle auf den Sitzungsstandard auflösen und dabei melden, dass ein Profil gewählt ist; deshalb wird es nicht angeboten.",
         "an_effort_needs_a_model": "Ein Aufwand braucht ein Modell: Die Engine lehnt eine Zuordnung ohne Modell ab, daher legt ein Aufwand auf einer nicht zugeordneten Rolle auch {{model}} als deren Modell vor.",
@@ -3885,7 +3885,9 @@
         "the_values_apply_to_every_project": "Diese Werte gelten für jedes Projekt, das {{profile}} gewählt hat, und {{count}} davon tun das derzeit. Eine Rolle oder eine festgelegte Grenze hier zu ändern ändert, womit sie alle laufen.",
         "unwritten_profile_changes": "Nicht geschriebene Profiländerungen",
         "write_the_change": "Die Änderung schreiben",
-        "wrote_the_change_and_re_read_the_profiles": "Die Änderung wurde geschrieben und die Profile wurden erneut aus dem Speicher gelesen."
+        "wrote_the_change_and_re_read_the_profiles": "Die Änderung wurde geschrieben und die Profile wurden erneut aus dem Speicher gelesen.",
+        "the_removal_was_refused": "Das Entfernen wurde abgelehnt.",
+        "the_staged_copy_was_withdrawn": "Das vorgemerkte Profil {{profile}} wurde zurückgezogen: Die kopierte Vorlage hat sich geändert, während die Kopie vorgemerkt war, sodass die Kopie keiner Vorgabe und keinem Profil mehr entspricht, das dieses Formular auf der Prüfkarte benennen könnte."
       },
       "reviewQueuePanel": {
         "a_feedback_bound_parked_this_run": "Eine Feedback-Grenze hat diesen Lauf für eine Person geparkt.",
