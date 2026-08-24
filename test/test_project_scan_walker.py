@@ -316,6 +316,9 @@ class TestFirebaseAppRoots:
         by_path = _by_path(tree)
         planner = by_path[str(tmp_path / "apps" / "planner")]
         assert planner.signals == (manifest_signal("firebase.json"),)
+        # A deploy root is unambiguous even nested inside the workspace root
+        # package: a deploy config never names a build fixture.
+        assert planner.tier is Tier.AUTO
         for child in ("functions", "web"):
             assert by_path[str(tmp_path / "apps" / "planner" / child)].parent_path == planner.path
 

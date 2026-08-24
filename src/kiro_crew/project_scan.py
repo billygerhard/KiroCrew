@@ -115,6 +115,27 @@ MANIFESTS: tuple[str, ...] = (
     "Procfile",
 )
 
+# The deploy-root subset of :data:`MANIFESTS`. Split out because the tier rule
+# treats them differently: a nested build manifest may be a build fixture, but
+# a deploy config never is — someone deploys that directory — so these stay
+# unambiguous at any depth, like a repository.
+DEPLOY_ROOTS: frozenset[str] = frozenset(
+    (
+        "firebase.json",
+        "vercel.json",
+        "netlify.toml",
+        "amplify.yml",
+        "serverless.yml",
+        "serverless.yaml",
+        "cdk.json",
+        "wrangler.toml",
+        "wrangler.jsonc",
+        "fly.toml",
+        "render.yaml",
+        "Procfile",
+    )
+)
+
 # Files that can carry a workspace's member list. ``package.json`` and
 # ``Cargo.toml`` are manifests too; the other two mean nothing on their own —
 # they are read for their member lists but never make their directory a
@@ -769,13 +790,22 @@ def _tier_for(signals: Sequence[str], *, inside_package: bool) -> Tier:
 
     ``.git`` and ``.kiro`` are unambiguous at any depth — a nested repository is
     its own package, and a directory the user has already used with Kiro is one
-    they have already treated as a project root. A manifest is the ambiguous
-    case, and position decides it: outside any package it names the package
-    itself, inside one it may just as easily name a build fixture, so it is
-    offered unticked.
+    they have already treated as a project root. A deploy-root marker is
+    unambiguous at any depth too: a build manifest inside a package may name a
+    build fixture, but a deploy config never does — someone deploys that
+    directory — so a monorepo's apps stay ticked even though the workspace root
+    wraps them in a package. The remaining manifests are the ambiguous case,
+    and position decides it: outside any package they name the package itself,
+    inside one they are offered unticked.
     """
 
     if SIGNAL_GIT in signals or SIGNAL_KIRO in signals:
+        return Tier.AUTO
+    if any(
+        signal.startswith(_MANIFEST_SIGNAL_PREFIX)
+        and signal[len(_MANIFEST_SIGNAL_PREFIX):] in DEPLOY_ROOTS
+        for signal in signals
+    ):
         return Tier.AUTO
     return Tier.OFFERED if inside_package else Tier.AUTO
 
