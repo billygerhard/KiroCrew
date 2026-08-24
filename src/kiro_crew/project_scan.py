@@ -86,6 +86,11 @@ MANIFESTS: tuple[str, ...] = (
     "pom.xml",
     "build.gradle",
     "build.gradle.kts",
+    # A Firebase app root. Not a build manifest, but it marks the same thing
+    # one does — "this directory is a deployable unit" — and a Firebase app
+    # commonly has no manifest of its own at that level (the package.json
+    # files live in its functions/ and web/ children).
+    "firebase.json",
 )
 
 # Files that can carry a workspace's member list. ``package.json`` and

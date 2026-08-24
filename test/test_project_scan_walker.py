@@ -296,6 +296,30 @@ class TestPruning:
         assert _relative_paths(scan(tmp_path), tmp_path) == ["app"]
 
 
+class TestFirebaseAppRoots:
+    def test_a_firebase_json_marks_an_app_root_and_children_nest_under_it(
+        self, tmp_path: Path
+    ) -> None:
+        # A Firebase app commonly has no manifest at its own level — the
+        # package.json files live in its functions/ and web/ children — so
+        # firebase.json is the marker that makes the app itself a candidate
+        # the children can hang off, instead of the children floating free.
+        _make(
+            tmp_path,
+            "package.json",
+            "apps/planner/firebase.json",
+            "apps/planner/functions/package.json",
+            "apps/planner/web/package.json",
+        )
+
+        tree = scan(tmp_path)
+        by_path = _by_path(tree)
+        planner = by_path[str(tmp_path / "apps" / "planner")]
+        assert planner.signals == (manifest_signal("firebase.json"),)
+        for child in ("functions", "web"):
+            assert by_path[str(tmp_path / "apps" / "planner" / child)].parent_path == planner.path
+
+
 class TestGitignorePruning:
     """The project's own ``.gitignore`` prunes with the same precedence as names.
 

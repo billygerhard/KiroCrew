@@ -184,6 +184,7 @@ class TestSignalConstants:
             "pom.xml",
             "build.gradle",
             "build.gradle.kts",
+            "firebase.json",
         )
 
     def test_extra_signals_widen_the_manifest_set(self) -> None:
