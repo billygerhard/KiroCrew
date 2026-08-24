@@ -41,6 +41,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
+import { SE_CSS } from '../apps/spec-engine/styles'
 import {
   dotted,
   isDescendant,
@@ -924,5 +925,18 @@ describe('the projects table', () => {
     await openConfig()
     expect(rows()).toHaveLength(1)
     expect(await screen.findByText(T.no_project_is_configured_yet)).toBeInTheDocument()
+  })
+})
+
+describe('the key-value list', () => {
+  /* The resolved-settings list renders dotted keys like
+   * `budget.run_ceiling_credits` into a fixed 118px grid column. jsdom applies
+   * no stylesheet, so no DOM test can see the failure mode: a key with no
+   * overflow containment overflows its track and paints UNDER the value in the
+   * next column, rendering both illegible. Pinned against the stylesheet text,
+   * the kill-switch dot idiom. */
+  it('contains a key that outgrows its column instead of painting under the value', () => {
+    const css = SE_CSS.replace(/\s+/g, '')
+    expect(css).toContain('dl.se-kv dt{color:var(--muted);overflow-wrap:anywhere}'.replace(/\s+/g, ''))
   })
 })

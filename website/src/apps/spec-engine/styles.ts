@@ -167,7 +167,7 @@ export const SE_CSS = `
 .se-btn.se-danger{background:var(--danger-subtle);border-color:var(--danger);color:var(--text-strong)}
 .se-acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 dl.se-kv{display:grid;grid-template-columns:118px minmax(0,1fr);gap:4px 10px;margin:0;font-size:12px}
-dl.se-kv dt{color:var(--muted)}
+dl.se-kv dt{color:var(--muted);overflow-wrap:anywhere}
 dl.se-kv dd{margin:0;font-family:var(--mono);color:var(--text-strong);overflow-wrap:anywhere}
 
 /* Row-level state words. One class per meaning, keyed by a data attribute rather
