@@ -282,7 +282,7 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
 async function openRows(answers: Parameters<typeof stub>[0] = {}) {
   const client = await openConfig(answers)
   await waitFor(() =>
-    expect(document.querySelectorAll('.se-setting').length).toBeGreaterThan(0),
+    expect(settingRows().length).toBeGreaterThan(0),
   )
   return client
 }
@@ -299,6 +299,18 @@ function block(): HTMLElement {
   const found = heading.closest('.se-blk')
   expect(found).not.toBeNull()
   return found as HTMLElement
+}
+
+/**
+ * The generated rows of the SETTINGS form.
+ *
+ * Scoped to the block for the reason {@link block} gives, and here it is load
+ * bearing rather than tidy: the profiles form below renders `.se-setting` rows of
+ * its own — role assignments and a profile's pinned limits — so an unscoped count
+ * would count another form's rows as this one's.
+ */
+function settingRows(): HTMLElement[] {
+  return [...block().querySelectorAll('.se-setting')] as HTMLElement[]
 }
 
 /**
@@ -384,7 +396,7 @@ afterEach(() => {
 describe('the rows are generated from the registry', () => {
   it('renders one row per registry entry, prose leading and the key beside it', async () => {
     await openRows()
-    expect(document.querySelectorAll('.se-setting')).toHaveLength(6)
+    expect(settingRows()).toHaveLength(6)
     // Prose leads: the label the catalog names for the key.
     expect(within(block()).getByText(L.limits_task_retry_limit)).toBeInTheDocument()
     expect(within(block()).getByText(L.watch_interval_s)).toBeInTheDocument()
@@ -438,7 +450,7 @@ describe('the rows are generated from the registry', () => {
   it('states the empty vocabulary rather than an empty form', async () => {
     await openConfig({ registry: { body: registry({ settings: [] }) } })
     expect(await screen.findByText(T.no_setting_is_registered)).toBeInTheDocument()
-    expect(document.querySelectorAll('.se-setting')).toHaveLength(0)
+    expect(settingRows()).toHaveLength(0)
   })
 })
 
@@ -766,7 +778,7 @@ describe('a failed read is doubt, not a form', () => {
       registry: { status: 503, body: { code: 'app_disabled', error: 'the app is disabled' } },
     })
     expect(await screen.findByText(T.could_not_read_the_setting_registry)).toBeInTheDocument()
-    expect(document.querySelectorAll('.se-setting')).toHaveLength(0)
+    expect(settingRows()).toHaveLength(0)
     expect(within(block()).queryByRole('button', { name: T.review_the_exact_change })).toBeNull()
   })
 
@@ -781,7 +793,7 @@ describe('a failed read is doubt, not a form', () => {
     await waitFor(() =>
       expect(screen.getAllByText(C.could_not_resolve_the_configuration).length).toBeGreaterThan(0),
     )
-    expect(document.querySelectorAll('.se-setting')).toHaveLength(0)
+    expect(settingRows()).toHaveLength(0)
   })
 })
 

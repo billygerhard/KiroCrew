@@ -71,16 +71,27 @@ exposes; the module posture note gains a sentence saying so):
   "source_presets": [
     {"host": "github.com", "program": "gh", "entry": { ...the preset entry... }}
   ],
-  "profile_presets": ["quality-first", "budget"],
+  "profile_presets": [{"name": "quality-first", "entry": { ...the preset entry... }}],
+  "profile_settings": ["concurrency.wave_max_tasks", "budget.run_ceiling_credits"],
   "roles": ["design", "review", "implement", "analysis", "setup"],
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
   "levels": ["authoring", "execution", "delivery", "integration"]
 }
 ```
 
 All values come from the engine's own constants (`settings.py` `_REGISTRY`,
-`sources.py` presets, `profiles.py` presets, schema vocabularies) — bundled
-data, no document read, so the route is a pure projection and cacheable
-client-side for the session.
+`sources.py` presets, `profiles.py` presets, `PROFILE_SETTING_KEYS` and
+`EFFORT_LEVELS`, schema vocabularies) — bundled data, no document read, so the
+route is a pure projection and cacheable client-side for the session.
+
+A cost-profile preset travels as name PLUS entry, the shape a source preset
+travels in, because adding a profile is adding a copy of one: a client holding
+only the name would have to invent the role assignments it claims to copy, which
+is the no-provenance profile Requirement 3.5 forbids. `profile_settings` and
+`efforts` are projected rather than derived from `settings`, because neither is
+derivable from a setting record — pinnability inside a profile is not a `Scope`,
+and effort is not a setting at all — while both are vocabularies the write door
+enforces.
 
 ### Frontend: `FormSurface` restructure (`ConfigPanel.tsx`)
 
@@ -121,13 +132,22 @@ client-side for the session.
 - Profile list from the document's `cost_profiles`; per-profile role rows from
   the `roles` vocabulary; model as free text defaulting to `auto` (the engine
   deliberately does not validate entitlement); effort as the level buttons
-  idiom. While model is `auto`, the effort control carries the inline sentence
-  that a pinned effort takes effect once a concrete model is named.
+  idiom over the `efforts` vocabulary. While model is `auto`, the effort control
+  carries the inline sentence that a pinned effort takes effect once a concrete
+  model is named. Pinning an effort on a role with no stored model also stages
+  the default model, visibly, because the write door refuses an assignment
+  without one.
+- Profile-pinned settings from `profile_settings`, typed by the same registry
+  records the settings form uses, written at `cost_profiles.<name>.<group>.<leaf>`.
 - "Every project that selected this profile" consequence sentence rendered on
-  the form (the resolved read's project list supplies the count).
+  the form, with the count computed from the document's `projects` entries.
 - Add = copy of a bundled preset (`profile_presets`) or an existing profile
-  under a new name; Remove = refused with the selecting projects named while
-  any project's `cost_profile` references it (computed from the document).
+  under a new name, refused on a name the document already carries (the merge
+  would fold the copy into that profile rather than add one); the review
+  sentence's provenance is derived from the staged bytes, so a copy cannot be
+  described as a copy of something else. Remove = refused with the selecting
+  projects named while any project's `cost_profile` references it (computed from
+  the document).
 
 ### `SourceForm`
 

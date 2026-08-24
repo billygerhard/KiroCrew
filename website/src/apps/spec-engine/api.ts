@@ -310,6 +310,22 @@ export interface SourcePreset {
 }
 
 /**
+ * One bundled cost-profile preset, from the registry projection.
+ *
+ * The ENTRY travels beside the name for the same reason a source preset's does:
+ * adding a profile is adding a copy of one, and a surface holding only the name
+ * would have to invent the role assignments it claims to copy — which is the
+ * no-provenance profile the engine refuses to be useful with, since every role
+ * then resolves to the session default while the project reports that a profile
+ * is selected.
+ */
+export interface ProfilePreset {
+  name: string
+  /** The deep copy `cost_profile_presets` returns, ready to write. */
+  entry: Record<string, unknown>
+}
+
+/**
  * The vocabularies the configuration forms are generated FROM, from
  * `_registry_payload`.
  *
@@ -318,12 +334,22 @@ export interface SourcePreset {
  * document reads carry. A surface generated from it offers exactly what the
  * write door enforces against — a hard-coded field list is how a form comes to
  * offer a setting the door rejects, or to omit one it accepts.
+ *
+ * `profile_settings` and `efforts` are projected rather than derived from
+ * `settings` because neither is derivable from a setting record: pinnability
+ * inside a cost profile is not a scope, and effort is not a setting at all. Both
+ * are vocabularies the write door enforces, so a form offering either from a copy
+ * kept on this side would offer what the door then refuses.
  */
 export interface RegistryPayload {
   settings: RegistrySetting[]
   source_presets: SourcePreset[]
-  profile_presets: string[]
+  profile_presets: ProfilePreset[]
+  /** The dotted keys a cost profile may pin, in the engine's own order. */
+  profile_settings: string[]
   roles: string[]
+  /** The effort ladder a role assignment may name, least effort first. */
+  efforts: string[]
   levels: string[]
 }
 

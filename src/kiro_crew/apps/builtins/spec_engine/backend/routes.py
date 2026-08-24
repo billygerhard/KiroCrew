@@ -39,8 +39,9 @@ values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
 them here would buy nothing and diverge the two doors. The form-vocabulary read
 discloses less again: it projects the setting registry, the bundled source and
-cost-profile presets, and the role and level vocabularies — data the app package
-itself ships, carrying no stored value at all, so it is strictly less than the
+cost-profile presets, and the role, effort, profile-pinnable-key and level
+vocabularies — data the app package itself ships, carrying no stored value at
+all, so it is strictly less than the
 document read the same token already reaches. The per-source autonomy
 grid joins them: it carries resolved autonomy levels and the configuration paths
 that declared them, which is a projection of a document the same agent can
@@ -112,6 +113,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from aiohttp import web
 
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.sel import sel
 
 from ..engine import audit as engine_audit
@@ -136,6 +138,7 @@ from ..engine.config import (
     COST_PROFILE_PRESET_NAMES,
     DASHBOARD_SURFACE,
     ELIDED,
+    PROFILE_SETTING_KEYS,
     ROLES,
     SETTINGS,
     SETUP_ASSISTANT_SURFACE,
@@ -147,6 +150,7 @@ from ..engine.config import (
     ConfigValidationError,
     ConfigWarning,
     ConfigWriteRefused,
+    cost_profile_presets,
     document_warnings,
     elide_secrets,
     resolve_all,
@@ -701,8 +705,9 @@ def _registry_payload() -> dict[str, Any]:
 
     Ordering is each owning module's declaration order throughout: registry order
     for settings, :data:`WATCH_SOURCE_PRESET_HOSTS` for presets, and the declared
-    tuples for the profile, role and level names. A client rendering the payload
-    in the order it arrives therefore renders it the same way on every read.
+    tuples for the profile, role, effort and level names. A client rendering the
+    payload in the order it arrives therefore renders it the same way on every
+    read.
 
     Preset entries come from :func:`watch_source_presets`, which deep-copies and
     deliberately carries no ``enabled`` key, so a copy an operator has not armed
@@ -710,6 +715,21 @@ def _registry_payload() -> dict[str, Any]:
     poll argv the engine's own: the write door validates argv SHAPE and not the
     program it names, so the preset tables are the boundary on what a form can
     cause the engine to run.
+
+    A cost-profile preset travels as its NAME and its ENTRY, the same shape a
+    source preset travels in, for the same reason: a form that adds a profile
+    adds a copy of one, and a client holding only the name would have to invent
+    the role assignments it copies — which is the no-provenance profile the
+    engine refuses to be useful with (an empty profile resolves every role to the
+    session default while reporting that a profile is selected).
+
+    ``profile_settings`` are the keys a profile may pin, and ``efforts`` the
+    effort ladder an assignment may name. Both are vocabularies the WRITE DOOR
+    enforces (``_check_profile_settings`` and the role-field check in
+    ``schema.py``) and neither is derivable from the setting registry: pinnability
+    is not a :class:`Scope`, and effort is not a setting at all. A form offering
+    either from a copy kept on its own side is a form that offers what the door
+    then refuses.
     """
     return {
         "settings": [_setting_vocabulary(setting) for setting in SETTINGS.values()],
@@ -725,8 +745,13 @@ def _registry_payload() -> dict[str, Any]:
             }
             for host in WATCH_SOURCE_PRESET_HOSTS
         ],
-        "profile_presets": list(COST_PROFILE_PRESET_NAMES),
+        "profile_presets": [
+            {"name": name, "entry": cost_profile_presets(name)}
+            for name in COST_PROFILE_PRESET_NAMES
+        ],
+        "profile_settings": list(PROFILE_SETTING_KEYS),
         "roles": list(ROLES),
+        "efforts": list(EFFORT_LEVELS),
         "levels": list(AUTONOMY_LEVELS),
     }
 

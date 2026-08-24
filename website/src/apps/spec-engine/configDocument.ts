@@ -159,14 +159,28 @@ export const SCOPE_SOURCE = 'source'
  * string.
  */
 export function settingSegments(key: string, scope: string, target: string): string[] | null {
-  const dot = key.indexOf('.')
-  if (dot <= 0 || dot === key.length - 1) return null
-  const leaf = [key.slice(0, dot), key.slice(dot + 1)]
+  const leaf = settingLeaf(key)
+  if (leaf === null) return null
   if (scope === SCOPE_APP) return leaf
   if (target === '') return null
   if (scope === SCOPE_PROJECT) return [PROJECTS, target, ...leaf]
   if (scope === SCOPE_SOURCE) return [SOURCES, target, ...leaf]
   return null
+}
+
+/**
+ * A dotted registry key as the two segments a document stores it under, or `null`
+ * for a key with no group.
+ *
+ * The engine's own split, at the FIRST dot only: `Setting.group` is everything
+ * before it and `Setting.leaf` everything after, as one segment each. One
+ * function for it, because a second split written beside a path composer is how
+ * the two come to disagree about a key holding two dots.
+ */
+export function settingLeaf(key: string): string[] | null {
+  const dot = key.indexOf('.')
+  if (dot <= 0 || dot === key.length - 1) return null
+  return [key.slice(0, dot), key.slice(dot + 1)]
 }
 
 /**
@@ -177,6 +191,48 @@ export function settingSegments(key: string, scope: string, target: string): str
  */
 export function roleSegments(profile: string, role: string): string[] {
   return [COST_PROFILES, profile, ROLES_KEY, role]
+}
+
+/** Field of a role assignment naming the model it routes to. */
+export const FIELD_MODEL = 'model'
+
+/** Field of a role assignment pinning reasoning effort. */
+export const FIELD_EFFORT = 'effort'
+
+/** Field of a project entry naming the cost profile that project selects. */
+export const PROJECT_PROFILE_FIELD = 'cost_profile'
+
+/** The segments addressing one cost profile's whole entry. */
+export function profileSegments(profile: string): string[] {
+  return [COST_PROFILES, profile]
+}
+
+/**
+ * The segments addressing one field of one role's assignment.
+ *
+ * A field rather than the whole assignment, so a form stages the leaf it changed:
+ * {@link buildFormPatch}'s minimality is a property of the paths it is given, and
+ * an edit staged at the assignment would carry a model the operator did not touch.
+ */
+export function roleFieldSegments(profile: string, role: string, field: string): string[] {
+  return [...roleSegments(profile, role), field]
+}
+
+/**
+ * The segments addressing one setting a profile pins, or `null` for a key with no
+ * group.
+ *
+ * `cost_profiles.<name>.<group>.<leaf>` — the same group-and-leaf split every
+ * other stored setting uses, which is why it goes through {@link settingLeaf}
+ * rather than splitting here. A profile may pin only the engine's own
+ * profile-pinnable keys; that vocabulary travels in the registry read, so this
+ * composes a path for whatever key it is handed and never decides which keys are
+ * offered.
+ */
+export function profileSettingSegments(profile: string, key: string): string[] | null {
+  const leaf = settingLeaf(key)
+  if (leaf === null) return null
+  return [COST_PROFILES, profile, ...leaf]
 }
 
 /**

@@ -222,6 +222,21 @@ function matrix(source = 'gh'): HTMLElement {
   })
 }
 
+/**
+ * The watch-sources block.
+ *
+ * Every query for one of the review card's controls is scoped to it, because each
+ * form on the pane owns its OWN copy of that card's words — "Review the exact
+ * change" is the settings form's label and the profiles form's too — so an unscoped
+ * query cannot tell one form's confirm from another's.
+ */
+function block(): HTMLElement {
+  const heading = screen.getByRole('heading', { name: T.watch_sources })
+  const found = heading.closest('.se-blk')
+  expect(found).not.toBeNull()
+  return found as HTMLElement
+}
+
 /** One cell of the matrix, addressed by class row and spec-type column. */
 function gridCell(klass: string, specType: string, source = 'gh'): HTMLElement {
   const table = matrix(source)
@@ -549,7 +564,7 @@ function choose(klass: string, specType: string, level: string, source = 'gh') {
 
 /** Open the review card for whatever is pending. */
 function review() {
-  fireEvent.click(screen.getByRole('button', { name: T.review_the_exact_change }))
+  fireEvent.click(within(block()).getByRole('button', { name: T.review_the_exact_change }))
 }
 
 /** The patch on screen, parsed — the exact object a confirm would send. */
@@ -639,7 +654,7 @@ describe('an edit is shown exactly before it is written', () => {
     // The patch is shown as the payload itself, so approving the review is
     // approving what will be written — and what was written is what was approved.
     expect(shownPatch()).toEqual(patch)
-    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    fireEvent.click(within(block()).getByRole('button', { name: T.write_the_change }))
     await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
     expect(putPatch()).toEqual(patch)
   })
@@ -761,11 +776,11 @@ describe('an edit is shown exactly before it is written', () => {
     stub({})
     await openConfig()
     choose('maintainer', 'feature', 'integration')
-    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
+    expect(within(block()).getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
     // Back to the level the cell itself holds. Every write is recorded, so queueing
     // this would put a line in the durable record for a change nobody made.
     choose('maintainer', 'feature', 'delivery')
-    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(within(block()).getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
     expect(screen.queryByText(T.not_written)).toBeNull()
   })
 
@@ -775,7 +790,7 @@ describe('an edit is shown exactly before it is written', () => {
     // Not a no-op: it pins the pair at the level it happens to have now, which is
     // what keeps it there when the broader rule moves.
     choose('contributor', 'feature', 'execution')
-    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
+    expect(within(block()).getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
     review()
     expect(shownPatch()).toEqual({
       sources: { gh: { autonomy: { contributor: { feature: 'execution' } } } },
@@ -789,7 +804,7 @@ describe('an edit is shown exactly before it is written', () => {
     review()
     fireEvent.click(screen.getByRole('button', { name: T.discard_the_pending_changes }))
     expect(screen.queryByText(T.the_change_that_would_be_written)).toBeNull()
-    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(within(block()).getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
     expect(calls.some((call) => call.method === 'PUT')).toBe(false)
   })
 
@@ -830,7 +845,7 @@ describe('an edit is shown exactly before it is written', () => {
     // No mark anywhere, and nothing left to review: the section is back to reading
     // the store, which is the only state a confirm can act on.
     await waitFor(() => expect(screen.queryByText(T.not_written)).toBeNull())
-    expect(screen.getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
+    expect(within(block()).getByRole('button', { name: T.review_the_exact_change })).toBeDisabled()
     expect(calls.some((call) => call.method === 'PUT')).toBe(false)
   })
 })
@@ -849,7 +864,7 @@ describe('a refused write leaves the grid showing the store', () => {
     await openConfig()
     choose('external', 'feature', 'execution')
     review()
-    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    fireEvent.click(within(block()).getByRole('button', { name: T.write_the_change }))
     await screen.findByText(T.could_not_write_the_grid_change)
     // The engine's own words, against the path it named: this panel keeps no
     // validation of its own to paraphrase them with.
@@ -907,7 +922,7 @@ describe('an accepted write is re-read rather than assumed', () => {
     await openConfig()
     choose('external', 'feature', 'execution')
     review()
-    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    fireEvent.click(within(block()).getByRole('button', { name: T.write_the_change }))
     await screen.findByText(T.wrote_the_change_and_re_read_the_matrix)
 
     await waitFor(() => {
@@ -940,7 +955,7 @@ describe('an accepted write is re-read rather than assumed', () => {
     expect(shownPatch()).toEqual({
       sources: { gh: { autonomy: { external: { feature: 'execution', bugfix: 'execution' } } } },
     })
-    fireEvent.click(screen.getByRole('button', { name: T.write_the_change }))
+    fireEvent.click(within(block()).getByRole('button', { name: T.write_the_change }))
     await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
     expect(putPatch()).toEqual({
       sources: { gh: { autonomy: { external: { feature: 'execution', bugfix: 'execution' } } } },

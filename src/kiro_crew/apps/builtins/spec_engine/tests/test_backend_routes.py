@@ -51,6 +51,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
     AUTONOMY_LEVELS,
     CONFIG_FILENAME,
     LEAST_TRUSTED_CLASS,
+    PROFILE_SETTING_KEYS,
     ROLES,
     SETTINGS,
     SPEC_TYPES,
@@ -63,6 +64,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
     COST_PROFILE_PRESET_NAMES,
+    cost_profile_presets,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.setup import CONFIRMED_LEVELS
 from kiro_crew.apps.builtins.spec_engine.engine.watch.sources import (
@@ -78,6 +80,7 @@ from kiro_crew.apps.builtins.spec_engine.engine_mcp.setup_surface import (
     REFUSED_KEY,
     StalePlan,
 )
+from kiro_crew.effort import EFFORT_LEVELS
 
 ROUTES_SOURCE = Path(routes.__file__)
 
@@ -1435,9 +1438,37 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
     ) -> None:
         async with _client() as client:
             reply = await _get(client, f"{routes.PREFIX}/config/registry")
-        assert reply.body["profile_presets"] == list(COST_PROFILE_PRESET_NAMES)
+        assert [preset["name"] for preset in reply.body["profile_presets"]] == list(
+            COST_PROFILE_PRESET_NAMES
+        )
         assert reply.body["roles"] == list(ROLES)
         assert reply.body["levels"] == list(AUTONOMY_LEVELS)
+        # The two vocabularies the profiles form offers that the setting registry
+        # cannot supply: pinnability is not a Scope, and effort is not a setting.
+        # Both are enforced by the write door, so a form offering either from its
+        # own copy would offer what the door then refuses.
+        assert reply.body["profile_settings"] == list(PROFILE_SETTING_KEYS)
+        assert reply.body["efforts"] == list(EFFORT_LEVELS)
+
+    @pytest.mark.asyncio
+    async def test_each_profile_preset_carries_the_entry_a_copy_is_made_from(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The name alone would not do. A form adds a profile as a COPY of one, so
+        a client holding only names would have to invent the role assignments it
+        claims to copy — which is the no-provenance profile the engine refuses to
+        be useful with: every role resolves to the session default while the
+        project reports that a profile is selected.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        for preset in reply.body["profile_presets"]:
+            assert preset["entry"] == cost_profile_presets(preset["name"])
+            # Every projected assignment names a model, because the write door
+            # refuses an assignment without one: a form staging this entry
+            # verbatim must not stage a document the door then rejects.
+            for role, assignment in preset["entry"]["roles"].items():
+                assert assignment["model"], f"{preset['name']}.{role} arrived with no model"
 
     @pytest.mark.asyncio
     async def test_the_read_opens_no_configuration_document(

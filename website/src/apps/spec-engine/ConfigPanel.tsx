@@ -91,6 +91,7 @@ import {
   type ConfigAdvisory,
   type ConfigSnapshot,
   type EffectiveSetting,
+  type ProfilePreset,
   type RegistrySetting,
   type ResolvedRole,
   type SourceGridCell,
@@ -99,7 +100,11 @@ import {
 import {
   COST_PROFILES,
   DELETE,
+  FIELD_EFFORT,
+  FIELD_MODEL,
+  PROJECT_PROFILE_FIELD,
   PROJECTS,
+  ROLES_KEY,
   SCOPE_PROJECT,
   SCOPE_SOURCE,
   buildFormPatch,
@@ -113,6 +118,9 @@ import {
   nodeAt,
   parseDocument,
   patchAt,
+  profileSegments,
+  profileSettingSegments,
+  roleFieldSegments,
   roleSegments,
   sameCell,
   settingSegments,
@@ -1167,6 +1175,77 @@ export function settingFields(
 }
 
 /**
+ * The one control a registry kind is edited with.
+ *
+ * Shared by the settings form and by a cost profile's pinned limits, because
+ * "which control edits an int, and with which bounds" is a property of the
+ * REGISTRY rather than of either form: two copies of it would be two chances to
+ * offer a value the write door then refuses, and only one of them would be found
+ * when the registry gains a kind.
+ *
+ * The value shown is the caller's — the staged one when there is one, otherwise
+ * what is stored — because only the caller knows which of the two it is holding.
+ * Nothing here writes: a change stages, and staging reaches the store only
+ * through the review card's confirm.
+ */
+function SettingControl({
+  id,
+  setting,
+  control,
+  value,
+  disabled,
+  onStage,
+  onWithdraw,
+}: {
+  id: string
+  setting: RegistrySetting
+  /** The control kind, resolved from {@link CONTROL_BY_KIND} by the caller. */
+  control: string
+  value: unknown
+  disabled: boolean
+  onStage: (value: unknown) => void
+  onWithdraw: () => void
+}) {
+  const numeric = control === 'number'
+  const twoState = control === 'checkbox'
+  return (
+    <input
+      id={id}
+      type={control}
+      className={twoState ? 'se-check' : 'se-input'}
+      disabled={disabled}
+      // The registry's bounds, carried by the control itself rather than
+      // restated: the engine refuses an out-of-range value by path either way,
+      // and a second copy of a bound here is one that can drift from it.
+      min={numeric && setting.minimum !== null ? setting.minimum : undefined}
+      max={numeric && setting.maximum !== null ? setting.maximum : undefined}
+      step={numeric ? STEP_BY_KIND[setting.kind] : undefined}
+      checked={twoState ? value === true : undefined}
+      value={
+        twoState ? undefined : typeof value === 'number' || typeof value === 'string'
+          ? String(value)
+          : ''
+      }
+      onChange={(event) => {
+        if (twoState) {
+          onStage(event.target.checked)
+          return
+        }
+        const raw = event.target.value
+        // A number control reports an entry it cannot parse as the empty
+        // string, and an empty one has no value to stage: the edit is withdrawn
+        // rather than written as some number the operator did not type.
+        if (numeric && raw.trim() === '') {
+          onWithdraw()
+          return
+        }
+        onStage(numeric ? Number(raw) : raw)
+      }}
+    />
+  )
+}
+
+/**
  * One setting: its meaning, the value in force, the control, and the scope a
  * write would land at.
  *
@@ -1219,8 +1298,6 @@ function SettingRow({
   ) : (
     <span className="se-m">{setting.key}</span>
   )
-  const numeric = control === 'number'
-  const twoState = control === 'checkbox'
   const value = staged ? staged.value : inForce?.value
   return (
     <div className="se-setting" data-kind={setting.kind} data-staged={staged !== undefined}>
@@ -1243,39 +1320,15 @@ function SettingRow({
           })}
         </p>
       ) : (
-        <input
+        <SettingControl
           id={id}
-          type={control}
-          className={twoState ? 'se-check' : 'se-input'}
+          setting={setting}
+          control={control}
+          value={value}
           // A row whose chosen scope has no path can be read but not written.
           disabled={segments === null}
-          // The registry's bounds, carried by the control itself rather than
-          // restated: the engine refuses an out-of-range value by path either way,
-          // and a second copy of a bound here is one that can drift from it.
-          min={numeric && setting.minimum !== null ? setting.minimum : undefined}
-          max={numeric && setting.maximum !== null ? setting.maximum : undefined}
-          step={numeric ? STEP_BY_KIND[setting.kind] : undefined}
-          checked={twoState ? value === true : undefined}
-          value={
-            twoState ? undefined : typeof value === 'number' || typeof value === 'string'
-              ? String(value)
-              : ''
-          }
-          onChange={(event) => {
-            if (twoState) {
-              onStage(event.target.checked)
-              return
-            }
-            const raw = event.target.value
-            // A number control reports an entry it cannot parse as the empty
-            // string, and an empty one has no value to stage: the edit is withdrawn
-            // rather than written as some number the operator did not type.
-            if (numeric && raw.trim() === '') {
-              onWithdraw()
-              return
-            }
-            onStage(numeric ? Number(raw) : raw)
-          }}
+          onStage={onStage}
+          onWithdraw={onWithdraw}
         />
       )}
       <p className="se-note">{setting.summary}</p>
@@ -1692,6 +1745,925 @@ function SettingsForm({ project }: { project: string }) {
             {i18nT('apps.specEngine.settingsForm.a_scope_targets_the_selection_above')}
           </p>
         </>
+      )}
+    </div>
+  )
+}
+
+// --- the cost profiles form ---------------------------------------------------
+
+/**
+ * The model an assignment names when nothing pins one, and the engine's own
+ * spelling of "let the served backend choose".
+ *
+ * It is what every bundled preset assigns (`PRESET_MODEL` in `profiles.py`) and
+ * what this form defaults a new assignment to, for the reason the engine gives:
+ * accounts differ in entitlement, so a concrete model chosen on a reader's behalf
+ * fails at runtime — silently until the first prompt — for anyone not entitled to
+ * it.
+ */
+const AUTO_MODEL = 'auto'
+
+/** An empty vocabulary before the read answers, so a memo sees one array. */
+const NO_NAMES: readonly string[] = []
+
+/** An empty preset list before the read answers, for `NO_NAMES`'s reason. */
+const NO_PROFILE_PRESETS: readonly ProfilePreset[] = []
+
+/** The profiles the document declares, in name order. */
+export function profileNames(document: Document): string[] {
+  const node = document[COST_PROFILES]
+  return isObject(node) ? Object.keys(node).sort() : []
+}
+
+/**
+ * Every project whose entry selects *profile*, in name order.
+ *
+ * Read from the DOCUMENT rather than from a resolution, because the question is
+ * which entries NAME this profile — including a project whose resolution fell
+ * back for some other reason. That is exactly the set a removal would strand.
+ */
+export function projectsSelecting(document: Document, profile: string): string[] {
+  const node = document[PROJECTS]
+  if (!isObject(node)) return []
+  return Object.keys(node)
+    .filter((name) => {
+      const entry = node[name]
+      return isObject(entry) && entry[PROJECT_PROFILE_FIELD] === profile
+    })
+    .sort()
+}
+
+/**
+ * The efforts a row may pin: the engine's ladder, plus a stored value the ladder
+ * does not contain.
+ *
+ * {@link levelOptions}' reason, for the same shape of control: a hand-edited
+ * effort outside the vocabulary would otherwise leave no button pressed, so the
+ * row could not say what is stored. The out-of-vocabulary value is offered so it
+ * is visible and replaceable; the write door refuses it either way.
+ */
+function effortOptions(efforts: readonly string[], stored: unknown): readonly string[] {
+  if (typeof stored !== 'string' || stored === '' || efforts.includes(stored)) return efforts
+  return [stored, ...efforts]
+}
+
+/** One role's row: where its two fields are written, and what is stored there. */
+interface RoleField {
+  role: string
+  /** The path the model control writes. */
+  modelSegments: readonly string[]
+  /** The path the effort control writes. */
+  effortSegments: readonly string[]
+  /** The model stored in the profile, `undefined` when the role has none. */
+  storedModel: unknown
+  /** The effort stored in the profile, `undefined` when the role pins none. */
+  storedEffort: unknown
+}
+
+/**
+ * One row per role in the vocabulary, in the order the read supplies them.
+ *
+ * Total over that vocabulary by construction: a role the profile has no
+ * assignment for is a row with nothing stored rather than an absent row, because
+ * a role nobody has assigned is precisely the one an operator came here to assign.
+ */
+function roleFields(profile: string, roles: readonly string[], document: Document): RoleField[] {
+  return roles.map((role) => {
+    const assignment = nodeAt(document, roleSegments(profile, role))
+    const stored = isObject(assignment) ? assignment : {}
+    return {
+      role,
+      modelSegments: roleFieldSegments(profile, role, FIELD_MODEL),
+      effortSegments: roleFieldSegments(profile, role, FIELD_EFFORT),
+      storedModel: stored[FIELD_MODEL],
+      storedEffort: stored[FIELD_EFFORT],
+    }
+  })
+}
+
+/** One pinned limit's row: its registry record, its path, and what is pinned. */
+interface ProfileSettingField {
+  setting: RegistrySetting
+  segments: readonly string[]
+  /** The value the profile pins, `undefined` when it pins none. */
+  stored: unknown
+}
+
+/**
+ * One row per key a profile may pin, for the keys the registry also describes.
+ *
+ * Both vocabularies arrive in ONE read, so a pinnable key with no registry record
+ * means the payload disagrees with itself rather than that a setting is new: there
+ * would be no kind, no bounds and no summary to generate a control from. Such a
+ * key is skipped rather than rendered as an untyped text box that would stage a
+ * string into a numeric limit.
+ */
+function profileSettingFields(
+  profile: string,
+  keys: readonly string[],
+  settings: readonly RegistrySetting[],
+  document: Document,
+): ProfileSettingField[] {
+  const fields: ProfileSettingField[] = []
+  for (const key of keys) {
+    const setting = settings.find((entry) => entry.key === key)
+    const segments = profileSettingSegments(profile, key)
+    if (!setting || !segments) continue
+    fields.push({ setting, segments, stored: nodeAt(document, segments) })
+  }
+  return fields
+}
+
+/**
+ * One role assignment: the model it routes to, the effort it pins, and the rule
+ * that decides whether that effort does anything at all.
+ *
+ * Three things on this row are load-bearing:
+ *
+ * 1. **The model is free text, defaulting to `auto`.** The engine deliberately
+ *    does not validate entitlement — a picker here would promise a check nobody
+ *    performs — so this is a text field, and the honest statement about it sits
+ *    with the section rather than being implied by a closed list.
+ * 2. **The effort is one button per rung.** The ladder is short and fixed, and a
+ *    dropdown would draw a popup over a page whose kill-switch strip must never be
+ *    covered: the autonomy grid's level control is buttons for the same reason.
+ * 3. **While the model is `auto`, the row states that the effort is inert.** Not a
+ *    style note: kiro-cli accepts no reasoning effort on `auto`, so the resolver
+ *    DROPS a pinned effort and records having dropped it. An operator who pins
+ *    `high` here would otherwise have to work out from a `dropped` flag on another
+ *    pane why nothing changed. The sentence appears and disappears with the model
+ *    value, because it is a statement about that value rather than about the
+ *    profile.
+ */
+function RoleAssignmentRow({
+  field,
+  efforts,
+  stagedModel,
+  stagedEffort,
+  onModel,
+  onEffort,
+}: {
+  field: RoleField
+  efforts: readonly string[]
+  /** The edit staged at the model path, or `undefined` when none is. */
+  stagedModel: StagedEdit | undefined
+  /** The edit staged at the effort path, or `undefined` when none is. */
+  stagedEffort: StagedEdit | undefined
+  onModel: (value: string) => void
+  onEffort: (effort: string) => void
+}) {
+  const id = useId()
+  const staged = stagedModel !== undefined || stagedEffort !== undefined
+  // What a write would store, which is what the controls have to show: the staged
+  // value when there is one, the stored value when there is not, and the engine's
+  // own default for a role nothing has assigned.
+  const model = stagedModel
+    ? String(stagedModel.value ?? '')
+    : typeof field.storedModel === 'string'
+      ? field.storedModel
+      : AUTO_MODEL
+  const effort = stagedEffort
+    ? String(stagedEffort.value ?? '')
+    : typeof field.storedEffort === 'string'
+      ? field.storedEffort
+      : ''
+  const effortLabel = i18nT('apps.specEngine.profilesForm.effort_for_role', { role: field.role })
+  return (
+    <div className="se-setting" data-role={field.role} data-staged={staged}>
+      <label className="se-setting-name" htmlFor={id}>
+        {i18nT('apps.specEngine.profilesForm.model_for_role', { role: field.role })}
+        {/* The path the write lands at, as the detail line: it is what the document
+            and the write log speak, and a role assignment lives on a SHARED
+            profile, so the node being changed is the whole blast radius. */}
+        <span className="se-kv-path">{dotted(field.modelSegments)}</span>
+      </label>
+      <input
+        id={id}
+        type="text"
+        className="se-input"
+        value={model}
+        onChange={(event) => onModel(event.target.value)}
+      />
+      {efforts.length > 0 && (
+        <div className="se-acts" role="group" aria-label={effortLabel}>
+          {effortOptions(efforts, field.storedEffort).map((level) => (
+            <button
+              key={level}
+              type="button"
+              className="se-btn se-sm se-m"
+              // Pressed on what a write would store, which after a staged choice is
+              // no longer what the profile holds.
+              aria-pressed={level === effort}
+              onClick={() => onEffort(level)}
+            >
+              {level}
+            </button>
+          ))}
+        </div>
+      )}
+      {model.trim() === AUTO_MODEL && (
+        <p className="se-note" data-effort-inert="true">
+          {i18nT('apps.specEngine.profilesForm.a_pinned_effort_is_inert_while_the_model_is_auto')}
+        </p>
+      )}
+      <p className="se-note">
+        {i18nT('apps.specEngine.profilesForm.stored_in_the_profile')}
+        {SEP}
+        <span className="se-m">{shownValue(field.storedModel)}</span>
+        {SEP}
+        <span className="se-m">{shownValue(field.storedEffort)}</span>
+      </p>
+      {stagedModel !== undefined && (
+        <p className="se-note">
+          <span className="se-flag" data-flag="pending">
+            {i18nT('apps.specEngine.profilesForm.not_written')}
+          </span>
+          <span className="se-m">
+            {shownValue(stagedModel.value)}
+            {SEP}
+            {dotted(field.modelSegments)}
+          </span>
+        </p>
+      )}
+      {stagedEffort !== undefined && (
+        <p className="se-note">
+          <span className="se-flag" data-flag="pending">
+            {i18nT('apps.specEngine.profilesForm.not_written')}
+          </span>
+          <span className="se-m">
+            {shownValue(stagedEffort.value)}
+            {SEP}
+            {dotted(field.effortSegments)}
+          </span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * One limit a profile pins: the registry's own control for it, and what is pinned.
+ *
+ * The control comes from the shared {@link SettingControl}, so a pinned limit and
+ * the same setting written at app scope are edited by one control carrying one set
+ * of bounds. What differs is only where the write lands — `cost_profiles.<name>`
+ * rather than a scope — and the row states that path for the settings rows'
+ * reason: the profile is shared, so the path IS the blast radius.
+ */
+function ProfileSettingRow({
+  field,
+  staged,
+  onStage,
+  onWithdraw,
+}: {
+  field: ProfileSettingField
+  staged: StagedEdit | undefined
+  onStage: (value: unknown) => void
+  onWithdraw: () => void
+}) {
+  const id = useId()
+  const { setting, segments, stored } = field
+  const control = CONTROL_BY_KIND[setting.kind]
+  const label = settingLabel(setting.key)
+  const named = label ? (
+    <>
+      {label}
+      <span className="se-kv-path">{dotted(segments)}</span>
+    </>
+  ) : (
+    <span className="se-m">{dotted(segments)}</span>
+  )
+  return (
+    <div className="se-setting" data-kind={setting.kind} data-staged={staged !== undefined}>
+      {control === undefined ? (
+        // No control to name, so no label element: a `for` pointing at nothing
+        // announces a form field that is not there.
+        <span className="se-setting-name">{named}</span>
+      ) : (
+        <label className="se-setting-name" htmlFor={id}>
+          {named}
+        </label>
+      )}
+      {control === undefined ? (
+        <p className="se-note">
+          {i18nT('apps.specEngine.profilesForm.the_registry_kind_is_not_editable_here', {
+            kind: setting.kind,
+          })}
+        </p>
+      ) : (
+        <SettingControl
+          id={id}
+          setting={setting}
+          control={control}
+          value={staged ? staged.value : stored}
+          disabled={false}
+          onStage={onStage}
+          onWithdraw={onWithdraw}
+        />
+      )}
+      {/* The registry's OWN summary, not a second sentence maintained here. */}
+      <p className="se-note">{setting.summary}</p>
+      <p className="se-note">
+        {i18nT('apps.specEngine.profilesForm.stored_in_the_profile')}
+        {SEP}
+        <span className="se-m">{shownValue(stored)}</span>
+      </p>
+      {staged !== undefined && (
+        <p className="se-note">
+          <span className="se-flag" data-flag="pending">
+            {i18nT('apps.specEngine.profilesForm.not_written')}
+          </span>
+          <span className="se-m">
+            {shownValue(staged.value)}
+            {SEP}
+            {dotted(segments)}
+          </span>
+        </p>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Which sentence describes a role-field edit, keyed by the assignment field it
+ * addresses.
+ *
+ * Keys rather than resolved strings, for `ORIGIN_KEY`'s reason — a module-level
+ * `i18nT()` runs once at import and would freeze the table in whichever language
+ * happened to be active then. Whole literal values indexed at the call site, so
+ * the key-reference gate can resolve every entry rather than seeing a key this
+ * module composed.
+ *
+ * A field with no entry earns no sentence, and therefore never reaches a patch:
+ * the two fields here are the two this form has controls for, and a third one
+ * would need its own control and its own sentence in the same change.
+ */
+const ROLE_FIELD_SENTENCE_KEY: Record<string, string> = {
+  model: 'apps.specEngine.profilesForm.edit_replaces_the_role_model',
+  effort: 'apps.specEngine.profilesForm.edit_replaces_the_role_effort',
+}
+
+/** Where a staged profile copy came from, as the review card names it. */
+interface CopySource {
+  name: string
+  /** Whether the copy came from a bundled preset rather than another profile. */
+  bundled: boolean
+}
+
+/**
+ * Which preset or profile a staged entry is a copy OF, or `null` for neither.
+ *
+ * Derived from the staged bytes rather than remembered from the click, and that is
+ * the point: the review card's sentence CLAIMS a provenance, and a claim checked
+ * against what is actually staged cannot describe a copy of something else. An
+ * entry matching nothing earns no sentence and therefore never reaches a patch —
+ * an empty profile reports that a profile is selected while resolving every role
+ * to the session default, so it must not be writable from here even if some later
+ * control staged one.
+ *
+ * Compared as JSON text: both sides are objects a read handed over — a preset
+ * entry, or a node of the document — so a copy and its origin serialize
+ * identically. Two vocabularies holding byte-identical entries name whichever
+ * comes first, which is honest either way, since the bytes about to be written are
+ * both of theirs.
+ */
+function copySourceOf(
+  value: unknown,
+  presets: readonly ProfilePreset[],
+  profiles: readonly string[],
+  document: Document,
+): CopySource | null {
+  const staged = JSON.stringify(value)
+  for (const preset of presets) {
+    if (JSON.stringify(preset.entry) === staged) return { name: preset.name, bundled: true }
+  }
+  for (const name of profiles) {
+    if (JSON.stringify(nodeAt(document, profileSegments(name))) === staged) {
+      return { name, bundled: false }
+    }
+  }
+  return null
+}
+
+/**
+ * The cost profiles, as forms: role assignments, pinned limits, add and remove.
+ *
+ * A cost profile is the one place role assignments live — a project SELECTS a
+ * profile rather than overriding roles within it — so this form is where a model
+ * or an effort is changed at all. Five properties of it are claims rather than
+ * arrangement:
+ *
+ * 1. **The rows are the engine's vocabularies.** Roles, efforts and the keys a
+ *    profile may pin all come from the registry read, and a pinned limit's type,
+ *    bounds and summary come from the same registry the settings form is generated
+ *    from. Nothing here lists a role or an effort of its own.
+ * 2. **A change is not a write.** Every edit accumulates in the shared staged-edit
+ *    state and reaches the engine only through a confirm on the review card that
+ *    shows the exact patch.
+ * 3. **The consequence is stated where the edit is made.** A profile is shared by
+ *    every project that selected it, so the form says so with the count from the
+ *    document. A form that showed a role table without it would let somebody
+ *    retune four projects believing they had tuned one.
+ * 4. **An add is a copy, and a remove that would strand a project is refused.** An
+ *    empty profile resolves every role to the session default while reporting that
+ *    a profile IS selected, and a removed profile leaves its projects in exactly
+ *    that state — so one is not offered, and the other names the projects that
+ *    block it, because pointing them elsewhere is the action that unblocks it.
+ * 5. **A success re-reads.** This mutation owns the invalidation: the review card
+ *    is presentational and cannot do it for its callers. The document is where
+ *    every row here comes from, and the resolved pane beside it renders the very
+ *    roles this write changes.
+ */
+function ProfilesForm({ config }: { config: ConfigSnapshot }) {
+  const client = useQueryClient()
+  const edits = useStagedEdits()
+  const [chosen, setChosen] = useState('')
+  const [addName, setAddName] = useState('')
+  const [reviewing, setReviewing] = useState(false)
+  const [wrote, setWrote] = useState(false)
+
+  const registry = useQuery({
+    queryKey: QK.registry,
+    queryFn: () => specEngineApi.configRegistry(),
+    retry: false,
+    // Bundled vocabulary: a projection of the engine's own constants, so it cannot
+    // change while the page is open. The same key the settings form reads, so the
+    // two share one answer and one request.
+    staleTime: Infinity,
+  })
+
+  const write = useMutation({
+    mutationFn: (patch: Document) => specEngineApi.writeConfig(patch),
+    onSuccess: () => {
+      edits.clear()
+      setAddName('')
+      setReviewing(false)
+      setWrote(true)
+      // The reply's merged document is NOT adopted: the read is this pane's
+      // authority on what is persisted, and every row here is a reading OF that
+      // document. All three keys are named because they are three readings a
+      // reader would otherwise have to know the key layout to see refreshed.
+      void client.invalidateQueries({ queryKey: QK.config })
+      void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
+      void client.invalidateQueries({ queryKey: QK.sources })
+    },
+    // No `onError`: a refusal must leave the staged edits in place and the queries
+    // untouched, so the rows keep showing the store's own state.
+  })
+
+  const document = config.document
+  const names = useMemo(() => profileNames(document), [document])
+  const presets = registry.data?.profile_presets ?? NO_PROFILE_PRESETS
+  const roles = registry.data?.roles ?? NO_NAMES
+  const efforts = registry.data?.efforts ?? NO_NAMES
+  const pinnable = registry.data?.profile_settings ?? NO_NAMES
+  const settings = registry.data?.settings ?? NO_SETTINGS
+  // Normalized against the document rather than trusted: a profile removed here,
+  // in the JSON view, or by another surface must not leave the form editing a name
+  // the document no longer carries.
+  const selected = names.includes(chosen) ? chosen : (names[0] ?? '')
+  const pending = addName.trim()
+
+  // Every profile a staged edit may address: one in the document, or the one the
+  // add block is naming. An edit whose profile has left the document is dropped
+  // rather than carried, because its patch would RESURRECT that profile carrying
+  // one field — a `cost_profiles` entry with a model and no roles object — and no
+  // sentence on the card would say so. That removal can arrive from this pane, from
+  // the JSON view, or on any refetch, which is why this reconciles against the
+  // current answer instead of trusting the document to hold still between an edit
+  // and its confirm.
+  const { reconcile } = edits
+  useEffect(() => {
+    reconcile(
+      (edit) =>
+        edit.segments.length >= 2 &&
+        edit.segments[0] === COST_PROFILES &&
+        (names.includes(edit.segments[1]) || edit.segments[1] === pending),
+    )
+  }, [names, pending, reconcile])
+
+  // `isError` before the data: React Query keeps the last successful answer across
+  // a failing refetch, and rows generated from a retained vocabulary would offer
+  // roles and limits nobody re-read.
+  if (registry.isError) {
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
+        <Refused
+          title={i18nT('apps.specEngine.profilesForm.could_not_read_the_profile_vocabulary')}
+          error={registry.error}
+        />
+      </div>
+    )
+  }
+  if (registry.isPending || !registry.data) {
+    // Distinct from an empty vocabulary on purpose: "the engine registers no role"
+    // is a fact about the engine, and "not read yet" is a fact about this request.
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
+        <p className="se-note">
+          {i18nT('apps.specEngine.profilesForm.reading_the_profile_vocabulary')}
+        </p>
+      </div>
+    )
+  }
+
+  const fields = selected === '' ? [] : roleFields(selected, roles, document)
+  const pinned =
+    selected === '' ? [] : profileSettingFields(selected, pinnable, settings, document)
+  const selecting = selected === '' ? [] : projectsSelecting(document, selected)
+
+  // Plain functions rather than `useCallback`: each closes over the mutation
+  // object, which React Query hands back fresh on every render, so a memo here
+  // would advertise a stability it cannot have.
+  const touched = () => {
+    setWrote(false)
+    write.reset()
+  }
+
+  /** Whether *value* is what the document already stores AT *segments*. */
+  const storedHere = (segments: readonly string[], value: unknown) =>
+    JSON.stringify(nodeAt(document, segments) ?? null) === JSON.stringify(value ?? null)
+
+  const stageField = (segments: readonly string[], value: unknown) => {
+    touched()
+    // Typing back exactly what this path already stores is not a change, and every
+    // write is recorded: staging it would put a line in the durable write record
+    // for an edit nobody made. Compared against the DOCUMENT node at this path
+    // rather than against a resolution, because a profile's assignment is stored
+    // where it is read — there is no precedence between the two to disagree about.
+    if (storedHere(segments, value)) edits.unstage(segments)
+    else edits.stage(segments, value)
+  }
+
+  const stageEffort = (field: RoleField, effort: string) => {
+    stageField(field.effortSegments, effort)
+    // An effort with no model is an assignment the write door refuses
+    // (`roles.<role>.model: expected a non-empty string`), so pinning an effort on
+    // an unassigned role stages the default model with it. Staged rather than
+    // implied: it becomes its own line in the patch and its own sentence on the
+    // card, because a value written under an operator's confirm has to be one they
+    // could see before confirming.
+    if (typeof field.storedModel !== 'string' || field.storedModel.trim() === '') {
+      if (!edits.stagedAt(field.modelSegments)) edits.stage(field.modelSegments, AUTO_MODEL)
+    }
+  }
+
+  const stageCopy = (entry: unknown) => {
+    touched()
+    // Refused rather than merged: the store's merge would fold the copy INTO the
+    // existing profile key by key, which is an edit to that profile rather than the
+    // addition this control offers.
+    if (pending === '' || names.includes(pending)) return
+    edits.stage(profileSegments(pending), entry)
+  }
+
+  const renameAdd = (next: string) => {
+    touched()
+    const staged = pending === '' ? undefined : edits.stagedAt(profileSegments(pending))
+    if (staged) edits.unstage(profileSegments(pending))
+    const trimmed = next.trim()
+    // A staged copy MOVES with the name rather than being dropped: an operator who
+    // picked a preset and then reconsidered the name meant to keep the copy.
+    if (staged && trimmed !== '' && !names.includes(trimmed)) {
+      edits.stage(profileSegments(trimmed), staged.value)
+    }
+    setAddName(next)
+  }
+
+  const stageRemoval = (profile: string) => {
+    touched()
+    // Refused, and not by a silent disable: the operator has to know WHICH projects
+    // block the removal, because pointing them at another profile is the action
+    // that unblocks it.
+    if (projectsSelecting(document, profile).length > 0) return
+    edits.stage(profileSegments(profile), DELETE)
+  }
+
+  const discard = () => {
+    edits.clear()
+    setReviewing(false)
+    setWrote(false)
+    write.reset()
+  }
+
+  /**
+   * One staged edit as the review card reads it, or `null` when this form cannot
+   * say what the edit means.
+   *
+   * The patch is built from exactly the edits this returns a sentence for, so the
+   * card can never show a line it cannot explain and a write can never carry one.
+   */
+  const describe = (edit: StagedEdit): ReviewedChange | null => {
+    const path = dotted(edit.segments)
+    const profile = edit.segments[1]
+    const rest = edit.segments.slice(2)
+    if (rest.length === 0) {
+      if (edit.value === DELETE) {
+        return {
+          path,
+          sentence: i18nT('apps.specEngine.profilesForm.edit_removes_the_profile', {
+            profile,
+            path,
+          }),
+        }
+      }
+      const from = copySourceOf(edit.value, presets, names, document)
+      if (!from) return null
+      return {
+        path,
+        // Two sentences rather than one with the kind interpolated: copying a
+        // bundled preset and copying a profile somebody already tuned are two
+        // different provenances, and the second one is shared with live projects.
+        sentence: from.bundled
+          ? i18nT('apps.specEngine.profilesForm.edit_copies_the_bundled_preset', {
+              profile,
+              preset: from.name,
+              path,
+            })
+          : i18nT('apps.specEngine.profilesForm.edit_copies_the_existing_profile', {
+              profile,
+              preset: from.name,
+              path,
+            }),
+      }
+    }
+    if (rest.length === 3 && rest[0] === ROLES_KEY && ROLE_FIELD_SENTENCE_KEY[rest[2]]) {
+      return {
+        path,
+        // Indexed at the call site rather than through a local, so the
+        // key-reference gate resolves every entry in the table.
+        sentence: i18nT(ROLE_FIELD_SENTENCE_KEY[rest[2]], {
+          profile,
+          role: rest[1],
+          oldValue: shownValue(nodeAt(document, edit.segments)),
+          newValue: shownValue(edit.value),
+          path,
+        }),
+      }
+    }
+    if (rest.length === 2) {
+      const setting = `${rest[0]}.${rest[1]}`
+      return {
+        path,
+        sentence: i18nT('apps.specEngine.profilesForm.edit_replaces_the_pinned_limit', {
+          setting: settingLabel(setting) || setting,
+          profile,
+          oldValue: shownValue(nodeAt(document, edit.segments)),
+          newValue: shownValue(edit.value),
+          path,
+        }),
+      }
+    }
+    return null
+  }
+
+  // The staged edits this form can account for, and the patch built from exactly
+  // those. One list for both, for the reason above.
+  const reviewed: Array<{ edit: StagedEdit; change: ReviewedChange }> = []
+  for (const edit of edits.edits) {
+    const change = describe(edit)
+    if (change) reviewed.push({ edit, change })
+  }
+  const patch = buildFormPatch(reviewed.map((entry) => entry.edit))
+  const removing = reviewed.filter(({ edit }) => edit.value === DELETE)
+  const addBlocked = pending === '' || names.includes(pending)
+
+  return (
+    <div className="se-blk">
+      <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
+      {names.length === 0 ? (
+        /* Not an empty role table: rows of unassignable roles read as "these roles
+           have no model", when the fact is that no profile exists to assign them
+           in. The add block below is the answer, so the sentence points at it. */
+        <p className="se-note">
+          {i18nT('apps.specEngine.profilesForm.no_cost_profile_is_defined')}
+        </p>
+      ) : (
+        <>
+          <div
+            className="se-acts"
+            role="group"
+            aria-label={i18nT('apps.specEngine.profilesForm.select_a_cost_profile')}
+          >
+            {names.map((name) => (
+              <button
+                key={name}
+                type="button"
+                className="se-btn se-sm se-m"
+                aria-pressed={name === selected}
+                onClick={() => setChosen(name)}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+          {/* The consequence of every edit below, stated once above them all: the
+              profile is shared, and the count is the document's own. */}
+          <p className="se-note">
+            {i18nT('apps.specEngine.profilesForm.the_values_apply_to_every_project', {
+              profile: selected,
+              count: fmtNumber(selecting.length),
+            })}
+          </p>
+          {fields.length === 0 ? (
+            <p className="se-note">{i18nT('apps.specEngine.profilesForm.no_role_is_registered')}</p>
+          ) : (
+            <div className="se-settings">
+              {fields.map((field) => (
+                <RoleAssignmentRow
+                  key={field.role}
+                  field={field}
+                  efforts={efforts}
+                  stagedModel={edits.stagedAt(field.modelSegments)}
+                  stagedEffort={edits.stagedAt(field.effortSegments)}
+                  onModel={(value) => stageField(field.modelSegments, value)}
+                  onEffort={(effort) => stageEffort(field, effort)}
+                />
+              ))}
+            </div>
+          )}
+          <p className="se-note">{i18nT('apps.specEngine.profilesForm.the_model_is_free_text')}</p>
+          <p className="se-note">
+            {i18nT('apps.specEngine.profilesForm.an_effort_needs_a_model', { model: AUTO_MODEL })}
+          </p>
+          {pinned.length > 0 && (
+            <>
+              <h3>{i18nT('apps.specEngine.profilesForm.limits_this_profile_pins')}</h3>
+              <div className="se-settings">
+                {pinned.map((field) => (
+                  <ProfileSettingRow
+                    key={field.setting.key}
+                    field={field}
+                    staged={edits.stagedAt(field.segments)}
+                    onStage={(value) => stageField(field.segments, value)}
+                    onWithdraw={() => {
+                      touched()
+                      edits.unstage(field.segments)
+                    }}
+                  />
+                ))}
+              </div>
+              <p className="se-note">
+                {i18nT('apps.specEngine.profilesForm.a_profile_may_pin_only_these_limits')}
+              </p>
+            </>
+          )}
+          <div className="se-acts" style={{ marginTop: 9 }}>
+            <button
+              type="button"
+              className="se-btn se-sm se-danger"
+              // The accessible name carries the target even though the visible
+              // label is one word: a bare "Remove" is how somebody removes the
+              // wrong profile.
+              aria-label={i18nT('apps.specEngine.profilesForm.remove_the_profile', {
+                profile: selected,
+              })}
+              onClick={() => stageRemoval(selected)}
+            >
+              {i18nT('apps.specEngine.configPanel.remove')}
+            </button>
+          </div>
+          {selecting.length > 0 && (
+            /* The refusal names the projects, in flow beside the control. A
+               `disabled` button with no reason would leave an operator with no next
+               action, and the next action is precisely to point these projects at
+               another profile. */
+            <p className="se-note" role="status">
+              {i18nT('apps.specEngine.profilesForm.a_project_still_selects_the_profile', {
+                projects: selecting.join(', '),
+                profile: selected,
+              })}
+            </p>
+          )}
+        </>
+      )}
+
+      <h3>{i18nT('apps.specEngine.profilesForm.add_a_cost_profile')}</h3>
+      <div className="se-setting">
+        <label className="se-setting-name" htmlFor="se-profile-add-name">
+          {i18nT('apps.specEngine.profilesForm.name_for_the_new_profile')}
+        </label>
+        <input
+          id="se-profile-add-name"
+          type="text"
+          className="se-input"
+          value={addName}
+          onChange={(event) => renameAdd(event.target.value)}
+        />
+        {pending !== '' && names.includes(pending) && (
+          <p className="se-note" role="status">
+            {i18nT('apps.specEngine.profilesForm.the_name_is_already_a_profile', {
+              profile: pending,
+            })}
+          </p>
+        )}
+        {pending === '' && (
+          <p className="se-note">{i18nT('apps.specEngine.profilesForm.name_the_profile_first')}</p>
+        )}
+      </div>
+      {presets.length > 0 && (
+        <div
+          className="se-acts"
+          role="group"
+          aria-label={i18nT('apps.specEngine.profilesForm.copy_a_bundled_preset')}
+        >
+          {presets.map((preset) => (
+            <button
+              key={preset.name}
+              type="button"
+              className="se-btn se-sm se-m"
+              disabled={addBlocked}
+              onClick={() => stageCopy(preset.entry)}
+            >
+              {preset.name}
+            </button>
+          ))}
+        </div>
+      )}
+      {names.length > 0 && (
+        <div
+          className="se-acts"
+          role="group"
+          aria-label={i18nT('apps.specEngine.profilesForm.copy_an_existing_profile')}
+        >
+          {names.map((name) => (
+            <button
+              key={name}
+              type="button"
+              className="se-btn se-sm se-m"
+              disabled={addBlocked}
+              onClick={() => stageCopy(nodeAt(document, profileSegments(name)))}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      )}
+      <p className="se-note">{i18nT('apps.specEngine.profilesForm.an_add_is_always_a_copy')}</p>
+
+      <div className="se-acts" style={{ marginTop: 9 }}>
+        <button
+          type="button"
+          className="se-btn"
+          disabled={reviewed.length === 0}
+          onClick={() => setReviewing(true)}
+        >
+          {i18nT('apps.specEngine.profilesForm.review_the_exact_change')}
+        </button>
+        {reviewed.length > 0 && (
+          <span className="se-lbl">
+            {i18nT('apps.specEngine.profilesForm.unwritten_profile_changes')}
+            {SEP}
+            <span className="se-m">{fmtNumber(reviewed.length)}</span>
+          </span>
+        )}
+      </div>
+      {reviewing && reviewed.length > 0 && (
+        <FormReview
+          changes={reviewed.map((entry) => entry.change)}
+          patch={patch}
+          labels={{
+            heading: i18nT('apps.specEngine.profilesForm.the_change_that_would_be_written'),
+            confirm: i18nT('apps.specEngine.profilesForm.write_the_change'),
+            writing: i18nT('apps.specEngine.configPanel.saving'),
+            discard: i18nT('apps.specEngine.profilesForm.discard_the_pending_changes'),
+            exactly: i18nT('apps.specEngine.profilesForm.a_confirm_writes_exactly_this_patch'),
+            refusalTitle: i18nT('apps.specEngine.profilesForm.could_not_write_the_profile_change'),
+            retained: i18nT(
+              'apps.specEngine.profilesForm.nothing_was_written_so_the_profile_is_stored_state',
+            ),
+          }}
+          consequences={
+            removing.length > 0 && (
+              /* In flow under the patch, never a dialog: a deletion's blast radius
+                 is not legible in a `null`, and a consequence stated in an overlay
+                 is one that can be dismissed. */
+              <div className="se-arm">
+                {removing.map(({ edit }) => (
+                  <p key={dotted(edit.segments)}>
+                    <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                    {i18nT('apps.specEngine.profilesForm.removing_deletes_the_profile', {
+                      profile: edit.segments[1],
+                      path: dotted(edit.segments),
+                    })}
+                  </p>
+                ))}
+              </div>
+            )
+          }
+          writing={write.isPending}
+          error={write.isError ? write.error : null}
+          onConfirm={() => write.mutate(patch)}
+          onDiscard={discard}
+        />
+      )}
+      {wrote && (
+        <p className="se-note" role="status">
+          {i18nT('apps.specEngine.profilesForm.wrote_the_change_and_re_read_the_profiles')}
+        </p>
       )}
     </div>
   )
@@ -2679,6 +3651,10 @@ export function ConfigPane({
                   different projects is the disagreement the shared selection
                   exists to prevent. */}
               <SettingsForm project={project} />
+              {/* Beside the settings because a role's model and effort are the
+                  other half of what a project runs on, and they live nowhere else:
+                  a project SELECTS a profile rather than overriding roles in it. */}
+              <ProfilesForm config={config} />
               {/* Beside the projects table for the same reason: who may run how
                   unattended is a reading, and reading it out of JSON is not the
                   same as seeing the matrix. */}
