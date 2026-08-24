@@ -440,7 +440,7 @@ class TestScanConfigThreading:
     ) -> None:
         root = tmp_path / "work"
         (root / "svc").mkdir(parents=True)
-        (root / "svc" / "composer.json").write_text("{}", encoding="utf-8")
+        (root / "svc" / "BUILD.bazel").write_text("{}", encoding="utf-8")
 
         async with TestClient(TestServer(_make_scaffold_app(state))) as client:
             _, unconfigured = await _scan(client, root)
@@ -448,12 +448,12 @@ class TestScanConfigThreading:
 
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_folder_scaffold.KiroCrewConfig",
-            _StubConfig(_config_with_scaffold(extra_manifest_signals=["composer.json"])),
+            _StubConfig(_config_with_scaffold(extra_manifest_signals=["BUILD.bazel"])),
         )
         async with TestClient(TestServer(_make_scaffold_app(state))) as client:
             _, configured = await _scan(client, root)
         assert [c["name"] for c in configured["candidates"]] == ["svc"]
-        assert configured["candidates"][0]["signals"] == ["manifest:composer.json"]
+        assert configured["candidates"][0]["signals"] == ["manifest:BUILD.bazel"]
 
 
 def _config_with_scaffold(**overrides: Any) -> Any:

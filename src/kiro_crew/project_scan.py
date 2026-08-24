@@ -86,11 +86,33 @@ MANIFESTS: tuple[str, ...] = (
     "pom.xml",
     "build.gradle",
     "build.gradle.kts",
-    # A Firebase app root. Not a build manifest, but it marks the same thing
-    # one does — "this directory is a deployable unit" — and a Firebase app
-    # commonly has no manifest of its own at that level (the package.json
-    # files live in its functions/ and web/ children).
+    "build.sbt",
+    "pubspec.yaml",
+    "composer.json",
+    "Gemfile",
+    "mix.exs",
+    "Package.swift",
+    "deno.json",
+    "deno.jsonc",
+    # Deploy-root markers. Not build manifests, but they mark the same thing
+    # one does — "this directory is a deployable unit" — and such an app
+    # commonly has no manifest of its own at that level (a Firebase app's
+    # package.json files live in its functions/ and web/ children). Generic
+    # names that would flag non-apps (template.yaml, app.yaml, Dockerfile)
+    # are deliberately absent; ``scaffold.extra_manifest_signals`` covers
+    # anyone who wants them.
     "firebase.json",
+    "vercel.json",
+    "netlify.toml",
+    "amplify.yml",
+    "serverless.yml",
+    "serverless.yaml",
+    "cdk.json",
+    "wrangler.toml",
+    "wrangler.jsonc",
+    "fly.toml",
+    "render.yaml",
+    "Procfile",
 )
 
 # Files that can carry a workspace's member list. ``package.json`` and
