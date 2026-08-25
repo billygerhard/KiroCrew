@@ -95,9 +95,11 @@ import {
   type RegistrySetting,
   type ResolvedRole,
   type SourceGridCell,
+  type SourcePreset,
   type SourcesPayload,
 } from './api'
 import {
+  AUTONOMY_KEY,
   COST_PROFILES,
   DELETE,
   FIELD_EFFORT,
@@ -107,6 +109,7 @@ import {
   ROLES_KEY,
   SCOPE_PROJECT,
   SCOPE_SOURCE,
+  SOURCES,
   buildFormPatch,
   buildGridPatch,
   documentText,
@@ -123,6 +126,7 @@ import {
   roleFieldSegments,
   roleSegments,
   sameCell,
+  settingLeaf,
   settingSegments,
   type Document,
   type GridCellRef,
@@ -142,6 +146,16 @@ const APP_WIDE = ''
 
 /** React key for the app-defaults row, whose id is deliberately not a project. */
 const APP_DEFAULTS_ROW_KEY = 'app-defaults'
+
+/**
+ * The id the autonomy grid section carries, so the source form can link into it.
+ *
+ * A link rather than a second rendering of the matrix: the grid is one resolution of
+ * the engine's autonomy policy, and two copies on one pane would be two answers to
+ * one question. Declared here beside the pane's other identifiers because both the
+ * section that carries it and the form that links to it need it.
+ */
+const SOURCES_GRID_ID = 'se-sources-grid'
 
 /**
  * The origin of a value in force, in words, keyed by the engine's own enum.
@@ -706,10 +720,20 @@ function GridReview({
  * The semantics sit once in the section rather than per cell: they are properties of
  * the resolution, not of any one pair, and twelve copies of a sentence teach a
  * reader to stop reading it.
+ *
+ * The shown source is the PANE's, not this section's: the source form above links
+ * into this matrix for the source it is editing, and a selection held here as well
+ * would let the link name one source while the grid rendered another.
  */
-function SourcesSection() {
+function SourcesSection({
+  chosen,
+  onChoose,
+}: {
+  /** The source the pane has selected, `''` when it has selected none. */
+  chosen: string
+  onChoose: (source: string) => void
+}) {
   const client = useQueryClient()
-  const [chosen, setChosen] = useState('')
   // The operator's choices, keyed by cell rather than by screen position, so
   // switching the shown source does not lose them and cannot silently move one.
   const [edits, setEdits] = useState<readonly PendingEdit[]>([])
@@ -812,7 +836,7 @@ function SourcesSection() {
   // `isError` first, then the data: see property 2 above.
   if (sources.isError) {
     return (
-      <div className="se-blk">
+      <div className="se-blk" id={SOURCES_GRID_ID}>
         <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
         <Refused
           title={i18nT('apps.specEngine.sourcesSection.could_not_read_the_watch_sources')}
@@ -825,7 +849,7 @@ function SourcesSection() {
     // Distinct from the empty state on purpose: "nothing is configured" is a fact
     // about the document, and "not read yet" is a fact about this request.
     return (
-      <div className="se-blk">
+      <div className="se-blk" id={SOURCES_GRID_ID}>
         <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
         <p className="se-note">{i18nT('apps.specEngine.sourcesSection.reading_the_watch_sources')}</p>
       </div>
@@ -862,7 +886,7 @@ function SourcesSection() {
     pickedShown !== null && pickedResolved ? { pair: pickedShown, cell: pickedResolved } : null
 
   return (
-    <div className="se-blk">
+    <div className="se-blk" id={SOURCES_GRID_ID}>
       <h3>{i18nT('apps.specEngine.sourcesSection.watch_sources')}</h3>
       {names.length === 0 ? (
         /* Not an empty matrix: a grid with no source to belong to reads as "no
@@ -885,7 +909,7 @@ function SourcesSection() {
                 type="button"
                 className="se-btn se-sm se-m"
                 aria-pressed={name === selected}
-                onClick={() => setChosen(name)}
+                onClick={() => onChoose(name)}
               >
                 {name}
               </button>
@@ -1842,11 +1866,20 @@ function roleFields(profile: string, roles: readonly string[], document: Documen
   })
 }
 
-/** One pinned limit's row: its registry record, its path, and what is pinned. */
-interface ProfileSettingField {
+/**
+ * One stored setting's row: its registry record, its path, and what is there.
+ *
+ * Shared by a cost profile's pinned limits and a watch source's own settings,
+ * because both are the same thing — one registry setting stored at one path the
+ * document holds directly, rather than resolved through the scope precedence the
+ * settings form reads. A second copy of this for sources would be a second place
+ * the control, the bounds and the staged-vs-stored mark could drift from the
+ * registry.
+ */
+interface StoredSettingField {
   setting: RegistrySetting
   segments: readonly string[]
-  /** The value the profile pins, `undefined` when it pins none. */
+  /** The value stored at the path, `undefined` when nothing is. */
   stored: unknown
 }
 
@@ -1864,8 +1897,8 @@ function profileSettingFields(
   keys: readonly string[],
   settings: readonly RegistrySetting[],
   document: Document,
-): ProfileSettingField[] {
-  const fields: ProfileSettingField[] = []
+): StoredSettingField[] {
+  const fields: StoredSettingField[] = []
   for (const key of keys) {
     const setting = settings.find((entry) => entry.key === key)
     const segments = profileSettingSegments(profile, key)
@@ -2003,21 +2036,38 @@ function RoleAssignmentRow({
 }
 
 /**
- * One limit a profile pins: the registry's own control for it, and what is pinned.
+ * One setting stored at one path: the registry's own control for it, and what is
+ * stored there.
  *
- * The control comes from the shared {@link SettingControl}, so a pinned limit and
- * the same setting written at app scope are edited by one control carrying one set
- * of bounds. What differs is only where the write lands — `cost_profiles.<name>`
- * rather than a scope — and the row states that path for the settings rows'
- * reason: the profile is shared, so the path IS the blast radius.
+ * The control comes from the shared {@link SettingControl}, so a limit pinned in a
+ * profile, a setting a source holds, and the same setting written at app scope are
+ * all edited by one control carrying one set of bounds. What differs is only where
+ * the write lands — `cost_profiles.<name>` or `sources.<name>` rather than a scope
+ * — and the row states that path for the settings rows' reason: the path IS the
+ * blast radius, and a profile is shared by every project that selected it.
+ *
+ * The three sentences are the CALLER's, resolved at its own call site: "stored in
+ * the profile" and "stored on the source" are different facts, and a shared row
+ * that invented one wording for both would say the wrong one half the time.
  */
-function ProfileSettingRow({
+interface StoredSettingLabels {
+  /** Leads the line stating what is stored at the path. */
+  stored: string
+  /** Marks a staged value as unwritten. */
+  notWritten: string
+  /** States that this registry kind has no control here, naming the kind. */
+  notEditable: string
+}
+
+function StoredSettingRow({
   field,
+  labels,
   staged,
   onStage,
   onWithdraw,
 }: {
-  field: ProfileSettingField
+  field: StoredSettingField
+  labels: StoredSettingLabels
   staged: StagedEdit | undefined
   onStage: (value: unknown) => void
   onWithdraw: () => void
@@ -2046,11 +2096,7 @@ function ProfileSettingRow({
         </label>
       )}
       {control === undefined ? (
-        <p className="se-note">
-          {i18nT('apps.specEngine.profilesForm.the_registry_kind_is_not_editable_here', {
-            kind: setting.kind,
-          })}
-        </p>
+        <p className="se-note">{labels.notEditable}</p>
       ) : (
         <SettingControl
           id={id}
@@ -2065,14 +2111,14 @@ function ProfileSettingRow({
       {/* The registry's OWN summary, not a second sentence maintained here. */}
       <p className="se-note">{setting.summary}</p>
       <p className="se-note">
-        {i18nT('apps.specEngine.profilesForm.stored_in_the_profile')}
+        {labels.stored}
         {SEP}
         <span className="se-m">{shownValue(stored)}</span>
       </p>
       {staged !== undefined && (
         <p className="se-note">
           <span className="se-flag" data-flag="pending">
-            {i18nT('apps.specEngine.profilesForm.not_written')}
+            {labels.notWritten}
           </span>
           <span className="se-m">
             {shownValue(staged.value)}
@@ -2532,9 +2578,17 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
               <h3>{i18nT('apps.specEngine.profilesForm.limits_this_profile_pins')}</h3>
               <div className="se-settings">
                 {pinned.map((field) => (
-                  <ProfileSettingRow
+                  <StoredSettingRow
                     key={field.setting.key}
                     field={field}
+                    labels={{
+                      stored: i18nT('apps.specEngine.profilesForm.stored_in_the_profile'),
+                      notWritten: i18nT('apps.specEngine.profilesForm.not_written'),
+                      notEditable: i18nT(
+                        'apps.specEngine.profilesForm.the_registry_kind_is_not_editable_here',
+                        { kind: field.setting.kind },
+                      ),
+                    }}
                     staged={edits.stagedAt(field.segments)}
                     onStage={(value) => stageField(field.segments, value)}
                     onWithdraw={() => {
@@ -2721,6 +2775,1226 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
       {wrote && (
         <p className="se-note" role="status">
           {i18nT('apps.specEngine.profilesForm.wrote_the_change_and_re_read_the_profiles')}
+        </p>
+      )}
+    </div>
+  )
+}
+
+// --- the watch source form ----------------------------------------------------
+
+/** Field of a source entry deciding whether the engine polls it at all. */
+const SOURCE_ENABLED = 'enabled'
+
+/** Field of a source entry naming the project its items are filed into. */
+const SOURCE_PROJECT = 'project'
+
+/** Field of a source entry listing the accounts classified as maintainers. */
+const SOURCE_MAINTAINERS = 'maintainers'
+
+/** Field holding the poll argv the engine EXECUTES. */
+const SOURCE_POLL = 'poll'
+
+/** Field holding where each engine item field sits in the poll's output. */
+const SOURCE_FIELD_MAP = 'field_map'
+
+/** Field naming the bundled preset an entry was copied from. */
+const SOURCE_PRESET = 'preset'
+
+/** Field declaring the source's items publicly submittable. */
+const SOURCE_PUBLIC = 'public'
+
+/**
+ * The two fields carrying what the engine runs and how it reads the output.
+ *
+ * Named as a pair because they are the pair no path this form composes may
+ * address. `poll` is argv the engine executes, and the write door validates its
+ * SHAPE rather than which program it names — so the boundary on what the engine
+ * runs is the preset tables plus this form's refusal to compose either path, and
+ * nothing downstream of that.
+ */
+const SOURCE_ARGV_FIELDS: readonly string[] = [SOURCE_POLL, SOURCE_FIELD_MAP]
+
+/**
+ * The fields of a source entry this form writes. Deliberately these three.
+ *
+ * Exported because the claim is about the LIST: every write this form can make is
+ * one of these three fields, a registry-typed per-source setting, a whole preset
+ * copy, or a deletion — and none of those can carry an argument the engine runs. A
+ * name added here without a control is a path nothing stages; a name added here
+ * that the engine executes is the failure this whole form exists to prevent.
+ */
+export const SOURCE_FORM_FIELDS: readonly string[] = [
+  SOURCE_ENABLED,
+  SOURCE_PROJECT,
+  SOURCE_MAINTAINERS,
+]
+
+/**
+ * The fields this form displays without writing them.
+ *
+ * Shown rather than hidden: an operator deciding whether to arm a source is
+ * deciding to run the command in `poll`, so the command is on screen in full.
+ * `autonomy` is displayed by the grid section this form links to, which is one
+ * resolution of it rather than a second rendering here.
+ */
+const SOURCE_SHOWN_FIELDS: readonly string[] = [
+  SOURCE_POLL,
+  SOURCE_FIELD_MAP,
+  SOURCE_PRESET,
+  SOURCE_PUBLIC,
+  AUTONOMY_KEY,
+]
+
+/** The preset vocabulary before the read answers. One constant, for `NO_SETTINGS`'
+ *  reason: a memo over it must not see a fresh array on every render. */
+const NO_SOURCE_PRESETS: readonly SourcePreset[] = []
+/**
+ * The watch sources the document declares, in the order it holds them.
+ *
+ * The document's own order rather than sorted, matching `source_names` in the
+ * engine: the picker then lists sources in the order the file does, which is the
+ * order an operator reading the JSON view sees.
+ */
+export function sourceNames(document: Document): string[] {
+  const node = document[SOURCES]
+  return isObject(node) ? Object.keys(node) : []
+}
+
+/**
+ * The entry a preset copy stages: the preset's own bytes, still inert.
+ *
+ * Two properties, and both are why this is a function rather than a spread at a
+ * call site:
+ *
+ * 1. **The commands are the preset's, byte for byte.** `poll` and `field_map` come
+ *    out exactly as the engine's own table holds them, because this is a deep copy
+ *    of the entry the read supplied and nothing here composes an argument. Since
+ *    the write door checks an argv's shape and not which program it names, this is
+ *    where "the engine runs only what it bundled" is actually decided.
+ * 2. **`enabled` is ABSENT, not false.** The bundled table carries no such key on
+ *    purpose — polling is the step that decides an unattended run may start at all,
+ *    and a fresh copy still names the preset's placeholder repository. Removing the
+ *    key rather than trusting the payload makes inert-by-default a property of this
+ *    function, so a payload that ever carried one cannot arm a copy.
+ *
+ * Copied through JSON, which is what the entry is: a value a read handed over. The
+ * read's own object must never become the staged value — an edit to the staged copy
+ * would then change what the next copy is offered, and the cache is shared with
+ * every other surface reading the registry.
+ */
+export function composeSource(preset: SourcePreset): Document {
+  const entry = JSON.parse(JSON.stringify(preset.entry)) as Document
+  delete entry[SOURCE_ENABLED]
+  return entry
+}
+
+/**
+ * One act the source form can perform, in the only vocabulary it has.
+ *
+ * A closed vocabulary rather than a free `(segments, value)` call, because that is
+ * what makes the no-freeform-argv guarantee statable at all: {@link sourceEdit} is
+ * the ONE place this form composes a path under `sources`, so the set of paths it
+ * can write is exactly the set these four kinds produce.
+ */
+export type SourceFormAction =
+  | { kind: 'add'; source: string; preset: SourcePreset }
+  | { kind: 'field'; source: string; field: string; value: unknown }
+  | { kind: 'setting'; source: string; key: string; value: unknown }
+  | { kind: 'remove'; source: string }
+
+/**
+ * The one staged edit an action makes, or `null` for an action with no address.
+ *
+ * `null` rather than a guessed path for every way an action cannot be composed: an
+ * unnamed source, a field outside {@link SOURCE_FORM_FIELDS}, a registry key with
+ * no group — and a setting whose group would land on one of the argv fields. That
+ * last guard is not hypothetical caution: the schema keeps setting groups and
+ * source fields disjoint, but a group named `poll` would address the command the
+ * engine executes, and the guard belongs where the path is composed rather than
+ * resting on the schema's promise.
+ */
+export function sourceEdit(action: SourceFormAction): StagedEdit | null {
+  if (action.source.trim() === '') return null
+  if (action.kind === 'add') {
+    return { segments: [SOURCES, action.source], value: composeSource(action.preset) }
+  }
+  if (action.kind === 'remove') {
+    return { segments: [SOURCES, action.source], value: DELETE }
+  }
+  if (action.kind === 'field') {
+    if (!SOURCE_FORM_FIELDS.includes(action.field)) return null
+    return { segments: [SOURCES, action.source, action.field], value: action.value }
+  }
+  const segments = settingSegments(action.key, SCOPE_SOURCE, action.source)
+  if (segments === null || SOURCE_ARGV_FIELDS.includes(segments[2])) return null
+  return { segments, value: action.value }
+}
+
+/** The setting leaves a source may hold, keyed by the group holding them. */
+function sourceSettingGroups(settings: readonly RegistrySetting[]): Map<string, Set<string>> {
+  const groups = new Map<string, Set<string>>()
+  for (const setting of settings) {
+    if (!setting.scopes.includes(SCOPE_SOURCE)) continue
+    const leaf = settingLeaf(setting.key)
+    if (!leaf) continue
+    const found = groups.get(leaf[0]) ?? new Set<string>()
+    found.add(leaf[1])
+    groups.set(leaf[0], found)
+  }
+  return groups
+}
+
+/** What this form can say about one stored source entry. */
+export interface SourceShape {
+  /** The bundled preset whose poll argv the entry carries, or `null` for none. */
+  preset: SourcePreset | null
+  /** The entry's own keys this form neither writes nor displays, in order. */
+  unexpressed: readonly string[]
+  /** Whether the form can express the WHOLE entry. */
+  expressible: boolean
+}
+
+/**
+ * Whether the form can express a stored entry, and what stops it when it cannot.
+ *
+ * Both halves have to hold.
+ *
+ * A `poll` no bundled preset supplied cannot be described as a preset's — and
+ * describing what the engine runs is the whole of what this form offers in place of
+ * a command field. It is also the arming risk: the one edit here that starts
+ * execution is `enabled`, so a form that offered it over argv nobody bundled would
+ * be a way to arm a command this surface never constrained.
+ *
+ * And a key the form neither edits nor displays is a field a partial form would
+ * hide while the operator confirmed a write. The requirement's own words are that
+ * such an entry routes to the JSON view rather than rendering a form that rewrites
+ * fields it did not show.
+ *
+ * A setting group is expressible LEAF BY LEAF: a group holding a leaf no registry
+ * record describes has no kind, no bounds and no summary to generate a control
+ * from, so showing its siblings does not express it.
+ *
+ * The residual, stated because it is a real cost rather than an oversight: a preset
+ * copy whose placeholder repository has been named in the JSON view no longer
+ * carries the preset's argv byte for byte, so this form stops offering it and says
+ * so. That is the honest direction to fail in — the alternative is a form that
+ * edits and arms sources whose commands it cannot vouch for — but it does mean the
+ * JSON view owns a source from the moment its command is made real.
+ */
+export function sourceShape(
+  entry: unknown,
+  presets: readonly SourcePreset[],
+  settings: readonly RegistrySetting[],
+): SourceShape {
+  if (!isObject(entry)) return { preset: null, unexpressed: [], expressible: false }
+  const poll = JSON.stringify(entry[SOURCE_POLL] ?? null)
+  const from =
+    presets.find((preset) => JSON.stringify(preset.entry[SOURCE_POLL] ?? null) === poll) ?? null
+  const groups = sourceSettingGroups(settings)
+  const unexpressed: string[] = []
+  for (const key of Object.keys(entry)) {
+    if (SOURCE_FORM_FIELDS.includes(key) || SOURCE_SHOWN_FIELDS.includes(key)) continue
+    const leaves = groups.get(key)
+    const value = entry[key]
+    if (leaves && isObject(value) && Object.keys(value).every((leaf) => leaves.has(leaf))) continue
+    unexpressed.push(key)
+  }
+  return { preset: from, unexpressed, expressible: from !== null && unexpressed.length === 0 }
+}
+
+/**
+ * The preset a staged entry is a copy OF, or `null` when it is a copy of nothing.
+ *
+ * Derived from the staged bytes rather than remembered from the click, for
+ * {@link copySourceOf}'s reason: the review card CLAIMS a provenance, and a claim
+ * checked against what is actually staged cannot describe a copy of something else.
+ * An entry matching no preset earns no sentence and therefore reaches no patch —
+ * the second place, after {@link sourceEdit}, where an entry carrying argv nobody
+ * bundled is stopped before it can be written.
+ */
+function sourcePresetOf(value: unknown, presets: readonly SourcePreset[]): SourcePreset | null {
+  const staged = JSON.stringify(value)
+  for (const preset of presets) {
+    if (JSON.stringify(composeSource(preset)) === staged) return preset
+  }
+  return null
+}
+
+/** One row per registry setting a source may hold, in the registry's order. */
+function sourceSettingFields(
+  source: string,
+  settings: readonly RegistrySetting[],
+  document: Document,
+): StoredSettingField[] {
+  const fields: StoredSettingField[] = []
+  for (const setting of settings) {
+    if (!setting.scopes.includes(SCOPE_SOURCE)) continue
+    const segments = settingSegments(setting.key, SCOPE_SOURCE, source)
+    if (segments === null) continue
+    fields.push({ setting, segments, stored: nodeAt(document, segments) })
+  }
+  return fields
+}
+
+/**
+ * Which sentence describes an enablement edit, keyed by what it would store.
+ *
+ * Keys rather than resolved strings, for `ORIGIN_KEY`'s reason. Two sentences
+ * rather than one with the value interpolated, because they are opposite acts: one
+ * starts unattended ingestion and the other stops it.
+ */
+const SOURCE_ENABLED_SENTENCE_KEY: Record<string, string> = {
+  true: 'apps.specEngine.sourceForm.edit_enables_the_source',
+  false: 'apps.specEngine.sourceForm.edit_disables_the_source',
+}
+
+/** Which sentence describes a field edit, keyed by the field it addresses. */
+const SOURCE_FIELD_SENTENCE_KEY: Record<string, string> = {
+  project: 'apps.specEngine.sourceForm.edit_replaces_the_project_binding',
+  maintainers: 'apps.specEngine.sourceForm.edit_replaces_the_maintainers',
+}
+
+/** A maintainer list as one line of text, and back. Commas, because the values
+ *  are account names and the engine stores them as a list of strings. */
+function maintainerText(stored: unknown): string {
+  return Array.isArray(stored) ? stored.map((entry) => String(entry)).join(', ') : ''
+}
+
+/** The accounts a typed line names, empty entries dropped. */
+function maintainerList(text: string): string[] {
+  return text
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '')
+}
+
+/**
+ * What a source runs and how it reads the output, read-only.
+ *
+ * On screen rather than folded away, because this is the whole substitute for a
+ * command field: an operator arming a source is deciding to run this argv, and a
+ * form that hid it while offering an enable control would be asking for a decision
+ * with the subject withheld. Rendered as the JSON array it is, for the review
+ * card's reason — the payload itself, not a shell-looking rendering of it that
+ * would imply a shell the engine does not use.
+ */
+function SourceCommand({ entry, preset }: { entry: Document; preset: SourcePreset }) {
+  const map = entry[SOURCE_FIELD_MAP]
+  const fields = isObject(map) ? Object.entries(map) : []
+  return (
+    <>
+      <dl className="se-kv">
+        <dt>{i18nT('apps.specEngine.sourceForm.the_preset_host')}</dt>
+        <dd>{preset.host}</dd>
+        <dt>{i18nT('apps.specEngine.sourceForm.the_program_it_runs')}</dt>
+        <dd>{preset.program}</dd>
+      </dl>
+      <p className="se-note">{i18nT('apps.specEngine.sourceForm.the_poll_command')}</p>
+      <pre className="se-json">{JSON.stringify(entry[SOURCE_POLL] ?? null, null, 2)}</pre>
+      {fields.length > 0 && (
+        <>
+          <p className="se-note">{i18nT('apps.specEngine.sourceForm.the_field_map')}</p>
+          <dl className="se-kv">
+            {fields.map(([field, path]) => (
+              <Fragment key={field}>
+                <dt>{field}</dt>
+                <dd>{String(path)}</dd>
+              </Fragment>
+            ))}
+          </dl>
+        </>
+      )}
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourceForm.the_form_cannot_change_the_command')}
+      </p>
+    </>
+  )
+}
+
+/**
+ * The watch sources, as forms: create from a preset, edit, and remove.
+ *
+ * A source is a poll command the engine EXECUTES plus a map from its output to the
+ * engine's item fields, so this form is the one surface on the pane whose subject
+ * is something that runs. Six properties of it are claims rather than arrangement:
+ *
+ * 1. **No control here accepts a command or an argument.** Not the add flow, not
+ *    the edit flow, not indirectly: {@link sourceEdit} is the only path composer,
+ *    and the paths it can produce are three named fields, a registry-typed
+ *    per-source setting, a whole preset copy, and a deletion. The commands come
+ *    from the engine's own preset tables, byte for byte, because the write door
+ *    checks an argv's shape and not which program it names.
+ * 2. **A copy arrives inert.** The preset entries carry no `enabled` key and
+ *    {@link composeSource} keeps it absent, so creating a source ingests nothing
+ *    until a separate, separately confirmed write arms it.
+ * 3. **An enable states what it starts.** Arming a source is arming unattended
+ *    ingestion under whatever its autonomy grid resolves, so the review card says
+ *    so and links to that grid, and the form states that a source with no grid
+ *    grants nothing at all.
+ * 4. **A shape the form cannot express gets no form.** Not a partial one: a form
+ *    rendering three of an entry's eight fields invites a confirm over the five it
+ *    never showed. The state says which fields those are and routes to the JSON
+ *    view.
+ * 5. **A removal names its source.** The confirmation is the source's own name,
+ *    typed, because a column of identical Remove controls is how the wrong source
+ *    goes — and the review card then states that ingestion stops.
+ * 6. **A success re-reads.** This mutation owns the invalidation: the review card
+ *    is presentational and cannot do it for its callers. The document is where
+ *    every row here comes from, and the grid beside it is a resolution of the very
+ *    entries this write changes.
+ */
+function SourceForm({
+  config,
+  onShowGrid,
+  onOpenJson,
+}: {
+  config: ConfigSnapshot
+  /** Select *source* in the autonomy grid section this form links to. */
+  onShowGrid: (source: string) => void
+  /** Open the JSON view, for a stored shape no form can express. */
+  onOpenJson: () => void
+}) {
+  const client = useQueryClient()
+  const edits = useStagedEdits()
+  const [chosen, setChosen] = useState('')
+  const [addName, setAddName] = useState('')
+  // The source whose removal is armed, and the name typed to confirm it. A name
+  // rather than a boolean: an arm that outlived a selection change would offer a
+  // confirmation captioned with one source and staged against another.
+  const [armed, setArmed] = useState<string | null>(null)
+  const [typedName, setTypedName] = useState('')
+  const [reviewing, setReviewing] = useState(false)
+  const [wrote, setWrote] = useState(false)
+  // The last removal confirmation that was refused, and the staged copy the form
+  // had to withdraw. Both exist so an outcome this form CAUSED is stated rather
+  // than inferred from the absence of a change: a refused confirm with no new
+  // feedback looks inert, and a withdrawn edit with no sentence looks like it was
+  // never made.
+  const [removalRefused, setRemovalRefused] = useState(false)
+  const [orphanedCopy, setOrphanedCopy] = useState('')
+
+  const registry = useQuery({
+    queryKey: QK.registry,
+    queryFn: () => specEngineApi.configRegistry(),
+    retry: false,
+    // Bundled vocabulary: a projection of the engine's own constants, so it cannot
+    // change while the page is open. The same key the forms above read, so all
+    // three share one answer and one request.
+    staleTime: Infinity,
+  })
+
+  const write = useMutation({
+    mutationFn: (patch: Document) => specEngineApi.writeConfig(patch),
+    onSuccess: () => {
+      edits.clear()
+      setAddName('')
+      setArmed(null)
+      setTypedName('')
+      setReviewing(false)
+      setWrote(true)
+      // The reply's merged document is NOT adopted: the read is this pane's
+      // authority on what is persisted, and every row here is a reading OF that
+      // document. All three keys are named because they are three readings a
+      // reader would otherwise have to know the key layout to see refreshed — and
+      // the grid below is one of them, since a source this form creates or removes
+      // appears in or leaves that matrix.
+      void client.invalidateQueries({ queryKey: QK.config })
+      void client.invalidateQueries({ queryKey: QK_RESOLVED_ROOT })
+      void client.invalidateQueries({ queryKey: QK.sources })
+    },
+    // No `onError`: a refusal must leave the staged edits in place and the queries
+    // untouched, so the form keeps showing the store's own state.
+  })
+
+  const document = config.document
+  const names = useMemo(() => sourceNames(document), [document])
+  const presets = registry.data?.source_presets ?? NO_SOURCE_PRESETS
+  const settings = registry.data?.settings ?? NO_SETTINGS
+  const projects = useMemo(() => {
+    const node = document[PROJECTS]
+    return isObject(node) ? Object.keys(node) : []
+  }, [document])
+  // Normalized against the document rather than trusted: a source removed here, in
+  // the JSON view, or by another surface must not leave the form editing a name the
+  // document no longer carries.
+  const selected = names.includes(chosen) ? chosen : (names[0] ?? '')
+  const pending = addName.trim()
+
+  // Every source a staged edit may address: one the document holds, or the one the
+  // add block is naming. An edit whose source has left the document is dropped
+  // rather than carried, because its patch would RESURRECT that source carrying one
+  // field — a `sources` entry with an `enabled` and no poll command — and no
+  // sentence on the card would say so. That removal can arrive from this pane, from
+  // the JSON view, or on any refetch, which is why this reconciles against the
+  // current answer instead of trusting the document to hold still between an edit
+  // and its confirm.
+  const { reconcile } = edits
+  useEffect(() => {
+    reconcile(
+      (edit) =>
+        edit.segments.length >= 2 &&
+        edit.segments[0] === SOURCES &&
+        (names.includes(edit.segments[1]) || edit.segments[1] === pending),
+    )
+  }, [names, pending, reconcile])
+
+  // A staged copy stays reviewable only while it is still an ADD of a preset: its
+  // provenance is derived from its bytes, and its being an add depends on the name
+  // still being free. Both can stop holding under it — the document can gain that
+  // name from the JSON view, from another surface, or on any refetch, and the copy
+  // would then MERGE into the source of that name key by key rather than add one.
+  // Leaving the edit staged would make it silently absent from both the card and
+  // the write, so it is withdrawn, and the withdrawal is stated where the copy was
+  // made.
+  const { edits: stagedNow, unstage } = edits
+  useEffect(() => {
+    const presetsNow = registry.data?.source_presets
+    if (!presetsNow) return
+    for (const edit of stagedNow) {
+      if (edit.segments.length !== 2 || edit.segments[0] !== SOURCES) continue
+      if (edit.value === DELETE) continue
+      if (sourcePresetOf(edit.value, presetsNow) === null || names.includes(edit.segments[1])) {
+        unstage(edit.segments)
+        setOrphanedCopy(edit.segments[1])
+      }
+    }
+  }, [stagedNow, unstage, registry.data, names])
+
+  // An arm outlives the entry it names unless it is withdrawn: another surface, or
+  // the JSON view beside this form, can delete the entry while the confirmation
+  // sits on screen — and a confirm then stages a deletion for a key that is gone.
+  useEffect(() => {
+    if (armed !== null && !names.includes(armed)) setArmed(null)
+  }, [armed, names])
+
+  // `isError` before the data: React Query keeps the last successful answer across
+  // a failing refetch, and a preset list nobody re-read would describe commands
+  // this form then claims the engine bundles.
+  if (registry.isError) {
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
+        <Refused
+          title={i18nT('apps.specEngine.sourceForm.could_not_read_the_source_presets')}
+          error={registry.error}
+        />
+      </div>
+    )
+  }
+  if (registry.isPending || !registry.data) {
+    // Distinct from an empty preset list on purpose: "the engine bundles no preset"
+    // is a fact about the engine, and "not read yet" is a fact about this request.
+    return (
+      <div className="se-blk">
+        <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
+        <p className="se-note">{i18nT('apps.specEngine.sourceForm.reading_the_source_presets')}</p>
+      </div>
+    )
+  }
+
+  const entry = nodeAt(document, [SOURCES, selected])
+  const shape = sourceShape(entry, presets, settings)
+  const stored = isObject(entry) ? entry : {}
+  const sourceSettings = selected === '' ? [] : sourceSettingFields(selected, settings, document)
+
+  // Plain functions rather than `useCallback`: each closes over the mutation
+  // object, which React Query hands back fresh on every render, so a memo here
+  // would advertise a stability it cannot have.
+  const touched = () => {
+    setWrote(false)
+    setRemovalRefused(false)
+    setOrphanedCopy('')
+    write.reset()
+  }
+
+  /** Stage *action*, or withdraw it when it would write what is already there. */
+  const act = (action: SourceFormAction) => {
+    touched()
+    const edit = sourceEdit(action)
+    if (!edit) return
+    if (edit.value === DELETE) {
+      edits.stage(edit.segments, edit.value)
+      return
+    }
+    // Writing back exactly what this path already stores is not a change, and every
+    // write is recorded: staging it would put a line in the durable write record for
+    // an edit nobody made. Compared against the DOCUMENT node at the path rather
+    // than a resolution, because a source's own fields are stored where they are
+    // read — there is no precedence between the two to disagree about.
+    const at = nodeAt(document, edit.segments)
+    if (JSON.stringify(at ?? null) === JSON.stringify(edit.value ?? null)) {
+      edits.unstage(edit.segments)
+      return
+    }
+    edits.stage(edit.segments, edit.value)
+  }
+
+  const stageEnabled = (next: boolean) => {
+    const at = stored[SOURCE_ENABLED]
+    // Absent and false are one posture — the engine polls neither — so unchecking a
+    // source that stores no `enabled` withdraws rather than writing a key that
+    // changes nothing about whether it is polled.
+    if (next === false && at === undefined) {
+      touched()
+      edits.unstage([SOURCES, selected, SOURCE_ENABLED])
+      return
+    }
+    act({ kind: 'field', source: selected, field: SOURCE_ENABLED, value: next })
+  }
+
+  const stageCopy = (preset: SourcePreset) => {
+    touched()
+    // Refused rather than merged: the store's merge would fold the copy INTO the
+    // existing source key by key, which is an edit to that source — and one that
+    // could leave its poll command half from one preset and half from another.
+    if (pending === '' || names.includes(pending)) return
+    const edit = sourceEdit({ kind: 'add', source: pending, preset })
+    if (edit) edits.stage(edit.segments, edit.value)
+  }
+
+  const renameAdd = (next: string) => {
+    touched()
+    const staged = pending === '' ? undefined : edits.stagedAt([SOURCES, pending])
+    if (staged) edits.unstage([SOURCES, pending])
+    const trimmed = next.trim()
+    // A staged copy MOVES with the name rather than being dropped: an operator who
+    // picked a preset and then reconsidered the name meant to keep the copy.
+    if (staged && trimmed !== '' && !names.includes(trimmed)) {
+      edits.stage([SOURCES, trimmed], staged.value)
+    }
+    setAddName(next)
+  }
+
+  const confirmRemoval = () => {
+    if (armed === null) return
+    touched()
+    // The name has to match, and a mismatch is ACKNOWLEDGED rather than ignored:
+    // the confirmation is on screen before the click, so without the statement a
+    // refused confirm would look like a control that does nothing.
+    if (typedName.trim() !== armed) {
+      setRemovalRefused(true)
+      return
+    }
+    act({ kind: 'remove', source: armed })
+    setArmed(null)
+    setTypedName('')
+  }
+
+  const discard = () => {
+    edits.clear()
+    setReviewing(false)
+    setWrote(false)
+    write.reset()
+  }
+
+  /**
+   * One staged edit as the review card reads it, or `null` when this form cannot
+   * say what the edit means.
+   *
+   * The patch is built from exactly the edits this returns a sentence for, so the
+   * card can never show a line it cannot explain and a write can never carry one.
+   * That is also the last gate on a whole-entry stage: an entry matching no
+   * bundled preset earns no sentence, so it reaches no patch.
+   */
+  const describe = (edit: StagedEdit): ReviewedChange | null => {
+    const path = dotted(edit.segments)
+    const source = edit.segments[1]
+    const rest = edit.segments.slice(2)
+    if (rest.length === 0) {
+      if (edit.value === DELETE) {
+        return {
+          path,
+          sentence: i18nT('apps.specEngine.sourceForm.edit_removes_the_source', { source, path }),
+        }
+      }
+      const from = sourcePresetOf(edit.value, presets)
+      if (!from) return null
+      return {
+        path,
+        sentence: i18nT('apps.specEngine.sourceForm.edit_copies_the_bundled_preset', {
+          source,
+          preset: from.host,
+          program: from.program,
+          path,
+        }),
+      }
+    }
+    if (rest.length === 1 && rest[0] === SOURCE_ENABLED) {
+      const key = SOURCE_ENABLED_SENTENCE_KEY[String(edit.value === true)]
+      // Indexed at the call site rather than through a local, so the
+      // key-reference gate resolves every entry in the table.
+      return { path, sentence: i18nT(key, { source, path }) }
+    }
+    if (rest.length === 1 && SOURCE_FIELD_SENTENCE_KEY[rest[0]]) {
+      return {
+        path,
+        sentence: i18nT(SOURCE_FIELD_SENTENCE_KEY[rest[0]], {
+          source,
+          oldValue: shownValue(nodeAt(document, edit.segments)),
+          newValue: shownValue(edit.value),
+          path,
+        }),
+      }
+    }
+    if (rest.length === 2) {
+      const setting = `${rest[0]}.${rest[1]}`
+      return {
+        path,
+        sentence: i18nT('apps.specEngine.sourceForm.edit_replaces_the_source_limit', {
+          setting: settingLabel(setting) || setting,
+          source,
+          oldValue: shownValue(nodeAt(document, edit.segments)),
+          newValue: shownValue(edit.value),
+          path,
+        }),
+      }
+    }
+    return null
+  }
+
+  // The staged edits this form can account for, and the patch built from exactly
+  // those. One list for both, for the reason above.
+  const reviewed: Array<{ edit: StagedEdit; change: ReviewedChange }> = []
+  for (const edit of edits.edits) {
+    const change = describe(edit)
+    if (change) reviewed.push({ edit, change })
+  }
+  const patch = buildFormPatch(reviewed.map((entry) => entry.edit))
+  const removing = reviewed.filter(({ edit }) => edit.value === DELETE)
+  const enabling = reviewed.filter(
+    ({ edit }) =>
+      edit.segments.length === 3 && edit.segments[2] === SOURCE_ENABLED && edit.value === true,
+  )
+  const addBlocked = pending === '' || names.includes(pending)
+  const enabledStaged = edits.stagedAt([SOURCES, selected, SOURCE_ENABLED])
+  const enabled = enabledStaged ? enabledStaged.value === true : stored[SOURCE_ENABLED] === true
+  const projectStaged = edits.stagedAt([SOURCES, selected, SOURCE_PROJECT])
+  const boundProject = String(
+    (projectStaged ? projectStaged.value : stored[SOURCE_PROJECT]) ?? '',
+  )
+  const maintainersStaged = edits.stagedAt([SOURCES, selected, SOURCE_MAINTAINERS])
+  const maintainers = maintainerText(
+    maintainersStaged ? maintainersStaged.value : stored[SOURCE_MAINTAINERS],
+  )
+
+  /** The link into the autonomy grid for *source*, which is the resolution this
+   *  form links to rather than rendering a second time. */
+  const gridLink = (source: string) => (
+    <a
+      href={`#${SOURCES_GRID_ID}`}
+      onClick={() => onShowGrid(source)}
+    >
+      {i18nT('apps.specEngine.sourceForm.open_the_autonomy_grid_for_source', { source })}
+    </a>
+  )
+
+  return (
+    <div className="se-blk">
+      <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
+      {names.length === 0 ? (
+        /* Not an empty form: fields for a source that does not exist read as a
+           source with nothing configured, when the fact is that nothing is being
+           ingested at all. The add block below is the answer. */
+        <p className="se-note">{i18nT('apps.specEngine.sourceForm.no_watch_source_is_defined')}</p>
+      ) : (
+        <>
+          <div
+            className="se-acts"
+            role="group"
+            aria-label={i18nT('apps.specEngine.sourceForm.select_a_watch_source_to_edit')}
+          >
+            {names.map((name) => (
+              <button
+                key={name}
+                type="button"
+                className="se-btn se-sm se-m"
+                aria-pressed={name === selected}
+                // The refusal acknowledgment is about a confirmation typed for THIS
+                // source; carried across a switch it would caption another source's
+                // block with a refusal that never happened to it.
+                onClick={() => {
+                  setChosen(name)
+                  setArmed(null)
+                  setTypedName('')
+                  setRemovalRefused(false)
+                }}
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+          {!shape.expressible ? (
+            /* The honest state, and no controls: a form over three of an entry's
+               fields invites a confirm over the ones it never showed. */
+            <div className="se-arm" data-not-expressible="true">
+              <p>
+                <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                {i18nT('apps.specEngine.sourceForm.the_form_cannot_express_this_source', {
+                  source: selected,
+                })}
+              </p>
+              {shape.preset === null && (
+                <p className="se-note">
+                  {i18nT('apps.specEngine.sourceForm.the_poll_is_not_a_bundled_presets')}
+                </p>
+              )}
+              {shape.unexpressed.length > 0 && (
+                <p className="se-note">
+                  {i18nT('apps.specEngine.sourceForm.the_entry_carries_unshown_fields', {
+                    fields: shape.unexpressed.join(', '),
+                  })}
+                </p>
+              )}
+              <div className="se-acts">
+                <button type="button" className="se-btn" onClick={onOpenJson}>
+                  {i18nT('apps.specEngine.sourceForm.edit_this_source_in_the_json_view', {
+                    source: selected,
+                  })}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* What the engine runs, before any control that could arm it. */}
+              <SourceCommand entry={stored} preset={shape.preset as SourcePreset} />
+              <div className="se-settings">
+                <div
+                  className="se-setting"
+                  data-source-field={SOURCE_ENABLED}
+                  data-staged={enabledStaged !== undefined}
+                >
+                  <label className="se-setting-name" htmlFor="se-source-enabled">
+                    {i18nT('apps.specEngine.sourceForm.poll_this_source')}
+                    <span className="se-kv-path">
+                      {dotted([SOURCES, selected, SOURCE_ENABLED])}
+                    </span>
+                  </label>
+                  <input
+                    id="se-source-enabled"
+                    type="checkbox"
+                    className="se-check"
+                    checked={enabled}
+                    onChange={(event) => stageEnabled(event.target.checked)}
+                  />
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.stored_on_the_source')}
+                    {SEP}
+                    <span className="se-m">{shownValue(stored[SOURCE_ENABLED])}</span>
+                  </p>
+                  {enabledStaged !== undefined && (
+                    <p className="se-note">
+                      <span className="se-flag" data-flag="pending">
+                        {i18nT('apps.specEngine.sourceForm.not_written')}
+                      </span>
+                      <span className="se-m">
+                        {shownValue(enabledStaged.value)}
+                        {SEP}
+                        {dotted([SOURCES, selected, SOURCE_ENABLED])}
+                      </span>
+                    </p>
+                  )}
+                </div>
+                <div
+                  className="se-setting"
+                  data-source-field={SOURCE_PROJECT}
+                  data-staged={projectStaged !== undefined}
+                >
+                  <span className="se-setting-name">
+                    {i18nT('apps.specEngine.sourceForm.the_project_binding')}
+                    <span className="se-kv-path">
+                      {dotted([SOURCES, selected, SOURCE_PROJECT])}
+                    </span>
+                  </span>
+                  {projects.length === 0 ? (
+                    <p className="se-note">
+                      {i18nT('apps.specEngine.sourceForm.no_project_is_configured_to_bind')}
+                    </p>
+                  ) : (
+                    <div
+                      className="se-acts"
+                      role="group"
+                      aria-label={i18nT('apps.specEngine.sourceForm.project_for_source', {
+                        source: selected,
+                      })}
+                    >
+                      {/* A button group rather than a dropdown, for the level
+                          control's reason: a popup would be drawn over a page whose
+                          kill-switch strip must never be covered. A stored name the
+                          document no longer lists is offered too, so the row can
+                          show what is actually bound. */}
+                      {(projects.includes(boundProject) || boundProject === ''
+                        ? projects
+                        : [boundProject, ...projects]
+                      ).map((name) => (
+                        <button
+                          key={name}
+                          type="button"
+                          className="se-btn se-sm se-m"
+                          aria-pressed={name === boundProject}
+                          onClick={() =>
+                            act({
+                              kind: 'field',
+                              source: selected,
+                              field: SOURCE_PROJECT,
+                              value: name,
+                            })
+                          }
+                        >
+                          {name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.stored_on_the_source')}
+                    {SEP}
+                    <span className="se-m">{shownValue(stored[SOURCE_PROJECT])}</span>
+                  </p>
+                  {projectStaged !== undefined && (
+                    <p className="se-note">
+                      <span className="se-flag" data-flag="pending">
+                        {i18nT('apps.specEngine.sourceForm.not_written')}
+                      </span>
+                      <span className="se-m">
+                        {shownValue(projectStaged.value)}
+                        {SEP}
+                        {dotted([SOURCES, selected, SOURCE_PROJECT])}
+                      </span>
+                    </p>
+                  )}
+                </div>
+                <div
+                  className="se-setting"
+                  data-source-field={SOURCE_MAINTAINERS}
+                  data-staged={maintainersStaged !== undefined}
+                >
+                  <label className="se-setting-name" htmlFor="se-source-maintainers">
+                    {i18nT('apps.specEngine.sourceForm.the_maintainer_accounts')}
+                    <span className="se-kv-path">
+                      {dotted([SOURCES, selected, SOURCE_MAINTAINERS])}
+                    </span>
+                  </label>
+                  <input
+                    id="se-source-maintainers"
+                    type="text"
+                    className="se-input"
+                    value={maintainers}
+                    onChange={(event) =>
+                      act({
+                        kind: 'field',
+                        source: selected,
+                        field: SOURCE_MAINTAINERS,
+                        value: maintainerList(event.target.value),
+                      })
+                    }
+                  />
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.maintainers_are_the_most_trusted_class')}
+                  </p>
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.stored_on_the_source')}
+                    {SEP}
+                    <span className="se-m">{shownValue(stored[SOURCE_MAINTAINERS])}</span>
+                  </p>
+                  {maintainersStaged !== undefined && (
+                    <p className="se-note">
+                      <span className="se-flag" data-flag="pending">
+                        {i18nT('apps.specEngine.sourceForm.not_written')}
+                      </span>
+                      <span className="se-m">
+                        {shownValue(maintainersStaged.value)}
+                        {SEP}
+                        {dotted([SOURCES, selected, SOURCE_MAINTAINERS])}
+                      </span>
+                    </p>
+                  )}
+                </div>
+              </div>
+              {sourceSettings.length > 0 && (
+                <>
+                  <h3>{i18nT('apps.specEngine.sourceForm.settings_this_source_holds')}</h3>
+                  <div className="se-settings">
+                    {sourceSettings.map((field) => (
+                      <StoredSettingRow
+                        key={field.setting.key}
+                        field={field}
+                        labels={{
+                          stored: i18nT('apps.specEngine.sourceForm.stored_on_the_source'),
+                          notWritten: i18nT('apps.specEngine.sourceForm.not_written'),
+                          notEditable: i18nT(
+                            'apps.specEngine.sourceForm.the_registry_kind_is_not_editable_here',
+                            { kind: field.setting.kind },
+                          ),
+                        }}
+                        staged={edits.stagedAt(field.segments)}
+                        onStage={(value) =>
+                          act({
+                            kind: 'setting',
+                            source: selected,
+                            key: field.setting.key,
+                            value,
+                          })
+                        }
+                        onWithdraw={() => {
+                          touched()
+                          edits.unstage(field.segments)
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.a_source_may_hold_only_these_settings')}
+                  </p>
+                </>
+              )}
+              {/* The grid is a resolution, linked rather than rendered twice, and
+                  the fail-closed rule is stated here because it is the answer for
+                  a source whose grid is absent — which is every new source. */}
+              <p className="se-note">
+                {i18nT('apps.specEngine.sourceForm.the_grid_decides_how_far_a_run_goes')}
+                {SEP}
+                {gridLink(selected)}
+              </p>
+              <p className="se-note">
+                {i18nT('apps.specEngine.sourceForm.an_absent_grid_fails_closed')}
+              </p>
+              <div className="se-acts" style={{ marginTop: 9 }}>
+                <button
+                  type="button"
+                  className="se-btn se-sm se-danger"
+                  // The accessible name carries the target even though the visible
+                  // label is one word: a bare "Remove" is how the wrong source goes.
+                  aria-label={i18nT('apps.specEngine.sourceForm.remove_the_source', {
+                    source: selected,
+                  })}
+                  onClick={() => {
+                    touched()
+                    setTypedName('')
+                    setArmed(selected)
+                  }}
+                >
+                  {i18nT('apps.specEngine.configPanel.remove')}
+                </button>
+              </div>
+            </>
+          )}
+          {armed !== null && (
+            /* In flow under the form, never a dialog: the confirmation for a
+               destructive edit is a sibling block for the same reason the kill
+               switch's is. The source's own name, TYPED, because a column of
+               identical Remove controls is how the wrong source goes — and the
+               name is the one thing that cannot be clicked by accident. */
+            <div className="se-arm">
+              <p>
+                <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                {i18nT('apps.specEngine.sourceForm.removing_stops_ingesting', {
+                  source: armed,
+                  path: dotted([SOURCES, armed]),
+                })}
+              </p>
+              <div className="se-setting">
+                <label className="se-setting-name" htmlFor="se-source-remove-name">
+                  {i18nT('apps.specEngine.sourceForm.type_the_name_to_confirm', { source: armed })}
+                </label>
+                <input
+                  id="se-source-remove-name"
+                  type="text"
+                  className="se-input"
+                  value={typedName}
+                  onChange={(event) => setTypedName(event.target.value)}
+                />
+              </div>
+              <div className="se-acts">
+                <button type="button" className="se-btn se-danger" onClick={confirmRemoval}>
+                  {i18nT('apps.specEngine.sourceForm.confirm_the_removal', { source: armed })}
+                </button>
+                <button
+                  type="button"
+                  className="se-btn"
+                  onClick={() => {
+                    setArmed(null)
+                    setTypedName('')
+                    setRemovalRefused(false)
+                  }}
+                >
+                  {i18nT('apps.specEngine.sourceForm.keep_the_source')}
+                </button>
+              </div>
+              {removalRefused && (
+                <p className="se-note" role="status">
+                  <span>{i18nT('apps.specEngine.sourceForm.the_removal_was_refused')}</span>
+                  {SEP}
+                  <span>
+                    {i18nT('apps.specEngine.sourceForm.the_typed_name_does_not_match', {
+                      source: armed,
+                    })}
+                  </span>
+                </p>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      <h3>{i18nT('apps.specEngine.sourceForm.add_a_watch_source')}</h3>
+      <div className="se-setting">
+        <label className="se-setting-name" htmlFor="se-source-add-name">
+          {i18nT('apps.specEngine.sourceForm.name_for_the_new_source')}
+        </label>
+        <input
+          id="se-source-add-name"
+          type="text"
+          className="se-input"
+          value={addName}
+          onChange={(event) => renameAdd(event.target.value)}
+        />
+        {pending !== '' && names.includes(pending) && (
+          <p className="se-note" role="status">
+            {i18nT('apps.specEngine.sourceForm.the_name_is_already_a_source', { source: pending })}
+          </p>
+        )}
+        {pending === '' && (
+          <p className="se-note">{i18nT('apps.specEngine.sourceForm.name_the_source_first')}</p>
+        )}
+      </div>
+      {presets.length === 0 ? (
+        <p className="se-note">{i18nT('apps.specEngine.sourceForm.the_engine_bundles_no_preset')}</p>
+      ) : (
+        <div
+          role="group"
+          aria-label={i18nT('apps.specEngine.sourceForm.choose_a_preset_to_copy')}
+        >
+          {presets.map((preset) => {
+            const map = preset.entry[SOURCE_FIELD_MAP]
+            const fields = isObject(map) ? Object.keys(map) : []
+            return (
+              <div className="se-offer" key={preset.host} data-preset={preset.host}>
+                <span className="se-m">{preset.host}</span>
+                {/* What it ingests and which tool it needs, from the preset's own
+                    bytes: the program is derived from its argv upstream, and the
+                    fields are the ones its field map reads out of the output. */}
+                <span className="se-note">
+                  {i18nT('apps.specEngine.sourceForm.preset_ingests_items', {
+                    host: preset.host,
+                    program: preset.program,
+                    count: fmtNumber(fields.length),
+                    fields: fields.join(', '),
+                  })}
+                </span>
+                <button
+                  type="button"
+                  className="se-btn se-sm"
+                  disabled={addBlocked}
+                  onClick={() => stageCopy(preset)}
+                >
+                  {i18nT('apps.specEngine.sourceForm.copy_the_preset', { host: preset.host })}
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <p className="se-note">
+        {i18nT('apps.specEngine.sourceForm.an_add_is_always_a_preset_copy')}
+      </p>
+      {orphanedCopy !== '' && (
+        /* The withdrawal is an event this form caused, so it is stated: a staged
+           copy that silently stopped being counted would read as an edit that was
+           never made. `role="status"` so the announcement reaches a reader who is
+           not looking at the add block when a refetch lands. */
+        <p className="se-note" role="status">
+          {i18nT('apps.specEngine.sourceForm.the_staged_copy_was_withdrawn', {
+            source: orphanedCopy,
+          })}
+        </p>
+      )}
+
+      <div className="se-acts" style={{ marginTop: 9 }}>
+        <button
+          type="button"
+          className="se-btn"
+          disabled={reviewed.length === 0}
+          onClick={() => setReviewing(true)}
+        >
+          {i18nT('apps.specEngine.sourceForm.review_the_exact_change')}
+        </button>
+        {reviewed.length > 0 && (
+          <span className="se-lbl">
+            {i18nT('apps.specEngine.sourceForm.unwritten_source_changes')}
+            {SEP}
+            <span className="se-m">{fmtNumber(reviewed.length)}</span>
+          </span>
+        )}
+      </div>
+      {reviewing && reviewed.length > 0 && (
+        <FormReview
+          changes={reviewed.map((entry) => entry.change)}
+          patch={patch}
+          labels={{
+            heading: i18nT('apps.specEngine.sourceForm.the_change_that_would_be_written'),
+            confirm: i18nT('apps.specEngine.sourceForm.write_the_change'),
+            writing: i18nT('apps.specEngine.configPanel.saving'),
+            discard: i18nT('apps.specEngine.sourceForm.discard_the_pending_changes'),
+            exactly: i18nT('apps.specEngine.sourceForm.a_confirm_writes_exactly_this_patch'),
+            refusalTitle: i18nT('apps.specEngine.sourceForm.could_not_write_the_source_change'),
+            retained: i18nT(
+              'apps.specEngine.sourceForm.nothing_was_written_so_the_source_is_stored_state',
+            ),
+          }}
+          consequences={
+            (enabling.length > 0 || removing.length > 0) && (
+              /* In flow under the patch, never a dialog: neither consequence is
+                 legible in the JSON — a `true` does not say that a program starts
+                 running on a timer, and a `null` does not say that ingestion
+                 stops — and a consequence stated in an overlay is one that can be
+                 dismissed. */
+              <div className="se-arm">
+                {enabling.map(({ edit }) => {
+                  const source = edit.segments[1]
+                  const from = sourceShape(
+                    nodeAt(document, [SOURCES, source]),
+                    presets,
+                    settings,
+                  ).preset
+                  return (
+                    <Fragment key={dotted(edit.segments)}>
+                      <p>
+                        <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                        {i18nT('apps.specEngine.sourceForm.enabling_begins_polling', {
+                          source,
+                          program: from ? from.program : NONE,
+                          path: dotted(edit.segments),
+                        })}
+                      </p>
+                      <p className="se-note">{gridLink(source)}</p>
+                      <p className="se-note">
+                        {i18nT('apps.specEngine.sourceForm.an_absent_grid_fails_closed')}
+                      </p>
+                    </Fragment>
+                  )
+                })}
+                {removing.map(({ edit }) => (
+                  <p key={dotted(edit.segments)}>
+                    <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                    {i18nT('apps.specEngine.sourceForm.removing_stops_ingesting', {
+                      source: edit.segments[1],
+                      path: dotted(edit.segments),
+                    })}
+                  </p>
+                ))}
+              </div>
+            )
+          }
+          writing={write.isPending}
+          error={write.isError ? write.error : null}
+          onConfirm={() => write.mutate(patch)}
+          onDiscard={discard}
+        />
+      )}
+      {wrote && (
+        <p className="se-note" role="status">
+          {i18nT('apps.specEngine.sourceForm.wrote_the_change_and_re_read_the_sources')}
         </p>
       )}
     </div>
@@ -3656,6 +4930,10 @@ export function ConfigPane({
   // the left is what selects it and the resolved read on the right is what it is
   // read FOR, and a copy on either side is how the two come to disagree.
   const [chosenProject, setChosenProject] = useState<string>(APP_WIDE)
+  // The source the autonomy grid shows, held here rather than in the section: the
+  // source form links into that matrix for the source it is editing, and a copy of
+  // the selection on either side is how the two come to disagree.
+  const [gridSource, setGridSource] = useState('')
   const [jsonOpen, setJsonOpen] = useState(false)
   // The editor's unsaved text, held here so closing the view does not discard it.
   const [draft, setDraft] = useState<string | null>(null)
@@ -3713,10 +4991,18 @@ export function ConfigPane({
                   other half of what a project runs on, and they live nowhere else:
                   a project SELECTS a profile rather than overriding roles in it. */}
               <ProfilesForm config={config} />
+              {/* Beside the grid it links into: this is where a source is created,
+                  edited and removed, and the grid below is the resolution of how
+                  far its items may run unattended. */}
+              <SourceForm
+                config={config}
+                onShowGrid={setGridSource}
+                onOpenJson={() => setJsonOpen(true)}
+              />
               {/* Beside the projects table for the same reason: who may run how
                   unattended is a reading, and reading it out of JSON is not the
                   same as seeing the matrix. */}
-              <SourcesSection />
+              <SourcesSection chosen={gridSource} onChoose={setGridSource} />
               <JsonViewToggle
                 open={jsonOpen}
                 dirty={isDirty(draft, config.document)}

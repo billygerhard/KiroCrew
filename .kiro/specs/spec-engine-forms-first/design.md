@@ -158,9 +158,16 @@ enforces.
   settings (registry-scoped), maintainers list. The poll command and field map
   render read-only beside the preset host. No control anywhere accepts
   command text.
-- Edit: same form over a stored entry WHEN its shape is preset-expressible
-  (poll argv equal to a preset's, or fields limited to what the form shows);
-  otherwise the honest not-expressible state routing to the JSON view.
+- Edit: same form over a stored entry WHEN its shape is preset-expressible,
+  which is **both** halves together: its `poll` argv is byte-equal to a bundled
+  preset's, AND every key it carries is one the form writes, displays read-only,
+  or the autonomy grid shows (a setting group counting leaf by leaf against the
+  registry). Either half failing gives the honest not-expressible state routing
+  to the JSON view, with no controls at all — the one edit here that starts
+  execution is `enabled`, so a form offered over argv no preset supplied would be
+  a way to arm a command this surface never constrained. The residual is
+  accepted: naming a preset copy's placeholder repository in the JSON view takes
+  that source out of the form's reach, which is the safe direction to fail in.
 - Remove: named confirmation, patch `{"sources": {"<name>": null}}`, with the
   stops-ingesting sentence. Enabling a new source carries the begins-polling
   sentence with a link to the source's autonomy grid (the existing
