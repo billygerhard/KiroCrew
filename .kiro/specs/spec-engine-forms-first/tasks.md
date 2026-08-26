@@ -196,3 +196,142 @@ sweep. The review gate runs between waves.
 ```json
 {"waves": [{"id": 0, "tasks": ["1.1"]}, {"id": 1, "tasks": ["2.1"]}, {"id": 2, "tasks": ["3.1"]}, {"id": 3, "tasks": ["4.1"]}, {"id": 4, "tasks": ["5.1"]}, {"id": 5, "tasks": ["6.1"]}]}
 ```
+
+## Verification record — 2026-08-26 (task 6.1, closing sweep)
+
+Run on `feat/spec-engine-poc` at `086e5a825` plus this task's three edits (the
+zh-CN string, the `choices` guard test, and R4.2's clause).
+Exit codes are the real unpiped codes.
+
+### Gates
+
+| Gate | Command | Exit | Result |
+|---|---|---|---|
+| spec_engine pytest | `pytest src/kiro_crew/apps/builtins/spec_engine/tests/ -q` | **0** | `3424 passed` (3423 before this task's added guard) |
+| spec_builder pytest | `pytest src/kiro_crew/apps/builtins/spec_builder/ -q` | **0** | `269 passed` |
+| isort | `isort --check-only src/kiro_crew test` | **0** | `Skipped 2 files` |
+| flake8 | `flake8 src/kiro_crew test` | **0** | no output |
+| mypy (repo) | `mypy src/kiro_crew` | **1** | `Found 3 errors in 1 file (checked 1068 source files)` — all `hooks.py` `os.{list,get,set}xattr`, Linux-only names on darwin; `hooks.py` is untouched by the whole branch. **Inherited.** |
+| mypy (territory) | `mypy src/kiro_crew/apps/builtins/spec_engine` | **0** | `Success: no issues found in 205 source files` |
+| black (repo) | `black --check src/kiro_crew test` | **1** | `1178 files would be reformatted` under the pinned `black==26.3.1`; repo-wide and pre-existing. Wave-touched `.py` files: exit **0**. Not in this task's gate list; `AGENTS.md` runs black as a writer, not a checker. **Inherited.** |
+| tsc | `npx tsc -b` | **0** | no output |
+| eslint | `npx eslint src --ext .ts,.tsx` | **0** | `601 problems (0 errors, 601 warnings)`; `ConfigPanel.tsx` = 19 warnings (10 `jsx-a11y/label-has-for`, 9 `jsx-a11y/control-has-associated-label`) |
+| vitest (full) | `npx vitest run` | **1** | `1 failed \| 12168 passed \| 2 expected fail \| 3 skipped (12174)`, `890 passed (891)` files. The one failure is the inherited `hiStyle` baseline, proven below. No unhandled errors; the `App.test.tsx` credits-pill flake did not reproduce in either full run. |
+| i18n:check | `npm run i18n:check` | **1** | pseudolocale ok · key-refs ok · extractable ok · plurals ok · **source-strings exit 1** · added-lines/vs-base/untranslated/allcaps ok · dnt ok · manifest-sync ok. Every hard-zero gate passes; the one failure is `pages.artifactDeployPage.domain` (`"domain —"`), present at `b84c6d1df^` and not a spec-engine key. **Inherited.** `changed-values` reports 0 findings, which covers this task's zh-CN edit. |
+| key-refs | `node scripts/check-i18n-keys.mjs` | **0** | `11611 static key references all resolve, 30 dynamic site(s) at baseline` |
+| manifest-sync | `node scripts/check-app-manifest-sync.mjs` | **0** | `20 built-in manifests, 171 strings match locales/en.json exactly` |
+| boundary fence | `pytest …/tests/test_app_boundary_fence.py -q` | **0** | `38 passed` |
+| build | `npm run build` | **0** | `✓ built in 8.55s` |
+
+**One environment note, not a finding.** With the ambient `TMPDIR`
+(`…/KiroCrew/.kirocrew-dev/scratch/runtime-*`, which sits inside a *different*
+git repository), `test_a_directory_that_is_not_a_repository_fails_closed` fails
+its own stated precondition — `git -C <tmp_path> rev-parse --git-dir` returns 0
+— and the spec_engine suite exits 1 on that one test. Re-run with a `TMPDIR`
+outside any repository and the fence suite is `38 passed`, the whole suite
+`3424 passed`. The fence code is not implicated; the test asserts the
+precondition rather than assuming it, which is why it says so out loud.
+
+### Inherited failures, proven rather than asserted
+
+- **`hiStyle` formal-आप, 125 > 119.** Re-proved by parent-catalog swap because
+  the count sits above the baseline: flattening `hi.json` at `b84c6d1df^` (the
+  parent of the wave's first commit) and applying the test's own predicate
+  (`'आप' in value` after stripping `अपने[-\s]?आप`) yields **125** violations
+  pre-wave and **125** now — **0 added, 0 removed**, and no
+  `apps.specEngine.*Form.*` key among them. The stale figure is the test's
+  hard-coded `119`, which the catalog had already outgrown before this spec
+  began. Not this wave's to move.
+- **`source-strings` on `pages.artifactDeployPage.domain`.** The value
+  `"domain —"` is byte-identical at `b84c6d1df^`. Not a spec-engine key; the
+  gate reports it because it is new *vs `origin/main`*, i.e. it belongs to an
+  earlier branch commit.
+
+### Correctness properties: executed mutation probes
+
+Every probe below was executed **in this task**, not cited from a commit
+message: plant → named test fails → restore → SHA compared. Each source file's
+`shasum -a 256` after restore equals its value before the plant, and
+`git diff --stat` over `src/apps/spec-engine/` is empty.
+
+| Property | Live named test | Planted regression | Named test failed with |
+|---|---|---|---|
+| **1** — a form patch touches only its staged paths | `SpecEngineFormPatch.property.test.ts` › *Property 1 (TS half): a form patch touches only its staged paths* (+ backend hypothesis `test_merging_a_cell_patch_leaves_every_other_path_identical`, `test_merging_a_deletion_patch_removes_only_the_named_key` through the real `_merge`) | `buildFormPatch`: `edit.value === DELETE ? null` → `? false` | 5 tests red, incl. *spells a removal as null and never emits one otherwise* — `expected false to be null`. Restore SHA `d9755967…` = before. |
+| **2** — the settings form is total over the registry | `SpecEngineSettingsForm.property.test.tsx` › *Property 2: the settings form is total over the registry* | `CONTROL_BY_KIND`: `bool: 'checkbox'` → `bool: 'text'` | *renders exactly one control per setting, of the kind the registry names* — counterexample `{"kind":"bool",…}`. Restore SHA `a7cfe295…` = before. |
+| **3** — a composed source carries only preset commands | `SpecEngineSourceCompose.property.test.ts` (frontend half, incl. the round-3 shape guard) + backend hypothesis `test_a_projected_preset_carries_the_bundled_argv_and_survives_an_edit_to_it` | `wellFormedRepository`: dot-only-halves guard → `owner !== '' && repo !== ''` | *refuses a repository that could rewrite the argument around the slot* — counterexample `"../.."`, `expected true to be false`. Restore SHA `a7cfe295…` = before. |
+
+The round-3 shape guard is therefore confirmed live, not merely recorded: the
+`../..` probe is exactly the approval-minor (a) fix, and removing it turns a
+named test red.
+
+A fourth probe covers the guard **added by this sweep** (see the ledger's
+`Setting.choices` row): planting `choices=("dashboard","slack")` on
+`notify.channel` turned
+`test_no_projected_setting_declares_an_enforced_choice_set` red with
+`['notify.channel'] now declare choices the write door enforces`; restore SHA
+`27014c25…` = before.
+
+### Catalog completeness
+
+Computed against the catalogs, not against the diff: every en key absent at
+`b84c6d1df^` and present now.
+
+- **141 new keys** — `sourceForm` 75, `profilesForm` 44, `settingsForm` 22.
+- All **13** catalogs (`bn de en es fr hi it ja ko pt ru zh-CN` + `en-XA`)
+  carry **141/141**: **0 missing, 0 empty**.
+- `en.manual.json` carries none, which is correct — it is an override overlay,
+  and the key-refs gate separately proves no en/en.manual shadowing.
+- **4 values are identical to English, all legitimately**: `de`/`it`
+  `Repository (owner/repo)` (the loanword *is* the German and Italian term) and
+  `it`/`pt` `Preset` (likewise). Every other 137 × 12 value differs.
+- `node scripts/gen-pseudolocale.mjs` → `wrote … (10407 keys)` and
+  `git diff -- src/i18n/locales/en-XA.json` is **empty**: en-XA is byte-identical
+  to a fresh regeneration.
+
+### Disposition ledger, tasks 1.1 → 5.1
+
+Verdicts: **fixed** · **accepted-with-reason** · **amendment-recommended**.
+
+| # | Carried finding | Verdict | Reason / evidence |
+|---|---|---|---|
+| 1 | 1.1 contract facts for 2.1–5.1 (registry route path; preset host keys are the table's own) | accepted-with-reason | Informational and consumed: the route is `GET {PREFIX}/config/registry`, and `test_each_source_preset_is_byte_equal_to_the_bundled_table` asserts hosts against `WATCH_SOURCE_PRESET_HOSTS` rather than domain names. |
+| 2 | 1.1 review — `Setting.choices` not projected | **fixed** | The assumption was documented in two prose comments (`api.ts`, `CONTROL_BY_KIND`) and enforced nowhere, while `Setting.validate` *does* refuse a non-member value — so a setting gaining `choices` would silently give the operator a text box the door then refuses by path. Added `test_no_projected_setting_declares_an_enforced_choice_set`, which pins the precondition (21 settings, none declaring choices) and fails the moment the first half of that change lands alone. Mutation-probed. |
+| 3 | 2.1 review (a) — `FormReview` is presentational, each mutation owns its invalidation | accepted-with-reason | Honored: all three forms carry a named *re-renders … from a fresh read after a successful write* test (`SettingsForm:693`, `ProfilesForm:864`, `SourceForm:1232`). |
+| 4 | 2.1 review (b) — one shared `useStagedEdits`, not three ad-hoc states | accepted-with-reason | Honored: exactly three `useStagedEdits()` call sites, one per form (`ConfigPanel.tsx:1491, 2226, 3460`); no other staging state. |
+| 5 | 2.1 review (c) — ancestor/descendant overlap must be reconciled, property-checked | accepted-with-reason | Honored and property-checked: *leaves no two staged paths overlapping, however they were staged* and *drops an ancestor when a descendant is staged, and the other way round*. |
+| 6 | 2.1 orchestrator fix — `FormReview` refusal gate widened to `error != null` | accepted-with-reason | Verified in place (`ConfigPanel.tsx:579`), so a caller passing `undefined` cannot render an empty refusal for a write never attempted. |
+| 7 | 3.1 review — the settings form's resolved read omits the `source` query parameter | accepted-with-reason + **design-amendment recommended** | Real and unfixed here. `specEngineApi.resolvedConfig` accepts `source`; the form deliberately does not pass it, and says why: it shares `QK.resolved(project)` with the resolved pane so *"the two read one answer"*. Passing `source` needs a second cache entry keyed `(project, source)` or a re-keying that makes the pane refetch on every source pick — a design change, not a call-site edit. The operator-visible residual is bounded: the review sentence stays honest (`{{oldValue}} is in force from {{origin}}, and {{newValue}} would be stored at {{path}}` never claims the old value is stored at the target), and the only concrete loss is that `storedAt()` cannot withdraw a no-op re-entry of a source's own stored value — a redundant write, logged, never a wrong one. **Recommended amendment:** design.md's `SettingsForm` section should give a source-scoped row its own resolved read keyed `(project, source)`, so R2.5's "value currently in force" is the value in force at the row's own target. |
+| 8 | 3.1 orchestrator fix — source picker gated on a setting permitting source scope | accepted-with-reason | Verified: *offers the source picker only while a setting can be written at source scope* (`SettingsForm:519`). |
+| 9 | 3.1 — an int row stages `Number(raw)` verbatim, so a fractional entry is refused by the door | accepted-with-reason | Re-affirmed unchanged. Bounds live in the registry and the door; a restated frontend copy is a second thing to drift. The refusal is stated and path-addressed — the same disposition class as the door's shape-only argv validation. |
+| 10 | 4.1 — the registry route grew profile-preset entries, `profile_settings`, the effort ladder | accepted-with-reason | Reviewed against the requirements and sound: R3.5's add-as-copy is unbuildable from names alone, and neither pinnability (not a `Scope`) nor effort (not a setting) is derivable from a `Setting` record while both are door-enforced. The route stays a zero-document-read projection; design.md carries it; `test_each_profile_preset_carries_the_entry_a_copy_is_made_from` and `test_the_profile_role_and_level_vocabularies_are_the_owning_modules` pin it. |
+| 11 | 4.1 review — effort-on-auto copy over-promises vs `model_supports_effort()` | accepted-with-reason + **requirement-amendment recommended** | The engine's `_usable_effort()` drops a pinned effort for any concrete model failing `model_supports_effort()` (haiku, nova, deepseek, minimax, glm, qwen), so naming a concrete model is necessary and *not* sufficient — the copy mirrors R3.2 verbatim, so the requirement is what over-promises. Not silent, though, and that bounds it: the engine reports `dropped_effort` per role and the pane already flags it beside the resolved effort (`ConfigPanel.tsx:5118`, `configPanel.effort_dropped`). Left as-is because the honest sentence needs `supports_effort` projected in the registry — a backend + design + requirement change, outside a sweep. **Recommended amendment:** R3.2 should state that a pinned effort takes effect once the role names a concrete model *that accepts one*, and the registry read should project the capability the sentence would then depend on. |
+| 12 | 4.1 orchestrator fixes (a)–(e) — design diagram annotation, withdrawn-copy announcement, refused-removal acknowledgement, naming-note subject-verb, render coverage | accepted-with-reason | All five landed in `1cbd82b42` with named tests; the profiles suite is green in the full run above. |
+| 13 | 4.1 — probe backups left in the shared untracked `./tmp` | accepted-with-reason | Left untouched per the shared-tmp rule (other sessions' files sit beside them). Every commit in this spec stages explicit paths, so the stale-duplicate risk does not arise. This task's own probe backups went to `./tmp/sweep-probe/` and are likewise left in place. |
+| 14 | 5.1 — preset-plus-parameters vs R4.2's absolute wording | **fixed, by amending R4.2** | The clause was a single clause, so it is amended rather than merely recommended: R4.2 now says the UI composes commands from the preset's tables *"filling only the placeholder positions those commands designate — never the position naming the program — from a value constrained to the shape of a repository name"*, and keeps *"SHALL NOT offer freeform command or argument entry anywhere"* absolute. EARS form (`WHEN … THE … SHALL …`) preserved; requirements now outrank design on the point they previously contradicted, and the round-1 finding that byte-equality made R4.3/4.7 unreachable for every functional source is no longer in tension with the text. **The orchestrator must re-run the spec validator** — this task had no access to it. |
+| 15 | 5.1 — no rename control, though the task bullet lists `name` | accepted-with-reason | A rename is a delete plus an add of the *whole* entry, including fields this form never shows, which is precisely the partial-form write R4.5 forbids. The JSON view owns it; the name still renders in the selector and in every path line. Read the task bullet's `name` as the displayed key. |
+| 16 | 5.1 round-3 fix — `wellFormedRepository` on both compose and acceptance, stated refusals, slotless-preset refusal | accepted-with-reason | Confirmed **live**, not merely recorded: the Property 3 probe above removes the guard and turns a named test red on `"../.."`. |
+| 17 | 5.1 — `ConfigPanel.tsx` eslint a11y warnings grew 7 → 19 | accepted-with-reason | Count verified at exactly 19, 0 errors. All 19 are the file's existing label idiom: `jsx-a11y/label-has-for` demands *both* nesting and `id`, which is stricter than WCAG and deprecated upstream, and every flagged site does carry `htmlFor` + a matching `id` (spot-verified at `ConfigPanel.tsx:4380`). Association is proven behaviorally by `getByLabelText` in the profiles and source suites. |
+| 18 | 5.1 residuals — a poll hand-edited beyond its slot belongs to the JSON view; `GH_POLL_NAMED` fixture note | accepted-with-reason | Unchanged and correct: the not-expressible state offers removal and no other control, because a deletion writes no field it did not show. Fixture verified — `GH_POLL_NAMED` is `GH_POLL` with `OWNER/REPO` replaced, and `fresh` keeps the placeholder. |
+| 19 | 5.1 approval minor (b) — repository buffer and both refusal states reset on write and discard | accepted-with-reason | Landed in `086e5a825` and pinned by *drops the refusal with the rest of the pending posture on discard*; source suite green. |
+
+### Fixed in this sweep
+
+- **zh-CN half-width punctuation** (this sweep's own finding, not carried).
+  `apps.specEngine.sourceForm.that_is_not_a_repository_name` used `,` and `:`
+  between CJK characters, failing `zhStyle`'s hard-zero *uses full-width
+  punctuation between CJK characters*. Replaced with `，` and `：`. A broader
+  scan than the gate's own — any half-width `, . ; : ? ! ( )` adjacent to a CJK
+  character across all 141 wave-added zh-CN values — finds no second instance.
+  `zhStyle` is now `21 passed`.
+- **The `Setting.choices` guard** described in ledger row 2.
+- **R4.2's wording** described in ledger row 14.
+
+### Open items handed back to the orchestrator
+
+1. Re-run the spec validator over the amended `requirements.md` (R4.2).
+2. Two recommended amendments, neither implemented here: the source-scoped
+   resolved read (ledger 7, design) and the effort-capability sentence
+   (ledger 11, requirement + registry).
+3. Four inherited gate failures stay red and are not this spec's:
+   `hooks.py` mypy on darwin, repo-wide `black --check`, `hiStyle`'s stale 119
+   baseline, and `source-strings` on `pages.artifactDeployPage.domain`.

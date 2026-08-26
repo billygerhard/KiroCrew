@@ -1413,6 +1413,32 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
             ]
 
     @pytest.mark.asyncio
+    async def test_no_projected_setting_declares_an_enforced_choice_set(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The precondition under which omitting ``choices`` is safe, asserted
+        rather than assumed.
+
+        A ``str`` setting renders as free text, and that is only sound because no
+        setting declares ``choices``. The write door DOES enforce them
+        (``Setting.validate`` refuses a value outside the set), so a setting that
+        gained one while the projection stayed silent would give the operator a
+        text box whose every non-member entry the door then refuses by path. The
+        vocabulary and a closed-choice control have to arrive together; this fails
+        the moment the first half arrives alone.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        declaring = [key for key, setting in SETTINGS.items() if setting.choices]
+        assert declaring == [], (
+            f"{declaring} now declare choices the write door enforces; project "
+            "`choices` in this read and give the settings form a closed-choice "
+            "control in the same change, or its text input will offer values the "
+            "door refuses"
+        )
+        assert all("choices" not in entry for entry in reply.body["settings"])
+
+    @pytest.mark.asyncio
     async def test_each_source_preset_is_byte_equal_to_the_bundled_table(
         self, recorded_sel: RecordedSel, enabled: None, home: Path
     ) -> None:

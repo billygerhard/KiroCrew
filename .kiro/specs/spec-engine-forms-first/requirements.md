@@ -147,8 +147,11 @@ intake feed does not require hand-writing JSON that includes commands.
    the Source_Presets the engine bundles, each described by what it ingests
    and the programs its commands run.
 2. WHEN a Watch_Source is created from a Source_Preset, THE Spec_App_UI SHALL
-   compose the entry's commands from the preset's own tables, and THE
-   Form_Surface SHALL NOT offer freeform command or argument entry anywhere.
+   compose the entry's commands from the preset's own tables, filling only the
+   placeholder positions those commands designate — never the position naming
+   the program — from a value constrained to the shape of a repository name,
+   and THE Form_Surface SHALL NOT offer freeform command or argument entry
+   anywhere.
 3. WHEN a Watch_Source is selected, THE Spec_App_UI SHALL render its stored
    fields as a form — name, enabled, project binding, and its per-source
    settings — with its poll command displayed read-only alongside the preset
