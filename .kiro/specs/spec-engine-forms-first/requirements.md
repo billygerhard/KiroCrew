@@ -153,9 +153,10 @@ intake feed does not require hand-writing JSON that includes commands.
    and THE Form_Surface SHALL NOT offer freeform command or argument entry
    anywhere.
 3. WHEN a Watch_Source is selected, THE Spec_App_UI SHALL render its stored
-   fields as a form — name, enabled, project binding, and its per-source
-   settings — with its poll command displayed read-only alongside the preset
-   it came from.
+   fields as a form — name, enabled, project binding, its per-source
+   settings, and the shape-checked repository parameter that fills only the
+   preset's designated placeholder slot — with the rest of its poll command
+   displayed read-only alongside the preset it came from.
 4. WHILE a Watch_Source form is displayed, THE Spec_App_UI SHALL display the
    source's submitter-class autonomy grid or link directly to it, and state
    that an absent grid fails closed.

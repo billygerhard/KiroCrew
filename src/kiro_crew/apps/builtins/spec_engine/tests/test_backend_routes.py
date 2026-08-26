@@ -1421,7 +1421,7 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
 
         A ``str`` setting renders as free text, and that is only sound because no
         setting declares ``choices``. The write door DOES enforce them
-        (``Setting.validate`` refuses a value outside the set), so a setting that
+        (``Setting.coerce`` refuses a value outside the set), so a setting that
         gained one while the projection stayed silent would give the operator a
         text box whose every non-member entry the door then refuses by path. The
         vocabulary and a closed-choice control have to arrive together; this fails

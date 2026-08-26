@@ -184,8 +184,8 @@ sweep. The review gate runs between waves.
     - Vitest: picker rendering, compose-inert-by-default, no-freeform-argv (absence of any command input), not-expressible routing, enable consequence, removal confirmation and patch shape; strings in all 13 catalogs.
     - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.4_
 
-- [ ] 6. Gate sweep
-  - [ ] 6.1 Full verification sweep and dispositions
+- [x] 6. Gate sweep
+  - [x] 6.1 Full verification sweep and dispositions
     - Run all gates with real exit codes: spec_engine pytest, spec_builder pytest, isort/flake8/mypy, tsc, eslint, full vitest (watch for unhandled errors exiting 1 with tests green), i18n:check, key-refs, manifest-sync, boundary fence.
     - Confirm all three correctness properties have executed mutation probes recorded (plant, named test fails, restore byte-identical).
     - Disposition every carried finding from tasks 1.1–5.1 in this file; verify catalog completeness for every new string; append a dated verification record section.
@@ -295,7 +295,7 @@ Verdicts: **fixed** · **accepted-with-reason** · **amendment-recommended**.
 | # | Carried finding | Verdict | Reason / evidence |
 |---|---|---|---|
 | 1 | 1.1 contract facts for 2.1–5.1 (registry route path; preset host keys are the table's own) | accepted-with-reason | Informational and consumed: the route is `GET {PREFIX}/config/registry`, and `test_each_source_preset_is_byte_equal_to_the_bundled_table` asserts hosts against `WATCH_SOURCE_PRESET_HOSTS` rather than domain names. |
-| 2 | 1.1 review — `Setting.choices` not projected | **fixed** | The assumption was documented in two prose comments (`api.ts`, `CONTROL_BY_KIND`) and enforced nowhere, while `Setting.validate` *does* refuse a non-member value — so a setting gaining `choices` would silently give the operator a text box the door then refuses by path. Added `test_no_projected_setting_declares_an_enforced_choice_set`, which pins the precondition (21 settings, none declaring choices) and fails the moment the first half of that change lands alone. Mutation-probed. |
+| 2 | 1.1 review — `Setting.choices` not projected | **fixed** | The assumption was documented in two prose comments (`api.ts`, `CONTROL_BY_KIND`) and enforced nowhere, while `Setting.coerce` *does* refuse a non-member value — so a setting gaining `choices` would silently give the operator a text box the door then refuses by path. Added `test_no_projected_setting_declares_an_enforced_choice_set`, which pins the precondition (21 settings, none declaring choices) and fails the moment the first half of that change lands alone. Mutation-probed. |
 | 3 | 2.1 review (a) — `FormReview` is presentational, each mutation owns its invalidation | accepted-with-reason | Honored: all three forms carry a named *re-renders … from a fresh read after a successful write* test (`SettingsForm:693`, `ProfilesForm:864`, `SourceForm:1232`). |
 | 4 | 2.1 review (b) — one shared `useStagedEdits`, not three ad-hoc states | accepted-with-reason | Honored: exactly three `useStagedEdits()` call sites, one per form (`ConfigPanel.tsx:1491, 2226, 3460`); no other staging state. |
 | 5 | 2.1 review (c) — ancestor/descendant overlap must be reconciled, property-checked | accepted-with-reason | Honored and property-checked: *leaves no two staged paths overlapping, however they were staged* and *drops an ancestor when a descendant is staged, and the other way round*. |
