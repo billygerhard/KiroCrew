@@ -154,24 +154,51 @@ enforces.
 - Add: preset picker listing `source_presets` with host, program, and what it
   ingests; selecting one stages the deep-copied entry under an operator-chosen
   name with `enabled` absent (inert by construction — the preset's own
-  contract). Editable fields: name, enabled, project binding, per-source
-  settings (registry-scoped), maintainers list. The poll command and field map
-  render read-only beside the preset host. No control anywhere accepts
-  command text.
+  contract). Editable fields: enabled, project binding, per-source
+  settings (registry-scoped), maintainers list, and the repository parameter
+  below. The poll command, field map, and `public` flag render read-only beside
+  the preset host. No control anywhere accepts command text.
+- **The repository parameter, and why the form is preset-*plus-parameters*.**
+  Every bundled preset's `poll` carries an `OWNER/REPO` literal, a poll has no
+  variable substitution, and setup writes the literal verbatim — so a source that
+  actually polls anything has an argv that is NOT byte-equal to its preset's. A
+  byte-equality expressibility rule therefore admits only copies that cannot run,
+  which is the opposite of Requirement 4's user story. The rule is
+  **modulo the designated slot(s)**: the positions of a preset's own argv holding
+  the placeholder literal, derived from the preset the read supplied (never
+  hard-coded indices), and never `argv[0]` — a preset whose placeholder sits on
+  the program is refused a slot altogether, because substituting there would let a
+  data field decide what the engine runs. The parameter stages the *whole* `poll`
+  array built from the preset's argv with only those slots filled, so the program,
+  the argument count and every other argument stay the preset's, and the engine
+  runs argv with no shell, so text inside one argument cannot become another. An
+  empty parameter keeps the placeholder and the form states that the command
+  cannot poll. On the add flow the parameter composes into the SAME single edit as
+  the copy (`sources.<name>` and `sources.<name>.poll` overlap, and the shared
+  staging drops one of two overlapping paths), whose review sentence names both
+  the copy's provenance and the repository.
 - Edit: same form over a stored entry WHEN its shape is preset-expressible,
-  which is **both** halves together: its `poll` argv is byte-equal to a bundled
-  preset's, AND every key it carries is one the form writes, displays read-only,
-  or the autonomy grid shows (a setting group counting leaf by leaf against the
-  registry). Either half failing gives the honest not-expressible state routing
-  to the JSON view, with no controls at all — the one edit here that starts
-  execution is `enabled`, so a form offered over argv no preset supplied would be
-  a way to arm a command this surface never constrained. The residual is
-  accepted: naming a preset copy's placeholder repository in the JSON view takes
-  that source out of the form's reach, which is the safe direction to fail in.
+  which is **both** halves together: its `poll` argv is a bundled preset's own
+  modulo that preset's designated slots, AND every key it carries is one the form
+  writes, displays read-only, or the autonomy grid shows (a setting group counting
+  leaf by leaf against the registry). Either half failing gives the honest
+  not-expressible state routing to the JSON view, with no *editing* controls at
+  all — the one edit here that starts execution is `enabled`, so a form offered
+  over argv no preset supplied would be a way to arm a command this surface never
+  constrained. The removal IS still offered there, because a deletion writes no
+  field and so cannot rewrite one the state withheld. The residual is accepted: a
+  poll hand-edited beyond its repository — a changed flag, an added argument,
+  another program — belongs to the JSON view from then on.
+- **No rename.** The name is displayed as the key it is and is not editable by
+  form. Renaming an entry is a delete plus an add of the WHOLE entry, including
+  every field this form does not show, so a rename control here would be the
+  partial-form write Requirement 4.5 forbids wearing a different name. A rename is
+  the JSON view's.
 - Remove: named confirmation, patch `{"sources": {"<name>": null}}`, with the
   stops-ingesting sentence. Enabling a new source carries the begins-polling
   sentence with a link to the source's autonomy grid (the existing
-  SourcesSection).
+  SourcesSection); enabling one whose poll still holds the placeholder carries its
+  own sentence instead, because what that arms is a command that cannot run.
 
 ## Data Models
 
@@ -209,9 +236,13 @@ vitest property over generated vocabularies (fast-check), not just the shipped
 
 FOR ALL bundled presets, the entry the form stages carries `poll` argv
 byte-equal to the preset table's own, and no staged source entry path ever
-carries argv the preset did not supply. Verified against the real preset
-tables (backend hypothesis test on the route payload + frontend fast-check on
-the staging function).
+carries argv the preset did not supply — where "supplied" means byte-equal to a
+preset's argv OR that argv with only its designated repository slots filled, and
+nothing else differing (same length, same program, same every other argument).
+Verified against the real preset tables (backend hypothesis test on the route
+payload + frontend fast-check on the staging function, over generated presets
+whose placeholder sits at arbitrary positions including `argv[0]`, which yields
+no slot at all).
 
 **Validates: Requirements 4.2**
 

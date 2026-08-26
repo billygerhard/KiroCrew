@@ -12,9 +12,15 @@
  *     separately confirmed write arms it.
  *   - **No control anywhere takes a command or an argument.** Not directly and not
  *     indirectly: the test exercises every control the form renders and asserts that
- *     no path the patch carries is `poll` or `field_map`.
+ *     every argv the patch carries is a bundled preset's own, up to the repository
+ *     slot that preset itself left open.
+ *   - **The repository is a value.** The presets ship an `OWNER/REPO` placeholder the
+ *     project is expected to name, so the form names it — by staging the preset's own
+ *     argv with only that slot filled, and by stating the placeholder while it is
+ *     still there.
  *   - **A stored shape the form cannot express gets no form.** Not a partial one —
- *     the state says what stops it and routes to the JSON view.
+ *     the state says what stops it and routes to the JSON view, while still offering
+ *     the removal, which writes no field at all.
  *   - **An enable states what it starts**, with the program it runs and a link into
  *     the autonomy grid that decides how far its items go.
  *   - **A removal is confirmed by typing the source's own name**, patches the
@@ -73,6 +79,18 @@ const GH_MAP = {
 }
 
 const GL_POLL = ['glab', 'issue', 'list', '--repo', 'OWNER/REPO', '--output', 'json']
+
+/**
+ * The GitHub preset's argv with its repository named, which is what a source that
+ * actually polls anything holds.
+ *
+ * The presets ship an `OWNER/REPO` literal and the engine has no variable
+ * substitution in a poll, so a working source's argv is NEVER byte-equal to its
+ * preset's — the form has to express this shape or it can only edit copies that
+ * cannot run.
+ */
+const REPO = 'acme/widgets'
+const GH_POLL_NAMED = GH_POLL.map((argument) => argument.replace('OWNER/REPO', REPO))
 
 const GL_MAP = {
   identifier: 'iid',
@@ -143,10 +161,13 @@ function registry(over: Record<string, unknown> = {}) {
  * The stored document.
  *
  * `gh` sorts first in document order, so it is what the form selects with no
- * interaction: its poll is the bundled preset's byte for byte and every key it
- * carries is one the form shows or the grid does. `legacy` polls something no preset
- * supplies, and `extra` carries a field this form has no control for — the two
- * not-expressible cases, which must never render a partial form.
+ * interaction: its poll is the bundled GitHub preset's with the repository named —
+ * the shape every source that actually polls anything is in — and every key it
+ * carries is one the form shows or the grid does. `fresh` is a preset copy whose
+ * placeholder nobody has named yet, which must be said rather than shown as a
+ * working command. `legacy` polls something no preset supplies, and `extra` carries a
+ * field this form has no control for — the two not-expressible cases, which must
+ * never render a partial form.
  */
 function stored() {
   return {
@@ -154,18 +175,19 @@ function stored() {
       gh: {
         preset: 'github',
         public: true,
-        poll: [...GH_POLL],
+        poll: [...GH_POLL_NAMED],
         field_map: { ...GH_MAP },
         project: 'acme',
         maintainers: ['octocat'],
         watch: { interval_s: 600 },
         autonomy: { maintainer: { feature: 'execution' } },
       },
+      fresh: { preset: 'github', public: false, poll: [...GH_POLL], field_map: { ...GH_MAP } },
       legacy: { poll: ['curl', '-s', 'https://tracker.example/api'], field_map: { title: 'name' } },
       extra: {
         preset: 'github',
         public: true,
-        poll: [...GH_POLL],
+        poll: [...GH_POLL_NAMED],
         field_map: { ...GH_MAP },
         spend_cap: { credits: 5 },
       },
@@ -216,6 +238,7 @@ function sources() {
   return {
     sources: [
       { name: 'gh', grid: {} },
+      { name: 'fresh', grid: {} },
       { name: 'legacy', grid: {} },
       { name: 'extra', grid: {} },
     ],
@@ -345,6 +368,20 @@ function nameTheAdd(name: string) {
   })
 }
 
+/** Name the repository the add block's copy would poll. */
+function nameTheAddRepository(repository: string) {
+  fireEvent.change(within(block()).getByLabelText(T.the_repository_for_the_new_source), {
+    target: { value: repository },
+  })
+}
+
+/** The repository parameter row of the selected source. */
+function repositoryRow(): HTMLElement {
+  const found = block().querySelector('.se-setting[data-source-parameter="repository"]')
+  expect(found, 'no repository row').not.toBeNull()
+  return found as HTMLElement
+}
+
 /** The button that copies one bundled preset. */
 function presetButton(host: string): HTMLElement {
   const group = within(block()).getByRole('group', { name: T.choose_a_preset_to_copy })
@@ -392,6 +429,37 @@ function argvEntries(node: unknown, found: Array<[string, unknown]> = []): Array
     }
   }
   return found
+}
+
+/**
+ * Whether *value* is an argv a bundled preset supplied, up to its repository slot.
+ *
+ * The claim the form makes: the program, the argument count and every argument
+ * outside the slot the preset itself left open are the preset's own. Checked here by
+ * rebuilding the preset's argv with whatever the candidate holds in that slot, so a
+ * changed flag or an added argument fails even when the repository looks plausible.
+ */
+function suppliedArgv(field: string, value: unknown): boolean {
+  for (const entry of [GH_ENTRY, GL_ENTRY] as Array<Record<string, unknown>>) {
+    const own = entry[field]
+    if (JSON.stringify(own) === JSON.stringify(value)) return true
+    if (field !== 'poll' || !Array.isArray(own) || !Array.isArray(value)) continue
+    if (own.length !== value.length) continue
+    const slots = own.flatMap((argument, index) =>
+      typeof argument === 'string' && argument.includes('OWNER/REPO') && index > 0 ? [index] : [],
+    )
+    if (slots.length === 0) continue
+    const named = String(value[slots[0]])
+    const prefix = String(own[slots[0]]).split('OWNER/REPO')[0]
+    const suffix = String(own[slots[0]]).split('OWNER/REPO')[1] ?? ''
+    if (!named.startsWith(prefix) || !named.endsWith(suffix)) continue
+    const repository = named.slice(prefix.length, named.length - suffix.length)
+    const rebuilt = own.map((argument, index) =>
+      slots.includes(index) ? String(argument).split('OWNER/REPO').join(repository) : argument,
+    )
+    if (JSON.stringify(rebuilt) === JSON.stringify(value)) return true
+  }
+  return false
 }
 
 afterEach(() => {
@@ -531,28 +599,50 @@ describe('a composed source carries the preset\u2019s command and nothing else',
 })
 
 describe('no control on the form accepts a command or an argument', () => {
-  it('shows the poll command and the field map read-only, beside the preset', async () => {
+  it('shows the poll command, the field map and the public flag read-only', async () => {
     await openForm()
-    // The preset provenance and the program, as facts rather than controls.
+    // The preset provenance, the program, and whether anyone may submit — as facts
+    // rather than controls.
     const facts = block().querySelector('dl.se-kv') as HTMLElement
     expect(within(facts).getByText(T.the_preset_host)).toBeInTheDocument()
     expect(within(facts).getByText('github')).toBeInTheDocument()
     expect(within(facts).getByText(T.the_program_it_runs)).toBeInTheDocument()
     expect(within(facts).getByText('gh')).toBeInTheDocument()
+    expect(within(facts).getByText(T.the_source_is_public)).toBeInTheDocument()
+    expect((facts.querySelector('[data-source-shown="public"]') as HTMLElement).textContent).toBe(
+      'true',
+    )
+    // Public is what makes the grid's submitter classes load-bearing, and the enable
+    // control that arms unattended ingestion sits on this same form, so the meaning
+    // is stated beside it rather than left to the word.
+    expect(within(block()).getByText(T.public_items_come_from_anyone)).toBeInTheDocument()
     // The argv itself, exactly as the engine will run it.
     const argv = block().querySelector('pre.se-json')
     expect(argv).not.toBeNull()
-    expect(JSON.parse((argv as HTMLElement).textContent ?? 'null')).toEqual(GH_POLL)
+    expect(JSON.parse((argv as HTMLElement).textContent ?? 'null')).toEqual(GH_POLL_NAMED)
     // And the mapping, which is the other half of what the poll does.
     expect(within(block()).getByText(T.the_field_map)).toBeInTheDocument()
     expect(within(block()).getByText('labels.0.name')).toBeInTheDocument()
     expect(within(block()).getByText(T.the_form_cannot_change_the_command)).toBeInTheDocument()
   })
 
-  it('stages no argv path however every control on it is exercised', async () => {
+  it('states a source is not public rather than implying screening it does not do', async () => {
+    await openForm()
+    selectSource('fresh')
+    const facts = block().querySelector('dl.se-kv') as HTMLElement
+    expect((facts.querySelector('[data-source-shown="public"]') as HTMLElement).textContent).toBe(
+      'false',
+    )
+    // The advisory belongs to a public source; a private one earns no warning it
+    // would then be read as carrying.
+    expect(within(block()).queryByText(T.public_items_come_from_anyone)).toBeNull()
+  })
+
+  it('stages no argv outside a preset\u2019s own however every control is exercised', async () => {
     await openForm()
     // Every control the form renders, driven with argv-looking text: whatever the
-    // form can be made to stage, none of it may be a path the engine executes.
+    // form can be made to stage, none of it may be an argv the presets did not
+    // supply — the repository slot they left open included.
     nameTheAdd('gh api repos/evil/repo')
     for (const box of Array.from(block().querySelectorAll('input[type="text"]'))) {
       fireEvent.change(box, { target: { value: 'gh api repos/evil/repo --jq .' } })
@@ -571,17 +661,210 @@ describe('no control on the form accepts a command or an argument', () => {
     const patch = shownPatch()
     // The claim is not that no `poll` key appears — a preset copy carries the
     // preset's own argv, which is the point — but that every argv path in the patch
-    // is a preset's OWN, and that nothing else here can put one there. The paths are
-    // what is checked rather than the values: a maintainer account may contain any
-    // text at all, and what must never appear is an argv the engine did not bundle.
+    // is a preset's OWN up to the repository slot the preset itself left open, and
+    // that nothing here can put another one there. Not the values in general: a
+    // maintainer account may contain any text at all.
     for (const [key, value] of argvEntries(patch)) {
-      const supplied = [GH_ENTRY, GL_ENTRY].some(
-        (entry) =>
-          JSON.stringify((entry as Record<string, unknown>)[key]) === JSON.stringify(value),
-      )
-      expect(supplied, `${key} was not supplied by a bundled preset`).toBe(true)
+      expect(suppliedArgv(key, value), `${key} was not supplied by a bundled preset`).toBe(true)
     }
     expect(Object.keys(patch as Record<string, unknown>)).toEqual(['sources'])
+  })
+})
+
+describe('the repository is a value the preset left open', () => {
+  it('names it inside the preset\u2019s own argv, changing nothing else', async () => {
+    await openForm()
+    const box = within(repositoryRow()).getByRole('textbox')
+    // The stored repository is read back out of the argv, so the control cannot show
+    // a repository the array does not carry.
+    expect((box as HTMLInputElement).value).toBe(REPO)
+    expect(within(repositoryRow()).getByText(T.the_repository_is_a_value_not_a_command)).toBeInTheDocument()
+    fireEvent.change(box, { target: { value: '  other/repo  ' } })
+    review()
+    // The whole array, with only the designated slot substituted and trimmed: the
+    // program, the flags and the query string are still the preset's.
+    expect(shownPatch()).toEqual({
+      sources: {
+        gh: { poll: GH_POLL.map((argument) => argument.replace('OWNER/REPO', 'other/repo')) },
+      },
+    })
+    expect(
+      within(block()).getByText(
+        T.edit_names_the_repository
+          .replace('{{source}}', 'gh')
+          .replace('{{preset}}', 'github')
+          .replace('{{oldValue}}', REPO)
+          .replace('{{newValue}}', 'other/repo')
+          .replace('{{path}}', 'sources.gh.poll'),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('withdraws a repository typed back to the one already stored', async () => {
+    await openForm()
+    const box = within(repositoryRow()).getByRole('textbox')
+    fireEvent.change(box, { target: { value: 'other/repo' } })
+    expect(unwritten()).toContain(T.unwritten_source_changes)
+    // Writing back what the path already holds is not a change, and every write is
+    // recorded: staging it would put a line in the durable record for nothing.
+    fireEvent.change(box, { target: { value: REPO } })
+    expect(unwritten()).toBe('')
+  })
+
+  it('says the placeholder is still there rather than showing it as a command', async () => {
+    await openForm()
+    selectSource('fresh')
+    // Empty rather than pre-filled with the literal: the literal is not a repository,
+    // and a box holding it would invite an edit around it.
+    expect((within(repositoryRow()).getByRole('textbox') as HTMLInputElement).value).toBe('')
+    expect(
+      within(block()).getByText(
+        T.the_repository_is_still_the_placeholder.replace('{{placeholder}}', 'OWNER/REPO'),
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('states that enabling a placeholder poll ingests nothing', async () => {
+    await openForm()
+    selectSource('fresh')
+    fireEvent.click(within(fieldRow('enabled')).getByRole('checkbox'))
+    review()
+    // A `true` in the patch does not say that the command it arms cannot run, so the
+    // card says it — and does not claim polling begins on a repository.
+    expect(
+      within(block()).getByText(
+        T.enabling_polls_the_placeholder
+          .replace('{{source}}', 'fresh')
+          .replace('{{program}}', 'gh')
+          .replace('{{placeholder}}', 'OWNER/REPO')
+          .replace('{{path}}', 'sources.fresh.enabled'),
+      ),
+    ).toBeInTheDocument()
+    expect(
+      within(block()).queryByText(
+        T.enabling_begins_polling
+          .replace('{{source}}', 'fresh')
+          .replace('{{program}}', 'gh')
+          .replace('{{path}}', 'sources.fresh.enabled'),
+      ),
+    ).toBeNull()
+  })
+
+  it('names a repository and an enable in one review, each stated', async () => {
+    await openForm()
+    selectSource('fresh')
+    fireEvent.change(within(repositoryRow()).getByRole('textbox'), {
+      target: { value: 'acme/other' },
+    })
+    fireEvent.click(within(fieldRow('enabled')).getByRole('checkbox'))
+    review()
+    // The repository lands in the same patch, so the polling sentence must describe
+    // the command as it will stand — not the placeholder it no longer holds.
+    expect(
+      within(block()).getByText(
+        T.enabling_begins_polling
+          .replace('{{source}}', 'fresh')
+          .replace('{{program}}', 'gh')
+          .replace('{{path}}', 'sources.fresh.enabled'),
+      ),
+    ).toBeInTheDocument()
+    expect(shownPatch()).toEqual({
+      sources: {
+        fresh: {
+          poll: GH_POLL.map((argument) => argument.replace('OWNER/REPO', 'acme/other')),
+          enabled: true,
+        },
+      },
+    })
+  })
+
+  it('creates a working source from the add block without opening the JSON view', async () => {
+    await openForm()
+    nameTheAdd('issues')
+    nameTheAddRepository('acme/tickets')
+    fireEvent.click(presetButton('github'))
+    review()
+    // One edit, and its card names BOTH decisions: which preset the entry copies and
+    // which repository its command names. A silent merge of the two would be a card
+    // that claimed a provenance and hid the target.
+    expect(shownPatch()).toEqual({
+      sources: {
+        issues: {
+          ...GH_ENTRY,
+          poll: GH_POLL.map((argument) => argument.replace('OWNER/REPO', 'acme/tickets')),
+        },
+      },
+    })
+    expect(
+      within(block()).getByText(
+        T.edit_copies_the_preset_for_repository
+          .replace('{{source}}', 'issues')
+          .replace('{{preset}}', 'github')
+          .replace('{{program}}', 'gh')
+          .replace('{{repository}}', 'acme/tickets')
+          .replace('{{path}}', 'sources.issues'),
+      ),
+    ).toBeInTheDocument()
+    confirm()
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
+    const written = (putPatch() as { sources: { issues: Record<string, unknown> } }).sources.issues
+    // Still inert: naming a repository is not arming a source.
+    expect('enabled' in written).toBe(false)
+  })
+
+  it('re-composes a staged copy when the repository is named after the preset', async () => {
+    await openForm()
+    nameTheAdd('issues')
+    fireEvent.click(presetButton('github'))
+    // The placeholder is kept while nothing is named, and the consequence is stated
+    // where it is left empty rather than discovered on the next poll.
+    expect(
+      within(block()).getByText(
+        T.a_copy_with_no_repository_keeps_the_placeholder.replace('{{placeholder}}', 'OWNER/REPO'),
+      ),
+    ).toBeInTheDocument()
+    review()
+    expect(shownPatch()).toEqual({ sources: { issues: GH_ENTRY } })
+    nameTheAddRepository('acme/late')
+    expect(shownPatch()).toEqual({
+      sources: {
+        issues: {
+          ...GH_ENTRY,
+          poll: GH_POLL.map((argument) => argument.replace('OWNER/REPO', 'acme/late')),
+        },
+      },
+    })
+  })
+
+  it('says a preset leaves no repository rather than offering an inert control', async () => {
+    // Two shapes with no slot this form may fill: a poll carrying no placeholder at
+    // all, and one carrying it on the PROGRAM — which is refused rather than
+    // substituted, because argv[0] is what the engine executes.
+    for (const poll of [
+      ['fj', 'issue', 'list'],
+      ['OWNER/REPO', 'issue', 'list'],
+    ]) {
+      const entry = { preset: 'forgejo', public: true, poll, field_map: { title: 'title' } }
+      const doc = { sources: { fj: { ...entry } }, projects: {} }
+      await openForm({
+        registry: {
+          body: registry({ source_presets: [{ host: 'forgejo', program: 'fj', entry }] }),
+        },
+        config: { body: snapshot(doc) },
+      })
+      expect(
+        within(block()).getByText(
+          T.the_preset_has_no_repository_slot.replace('{{preset}}', 'forgejo'),
+        ),
+      ).toBeInTheDocument()
+      // Not an empty box: there is nowhere in this argv the form is allowed to write.
+      expect(block().querySelector('[data-source-parameter="repository"]')).toBeNull()
+      // And the rest of the form is still offered, because the entry is expressible.
+      expect(fieldRow('enabled')).not.toBeNull()
+      cleanup()
+      vi.unstubAllGlobals()
+      calls.length = 0
+    }
   })
 })
 
@@ -715,6 +998,38 @@ describe('a stored shape the form cannot express', () => {
       within(block()).getByText(T.the_entry_carries_unshown_fields.replace('{{fields}}', 'spend_cap')),
     ).toBeInTheDocument()
     expect(block().querySelector('[data-source-field]')).toBeNull()
+  })
+
+  it('still offers the removal, which writes no field it did not show', async () => {
+    await openForm()
+    selectSource('legacy')
+    expect(
+      within(block()).getByText(T.a_removal_writes_no_field_it_did_not_show),
+    ).toBeInTheDocument()
+    // A deletion cannot rewrite a field this state withheld, so withholding it too
+    // would leave a source the form cannot describe removable only by hand.
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: T.remove_the_source.replace('{{source}}', 'legacy'),
+      }),
+    )
+    fireEvent.change(
+      within(block()).getByLabelText(T.type_the_name_to_confirm.replace('{{source}}', 'legacy')),
+      { target: { value: 'legacy' } },
+    )
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: T.confirm_the_removal.replace('{{source}}', 'legacy'),
+      }),
+    )
+    review()
+    expect(shownPatch()).toEqual({ sources: { legacy: null } })
+    // And still no editing control anywhere on the state.
+    expect(block().querySelector('[data-source-field]')).toBeNull()
+    expect(block().querySelector('[data-source-parameter="repository"]')).toBeNull()
+    confirm()
+    await waitFor(() => expect(calls.some((call) => call.method === 'PUT')).toBe(true))
+    expect(putPatch()).toEqual({ sources: { legacy: null } })
   })
 })
 
@@ -923,6 +1238,22 @@ describe('the operator-facing strings', () => {
     expect(T.copy_the_preset).toContain('{{host}}')
     expect(T.the_entry_carries_unshown_fields).toContain('{{fields}}')
     expect(T.the_registry_kind_is_not_editable_here).toContain('{{kind}}')
+    expect(T.the_preset_has_no_repository_slot).toContain('{{preset}}')
+    for (const key of [
+      'a_copy_with_no_repository_keeps_the_placeholder',
+      'the_repository_is_still_the_placeholder',
+    ] as const) {
+      expect(T[key], key).toContain('{{placeholder}}')
+    }
+    for (const name of ['source', 'program', 'placeholder', 'path']) {
+      expect(T.enabling_polls_the_placeholder).toContain(`{{${name}}}`)
+    }
+    for (const name of ['source', 'preset', 'oldValue', 'newValue', 'path']) {
+      expect(T.edit_names_the_repository).toContain(`{{${name}}}`)
+    }
+    for (const name of ['source', 'preset', 'program', 'repository', 'path']) {
+      expect(T.edit_copies_the_preset_for_repository).toContain(`{{${name}}}`)
+    }
     for (const name of ['host', 'program', 'count', 'fields']) {
       expect(T.preset_ingests_items).toContain(`{{${name}}}`)
     }

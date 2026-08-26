@@ -1,10 +1,10 @@
 /**
- * Property 3, frontend half: a composed source carries only preset commands.
+ * Property 3, frontend half: a source's argv is always a preset's argv.
  *
  * The write door validates an argv's SHAPE and not which program it names, so the
  * boundary on what the engine can be made to run through configuration is the
- * bundled preset tables plus this form's refusal to compose an argv path. That makes
- * two claims, and neither is a claim about the two presets shipped today:
+ * bundled preset tables plus this form's refusal to compose an argv freely. That makes
+ * three claims, and none of them is a claim about the two presets shipped today:
  *
  *   - **`composeSource` copies the command.** For any preset entry, the staged
  *     entry's `poll` is byte-equal to the preset's own, its `field_map` likewise, and
@@ -12,16 +12,22 @@
  *     so a fresh copy must be inert. The copy is also deep: the read's cached object
  *     must never become the staged value, or an edit to one source's staged copy
  *     would change what the next copy is offered.
- *   - **No sequence of form actions stages an argv the presets did not supply.**
+ *   - **The repository parameter changes only its own slot.** The presets ship an
+ *     `OWNER/REPO` placeholder the project is expected to name, so the form names it —
+ *     and every argv it stages is the preset's own array with only the positions
+ *     holding that literal replaced. `argv[0]` is never such a position, and a preset
+ *     whose placeholder sits there is refused rather than substituted, because that
+ *     position is the PROGRAM.
+ *   - **No sequence of form actions stages an argv outside those two shapes.**
  *     `sourceEdit` is the one place this form composes a path under `sources`, so the
  *     property is stated over ARBITRARY action sequences — including a field named
  *     `poll`, a registry key whose group is `field_map`, and a settings group the
  *     schema keeps disjoint today but might not tomorrow — and checked against the
  *     patch those actions actually build.
  *
- * A generator is the only way to state either. A hard-coded case proves the two
- * shipped presets copy correctly; it cannot prove that the set of paths this form can
- * write excludes the two the engine executes.
+ * A generator is the only way to state any of them. A hard-coded case proves the two
+ * shipped presets copy correctly; it cannot prove that the set of argv this form can
+ * write is exactly the preset table modulo one designated slot.
  */
 import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
@@ -29,6 +35,9 @@ import * as fc from 'fast-check'
 import {
   SOURCE_FORM_FIELDS,
   composeSource,
+  designatedSlots,
+  matchPoll,
+  pollForRepository,
   sourceEdit,
   sourceShape,
   type SourceFormAction,
@@ -40,8 +49,34 @@ import type { RegistrySetting, SourcePreset } from '../apps/spec-engine/api'
 /** The two argv-bearing fields, which are the subject of the whole property. */
 const ARGV_FIELDS = ['poll', 'field_map'] as const
 
+/** The engine's own placeholder literal, as `WATCH_SOURCE_PRESETS` spells it. */
+const PLACEHOLDER = 'OWNER/REPO'
+
 /** An argv: a non-empty list of strings, as the engine's own preset tables hold. */
 const ARGV = fc.array(fc.string({ minLength: 1, maxLength: 8 }), { minLength: 1, maxLength: 5 })
+
+/**
+ * An argv carrying the placeholder at an arbitrary position, including position 0.
+ *
+ * The shapes that matter are all here: the placeholder as a whole argument (GitLab's
+ * form), embedded in a longer argument (GitHub's), at more than one position, and on
+ * the program itself — which is the one the form has to refuse.
+ */
+const PLACEHOLDER_ARGV: fc.Arbitrary<string[]> = fc
+  .record({
+    before: fc.array(fc.string({ minLength: 1, maxLength: 5 }), { maxLength: 3 }),
+    prefix: fc.constantFrom('', 'repos/', 'api/v4/projects/'),
+    suffix: fc.constantFrom('', '/issues?state=all', '.git'),
+    after: fc.array(fc.string({ minLength: 1, maxLength: 5 }), { maxLength: 3 }),
+    extra: fc.boolean(),
+  })
+  .map(({ before, prefix, suffix, after, extra }) => {
+    const slot = `${prefix}${PLACEHOLDER}${suffix}`
+    // The placeholder-free arguments must stay placeholder-free, or the generator
+    // would quietly designate positions the case did not mean to designate.
+    const clean = (parts: string[]) => parts.map((part) => part.replace(/OWNER\/REPO/g, 'x'))
+    return [...clean(before), slot, ...(extra ? [slot] : []), ...clean(after)]
+  })
 
 /** A field map: engine item field to a dotted output path. */
 const FIELD_MAP = fc.dictionary(
@@ -59,7 +94,7 @@ const PRESET: fc.Arbitrary<SourcePreset> = fc
   .record({
     host: fc.constantFrom('github', 'gitlab', 'forgejo', '__proto__', ''),
     program: fc.constantFrom('gh', 'glab', 'fj'),
-    poll: ARGV,
+    poll: fc.oneof(ARGV, PLACEHOLDER_ARGV),
     fieldMap: FIELD_MAP,
     enabled: fc.option(fc.boolean(), { nil: undefined }),
   })
@@ -73,6 +108,17 @@ const PRESET: fc.Arbitrary<SourcePreset> = fc
     if (enabled !== undefined) entry.enabled = enabled
     return { host, program, entry }
   })
+
+/** A repository a parameter control could be handed, argv-looking text included. */
+const REPOSITORY = fc.constantFrom(
+  'acme/widgets',
+  '',
+  '   ',
+  'a/b --jq .',
+  '$(id)',
+  'OWNER/REPO',
+  '../../etc/passwd',
+)
 
 /** A source name, including the two names a container must never be treated as. */
 const NAME = fc.constantFrom('gh', 'issues', 'a.b', '__proto__', 'constructor', ' ', '')
@@ -99,6 +145,13 @@ const ACTION = (presets: readonly SourcePreset[]): fc.Arbitrary<SourceFormAction
       kind: fc.constant('add' as const),
       source: NAME,
       preset: fc.constantFrom(...presets),
+      repository: REPOSITORY,
+    }),
+    fc.record({
+      kind: fc.constant('repository' as const),
+      source: NAME,
+      preset: fc.constantFrom(...presets),
+      repository: REPOSITORY,
     }),
     fc.record({
       kind: fc.constant('field' as const),
@@ -124,6 +177,22 @@ function argvEntries(node: unknown, found: Array<[string, unknown]> = []): Array
     }
   }
   return found
+}
+
+/**
+ * Whether *value* is an argv one of *presets* supplied, modulo the repository slot.
+ *
+ * The whole claim of the form, as a predicate: an argv it stages is either a
+ * preset's own bytes or a preset's own bytes with the designated slots — and only
+ * those — holding something else. `matchPoll` is what decides that, so the property
+ * exercises the same rule the form's expressibility gate turns on.
+ */
+function suppliedArgv(field: string, value: unknown, presets: readonly SourcePreset[]): boolean {
+  return presets.some((preset) => {
+    const own = (preset.entry as Record<string, unknown>)[field]
+    if (JSON.stringify(own) === JSON.stringify(value)) return true
+    return field === 'poll' && matchPoll(own, value) !== null
+  })
 }
 
 describe('composeSource copies the preset\u2019s command and leaves it inert', () => {
@@ -164,15 +233,104 @@ describe('composeSource copies the preset\u2019s command and leaves it inert', (
   })
 })
 
-describe('no sequence of form actions stages an argv the presets did not supply', () => {
-  it('builds a patch whose every argv path is a preset\u2019s own', () => {
+describe('the repository parameter changes only its own slot', () => {
+  it('never designates the program position, and refuses a preset that would', () => {
+    fc.assert(
+      fc.property(PLACEHOLDER_ARGV, (poll) => {
+        const slots = designatedSlots(poll)
+        // Position zero is the PROGRAM the engine executes. A form that substituted
+        // there would let a data field decide what runs, so a preset whose
+        // placeholder sits there gets no designated slot at all rather than a
+        // narrower one.
+        expect(slots).not.toContain(0)
+        if (poll[0].includes(PLACEHOLDER)) expect(slots).toEqual([])
+        else expect(slots.length).toBeGreaterThan(0)
+        for (const slot of slots) expect(poll[slot]).toContain(PLACEHOLDER)
+      }),
+    )
+  })
+
+  it('stages the preset\u2019s own argv with only the designated slots filled', () => {
+    fc.assert(
+      fc.property(PRESET, NAME, REPOSITORY, (preset, source, repository) => {
+        const edit = sourceEdit({ kind: 'repository', source, preset, repository })
+        const template = preset.entry.poll as string[]
+        const slots = designatedSlots(template)
+        if (slots.length === 0 || source.trim() === '') {
+          // No slot to fill is a refusal, not a substitution: there is nowhere in
+          // this argv the form is allowed to write.
+          expect(edit).toBeNull()
+          return
+        }
+        expect(edit).not.toBeNull()
+        const staged = (edit as StagedEdit).value as unknown[]
+        expect((edit as StagedEdit).segments).toEqual(['sources', source, 'poll'])
+        // Same length, same program, same everything outside a designated slot.
+        expect(staged).toHaveLength(template.length)
+        expect(staged[0]).toBe(template[0])
+        for (let index = 0; index < template.length; index += 1) {
+          if (slots.includes(index)) continue
+          expect(staged[index]).toBe(template[index])
+        }
+        // And the slots hold the trimmed value, or the placeholder when it is empty:
+        // a poll naming the literal is refused loudly, which is safer than one
+        // naming a repository nobody meant.
+        const named = repository.trim() === '' ? PLACEHOLDER : repository.trim()
+        const match = matchPoll(template, staged)
+        expect(match).not.toBeNull()
+        expect((match as { repository: string }).repository).toBe(named)
+      }),
+    )
+  })
+
+  it('accepts exactly the polls that differ from a preset only at its slots', () => {
+    fc.assert(
+      fc.property(
+        PRESET,
+        REPOSITORY,
+        fc.nat(6),
+        fc.string({ minLength: 1, maxLength: 5 }),
+        (preset, repository, index, noise) => {
+          const template = preset.entry.poll as string[]
+          const slots = designatedSlots(template)
+          const filled = pollForRepository(preset, repository)
+          if (slots.length === 0) {
+            expect(filled).toBeNull()
+            // With no slot, expressibility collapses back to byte-equality.
+            expect(matchPoll(template, template)).not.toBeNull()
+            expect(matchPoll(template, [...template, noise])).toBeNull()
+            return
+          }
+          // A substituted poll matches. That is the whole repair: the engine's own
+          // presets ship a placeholder the project replaces, so a poll that actually
+          // polls something is still one this form can account for.
+          expect(matchPoll(template, filled)).not.toBeNull()
+          // A poll differing anywhere OUTSIDE a slot does not match, whatever the
+          // slots hold — a changed flag, a changed query string, another program.
+          const at = index % template.length
+          const changed = [...(filled as string[])]
+          changed[at] = `${changed[at]}${noise}`
+          const stillFramed = slots.includes(at) && matchPoll(template, changed) !== null
+          expect(matchPoll(template, changed) === null || stillFramed).toBe(true)
+          if (!slots.includes(at)) expect(matchPoll(template, changed)).toBeNull()
+          // And a poll of a different length never matches.
+          expect(matchPoll(template, (filled as string[]).slice(1))).toBeNull()
+        },
+      ),
+    )
+  })
+})
+
+describe('no sequence of form actions stages an argv outside a preset\u2019s own', () => {
+  it('builds a patch whose every argv path is a preset\u2019s, modulo the slot', () => {
     fc.assert(
       fc.property(
         fc.array(PRESET, { minLength: 1, maxLength: 3 }),
         fc.array(fc.nat(6), { maxLength: 6 }),
         (presets, seeds) => {
           // The actions are drawn against the presets that exist, exactly as the form
-          // draws them: a copy is always a copy of something the read supplied.
+          // draws them: a copy is always a copy of something the read supplied, and a
+          // repository is always named into a preset the read supplied.
           const actions = seeds.map((seed) =>
             fc.sample(ACTION(presets), { numRuns: 1, seed })[0],
           )
@@ -180,20 +338,16 @@ describe('no sequence of form actions stages an argv the presets did not supply'
           for (const action of actions) {
             const edit = sourceEdit(action)
             // `null` is the refusal, and the form drops it rather than guessing a
-            // path — a field outside the three, or a setting group that would land on
-            // an argv field.
+            // path — a field outside the three, a setting group that would land on
+            // an argv field, or a preset with no slot to name a repository in.
             if (edit) edits = stageEdit(edits, edit.segments, edit.value)
           }
           const patch = buildFormPatch(edits.filter((edit) => edit.value !== DELETE))
-          for (const [, value] of argvEntries(patch)) {
-            const supplied = presets.some((preset) =>
-              ARGV_FIELDS.some(
-                (field) =>
-                  JSON.stringify((preset.entry as Record<string, unknown>)[field]) ===
-                  JSON.stringify(value),
-              ),
-            )
-            expect(supplied).toBe(true)
+          for (const [field, value] of argvEntries(patch)) {
+            expect(
+              suppliedArgv(field, value, presets),
+              `${field} was not a bundled preset\u2019s own`,
+            ).toBe(true)
           }
         },
       ),
@@ -238,19 +392,32 @@ describe('sourceShape refuses what it cannot express', () => {
     },
   ]
 
-  it('calls an entry expressible only when a preset supplied its poll', () => {
+  it('calls an entry expressible when a preset supplied its poll, slot aside', () => {
     fc.assert(
-      fc.property(fc.array(PRESET, { minLength: 1, maxLength: 3 }), ARGV, (presets, poll) => {
-        const shape = sourceShape({ poll }, presets, SETTINGS)
-        const supplied = presets.some(
-          (preset) => JSON.stringify(preset.entry.poll) === JSON.stringify(poll),
-        )
-        // Expressible is exactly "a preset supplied this argv" for an entry carrying
-        // nothing else: the form's one arming control is `enabled`, so an argv no
-        // preset supplied must not reach a form that offers it.
-        expect(shape.expressible).toBe(supplied)
-        expect(shape.preset !== null).toBe(supplied)
-      }),
+      fc.property(
+        fc.array(PRESET, { minLength: 1, maxLength: 3 }),
+        fc.oneof(ARGV, PLACEHOLDER_ARGV),
+        REPOSITORY,
+        (presets, poll, repository) => {
+          const shape = sourceShape({ poll }, presets, SETTINGS)
+          const supplied = presets.some((preset) => matchPoll(preset.entry.poll, poll) !== null)
+          // Expressible is exactly "a preset supplied this argv, up to its own
+          // repository slot" for an entry carrying nothing else: the form's one
+          // arming control is `enabled`, so an argv it cannot account for argument by
+          // argument must not reach a form that offers it.
+          expect(shape.expressible).toBe(supplied)
+          expect(shape.preset !== null).toBe(supplied)
+          // And a preset's poll with a repository named in it stays expressible,
+          // which is the case every source that actually polls anything is in.
+          for (const preset of presets) {
+            const filled = pollForRepository(preset, repository)
+            if (filled === null) continue
+            const named = sourceShape({ poll: filled }, presets, SETTINGS)
+            expect(named.expressible).toBe(true)
+            expect(named.slots.length).toBeGreaterThan(0)
+          }
+        },
+      ),
     )
   })
 

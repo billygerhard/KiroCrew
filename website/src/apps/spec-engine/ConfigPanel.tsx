@@ -891,8 +891,8 @@ function SourcesSection({
       {names.length === 0 ? (
         /* Not an empty matrix: a grid with no source to belong to reads as "no
            authority is granted", when the fact is that nothing is being ingested at
-           all. The offer flow is named because that is the only place a source comes
-           from — this section edits grids and never creates one. */
+           all. The copy names the source form above, which is where a source is
+           created — this section edits grids and never creates one. */
         <p className="se-note">
           {i18nT('apps.specEngine.sourcesSection.no_watch_source_is_configured')}
         </p>
@@ -2805,13 +2805,35 @@ const SOURCE_PRESET = 'preset'
 const SOURCE_PUBLIC = 'public'
 
 /**
+ * The literal a bundled preset's poll argv holds where the repository belongs.
+ *
+ * The engine's own placeholder, spelled in `WATCH_SOURCE_PRESETS`: a poll has no run
+ * context to substitute from, so the preset tables carry this literal rather than a
+ * variable, precisely so a copy nobody parameterized is refused loudly instead of
+ * polling somewhere unintended. Every preset the engine bundles ships it, which is
+ * why a source that actually polls anything has an argv that is NOT byte-equal to
+ * its preset's.
+ *
+ * Named here rather than derived, because a literal cannot be derived — but the
+ * POSITIONS it sits at are never spelled: {@link designatedSlots} finds them in the
+ * preset the read supplied, so a preset whose placeholder moves, or a preset the
+ * engine adds, needs no change here.
+ */
+const SOURCE_REPO_PLACEHOLDER = 'OWNER/REPO'
+
+/**
  * The two fields carrying what the engine runs and how it reads the output.
  *
- * Named as a pair because they are the pair no path this form composes may
- * address. `poll` is argv the engine executes, and the write door validates its
- * SHAPE rather than which program it names — so the boundary on what the engine
- * runs is the preset tables plus this form's refusal to compose either path, and
- * nothing downstream of that.
+ * Named as a pair because they are the pair no path this form composes FREELY.
+ * `poll` is argv the engine executes, and the write door validates its SHAPE rather
+ * than which program it names — so the boundary on what the engine runs is the
+ * preset tables plus this form's refusal to compose either path from operator text,
+ * and nothing downstream of that.
+ *
+ * The one exception is the repository parameter, and it is an exception in address
+ * only: it stages `poll` as the matched preset's own argv with the placeholder in
+ * {@link designatedSlots} filled, so the program, the argument COUNT and every other
+ * argument stay the preset's. See {@link sourceEdit}.
  */
 const SOURCE_ARGV_FIELDS: readonly string[] = [SOURCE_POLL, SOURCE_FIELD_MAP]
 
@@ -2835,8 +2857,11 @@ export const SOURCE_FORM_FIELDS: readonly string[] = [
  *
  * Shown rather than hidden: an operator deciding whether to arm a source is
  * deciding to run the command in `poll`, so the command is on screen in full.
- * `autonomy` is displayed by the grid section this form links to, which is one
- * resolution of it rather than a second rendering here.
+ * `public` is on screen for the same reason and beside it: the enable control lives
+ * on this form, and whether items arrive from anyone is what decides how much the
+ * grid's submitter classes are actually load-bearing. `autonomy` is displayed by the
+ * grid section this form links to, which is one resolution of it rather than a
+ * second rendering here.
  */
 const SOURCE_SHOWN_FIELDS: readonly string[] = [
   SOURCE_POLL,
@@ -2893,15 +2918,183 @@ export function composeSource(preset: SourcePreset): Document {
  * One act the source form can perform, in the only vocabulary it has.
  *
  * A closed vocabulary rather than a free `(segments, value)` call, because that is
- * what makes the no-freeform-argv guarantee statable at all: {@link sourceEdit} is
- * the ONE place this form composes a path under `sources`, so the set of paths it
- * can write is exactly the set these four kinds produce.
+ * what makes the argv guarantee statable at all: {@link sourceEdit} is the ONE place
+ * this form composes a path under `sources`, so the set of paths it can write is
+ * exactly the set these five kinds produce.
  */
 export type SourceFormAction =
-  | { kind: 'add'; source: string; preset: SourcePreset }
+  | { kind: 'add'; source: string; preset: SourcePreset; repository: string }
+  | { kind: 'repository'; source: string; preset: SourcePreset; repository: string }
   | { kind: 'field'; source: string; field: string; value: unknown }
   | { kind: 'setting'; source: string; key: string; value: unknown }
   | { kind: 'remove'; source: string }
+
+/**
+ * The argv positions of *poll* that hold the repository placeholder.
+ *
+ * Derived from the preset the read supplied, never spelled as an index: the GitHub
+ * preset carries the placeholder INSIDE a longer argument
+ * (`repos/OWNER/REPO/issues?…`) while GitLab's is a whole argument of its own, and a
+ * form holding either position as a number would substitute into the wrong argument
+ * the first time a preset changed.
+ *
+ * **`argv[0]` is never a slot, and a placeholder there refuses the whole preset.**
+ * Position zero is the PROGRAM the engine executes. Substituting there would let a
+ * data field decide what runs, which is the one thing this form exists to prevent —
+ * so such a preset gets no designated slot at all, its poll is expressible only byte
+ * for byte, and it is offered no repository control. Defensive rather than
+ * hypothetical: no bundled preset does this, and the refusal is what keeps it true.
+ */
+export function designatedSlots(poll: unknown): number[] {
+  if (!Array.isArray(poll)) return []
+  const slots: number[] = []
+  for (let index = 0; index < poll.length; index += 1) {
+    const argument = poll[index]
+    if (typeof argument !== 'string' || !argument.includes(SOURCE_REPO_PLACEHOLDER)) continue
+    if (index === 0) return []
+    slots.push(index)
+  }
+  return slots
+}
+
+/**
+ * *argument* with every placeholder occurrence replaced by *repository*.
+ *
+ * The surrounding text is kept, which is the whole reason substitution is per
+ * argument rather than per position: `repos/OWNER/REPO/issues?state=all` becomes
+ * `repos/acme/widgets/issues?state=all`, and the query string the preset chose is
+ * still the preset's.
+ */
+function fillSlot(argument: string, repository: string): string {
+  return argument.split(SOURCE_REPO_PLACEHOLDER).join(repository)
+}
+
+/**
+ * The repository *stored* holds where *template* holds the placeholder, or `null`
+ * when *stored* is not *template* with one value filled in.
+ *
+ * The literal frame around the placeholder has to match byte for byte — an argument
+ * that merely happens to be a string is not this preset's argument with a repository
+ * named in it. The value itself is free text, because a repository name is the one
+ * thing the preset deliberately left open.
+ *
+ * Stated over any number of occurrences rather than assuming one: the value's length
+ * is fixed by what is left after the literal parts, so a template repeating the
+ * placeholder matches only when every occurrence holds the SAME repository.
+ */
+function slotValue(template: string, stored: string): string | null {
+  const parts = template.split(SOURCE_REPO_PLACEHOLDER)
+  const gaps = parts.length - 1
+  if (gaps <= 0) return null
+  const literal = parts.reduce((sum, part) => sum + part.length, 0)
+  const span = stored.length - literal
+  if (span < 0 || span % gaps !== 0) return null
+  const value = stored.slice(parts[0].length, parts[0].length + span / gaps)
+  return parts.join(value) === stored ? value : null
+}
+
+/** What a stored poll and a bundled preset's poll agree on. */
+export interface PollMatch {
+  /** The template's designated slots, empty when it has none. */
+  readonly slots: readonly number[]
+  /** The repository those slots hold; `''` when there are no slots. */
+  readonly repository: string
+}
+
+/**
+ * Whether *poll* is *template* with only its designated slots filled, and by what.
+ *
+ * This is the expressibility rule the form's edit surface turns on, and it is
+ * MODULO the placeholder rather than byte-equal on purpose. Byte-equality was the
+ * stricter rule and it was also the wrong one: the engine's presets ship a
+ * placeholder that the project edits, there is no variable substitution in a poll,
+ * and setup writes the placeholder verbatim — so under byte-equality every source
+ * that actually polls anything is inexpressible, and the form could edit only copies
+ * that cannot poll.
+ *
+ * What it still refuses is everything else: a different program, a different
+ * argument count, a changed flag, a changed query string. The form therefore
+ * describes an argv it can account for argument by argument, which is what a preset
+ * name on screen is claiming.
+ */
+export function matchPoll(template: unknown, poll: unknown): PollMatch | null {
+  if (!Array.isArray(template) || !Array.isArray(poll)) return null
+  if (template.length !== poll.length) return null
+  const slots = designatedSlots(template)
+  let repository: string | null = null
+  for (let index = 0; index < template.length; index += 1) {
+    if (!slots.includes(index)) {
+      if (JSON.stringify(template[index]) !== JSON.stringify(poll[index])) return null
+      continue
+    }
+    const stored = poll[index]
+    if (typeof stored !== 'string') return null
+    const value = slotValue(String(template[index]), stored)
+    if (value === null || (repository !== null && value !== repository)) return null
+    repository = value
+  }
+  return { slots, repository: repository ?? '' }
+}
+
+/** The first bundled preset whose poll *poll* is, modulo the repository slots. */
+function presetForPoll(
+  poll: unknown,
+  presets: readonly SourcePreset[],
+): { preset: SourcePreset; match: PollMatch } | null {
+  for (const preset of presets) {
+    const match = matchPoll(preset.entry[SOURCE_POLL], poll)
+    if (match) return { preset, match }
+  }
+  return null
+}
+
+/** Whether *repository* is the placeholder still, which is a poll that cannot run. */
+function isPlaceholder(repository: string): boolean {
+  return repository === SOURCE_REPO_PLACEHOLDER
+}
+
+/**
+ * *preset*'s own poll argv with its designated slots holding *repository*.
+ *
+ * The value staged for the one argv path this form writes, and the reason that path
+ * is safe to write: the array is built from the PRESET's argv rather than from
+ * anything on screen, so the program is the preset's, the argument count is the
+ * preset's, and every position outside a designated slot is byte-equal to the
+ * preset's. A repository containing spaces, a flag, or a shell metacharacter stays
+ * one argument — the engine runs argv with no shell, so text inside an argument
+ * cannot become a new argument.
+ *
+ * An empty repository keeps the placeholder rather than emptying the argument: a
+ * poll naming the literal is refused loudly, and a poll naming `repos//issues` is a
+ * request against a repository that is not the one anybody meant.
+ */
+export function pollForRepository(preset: SourcePreset, repository: string): unknown[] | null {
+  const template = preset.entry[SOURCE_POLL]
+  if (!Array.isArray(template)) return null
+  const slots = designatedSlots(template)
+  if (slots.length === 0) return null
+  const named = repository.trim() === '' ? SOURCE_REPO_PLACEHOLDER : repository.trim()
+  return template.map((argument, index) =>
+    slots.includes(index) ? fillSlot(String(argument), named) : argument,
+  )
+}
+
+/**
+ * The entry an add stages: *preset*'s own bytes with its repository named.
+ *
+ * One edit rather than a copy followed by a parameter edit, because the staged list
+ * is pairwise non-overlapping by construction — `sources.<name>` and
+ * `sources.<name>.poll` cannot both survive into one patch — and an edit silently
+ * dropped by the reconciliation is the failure the shared machinery exists to
+ * prevent. The review card states BOTH facts about this one edit: which preset it
+ * copies, and which repository it names.
+ */
+function composeSourceFor(preset: SourcePreset, repository: string): Document {
+  const entry = composeSource(preset)
+  const poll = pollForRepository(preset, repository)
+  if (poll !== null) entry[SOURCE_POLL] = poll
+  return entry
+}
 
 /**
  * The one staged edit an action makes, or `null` for an action with no address.
@@ -2913,14 +3106,28 @@ export type SourceFormAction =
  * source fields disjoint, but a group named `poll` would address the command the
  * engine executes, and the guard belongs where the path is composed rather than
  * resting on the schema's promise.
+ *
+ * The `repository` action is the only one that addresses an argv field, and it is
+ * still not a command control: its value is {@link pollForRepository}'s — the
+ * preset's own argv with the placeholder filled — so a `null` template, a preset
+ * with no designated slot, and a preset whose placeholder sits on the program are
+ * all refusals rather than a substitution.
  */
 export function sourceEdit(action: SourceFormAction): StagedEdit | null {
   if (action.source.trim() === '') return null
   if (action.kind === 'add') {
-    return { segments: [SOURCES, action.source], value: composeSource(action.preset) }
+    return {
+      segments: [SOURCES, action.source],
+      value: composeSourceFor(action.preset, action.repository),
+    }
   }
   if (action.kind === 'remove') {
     return { segments: [SOURCES, action.source], value: DELETE }
+  }
+  if (action.kind === 'repository') {
+    const poll = pollForRepository(action.preset, action.repository)
+    if (poll === null) return null
+    return { segments: [SOURCES, action.source, SOURCE_POLL], value: poll }
   }
   if (action.kind === 'field') {
     if (!SOURCE_FORM_FIELDS.includes(action.field)) return null
@@ -2949,6 +3156,10 @@ function sourceSettingGroups(settings: readonly RegistrySetting[]): Map<string, 
 export interface SourceShape {
   /** The bundled preset whose poll argv the entry carries, or `null` for none. */
   preset: SourcePreset | null
+  /** That preset's designated repository slots, empty when it has none. */
+  slots: readonly number[]
+  /** The repository the entry's poll names; the placeholder when unsubstituted. */
+  repository: string
   /** The entry's own keys this form neither writes nor displays, in order. */
   unexpressed: readonly string[]
   /** Whether the form can express the WHOLE entry. */
@@ -2966,6 +3177,12 @@ export interface SourceShape {
  * execution is `enabled`, so a form that offered it over argv nobody bundled would
  * be a way to arm a command this surface never constrained.
  *
+ * Supplied means {@link matchPoll}'s rule — the preset's argv with only its
+ * designated repository slots filled. Not byte-equality: the presets ship a
+ * placeholder the project is expected to replace, so byte-equality would call every
+ * source that actually polls anything inexpressible and leave the form editing only
+ * copies that cannot run.
+ *
  * And a key the form neither edits nor displays is a field a partial form would
  * hide while the operator confirmed a write. The requirement's own words are that
  * such an entry routes to the JSON view rather than rendering a form that rewrites
@@ -2975,22 +3192,20 @@ export interface SourceShape {
  * record describes has no kind, no bounds and no summary to generate a control
  * from, so showing its siblings does not express it.
  *
- * The residual, stated because it is a real cost rather than an oversight: a preset
- * copy whose placeholder repository has been named in the JSON view no longer
- * carries the preset's argv byte for byte, so this form stops offering it and says
- * so. That is the honest direction to fail in — the alternative is a form that
- * edits and arms sources whose commands it cannot vouch for — but it does mean the
- * JSON view owns a source from the moment its command is made real.
+ * The residual, stated because it is a real cost rather than an oversight: an entry
+ * whose poll was hand-edited beyond its repository — a changed flag, an added
+ * argument, another program — is owned by the JSON view from then on. That is the
+ * honest direction to fail in, since the alternative is a form that arms sources
+ * whose commands it cannot vouch for argument by argument.
  */
 export function sourceShape(
   entry: unknown,
   presets: readonly SourcePreset[],
   settings: readonly RegistrySetting[],
 ): SourceShape {
-  if (!isObject(entry)) return { preset: null, unexpressed: [], expressible: false }
-  const poll = JSON.stringify(entry[SOURCE_POLL] ?? null)
-  const from =
-    presets.find((preset) => JSON.stringify(preset.entry[SOURCE_POLL] ?? null) === poll) ?? null
+  const none = { preset: null, slots: [], repository: '', unexpressed: [], expressible: false }
+  if (!isObject(entry)) return none
+  const found = presetForPoll(entry[SOURCE_POLL], presets)
   const groups = sourceSettingGroups(settings)
   const unexpressed: string[] = []
   for (const key of Object.keys(entry)) {
@@ -3000,11 +3215,18 @@ export function sourceShape(
     if (leaves && isObject(value) && Object.keys(value).every((leaf) => leaves.has(leaf))) continue
     unexpressed.push(key)
   }
-  return { preset: from, unexpressed, expressible: from !== null && unexpressed.length === 0 }
+  return {
+    preset: found ? found.preset : null,
+    slots: found ? found.match.slots : [],
+    repository: found ? found.match.repository : '',
+    unexpressed,
+    expressible: found !== null && unexpressed.length === 0,
+  }
 }
 
 /**
- * The preset a staged entry is a copy OF, or `null` when it is a copy of nothing.
+ * The preset a staged entry is a copy OF and the repository it names, or `null`
+ * when it is a copy of nothing.
  *
  * Derived from the staged bytes rather than remembered from the click, for
  * {@link copySourceOf}'s reason: the review card CLAIMS a provenance, and a claim
@@ -3012,11 +3234,24 @@ export function sourceShape(
  * An entry matching no preset earns no sentence and therefore reaches no patch —
  * the second place, after {@link sourceEdit}, where an entry carrying argv nobody
  * bundled is stopped before it can be written.
+ *
+ * The check is byte-equality against the preset's own composed entry with the
+ * repository this entry's poll names filled in — so a copy is recognized whatever
+ * repository it was staged for, and an entry differing anywhere ELSE is not
+ * recognized at all.
  */
-function sourcePresetOf(value: unknown, presets: readonly SourcePreset[]): SourcePreset | null {
+function sourcePresetOf(
+  value: unknown,
+  presets: readonly SourcePreset[],
+): { preset: SourcePreset; repository: string } | null {
+  if (!isObject(value)) return null
   const staged = JSON.stringify(value)
   for (const preset of presets) {
-    if (JSON.stringify(composeSource(preset)) === staged) return preset
+    const match = matchPoll(preset.entry[SOURCE_POLL], value[SOURCE_POLL])
+    const repository = match ? match.repository : ''
+    if (JSON.stringify(composeSourceFor(preset, repository)) === staged) {
+      return { preset, repository }
+    }
   }
   return null
 }
@@ -3070,7 +3305,7 @@ function maintainerList(text: string): string[] {
 }
 
 /**
- * What a source runs and how it reads the output, read-only.
+ * What a source runs, how it reads the output, and who may submit to it, read-only.
  *
  * On screen rather than folded away, because this is the whole substitute for a
  * command field: an operator arming a source is deciding to run this argv, and a
@@ -3078,6 +3313,10 @@ function maintainerList(text: string): string[] {
  * with the subject withheld. Rendered as the JSON array it is, for the review
  * card's reason — the payload itself, not a shell-looking rendering of it that
  * would imply a shell the engine does not use.
+ *
+ * `public` is here for the same reason and not one row further away: it is the
+ * difference between a feed whose authors are known and one anyone can file into,
+ * and the enable control that arms unattended ingestion sits on this same form.
  */
 function SourceCommand({ entry, preset }: { entry: Document; preset: SourcePreset }) {
   const map = entry[SOURCE_FIELD_MAP]
@@ -3089,7 +3328,17 @@ function SourceCommand({ entry, preset }: { entry: Document; preset: SourcePrese
         <dd>{preset.host}</dd>
         <dt>{i18nT('apps.specEngine.sourceForm.the_program_it_runs')}</dt>
         <dd>{preset.program}</dd>
+        <dt>{i18nT('apps.specEngine.sourceForm.the_source_is_public')}</dt>
+        {/* The stored value verbatim, absent included: `public` is a field the form
+            displays without writing, so it says what is there rather than resolving
+            a default the engine owns. */}
+        <dd data-source-shown={SOURCE_PUBLIC}>{shownValue(entry[SOURCE_PUBLIC])}</dd>
       </dl>
+      {entry[SOURCE_PUBLIC] === true && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.sourceForm.public_items_come_from_anyone')}
+        </p>
+      )}
       <p className="se-note">{i18nT('apps.specEngine.sourceForm.the_poll_command')}</p>
       <pre className="se-json">{JSON.stringify(entry[SOURCE_POLL] ?? null, null, 2)}</pre>
       {fields.length > 0 && (
@@ -3122,27 +3371,40 @@ function SourceCommand({ entry, preset }: { entry: Document; preset: SourcePrese
  * 1. **No control here accepts a command or an argument.** Not the add flow, not
  *    the edit flow, not indirectly: {@link sourceEdit} is the only path composer,
  *    and the paths it can produce are three named fields, a registry-typed
- *    per-source setting, a whole preset copy, and a deletion. The commands come
- *    from the engine's own preset tables, byte for byte, because the write door
- *    checks an argv's shape and not which program it names.
- * 2. **A copy arrives inert.** The preset entries carry no `enabled` key and
+ *    per-source setting, a whole preset copy, the repository slot of a matched
+ *    preset's own argv, and a deletion. The commands come from the engine's own
+ *    preset tables, because the write door checks an argv's shape and not which
+ *    program it names.
+ * 2. **The repository is a value, not a command.** The presets ship an `OWNER/REPO`
+ *    placeholder the project is expected to name, so the form names it — by staging
+ *    the PRESET's argv with {@link designatedSlots} filled. The program, the
+ *    argument count and every other argument stay the preset's, and the engine runs
+ *    argv with no shell, so text inside one argument cannot become another.
+ * 3. **A copy arrives inert.** The preset entries carry no `enabled` key and
  *    {@link composeSource} keeps it absent, so creating a source ingests nothing
  *    until a separate, separately confirmed write arms it.
- * 3. **An enable states what it starts.** Arming a source is arming unattended
+ * 4. **An enable states what it starts.** Arming a source is arming unattended
  *    ingestion under whatever its autonomy grid resolves, so the review card says
  *    so and links to that grid, and the form states that a source with no grid
- *    grants nothing at all.
- * 4. **A shape the form cannot express gets no form.** Not a partial one: a form
+ *    grants nothing at all. A poll still naming the placeholder gets its own
+ *    sentence, because what that arms is a command that cannot run.
+ * 5. **A shape the form cannot express gets no form.** Not a partial one: a form
  *    rendering three of an entry's eight fields invites a confirm over the five it
  *    never showed. The state says which fields those are and routes to the JSON
- *    view.
- * 5. **A removal names its source.** The confirmation is the source's own name,
+ *    view — but it still offers the REMOVAL, because a deletion writes no field and
+ *    so cannot rewrite one the state did not show.
+ * 6. **A removal names its source.** The confirmation is the source's own name,
  *    typed, because a column of identical Remove controls is how the wrong source
  *    goes — and the review card then states that ingestion stops.
- * 6. **A success re-reads.** This mutation owns the invalidation: the review card
+ * 7. **A success re-reads.** This mutation owns the invalidation: the review card
  *    is presentational and cannot do it for its callers. The document is where
  *    every row here comes from, and the grid beside it is a resolution of the very
  *    entries this write changes.
+ *
+ * What it deliberately does NOT offer is a rename. Renaming an entry is deleting one
+ * key and writing another — the whole entry rewritten, including every field this
+ * form does not show — so the name is displayed as the key it is and a rename is the
+ * JSON view's.
  */
 function SourceForm({
   config,
@@ -3159,6 +3421,12 @@ function SourceForm({
   const edits = useStagedEdits()
   const [chosen, setChosen] = useState('')
   const [addName, setAddName] = useState('')
+  // The repository the add block would name inside the copied preset's own argv.
+  // Component state rather than a staged edit: an add stages ONE edit at
+  // `sources.<name>`, because a second edit at `sources.<name>.poll` overlaps it and
+  // the shared staging drops one of two overlapping paths rather than letting the
+  // patch decide which survives.
+  const [addRepo, setAddRepo] = useState('')
   // The source whose removal is armed, and the name typed to confirm it. A name
   // rather than a boolean: an arm that outlived a selection change would offer a
   // confirmation captioned with one source and staged against another.
@@ -3189,6 +3457,7 @@ function SourceForm({
     onSuccess: () => {
       edits.clear()
       setAddName('')
+      setAddRepo('')
       setArmed(null)
       setTypedName('')
       setReviewing(false)
@@ -3349,8 +3618,38 @@ function SourceForm({
     // existing source key by key, which is an edit to that source — and one that
     // could leave its poll command half from one preset and half from another.
     if (pending === '' || names.includes(pending)) return
-    const edit = sourceEdit({ kind: 'add', source: pending, preset })
+    const edit = sourceEdit({ kind: 'add', source: pending, preset, repository: addRepo })
     if (edit) edits.stage(edit.segments, edit.value)
+  }
+
+  /**
+   * Name the repository the add block's copy would poll.
+   *
+   * A staged copy is re-composed rather than left alone: the operator is looking at
+   * one pending add, and a repository typed after the preset was picked has to reach
+   * the entry that will actually be written. The preset comes from the STAGED bytes,
+   * so the re-compose cannot silently switch which preset the copy is of.
+   */
+  const nameAddRepository = (next: string) => {
+    touched()
+    setAddRepo(next)
+    const staged = pending === '' ? undefined : edits.stagedAt([SOURCES, pending])
+    if (!staged || staged.value === DELETE) return
+    const copy = sourcePresetOf(staged.value, presets)
+    if (!copy) return
+    const edit = sourceEdit({
+      kind: 'add',
+      source: pending,
+      preset: copy.preset,
+      repository: next,
+    })
+    if (edit) edits.stage(edit.segments, edit.value)
+  }
+
+  /** Name the repository the SELECTED source polls, inside its preset's own argv. */
+  const nameRepository = (next: string) => {
+    if (shape.preset === null) return
+    act({ kind: 'repository', source: selected, preset: shape.preset, repository: next })
   }
 
   const renameAdd = (next: string) => {
@@ -3410,12 +3709,46 @@ function SourceForm({
       }
       const from = sourcePresetOf(edit.value, presets)
       if (!from) return null
+      // Two sentences for one edit, because the edit is two decisions: which preset
+      // the entry copies, and which repository its command names. A copy staged for
+      // a real repository described only as "a copy of the github preset" would be a
+      // card that named the provenance and hid the target.
+      if (from.repository === '' || isPlaceholder(from.repository)) {
+        return {
+          path,
+          sentence: i18nT('apps.specEngine.sourceForm.edit_copies_the_bundled_preset', {
+            source,
+            preset: from.preset.host,
+            program: from.preset.program,
+            path,
+          }),
+        }
+      }
       return {
         path,
-        sentence: i18nT('apps.specEngine.sourceForm.edit_copies_the_bundled_preset', {
+        sentence: i18nT('apps.specEngine.sourceForm.edit_copies_the_preset_for_repository', {
           source,
-          preset: from.host,
-          program: from.program,
+          preset: from.preset.host,
+          program: from.preset.program,
+          repository: from.repository,
+          path,
+        }),
+      }
+    }
+    if (rest.length === 1 && rest[0] === SOURCE_POLL) {
+      // The one argv path this form writes, and the sentence names the two things
+      // that make it safe: the preset whose argv it still is, and the repository
+      // that is the only part of it this edit changed.
+      const was = presetForPoll(nodeAt(document, edit.segments), presets)
+      const now = presetForPoll(edit.value, presets)
+      if (!now) return null
+      return {
+        path,
+        sentence: i18nT('apps.specEngine.sourceForm.edit_names_the_repository', {
+          source,
+          preset: now.preset.host,
+          oldValue: was ? was.match.repository : NONE,
+          newValue: now.match.repository,
           path,
         }),
       }
@@ -3469,6 +3802,14 @@ function SourceForm({
   const addBlocked = pending === '' || names.includes(pending)
   const enabledStaged = edits.stagedAt([SOURCES, selected, SOURCE_ENABLED])
   const enabled = enabledStaged ? enabledStaged.value === true : stored[SOURCE_ENABLED] === true
+  const pollStaged = edits.stagedAt([SOURCES, selected, SOURCE_POLL])
+  // The repository the poll would name as the form now stands. Read back OUT of the
+  // argv rather than held in a second state: a control showing a repository the
+  // staged array does not actually carry is the drift the review card exists to
+  // prevent, and the argv is the thing that gets written.
+  const stagedMatch =
+    pollStaged && shape.preset ? matchPoll(shape.preset.entry[SOURCE_POLL], pollStaged.value) : null
+  const repository = stagedMatch ? stagedMatch.repository : shape.repository
   const projectStaged = edits.stagedAt([SOURCES, selected, SOURCE_PROJECT])
   const boundProject = String(
     (projectStaged ? projectStaged.value : stored[SOURCE_PROJECT]) ?? '',
@@ -3552,13 +3893,90 @@ function SourceForm({
                     source: selected,
                   })}
                 </button>
+                {/* Removal is offered here too, and it is the one control that can
+                    be: a deletion writes no field, so it cannot rewrite one this
+                    state did not show. Withholding it would leave a source the form
+                    cannot describe removable only by hand-editing the document. */}
+                <button
+                  type="button"
+                  className="se-btn se-sm se-danger"
+                  aria-label={i18nT('apps.specEngine.sourceForm.remove_the_source', {
+                    source: selected,
+                  })}
+                  onClick={() => {
+                    touched()
+                    setTypedName('')
+                    setArmed(selected)
+                  }}
+                >
+                  {i18nT('apps.specEngine.configPanel.remove')}
+                </button>
               </div>
+              <p className="se-note">
+                {i18nT('apps.specEngine.sourceForm.a_removal_writes_no_field_it_did_not_show')}
+              </p>
             </div>
           ) : (
             <>
               {/* What the engine runs, before any control that could arm it. */}
               <SourceCommand entry={stored} preset={shape.preset as SourcePreset} />
               <div className="se-settings">
+                {shape.slots.length === 0 ? (
+                  /* Stated rather than absent: a preset with no repository slot — or
+                     one whose placeholder sits on the program, which this form
+                     refuses to substitute — has no parameter for this form to offer,
+                     and silence would read as a form that simply forgot. */
+                  <p className="se-note">
+                    {i18nT('apps.specEngine.sourceForm.the_preset_has_no_repository_slot', {
+                      preset: shape.preset ? shape.preset.host : NONE,
+                    })}
+                  </p>
+                ) : (
+                  <div
+                    className="se-setting"
+                    data-source-parameter="repository"
+                    data-staged={pollStaged !== undefined}
+                  >
+                    <label className="se-setting-name" htmlFor="se-source-repository">
+                      {i18nT('apps.specEngine.sourceForm.the_repository_parameter')}
+                      <span className="se-kv-path">{dotted([SOURCES, selected, SOURCE_POLL])}</span>
+                    </label>
+                    <input
+                      id="se-source-repository"
+                      type="text"
+                      className="se-input"
+                      value={isPlaceholder(repository) ? '' : repository}
+                      onChange={(event) => nameRepository(event.target.value)}
+                    />
+                    <p className="se-note">
+                      {i18nT('apps.specEngine.sourceForm.the_repository_is_a_value_not_a_command')}
+                    </p>
+                    {isPlaceholder(repository) && (
+                      <p className="se-note">
+                        {i18nT('apps.specEngine.sourceForm.the_repository_is_still_the_placeholder', {
+                          placeholder: SOURCE_REPO_PLACEHOLDER,
+                        })}
+                      </p>
+                    )}
+                    <p className="se-note">
+                      {i18nT('apps.specEngine.sourceForm.stored_on_the_source')}
+                      {SEP}
+                      <span className="se-m">{shape.repository}</span>
+                    </p>
+                    {pollStaged !== undefined && (
+                      <p className="se-note">
+                        <span className="se-flag" data-flag="pending">
+                          {i18nT('apps.specEngine.sourceForm.not_written')}
+                        </span>
+                        <span className="se-m">
+                          {shownValue(pollStaged.value)}
+                          {SEP}
+                          {dotted([SOURCES, selected, SOURCE_POLL])}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                )}
                 <div
                   className="se-setting"
                   data-source-field={SOURCE_ENABLED}
@@ -3858,6 +4276,30 @@ function SourceForm({
           <p className="se-note">{i18nT('apps.specEngine.sourceForm.name_the_source_first')}</p>
         )}
       </div>
+      <div className="se-setting" data-source-parameter="add-repository">
+        <label className="se-setting-name" htmlFor="se-source-add-repository">
+          {i18nT('apps.specEngine.sourceForm.the_repository_for_the_new_source')}
+        </label>
+        <input
+          id="se-source-add-repository"
+          type="text"
+          className="se-input"
+          value={addRepo}
+          onChange={(event) => nameAddRepository(event.target.value)}
+        />
+        <p className="se-note">
+          {i18nT('apps.specEngine.sourceForm.the_repository_is_a_value_not_a_command')}
+        </p>
+        {addRepo.trim() === '' && (
+          /* The consequence of leaving it empty, stated where it is left empty: the
+             copy is still written, and it still cannot poll. */
+          <p className="se-note">
+            {i18nT('apps.specEngine.sourceForm.a_copy_with_no_repository_keeps_the_placeholder', {
+              placeholder: SOURCE_REPO_PLACEHOLDER,
+            })}
+          </p>
+        )}
+      </div>
       {presets.length === 0 ? (
         <p className="se-note">{i18nT('apps.specEngine.sourceForm.the_engine_bundles_no_preset')}</p>
       ) : (
@@ -3952,20 +4394,30 @@ function SourceForm({
               <div className="se-arm">
                 {enabling.map(({ edit }) => {
                   const source = edit.segments[1]
-                  const from = sourceShape(
-                    nodeAt(document, [SOURCES, source]),
-                    presets,
-                    settings,
-                  ).preset
+                  // The poll as it will stand once this patch lands: a repository
+                  // named in the same review must not be described as unnamed, and a
+                  // placeholder still in place must not be described as a repository.
+                  const staged = edits.stagedAt([SOURCES, source, SOURCE_POLL])
+                  const poll = staged ? staged.value : nodeAt(document, [SOURCES, source, SOURCE_POLL])
+                  const from = presetForPoll(poll, presets)
+                  const program = from ? from.preset.program : NONE
+                  const unnamed = from === null || isPlaceholder(from.match.repository)
                   return (
                     <Fragment key={dotted(edit.segments)}>
                       <p>
                         <AlertTriangle className="lucide-inline" aria-hidden="true" />
-                        {i18nT('apps.specEngine.sourceForm.enabling_begins_polling', {
-                          source,
-                          program: from ? from.program : NONE,
-                          path: dotted(edit.segments),
-                        })}
+                        {unnamed
+                          ? i18nT('apps.specEngine.sourceForm.enabling_polls_the_placeholder', {
+                              source,
+                              program,
+                              placeholder: SOURCE_REPO_PLACEHOLDER,
+                              path: dotted(edit.segments),
+                            })
+                          : i18nT('apps.specEngine.sourceForm.enabling_begins_polling', {
+                              source,
+                              program,
+                              path: dotted(edit.segments),
+                            })}
                       </p>
                       <p className="se-note">{gridLink(source)}</p>
                       <p className="se-note">
