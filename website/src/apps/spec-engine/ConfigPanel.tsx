@@ -2972,7 +2972,14 @@ export function designatedSlots(poll: unknown): number[] {
  * special case.
  */
 export function wellFormedRepository(repository: string): boolean {
-  return /^[A-Za-z0-9._][A-Za-z0-9._-]*\/[A-Za-z0-9._][A-Za-z0-9._-]*$/.test(repository)
+  if (!/^[A-Za-z0-9._][A-Za-z0-9._-]*\/[A-Za-z0-9._][A-Za-z0-9._-]*$/.test(repository)) {
+    return false
+  }
+  // A half made ENTIRELY of dots re-targets the endpoint by path normalization —
+  // `repos/../../issues` is not a repository under `repos/` — and no host permits
+  // an owner or repo named `.` or `..`, so refusing them costs nothing.
+  const [owner, repo] = repository.split('/')
+  return !/^\.+$/.test(owner) && !/^\.+$/.test(repo)
 }
 
 /**
@@ -3502,6 +3509,12 @@ function SourceForm({
       setAddRepo('')
       setArmed(null)
       setTypedName('')
+      // The refusal and buffer states go with the text they were about: after a
+      // successful write the form re-derives everything from the fresh read, and a
+      // refusal caption over an emptied box would be an outcome nothing caused.
+      setRepoInput(null)
+      setRepoRefused(false)
+      setAddRefused('')
       setReviewing(false)
       setWrote(true)
       // The reply's merged document is NOT adopted: the read is this pane's
@@ -3771,6 +3784,11 @@ function SourceForm({
 
   const discard = () => {
     edits.clear()
+    // Discard abandons the whole pending posture, refusals included: what was
+    // refused was part of what is being discarded.
+    setRepoInput(null)
+    setRepoRefused(false)
+    setAddRefused('')
     setReviewing(false)
     setWrote(false)
     write.reset()

@@ -352,6 +352,10 @@ describe('the repository parameter changes only its own slot', () => {
       'a&b/c',
       'owner/',
       '/repo',
+      '../..',
+      './.',
+      'a/..',
+      '../repo',
     )
     fc.assert(
       fc.property(PRESET, rewriting, (preset, bad) => {

@@ -893,6 +893,24 @@ describe('the repository is a value the preset left open', () => {
     expect(within(block()).getByText(T.that_is_not_a_repository_name)).toBeInTheDocument()
   })
 
+  it('drops the refusal with the rest of the pending posture on discard', async () => {
+    // What was refused was part of what is being discarded: a refusal caption
+    // surviving a discard would be an outcome nothing on screen still explains.
+    await openForm()
+    const box = within(repositoryRow()).getByRole('textbox')
+    fireEvent.change(box, { target: { value: 'acme/other#frag' } })
+    expect(within(block()).getByText(T.that_is_not_a_repository_name)).toBeInTheDocument()
+    fireEvent.click(within(fieldRow('enabled')).getByRole('checkbox'))
+    expect(unwritten()).toContain(T.unwritten_source_changes)
+    review()
+    fireEvent.click(
+      within(block()).getByRole('button', { name: T.discard_the_pending_changes }),
+    )
+    expect(within(block()).queryByText(T.that_is_not_a_repository_name)).toBeNull()
+    // The box re-derives from the store rather than keeping the refused text.
+    expect((within(repositoryRow()).getByRole('textbox') as HTMLInputElement).value).toBe(REPO)
+  })
+
   it('refuses a malformed repository on the add block, and says so', async () => {
     await openForm()
     nameTheAdd('mirror')

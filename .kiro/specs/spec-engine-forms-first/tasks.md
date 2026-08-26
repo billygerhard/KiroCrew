@@ -123,6 +123,13 @@ sweep. The review gate runs between waves.
   the not-expressible state offers removal but no other control. The source
   suite's default `gh` fixture polls a NAMED repository (`GH_POLL_NAMED`) and
   `fresh` holds the placeholder — later tasks assert against those.
+- **Fixed post-review (5.1 round 3 approval minors, orchestrator):** (a)
+  `wellFormedRepository` now refuses halves made entirely of dots (`../..`
+  re-targeted the endpoint by path normalization while the frame reassembled);
+  property list extended, guard mutation-probed. (b) the repository buffer and
+  both refusal states now reset on a successful write and on discard, matching
+  the form's re-derive-from-a-fresh-read posture; pinned by "drops the refusal
+  with the rest of the pending posture on discard".
 
 ## Tasks
 
@@ -167,8 +174,8 @@ sweep. The review gate runs between waves.
     - Vitest: effort-on-auto sentence appears and disappears with the model value, add-as-copy provenance, removal refusal naming projects, staged distinction; strings in all 13 catalogs.
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 5.1, 5.4_
 
-- [ ] 5. Source form
-  - [ ] 5.1 Preset-constrained watch source creation, editing, and removal
+- [x] 5. Source form
+  - [x] 5.1 Preset-constrained watch source creation, editing, and removal
     - Add flow: preset picker from the registry payload (host, program, what it ingests), staging the deep-copied entry under an operator-chosen name with `enabled` absent; no control anywhere accepts command or argument text.
     - Edit flow: name, enabled, project binding, per-source settings, maintainers; poll command and field map read-only beside the preset host; a stored entry the form cannot express renders the honest not-expressible state routing to the JSON view, never a partial form.
     - Enable states the begins-polling consequence with a link to the source's autonomy grid section; removal takes a named confirmation, patches `{"sources": {"<name>": null}}`, and states ingestion stops.

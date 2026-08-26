@@ -4,7 +4,7 @@
     "2.1": "completed",
     "3.1": "completed",
     "4.1": "completed",
-    "5.1": "queued",
+    "5.1": "completed",
     "6.1": "queued"
   },
   "pbt": {},
@@ -53,6 +53,16 @@
     {
       "ts": "2026-08-24T16:53:26",
       "taskId": "4.1",
+      "status": "completed"
+    },
+    {
+      "ts": "2026-08-24T16:53:55",
+      "taskId": "5.1",
+      "status": "in_progress"
+    },
+    {
+      "ts": "2026-08-26T12:09:25",
+      "taskId": "5.1",
       "status": "completed"
     }
   ]
