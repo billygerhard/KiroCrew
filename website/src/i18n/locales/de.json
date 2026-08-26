@@ -3767,7 +3767,18 @@
         "elided_values_are_never_written_back": "Ein zurückgehaltener Wert wird nie zurückgeschrieben, daher kann Speichern keine Zugangsdaten durch die Markierung ersetzen. Gib einen neuen Wert ein, um sie zu überschreiben.",
         "every_setting_in_force": "Alle geltenden Einstellungen",
         "every_setting_is_at_its_bundled_default": "Jede Einstellung löst auf ihren mitgelieferten Standard auf.",
+        "group_labels": {
+          "concurrency": "Parallelität",
+          "limits": "Wiederholungs- und Zyklusgrenzen",
+          "timeouts": "Zeitlimits",
+          "budget": "Budget",
+          "watch": "Beobachtungsabfrage",
+          "delivery": "Auslieferung",
+          "notify": "Benachrichtigungen",
+          "telemetry": "Telemetrie"
+        },
         "inherited_from_the_provider": "Vom Anbieter geerbt",
+        "jump_to_a_settings_section": "Zu einem Einstellungsabschnitt springen",
         "keep_the_project_entry": "Eintrag behalten",
         "most_specific_segment_wins": "Das spezifischste Segment gewinnt, und ein Name mit Punkt ist ein einzelnes Segment.",
         "no_cost_profile_is_selected": "Es ist kein Kostenprofil gewählt, daher läuft jede Rolle auf dem Sitzungsstandard.",

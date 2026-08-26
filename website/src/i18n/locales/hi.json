@@ -3767,7 +3767,18 @@
         "elided_values_are_never_written_back": "छिपाया गया मान कभी वापस नहीं लिखा जाता, इसलिए सहेजने से कोई क्रेडेंशियल इस चिह्न से नहीं बदलेगा। बदलने के लिए नया मान लिखें।",
         "every_setting_in_force": "लागू सभी सेटिंग",
         "every_setting_is_at_its_bundled_default": "हर सेटिंग अपने बंडल किए गए डिफ़ॉल्ट पर हल होती है।",
+        "group_labels": {
+          "concurrency": "समवर्तीता",
+          "limits": "पुनः प्रयास और चक्र सीमाएँ",
+          "timeouts": "टाइमआउट",
+          "budget": "बजट",
+          "watch": "स्रोत पोलिंग",
+          "delivery": "डिलीवरी",
+          "notify": "सूचनाएँ",
+          "telemetry": "टेलीमेट्री"
+        },
         "inherited_from_the_provider": "प्रदाता से विरासत में",
+        "jump_to_a_settings_section": "किसी सेटिंग अनुभाग पर जाएँ",
         "keep_the_project_entry": "प्रविष्टि रखें",
         "most_specific_segment_wins": "सबसे विशिष्ट खंड जीतता है, और बिंदु वाला नाम एक ही खंड है।",
         "no_cost_profile_is_selected": "कोई कॉस्ट प्रोफ़ाइल चुनी नहीं गई है, इसलिए हर भूमिका सत्र के डिफ़ॉल्ट पर चलती है।",

@@ -3828,7 +3828,18 @@
         "elided_values_are_never_written_back": "Un valore trattenuto non viene mai riscritto, quindi salvare non può sostituire una credenziale con il segnaposto. Digita un valore nuovo per sovrascriverla.",
         "every_setting_in_force": "Tutte le impostazioni in vigore",
         "every_setting_is_at_its_bundled_default": "Ogni impostazione si risolve al valore predefinito incluso.",
+        "group_labels": {
+          "concurrency": "Concorrenza",
+          "limits": "Limiti di tentativi e cicli",
+          "timeouts": "Timeout",
+          "budget": "Budget",
+          "watch": "Polling delle sorgenti",
+          "delivery": "Consegna",
+          "notify": "Notifiche",
+          "telemetry": "Telemetria"
+        },
         "inherited_from_the_provider": "Ereditato dal fornitore",
+        "jump_to_a_settings_section": "Vai a una sezione delle impostazioni",
         "keep_the_project_entry": "Mantieni la voce",
         "most_specific_segment_wins": "Vince il segmento più specifico, e un nome con un punto è un singolo segmento.",
         "no_cost_profile_is_selected": "Nessun profilo di costo è selezionato, quindi ogni ruolo usa il valore predefinito della sessione.",

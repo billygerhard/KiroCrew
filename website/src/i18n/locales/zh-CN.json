@@ -3706,7 +3706,18 @@
         "elided_values_are_never_written_back": "被隐去的值不会被写回，所以保存不会用占位标记替换凭据。输入新值即可覆盖。",
         "every_setting_in_force": "所有生效的设置",
         "every_setting_is_at_its_bundled_default": "所有设置都解析为随附默认值。",
+        "group_labels": {
+          "concurrency": "并发",
+          "limits": "重试与周期限制",
+          "timeouts": "超时",
+          "budget": "预算",
+          "watch": "来源轮询",
+          "delivery": "交付",
+          "notify": "通知",
+          "telemetry": "遥测"
+        },
         "inherited_from_the_provider": "继承自提供方",
+        "jump_to_a_settings_section": "跳转到设置分区",
         "keep_the_project_entry": "保留条目",
         "most_specific_segment_wins": "最具体的段生效，含点号的名称算作一个段。",
         "no_cost_profile_is_selected": "未选择成本档案，因此每个角色都使用会话默认值。",

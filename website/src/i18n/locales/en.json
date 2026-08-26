@@ -3084,7 +3084,18 @@
         "elided_values_are_never_written_back": "A withheld value is never written back, so saving cannot replace a credential with the marker. Type a new value to overwrite one.",
         "every_setting_in_force": "Every setting in force",
         "every_setting_is_at_its_bundled_default": "Every setting resolves to its bundled default.",
+        "group_labels": {
+          "concurrency": "Concurrency",
+          "limits": "Retry and cycle limits",
+          "timeouts": "Timeouts",
+          "budget": "Budget",
+          "watch": "Watch polling",
+          "delivery": "Delivery",
+          "notify": "Notifications",
+          "telemetry": "Telemetry"
+        },
         "inherited_from_the_provider": "Inherited from the provider",
+        "jump_to_a_settings_section": "Jump to a settings section",
         "keep_the_project_entry": "Keep the entry",
         "most_specific_segment_wins": "The most specific segment wins, and a name holding a dot is one segment.",
         "no_cost_profile_is_selected": "No cost profile is selected, so every role runs on the session default.",

@@ -3828,7 +3828,18 @@
         "elided_values_are_never_written_back": "Un valor retenido nunca se vuelve a escribir, así que guardar no puede sustituir una credencial por el marcador. Escribe un valor nuevo para sobrescribirla.",
         "every_setting_in_force": "Todos los ajustes en vigor",
         "every_setting_is_at_its_bundled_default": "Todos los ajustes se resuelven a su valor por defecto incluido.",
+        "group_labels": {
+          "concurrency": "Concurrencia",
+          "limits": "Límites de reintentos y ciclos",
+          "timeouts": "Tiempos de espera",
+          "budget": "Presupuesto",
+          "watch": "Sondeo de fuentes",
+          "delivery": "Entrega",
+          "notify": "Notificaciones",
+          "telemetry": "Telemetría"
+        },
         "inherited_from_the_provider": "Heredado del proveedor",
+        "jump_to_a_settings_section": "Ir a una sección de ajustes",
         "keep_the_project_entry": "Conservar la entrada",
         "most_specific_segment_wins": "Gana el segmento más específico, y un nombre con un punto es un solo segmento.",
         "no_cost_profile_is_selected": "No hay perfil de coste seleccionado, así que cada rol usa el valor por defecto de la sesión.",

@@ -3828,7 +3828,18 @@
         "elided_values_are_never_written_back": "Une valeur masquée n'est jamais réécrite, donc enregistrer ne peut pas remplacer un identifiant par le marqueur. Saisissez une nouvelle valeur pour l'écraser.",
         "every_setting_in_force": "Tous les réglages en vigueur",
         "every_setting_is_at_its_bundled_default": "Tous les réglages se résolvent à leur valeur par défaut fournie.",
+        "group_labels": {
+          "concurrency": "Concurrence",
+          "limits": "Limites de tentatives et de cycles",
+          "timeouts": "Délais d'expiration",
+          "budget": "Budget",
+          "watch": "Interrogation des sources",
+          "delivery": "Livraison",
+          "notify": "Notifications",
+          "telemetry": "Télémétrie"
+        },
         "inherited_from_the_provider": "Hérité du fournisseur",
+        "jump_to_a_settings_section": "Aller à une section de réglages",
         "keep_the_project_entry": "Conserver l’entrée",
         "most_specific_segment_wins": "Le segment le plus spécifique gagne, et un nom contenant un point est un seul segment.",
         "no_cost_profile_is_selected": "Aucun profil de coût n'est sélectionné, donc chaque rôle utilise la valeur par défaut de la session.",

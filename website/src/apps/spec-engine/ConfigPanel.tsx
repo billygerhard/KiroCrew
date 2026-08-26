@@ -1523,6 +1523,164 @@ export function SettingsFields({
 }
 
 /**
+ * The leading dot-segment of a registry key — the engine's own group.
+ *
+ * `Setting.group` on the engine's side is everything before the FIRST dot, so this
+ * is that split and nothing else: `limits.task_retry_limit` groups under `limits`,
+ * and a key with no dot is its own whole group rather than being dropped. Total by
+ * construction, which is what lets {@link settingGroups} account for every field.
+ */
+function settingGroup(key: string): string {
+  const dot = key.indexOf('.')
+  return dot < 0 ? key : key.slice(0, dot)
+}
+
+/**
+ * The generated fields partitioned by their registry group, in first-appearance
+ * order.
+ *
+ * Pure and exported because the claim is about the PARTITION, not the render: every
+ * field lands in exactly one group, no field is dropped or duplicated, and the
+ * group order is the order the groups first appear in the input — the same
+ * generated-not-hard-coded rule the fields themselves follow, so a group the engine
+ * adds to its registry gets its own subsection with no edit here. A property states
+ * that over generated vocabularies; a hard-coded group list would fail it.
+ */
+export function settingGroups(
+  fields: readonly SettingField[],
+): Array<{ group: string; fields: SettingField[] }> {
+  const order: string[] = []
+  const byGroup = new Map<string, SettingField[]>()
+  for (const field of fields) {
+    const group = settingGroup(field.setting.key)
+    const bucket = byGroup.get(group)
+    if (bucket) {
+      bucket.push(field)
+    } else {
+      byGroup.set(group, [field])
+      order.push(group)
+    }
+  }
+  return order.map((group) => ({ group, fields: byGroup.get(group) as SettingField[] }))
+}
+
+/**
+ * Human label per registry group, as whole literal catalog keys so the
+ * key-reference gate can resolve every entry — the {@link SETTING_LABEL_KEY} idiom.
+ * The raw group segment stays on screen as the detail line, because it is what the
+ * document and the write log speak. A group absent here is NOT an error: the groups
+ * are the engine's, and one it adds to its registry heads its subsection with the
+ * raw segment until a label is authored, rather than being dropped.
+ */
+const GROUP_LABEL_KEY: Record<string, string> = {
+  concurrency: 'apps.specEngine.configPanel.group_labels.concurrency',
+  limits: 'apps.specEngine.configPanel.group_labels.limits',
+  timeouts: 'apps.specEngine.configPanel.group_labels.timeouts',
+  budget: 'apps.specEngine.configPanel.group_labels.budget',
+  watch: 'apps.specEngine.configPanel.group_labels.watch',
+  delivery: 'apps.specEngine.configPanel.group_labels.delivery',
+  notify: 'apps.specEngine.configPanel.group_labels.notify',
+  telemetry: 'apps.specEngine.configPanel.group_labels.telemetry',
+}
+
+/** The translated label for a registry group, or `''` for one no label names. */
+function groupLabel(group: string): string {
+  // Indexed at the call site rather than through a local, so the key-reference gate
+  // resolves every entry in the map — the ORIGIN_KEY idiom.
+  return GROUP_LABEL_KEY[group] ? i18nT(GROUP_LABEL_KEY[group]) : ''
+}
+
+/** The DOM id of one group's subsection, so the jump nav can scroll to it. */
+function groupAnchorId(group: string): string {
+  return `se-settings-group-${group}`
+}
+
+/**
+ * The generated rows, grouped into the registry's own subsections with a jump nav.
+ *
+ * The rows themselves are unchanged — the same {@link SettingsFields}, the same
+ * scope offering, staging and review — so the write machinery is untouched and only
+ * the visible structure differs. Two things this adds, both statable:
+ *
+ * 1. **The subsections are exactly the registry's groups**, in first-appearance
+ *    order, via the pure {@link settingGroups}. A group with an authored label heads
+ *    its subsection with it and shows the raw segment as the detail line; an
+ *    unmapped group heads with the raw segment rather than being dropped.
+ * 2. **The jump navigation is in flow**, above the rows — a row of `se-filter`
+ *    buttons that scroll to a subsection, with no sticky or floating positioning
+ *    (the app's layout holds only because it has no overlay). It renders only when
+ *    there is more than one subsection, because a single group is its own heading.
+ */
+function GroupedSettings({
+  fields,
+  stagedAt,
+  onScope,
+  onStage,
+  onWithdraw,
+}: {
+  fields: readonly SettingField[]
+  stagedAt: (segments: readonly string[]) => StagedEdit | undefined
+  onScope: (field: SettingField, scope: string) => void
+  onStage: (field: SettingField, value: unknown) => void
+  onWithdraw: (segments: readonly string[]) => void
+}) {
+  const groups = useMemo(() => settingGroups(fields), [fields])
+  return (
+    <>
+      {groups.length > 1 && (
+        <div
+          className="se-filters se-jump"
+          role="group"
+          aria-label={i18nT('apps.specEngine.configPanel.jump_to_a_settings_section')}
+        >
+          {groups.map(({ group }) => {
+            const label = groupLabel(group)
+            return (
+              <button
+                key={group}
+                type="button"
+                className="se-filter"
+                // In flow, so the scroll is the only movement: `scrollIntoView`
+                // reads from the DOM by id rather than a ref, because the subsection
+                // it targets is rendered below in the same pass and a ref would only
+                // be a second handle on the same node.
+                onClick={() => document.getElementById(groupAnchorId(group))?.scrollIntoView()}
+              >
+                {label || <span className="se-m">{group}</span>}
+              </button>
+            )
+          })}
+        </div>
+      )}
+      {groups.map(({ group, fields: groupFields }) => {
+        const label = groupLabel(group)
+        return (
+          <section key={group} id={groupAnchorId(group)} className="se-setting-group">
+            <h4 className="se-setting-group-head">
+              {label ? (
+                <>
+                  {label}
+                  <span className="se-kv-path">{group}</span>
+                </>
+              ) : (
+                <span className="se-m">{group}</span>
+              )}
+            </h4>
+            <SettingsFields
+              fields={groupFields}
+              stagedAt={stagedAt}
+              onScope={onScope}
+              onStage={onStage}
+              onWithdraw={onWithdraw}
+            />
+          </section>
+        )
+      })}
+    </>
+  )
+}
+
+/**
  * Every setting the engine registers, as a form.
  *
  * The fields are GENERATED from the registry the read supplies — key, type,
@@ -1776,7 +1934,7 @@ function SettingsForm({
               ))}
             </div>
           )}
-          <SettingsFields
+          <GroupedSettings
             fields={fields}
             stagedAt={edits.stagedAt}
             onScope={chooseScope}

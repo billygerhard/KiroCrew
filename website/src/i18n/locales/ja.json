@@ -3706,7 +3706,18 @@
         "elided_values_are_never_written_back": "伏せられた値は書き戻されないので、保存によって資格情報がこの目印に置き換わることはありません。上書きするには新しい値を入力してください。",
         "every_setting_in_force": "有効なすべての設定",
         "every_setting_is_at_its_bundled_default": "すべての設定が同梱の既定値に解決されます。",
+        "group_labels": {
+          "concurrency": "同時実行",
+          "limits": "再試行とサイクルの上限",
+          "timeouts": "タイムアウト",
+          "budget": "予算",
+          "watch": "監視ポーリング",
+          "delivery": "配信",
+          "notify": "通知",
+          "telemetry": "テレメトリ"
+        },
         "inherited_from_the_provider": "プロバイダーから継承",
+        "jump_to_a_settings_section": "設定セクションへ移動",
         "keep_the_project_entry": "エントリを残す",
         "most_specific_segment_wins": "最も具体的なセグメントが優先され、ドットを含む名前は 1 つのセグメントです。",
         "no_cost_profile_is_selected": "コストプロファイルが選ばれていないため、すべてのロールがセッションの既定値で動きます。",

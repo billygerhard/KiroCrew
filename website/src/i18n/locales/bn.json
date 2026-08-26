@@ -3767,7 +3767,18 @@
         "elided_values_are_never_written_back": "গোপন রাখা মান কখনও ফিরে লেখা হয় না, তাই সংরক্ষণ কোনও শংসাপত্রকে এই চিহ্ন দিয়ে বদলাবে না। বদলাতে নতুন মান লিখুন।",
         "every_setting_in_force": "কার্যকর সব সেটিং",
         "every_setting_is_at_its_bundled_default": "প্রতিটি সেটিং তার সঙ্গে দেওয়া ডিফল্টে নিরূপিত হয়।",
+        "group_labels": {
+          "concurrency": "সমসাময়িক চালনা",
+          "limits": "পুনঃচেষ্টা ও চক্রের সীমা",
+          "timeouts": "টাইমআউট",
+          "budget": "বাজেট",
+          "watch": "উৎস পোলিং",
+          "delivery": "ডেলিভারি",
+          "notify": "বিজ্ঞপ্তি",
+          "telemetry": "টেলিমেট্রি"
+        },
         "inherited_from_the_provider": "প্রদানকারী থেকে প্রাপ্ত",
+        "jump_to_a_settings_section": "একটি সেটিং বিভাগে যান",
         "keep_the_project_entry": "এন্ট্রি রেখে দিন",
         "most_specific_segment_wins": "সবচেয়ে নির্দিষ্ট খণ্ড জেতে, আর বিন্দুযুক্ত নাম একটিই খণ্ড।",
         "no_cost_profile_is_selected": "কোনও কস্ট প্রোফাইল বাছা হয়নি, তাই প্রতিটি ভূমিকা সেশনের ডিফল্টে চলে।",

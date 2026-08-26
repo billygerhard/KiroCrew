@@ -3706,7 +3706,18 @@
         "elided_values_are_never_written_back": "가려진 값은 다시 쓰이지 않으므로 저장이 자격 증명을 이 표시로 바꾸지 않습니다. 덮어쓰려면 새 값을 입력하세요.",
         "every_setting_in_force": "적용 중인 모든 설정",
         "every_setting_is_at_its_bundled_default": "모든 설정이 함께 제공되는 기본값으로 해석됩니다.",
+        "group_labels": {
+          "concurrency": "동시 실행",
+          "limits": "재시도 및 주기 제한",
+          "timeouts": "시간 제한",
+          "budget": "예산",
+          "watch": "소스 폴링",
+          "delivery": "전달",
+          "notify": "알림",
+          "telemetry": "텔레메트리"
+        },
         "inherited_from_the_provider": "공급자로부터 상속",
+        "jump_to_a_settings_section": "설정 섹션으로 이동",
         "keep_the_project_entry": "항목 유지",
         "most_specific_segment_wins": "가장 구체적인 세그먼트가 이기고, 점이 든 이름은 하나의 세그먼트입니다.",
         "no_cost_profile_is_selected": "선택된 비용 프로필이 없어 모든 역할이 세션 기본값으로 실행됩니다.",

@@ -110,6 +110,14 @@ export const SE_CSS = `
 /* The tab row sits inside the pane's scrolling body rather than in a header bar,
    so it takes the body's own horizontal padding instead of the list header's. */
 .se-tabs{padding:0 0 10px;border-bottom:0}
+/* The settings tab's jump navigation: the same pill row as the filters, in flow
+   above the rows rather than sticky or floating — the pane's layout holds only
+   because nothing is positioned over the surfaces it points at. No bottom border,
+   because it sits inside the settings block rather than dividing header from body. */
+.se-jump{padding:0 0 8px;border-bottom:0}
+/* One registry group's subsection heading: prose leads, the raw group segment
+   follows as the .se-kv-path detail line the way a setting row's key does. */
+.se-setting-group-head{margin:10px 0 4px;font-size:12px}
 .se-rows{overflow:auto;min-height:0;flex:1}
 /* One ordered list, laid out as a grid rather than as a <table>.
    The columns are the mockup's and the density is unchanged, but every row is a

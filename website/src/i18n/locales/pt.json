@@ -3828,7 +3828,18 @@
         "elided_values_are_never_written_back": "Um valor retido nunca é gravado de volta, então salvar não substitui uma credencial pelo marcador. Digite um valor novo para sobrescrevê-la.",
         "every_setting_in_force": "Todas as configurações em vigor",
         "every_setting_is_at_its_bundled_default": "Todas as configurações resolvem para o padrão incluído.",
+        "group_labels": {
+          "concurrency": "Concorrência",
+          "limits": "Limites de repetição e ciclo",
+          "timeouts": "Tempos limite",
+          "budget": "Orçamento",
+          "watch": "Sondagem de fontes",
+          "delivery": "Entrega",
+          "notify": "Notificações",
+          "telemetry": "Telemetria"
+        },
         "inherited_from_the_provider": "Herdado do provedor",
+        "jump_to_a_settings_section": "Ir para uma seção de configurações",
         "keep_the_project_entry": "Manter a entrada",
         "most_specific_segment_wins": "O segmento mais específico vence, e um nome com ponto é um único segmento.",
         "no_cost_profile_is_selected": "Nenhum perfil de custo está selecionado, então cada papel usa o padrão da sessão.",
