@@ -258,6 +258,10 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
+  // The pane's editing surfaces are tabs now, and only the active one is reachable:
+  // an inactive panel carries `hidden`, which takes it out of the accessibility tree
+  // the role queries read. This form lives on the Cost profiles tab.
+  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_cost_profiles}`) }))
   await screen.findByRole('heading', { name: T.cost_profiles })
   return client
 }

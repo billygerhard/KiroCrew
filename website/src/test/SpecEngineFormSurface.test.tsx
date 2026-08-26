@@ -1,22 +1,24 @@
 /**
- * The configuration pane leads with forms, and the raw document is on request.
+ * The configuration pane leads with forms, and the raw document is one tab over.
  *
  * The pane grew around its JSON editor: the document was the first thing an operator
  * met and, for most of what is stored, the only place to change it. This suite pins
  * the inversion, and every property here is a correctness claim rather than a
  * rendering preference:
  *
- *   - **The JSON is never rendered unbidden.** Not the editor, not the engine's
+ *   - **The JSON is never SHOWN unbidden.** Not the editor, not the engine's
  *     problems and advisories for the persisted document, not a read-only preview.
  *     A pane that showed the document anyway would have moved the raw view rather
  *     than demoted it, and the whole point is which of the two an operator meets.
- *   - **One explicit control opens it, and opening gives back the WHOLE editor.**
- *     The JSON view is the escape hatch for shapes no form expresses, so a
- *     read-only or partial version of it would re-create the dead ends this pane
- *     exists to remove.
- *   - **A closed view does not discard a draft, and says it is holding one.** Half-
- *     written JSON is a legitimate state of an editor. If closing the view dropped
- *     it silently, the control would be a data-loss button.
+ *     Shown, not mounted: the pane's four panels all stay mounted so switching tabs
+ *     cannot discard staged work, so what is asserted here is visibility.
+ *   - **One tab shows it, and showing it gives back the WHOLE editor.** The JSON
+ *     view is the escape hatch for shapes no form expresses, so a read-only or
+ *     partial version of it would re-create the dead ends this pane exists to
+ *     remove.
+ *   - **Leaving the tab does not discard a draft, and the tab says it is holding
+ *     one.** Half-written JSON is a legitimate state of an editor. If leaving the
+ *     tab dropped it silently, the tab would be a data-loss button.
  *   - **Both surfaces refresh from a FRESH read after any write, in both
  *     directions.** They read one query, so a save in the JSON view re-renders the
  *     forms and a form write re-renders the document — neither adopts what it just
@@ -28,7 +30,8 @@
  * The shared review card and the patch builder behind every form write are asserted
  * where they are exercised: `SpecEngineSources.test.tsx` drives the card end to end
  * through the autonomy grid, and `SpecEngineFormPatch.property.test.ts` holds the
- * minimality property both share.
+ * minimality property both share. The tab structure itself — semantics, badges, and
+ * staged-state survival across switches — is `SpecEngineConfigTabs.test.tsx`.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -173,9 +176,20 @@ async function openConfig() {
   return { client, ...rendered }
 }
 
-/** The control that opens the JSON view. */
+/**
+ * The tab named *label*.
+ *
+ * Matched as a prefix rather than exactly, because a tab's accessible name grows
+ * the marks it is carrying — an unsaved draft, the engine's problem and advisory
+ * counts — and that is the point of putting them there.
+ */
+function tab(label: string): HTMLElement {
+  return screen.getByRole('tab', { name: new RegExp(`^${label}`) })
+}
+
+/** The tab that shows the JSON view. */
 function toggle(): HTMLElement {
-  return screen.getByRole('button', { name: T.open_the_json_view })
+  return tab(T.tab_json_view)
 }
 
 /** The document editor's textarea. */
@@ -206,23 +220,33 @@ afterEach(() => {
 })
 
 describe('the pane opens on the forms and not on the document', () => {
-  it('renders no editor, and no document text anywhere', async () => {
+  it('shows no editor, and no document text, until the tab is chosen', async () => {
     stub({})
     await openConfig()
     // The forms are on screen.
     expect(screen.getByRole('grid', { name: T.configured_projects })).toBeInTheDocument()
-    // And the document is not, in any form: no editor to type in, and no rendering
-    // of its text either. `task_retry_limit` is a key the fixture document holds, so
-    // finding it on screen means the JSON reached the page unbidden.
+    // And the document is not, in any form: nothing to type in, no save control, and
+    // no rendering of its text either. `task_retry_limit` is a key the fixture
+    // document holds, so SEEING it means the JSON reached the operator unbidden.
+    //
+    // Not-visible rather than not-present, and the difference is deliberate: the
+    // pane keeps all four panels mounted so switching tabs cannot discard a staged
+    // edit or a half-written draft. What is demoted is what an operator meets, and
+    // that is exactly what visibility states.
+    const name = T.the_configuration_document
+    expect(screen.getByRole('textbox', { name, hidden: true })).not.toBeVisible()
     expect(
-      screen.queryByRole('textbox', { name: T.the_configuration_document }),
-    ).toBeNull()
+      screen.getByRole('button', { name: T.validate_and_save, hidden: true }),
+    ).not.toBeVisible()
+    expect(screen.getByText(/task_retry_limit/)).not.toBeVisible()
+    // And nothing on the accessible surface offers either one, which is what a
+    // reader navigating by role would find.
+    expect(screen.queryByRole('textbox', { name: T.the_configuration_document })).toBeNull()
     expect(screen.queryByRole('button', { name: T.validate_and_save })).toBeNull()
-    expect(screen.queryByText(/task_retry_limit/)).toBeNull()
   })
 
   it('withholds the engine\u2019s problems and advisories but states that they exist', async () => {
-    // The counts are the one thing the toggle must carry: a form surface that
+    // The counts are the one thing the JSON tab must carry: a form surface that
     // silently withheld "this document has a problem" would read as a healthy
     // configuration, which is the opposite of demoting a view.
     stub({
@@ -245,22 +269,21 @@ describe('the pane opens on the forms and not on the document', () => {
     expect(
       screen.queryByRole('heading', { name: T.problems_in_the_persisted_document }),
     ).toBeNull()
-    expect(screen.queryByText('must be at least 1')).toBeNull()
-    expect(screen.queryByText('unattended_integration')).toBeNull()
-    expect(
-      screen.getByText(new RegExp(T.the_json_view_lists_the_documents_problems)),
-    ).toBeInTheDocument()
-    expect(
-      screen.getByText(new RegExp(T.the_json_view_lists_the_documents_advisories)),
-    ).toBeInTheDocument()
+    expect(screen.getByText('must be at least 1')).not.toBeVisible()
+    expect(screen.getByText('unattended_integration')).not.toBeVisible()
+    // The counts themselves, on the tab, where they are readable without opening it.
+    expect(toggle()).toHaveTextContent(new RegExp(`${T.problems}\\s*1`))
+    expect(toggle()).toHaveTextContent(new RegExp(`${T.advisories}\\s*1`))
   })
 
-  it('offers exactly one control that opens the view', async () => {
+  it('offers exactly one tab that shows the view', async () => {
     stub({})
     await openConfig()
-    expect(screen.getAllByRole('button', { name: T.open_the_json_view })).toHaveLength(1)
-    expect(toggle()).toHaveAttribute('aria-pressed', 'false')
-    expect(screen.getByText(T.the_json_view_edits_what_no_form_expresses)).toBeInTheDocument()
+    expect(screen.getAllByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) })).toHaveLength(1)
+    expect(toggle()).toHaveAttribute('aria-selected', 'false')
+    // The sentence saying what the view is FOR travels with the view itself now, so
+    // it is on the panel rather than beside a toggle.
+    expect(screen.getByText(T.the_json_view_edits_what_no_form_expresses)).not.toBeVisible()
   })
 })
 
@@ -304,16 +327,18 @@ describe('the JSON view, once asked for', () => {
     expect(screen.getByText(T.withheld_at)).toBeInTheDocument()
   })
 
-  it('closes again without discarding a draft, and says it is holding one', async () => {
+  it('leaves the tab without discarding a draft, and says it is holding one', async () => {
     stub({})
     await openConfig()
     fireEvent.click(toggle())
     fireEvent.change(editor(), { target: { value: '{ "limits": { ' } })
-    // Closing is not a discard. State held inside the editor would be dropped by
-    // the unmount, and the operator would have no way to know it had been.
-    fireEvent.click(screen.getByRole('button', { name: T.close_the_json_view }))
+    // Leaving the tab is not a discard. State held inside the editor would be
+    // dropped by an unmount, and the operator would have no way to know it had been.
+    fireEvent.click(tab(T.tab_settings))
     expect(screen.queryByRole('textbox', { name: T.the_configuration_document })).toBeNull()
-    expect(screen.getByText(T.unsaved_edits)).toBeInTheDocument()
+    // And the tab that holds it says so, so a pane showing no editor is not read as
+    // a pane holding no draft.
+    expect(toggle()).toHaveTextContent(T.unsaved_edits)
     fireEvent.click(toggle())
     expect(editor().value).toBe('{ "limits": { ')
     expect(calls.some((call) => call.method === 'PUT')).toBe(false)
@@ -376,9 +401,11 @@ describe('a failed read is doubt, not an empty form', () => {
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
     expect(await screen.findByText(P.could_not_read_the_configuration)).toBeInTheDocument()
     expect(screen.queryByRole('grid', { name: T.configured_projects })).toBeNull()
-    // And no door to a document nothing could read: the toggle would open an editor
-    // over values that are not there.
-    expect(screen.queryByRole('button', { name: T.open_the_json_view })).toBeNull()
+    // And no tabs at all: a refusal is not a set of surfaces with one of them
+    // showing, and the JSON tab in particular would offer an editor over values that
+    // are not there.
+    expect(screen.queryByRole('tablist')).toBeNull()
+    expect(screen.queryByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) })).toBeNull()
   })
 
   it('drops a form it had already rendered when a refetch fails', async () => {

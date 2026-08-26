@@ -249,8 +249,9 @@ function stub(answers: {
  * Render the page and switch to the configuration pane.
  *
  * Waits on the projects table rather than on the editor, because the pane leads
- * with the forms: the JSON view is not rendered until {@link openJson} asks for
- * it, which is the property `SpecEngineFormSurface.test.tsx` asserts.
+ * with the forms: the JSON view is a tab of its own, and its editor is not reachable
+ * until {@link openJson} activates it — which is the property
+ * `SpecEngineFormSurface.test.tsx` asserts.
  */
 async function openConfig() {
   const client = new QueryClient({
@@ -266,9 +267,15 @@ async function openConfig() {
   return screen.findByText(T.projects)
 }
 
-/** Open the JSON view, returning its save control. */
+/**
+ * Activate the JSON view tab, returning its save control.
+ *
+ * A tab rather than a toggle: the pane's editing surfaces are four tabs, and only
+ * the active one is reachable — an inactive panel carries `hidden`, which takes it
+ * out of the accessibility tree the role queries read.
+ */
 async function openJson() {
-  fireEvent.click(screen.getByRole('button', { name: T.open_the_json_view }))
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) }))
   return screen.findByRole('button', { name: T.validate_and_save })
 }
 

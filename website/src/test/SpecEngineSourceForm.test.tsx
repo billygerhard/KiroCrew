@@ -298,7 +298,14 @@ function stub(answers: {
   )
 }
 
-/** Render the page and switch to the configuration pane. */
+/**
+ * Render the page, switch to the configuration pane, and show the Watch sources tab.
+ *
+ * The pane's editing surfaces are tabs now, and only the active one is reachable:
+ * an inactive panel carries `hidden`, which takes it out of the accessibility tree
+ * the role queries read. The form under test lives on the Watch sources tab, so
+ * every case here starts by activating it.
+ */
 async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
   stub(answers)
   const client = new QueryClient({
@@ -310,6 +317,7 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
+  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
   await screen.findByRole('heading', { name: T.watch_source_definitions })
   return client
 }

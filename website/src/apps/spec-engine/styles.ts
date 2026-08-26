@@ -95,8 +95,21 @@ export const SE_CSS = `
   border-radius:999px;padding:2px 10px;font-size:11.5px}
 .se-filter[aria-pressed="true"]{background:var(--accent-subtle);border-color:var(--accent);
   color:var(--text-strong)}
+/* The configuration pane's section tabs are the same pill, selected rather than
+   pressed: they are a \`role="tablist"\`, so the state ARIA carries is
+   \`aria-selected\`. Flat and in flow, like every other control on that pane —
+   nothing is drawn over the surfaces the tabs switch between. */
+.se-filter[aria-selected="true"]{background:var(--accent-subtle);border-color:var(--accent);
+  color:var(--text-strong)}
 .se-filter:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
 .se-filter-count{font-family:var(--mono);margin-left:5px}
+/* A word a tab carries beside its label — an unsaved draft, or what the engine
+   found in the saved document. A word rather than a bare number because three
+   numbers on one tab would say nothing about which is which. */
+.se-filter-mark{margin-left:7px}
+/* The tab row sits inside the pane's scrolling body rather than in a header bar,
+   so it takes the body's own horizontal padding instead of the list header's. */
+.se-tabs{padding:0 0 10px;border-bottom:0}
 .se-rows{overflow:auto;min-height:0;flex:1}
 /* One ordered list, laid out as a grid rather than as a <table>.
    The columns are the mockup's and the density is unchanged, but every row is a

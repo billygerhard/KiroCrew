@@ -157,6 +157,71 @@ const APP_DEFAULTS_ROW_KEY = 'app-defaults'
  */
 const SOURCES_GRID_ID = 'se-sources-grid'
 
+/** One of the configuration pane's four editing surfaces. */
+type TabId = 'settings' | 'profiles' | 'sources' | 'json'
+
+/**
+ * The pane's four editing surfaces, in render order.
+ *
+ * Deliberately a fixed table rather than derived from data, unlike every other
+ * list on this pane: these four entries name the pane's OWN components, so a
+ * fifth surface is a code change whichever way this is written. Deriving them
+ * would only add a layer that cannot vary.
+ *
+ * The label keys are whole literals at their own entries so the key-reference
+ * gate can resolve each one, and they are keys rather than resolved strings
+ * because a module-level `i18nT()` runs once at import and would freeze the
+ * labels in whichever language happened to be active then.
+ */
+const SECTION_TABS: ReadonlyArray<{ id: TabId; labelKey: string }> = [
+  { id: 'settings', labelKey: 'apps.specEngine.configPanel.tab_settings' },
+  { id: 'profiles', labelKey: 'apps.specEngine.configPanel.tab_cost_profiles' },
+  { id: 'sources', labelKey: 'apps.specEngine.configPanel.tab_watch_sources' },
+  { id: 'json', labelKey: 'apps.specEngine.configPanel.tab_json_view' },
+]
+
+/** The DOM id of *tab*'s control, so its panel can name what labels it. */
+function tabControlId(tab: TabId): string {
+  return `se-tab-${tab}`
+}
+
+/** The DOM id of *tab*'s panel, so its control can name what it controls. */
+function tabPanelId(tab: TabId): string {
+  return `se-panel-${tab}`
+}
+
+/**
+ * Report *count* to *onCount* whenever it changes, and render nothing.
+ *
+ * The pane's per-tab badge has to state how much unwritten work a surface holds
+ * while that surface is hidden, and the surfaces hold their own staging — three
+ * `useStagedEdits` hooks, one per form. This carries the number out without
+ * moving the state: lifting three forms' staging into the pane is exactly the
+ * drift the shared hook exists to prevent, and a second store of the count is a
+ * second thing that can disagree with the patch.
+ *
+ * A component rather than a hook because the number is only known after each
+ * form's own refusal and reading guards have returned — a hook call there would
+ * sit after a conditional return. Rendered at the site that computes the count,
+ * so the badge and the form's own "unwritten changes" line read one value.
+ *
+ * An effect rather than a call during render: `onCount` sets state in the parent,
+ * and a parent setState during a child's render is a render-phase side effect
+ * React refuses.
+ */
+function PendingCount({
+  count,
+  onCount,
+}: {
+  count: number
+  onCount?: (count: number) => void
+}) {
+  useEffect(() => {
+    onCount?.(count)
+  }, [count, onCount])
+  return null
+}
+
 /**
  * The origin of a value in force, in words, keyed by the engine's own enum.
  *
@@ -1486,7 +1551,14 @@ export function SettingsFields({
  *    re-read as what is in force, and the registry's own defaults are emphatically
  *    not that.
  */
-function SettingsForm({ project }: { project: string }) {
+function SettingsForm({
+  project,
+  onPendingCount,
+}: {
+  project: string
+  /** Report how many staged changes this form would review, for the tab badge. */
+  onPendingCount?: (count: number) => void
+}) {
   const client = useQueryClient()
   const edits = useStagedEdits()
   // The scope each row writes at, keyed by registry key. Normalized on read
@@ -1583,6 +1655,10 @@ function SettingsForm({ project }: { project: string }) {
   if (registry.isError || resolved.isError) {
     return (
       <div className="se-blk">
+        {/* What it HOLDS, not what it can review: with no vocabulary the form
+            cannot say what any staged edit means, and a tab badge that dropped to
+            zero here would report unwritten work as gone. */}
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
         {registry.isError && (
           <Refused
@@ -1605,6 +1681,7 @@ function SettingsForm({ project }: { project: string }) {
     // request.
     return (
       <div className="se-blk">
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
         <p className="se-note">
           {i18nT('apps.specEngine.settingsForm.reading_the_setting_registry')}
@@ -1671,6 +1748,10 @@ function SettingsForm({ project }: { project: string }) {
 
   return (
     <div className="se-blk">
+      {/* The same number the "unwritten setting changes" line below states, read
+          from the same list, so the tab badge cannot claim a count this form does
+          not show. */}
+      <PendingCount count={reviewed.length} onCount={onPendingCount} />
       <h3>{i18nT('apps.specEngine.settingsForm.settings')}</h3>
       {fields.length === 0 ? (
         <p className="se-note">{i18nT('apps.specEngine.settingsForm.no_setting_is_registered')}</p>
@@ -2221,7 +2302,14 @@ function copySourceOf(
  *    every row here comes from, and the resolved pane beside it renders the very
  *    roles this write changes.
  */
-function ProfilesForm({ config }: { config: ConfigSnapshot }) {
+function ProfilesForm({
+  config,
+  onPendingCount,
+}: {
+  config: ConfigSnapshot
+  /** Report how many staged changes this form would review, for the tab badge. */
+  onPendingCount?: (count: number) => void
+}) {
   const client = useQueryClient()
   const edits = useStagedEdits()
   const [chosen, setChosen] = useState('')
@@ -2321,6 +2409,10 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
   if (registry.isError) {
     return (
       <div className="se-blk">
+        {/* What it HOLDS, not what it can review: with no vocabulary the form
+            cannot say what any staged edit means, and a tab badge that dropped to
+            zero here would report unwritten work as gone. */}
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
         <Refused
           title={i18nT('apps.specEngine.profilesForm.could_not_read_the_profile_vocabulary')}
@@ -2334,6 +2426,7 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
     // is a fact about the engine, and "not read yet" is a fact about this request.
     return (
       <div className="se-blk">
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
         <p className="se-note">
           {i18nT('apps.specEngine.profilesForm.reading_the_profile_vocabulary')}
@@ -2511,6 +2604,10 @@ function ProfilesForm({ config }: { config: ConfigSnapshot }) {
 
   return (
     <div className="se-blk">
+      {/* The same number the "unwritten profile changes" line below states, read
+          from the same list, so the tab badge cannot claim a count this form does
+          not show. */}
+      <PendingCount count={reviewed.length} onCount={onPendingCount} />
       <h3>{i18nT('apps.specEngine.profilesForm.cost_profiles')}</h3>
       {names.length === 0 ? (
         /* Not an empty role table: rows of unassignable roles read as "these roles
@@ -3449,12 +3546,15 @@ function SourceForm({
   config,
   onShowGrid,
   onOpenJson,
+  onPendingCount,
 }: {
   config: ConfigSnapshot
   /** Select *source* in the autonomy grid section this form links to. */
   onShowGrid: (source: string) => void
   /** Open the JSON view, for a stored shape no form can express. */
   onOpenJson: () => void
+  /** Report how many staged changes this form would review, for the tab badge. */
+  onPendingCount?: (count: number) => void
 }) {
   const client = useQueryClient()
   const edits = useStagedEdits()
@@ -3606,6 +3706,10 @@ function SourceForm({
   if (registry.isError) {
     return (
       <div className="se-blk">
+        {/* What it HOLDS, not what it can review: with no presets the form cannot
+            say what any staged edit means, and a tab badge that dropped to zero
+            here would report unwritten work as gone. */}
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
         <Refused
           title={i18nT('apps.specEngine.sourceForm.could_not_read_the_source_presets')}
@@ -3619,6 +3723,7 @@ function SourceForm({
     // is a fact about the engine, and "not read yet" is a fact about this request.
     return (
       <div className="se-blk">
+        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
         <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
         <p className="se-note">{i18nT('apps.specEngine.sourceForm.reading_the_source_presets')}</p>
       </div>
@@ -3944,6 +4049,10 @@ function SourceForm({
 
   return (
     <div className="se-blk">
+      {/* The same number the "unwritten source changes" line below states, read
+          from the same list, so the tab badge cannot claim a count this form does
+          not show. */}
+      <PendingCount count={reviewed.length} onCount={onPendingCount} />
       <h3>{i18nT('apps.specEngine.sourceForm.watch_source_definitions')}</h3>
       {names.length === 0 ? (
         /* Not an empty form: fields for a source that does not exist read as a
@@ -5420,63 +5529,139 @@ function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: st
 }
 
 /**
- * The form surface's one door to the raw document, and what it is holding.
+ * The pane's four editing surfaces as a tab list, and what each one is holding.
  *
- * A single control, because the JSON view is the escape hatch rather than a second
- * mode: everything the forms express is edited on them, and this is what reaches a
- * shape they cannot. It is a plain in-flow toggle for the pane's standing reason —
- * no drawer, no modal, no scrim.
+ * The surfaces used to stack in one scroll, which made an operator read past four
+ * of them to reach the fifth. They are tabs now — but a tab that HIDES unwritten
+ * work would be worse than the stack, so every tab states what its surface holds:
+ * a staged-change count for the three forms, and for the JSON view the draft it
+ * is carrying plus the engine's problems and advisories for the saved document.
  *
- * Two facts travel with it, and neither is decoration. A draft the operator has not
- * saved survives closing the view, so the control has to SAY it is holding one;
- * otherwise a closed view looks like a clean pane and the draft reappears later with
- * no explanation. And the engine's problems and advisories for the persisted document
- * are rendered inside the view, so their counts are stated here: a form surface that
- * silently withheld "this document has three problems" would read as a healthy
- * configuration.
+ * Neither fact is decoration. A draft the operator has not saved survives leaving
+ * the tab, so the tab has to SAY it is holding one; otherwise an unvisited JSON
+ * tab looks like a clean pane and the draft reappears later with no explanation.
+ * And the problems and advisories are only rendered INSIDE that view, so their
+ * counts are stated out here: a pane that silently withheld "this document has
+ * three problems" behind an unvisited tab would read as a healthy configuration.
+ *
+ * The keyboard is the WAI-ARIA tabs pattern with activation on focus movement:
+ * ArrowLeft/ArrowRight move the selection, which is safe here precisely because
+ * every panel is already mounted — showing one costs nothing, so there is no
+ * reason to make the operator press a second key to see it. Visually it is the
+ * pane's existing flat filter-pill idiom, in flow: no overlay, no popup, nothing
+ * positioned over the surfaces it switches between.
  */
-function JsonViewToggle({
-  open,
+function SectionTabs({
+  active,
+  pending,
   dirty,
   problems,
   advisories,
-  onToggle,
+  onActivate,
 }: {
-  open: boolean
+  active: TabId
+  /** Staged changes each tab's surfaces are holding, keyed by tab. */
+  pending: Record<TabId, number>
+  /** Whether the JSON view is holding an unsaved draft. */
   dirty: boolean
   problems: number
   advisories: number
-  onToggle: () => void
+  onActivate: (tab: TabId) => void
+}) {
+  const move = (from: number, step: number) => {
+    // Wrapping, per the tabs pattern: the ends of the list are not walls, and an
+    // arrow press that does nothing reads as a dead key.
+    const next = (from + step + SECTION_TABS.length) % SECTION_TABS.length
+    onActivate(SECTION_TABS[next].id)
+    // Focus follows selection, so the arrow keys move the reader as well as the
+    // panel. Read from the document rather than held in a ref: the control that
+    // is being moved to may not have rendered as selected yet.
+    document.getElementById(tabControlId(SECTION_TABS[next].id))?.focus()
+  }
+  return (
+    <div
+      className="se-filters se-tabs"
+      role="tablist"
+      aria-label={i18nT('apps.specEngine.configPanel.configuration_sections')}
+    >
+      {SECTION_TABS.map((tab, index) => (
+        <button
+          key={tab.id}
+          id={tabControlId(tab.id)}
+          type="button"
+          role="tab"
+          className="se-filter"
+          aria-selected={tab.id === active}
+          aria-controls={tabPanelId(tab.id)}
+          // One tab stop for the whole list: the arrows move between tabs, so a
+          // stop per tab would put four stops between the table and the panel.
+          tabIndex={tab.id === active ? 0 : -1}
+          onClick={() => onActivate(tab.id)}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowRight') {
+              event.preventDefault()
+              move(index, 1)
+            } else if (event.key === 'ArrowLeft') {
+              event.preventDefault()
+              move(index, -1)
+            }
+          }}
+        >
+          {i18nT(tab.labelKey)}
+          {pending[tab.id] > 0 && (
+            <span className="se-filter-count">{fmtNumber(pending[tab.id])}</span>
+          )}
+          {tab.id === 'json' && dirty && (
+            <span className="se-filter-mark">
+              {i18nT('apps.specEngine.configPanel.unsaved_edits')}
+            </span>
+          )}
+          {tab.id === 'json' && problems > 0 && (
+            <span className="se-filter-mark">
+              {i18nT('apps.specEngine.configPanel.problems')}
+              <span className="se-filter-count">{fmtNumber(problems)}</span>
+            </span>
+          )}
+          {tab.id === 'json' && advisories > 0 && (
+            <span className="se-filter-mark">
+              {i18nT('apps.specEngine.configPanel.advisories')}
+              <span className="se-filter-count">{fmtNumber(advisories)}</span>
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * One tab's surfaces, mounted whether or not the tab is the active one.
+ *
+ * `hidden` rather than a conditional render, and that is the whole point of this
+ * wrapper. Unmounting a panel would drop everything its forms hold that is not
+ * yet written: the staged edits in `useStagedEdits`, an armed removal and the
+ * name typed to confirm it, a half-written add, and the scope each row is
+ * targeting. An operator who switched tabs to check one number and came back to
+ * an emptied form would have lost work with nothing saying so — so the panels
+ * stay mounted and only their visibility changes.
+ */
+function SectionPanel({
+  tab,
+  active,
+  children,
+}: {
+  tab: TabId
+  active: TabId
+  children: React.ReactNode
 }) {
   return (
-    <div className="se-blk">
-      <div className="se-acts">
-        <button type="button" className="se-btn" aria-pressed={open} onClick={onToggle}>
-          {open
-            ? i18nT('apps.specEngine.configPanel.close_the_json_view')
-            : i18nT('apps.specEngine.configPanel.open_the_json_view')}
-        </button>
-        {dirty && (
-          <span className="se-lbl">{i18nT('apps.specEngine.configPanel.unsaved_edits')}</span>
-        )}
-      </div>
-      <p className="se-note">
-        {i18nT('apps.specEngine.configPanel.the_json_view_edits_what_no_form_expresses')}
-      </p>
-      {problems > 0 && (
-        <p className="se-note">
-          {i18nT('apps.specEngine.configPanel.the_json_view_lists_the_documents_problems')}
-          {SEP}
-          <span className="se-m">{fmtNumber(problems)}</span>
-        </p>
-      )}
-      {advisories > 0 && (
-        <p className="se-note">
-          {i18nT('apps.specEngine.configPanel.the_json_view_lists_the_documents_advisories')}
-          {SEP}
-          <span className="se-m">{fmtNumber(advisories)}</span>
-        </p>
-      )}
+    <div
+      id={tabPanelId(tab)}
+      role="tabpanel"
+      aria-labelledby={tabControlId(tab)}
+      hidden={tab !== active}
+    >
+      {children}
     </div>
   )
 }
@@ -5498,10 +5683,28 @@ function JsonViewToggle({
  *
  * The pane used to open on the raw document, which made JSON the only way to change
  * most of what is stored. It now opens on the forms, and the document editor sits
- * behind {@link JsonViewToggle} with its full behavior intact — the same textarea,
- * the same patch-computing save, the same problems and advisories. Nothing is
- * read-only and no shape has become unreachable; what changed is which of the two an
- * operator meets first.
+ * on the last of four tabs with its full behavior intact — the same textarea, the
+ * same patch-computing save, the same problems and advisories. Nothing is read-only
+ * and no shape has become unreachable; what changed is which of the two an operator
+ * meets first.
+ *
+ * ## Four tabs, and the two properties that make them safe
+ *
+ * The editing surfaces are {@link SectionTabs}, not a single scroll: five dense
+ * surfaces stacked meant reading past four of them to reach the fifth. Splitting
+ * them costs nothing only because of two things, and both are load-bearing rather
+ * than polish:
+ *
+ * 1. **Hidden panels stay mounted.** {@link SectionPanel} hides with `hidden`, so
+ *    switching tabs cannot drop a form's staged edits, an armed removal, or
+ *    half-typed text. The JSON draft is lifted to this pane for the same reason it
+ *    always was, and now covers leaving the tab as well as closing the view.
+ * 2. **Hidden work is announced.** Each form reports its reviewable staged count to
+ *    the tab that holds it, so an operator confirming a patch can never be looking
+ *    at a pane that shows no sign of the edits staged one tab over.
+ *
+ * The projects table and the project selection stay ABOVE the tabs, because the row
+ * selected there governs every tab and the resolved column beside them all.
  */
 export function ConfigPane({
   config,
@@ -5520,8 +5723,19 @@ export function ConfigPane({
   // source form links into that matrix for the source it is editing, and a copy of
   // the selection on either side is how the two come to disagree.
   const [gridSource, setGridSource] = useState('')
-  const [jsonOpen, setJsonOpen] = useState(false)
-  // The editor's unsaved text, held here so closing the view does not discard it.
+  // Which of the four editing surfaces is showing. Settings is the default: it is
+  // the most-visited surface, and the JSON view stays demoted at the far end.
+  const [activeTab, setActiveTab] = useState<TabId>('settings')
+  // How much unwritten work each tab is holding, reported by the surfaces on it.
+  // Held here rather than derived, because the forms own their own staging: the
+  // pane observes the counts and never becomes a second place they live.
+  const [pendingByTab, setPendingByTab] = useState<Record<TabId, number>>({
+    settings: 0,
+    profiles: 0,
+    sources: 0,
+    json: 0,
+  })
+  // The editor's unsaved text, held here so leaving the JSON tab does not discard it.
   const [draft, setDraft] = useState<string | null>(null)
   // Normalized against the document itself, not against how the entry left it:
   // a selection whose entry is gone — removed through its row, deleted in the
@@ -5542,6 +5756,17 @@ export function ConfigPane({
   useEffect(() => {
     if (!chosenKnown) setChosenProject(APP_WIDE)
   }, [chosenKnown])
+  // One stable reporter per form, so a form's count effect fires on the count
+  // changing rather than on every render of this pane. The identity guard keeps a
+  // report of an unchanged count from re-rendering the pane at all.
+  const report = useMemo(() => {
+    const at = (tab: TabId) => (count: number) => {
+      setPendingByTab((current) =>
+        current[tab] === count ? current : { ...current, [tab]: count },
+      )
+    }
+    return { settings: at('settings'), profiles: at('profiles'), sources: at('sources') }
+  }, [])
   return (
     <>
       <section className="se-cfg">
@@ -5566,37 +5791,52 @@ export function ConfigPane({
             <>
               {/* The question this pane is opened with is "which configuration
                   governs which project", and the answer must not sit under a
-                  fixed-height editor. */}
+                  fixed-height editor. Above the tabs and outside them, because the
+                  row selected here governs every one of them: a selection inside a
+                  tab would be a selection three surfaces could not see. */}
               <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
+              <SectionTabs
+                active={activeTab}
+                pending={pendingByTab}
+                dirty={isDirty(draft, config.document)}
+                problems={config.errors.length}
+                advisories={config.advisories.length}
+                onActivate={setActiveTab}
+              />
               {/* Beside the table because the row selected there is what these
                   values are resolved FOR: a settings form and a resolution for two
                   different projects is the disagreement the shared selection
                   exists to prevent. */}
-              <SettingsForm project={project} />
-              {/* Beside the settings because a role's model and effort are the
-                  other half of what a project runs on, and they live nowhere else:
-                  a project SELECTS a profile rather than overriding roles in it. */}
-              <ProfilesForm config={config} />
-              {/* Beside the grid it links into: this is where a source is created,
-                  edited and removed, and the grid below is the resolution of how
-                  far its items may run unattended. */}
-              <SourceForm
-                config={config}
-                onShowGrid={setGridSource}
-                onOpenJson={() => setJsonOpen(true)}
-              />
-              {/* Beside the projects table for the same reason: who may run how
-                  unattended is a reading, and reading it out of JSON is not the
-                  same as seeing the matrix. */}
-              <SourcesSection chosen={gridSource} onChoose={setGridSource} />
-              <JsonViewToggle
-                open={jsonOpen}
-                dirty={isDirty(draft, config.document)}
-                problems={config.errors.length}
-                advisories={config.advisories.length}
-                onToggle={() => setJsonOpen((shown) => !shown)}
-              />
-              {jsonOpen && <DocumentEditor config={config} text={draft} onText={setDraft} />}
+              <SectionPanel tab="settings" active={activeTab}>
+                <SettingsForm project={project} onPendingCount={report.settings} />
+              </SectionPanel>
+              {/* Its own tab because a role's model and effort are the other half
+                  of what a project runs on, and they live nowhere else: a project
+                  SELECTS a profile rather than overriding roles in it. */}
+              <SectionPanel tab="profiles" active={activeTab}>
+                <ProfilesForm config={config} onPendingCount={report.profiles} />
+              </SectionPanel>
+              {/* The form and the grid it links into share one tab: the form's
+                  enable consequence links to the matrix showing how far that
+                  source's items may run unattended, and a link that crossed tabs
+                  would hide the very thing it points at. */}
+              <SectionPanel tab="sources" active={activeTab}>
+                <SourceForm
+                  config={config}
+                  onShowGrid={setGridSource}
+                  onOpenJson={() => setActiveTab('json')}
+                  onPendingCount={report.sources}
+                />
+                <SourcesSection chosen={gridSource} onChoose={setGridSource} />
+              </SectionPanel>
+              {/* Last, and still the escape hatch: everything the forms express is
+                  edited on them, and this is what reaches a shape they cannot. */}
+              <SectionPanel tab="json" active={activeTab}>
+                <p className="se-note">
+                  {i18nT('apps.specEngine.configPanel.the_json_view_edits_what_no_form_expresses')}
+                </p>
+                <DocumentEditor config={config} text={draft} onText={setDraft} />
+              </SectionPanel>
             </>
           )}
         </div>

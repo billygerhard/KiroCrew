@@ -37,6 +37,7 @@ import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
 
 const T = en.apps.specEngine.sourcesSection
+const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 
 /** The engine's wildcard key, as it appears inside a declaring path. */
@@ -210,7 +211,13 @@ async function openConfig() {
   )
   const nav = await screen.findByRole('button', { name: new RegExp(P.configuration) })
   fireEvent.click(nav)
-  await screen.findByText(T.watch_sources)
+  // The pane's editing surfaces are tabs now, and only the active one is reachable:
+  // an inactive panel carries `hidden`, which takes it out of the accessibility tree
+  // the role queries read. The grid shares the Watch sources tab with the form that
+  // links into it. The section heading is found by ROLE rather than by text, because
+  // that tab's label is the same words.
+  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
+  await screen.findByRole('heading', { name: T.watch_sources })
   await waitFor(() => expect(screen.queryByText(T.reading_the_watch_sources)).toBeNull())
   return { client, ...rendered }
 }
@@ -491,6 +498,9 @@ describe('doubt about the read never renders as authority', () => {
       </QueryClientProvider>,
     )
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
+    // The grid lives on the Watch sources tab, and only the active tab's panel is
+    // reachable: an inactive one carries `hidden`.
+    fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
     await screen.findByText(T.reading_the_watch_sources)
     expect(screen.queryByText(T.no_watch_source_is_configured)).toBeNull()
     release?.()
