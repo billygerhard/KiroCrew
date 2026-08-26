@@ -40,6 +40,7 @@ import {
   pollForRepository,
   sourceEdit,
   sourceShape,
+  wellFormedRepository,
   type SourceFormAction,
 } from '../apps/spec-engine/ConfigPanel'
 import { DELETE, buildFormPatch, type StagedEdit } from '../apps/spec-engine/configDocument'
@@ -262,6 +263,15 @@ describe('the repository parameter changes only its own slot', () => {
           expect(edit).toBeNull()
           return
         }
+        const named = repository.trim() === '' ? PLACEHOLDER : repository.trim()
+        if (!wellFormedRepository(named)) {
+          // Refused, not substituted: a value that is not one owner and one repo
+          // could rewrite the argument AROUND the slot — a second `/` moves the
+          // endpoint, `?` or `#` rewrites the query, a leading `-` reads as a flag
+          // — so it never reaches an argv.
+          expect(edit).toBeNull()
+          return
+        }
         expect(edit).not.toBeNull()
         const staged = (edit as StagedEdit).value as unknown[]
         expect((edit as StagedEdit).segments).toEqual(['sources', source, 'poll'])
@@ -275,7 +285,6 @@ describe('the repository parameter changes only its own slot', () => {
         // And the slots hold the trimmed value, or the placeholder when it is empty:
         // a poll naming the literal is refused loudly, which is safer than one
         // naming a repository nobody meant.
-        const named = repository.trim() === '' ? PLACEHOLDER : repository.trim()
         const match = matchPoll(template, staged)
         expect(match).not.toBeNull()
         expect((match as { repository: string }).repository).toBe(named)
@@ -301,6 +310,13 @@ describe('the repository parameter changes only its own slot', () => {
             expect(matchPoll(template, [...template, noise])).toBeNull()
             return
           }
+          const named = repository.trim() === '' ? PLACEHOLDER : repository.trim()
+          if (!wellFormedRepository(named)) {
+            // A value that could rewrite the argument around the slot composes
+            // nothing at all.
+            expect(filled).toBeNull()
+            return
+          }
           // A substituted poll matches. That is the whole repair: the engine's own
           // presets ship a placeholder the project replaces, so a poll that actually
           // polls something is still one this form can account for.
@@ -317,6 +333,38 @@ describe('the repository parameter changes only its own slot', () => {
           expect(matchPoll(template, (filled as string[]).slice(1))).toBeNull()
         },
       ),
+    )
+  })
+  it('refuses a repository that could rewrite the argument around the slot', () => {
+    // Both doors, not one: the compose path must never build such a poll, and the
+    // acceptance path must never call one already stored "the preset's own" — a
+    // stored `a/b/issues?state=open#` reassembles the github frame perfectly while
+    // polling a different endpoint, and a form that calls it expressible would
+    // offer to arm it.
+    const rewriting = fc.constantFrom(
+      'a/b --jq .',
+      '$(id)',
+      'a b/c',
+      '-owner/repo',
+      'a/b/c',
+      'a/b?state=open',
+      'a/b#frag',
+      'a&b/c',
+      'owner/',
+      '/repo',
+    )
+    fc.assert(
+      fc.property(PRESET, rewriting, (preset, bad) => {
+        expect(wellFormedRepository(bad)).toBe(false)
+        const template = preset.entry.poll as string[]
+        const slots = designatedSlots(template)
+        fc.pre(slots.length > 0)
+        expect(pollForRepository(preset, bad)).toBeNull()
+        const stored = template.map((argument, index) =>
+          slots.includes(index) ? argument.split(PLACEHOLDER).join(bad) : argument,
+        )
+        expect(matchPoll(template, stored)).toBeNull()
+      }),
     )
   })
 })

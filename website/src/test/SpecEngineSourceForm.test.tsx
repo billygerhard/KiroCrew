@@ -866,6 +866,76 @@ describe('the repository is a value the preset left open', () => {
       calls.length = 0
     }
   })
+  it('refuses a value that is not one owner and one repo, and says so', async () => {
+    await openForm()
+    const box = within(repositoryRow()).getByRole('textbox')
+    fireEvent.change(box, { target: { value: 'acme/widgets --jq .' } })
+    // Stated, and nothing staged: the argv the patch would carry is untouched by
+    // text the guard refused.
+    expect(within(block()).getByText(T.that_is_not_a_repository_name)).toBeInTheDocument()
+    expect(unwritten()).toBe('')
+    // The text is kept so it can be corrected, not snapped back mid-typing.
+    expect((box as HTMLInputElement).value).toBe('acme/widgets --jq .')
+    fireEvent.change(box, { target: { value: 'acme/other' } })
+    expect(within(block()).queryByText(T.that_is_not_a_repository_name)).toBeNull()
+    expect(unwritten()).toContain(T.unwritten_source_changes)
+  })
+
+  it('withdraws the staged repository when the box turns malformed', async () => {
+    await openForm()
+    const box = within(repositoryRow()).getByRole('textbox')
+    fireEvent.change(box, { target: { value: 'acme/other' } })
+    expect(unwritten()).toContain(T.unwritten_source_changes)
+    fireEvent.change(box, { target: { value: 'acme/other#frag' } })
+    // The stale staged poll is withdrawn along with the statement: leaving it would
+    // put an argv in the patch that the box no longer shows.
+    expect(unwritten()).toBe('')
+    expect(within(block()).getByText(T.that_is_not_a_repository_name)).toBeInTheDocument()
+  })
+
+  it('refuses a malformed repository on the add block, and says so', async () => {
+    await openForm()
+    nameTheAdd('mirror')
+    nameTheAddRepository('$(id)')
+    expect(within(block()).getByText(T.that_is_not_a_repository_name)).toBeInTheDocument()
+    // The copy is refused outright rather than staged with the value dropped.
+    fireEvent.click(presetButton('github'))
+    expect(unwritten()).toBe('')
+  })
+
+  it('refuses the copy when the chosen preset has no slot for the typed repository', async () => {
+    // A preset with no placeholder has nowhere to put the typed value; composing
+    // anyway would write an entry that silently ignores what the operator typed.
+    const feed = {
+      preset: 'feed',
+      public: true,
+      poll: ['feedctl', 'list', '--json'],
+      field_map: { title: 'title' },
+    }
+    await openForm({
+      registry: {
+        body: registry({
+          source_presets: [
+            { host: 'github', program: 'gh', entry: GH_ENTRY },
+            { host: 'feed', program: 'feedctl', entry: feed },
+          ],
+        }),
+      },
+    })
+    nameTheAdd('mirror')
+    nameTheAddRepository('acme/widgets')
+    fireEvent.click(presetButton('feed'))
+    expect(unwritten()).toBe('')
+    expect(
+      within(block()).getByText(
+        T.the_preset_has_no_repository_slot.replace('{{preset}}', 'feed'),
+      ),
+    ).toBeInTheDocument()
+    // With the box cleared the plain inert copy is allowed again.
+    nameTheAddRepository('')
+    fireEvent.click(presetButton('feed'))
+    expect(unwritten()).toContain(T.unwritten_source_changes)
+  })
 })
 
 describe('editing a stored source', () => {

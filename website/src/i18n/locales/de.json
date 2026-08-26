@@ -4154,7 +4154,8 @@
         "unwritten_source_changes": "Nicht geschriebene Quelländerungen",
         "watch_source_definitions": "Definitionen der Watch-Quellen",
         "write_the_change": "Änderung schreiben",
-        "wrote_the_change_and_re_read_the_sources": "Änderung geschrieben und Quellen neu gelesen."
+        "wrote_the_change_and_re_read_the_sources": "Änderung geschrieben und Quellen neu gelesen.",
+        "that_is_not_a_repository_name": "Das ist kein Repository-Name und wird daher nicht vorgemerkt: Ein Repository besteht aus einem Eigentümer und einem Repo — Buchstaben, Ziffern, Punkte, Binde- und Unterstriche — verbunden durch einen einzelnen Schrägstrich."
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "Ein Bestätigen schreibt genau diesen Patch, durch dieselbe gesicherte Tür wie ein Speichern des Dokuments, und der Schreibvorgang wird aufgezeichnet.",

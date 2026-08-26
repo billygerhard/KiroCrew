@@ -2958,12 +2958,32 @@ export function designatedSlots(poll: unknown): number[] {
 }
 
 /**
+ * Whether *repository* is shaped like the one thing a designated slot leaves
+ * open: `owner/repo`.
+ *
+ * Letters, digits, dot, dash and underscore on each side of exactly ONE slash,
+ * with no leading dash on either half and no whitespace. This is not hostname
+ * validation — its job is to make the control's own promise ("a value, not a
+ * command") structurally true: every character that could rewrite the argument
+ * AROUND the slot is outside the set. A `?`, `#` or `&` would rewrite the query
+ * the preset composed, a second `/` would move the endpoint, a leading `-` reads
+ * as a flag to the program, and whitespace invites reading one argument as two.
+ * The placeholder itself is a well-formed repository, so a fresh copy needs no
+ * special case.
+ */
+export function wellFormedRepository(repository: string): boolean {
+  return /^[A-Za-z0-9._][A-Za-z0-9._-]*\/[A-Za-z0-9._][A-Za-z0-9._-]*$/.test(repository)
+}
+
+/**
  * *argument* with every placeholder occurrence replaced by *repository*.
  *
  * The surrounding text is kept, which is the whole reason substitution is per
  * argument rather than per position: `repos/OWNER/REPO/issues?state=all` becomes
  * `repos/acme/widgets/issues?state=all`, and the query string the preset chose is
- * still the preset's.
+ * still the preset's. That sentence is enforced, not assumed: every caller passes
+ * a value {@link wellFormedRepository} accepted, so the substitution cannot carry
+ * the characters that would rewrite the argument around the slot.
  */
 function fillSlot(argument: string, repository: string): string {
   return argument.split(SOURCE_REPO_PLACEHOLDER).join(repository)
@@ -2990,7 +3010,14 @@ function slotValue(template: string, stored: string): string | null {
   const span = stored.length - literal
   if (span < 0 || span % gaps !== 0) return null
   const value = stored.slice(parts[0].length, parts[0].length + span / gaps)
-  return parts.join(value) === stored ? value : null
+  if (parts.join(value) !== stored) return null
+  // The frame matching is not enough on its own: a stored value carrying `?`, `#`
+  // or a second `/` reassembles into the frame perfectly while naming a DIFFERENT
+  // endpoint or query than the preset composed. Such a poll is not "the preset's
+  // argv with a repository named in it" — it is a hand-edited command, and the
+  // JSON view owns it.
+  if (value !== SOURCE_REPO_PLACEHOLDER && !wellFormedRepository(value)) return null
+  return value
 }
 
 /** What a stored poll and a bundled preset's poll agree on. */
@@ -3074,6 +3101,11 @@ export function pollForRepository(preset: SourcePreset, repository: string): unk
   const slots = designatedSlots(template)
   if (slots.length === 0) return null
   const named = repository.trim() === '' ? SOURCE_REPO_PLACEHOLDER : repository.trim()
+  // Refused, not substituted: a value that is not owner/repo could rewrite the
+  // argument around the slot — the exact thing the designated-slot rule exists to
+  // make impossible. The placeholder passes the shape check, so an empty value
+  // still composes the preset's own inert copy.
+  if (!wellFormedRepository(named)) return null
   return template.map((argument, index) =>
     slots.includes(index) ? fillSlot(String(argument), named) : argument,
   )
@@ -3441,6 +3473,16 @@ function SourceForm({
   // never made.
   const [removalRefused, setRemovalRefused] = useState(false)
   const [orphanedCopy, setOrphanedCopy] = useState('')
+  // The repository text as typed, and the refusals the two repository controls
+  // have stated. The buffer exists because the edit-flow control otherwise
+  // derives its value from the STAGED argv, and a refused keystroke would snap
+  // the input back — an operator cannot correct text they cannot finish typing.
+  // `null` mirrors the staged/stored reading; a string is mid-edit text.
+  const [repoInput, setRepoInput] = useState<string | null>(null)
+  const [repoRefused, setRepoRefused] = useState(false)
+  // '' = no refusal; 'shape' = the typed value is not owner/repo; otherwise the
+  // host of a chosen preset that has no slot to put the typed repository in.
+  const [addRefused, setAddRefused] = useState('')
 
   const registry = useQuery({
     queryKey: QK.registry,
@@ -3537,6 +3579,14 @@ function SourceForm({
     if (armed !== null && !names.includes(armed)) setArmed(null)
   }, [armed, names])
 
+  // The repository buffer and its refusal are about the SELECTED source's control;
+  // carried across a switch they would caption another source's input with text —
+  // and a refusal — that was never typed at it.
+  useEffect(() => {
+    setRepoInput(null)
+    setRepoRefused(false)
+  }, [selected])
+
   // `isError` before the data: React Query keeps the last successful answer across
   // a failing refetch, and a preset list nobody re-read would describe commands
   // this form then claims the engine bundles.
@@ -3618,6 +3668,23 @@ function SourceForm({
     // existing source key by key, which is an edit to that source — and one that
     // could leave its poll command half from one preset and half from another.
     if (pending === '' || names.includes(pending)) return
+    const trimmed = addRepo.trim()
+    // A typed repository that cannot reach the copy is refused with a statement,
+    // never dropped: composing anyway would write an entry that ignores what the
+    // operator just typed, with a review sentence that never mentions it.
+    if (trimmed !== '' && !wellFormedRepository(trimmed)) {
+      setAddRefused('shape')
+      return
+    }
+    const template = preset.entry[SOURCE_POLL]
+    if (
+      trimmed !== '' &&
+      (!Array.isArray(template) || designatedSlots(template).length === 0)
+    ) {
+      setAddRefused(preset.host)
+      return
+    }
+    setAddRefused('')
     const edit = sourceEdit({ kind: 'add', source: pending, preset, repository: addRepo })
     if (edit) edits.stage(edit.segments, edit.value)
   }
@@ -3633,6 +3700,15 @@ function SourceForm({
   const nameAddRepository = (next: string) => {
     touched()
     setAddRepo(next)
+    const trimmed = next.trim()
+    // Refused and SAID, before any re-compose: a malformed value never reaches the
+    // staged copy, so whatever repository the copy already names is still the one
+    // its review sentence describes.
+    if (trimmed !== '' && !wellFormedRepository(trimmed)) {
+      setAddRefused('shape')
+      return
+    }
+    setAddRefused('')
     const staged = pending === '' ? undefined : edits.stagedAt([SOURCES, pending])
     if (!staged || staged.value === DELETE) return
     const copy = sourcePresetOf(staged.value, presets)
@@ -3649,6 +3725,19 @@ function SourceForm({
   /** Name the repository the SELECTED source polls, inside its preset's own argv. */
   const nameRepository = (next: string) => {
     if (shape.preset === null) return
+    setRepoInput(next)
+    const trimmed = next.trim()
+    // Refused and SAID: sourceEdit would refuse this value anyway, but a silent
+    // refusal under a live input reads as a control that does nothing, and the
+    // previously staged repository would keep sitting in the patch unexplained —
+    // so the stale staged poll is withdrawn along with the statement.
+    if (trimmed !== '' && !wellFormedRepository(trimmed)) {
+      touched()
+      edits.unstage([SOURCES, selected, SOURCE_POLL])
+      setRepoRefused(true)
+      return
+    }
+    setRepoRefused(false)
     act({ kind: 'repository', source: selected, preset: shape.preset, repository: next })
   }
 
@@ -3754,10 +3843,15 @@ function SourceForm({
       }
     }
     if (rest.length === 1 && rest[0] === SOURCE_ENABLED) {
-      const key = SOURCE_ENABLED_SENTENCE_KEY[String(edit.value === true)]
       // Indexed at the call site rather than through a local, so the
       // key-reference gate resolves every entry in the table.
-      return { path, sentence: i18nT(key, { source, path }) }
+      return {
+        path,
+        sentence: i18nT(SOURCE_ENABLED_SENTENCE_KEY[String(edit.value === true)], {
+          source,
+          path,
+        }),
+      }
     }
     if (rest.length === 1 && SOURCE_FIELD_SENTENCE_KEY[rest[0]]) {
       return {
@@ -3945,12 +4039,20 @@ function SourceForm({
                       id="se-source-repository"
                       type="text"
                       className="se-input"
-                      value={isPlaceholder(repository) ? '' : repository}
+                      value={repoInput ?? (isPlaceholder(repository) ? '' : repository)}
                       onChange={(event) => nameRepository(event.target.value)}
                     />
                     <p className="se-note">
                       {i18nT('apps.specEngine.sourceForm.the_repository_is_a_value_not_a_command')}
                     </p>
+                    {repoRefused && (
+                      /* The refusal is an event this control caused, stated where it
+                         happened: with the staged poll withdrawn, silence would read
+                         as an input that does nothing. */
+                      <p className="se-note" role="status">
+                        {i18nT('apps.specEngine.sourceForm.that_is_not_a_repository_name')}
+                      </p>
+                    )}
                     {isPlaceholder(repository) && (
                       <p className="se-note">
                         {i18nT('apps.specEngine.sourceForm.the_repository_is_still_the_placeholder', {
@@ -4290,6 +4392,20 @@ function SourceForm({
         <p className="se-note">
           {i18nT('apps.specEngine.sourceForm.the_repository_is_a_value_not_a_command')}
         </p>
+        {addRefused === 'shape' && (
+          <p className="se-note" role="status">
+            {i18nT('apps.specEngine.sourceForm.that_is_not_a_repository_name')}
+          </p>
+        )}
+        {addRefused !== '' && addRefused !== 'shape' && (
+          /* The chosen preset has nowhere to put the typed repository, so the copy
+             was refused rather than staged with the value silently dropped. */
+          <p className="se-note" role="status">
+            {i18nT('apps.specEngine.sourceForm.the_preset_has_no_repository_slot', {
+              preset: addRefused,
+            })}
+          </p>
+        )}
         {addRepo.trim() === '' && (
           /* The consequence of leaving it empty, stated where it is left empty: the
              copy is still written, and it still cannot poll. */

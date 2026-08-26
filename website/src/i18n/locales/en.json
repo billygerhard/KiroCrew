@@ -3471,7 +3471,8 @@
         "unwritten_source_changes": "Unwritten source changes",
         "watch_source_definitions": "Watch source definitions",
         "write_the_change": "Write the change",
-        "wrote_the_change_and_re_read_the_sources": "Wrote the change and re-read the sources."
+        "wrote_the_change_and_re_read_the_sources": "Wrote the change and re-read the sources.",
+        "that_is_not_a_repository_name": "That is not a repository name, so it is not staged: a repository is one owner and one repo — letters, digits, dots, dashes and underscores — joined by a single slash."
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "A confirm writes exactly this patch, through the same guarded door a document save goes through, and the write is recorded.",

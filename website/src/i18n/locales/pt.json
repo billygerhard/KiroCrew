@@ -4215,7 +4215,8 @@
         "unwritten_source_changes": "Alterações de fonte não escritas",
         "watch_source_definitions": "Definições das fontes de observação",
         "write_the_change": "Escrever a alteração",
-        "wrote_the_change_and_re_read_the_sources": "A alteração foi escrita e as fontes foram lidas de novo."
+        "wrote_the_change_and_re_read_the_sources": "A alteração foi escrita e as fontes foram lidas de novo.",
+        "that_is_not_a_repository_name": "Isso não é um nome de repositório, então nada é preparado: um repositório é um dono e um repo — letras, dígitos, pontos, hífens e sublinhados — unidos por uma única barra."
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "Confirmar grava exatamente este patch, pela mesma porta protegida de um salvamento do documento, e a gravação fica registrada.",

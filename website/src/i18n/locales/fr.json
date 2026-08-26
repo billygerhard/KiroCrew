@@ -4215,7 +4215,8 @@
         "unwritten_source_changes": "Modifications de source non écrites",
         "watch_source_definitions": "Définitions des sources de veille",
         "write_the_change": "Écrire la modification",
-        "wrote_the_change_and_re_read_the_sources": "Modification écrite et sources relues."
+        "wrote_the_change_and_re_read_the_sources": "Modification écrite et sources relues.",
+        "that_is_not_a_repository_name": "Ce n'est pas un nom de dépôt, donc rien n'est préparé : un dépôt est un propriétaire et un repo — lettres, chiffres, points, tirets et tirets bas — reliés par une seule barre oblique."
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "Une confirmation écrit exactement ce correctif, par la même porte protégée qu'un enregistrement du document, et l'écriture est consignée.",

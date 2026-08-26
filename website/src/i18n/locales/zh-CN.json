@@ -4093,7 +4093,8 @@
         "unwritten_source_changes": "未写入的源更改",
         "watch_source_definitions": "监视源定义",
         "write_the_change": "写入更改",
-        "wrote_the_change_and_re_read_the_sources": "已写入更改并重新读取了各个源。"
+        "wrote_the_change_and_re_read_the_sources": "已写入更改并重新读取了各个源。",
+        "that_is_not_a_repository_name": "这不是仓库名称,因此不会暂存:仓库由一个所有者和一个仓库名组成——字母、数字、点、连字符和下划线——由单个斜杠连接。"
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "确认后会通过与保存文档相同的受保护入口，原样写入这份补丁，并记录这次写入。",

@@ -171,7 +171,15 @@ enforces.
   data field decide what the engine runs. The parameter stages the *whole* `poll`
   array built from the preset's argv with only those slots filled, so the program,
   the argument count and every other argument stay the preset's, and the engine
-  runs argv with no shell, so text inside one argument cannot become another. An
+  runs argv with no shell, so text inside one argument cannot become another. The
+  value itself is **shape-checked, not free**: one owner and one repo — letters,
+  digits, dots, dashes and underscores joined by a single `/`, no leading dash on
+  either half — enforced on the compose path AND the acceptance path. Without the
+  check, a value carrying `?`, `#`, `&`, a second `/` or whitespace rewrites the
+  argument AROUND the slot (the query and endpoint the preset composed) while the
+  frame still reassembles, so the form would call the result the preset's own and
+  offer to arm it. A malformed value is refused with a statement, and a stored
+  poll whose slot holds one is not this form's to arm — the JSON view owns it. An
   empty parameter keeps the placeholder and the form states that the command
   cannot poll. On the add flow the parameter composes into the SAME single edit as
   the copy (`sources.<name>` and `sources.<name>.poll` overlap, and the shared

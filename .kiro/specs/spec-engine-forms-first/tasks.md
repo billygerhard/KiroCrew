@@ -88,6 +88,41 @@ sweep. The review gate runs between waves.
   add_profiles_form.py, sha-before.txt, commit-4.1.txt) per the shared-tmp
   rule. Every commit in this spec stages explicit paths, never `git add .`,
   so the stale-duplicate risk the review named does not arise in this flow.
+- **Accepted deviation (5.1, for 6.1's ledger):** the source form is
+  preset-plus-parameters, per the design's own decision row. Requirement 4.2's
+  clause reads "no freeform command or argument entry anywhere"; the repository
+  parameter is a shape-checked DATA field (one owner and one repo,
+  `[A-Za-z0-9._-]` halves joined by a single `/`, enforced on compose AND
+  acceptance) that fills only a preset's designated placeholder slot, never
+  `argv[0]`, so it is not freeform and cannot rewrite the argument around the
+  slot. 6.1 should consider amending R4.2's wording to name the parameter
+  explicitly; requirements outrank design and the current text predates the
+  round-1 review finding that byte-equality made R4.3/4.7 unreachable for
+  every functional source.
+- **Accepted deviation (5.1, for 6.1's ledger):** no rename control on the
+  source edit flow, though task 5.1's bullet lists `name` among the editable
+  fields. Renaming is a delete plus a whole-entry add, including fields the
+  form never shows; the JSON view owns it. Recorded in design.md's SourceForm
+  section; the name renders in the selector and every path line.
+- **Fixed post-review (5.1 round 3, orchestrator):** the round-2 reviewer's
+  major — the repository parameter accepted arbitrary text into executed argv
+  (gitlab's slot is a whole argument; github's endpoint/query rewritable via
+  `#?&/` while `slotValue` still called the result the preset's own) — closed
+  with `wellFormedRepository` enforced on both `pollForRepository` (compose)
+  and `slotValue` (acceptance), stated refusals on both repository controls
+  (typed text kept, stale staged poll withdrawn), the slotless-preset add
+  refusal (a typed repository is never silently dropped), the sentence-table
+  call-site indexing fixed to match its comment, and +5 named tests / +1
+  property (all three guards mutation-probed, restores SHA-verified).
+- **Recorded (5.1, for 6.1's sweep):** ConfigPanel.tsx's eslint a11y warning
+  count grew 7 → 19 across 5.1 (same accepted htmlFor/id label idiom the other
+  forms carry; label association verified by getByLabelText in tests). The
+  round-2 implementer's report had misstated these as all pre-existing.
+- **Residuals (5.1, accepted):** a poll hand-edited beyond its repository slot
+  (changed flag, extra argument, another program) is owned by the JSON view;
+  the not-expressible state offers removal but no other control. The source
+  suite's default `gh` fixture polls a NAMED repository (`GH_POLL_NAMED`) and
+  `fresh` holds the placeholder — later tasks assert against those.
 
 ## Tasks
 

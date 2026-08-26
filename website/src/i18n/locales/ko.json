@@ -4093,7 +4093,8 @@
         "unwritten_source_changes": "기록되지 않은 소스 변경",
         "watch_source_definitions": "감시 소스 정의",
         "write_the_change": "변경 기록",
-        "wrote_the_change_and_re_read_the_sources": "변경을 기록하고 소스를 다시 읽었습니다."
+        "wrote_the_change_and_re_read_the_sources": "변경을 기록하고 소스를 다시 읽었습니다.",
+        "that_is_not_a_repository_name": "이는 리포지토리 이름이 아니므로 스테이징되지 않습니다. 리포지토리는 소유자와 리포지토리 한 쌍으로, 영문자·숫자·마침표·대시·밑줄을 슬래시 하나로 이은 형태입니다."
       },
       "sourcesSection": {
         "a_confirm_writes_exactly_this_patch": "확인하면 문서 저장과 같은 보호된 경로로 이 패치가 그대로 기록되고, 기록은 로그에 남습니다.",
