@@ -90,10 +90,13 @@ function stubReads(answers: {
       ]
   stubSpecEngineFetch({
     config,
-    // The resolved read shares the document read's answer (this suite is not
-    // about resolution) but must not CONSUME a queued one: the queue exists to
-    // sequence reads of the document route, and a resolved fetch triggered by
-    // opening the configuration pane would otherwise silently advance it.
+    // The resolved read answers from the document queue's FIRST entry and
+    // deliberately never consumes the queue: the queue exists to sequence reads
+    // of the document route, and a resolved fetch triggered by opening the
+    // configuration pane would otherwise silently advance it. Pinned to the
+    // first answer rather than tracking the current head, because the stub
+    // copies the array it was handed — a suite that ever needs resolved to
+    // follow the head must pass its own responder rather than read config[0].
     resolved: () => config[0],
     ...(answers.killSwitch ? { killSwitch: answers.killSwitch } : {}),
     ...(answers.queue ? { queue: answers.queue } : {}),

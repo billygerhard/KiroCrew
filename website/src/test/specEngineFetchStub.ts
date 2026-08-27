@@ -289,8 +289,9 @@ function routeFor(path: string, method: string): RouteKey | null {
   if (rest.startsWith("/config/resolved")) return "resolved";
   if (rest.startsWith("/config/sources")) return "sources";
   // Last of the `/config` family on purpose: every branch above is prefixed by
-  // this one, so moving it up swallows all of them.
-  if (rest === "/config" || rest.startsWith("/config?")) {
+  // this one, so moving it up swallows all of them. An exact comparison is
+  // enough because `rest` already had its query stripped above.
+  if (rest === "/config") {
     return method === "PUT" ? "configWrite" : "config";
   }
 
@@ -299,7 +300,7 @@ function routeFor(path: string, method: string): RouteKey | null {
   }
   if (rest.startsWith("/run-spend")) return "runSpend";
   if (rest.startsWith("/queue/")) return "queueAction";
-  if (rest === "/queue" || rest.startsWith("/queue?")) return "queue";
+  if (rest === "/queue") return "queue";
   return null;
 }
 
