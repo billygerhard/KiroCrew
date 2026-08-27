@@ -329,6 +329,13 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in _REGISTRY}
 #: as top-level (and per-project, per-source) containers and nothing else.
 SETTING_GROUPS: frozenset[str] = frozenset(s.group for s in _REGISTRY)
 
+#: The same groups in registry declaration order, deduplicated. Separate from
+#: :data:`SETTING_GROUPS` because that is a frozenset and set iteration order is
+#: neither stable across processes nor meaningful: a surface grouping its rows by
+#: it would reorder them between two reads while nothing had changed. Anything
+#: that puts groups in front of a reader — or on a wire — orders them by this.
+SETTING_GROUP_ORDER: tuple[str, ...] = tuple(dict.fromkeys(s.group for s in _REGISTRY))
+
 
 def lookup(key: str) -> Setting | None:
     """Return the setting for a dotted *key*, or ``None`` when unknown."""

@@ -50,21 +50,37 @@ from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     AUTONOMY_LEVELS,
     CONFIG_FILENAME,
+    DELEGABLE_CAPABILITIES,
+    DELIVERY_STAGES,
+    ENGINE_FLOOR_CAPABILITIES,
+    GATE_POSITIONS,
+    GATE_SEVERITIES,
     LEAST_TRUSTED_CLASS,
+    PIPELINE_STAGE_ADVANCED,
+    PIPELINE_STAGES,
     PROFILE_SETTING_KEYS,
     ROLES,
+    SETTING_GROUP_ORDER,
     SETTINGS,
     SPEC_TYPES,
     SUBMITTER_CLASSES,
+    TRANSPORTS,
     WILDCARD_KEY,
     ConfigStore,
     ConfigWriteSurface,
     Scope,
+    capability_stage,
     default_root,
+    pipeline,
+    setting_group_stage,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
     COST_PROFILE_PRESET_NAMES,
     cost_profile_presets,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
+    WORKFLOW_PRESET_NAMES,
+    gate_presets,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.setup import CONFIRMED_LEVELS
 from kiro_crew.apps.builtins.spec_engine.engine.watch.sources import (
@@ -1497,6 +1513,152 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
                 assert assignment["model"], f"{preset['name']}.{role} arrived with no model"
 
     @pytest.mark.asyncio
+    async def test_each_extension_seam_vocabulary_is_the_owning_modules_tuple(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Order and membership against the owning tuples, never a copy written
+        here. Each of these is a closed set the write door enforces, so a form
+        offering a value from its own list would offer what the door refuses."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.body["transports"] == list(TRANSPORTS)
+        assert reply.body["delivery_stages"] == list(DELIVERY_STAGES)
+        assert reply.body["gate_positions"] == list(GATE_POSITIONS)
+        assert reply.body["gate_severities"] == list(GATE_SEVERITIES)
+        assert reply.body["capabilities"] == list(DELEGABLE_CAPABILITIES)
+        assert reply.body["workflow_presets"] == list(WORKFLOW_PRESET_NAMES)
+
+    @pytest.mark.asyncio
+    async def test_the_engine_floor_is_projected_apart_from_the_bindable_names(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The floor travels for the opposite reason to the rest of the
+        vocabulary: those names are what a surface must NOT offer a binding
+        control for. Naming one in ``capabilities`` is a refusal rather than an
+        ignored key, so a surface that could not tell the two lists apart would
+        leave the refusal to be discovered by provoking it."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.body["engine_floor"] == list(ENGINE_FLOOR_CAPABILITIES)
+        assert set(reply.body["engine_floor"]).isdisjoint(reply.body["capabilities"])
+
+    @pytest.mark.asyncio
+    async def test_each_gate_preset_carries_the_entry_a_copy_is_made_from(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Whole entries rather than names, for the reason the source and profile
+        presets carry theirs: a form adds a gate as a COPY of one, and a client
+        holding only names would have to invent the argv it claims to have
+        copied."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.body["gate_presets"] == gate_presets()
+        for preset in reply.body["gate_presets"]:
+            assert preset["position"] in reply.body["gate_positions"]
+            assert preset["severity"] in reply.body["gate_severities"]
+
+    @pytest.mark.asyncio
+    async def test_the_stages_partition_every_setting_group_and_capability(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Property 1 as the payload states it: nothing dropped, duplicated, or
+        invented. A group missing from every stage is a setting the write door
+        still enforces and no panel can reach; a group in two stages is a row an
+        operator can edit from two places with two staged values."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert [stage["id"] for stage in reply.body["stages"]] == list(PIPELINE_STAGES)
+        groups = [group for stage in reply.body["stages"] for group in stage["setting_groups"]]
+        capabilities = [name for stage in reply.body["stages"] for name in stage["capabilities"]]
+        assert sorted(groups) == sorted(set(groups)), f"a group reached two stages: {groups}"
+        assert sorted(groups) == sorted({setting.group for setting in SETTINGS.values()})
+        assert sorted(capabilities) == sorted(set(capabilities))
+        assert sorted(capabilities) == sorted(DELEGABLE_CAPABILITIES)
+        # Each placement is the engine's own answer, not a second derivation here.
+        for stage in reply.body["stages"]:
+            for group in stage["setting_groups"]:
+                assert setting_group_stage(group) == stage["id"]
+            for name in stage["capabilities"]:
+                assert capability_stage(name) == stage["id"]
+
+    @pytest.mark.asyncio
+    async def test_each_stage_orders_its_groups_by_the_setting_registry(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """``SETTING_GROUPS`` is a frozenset. A payload ordered by it would move a
+        stage's rows between two reads while nothing had changed, which is why the
+        order is taken from registry declaration order instead."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        for stage in reply.body["stages"]:
+            positions = [SETTING_GROUP_ORDER.index(group) for group in stage["setting_groups"]]
+            assert positions == sorted(positions), f"{stage['id']} reordered its groups"
+
+    @pytest.mark.asyncio
+    async def test_the_stage_ids_are_not_the_autonomy_ladder(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Three names appear in both vocabularies and mean different things: a
+        pipeline stage is where a knob applies, an autonomy level is how much
+        authority a run holds. Both travel in one payload, so the payload is where
+        the distinction is worth pinning."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        stage_ids = [stage["id"] for stage in reply.body["stages"]]
+        assert stage_ids != reply.body["levels"]
+        assert PIPELINE_STAGE_ADVANCED in stage_ids
+        assert PIPELINE_STAGE_ADVANCED not in reply.body["levels"]
+
+    @settings(
+        max_examples=40,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        invented_groups=st.lists(st.text(min_size=1, max_size=8), max_size=4, unique=True),
+        invented_capabilities=st.lists(st.text(min_size=1, max_size=8), max_size=4, unique=True),
+    )
+    def test_a_vocabulary_the_engine_grows_later_still_partitions_into_stages(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        invented_groups: list[str],
+        invented_capabilities: list[str],
+    ) -> None:
+        """The half of Property 1 that has to hold for a vocabulary this table has
+        never seen. A setting group or capability the engine adds without placing
+        it must still reach exactly one stage — the advanced one — because the
+        alternatives are a projection that raises (taking the whole vocabulary
+        read down over one unplaced name) and one that drops it (a control the
+        write door still enforces and no panel offers).
+
+        Composed directly rather than over HTTP: the claim is about the projection,
+        and the payload is assembled in memory with no request state in it.
+        """
+        assume(not set(invented_groups) & set(SETTING_GROUP_ORDER))
+        assume(not set(invented_capabilities) & set(DELEGABLE_CAPABILITIES))
+        monkeypatch.setattr(
+            pipeline,
+            "SETTING_GROUP_ORDER",
+            (*SETTING_GROUP_ORDER, *invented_groups),
+        )
+        monkeypatch.setattr(
+            pipeline,
+            "DELEGABLE_CAPABILITIES",
+            (*DELEGABLE_CAPABILITIES, *invented_capabilities),
+        )
+        stages = routes._registry_payload()["stages"]
+
+        placed_groups = [group for stage in stages for group in stage["setting_groups"]]
+        placed_names = [name for stage in stages for name in stage["capabilities"]]
+        assert sorted(placed_groups) == sorted(set(placed_groups))
+        assert sorted(placed_names) == sorted(set(placed_names))
+        assert set(placed_groups) == {*SETTING_GROUP_ORDER, *invented_groups}
+        assert set(placed_names) == {*DELEGABLE_CAPABILITIES, *invented_capabilities}
+        advanced = next(stage for stage in stages if stage["id"] == PIPELINE_STAGE_ADVANCED)
+        assert set(invented_groups) <= set(advanced["setting_groups"])
+        assert set(invented_capabilities) <= set(advanced["capabilities"])
+
+    @pytest.mark.asyncio
     async def test_the_read_opens_no_configuration_document(
         self, recorded_sel: RecordedSel, enabled: None, home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1526,6 +1688,33 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
             reply = await _get(client, f"{routes.PREFIX}/config/registry")
         assert reply.status == 200
         assert reads == [], f"the vocabulary read touched the config store: {reads}"
+        # Every projected key named, so a vocabulary added later has to be added
+        # here too — and is then shown to have been COMPOSED under the counting
+        # wrappers rather than merely to exist in some other read's payload.
+        projected = (
+            "settings",
+            "source_presets",
+            "profile_presets",
+            "profile_settings",
+            "roles",
+            "efforts",
+            "levels",
+            "transports",
+            "delivery_stages",
+            "gate_positions",
+            "gate_severities",
+            "capabilities",
+            "engine_floor",
+            "workflow_presets",
+            "gate_presets",
+            "stages",
+        )
+        assert sorted(reply.body) == sorted(projected), (
+            "the vocabulary read gained or lost a key; add it above so the "
+            "zero-document-read pin covers it too"
+        )
+        for key in projected:
+            assert reply.body[key], f"{key} arrived empty from a read that opened no document"
 
     @pytest.mark.asyncio
     async def test_an_unconfigured_home_still_answers_the_whole_vocabulary(
@@ -1541,6 +1730,14 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
         assert reply.body["settings"]
         assert reply.body["source_presets"]
         assert reply.body["profile_presets"]
+        # Including the extension seams: an operator whose document is empty is
+        # exactly the operator who has never bound a capability, defined a
+        # workflow, or added a gate, and the forms for those must still offer
+        # something.
+        assert reply.body["capabilities"] == list(DELEGABLE_CAPABILITIES)
+        assert reply.body["gate_presets"]
+        assert reply.body["workflow_presets"]
+        assert [stage["id"] for stage in reply.body["stages"]] == list(PIPELINE_STAGES)
 
     @pytest.mark.asyncio
     async def test_two_reads_return_the_identical_payload(

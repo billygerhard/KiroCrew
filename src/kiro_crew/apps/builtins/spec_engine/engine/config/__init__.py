@@ -38,6 +38,20 @@ from .agent_surface import (
     disk_lookup,
 )
 from .effective import EffectiveValue, ValueOrigin, resolve, resolve_all
+from .pipeline import (
+    CAPABILITY_STAGES,
+    PIPELINE_STAGE_ADVANCED,
+    PIPELINE_STAGE_AUTHORING,
+    PIPELINE_STAGE_DELIVERY,
+    PIPELINE_STAGE_EXECUTION,
+    PIPELINE_STAGE_INTAKE,
+    PIPELINE_STAGES,
+    SETTING_GROUP_STAGES,
+    capability_stage,
+    setting_group_stage,
+    stage_capabilities,
+    stage_setting_groups,
+)
 from .profiles import (
     COST_PROFILE_PRESET_NAMES,
     COST_PROFILE_PRESETS,
@@ -80,7 +94,15 @@ from .schema import (
     config_only_paths,
     validate_config_document,
 )
-from .settings import SETTINGS, Scope, Setting, default_of, lookup, settings_in_scope
+from .settings import (
+    SETTING_GROUP_ORDER,
+    SETTINGS,
+    Scope,
+    Setting,
+    default_of,
+    lookup,
+    settings_in_scope,
+)
 from .store import (
     APP_NAME,
     CONFIG_FILENAME,
@@ -108,6 +130,7 @@ __all__ = [
     "AUTO_INTEGRATE_SETTING",
     "AUTO_INTEGRATE_WITHOUT_VERIFY",
     "AUTONOMY_LEVELS",
+    "CAPABILITY_STAGES",
     "CONFIG_FILENAME",
     "CONFIG_ONLY_PATHS",
     "CONFIG_ACKNOWLEDGMENT_EVENT",
@@ -123,6 +146,12 @@ __all__ = [
     "GATE_SEVERITIES",
     "ITEM_LIFECYCLE_EVENTS",
     "LEAST_TRUSTED_CLASS",
+    "PIPELINE_STAGES",
+    "PIPELINE_STAGE_ADVANCED",
+    "PIPELINE_STAGE_AUTHORING",
+    "PIPELINE_STAGE_DELIVERY",
+    "PIPELINE_STAGE_EXECUTION",
+    "PIPELINE_STAGE_INTAKE",
     "PROFILE_SETTING_GROUPS",
     "PROFILE_SETTING_KEYS",
     "PROJECT_FIELDS",
@@ -136,6 +165,8 @@ __all__ = [
     "SECRET_KEY_SEGMENTS",
     "SECTIONS",
     "SETTINGS",
+    "SETTING_GROUP_ORDER",
+    "SETTING_GROUP_STAGES",
     "SETUP_ASSISTANT_SURFACE",
     "SOURCE_FIELDS",
     "SPEC_TYPES",
@@ -166,6 +197,7 @@ __all__ = [
     "WarningRecorder",
     "acknowledge",
     "agent_directories",
+    "capability_stage",
     "config_only_paths",
     "default_of",
     "default_root",
@@ -184,6 +216,9 @@ __all__ = [
     "resolve_all",
     "selected_profile",
     "selected_profile_name",
+    "setting_group_stage",
     "settings_in_scope",
+    "stage_capabilities",
+    "stage_setting_groups",
     "validate_config_document",
 ]

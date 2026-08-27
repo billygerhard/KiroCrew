@@ -38,10 +38,12 @@ and the rationale differs by route. The configuration reads are equivalence: the
 values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
 them here would buy nothing and diverge the two doors. The form-vocabulary read
-discloses less again: it projects the setting registry, the bundled source and
-cost-profile presets, and the role, effort, profile-pinnable-key and level
-vocabularies — data the app package itself ships, carrying no stored value at
-all, so it is strictly less than the
+discloses less again: it projects the setting registry, the bundled source, gate
+and cost-profile presets, the transport, delivery-stage, gate-position,
+gate-severity, capability, engine-floor, workflow-preset, role, effort,
+profile-pinnable-key and level vocabularies, and the pipeline-stage grouping
+those are presented under — data the app package itself ships, carrying no stored
+value at all, so it is strictly less than the
 document read the same token already reaches. The per-source autonomy
 grid joins them: it carries resolved autonomy levels and the configuration paths
 that declared them, which is a projection of a document the same agent can
@@ -137,13 +139,20 @@ from ..engine.config import (
     CONFIG_ONLY_PATHS,
     COST_PROFILE_PRESET_NAMES,
     DASHBOARD_SURFACE,
+    DELEGABLE_CAPABILITIES,
+    DELIVERY_STAGES,
     ELIDED,
+    ENGINE_FLOOR_CAPABILITIES,
+    GATE_POSITIONS,
+    GATE_SEVERITIES,
+    PIPELINE_STAGES,
     PROFILE_SETTING_KEYS,
     ROLES,
     SETTINGS,
     SETUP_ASSISTANT_SURFACE,
     SPEC_TYPES,
     SUBMITTER_CLASSES,
+    TRANSPORTS,
     ConfigLoadError,
     ConfigRecordError,
     ConfigStore,
@@ -154,10 +163,13 @@ from ..engine.config import (
     document_warnings,
     elide_secrets,
     resolve_all,
+    stage_capabilities,
+    stage_setting_groups,
     validate_config_document,
 )
 from ..engine.config.schema import SECTION_SOURCES
 from ..engine.config.settings import SCOPE_PRECEDENCE, Setting
+from ..engine.delivery import WORKFLOW_PRESET_NAMES, gate_presets
 from ..engine.roles import RolePlan
 from ..engine.watch.sources import (
     WATCH_SOURCE_PRESET_HOSTS,
@@ -730,6 +742,22 @@ def _registry_payload() -> dict[str, Any]:
     is not a :class:`Scope`, and effort is not a setting at all. A form offering
     either from a copy kept on its own side is a form that offers what the door
     then refuses.
+
+    ``transports``, ``delivery_stages``, ``gate_positions``, ``gate_severities``,
+    ``capabilities`` and ``engine_floor`` are the extension seams' vocabularies,
+    each one a closed set the write door already enforces. ``engine_floor`` is
+    projected for the opposite reason to the rest: those names are what a surface
+    must NOT offer a binding control for, and naming one in ``capabilities`` is a
+    refusal rather than an ignored key.
+
+    ``stages`` is the one composed entry. It carries the pipeline stages a surface
+    is organised around, each with the setting groups and delegable capabilities
+    it presents, so the stage a setting appears under is the engine's answer
+    rather than a list kept on the far side of the wire. Group order comes from
+    the setting registry's declaration order and never from ``SETTING_GROUPS``,
+    which is a frozenset. Read ``engine/config/pipeline.py`` before touching it:
+    a pipeline stage is a presentation grouping, and three of its five names also
+    appear in ``levels`` above, where they mean autonomy rungs instead.
     """
     return {
         "settings": [_setting_vocabulary(setting) for setting in SETTINGS.values()],
@@ -753,6 +781,45 @@ def _registry_payload() -> dict[str, Any]:
         "roles": list(ROLES),
         "efforts": list(EFFORT_LEVELS),
         "levels": list(AUTONOMY_LEVELS),
+        # The extension-seam vocabularies. Each is a closed set the WRITE DOOR
+        # enforces, so a form offering any of them from its own copy would offer
+        # what the door then refuses by path -- the same reason `roles` and
+        # `efforts` are projected rather than duplicated.
+        "transports": list(TRANSPORTS),
+        "delivery_stages": list(DELIVERY_STAGES),
+        "gate_positions": list(GATE_POSITIONS),
+        "gate_severities": list(GATE_SEVERITIES),
+        "capabilities": list(DELEGABLE_CAPABILITIES),
+        # Named so a surface can state which capabilities the engine always
+        # executes itself, and offer no control that would attempt to bind one:
+        # naming one in `capabilities` is a REFUSAL rather than an ignored key, so
+        # a surface that omitted them would leave the refusal to be discovered by
+        # provoking it.
+        "engine_floor": list(ENGINE_FLOOR_CAPABILITIES),
+        "workflow_presets": list(WORKFLOW_PRESET_NAMES),
+        # Gate presets travel as whole entries rather than names, for the reason
+        # the source and cost-profile presets do: a form adds a gate as a COPY of
+        # one, and a client holding only names would have to invent the argv it
+        # claims to have copied.
+        "gate_presets": gate_presets(),
+        # The pipeline stages a surface is organised around, each carrying the
+        # setting groups and capabilities it presents. Projected rather than held
+        # on the far side so a setting or capability the engine adds appears
+        # without an edit there, and so an UNMAPPED one lands in the advanced
+        # stage rather than vanishing from every stage at once.
+        #
+        # These are pipeline stages, NOT autonomy rungs: `PIPELINE_STAGES` shares
+        # three of its names with `AUTONOMY_LEVELS` above and answers a different
+        # question -- which part of the pipeline a knob governs, not how much
+        # authority a run holds. See `engine/config/pipeline.py`.
+        "stages": [
+            {
+                "id": stage,
+                "setting_groups": list(stage_setting_groups(stage)),
+                "capabilities": list(stage_capabilities(stage)),
+            }
+            for stage in PIPELINE_STAGES
+        ],
     }
 
 
