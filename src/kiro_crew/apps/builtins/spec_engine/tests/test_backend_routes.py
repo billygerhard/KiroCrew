@@ -31,6 +31,7 @@ import ast
 import asyncio
 import inspect
 import itertools
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,9 @@ from kiro_crew.apps.builtins.spec_engine.engine import local_analyzer
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
     AutonomyDecision,
     AutonomyLevel,
+)
+from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import (
+    DISPLAY_TRUNCATION_NOTICE,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     AUTONOMY_LEVELS,
@@ -1710,6 +1714,48 @@ class TestTheCapabilityReadJoinsEachBindingToItsReachability:
             "model-backed would claim a cost it does not incur"
         )
 
+    def test_the_snapshot_does_not_mutate_the_document_it_pinned(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pinned read is shared by every consumer, so none of them may write to it.
+
+        ``_PinnedStore.document`` hands the SAME dict to each consumer rather than
+        a fresh parse, which is what makes the join atomic — and also what would
+        let one mutating consumer corrupt every later read inside the same reply.
+        Every consumer on this path is read-only today; this fails the moment one
+        is added that is not, which the aliasing alone cannot report.
+
+        Observed through the store the SNAPSHOT builds, not one built here: the
+        snapshot constructs its own, so a store created in this test would be a
+        different object and could not witness a mutation inside the join.
+        """
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "capabilities": {"review": {"transport": "command", "command": ["true"]}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        witnessed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        real_pinned = routes._PinnedStore
+
+        class _Recording(real_pinned):  # type: ignore[valid-type,misc]
+            def __init__(self, store: ConfigStore) -> None:
+                super().__init__(store)
+                # The live object beside a copy of it as it was at pin time.
+                witnessed.append((self.document(), copy.deepcopy(self.document())))
+
+        monkeypatch.setattr(routes, "_PinnedStore", _Recording)
+        routes._capabilities_snapshot()
+        assert witnessed, "the snapshot pinned no document, so nothing was observed"
+        for live, at_pin_time in witnessed:
+            assert live == at_pin_time, (
+                "a consumer on the capability path mutated the pinned document; "
+                "with one shared read that corrupts every later read in the same reply"
+            )
+
 
 # --- the form vocabulary ------------------------------------------------------
 
@@ -3273,6 +3319,15 @@ class TestTheWorkflowReadRelaysWhatTheEngineResolved:
         assert [stage for stage, row in rows.items() if row["runs_at"] == routes.RUN_POINT_DELIVERY]
         assert reply.body["delivery_flow_stages"] == list(DELIVERY_FLOW_STAGES)
         assert routes.RUN_POINT_ARCHIVE not in reply.body["delivery_flow_stages"]
+        # Every declared stage must have an answer. `_STAGE_RUN_POINTS` projects ""
+        # for a stage it does not name, which renders as a blank run point — so a
+        # stage the engine adds to DELIVERY_STAGES alone would silently invite the
+        # very inference this field exists to remove. Fail loudly instead.
+        unmapped = [stage for stage, row in rows.items() if not row["runs_at"]]
+        assert not unmapped, (
+            f"these stages project no run point: {unmapped}. Add them to "
+            "_STAGE_RUN_POINTS rather than letting the client infer when they run"
+        )
 
     @pytest.mark.asyncio
     async def test_a_configured_gate_carries_its_position_severity_and_commands(
@@ -3407,7 +3462,16 @@ class TestTheWorkflowReadRelaysWhatTheEngineResolved:
         async with _client() as client:
             reply = await _get(client, f"{routes.PREFIX}/config/workflow")
         assert reply.status == 200, reply.body
-        assert len(reply.body["gates"][0]["name"]) < 400
+        name = reply.body["gates"][0]["name"]
+        # Against the cap the projection actually declares, not merely against the
+        # input width: `< 400` would have passed for any ceiling up to 399, which
+        # is every value except the one this test exists to pin. `sanitized` keeps
+        # `limit` characters and then appends its notice, so the notice is part of
+        # the expected width rather than an overrun of it.
+        assert name == "n" * routes.MAX_GATE_NAME_CHARS + DISPLAY_TRUNCATION_NOTICE, (
+            f"a hand-edited gate name must be capped at {routes.MAX_GATE_NAME_CHARS} "
+            f"characters and say it was truncated; got {len(name)} chars: {name!r}"
+        )
 
     def test_the_route_derives_no_precedence_of_its_own(self) -> None:
         """Structural, over the module's own source.
@@ -3627,6 +3691,60 @@ class TestConformanceIsAJobAndNotARequest:
             done = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
         assert done.body["status"] == "complete"
         assert done.body["report"]["capability"] == "analysis"
+
+    @pytest.mark.asyncio
+    async def test_a_builtin_binding_is_not_applicable_rather_than_never_checked(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The poll and the start must not disagree about whether there is work.
+
+        The POST refuses a builtin-bound capability with ``builtin_binding``. If the
+        GET called the same capability ``absent`` — "nobody has checked this yet" —
+        the two routes would describe one document two ways, and a panel would
+        offer a run the server then refuses.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+            refused = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+        assert reply.status == 200, reply.body
+        assert reply.body["status"] == routes.CONFORMANCE_NOT_APPLICABLE
+        assert reply.body["status"] != routes.CONFORMANCE_ABSENT
+        # Non-vacuous: the POST really does refuse this same capability, so the two
+        # answers are being compared against each other rather than asserted apart.
+        assert refused.status == 409, refused.body
+        assert refused.body["code"] == "builtin_binding"
+
+    @pytest.mark.asyncio
+    async def test_the_in_flight_task_is_held_by_a_strong_reference(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """A run nobody holds can be collected mid-flight.
+
+        ``asyncio`` keeps only a weak reference to a running task, so without the
+        module's own set a task can be garbage-collected while the job stays
+        recorded as ``running`` — leaving the poll route reporting a run that is
+        not happening, for the life of the gateway. The set is also what
+        ``_drain_conformance`` reads, so a refactor dropping the ``add()`` would
+        quietly turn that helper into a no-op and every other test in this class
+        would keep passing. Asserted directly for that reason.
+        """
+        _write_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            started = await _post(client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"})
+            # 202: the run was ACCEPTED, not completed. A job start that answered
+            # 200 would read as an outcome.
+            assert started.status == 202, started.body
+            assert routes._CONFORMANCE_TASKS, (
+                "the in-flight run is not in the module's task set, so nothing holds "
+                "a strong reference to it and it can be collected mid-run"
+            )
+            await _drain_conformance()
+        assert not routes._CONFORMANCE_TASKS, (
+            "a settled task was never discarded from the set, which leaks one entry "
+            "per run for the life of the gateway"
+        )
 
     @pytest.mark.asyncio
     async def test_the_run_happens_off_the_event_loop(

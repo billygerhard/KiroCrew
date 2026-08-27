@@ -871,8 +871,14 @@ async def handle_get_capabilities(request: web.Request) -> web.Response:
         # future sibling is not swallowed silently.
         return _refuse("capabilities_unreadable", str(exc), status=422)
     except ConfigValidationError as exc:
-        # The same condition reached through the config layer: a section that is
-        # not an object, or an entry naming a capability the engine does not have.
+        # The same condition reached through the config layer, and one more besides:
+        # a section that is not an object, an entry naming a capability the engine
+        # does not have, OR a stored SETTING the registry refuses to coerce —
+        # `describe` resolves each capability's deadline through
+        # `timeouts.capability_s`, so a document with an out-of-range value there
+        # answers unreadable even though its `capabilities` section is fine. The
+        # message names the offending path either way, so the reply stays
+        # actionable; what it does not do is claim the fault is in `capabilities`.
         # Must precede any ValueError arm -- ConfigValidationError derives it.
         return _refuse(
             "capabilities_unreadable",
@@ -1406,6 +1412,15 @@ CONFORMANCE_FAILED = "failed"
 #: No run has been started for this capability on this gateway.
 CONFORMANCE_ABSENT = "absent"
 
+#: The capability is bound to its builtin, so no run can be started for it.
+#:
+#: Its own status rather than ``absent`` for the same reason :data:`CONFORMANCE_FAILED`
+#: is not ``complete`` with an empty report: ``absent`` means "nobody has checked
+#: this yet", which invites an operator to start a run that the POST refuses with
+#: ``builtin_binding``. Two routes describing one document must not disagree about
+#: whether there is anything to do.
+CONFORMANCE_NOT_APPLICABLE = "not_applicable"
+
 
 @dataclass(frozen=True)
 class _ConformanceJob:
@@ -1692,18 +1707,27 @@ async def handle_get_conformance(request: web.Request) -> web.Response:
     because ``stale`` is the answer to "does this report still describe what is
     configured" and that answer changes when the document does, not when the run
     does.
+
+    A capability on its builtin with no run reports ``not_applicable`` rather than
+    ``absent``: the POST refuses that capability outright, and reporting "never
+    checked" would invite an operator to start a run they cannot start. A stored
+    report is still reported when one exists — rebinding to the builtin does not
+    delete the outcome of a run against the provider that was there before, it
+    only makes it ``stale``.
     """
     capability = request.match_info.get("capability", "")
     binding = await _binding_or_refusal(capability)
     if isinstance(binding, web.Response):
         return binding
-    return web.json_response(
-        _conformance_payload(
-            capability,
-            _CONFORMANCE_JOBS.get(capability),
-            current=_binding_fingerprint(binding),
-        )
+    job = _CONFORMANCE_JOBS.get(capability)
+    payload = _conformance_payload(
+        capability,
+        job,
+        current=_binding_fingerprint(binding),
     )
+    if job is None and binding.is_builtin:
+        payload["status"] = CONFORMANCE_NOT_APPLICABLE
+    return web.json_response(payload)
 
 
 # --- the setup assistant ----------------------------------------------------

@@ -207,6 +207,44 @@ function builtinCapabilityRow(
   };
 }
 
+/**
+ * One capability's conformance state, in the shape BOTH conformance routes return.
+ *
+ * The GET returns this object; the POST returns it with `ok: true` added. Kept as
+ * a builder for the same reason as {@link builtinCapabilityRow}: the shape is
+ * stated once, so a field the routes gain cannot be missing from one default and
+ * present in the other. Every one of the ten fields the routes emit is here —
+ * a default carrying a subset would be a shape no route returns, and a panel
+ * authored against it would render off fiction.
+ *
+ * `stale` is derived server-side and is never a client's own comparison: a client
+ * is not shown the binding's env, so any fingerprint it computed would digest
+ * something else.
+ */
+function conformanceState(
+  over: {
+    status?: "absent" | "not_applicable" | "running" | "complete" | "failed";
+    jobId?: string;
+    candidate?: string;
+    report?: unknown;
+  } = {},
+): Record<string, unknown> {
+  return {
+    capability: "review",
+    status: over.status ?? "absent",
+    job_id: over.jobId ?? "",
+    candidate: over.candidate ?? "",
+    binding_fingerprint: "",
+    binding_current: "",
+    stale: false,
+    // The server's per-invocation cap, not the binding's timeout_s. Present even
+    // with no run, because a panel must state the cost before offering to start.
+    deadline_s: 10,
+    error: "",
+    report: over.report ?? null,
+  };
+}
+
 const DEFAULTS: Record<RouteKey, Responder> = {
   // The configured shell, carrying a project ENTRY rather than a bare document:
   // first run is "no project entry", so `{}` here would put unrelated suites on
@@ -245,13 +283,15 @@ const DEFAULTS: Record<RouteKey, Responder> = {
       levels: ["authoring", "execution", "delivery", "integration"],
     },
   },
-  // The unconfigured answer the real route returns: one row for EVERY one of the
-  // seven delegable capabilities, each on its builtin. The route cannot return an
-  // empty list — `resolve_bindings` pre-seeds all seven — so an empty default
-  // would be a shape no route ever serves, and a suite rendering off it would be
-  // asserting against fiction. `reachable` is null on every row because a builtin
-  // is reachable by construction and the engine's check skips it; null here means
-  // "not applicable", NOT "unreachable". Only the analysis builtin carries a
+  // One row per delegable capability, each on its builtin — the shape the route
+  // returns when nothing has bound an external provider. `configured: true` beside
+  // unconfigured BINDINGS is a real combination, not a contradiction: it means a
+  // document exists on disk with no `capabilities` section. The route cannot
+  // return an empty list — `resolve_bindings` pre-seeds all seven — so an empty
+  // default would be a shape no route ever serves, and a suite rendering off it
+  // would be asserting against fiction. `reachable` is null on every row because a
+  // builtin is reachable by construction and the engine's check skips it; null
+  // means "not applicable", NOT "unreachable". Only the analysis builtin carries a
   // `version`. A suite that is about this pane passes its own fixture.
   capabilities: {
     body: {
@@ -352,10 +392,19 @@ const DEFAULTS: Record<RouteKey, Responder> = {
       gate_errors: [],
     },
   },
-  conformance: {
-    body: { status: "absent", binding_fingerprint: "", report: null },
+  // Both conformance routes answer the SAME ten-field shape — the GET directly,
+  // the POST with `ok: true` added — so both defaults are built from one builder.
+  // `absent` is the neutral state: no run has been started for this capability on
+  // this gateway. `deadline_s` is present and non-zero even with no run, because
+  // it is the cap the server will apply and a panel has to state it BEFORE
+  // starting a run.
+  conformance: { body: conformanceState() },
+  conformanceStart: {
+    body: {
+      ok: true,
+      ...conformanceState({ status: "running", jobId: "job-stub-0001", candidate: "/usr/bin/true" }),
+    },
   },
-  conformanceStart: { body: { ok: true, started: true } },
   killSwitch: {
     body: {
       switch: { engaged: false, unreadable: false },
