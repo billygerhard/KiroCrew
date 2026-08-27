@@ -43,7 +43,7 @@ const P = en.apps.specEngine.specEnginePage
 /** The engine's wildcard key, as it appears inside a declaring path. */
 const WILDCARD = 'default'
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, held, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -126,71 +126,34 @@ function stub(answers: {
   /** The write door's answer. Defaults to accepting the patch. */
   put?: Answer
 }) {
-  let reads = 0
-  let written = false
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (method === 'PUT') {
-        answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
-        written = (answer.status ?? 200) < 300
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The settings form is generated from this read, and it must be answered
-        // BEFORE the generic '/config' prefix below, which would otherwise hand it
-        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
-        // this suite is about the autonomy grid, and the generated form's own
-        // properties live in `SpecEngineSettingsForm.test.tsx`.
-        answer = {
-          body: {
-            settings: [],
-            source_presets: [],
-            profile_presets: [],
-            roles: [],
-            levels: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
-        reads += 1
-        answer =
-          (written ? answers.sourcesAfterPut : undefined) ??
-          (reads > 1 ? answers.sourcesAgain : undefined) ??
-          answers.sources ?? { body: sources() }
-      } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-        answer = {
-          body: {
-            configured: true,
-            project: null,
-            source: null,
-            settings: [],
-            roles: { profile: '', roles: {} },
-            role_order: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = { body: snapshot() }
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: {
-            switch: { engaged: false, unreadable: false },
-            stoppable: [],
-            stoppable_credits: 0,
-          },
-        }
-      } else {
-        answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+  const stubbed = stubSpecEngineFetch(
+    {
+      // Answered with an empty vocabulary: this suite is about the autonomy grid,
+      // and the generated form's own properties live in
+      // `SpecEngineSettingsForm.test.tsx`.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      sources: ({ read, written }) =>
+        (written ? answers.sourcesAfterPut : undefined) ??
+        (read > 1 ? answers.sourcesAgain : undefined) ??
+        answers.sources ?? { body: sources() },
+      resolved: {
+        body: {
+          configured: true,
+          project: null,
+          source: null,
+          settings: [],
+          roles: { profile: '', roles: {} },
+          role_order: [],
+        },
+      },
+      config: { body: snapshot() },
+      configWrite: answers.put ?? { body: { ok: true, document: {}, advisories: [] } },
+    },
+    { record: calls },
   )
-  return { reads: () => reads }
+  return { reads: () => stubbed.reads('sources') }
 }
 
 /** Render the page, switch to the configuration pane, and wait for the section.
@@ -450,45 +413,10 @@ describe('doubt about the read never renders as authority', () => {
   })
 
   it('says it is reading before the answer arrives', async () => {
-    let release: (() => void) | undefined
-    const held = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string) => {
-        if (url.startsWith('/api/apps/spec-engine/config/sources')) await held
-        const body = url.startsWith('/api/apps/spec-engine/config/sources')
-          ? sources()
-          : url.startsWith('/api/apps/spec-engine/config/registry')
-            ? {
-                settings: [],
-                source_presets: [],
-                profile_presets: [],
-                roles: [],
-                levels: [],
-              }
-            : url.startsWith('/api/apps/spec-engine/config/resolved')
-              ? {
-                  configured: true,
-                  project: null,
-                  source: null,
-                  settings: [],
-                  roles: { profile: '', roles: {} },
-                  role_order: [],
-                }
-              : url.startsWith('/api/apps/spec-engine/config')
-                ? snapshot()
-                : url.startsWith('/api/apps/spec-engine/kill-switch')
-                  ? {
-                      switch: { engaged: false, unreadable: false },
-                      stoppable: [],
-                      stoppable_credits: 0,
-                    }
-                  : { entries: [], grouped: {}, total: 0, total_credits: 0 }
-        return { ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) }
-      }),
-    )
+    // The pending read is observable only while it is unresolved, so the release
+    // is in the test's hands rather than a delay it would race against.
+    const { responder, release } = held({ body: sources() })
+    stubSpecEngineFetch({ sources: responder, config: { body: snapshot() } })
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false, refetchInterval: false } },
     })
@@ -503,7 +431,7 @@ describe('doubt about the read never renders as authority', () => {
     fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
     await screen.findByText(T.reading_the_watch_sources)
     expect(screen.queryByText(T.no_watch_source_is_configured)).toBeNull()
-    release?.()
+    release()
     await waitFor(() => expect(matrix()).toBeInTheDocument())
   })
 })

@@ -26,13 +26,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 const T = en.apps.specEngine.settingsForm
 const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 const G = C.group_labels
-
-type Answer = { status?: number; body: unknown }
 
 /** One registry setting, in `_registry_payload`'s shape. */
 function setting(key: string, over: Record<string, unknown> = {}) {
@@ -101,32 +100,12 @@ function snapshot() {
 }
 
 function stub(keys: string[], over: { registry?: Answer; resolved?: Answer } = {}) {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      let answer: Answer
-      if (method === 'PUT') answer = { body: { ok: true, document: {}, advisories: [] } }
-      else if (url.startsWith('/api/apps/spec-engine/config/registry'))
-        answer = over.registry ?? { body: registry(keys) }
-      else if (url.startsWith('/api/apps/spec-engine/config/resolved'))
-        answer = over.resolved ?? { body: resolved(keys) }
-      else if (url.startsWith('/api/apps/spec-engine/config/sources'))
-        answer = { body: { sources: [], submitter_classes: [], spec_types: [], levels: [] } }
-      else if (url.startsWith('/api/apps/spec-engine/config')) answer = { body: snapshot() }
-      else if (url.startsWith('/api/apps/spec-engine/kill-switch'))
-        answer = {
-          body: { switch: { engaged: false, unreadable: false }, stoppable: [], stoppable_credits: 0 },
-        }
-      else answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
-  )
+  stubSpecEngineFetch({
+    registry: over.registry ?? { body: registry(keys) },
+    resolved: over.resolved ?? { body: resolved(keys) },
+    sources: { body: { sources: [], submitter_classes: [], spec_types: [], levels: [] } },
+    config: { body: snapshot() },
+  })
 }
 
 /** Render the page, open the configuration pane, wait for the settings block. */

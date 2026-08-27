@@ -34,6 +34,7 @@ import { SE_CSS } from '../apps/spec-engine/styles'
 import { getBuiltinIcon } from '../apps/builtinIcons'
 import { getBuiltinComponent } from '../apps/builtinRegistry'
 import en from '../i18n/locales/en.json'
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 const T = en.apps.specEngine.specEnginePage
 
@@ -59,8 +60,6 @@ function entry(over: Partial<Record<string, unknown>> = {}) {
     ...over,
   }
 }
-
-type Answer = { status?: number; body: unknown }
 
 /**
  * Answer each of the shell's three reads independently.
@@ -89,47 +88,16 @@ function stubReads(answers: {
           body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
         },
       ]
-  const pick = (url: string): Answer => {
-    if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-      // The configuration pane's settings form is generated from this read. It is
-      // answered BEFORE the generic '/config' prefix below, which would otherwise
-      // hand it a ConfigSnapshot and crash its render, and it must not CONSUME a
-      // queued answer for the same reason the resolved read must not.
-      return {
-        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
-      }
-    }
-    if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-      // The resolved read shares the document read's answer (this suite is not
-      // about resolution) but must not CONSUME a queued one: the queue exists to
-      // sequence reads of the document route, and a resolved fetch triggered by
-      // opening the configuration pane would otherwise silently advance it.
-      return config[0]
-    }
-    if (url.startsWith('/api/apps/spec-engine/config')) {
-      return config.length > 1 ? config.shift()! : config[0]
-    }
-    if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-      return (
-        answers.killSwitch ?? {
-          body: { switch: { engaged: false, unreadable: false }, stoppable: [], stoppable_credits: 0 },
-        }
-      )
-    }
-    return answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-  }
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string) => {
-      const answer = pick(url)
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
-  )
+  stubSpecEngineFetch({
+    config,
+    // The resolved read shares the document read's answer (this suite is not
+    // about resolution) but must not CONSUME a queued one: the queue exists to
+    // sequence reads of the document route, and a resolved fetch triggered by
+    // opening the configuration pane would otherwise silently advance it.
+    resolved: () => config[0],
+    ...(answers.killSwitch ? { killSwitch: answers.killSwitch } : {}),
+    ...(answers.queue ? { queue: answers.queue } : {}),
+  })
 }
 
 /** The client the last render used, so a test can force a refetch of one read. */

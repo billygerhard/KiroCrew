@@ -43,7 +43,7 @@ import en from '../i18n/locales/en.json'
 const T = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -84,79 +84,42 @@ function stub(answers: {
   configAgain?: Answer
   put?: Answer
 }) {
-  let reads = 0
-  let written = false
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (method === 'PUT') {
-        answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
-        written = (answer.status ?? 200) < 300
-      } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-        answer = {
-          body: {
-            configured: true,
-            project: null,
-            source: null,
-            settings: [],
-            roles: { profile: '', roles: {} },
-            role_order: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The settings form is generated from this read, and it must be answered
-        // BEFORE the generic '/config' prefix below, which would otherwise hand it
-        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
-        // this suite is about which surface leads, and the generated form's own
-        // properties live in `SpecEngineSettingsForm.test.tsx`.
-        answer = {
-          body: {
-            settings: [],
-            source_presets: [],
-            profile_presets: [],
-            roles: [],
-            levels: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
-        // No source at all: the grid's own properties are asserted in
-        // `SpecEngineSources.test.tsx`, and a fixture here would be a second place
-        // the payload shape is spelled.
-        answer = {
-          body: {
-            sources: [],
-            submitter_classes: ['maintainer', 'external'],
-            spec_types: ['feature', 'bugfix'],
-            levels: ['authoring', 'execution', 'delivery', 'integration'],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        reads += 1
-        answer =
-          (written ? answers.configAfterPut : undefined) ??
-          (reads > 1 ? answers.configAgain : undefined) ??
-          answers.config ?? { body: snapshot(document()) }
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: {
-            switch: { engaged: false, unreadable: false },
-            stoppable: [],
-            stoppable_credits: 0,
-          },
-        }
-      } else {
-        answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+  stubSpecEngineFetch(
+    {
+      resolved: {
+        body: {
+          configured: true,
+          project: null,
+          source: null,
+          settings: [],
+          roles: { profile: '', roles: {} },
+          role_order: [],
+        },
+      },
+      // Answered with an empty vocabulary: this suite is about which surface
+      // leads, and the generated form's own properties live in
+      // `SpecEngineSettingsForm.test.tsx`.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      // No source at all: the grid's own properties are asserted in
+      // `SpecEngineSources.test.tsx`, and a fixture here would be a second place
+      // the payload shape is spelled.
+      sources: {
+        body: {
+          sources: [],
+          submitter_classes: ['maintainer', 'external'],
+          spec_types: ['feature', 'bugfix'],
+          levels: ['authoring', 'execution', 'delivery', 'integration'],
+        },
+      },
+      config: ({ read, written }) =>
+        (written ? answers.configAfterPut : undefined) ??
+        (read > 1 ? answers.configAgain : undefined) ??
+        answers.config ?? { body: snapshot(document()) },
+      configWrite: answers.put ?? { body: { ok: true, document: {}, advisories: [] } },
+    },
+    { record: calls },
   )
 }
 

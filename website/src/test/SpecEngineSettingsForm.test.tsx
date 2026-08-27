@@ -55,7 +55,7 @@ const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -214,44 +214,17 @@ function stub(answers: {
   sources?: Answer
   put?: Answer
 }) {
-  let written = false
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (method === 'PUT') {
-        answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
-        written = (answer.status ?? 200) < 300
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        answer = answers.registry ?? { body: registry() }
-      } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-        answer =
-          (written ? answers.resolvedAfterPut : undefined) ??
-          answers.resolved ?? { body: resolved() }
-      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
-        answer = answers.sources ?? { body: sources() }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = { body: snapshot(stored()) }
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: {
-            switch: { engaged: false, unreadable: false },
-            stoppable: [],
-            stoppable_credits: 0,
-          },
-        }
-      } else {
-        answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+  stubSpecEngineFetch(
+    {
+      registry: answers.registry ?? { body: registry() },
+      resolved: ({ written }) =>
+        (written ? answers.resolvedAfterPut : undefined) ??
+        answers.resolved ?? { body: resolved() },
+      sources: answers.sources ?? { body: sources() },
+      config: { body: snapshot(stored()) },
+      configWrite: answers.put ?? { body: { ok: true, document: {}, advisories: [] } },
+    },
+    { record: calls },
   )
 }
 

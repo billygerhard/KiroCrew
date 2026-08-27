@@ -66,7 +66,7 @@ const P = en.apps.specEngine.specEnginePage
  */
 const ELIDED = '<elided>'
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -177,71 +177,46 @@ function stub(answers: {
   resolvedAgain?: Record<string, Answer>
   put?: Answer
 }) {
-  let written = false
   const reads = new Map<string, number>()
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (method === 'PUT') {
-        answer = answers.put ?? { body: { ok: true, document: {}, advisories: [] } }
-        written = (answer.status ?? 200) < 300
-      } else if (url.startsWith('/api/apps/spec-engine/config/resolved')) {
-        const project = new URL(url, 'http://gateway.invalid').searchParams.get('project') ?? ''
+  stubSpecEngineFetch(
+    {
+      // Keyed by the `project` parameter and counted PER project: the state worth
+      // scripting is one project's refetch failing while another's stays healthy,
+      // which a single per-route counter cannot express.
+      resolved: ({ params }) => {
+        const project = params.get('project') ?? ''
         const seen = (reads.get(project) ?? 0) + 1
         reads.set(project, seen)
-        answer =
+        return (
           (seen > 1 ? answers.resolvedAgain?.[project] : undefined) ??
           answers.resolvedFor?.[project] ??
           answers.resolved ?? { body: resolved() }
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The settings form is generated from this read, and it must be answered
-        // BEFORE the generic '/config' prefix below, which would otherwise hand it
-        // a ConfigSnapshot and crash its render. Answered with an empty vocabulary:
-        // these tests are about the document and its resolution, and the generated
-        // form's own properties live in `SpecEngineSettingsForm.test.tsx`.
-        answer = {
-          body: {
-            settings: [],
-            source_presets: [],
-            profile_presets: [],
-            roles: [],
-            levels: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
-        // The pane's sources section reads this route. Answered with no source at
-        // all, because these tests are about the document and its resolution: the
-        // grid's own properties are asserted in `SpecEngineSources.test.tsx`, and a
-        // fixture here would be a second place the payload shape is spelled.
-        answer = {
-          body: {
-            sources: [],
-            submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
-            spec_types: ['feature', 'bugfix', 'quick'],
-            levels: ['authoring', 'execution', 'delivery', 'integration'],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer =
-          (written ? answers.configAfterPut : undefined) ??
-          answers.config ?? { body: snapshot(document()) }
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: { switch: { engaged: false, unreadable: false }, stoppable: [], stoppable_credits: 0 },
-        }
-      } else {
-        answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+        )
+      },
+      // Answered with an empty vocabulary: these tests are about the document and
+      // its resolution, and the generated form's own properties live in
+      // `SpecEngineSettingsForm.test.tsx`.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      // No source at all, because these tests are about the document and its
+      // resolution: the grid's own properties are asserted in
+      // `SpecEngineSources.test.tsx`, and a fixture here would be a second place
+      // the payload shape is spelled.
+      sources: {
+        body: {
+          sources: [],
+          submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
+          spec_types: ['feature', 'bugfix', 'quick'],
+          levels: ['authoring', 'execution', 'delivery', 'integration'],
+        },
+      },
+      config: ({ written }) =>
+        (written ? answers.configAfterPut : undefined) ??
+        answers.config ?? { body: snapshot(document()) },
+      configWrite: answers.put ?? { body: { ok: true, document: {}, advisories: [] } },
+    },
+    { record: calls },
   )
 }
 

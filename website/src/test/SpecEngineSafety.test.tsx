@@ -38,7 +38,7 @@ import en from '../i18n/locales/en.json'
 const T = en.apps.specEngine.safetyPanel
 const P = en.apps.specEngine.specEnginePage
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, PENDING, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read what was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -107,8 +107,6 @@ function spend(over: Record<string, unknown> = {}) {
   }
 }
 
-const NEVER: Answer = { body: '__never__' }
-
 /**
  * Answer each route independently.
  *
@@ -124,45 +122,26 @@ function stub(answers: {
   post?: Answer
   runSpend?: Record<string, Answer>
 }) {
-  const killSwitch = [...(answers.killSwitch ?? [{ body: snapshot() }])]
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer =
-          method === 'POST'
-            ? (answers.post ?? { body: { ok: true, action: 'engage', switch: switchState() } })
-            : (killSwitch.length > 1 ? killSwitch.shift()! : killSwitch[0])
-      } else if (url.startsWith('/api/apps/spec-engine/run-spend')) {
-        const runId = new URL(url, 'http://x').searchParams.get('run_id') ?? ''
-        answer = answers.runSpend?.[runId] ?? { body: spend({ run_id: runId }) }
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The configuration pane's settings form is generated from this read, and
-        // it must be answered BEFORE the generic '/config' prefix below, which
-        // would otherwise hand it a ConfigSnapshot and crash its render.
-        answer = {
-          body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = answers.config ?? {
-          body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
-        }
-      } else {
-        answer = answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      // A read that never settles is how the PENDING state is exercised: it is a
-      // real state of the surface, and it is the one that used to render zeros.
-      if (answer === NEVER) return new Promise(() => {})
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+  stubSpecEngineFetch(
+    {
+      killSwitch: answers.killSwitch ?? [{ body: snapshot() }],
+      killSwitchSet: answers.post ?? {
+        body: { ok: true, action: 'engage', switch: switchState() },
+      },
+      runSpend: ({ params }) => {
+        const runId = params.get('run_id') ?? ''
+        return answers.runSpend?.[runId] ?? { body: spend({ run_id: runId }) }
+      },
+      // Answered with an empty vocabulary: this suite is about the safety strip.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      config: answers.config ?? {
+        body: { configured: true, document: { projects: { acme: {} } }, elided: [] },
+      },
+      queue: answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } },
+    },
+    { record: calls },
   )
 }
 
@@ -233,7 +212,7 @@ describe('the indicator', () => {
   })
 
   it('does not show a released dot before the first read lands', async () => {
-    stub({ killSwitch: [NEVER] })
+    stub({ killSwitch: [PENDING] })
     const { container } = renderPage()
     await screen.findByText(P.reading_the_kill_switch)
     expect(dot(container)).toHaveAttribute('data-state', 'unknown')
@@ -253,7 +232,7 @@ describe('the indicator', () => {
 
 describe('the strip while its reads are pending', () => {
   it('does not render zero for a spend it has not read', async () => {
-    stub({ queue: NEVER })
+    stub({ queue: PENDING })
     const { container } = renderPage()
     const strip = await waitFor(() => {
       const found = container.querySelector('.se-status')
@@ -270,7 +249,7 @@ describe('the strip while its reads are pending', () => {
   it('holds the work area until the configuration read decides the pane', async () => {
     // Without this branch an unconfigured engine flashed the run list before
     // switching to setup, because `null` fell through to the queue pane.
-    stub({ config: NEVER })
+    stub({ config: PENDING })
     const { container } = renderPage()
     await screen.findByText(P.reading_the_configuration)
     expect(container.querySelector('[data-pane-pending="true"]')).not.toBeNull()
@@ -306,7 +285,7 @@ describe('what the control offers', () => {
     // The engage stays offered even here, because a pending read is doubt and
     // stopping is what doubt licenses. Re-reading a read that has not finished is
     // not, so that control waits for the first one to settle.
-    stub({ killSwitch: [NEVER] })
+    stub({ killSwitch: [PENDING] })
     renderPage()
     await screen.findByText(P.reading_the_kill_switch)
     expect(screen.getByRole('button', { name: T.engage_the_kill_switch })).toBeInTheDocument()

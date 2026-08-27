@@ -87,7 +87,7 @@ function emptyReport() {
   }
 }
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -97,67 +97,40 @@ const calls: Array<{ url: string; method: string; body: unknown }> = []
  * replies so a wired action can be observed refusing and then succeeding.
  */
 function stub(answers: { queue?: Answer; post?: Record<string, Answer> }) {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({
-        url,
-        method,
-        body: init?.body ? JSON.parse(String(init.body)) : undefined,
-      })
-      let answer: Answer
-      if (method === 'POST') {
+  stubSpecEngineFetch(
+    {
+      queueAction: ({ url }) => {
         const path = url.replace('/api/apps/spec-engine/queue/', '')
-        answer = answers.post?.[path] ?? { body: { ok: true } }
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The configuration pane's settings form is generated from this read, and
-        // it must be answered BEFORE the generic '/config' prefix below, which
-        // would otherwise hand it a ConfigSnapshot and crash its render.
-        answer = {
-          body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        answer = { body: { configured: true, document: { projects: { acme: {} } }, elided: [] } }
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: {
-            switch: { engaged: false, unreadable: false },
-            stoppable: [],
-            stoppable_credits: 0,
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/run-spend')) {
-        // The inspector's spend block reads this per selected run. Answered with a
-        // real shape rather than left to fall through to the queue reply, so a
-        // panel assertion here is never reading a spend rendered from the wrong
-        // payload.
-        answer = {
-          body: {
-            run_id: 'run_8f2a41',
-            project: '/home/me/src/checkout-svc',
-            spec: 'idempotent-refunds',
-            state: 'awaiting_review',
-            source: '',
-            credits: 163.2,
-            metered_credits: 163.2,
-            declared_credits: 0,
-            turns: 41,
-            sessions: 3,
-            recorded_credits: 163.2,
-            ceiling: { value: 600, origin: 'app_config', declared_at: 'budget.run_ceiling_credits' },
-          },
-        }
-      } else {
-        answer = answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+        return answers.post?.[path] ?? { body: { ok: true } }
+      },
+      // Answered with an empty vocabulary: this suite is about the queue.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      config: { body: { configured: true, document: { projects: { acme: {} } }, elided: [] } },
+      // The inspector's spend block reads this per selected run. Answered with a
+      // real shape rather than left to fall through to the queue reply, so a
+      // panel assertion here is never reading a spend rendered from the wrong
+      // payload.
+      runSpend: {
+        body: {
+          run_id: 'run_8f2a41',
+          project: '/home/me/src/checkout-svc',
+          spec: 'idempotent-refunds',
+          state: 'awaiting_review',
+          source: '',
+          credits: 163.2,
+          metered_credits: 163.2,
+          declared_credits: 0,
+          turns: 41,
+          sessions: 3,
+          recorded_credits: 163.2,
+          ceiling: { value: 600, origin: 'app_config', declared_at: 'budget.run_ceiling_credits' },
+        },
+      },
+      queue: answers.queue ?? { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } },
+    },
+    { record: calls },
   )
 }
 

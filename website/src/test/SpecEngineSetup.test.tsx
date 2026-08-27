@@ -93,7 +93,7 @@ function forProject(sentence: string, project: string): string {
   return sentence.split('{{project}}').join(project)
 }
 
-type Answer = { status?: number; body: unknown }
+import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -202,70 +202,34 @@ function stub(answers: {
   /** A function is answered per request, so a read can change after a write. */
   config?: Answer | (() => Answer)
 }) {
-  vi.stubGlobal(
-    'fetch',
-    vi.fn((url: string, init?: RequestInit) => {
-      const method = init?.method ?? 'GET'
-      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined })
-      let answer: Answer
-      if (url.endsWith('/setup/inspect')) {
-        answer = answers.inspect ?? { body: inspection() }
-      } else if (url.endsWith('/setup/plan')) {
-        answer = answers.plan ?? { body: envelope() }
-      } else if (url.endsWith('/setup/apply')) {
-        answer = answers.apply ?? { body: applied() }
-      } else if (url.startsWith('/api/apps/spec-engine/config/registry')) {
-        // The configuration pane's settings form is generated from this read, and
-        // it must be answered BEFORE the generic '/config' prefix below, which
-        // would otherwise hand it a ConfigSnapshot and crash its render. Answered
-        // with an empty vocabulary — this suite is about the setup flow.
-        answer = {
-          body: {
-            settings: [],
-            source_presets: [],
-            profile_presets: [],
-            roles: [],
-            levels: [],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config/sources')) {
-        // The config pane's sources section reads this route, and it must be
-        // answered BEFORE the generic '/config' prefix below: the prefix match
-        // would hand the section a ConfigSnapshot body, which crashes its render.
-        // Answered with no source at all — these tests are about the setup flow,
-        // and the grid's own properties live in `SpecEngineSources.test.tsx`.
-        answer = {
-          body: {
-            sources: [],
-            submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
-            spec_types: ['feature', 'bugfix', 'quick'],
-            levels: ['authoring', 'execution', 'delivery', 'integration'],
-          },
-        }
-      } else if (url.startsWith('/api/apps/spec-engine/config')) {
-        // Unconfigured, which is what routes the page to the assistant. A caller
-        // that cares about the CONFIGURED state passes its own answer: first run is
-        // "no project entry", so a document carrying one is the other state.
+  stubSpecEngineFetch(
+    {
+      setupInspect: answers.inspect ?? { body: inspection() },
+      setupPlan: answers.plan ?? { body: envelope() },
+      setupApply: answers.apply ?? { body: applied() },
+      // Answered with an empty vocabulary — this suite is about the setup flow.
+      registry: {
+        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+      },
+      // Answered with no source at all — these tests are about the setup flow, and
+      // the grid's own properties live in `SpecEngineSources.test.tsx`.
+      sources: {
+        body: {
+          sources: [],
+          submitter_classes: ['maintainer', 'member', 'contributor', 'external'],
+          spec_types: ['feature', 'bugfix', 'quick'],
+          levels: ['authoring', 'execution', 'delivery', 'integration'],
+        },
+      },
+      // Unconfigured, which is what routes the page to the assistant. A caller
+      // that cares about the CONFIGURED state passes its own answer: first run is
+      // "no project entry", so a document carrying one is the other state.
+      config: () => {
         const given = typeof answers.config === 'function' ? answers.config() : answers.config
-        answer = given ?? UNCONFIGURED
-      } else if (url.startsWith('/api/apps/spec-engine/kill-switch')) {
-        answer = {
-          body: {
-            switch: { engaged: false, unreadable: false },
-            stoppable: [],
-            stoppable_credits: 0,
-          },
-        }
-      } else {
-        answer = { body: { entries: [], grouped: {}, total: 0, total_credits: 0 } }
-      }
-      const status = answer.status ?? 200
-      return Promise.resolve({
-        ok: status >= 200 && status < 300,
-        status,
-        text: () => Promise.resolve(JSON.stringify(answer.body)),
-      })
-    }),
+        return given ?? UNCONFIGURED
+      },
+    },
+    { record: calls },
   )
 }
 
