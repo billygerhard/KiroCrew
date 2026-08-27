@@ -120,6 +120,20 @@ DEFAULT_DEADLINE_S = 10
 #: as a provider defect.
 DEFAULT_GRACE_S = 2.0
 
+#: Characters kept from one schema violation on its way into a check detail.
+#:
+#: A violation is addressed by its PATH inside the response, and a closed object
+#: reports an unrecognised key by naming it -- so the path is composed from the
+#: provider's own key names, and a free-form ``StrMap`` value nests further ones
+#: under it. Those names are whatever a provider sent: arbitrarily long, and able
+#: to carry a carriage return that overwrites the line printed before it in
+#: whatever is reading the report. A detail is printed, logged, and pasted into an
+#: issue, so the tokens go through :func:`~.contracts.sanitized` and the length
+#: is bounded here rather than by the provider. Wider than the 64 used for a
+#: single coverage token, because this string also carries the engine's own
+#: sentence about what was wrong.
+SCHEMA_VIOLATION_CHARS = 120
+
 #: Separator a provider may use to namespace a coverage token. A provider that
 #: declares a document skipped names the artifact kind, optionally prefixed --
 #: ``requirements`` and ``document:requirements`` both name the requirements
@@ -207,6 +221,10 @@ class CheckResult:
             "fixture": self.fixture,
             "passed": self.passed,
             "detail": self.detail,
+            # Travels because a surface cannot re-derive it: a check that passed
+            # by accepting a declared skip and one that passed by finding the
+            # defect are the same boolean, and only this number tells them apart.
+            "excused": self.excused,
         }
 
 
@@ -308,6 +326,11 @@ class ConformanceReport:
             "declared_checks": list(self.declared_checks),
             "results": [result.to_json_object() for result in self.results],
             "gaps": list(self.gaps),
+            # The qualifier :meth:`summary` puts in the verdict line, carried as a
+            # number so a surface can render it too. Without it a reader of the
+            # JSON sees ``passed`` true and every check passing, which is an
+            # unqualified pass about a candidate that may have examined nothing.
+            "declined_detections": self.declined_detections,
         }
 
 
@@ -542,7 +565,15 @@ class ConformanceRunner:
                 True,
                 "the response satisfies the published response schema",
             )
-        shown = "; ".join(str(error) for error in errors[:3])
+        shown = "; ".join(
+            # Sanitized, because a violation's path is built from the provider's
+            # own key names -- the one provider-derived token in this module that
+            # reached a detail verbatim, while the coverage tokens beside it did
+            # not. Per error rather than over the joined string, so one enormous
+            # key cannot consume the whole budget and hide the other two reasons.
+            sanitized(str(error), limit=SCHEMA_VIOLATION_CHARS)
+            for error in errors[:3]
+        )
         more = "" if len(errors) <= 3 else f" (and {len(errors) - 3} more)"
         return CheckResult(
             CHECK_SCHEMA_VALIDITY,

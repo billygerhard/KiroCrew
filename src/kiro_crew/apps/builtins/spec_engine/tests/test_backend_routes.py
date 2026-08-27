@@ -79,7 +79,9 @@ from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
     cost_profile_presets,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
+    DELIVERY_FLOW_STAGES,
     WORKFLOW_PRESET_NAMES,
+    WORKFLOW_PRESETS,
     gate_presets,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.setup import CONFIRMED_LEVELS
@@ -150,6 +152,7 @@ def test_the_derived_blocking_set_still_sees_the_known_helpers() -> None:
         "_queue_snapshot",
         "_release_feedback",
         "_resolved_snapshot",
+        "_workflow_snapshot",
         "_sources_snapshot",
         "_inspect_setup",
         "_plan_envelope",
@@ -268,6 +271,20 @@ MUTATING = tuple(sorted((method, path) for method, path, _ in TABLE if method !=
 #: The read half.
 READS = tuple(sorted((method, path) for method, path, _ in TABLE if method == "GET"))
 
+#: A concrete value per dynamic path segment the table carries. A registered path
+#: is a TEMPLATE, and a template is not requestable: driven literally, aiohttp's
+#: dynamic pattern excludes braces, so the request 404s and the parametrized
+#: 401/403 tests would assert against a routing miss instead of against the gate.
+PATH_VARIABLES: dict[str, str] = {"capability": "analysis"}
+
+
+def _requestable(path: str) -> str:
+    """*path* with each dynamic segment replaced by a value that resolves."""
+    for name, value in PATH_VARIABLES.items():
+        path = path.replace("{" + name + "}", value)
+    return path
+
+
 #: What each mutating route needs in its body to get PAST parsing. The guard runs
 #: before the body is read, so these matter only for tests that must reach a
 #: handler — but an entry per mutating path also means a route added without one
@@ -288,6 +305,9 @@ MUTATING_BODIES: dict[tuple[str, str], dict[str, Any]] = {
     },
     ("POST", f"{routes.PREFIX}/queue/clean-workspace"): {"workspace_id": 1},
     ("POST", f"{routes.PREFIX}/queue/teardown"): {"run_id": "run-1"},
+    # Conformance starts a job that spawns the operator-configured program, so it
+    # is driven here like any other mutating route.
+    ("POST", f"{routes.PREFIX}/config/conformance"): {"capability": "analysis"},
     # The setup flow. Its two read-only steps are guarded because the project path
     # is the CALLER's, so they are driven here like any other mutating route.
     ("POST", f"{routes.PREFIX}/setup/inspect"): {"project": "/tmp/project"},
@@ -442,7 +462,9 @@ class TestAnAppTokenIsRefusedOnEveryMutatingRoute:
         home: Path,
     ) -> None:
         async with _client(user="spec-engine", app="spec-engine") as client:
-            reply = await _request(client, method, path, MUTATING_BODIES[(method, path)])
+            reply = await _request(
+                client, method, _requestable(path), MUTATING_BODIES[(method, path)]
+            )
         assert reply.status == 403
         assert reply.code == "dashboard_user_required"
 
@@ -471,7 +493,7 @@ class TestAnAppTokenIsRefusedOnEveryMutatingRoute:
             f"undriven={sorted(set(MUTATING) - set(MUTATING_BODIES))} "
             f"stale={sorted(set(MUTATING_BODIES) - set(MUTATING))}"
         )
-        assert len(MUTATING) == 9, (
+        assert len(MUTATING) == 10, (
             "the mutating surface changed size; re-read the guard's reasoning in "
             "routes.py before accepting it"
         )
@@ -519,7 +541,7 @@ class TestAnAppTokenIsRefusedOnEveryMutatingRoute:
         isolated home yields — never the guard's 403, and never a denial event.
         """
         async with _client(user="spec-engine", app="spec-engine") as client:
-            reply = await _request(client, method, path)
+            reply = await _request(client, method, _requestable(path))
         assert reply.status != 403
         assert recorded_sel.denials() == []
 
@@ -538,7 +560,7 @@ class TestTheGuardCannotBeReachedAround:
         """
         from kiro_crew.dashboard.token_auth import app_token_path_allowed
 
-        assert app_token_path_allowed("spec-engine", path) is True, (
+        assert app_token_path_allowed("spec-engine", _requestable(path)) is True, (
             "the token layer no longer grants this app its own namespace; "
             "re-derive the guard's reasoning in routes.py before relaxing it"
         )
@@ -557,7 +579,9 @@ class TestTheOtherTwoRefusals:
         self, method: str, path: str, recorded_sel: RecordedSel, enabled: None, home: Path
     ) -> None:
         async with _client(user=None) as client:
-            reply = await _request(client, method, path, MUTATING_BODIES.get((method, path)))
+            reply = await _request(
+                client, method, _requestable(path), MUTATING_BODIES.get((method, path))
+            )
         assert reply.status == 401
         assert reply.code == "unauthorized"
 
@@ -574,7 +598,9 @@ class TestTheOtherTwoRefusals:
         """Deny-by-default for an opt-in app, ahead of both other gates."""
         monkeypatch.setattr(routes, "is_app_enabled", lambda name: False)
         async with _client() as client:
-            reply = await _request(client, method, path, MUTATING_BODIES.get((method, path)))
+            reply = await _request(
+                client, method, _requestable(path), MUTATING_BODIES.get((method, path))
+            )
         assert reply.status == 403
         assert reply.code == "app_disabled"
 
@@ -590,7 +616,11 @@ class TestTheRegisteredSurface:
             ("PUT", f"{routes.PREFIX}/config"),
             ("GET", f"{routes.PREFIX}/config/resolved"),
             ("GET", f"{routes.PREFIX}/config/registry"),
+            ("GET", f"{routes.PREFIX}/config/workflow"),
             ("GET", f"{routes.PREFIX}/config/sources"),
+            ("GET", f"{routes.PREFIX}/config/capabilities"),
+            ("POST", f"{routes.PREFIX}/config/conformance"),
+            ("GET", f"{routes.PREFIX}/config/conformance/{{capability}}"),
             ("POST", f"{routes.PREFIX}/setup/inspect"),
             ("POST", f"{routes.PREFIX}/setup/plan"),
             ("POST", f"{routes.PREFIX}/setup/apply"),
@@ -603,6 +633,20 @@ class TestTheRegisteredSurface:
             ("POST", f"{routes.PREFIX}/queue/clean-workspace"),
             ("POST", f"{routes.PREFIX}/queue/teardown"),
         }
+
+    def test_every_dynamic_path_segment_has_a_concrete_value(self) -> None:
+        """Non-vacuity for every parametrized test that drives the table.
+
+        A registered template nobody substituted is requested literally, aiohttp's
+        dynamic pattern excludes braces, and the request 404s — so the 401 and 403
+        assertions above would be asserting against a routing miss rather than
+        against the gate they were written for.
+        """
+        unsubstituted = [(method, path) for method, path, _ in TABLE if "{" in _requestable(path)]
+        assert unsubstituted == [], (
+            f"registered paths with no value in PATH_VARIABLES: {unsubstituted}. "
+            "Add one, or the parametrized gate tests silently assert on a 404."
+        )
 
     def test_the_prefix_is_this_apps_own_namespace(self) -> None:
         """Served from a route this app declares, never one the Prior_App does.
@@ -1346,6 +1390,242 @@ class TestTheResolvedReadIsAReadOfTheDocumentBesideIt:
             reply = await _get(client, f"{routes.PREFIX}/config/resolved")
         assert reply.status == 409
         assert reply.code == "config_unreadable"
+
+
+# --- the capability bindings ---------------------------------------------------
+
+
+def _store_document(document: dict[str, Any]) -> None:
+    """Write *document* straight to the data home, bypassing the write door.
+
+    Needed for the refusal cases: an engine-floor binding is exactly what the
+    write path rejects, so the only way a document holding one exists is that
+    somebody hand-edited the file — which is the case the read has to survive.
+    """
+    config_dir = default_root()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / CONFIG_FILENAME).write_text(json.dumps(document), encoding="utf-8")
+
+
+class TestTheCapabilityReadJoinsEachBindingToItsReachability:
+    """Which provider serves each capability, and whether it can be reached.
+
+    Both halves are the engine's own answers rather than this surface's: the
+    binding description comes from the capability registry, and reachability from
+    the same provider check a run's prerequisite gate reports against — so a
+    binding shown here as reachable is one a run would accept.
+
+    The claim that carries the most weight is negative. An unconfigured document
+    resolves to an all-builtin map, and a document the engine REFUSES must never
+    arrive as that map: the two are the same shape and opposite facts, and
+    conflating them would show a refused document as a clean one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_home_answers_every_capability_as_its_builtin(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Nothing configured is not nothing bound. Every delegable capability
+        ships a builtin, so none of them can answer "not configured"."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 200
+        assert reply.body["configured"] is False
+        entries = {entry["capability"]: entry for entry in reply.body["capabilities"]}
+        assert list(entries) == list(DELEGABLE_CAPABILITIES), (
+            "the read must answer for every capability the engine declares delegable, "
+            "in the engine's own order"
+        )
+        for entry in entries.values():
+            assert entry["transport"] == "builtin"
+            assert entry["configured"] is False
+            assert entry["declared_at"] == ""
+            assert entry["program"] == ""
+            assert entry["provider"]["kind"] == "builtin"
+
+    @pytest.mark.asyncio
+    async def test_one_entry_carries_the_engines_description_beside_its_reachability(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The whole shape of one row, so a field that quietly disappears fails
+        here rather than in a client that stops rendering it."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        entries = {entry["capability"]: entry for entry in reply.body["capabilities"]}
+        assert entries["model_catalog"] == {
+            "capability": "model_catalog",
+            "transport": "builtin",
+            "provider": {
+                "name": "engine-model-catalog-host",
+                "kind": "builtin",
+                "nature": "deterministic",
+                "transport": "builtin",
+            },
+            "configured": False,
+            "declared_at": "",
+            # The resolved deadline, not the raw override: the binding declares
+            # none, so the app setting's value is what one call would get.
+            "timeout_s": 120,
+            "program": "",
+            "reachable": None,
+            "action": "",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_builtins_that_stand_for_a_model_backed_path_say_so(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The distinction an operator learns which capabilities cost money from.
+
+        Authoring, review and implementation are served by a seeded turn, and
+        until the engine's own builtins are registered over the registry all three
+        resolve to the shipped deterministic no-coverage default — which reports a
+        path that spends credits as one that spends nothing.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        natures = {
+            entry["capability"]: entry["provider"]["nature"] for entry in reply.body["capabilities"]
+        }
+        assert natures["authoring"] == "model_backed"
+        assert natures["review"] == "model_backed"
+        assert natures["implementation"] == "model_backed"
+        assert natures["model_catalog"] == "deterministic"
+        assert natures["watch_sources"] == "deterministic"
+
+    @pytest.mark.asyncio
+    async def test_a_binding_on_its_builtin_reports_reachability_as_not_applicable(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """``null``, not ``false``. A builtin is reachable by construction — it is
+        this engine — so the engine's check skips it, and coercing that to ``false``
+        would show a broken provider on a capability that has none."""
+        _store_document({"version": 1, "capabilities": {"analysis": {"transport": "builtin"}}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 200
+        entries = {entry["capability"]: entry for entry in reply.body["capabilities"]}
+        analysis = entries["analysis"]
+        # Declared by an operator AND on its builtin: the two are independent, and
+        # the row has to carry both without inventing a program to check.
+        assert analysis["configured"] is True
+        assert analysis["declared_at"] == "capabilities.analysis"
+        assert analysis["reachable"] is None
+        assert analysis["action"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_delegated_program_off_the_path_is_unreachable_with_the_escape(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The remediation names both ways out, because unsetting the binding is
+        the one that always works: the capability's builtin is still there."""
+        _store_document(
+            {
+                "version": 1,
+                "capabilities": {
+                    "review": {
+                        "transport": "command",
+                        "command": ["definitely-not-on-this-path", "--check"],
+                    }
+                },
+            }
+        )
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 200
+        entries = {entry["capability"]: entry for entry in reply.body["capabilities"]}
+        review = entries["review"]
+        assert review["transport"] == "command"
+        assert review["program"] == "definitely-not-on-this-path"
+        assert review["reachable"] is False
+        assert "unset capabilities.review to use the builtin" in review["action"]
+        # An external provider is reported model-backed because the engine cannot
+        # know whether it reasons. The payload projects that as the engine states
+        # it and adds no reading of its own.
+        assert review["provider"]["kind"] == "external"
+        # The capabilities that were not bound are unaffected, and still not
+        # reported as unreachable.
+        assert entries["analysis"]["reachable"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_delegated_transport_with_an_empty_command_is_a_read_failure(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """A transport that runs a program and names none cannot be resolved at
+        all, so it is a read failure rather than a binding reported unreachable."""
+        _store_document(
+            {"version": 1, "capabilities": {"analysis": {"transport": "mcp", "command": []}}}
+        )
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 422
+        assert reply.code == "capabilities_unreadable"
+        assert "capabilities" not in reply.body
+
+    @pytest.mark.asyncio
+    async def test_an_engine_floor_binding_is_a_read_failure_not_an_all_builtin_read(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The refusal that must not be mistaken for a clean document.
+
+        ``resolve_bindings`` pre-seeds every capability with its builtin BEFORE it
+        consults the document, so the failure path and the unconfigured path differ
+        only in whether a raise escaped. A surface that swallowed the raise would
+        report a document the engine refuses to run against as one with nothing
+        configured.
+        """
+        _store_document({"version": 1, "capabilities": {"audit_log": {"transport": "command"}}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 422
+        assert reply.code == "capabilities_unreadable"
+        assert "audit_log" in reply.body["error"]
+        assert "capabilities" not in reply.body, (
+            "a refused document must carry no binding list at all; an all-builtin "
+            "list beside the refusal is what a client would render"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_section_that_is_not_an_object_is_a_read_failure(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The third way resolution refuses, and the same answer."""
+        _store_document({"version": 1, "capabilities": ["analysis"]})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 422
+        assert reply.code == "capabilities_unreadable"
+        assert "capabilities" not in reply.body
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_capability_is_a_read_failure(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        _store_document({"version": 1, "capabilities": {"telepathy": {"transport": "builtin"}}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 422
+        assert reply.code == "capabilities_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_document_is_reported_rather_than_read_as_builtin(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 409
+        assert reply.code == "config_unreadable"
+
+    def test_the_binding_read_takes_no_project_because_there_is_no_project_layer(
+        self,
+    ) -> None:
+        """The engine reads ``capabilities`` from one app-wide section with no
+        per-project layer, so a project-scoped read would imply a scope that does
+        not exist and let two projects appear to bind different providers."""
+        assert list(inspect.signature(routes._capabilities_snapshot).parameters) == []
 
 
 # --- the form vocabulary ------------------------------------------------------
@@ -2656,3 +2936,1150 @@ def test_the_module_starts_no_threads_of_its_own() -> None:
     assert "threading" not in source
     assert "asyncio.to_thread" in source
     assert asyncio.to_thread is not None
+
+
+# --- the delivery workflow and its gates ------------------------------------
+
+
+def _function_ast(name: str) -> ast.FunctionDef:
+    """A plain (non-async) module-level function in :mod:`routes`, as source.
+
+    The sibling of :func:`_handler_ast`, which finds handlers only: the claim
+    below is about a blocking helper rather than about a coroutine.
+    """
+    for node in _module_ast().body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"no function named {name} in {ROUTES_SOURCE}")
+
+
+def _function_body_source(node: ast.FunctionDef) -> str:
+    """*node*'s source with its docstring removed.
+
+    A structural claim about what a function DOES must not read what it SAYS: a
+    docstring naming the thing it promises not to compute would fail an assertion
+    for explaining itself.
+    """
+    body = [
+        statement
+        for statement in node.body
+        if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
+    ]
+    assert body, f"{node.name} has no statements outside its docstring"
+    lines = ROUTES_SOURCE.read_text(encoding="utf-8").splitlines()
+    last = body[-1].end_lineno or body[-1].lineno
+    return "\n".join(lines[body[0].lineno - 1 : last])
+
+
+def _stage_rows(body: Any) -> dict[str, dict[str, Any]]:
+    """The workflow read's stage rows, keyed by stage name.
+
+    Also the assertion that every declared stage appears: a surface listing only
+    the stages that resolved would leave an operator inferring "runs nothing" from
+    a stage's absence, which is the distinction the display exists to keep.
+    """
+    rows = {row["stage"]: row for row in body["stages"]}
+    assert list(rows) == list(DELIVERY_STAGES), (
+        "the workflow read must carry one row per declared stage, in schema order: "
+        f"got {list(rows)}"
+    )
+    return rows
+
+
+class TestTheWorkflowReadRelaysWhatTheEngineResolved:
+    """Which layer supplied each stage's commands, and the gates beside it.
+
+    The claim is not that the JSON has the right shape: it is that the route
+    RELAYS the engine's own per-stage resolution instead of re-deriving it. So
+    every case below drives a real document through the real route and asserts on
+    the source, the declaring path and the commands together — a row that resolved
+    the right commands while attributing them to the wrong layer would send an
+    operator to edit a preset when the answer is a project override, and the next
+    edit would be made on that belief.
+
+    The 401 floor and the disabled-app refusal are not repeated here: both are
+    parametrized over the route table, so registering the path enrolled it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_bundled_preset_is_named_as_bundled_with_its_stages(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "projects": {
+                            "acme": {
+                                "path": "/tmp/acme",
+                                "workflow": {"preset": "git-pull-request"},
+                            }
+                        }
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        assert reply.status == 200, reply.body
+        assert reply.body["project"] == "acme"
+        assert reply.body["preset"] == {
+            "name": "git-pull-request",
+            "origin": "project_config",
+            "declared_at": "projects.acme.workflow.preset",
+            # The one field that separates engine-authored commands from
+            # document-authored ones.
+            "bundled": True,
+        }
+        submit = _stage_rows(reply.body)["submit"]
+        assert submit["source"] == "bundled_preset"
+        assert submit["from_preset"] is True
+        assert submit["bundled"] is True
+        assert submit["preset"] == "git-pull-request"
+        # Byte-equal to the engine's own table, not a paraphrase of it.
+        assert submit["argv"] == [
+            list(argv) for argv in WORKFLOW_PRESETS["git-pull-request"]["submit"]
+        ]
+        assert submit["commands"] == len(WORKFLOW_PRESETS["git-pull-request"]["submit"])
+
+    @pytest.mark.asyncio
+    async def test_a_user_defined_preset_is_never_flattened_onto_a_bundled_one(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The invariant a bundled name is reserved to protect.
+
+        A definition an operator wrote and one the engine ships call for opposite
+        trust, so ``preset`` alone is not an answer: the source has to say which.
+        """
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "workflow": {
+                            "presets": {"my-host": {"stages": {"submit": [["hg", "ci"]]}}}
+                        },
+                        "projects": {
+                            "acme": {"path": "/tmp/acme", "workflow": {"preset": "my-host"}}
+                        },
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        assert reply.status == 200, reply.body
+        assert reply.body["preset"] == {
+            "name": "my-host",
+            "origin": "project_config",
+            "declared_at": "projects.acme.workflow.preset",
+            "bundled": False,
+        }
+        submit = _stage_rows(reply.body)["submit"]
+        assert submit["source"] == "user_preset"
+        assert submit["from_preset"] is True
+        assert submit["bundled"] is False
+        assert submit["argv"] == [["hg", "ci"]]
+        assert submit["declared_at"] == "workflow.presets.my-host.stages.submit"
+        # Offered for selection from the document, because the registry read
+        # carries the bundled names only.
+        assert reply.body["user_presets"] == ["my-host"]
+
+    @pytest.mark.asyncio
+    async def test_an_app_wide_stage_declaration_reports_as_an_app_override(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {"patch": {"workflow": {"stages": {"publish": [["make", "deploy"]]}}}},
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        assert reply.status == 200, reply.body
+        publish = _stage_rows(reply.body)["publish"]
+        assert publish["source"] == "app_override"
+        assert publish["from_preset"] is False
+        # An override names no preset: claiming one would say the commands came
+        # from a definition an operator could change by selecting another.
+        assert publish["preset"] == ""
+        assert publish["declared_at"] == "workflow.stages.publish"
+        assert publish["argv"] == [["make", "deploy"]]
+
+    @pytest.mark.asyncio
+    async def test_a_project_stage_declaration_wins_and_says_it_is_the_projects(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Both layers declare the same stage, so this also pins that the route
+        derives no precedence of its own: the narrower layer wins because the
+        engine resolved it that way, and the row names that layer."""
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "workflow": {"stages": {"publish": [["make", "deploy"]]}},
+                        "projects": {
+                            "acme": {
+                                "path": "/tmp/acme",
+                                "workflow": {"stages": {"publish": [["make", "ship"]]}},
+                            }
+                        },
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        assert reply.status == 200, reply.body
+        publish = _stage_rows(reply.body)["publish"]
+        assert publish["source"] == "project_override"
+        assert publish["declared_at"] == "projects.acme.workflow.stages.publish"
+        assert publish["argv"] == [["make", "ship"]]
+
+    @pytest.mark.asyncio
+    async def test_a_stage_nothing_defines_is_unconfigured_and_not_from_the_preset(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The other required invariant. ``git-pull-request`` defines isolate and
+        submit only, so the three stages it leaves alone must say so: rendering
+        them as preset-supplied would tell an operator a stage runs when it does
+        not, and omitting them would say the same thing by silence."""
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "projects": {
+                            "acme": {
+                                "path": "/tmp/acme",
+                                "workflow": {"preset": "git-pull-request"},
+                            }
+                        }
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        rows = _stage_rows(reply.body)
+        for stage in ("verify", "publish", "teardown"):
+            row = rows[stage]
+            assert row["source"] == "unconfigured", stage
+            assert row["from_preset"] is False, stage
+            assert row["preset"] == "", stage
+            assert row["skipped"] is True, stage
+            assert row["commands"] == 0, stage
+            assert row["argv"] == [], stage
+
+    @pytest.mark.asyncio
+    async def test_the_read_says_where_a_stage_outside_the_delivery_flow_runs(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Teardown runs at archive rather than at the end of a delivery, and
+        isolate runs before the flow. Projected so a client renders when a stage
+        runs without keeping its own copy of a fact that lives in the engine."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 200, reply.body
+        rows = _stage_rows(reply.body)
+        assert rows["isolate"]["runs_at"] == routes.RUN_POINT_ISOLATION
+        assert rows["teardown"]["runs_at"] == routes.RUN_POINT_ARCHIVE
+        assert [stage for stage, row in rows.items() if row["runs_at"] == routes.RUN_POINT_DELIVERY]
+        assert reply.body["delivery_flow_stages"] == list(DELIVERY_FLOW_STAGES)
+        assert routes.RUN_POINT_ARCHIVE not in reply.body["delivery_flow_stages"]
+
+    @pytest.mark.asyncio
+    async def test_a_configured_gate_carries_its_position_severity_and_commands(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            written = await _put(
+                client,
+                f"{routes.PREFIX}/config",
+                {
+                    "patch": {
+                        "quality_gates": [
+                            {
+                                "name": "tests",
+                                "position": "pre_submit",
+                                "severity": "blocking",
+                                "commands": [["make", "test"]],
+                            },
+                            {
+                                "name": "coverage",
+                                "position": "post_submit",
+                                "severity": "advisory",
+                                "commands": [["make", "coverage"]],
+                            },
+                        ]
+                    }
+                },
+            )
+            assert written.status == 200, written.body
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow?project=acme")
+        assert reply.status == 200, reply.body
+        assert reply.body["gates_unreadable"] is False
+        # Declaration order, because that is the order they run in at a position.
+        assert [gate["name"] for gate in reply.body["gates"]] == ["tests", "coverage"]
+        assert reply.body["gates"][0] == {
+            "name": "tests",
+            "position": "pre_submit",
+            "severity": "blocking",
+            # The engine's own reading of that severity, so a surface does not
+            # decide for itself whether a failure stops the flow.
+            "blocking": True,
+            "commands": [["make", "test"]],
+            "origin": "app_config",
+            "declared_at": "quality_gates[0]",
+        }
+        assert reply.body["gates"][1]["blocking"] is False
+        # App-level: the read is project-scoped for the workflow and the gate list
+        # beside it is not, and it says which.
+        assert reply.body["gates_scope_is_app"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_gate_list_is_not_reported_as_no_gates(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The distinction the engine itself makes: an unparseable list refuses
+        delivery outright rather than proceeding ungated, so reporting it as an
+        empty list would say every check is configured away when what is true is
+        that the document needs repairing. ``gates`` is null rather than ``[]`` so
+        a client cannot read the two as the same answer by accident."""
+        _write_document({"version": 1, "quality_gates": "make test"})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 200, reply.body
+        assert reply.body["gates_unreadable"] is True
+        assert reply.body["gates"] is None
+        assert [error["path"] for error in reply.body["gate_errors"]] == ["quality_gates"]
+        # The workflow beside it still resolves: refusing the whole read would
+        # leave the stage rows unstateable, which is the opposite failure.
+        assert _stage_rows(reply.body)
+
+    @pytest.mark.asyncio
+    async def test_a_document_with_no_gates_is_reported_as_an_empty_list(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """Non-vacuity for the test above: the two states are distinguishable, so
+        the null means something."""
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 200, reply.body
+        assert reply.body["gates"] == []
+        assert reply.body["gates_unreadable"] is False
+        assert reply.body["gate_errors"] == []
+        assert reply.body["configured"] is False
+        assert reply.body["preset"] is None
+        assert reply.body["user_presets"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_preset_name_nothing_defines_is_a_refusal_naming_its_path(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """A selection never silently degrades. The engine raises rather than
+        resolving to nothing, and the route reports it by path so an operator
+        repairs the selection instead of hunting a workflow that renders empty."""
+        _write_document({"version": 1, "workflow": {"preset": "no-such-preset"}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 422
+        assert reply.code == "config_invalid"
+        assert "workflow.preset" in reply.body["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_document_is_a_refusal_and_not_an_empty_workflow(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 409
+        assert reply.code == "config_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_gate_name_cannot_set_the_width_of_a_row(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The write door constrains a gate name to a non-empty string and nothing
+        more, so the ceiling is this projection's."""
+        _write_document(
+            {
+                "version": 1,
+                "quality_gates": [
+                    {
+                        "name": "n" * 400,
+                        "position": "pre_submit",
+                        "severity": "blocking",
+                        "commands": [["make", "test"]],
+                    }
+                ],
+            }
+        )
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/workflow")
+        assert reply.status == 200, reply.body
+        assert len(reply.body["gates"][0]["name"]) < 400
+
+    def test_the_route_derives_no_precedence_of_its_own(self) -> None:
+        """Structural, over the module's own source.
+
+        The per-stage layering lives in ``DeliveryWorkflow`` and the display of it
+        in ``stage_origins``. A second implementation here would be the copy that
+        drifts, and it would drift silently: both answers look plausible until the
+        day a project overrides a stage its preset also defines.
+        """
+        snapshot = _function_ast("_workflow_snapshot")
+        reached = {
+            child.func.id
+            for child in ast.walk(snapshot)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        assert "stage_origins" in reached, "the stage rows must come from the engine's own display"
+        # The docstring is excluded deliberately: it NAMES the layers to state the
+        # invariants it keeps, and reading prose as code would make this fail for
+        # documenting the very property it asserts. The match is on the quoted
+        # literal, so the ``user_presets`` payload key is not read as the
+        # ``user_preset`` source it merely contains.
+        body = _function_body_source(snapshot)
+        for layer in ("bundled_preset", "user_preset", "app_override", "project_override"):
+            assert f'"{layer}"' not in body, (
+                f"{layer} is named inside _workflow_snapshot, which means the route "
+                "is deciding a source rather than relaying the one the engine resolved"
+            )
+
+
+# --- provider conformance as a job ------------------------------------------
+
+
+def _conformance_source(name: str) -> str:
+    """A conformance function's source with its docstring dropped.
+
+    Tolerant of both function kinds because this section owns one blocking helper
+    and one coroutine, and the claim below is the same about each. A structural
+    claim must not read a docstring: prose NAMING the value a function promises not
+    to read would fail the assertion for explaining itself.
+    """
+    for node in _module_ast().body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            body = [
+                statement
+                for statement in node.body
+                if not (
+                    isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                )
+            ]
+            assert body, f"{name} has no statements outside its docstring"
+            lines = ROUTES_SOURCE.read_text(encoding="utf-8").splitlines()
+            last = body[-1].end_lineno or body[-1].lineno
+            return "\n".join(lines[body[0].lineno - 1 : last])
+    raise AssertionError(f"no function named {name} in {ROUTES_SOURCE}")
+
+
+#: A configured command binding for the analysis capability, with a deliberately
+#: enormous per-binding timeout. Nothing ever runs it: every test below either
+#: substitutes the runner or substitutes the transport, so the argv exists to be
+#: fingerprinted and turned into a candidate rather than to be executed.
+_BOUND_ANALYSIS: dict[str, Any] = {
+    "capabilities": {
+        "analysis": {
+            "transport": "command",
+            "command": ["my-analyzer", "--json"],
+            "env": {"TOKEN": "not-a-real-secret"},
+            # Far above the app setting's floor, which the engine deliberately
+            # permits: raising ONE provider's ceiling is a legitimate thing for an
+            # operator to do. It must not raise this surface's probe bound.
+            "timeout_s": 3000,
+        }
+    }
+}
+
+
+@pytest.fixture()
+def no_conformance_jobs() -> Any:
+    """Empty the module's job table around each test.
+
+    The table is process-global by design — a job outlives the request that
+    started it — so without this a completed run leaks into the next test and the
+    absent-state assertions read a report somebody else's test produced.
+    """
+    routes._CONFORMANCE_JOBS.clear()
+    routes._CONFORMANCE_TASKS.clear()
+    yield
+    routes._CONFORMANCE_JOBS.clear()
+    routes._CONFORMANCE_TASKS.clear()
+
+
+async def _drain_conformance() -> None:
+    """Wait for every in-flight conformance task to record its outcome.
+
+    Completion is not the same event as removal from the module's task set: the
+    callback that discards a finished task is scheduled on the loop, so awaiting
+    the task alone leaves it in the set and a loop over "is the set empty" never
+    terminates. Awaited on ``done()`` instead, with one trip through the loop
+    afterwards so the set a caller inspects is settled.
+    """
+    for _ in range(100):
+        pending = tuple(task for task in routes._CONFORMANCE_TASKS if not task.done())
+        if not pending:
+            await asyncio.sleep(0)
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+    raise AssertionError("conformance tasks never drained")
+
+
+def _report_stub(
+    *, capability: str = "analysis", candidate: str = "my-analyzer", passed: bool = True
+) -> Any:
+    """A real :class:`ConformanceReport`, so the route serializes what it would.
+
+    A hand-written dict here would let the route pass while ``to_json_object``
+    changed shape underneath it, which is the coupling the payload exists to keep.
+    """
+    from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
+        CHECK_PLANTED_DEFECT,
+        CheckResult,
+        ConformanceReport,
+    )
+
+    return ConformanceReport(
+        capability=capability,
+        candidate=candidate,
+        declared_fixtures=("planted-ambiguity",),
+        declared_checks=(CHECK_PLANTED_DEFECT,),
+        results=(
+            CheckResult(
+                check=CHECK_PLANTED_DEFECT,
+                fixture="planted-ambiguity",
+                passed=passed,
+                detail="detected 1 planted defect(s)" if passed else "reported no finding",
+                excused=0 if passed else 1,
+            ),
+        ),
+    )
+
+
+@dataclass
+class _RecordedVerify:
+    """Stands in for the conformance runner, recording what the route asked of it.
+
+    Substituted at ``routes.verify`` rather than lower down because the deadline is
+    the thing under test and that is the argument the route chooses: a fake any
+    deeper would be asserting about the runner's defaults instead of the route's
+    decision.
+    """
+
+    calls: list[dict[str, Any]]
+    gate: Any = None
+    raises: BaseException | None = None
+    report: Any = None
+
+    def __call__(self, candidate: Any, capability: str, **kwargs: Any) -> Any:
+        self.calls.append(
+            {"candidate": candidate, "capability": capability, "kwargs": dict(kwargs)}
+        )
+        if self.gate is not None:
+            assert self.gate.wait(timeout=5), "the gated run was never released"
+        if self.raises is not None:
+            raise self.raises
+        return self.report if self.report is not None else _report_stub(capability=capability)
+
+
+@pytest.fixture()
+def recorded_verify(monkeypatch: pytest.MonkeyPatch) -> _RecordedVerify:
+    fake = _RecordedVerify(calls=[])
+    monkeypatch.setattr(routes, "verify", fake)
+    return fake
+
+
+class TestConformanceIsAJobAndNotARequest:
+    """A started run answers immediately; the outcome is polled.
+
+    Not a matter of taste. The bundled suite gives a document capability five
+    fixtures, four of which invoke the candidate a second time for the
+    repeatability check — nine child processes, each spawned through the package's
+    sandbox chokepoint — and it enforces no aggregate deadline of its own. Held
+    inline it would block the gateway's event loop for the whole run; held open as
+    a request it would hold a connection for minutes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_starting_a_run_answers_before_the_suite_finishes(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        import threading
+
+        recorded_verify.gate = threading.Event()
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            # 202: accepted, and deliberately carrying no outcome. The suite has
+            # not finished -- the fake is still blocked on its gate.
+            assert started.status == 202
+            assert started.body["status"] == "running"
+            assert started.body["job_id"]
+            assert started.body["report"] is None
+
+            polled = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+            assert polled.status == 200
+            assert polled.body["status"] == "running"
+            assert polled.body["report"] is None
+            assert polled.body["job_id"] == started.body["job_id"]
+
+            recorded_verify.gate.set()
+            await _drain_conformance()
+
+            done = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert done.body["status"] == "complete"
+        assert done.body["report"]["capability"] == "analysis"
+
+    @pytest.mark.asyncio
+    async def test_the_run_happens_off_the_event_loop(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The suite is fully synchronous, so it must not run on the loop.
+
+        Asserted by thread identity rather than by reading the source: a
+        ``to_thread`` that was refactored into a direct call would still look like
+        a job from the outside, and the symptom would be a gateway that stops
+        answering everything else for the length of a run.
+        """
+        import threading
+
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+
+        def _record(candidate: Any, capability: str, **kwargs: Any) -> Any:
+            seen.append(threading.get_ident())
+            return _report_stub(capability=capability)
+
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(routes, "verify", _record)
+                await _post(
+                    client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+                )
+                await _drain_conformance()
+        assert seen, "the runner was never called"
+        assert seen[0] != loop_thread
+
+    @pytest.mark.asyncio
+    async def test_a_second_run_for_the_same_capability_is_refused_with_the_reason(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """Nothing in the runner prevents overlapping runs against one program."""
+        import threading
+
+        recorded_verify.gate = threading.Event()
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            first = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            second = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            assert first.status == 202
+            assert second.status == 409
+            assert second.code == "conformance_running"
+            # Saying why, and naming the job already in flight, so the operator can
+            # poll the one that is running rather than retrying into the refusal.
+            assert first.body["job_id"] in second.body["error"]
+            recorded_verify.gate.set()
+            await _drain_conformance()
+        assert len(recorded_verify.calls) == 1, "the refused run must not have invoked anything"
+
+    @pytest.mark.asyncio
+    async def test_a_run_can_start_again_once_the_first_one_finished(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """Non-vacuity: the refusal is about CONCURRENCY, not a one-shot latch."""
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            first = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            second = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+        assert first.status == 202
+        assert second.status == 202
+        assert second.body["job_id"] != first.body["job_id"]
+
+
+class TestTheRouteChoosesTheDeadlineAndABindingCannotRaiseIt:
+    """The one number this surface must not take from configuration.
+
+    ``CapabilityRegistry.timeout_for`` lets a per-binding ``timeout_s`` sit above
+    the app setting's floor with no clamp, and that is correct for a real
+    invocation. For a probe an operator started from a page it is not: the suite
+    invokes the provider nine times and caps nothing in aggregate, so the
+    binding's number is multiplied by nine — a declared 3000 seconds would be
+    most of a day of held resources for a check nobody is watching.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_binding_declaring_a_large_timeout_does_not_raise_the_servers_cap(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        _store_document(_BOUND_ANALYSIS)
+        declared = _BOUND_ANALYSIS["capabilities"]["analysis"]["timeout_s"]
+        assert declared > routes.CONFORMANCE_DEADLINE_S, "the fixture must exceed the cap"
+        async with _client() as client:
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+        assert started.status == 202
+        assert recorded_verify.calls, "the runner was never reached"
+        assert recorded_verify.calls[0]["kwargs"]["deadline_s"] == routes.CONFORMANCE_DEADLINE_S
+        # And the cap travels in the payload, so the surface offering the action
+        # can state the bound rather than guessing it.
+        assert started.body["deadline_s"] == routes.CONFORMANCE_DEADLINE_S
+
+    def test_the_route_never_reads_a_bindings_timeout_for_its_deadline(self) -> None:
+        """Structural, over the module's own source.
+
+        The live assertion above proves the value for one document. This proves
+        the route has no path to the binding's number at all, so a later branch
+        cannot reintroduce it for the case somebody thought was special.
+        """
+        for name in ("_run_conformance", "handle_post_conformance"):
+            body = _conformance_source(name)
+            assert "timeout_s" not in body, (
+                f"{name} reads a timeout out of the binding; the per-invocation "
+                "deadline is this route's own choice"
+            )
+            assert "timeout_for" not in body
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_is_built_from_the_binding_and_bypasses_the_registry(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The registry degrades a broken provider to its builtin and continues.
+
+        Right for a run, and it would hide exactly what a conformance report
+        exists to reveal — so the candidate is built from the binding directly and
+        carries the program's own label.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.capabilities import TransportCandidate
+        from kiro_crew.apps.builtins.spec_engine.engine.capabilities.transports import (
+            CommandProviderTransport,
+        )
+
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+        candidate = recorded_verify.calls[0]["candidate"]
+        assert isinstance(candidate, TransportCandidate)
+        assert isinstance(candidate.transport, CommandProviderTransport)
+        assert candidate.transport.argv == ("my-analyzer", "--json")
+        assert candidate.name == "my-analyzer"
+
+
+class TestTheConformanceStateIsHonestAboutWhatItHas:
+    """Every way this read could flatter a provider, closed one at a time."""
+
+    @pytest.mark.asyncio
+    async def test_a_capability_never_checked_reports_absent_rather_than_passing(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert reply.status == 200
+        assert reply.body["status"] == "absent"
+        assert reply.body["report"] is None
+        assert reply.body["binding_fingerprint"] == ""
+        # The live binding still has a fingerprint, so a client can key a cache on
+        # it before any run exists.
+        assert reply.body["binding_current"]
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_could_not_be_carried_out_is_not_reported_as_complete(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The absence of failures is never a pass.
+
+        ``complete`` with an empty report is exactly how "no outcome was obtained"
+        gets read as "nothing was wrong", so a run that did not happen gets its own
+        status.
+        """
+        recorded_verify.raises = OSError("no room for a temporary directory")
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert reply.body["status"] == "failed"
+        assert reply.body["status"] != routes.CONFORMANCE_COMPLETE
+        assert reply.body["report"] is None
+        assert "OSError" in reply.body["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_binding_edited_after_a_run_makes_the_report_stale(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """A report describes the binding it ran against and no other."""
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            fresh = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+            assert fresh.body["stale"] is False
+            assert fresh.body["binding_current"] == fresh.body["binding_fingerprint"]
+
+            moved = json.loads(json.dumps(_BOUND_ANALYSIS))
+            moved["capabilities"]["analysis"]["command"] = ["a-different-analyzer"]
+            _store_document(moved)
+            after = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert after.body["stale"] is True
+        assert after.body["binding_current"] != after.body["binding_fingerprint"]
+        # The report is still relayed rather than dropped: it is evidence about a
+        # binding that existed, and hiding it would be as dishonest as presenting
+        # it as current.
+        assert after.body["report"] is not None
+
+    @pytest.mark.asyncio
+    async def test_an_edited_environment_value_also_makes_the_report_stale(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """Every field the transport reads is in the fingerprint, not just argv.
+
+        A provider handed a different token is a different provider, and a report
+        that survived the swap would be a report about a call nobody makes.
+        """
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            moved = json.loads(json.dumps(_BOUND_ANALYSIS))
+            moved["capabilities"]["analysis"]["env"] = {"TOKEN": "a-different-value"}
+            _store_document(moved)
+            after = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert after.body["stale"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_fingerprint_never_carries_the_binding_it_digests(
+        self,
+        recorded_sel: RecordedSel,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """``env`` may hold a credential, so the binding travels as a digest.
+
+        A relayed binding would put a token on a read an app-minted session may
+        make, which is the one thing this payload must not do.
+        """
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        body = json.dumps(reply.body)
+        assert "not-a-real-secret" not in body
+        assert "TOKEN" not in body
+
+    @pytest.mark.asyncio
+    async def test_a_declined_detection_and_its_excused_count_reach_the_payload(
+        self,
+        recorded_sel: RecordedSel,
+        monkeypatch: pytest.MonkeyPatch,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The qualifier the verdict line carries, rendered from the payload.
+
+        Driven through the REAL runner with only the transport substituted, so the
+        report is serialized by ``to_json_object`` rather than by a fixture that
+        could agree with the route while disagreeing with the engine. Without these
+        two fields a client shows an unqualified pass about a provider that
+        declared every document skipped.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
+            CURRENT_SCHEMA_VERSION,
+            TRANSPORT_COMMAND,
+        )
+
+        @dataclass
+        class _DecliningTransport:
+            """Answers every fixture by declaring the documents skipped."""
+
+            @property
+            def transport(self) -> str:
+                return TRANSPORT_COMMAND
+
+            def invoke(self, request: Any, *, timeout_s: int) -> Any:
+                return {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "capability": request.capability,
+                    "provider": {"name": "declining"},
+                    "coverage": {
+                        "processed": [],
+                        "skipped": [
+                            {"item": f"document:{artifact.kind}", "reason": "declined to examine"}
+                            for artifact in request.artifacts
+                        ]
+                        or [{"item": "nothing", "reason": "declined to examine"}],
+                    },
+                    "findings": [],
+                    "cost": {"credits": 0.0},
+                    "result": {"depth": "structural"},
+                }
+
+        monkeypatch.setattr(routes, "transport_for", lambda binding: _DecliningTransport())
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        report = reply.body["report"]
+        assert reply.body["status"] == "complete", reply.body
+        assert report["declined_detections"] > 0
+        excused = [entry for entry in report["results"] if entry["excused"]]
+        assert excused, report["results"]
+        assert all(entry["passed"] is True for entry in excused)
+
+    @pytest.mark.asyncio
+    async def test_the_verdict_is_the_engines_and_a_gap_makes_it_false(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """A declared check that never ran is a failure of the RUN, not an absence.
+
+        ``passed`` is not "no failures": it also requires that every declared
+        fixture and check was evaluated. The route relays that answer rather than
+        recomputing one from the results it can see.
+        """
+        from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
+            CHECK_PLANTED_DEFECT,
+            CHECK_SCHEMA_VALIDITY,
+            ConformanceReport,
+        )
+
+        recorded_verify.report = ConformanceReport(
+            capability="analysis",
+            candidate="my-analyzer",
+            declared_fixtures=("planted-ambiguity",),
+            # Two declared, one evaluated: the report's own gap machinery.
+            declared_checks=(CHECK_PLANTED_DEFECT, CHECK_SCHEMA_VALIDITY),
+            results=_report_stub().results,
+        )
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        report = reply.body["report"]
+        assert report["gaps"], "the gap must travel so a client can name it"
+        assert report["passed"] is False
+        assert all(entry["passed"] is True for entry in report["results"]), (
+            "every individual check passed, which is exactly why the verdict has "
+            "to come from the engine rather than from the results"
+        )
+
+
+class TestTheConformanceRoutesRefuseWhatCannotBeChecked:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("capability", ["format_validation", "claim_ledger"])
+    async def test_an_engine_floor_capability_has_no_provider_to_check(
+        self,
+        capability: str,
+        recorded_sel: RecordedSel,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The floor is not bindable, so there is no candidate and no suite."""
+        async with _client() as client:
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": capability}
+            )
+            polled = await _get(client, f"{routes.PREFIX}/config/conformance/{capability}")
+        for reply in (started, polled):
+            assert reply.status == 422
+            assert reply.code == "engine_floor_capability"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_capability_is_refused_rather_than_answered_absent(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        """``absent`` means "not checked yet", which would be a lie about a
+        capability the engine does not have."""
+        async with _client() as client:
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "no-such-thing"}
+            )
+            polled = await _get(client, f"{routes.PREFIX}/config/conformance/no-such-thing")
+        for reply in (started, polled):
+            assert reply.status == 404
+            assert reply.code == "unknown_capability"
+
+    @pytest.mark.asyncio
+    async def test_a_capability_bound_to_its_builtin_has_nothing_external_to_check(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+        assert reply.status == 409
+        assert reply.code == "builtin_binding"
+
+    @pytest.mark.asyncio
+    async def test_a_run_needs_a_capability_named(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        async with _client() as client:
+            reply = await _post(client, f"{routes.PREFIX}/config/conformance", {})
+        assert reply.status == 400
+        assert reply.code == "field_required"
+
+    @pytest.mark.asyncio
+    async def test_a_document_the_engine_refuses_is_not_reported_as_all_builtin(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        """A refused section and an unconfigured one are the same shape.
+
+        Resolving a document that binds an engine-floor name RAISES, and answering
+        that as "analysis is on its builtin, nothing to check" would report a
+        document a human has to repair as a clean one.
+        """
+        _store_document({"capabilities": {"audit_log": {"transport": "builtin"}}})
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert reply.status == 422
+        assert reply.code == "engine_floor_capability"
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_document_is_reported_as_unreadable(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        config_dir = default_root()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / CONFIG_FILENAME).write_text("{ not json", encoding="utf-8")
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+        assert reply.status == 409
+        assert reply.code == "config_unreadable"
+
+
+class TestStartingARunIsRecordedAsAnOperatorAction:
+    """It spawns the operator-configured program, so the trail is not optional."""
+
+    @pytest.mark.asyncio
+    async def test_a_started_run_records_the_program_it_spawned(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            reply = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            await _drain_conformance()
+        assert reply.status == 202
+        events = [
+            event
+            for event in recorded_sel.events
+            if event.get("operation") == "spec_engine_conformance_run"
+        ]
+        assert len(events) == 1
+        recorded = events[0]
+        assert recorded["outcome"] == "success"
+        assert recorded["caller"] == "operator"
+        # The program is named, because "a conformance run happened" does not say
+        # what was executed on this host.
+        assert "my-analyzer" in recorded["resources"]
+        assert "capability=analysis" in recorded["resources"]
+
+    @pytest.mark.asyncio
+    async def test_a_refused_run_records_no_success(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        """Non-vacuity: the record is of a run that started, not of a request."""
+        async with _client() as client:
+            await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+        assert [
+            event
+            for event in recorded_sel.events
+            if event.get("operation") == "spec_engine_conformance_run"
+        ] == []

@@ -27,6 +27,7 @@ planted-defect check by declaring, while the silent processor above fails it.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -489,6 +490,118 @@ class TestSchemaValidity:
         assert all(result.passed for result in timings)
 
 
+@dataclass
+class ReflectingStub:
+    """Returns a schema-invalid payload whose EXTRA KEY the provider authored.
+
+    The other half of what the ``malformed-response`` fixture is for. That
+    fixture's document quotes a response payload and asks its reader to return it;
+    a provider that reflects its input, or reads document text as instruction,
+    does so. The runner then has to say why the response failed, and a closed
+    object reports an unrecognised key BY NAMING IT — so the reason the runner
+    composes is partly written by whoever wrote that key.
+
+    ``schema_version`` is valid on purpose. An invalid one short-circuits
+    validation into a single engine-authored error before the payload's own keys
+    are ever walked, which would be an invalid-version test rather than this one.
+    """
+
+    #: The key a provider supplies. Long, and carrying a carriage return followed
+    #: by an erase-line sequence: the pair that rewrites whatever a terminal
+    #: printed on the line before.
+    key: str = "PWNED-" + "x" * 400 + "\r\x1b[2Kforged: this line was overwritten"
+    name: str = "reflecting-stub"
+
+    def respond(self, request: CapabilityRequest) -> Any:
+        payload = valid_payload(findings=[finding_on(PLANTED_REFS)])
+        payload[self.key] = True
+        return payload
+
+
+@dataclass
+class ObedientStub:
+    """Returns exactly the payload the ``malformed-response`` document asks for.
+
+    The fixture's own subject: document text handled as instruction rather than as
+    data. Quoted from the fixture module so the two cannot drift.
+    """
+
+    name: str = "obedient-stub"
+
+    def respond(self, request: CapabilityRequest) -> Any:
+        quoted = MALFORMED_RESPONSE_REQUIREMENTS.split("```json", 1)[1].split("```", 1)[0]
+        return json.loads(quoted)
+
+
+class TestAProviderCannotAuthorTheReportAboutItself:
+    """The schema reason is engine prose with provider tokens neutralised.
+
+    A violation is addressed by its PATH inside the response, and that path is
+    composed from the provider's own key names — the one provider-derived token in
+    the conformance module that reached a check detail without passing through
+    ``sanitized``, while the coverage tokens two methods below it did. A detail is
+    printed, logged, and pasted into an issue, so it is neutralised where the
+    reason is COMPOSED and no surface has to get its own escaping right for the
+    report to be safe.
+
+    What is guaranteed is neutralisation and a bound, not erasure: the key that
+    was unexpected is the diagnostic, so a bounded, control-character-free prefix
+    of it is what a reader needs and all they get.
+    """
+
+    def _schema_detail(self, candidate: Any) -> str:
+        report = RUNNER.run(
+            candidate, CAPABILITY, fixtures=[one_fixture(FIXTURE_MALFORMED_RESPONSE)]
+        )
+        results = results_for(report, CHECK_SCHEMA_VALIDITY)
+        assert results, report.report_text()
+        assert not results[0].passed
+        return str(results[0].detail)
+
+    def test_a_provider_authored_key_reaches_the_reason_without_its_control_bytes(self) -> None:
+        stub = ReflectingStub()
+        detail = self._schema_detail(stub)
+        assert "\r" not in detail
+        assert "\x1b" not in detail
+        assert "this line was overwritten" not in detail
+
+    def test_a_provider_cannot_choose_how_long_the_reason_is(self) -> None:
+        stub = ReflectingStub()
+        detail = self._schema_detail(stub)
+        # The whole fragment does not reach the detail: an unbounded copy would
+        # let one enormous key be the entire report, and would push the engine's
+        # own sentences about the other violations out of a reader's view.
+        assert stub.key not in detail
+        assert len(detail) < len(stub.key)
+
+    def test_a_provider_flooding_one_key_cannot_hide_the_other_reasons(self) -> None:
+        # Three violations are shown, so the bound is per violation rather than
+        # over the joined string -- otherwise the first enormous key consumes the
+        # budget and the reasons behind it vanish.
+        first = ReflectingStub(key="A" * 400, name="first-flooding-stub")
+
+        @dataclass
+        class ThreeBadKeysStub:
+            name: str = "three-bad-keys-stub"
+
+            def respond(self, request: CapabilityRequest) -> Any:
+                payload = valid_payload(findings=[finding_on(PLANTED_REFS)])
+                payload[first.key] = True
+                payload["second-unexpected-key"] = True
+                payload["third-unexpected-key"] = True
+                return payload
+
+        detail = self._schema_detail(ThreeBadKeysStub())
+        assert "second-unexpected-key" in detail
+        assert "third-unexpected-key" in detail
+
+    def test_a_provider_obeying_the_fixture_document_fails_the_schema_check(self) -> None:
+        # Non-vacuity for the fixture itself: the payload it quotes really is
+        # invalid, so a provider that returns it is caught rather than passed.
+        detail = self._schema_detail(ObedientStub())
+        assert "fails the published schema" in detail
+
+
 class TestPlantedDefectDetection:
     def test_a_silent_processor_fails_detection(self) -> None:
         report = RUNNER.run(SilentProcessorStub(), CAPABILITY)
@@ -803,6 +916,33 @@ class TestReportHonesty:
         assert record["passed"] is False
         assert record["capability"] == CAPABILITY
         assert any(entry["check"] == CHECK_PLANTED_DEFECT for entry in record["results"])
+
+    def test_a_declined_detection_survives_serialization(self) -> None:
+        """Without this, JSON says an unqualified pass about a declining provider.
+
+        The default builtin passes the detection check by declaring the document
+        skipped rather than by finding the defect. ``summary()`` names that in the
+        verdict line; a surface reading only the JSON saw ``passed`` true and every
+        check passing, which is the one outcome this runner exists to prevent.
+        """
+        report = verify_builtin(default_builtins()[CAPABILITY], CAPABILITY)
+        record = report.to_json_object()
+        assert report.declined_detections > 0, report.report_text()
+        assert record["declined_detections"] == report.declined_detections
+        declining = [
+            entry
+            for entry in record["results"]
+            if entry["check"] == CHECK_PLANTED_DEFECT and entry["excused"]
+        ]
+        assert declining, record["results"]
+        # The pair a surface needs together: passed, and passed by declining.
+        assert all(entry["passed"] is True for entry in declining)
+
+    def test_a_detecting_candidate_serializes_no_declined_detections(self) -> None:
+        """Non-vacuity: the number moves, so a nonzero one above means something."""
+        record = RUNNER.run(ConformingStub(), CAPABILITY).to_json_object()
+        assert record["declined_detections"] == 0
+        assert all(entry["excused"] == 0 for entry in record["results"])
 
     def test_the_summary_counts_what_ran(self) -> None:
         report = RUNNER.run(ConformingStub(), CAPABILITY)

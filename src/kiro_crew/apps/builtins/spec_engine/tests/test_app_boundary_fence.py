@@ -109,6 +109,12 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "geometry lives.",
     ),
     (
+        "website/src/test/specEngineFetchStub.ts",
+        "A test-only helper under the shared test tree, answering this app's own read "
+        "surface for the suites that mount its page; it names no route any other app "
+        "serves, and the alternative is one hand-rolled fetch router per suite.",
+    ),
+    (
         "website/src/components/appstore/appManifest.ts",
         "The shared store key table; an app has no card without its own row here.",
     ),

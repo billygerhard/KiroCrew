@@ -36,10 +36,12 @@ from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
     CapabilityRegistry,
     CapabilityRequest,
     CapabilityResponse,
+    CommandProviderTransport,
     Coverage,
     DeclaredSkipProvider,
     EngineFloorViolation,
     FindingSeverity,
+    McpProviderTransport,
     ProviderKind,
     ProviderNature,
     RecordingCostSink,
@@ -50,6 +52,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.capabilities import (
     Untrusted,
     builtin_identity,
     resolve_bindings,
+    transport_for,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     DASHBOARD_SURFACE,
@@ -309,6 +312,53 @@ class TestBindingResolution:
         # A builtin's nature is shown because "the checks found nothing" and "a
         # model reported nothing" are different claims.
         assert analysis["provider"]["nature"] == ProviderNature.DETERMINISTIC.value
+
+
+class TestOneSpellingOfBindingToTransport:
+    """The construction the registry and the conformance runner share.
+
+    A conformance report is built from a candidate that deliberately bypasses the
+    registry — the registry degrades a broken provider to its builtin, which would
+    hide the failure the report exists to reveal — so it needs the same
+    binding-to-transport step the invocation path uses. Two copies of it is how the
+    one that drifts becomes the one a report is built from.
+    """
+
+    def test_each_external_transport_is_built_from_the_bindings_argv_and_env(self) -> None:
+        command = transport_for(
+            Binding("analysis", TRANSPORT_COMMAND, argv=("analyzer", "--json"), env={"K": "V"})
+        )
+        assert isinstance(command, CommandProviderTransport)
+        assert command.argv == ("analyzer", "--json")
+        assert command.env == {"K": "V"}
+        mcp = transport_for(Binding("analysis", TRANSPORT_MCP, argv=("server", "--stdio")))
+        assert isinstance(mcp, McpProviderTransport)
+        assert mcp.argv == ("server", "--stdio")
+
+    def test_a_binding_with_nothing_to_run_builds_no_transport(self) -> None:
+        """``None`` covers both cases: the builtin is not reached over a transport
+        at all, and an external binding naming no argv has nothing to spawn."""
+        assert transport_for(Binding("analysis", TRANSPORT_BUILTIN)) is None
+        assert transport_for(Binding("analysis", TRANSPORT_COMMAND)) is None
+
+    def test_the_registry_builds_its_transport_through_the_same_function(
+        self, store: ConfigStore
+    ) -> None:
+        """The method is a delegation, so a change to the construction reaches the
+        invocation path rather than only the conformance path."""
+        binding = Binding("analysis", TRANSPORT_COMMAND, argv=("analyzer",))
+        built = CapabilityRegistry(store)._transport_for(binding)
+        assert isinstance(built, CommandProviderTransport)
+        assert built.argv == transport_for(binding).argv  # type: ignore[union-attr]
+
+    def test_an_injected_transport_still_wins_over_the_built_one(
+        self, store: ConfigStore
+    ) -> None:
+        """Injection is the registry's own concern and stays on the method: a host
+        or a test substituting a transport must not be overridden by construction."""
+        stub = StubTransport(payload={})
+        registry = registry_with(store, stub)
+        assert registry._transport_for(Binding("analysis", TRANSPORT_COMMAND, argv=("x",))) is stub
 
 
 class TestExternalProviderSuccess:

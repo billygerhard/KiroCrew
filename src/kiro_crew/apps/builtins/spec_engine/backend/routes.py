@@ -33,7 +33,7 @@ widen its own autonomy or lift its own stop. So every MUTATING handler refuses
 an app token with 403 and a security event, and refuses an unauthenticated
 caller with 401.
 
-Reads deliberately stop at 401. An app token may READ all seven read routes,
+Reads deliberately stop at 401. An app token may READ every read route,
 and the rationale differs by route. The configuration reads are equivalence: the
 values come back with credential-classified values elided, and an agent already
 has the same read through the Engine_MCP_Server's ``get_config``, so refusing
@@ -44,12 +44,21 @@ gate-severity, capability, engine-floor, workflow-preset, role, effort,
 profile-pinnable-key and level vocabularies, and the pipeline-stage grouping
 those are presented under — data the app package itself ships, carrying no stored
 value at all, so it is strictly less than the
-document read the same token already reaches. The per-source autonomy
+document read the same token already reaches. The capability-binding read is a
+projection of that same document: it names the provider bound to each capability,
+the program an external binding runs, and the path the binding was declared at,
+and it carries no ``env`` entry at all — so nothing an operator stored there as a
+credential can ride out on it. The per-source autonomy
 grid joins them: it carries resolved autonomy levels and the configuration paths
 that declared them, which is a projection of a document the same agent can
 already read, and no credential-classified value appears in it. Reading how far
 a source may run unattended is also not the authority to change it — that is the
-config write, which is operator-only. The queue, run-spend and kill-switch reads
+config write, which is operator-only. The conformance POLL sits with them: it
+reports a run's own verdict and per-check reasons about a program the same token
+can already read the binding for, and it carries no part of that binding — the
+binding travels as a digest precisely so an ``env`` value cannot ride out on a
+report. STARTING a run is the opposite and is operator-only, because that spawns
+the program. The queue, run-spend and kill-switch reads
 have NO MCP equivalent — an app token gains reads here it could not otherwise
 obtain (queue rows with source and item ids, per-run spend, kill-switch state
 with stoppable run ids). That is accepted, not overlooked:
@@ -107,7 +116,12 @@ with no import-time work of its own.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import shutil
+import uuid
+from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
@@ -133,6 +147,19 @@ from ..engine.budget import ceiling as engine_ceiling
 from ..engine.budget import killswitch as engine_killswitch
 from ..engine.budget import ledger as engine_ledger
 from ..engine.budget import switch as engine_switch
+from ..engine.capabilities import (
+    Binding,
+    CapabilityRegistry,
+    EngineFloorViolation,
+    TransportCandidate,
+    UnknownCapability,
+    register_builtins,
+    require_delegable,
+    resolve_bindings,
+    transport_for,
+    verify,
+)
+from ..engine.capabilities.contracts import sanitized
 from ..engine.config import (
     APP_NAME,
     AUTONOMY_LEVELS,
@@ -167,9 +194,27 @@ from ..engine.config import (
     stage_setting_groups,
     validate_config_document,
 )
-from ..engine.config.schema import SECTION_SOURCES
+from ..engine.config.schema import SECTION_SOURCES, SECTION_WORKFLOW, WORKFLOW_PRESETS_KEY
 from ..engine.config.settings import SCOPE_PRECEDENCE, Setting
-from ..engine.delivery import WORKFLOW_PRESET_NAMES, gate_presets
+from ..engine.delivery import (
+    DELIVERY_FLOW_STAGES,
+    ISOLATE_STAGE,
+    MAX_PRESET_NAME_CHARS,
+    TEARDOWN_STAGE,
+    WORKFLOW_PRESET_NAMES,
+    DeliveryWorkflow,
+    QualityGate,
+    gate_presets,
+    load_quality_gates,
+    stage_origins,
+)
+
+# The engine's OWN reachability answer, the one a run's prerequisite gate reports
+# against. Aliased the way ``engine/setup.py`` takes ``_program_check`` from the
+# same module: a second PATH lookup written here could call a provider reachable
+# that the gate then refuses, which is the one disagreement this surface must not
+# be able to have.
+from ..engine.prerequisites import _provider_checks as provider_checks
 from ..engine.roles import RolePlan
 from ..engine.watch.sources import (
     WATCH_SOURCE_PRESET_HOSTS,
@@ -673,6 +718,115 @@ async def handle_get_resolved_config(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+# --- the capability bindings --------------------------------------------------
+
+
+def _no_model_catalog() -> tuple[str, ...]:
+    """The model resolver a description read never calls.
+
+    :func:`register_builtins` needs one to construct the host model catalog
+    provider, but :meth:`CapabilityRegistry.describe` reads provider IDENTITIES
+    and serves no request — and the catalog's identity is deterministic whatever
+    it would resolve — so nothing this returns can reach a payload. A real
+    resolver here would be a host call made for a value nobody reads.
+    """
+    return ()
+
+
+def _capabilities_snapshot() -> dict[str, Any]:
+    """BLOCKING — every delegable capability's bound provider and its reachability.
+
+    Two engine answers joined, neither recomputed here.
+    :meth:`CapabilityRegistry.describe` is the engine's own per-capability
+    provider description, written for a configuration surface: which provider
+    serves the capability, whether an operator declared the binding and where,
+    and the resolved deadline one call gets. ``_provider_checks`` is the engine's
+    own reachability answer, the same one a run's prerequisite gate reports
+    against — so a binding this surface calls reachable is one a run would accept,
+    rather than a second PATH lookup that could disagree with the gate.
+
+    ``register_builtins`` runs over the registry for one reason: until it does,
+    authoring, review and implementation resolve to the shipped deterministic
+    no-coverage default, which reports a path that spends credits as one that
+    spends nothing. The model resolver it needs is never called — ``describe``
+    reads provider IDENTITIES and serves no request, and the host catalog's
+    identity is deterministic whatever it would resolve — so an empty catalog here
+    cannot reach a payload.
+
+    ``reachable`` is three-valued on purpose. A builtin binding is reachable by
+    construction (it is this engine), so the engine's check skips it entirely and
+    this reports ``None`` rather than coercing "not applicable" into ``False`` —
+    which would read as a broken provider on every unconfigured capability.
+
+    No project is selected. The engine reads bindings from ONE app-wide section
+    with no per-project layer, so a project-scoped read would imply a scope that
+    does not exist. The one project-sensitive value is the resolved timeout, which
+    therefore travels at app scope.
+    """
+    store = _config_store()
+    registry = CapabilityRegistry(store)
+    register_builtins(registry, model_resolver=_no_model_catalog)
+    bindings = registry.bindings()
+    # Keyed by declaring path, which is what both sides of the join hold: a
+    # delegated binding always carries the dotted path it was declared at, and the
+    # engine's check reports the same path so an operator is told where to fix it.
+    checks = {
+        check.declared_at: check
+        for check in provider_checks(store, shutil.which)
+        if check.declared_at
+    }
+    described: list[dict[str, Any]] = []
+    for entry in registry.describe():
+        binding = bindings[str(entry["capability"])]
+        check = None if binding.is_builtin else checks.get(binding.declared_at)
+        described.append(
+            {
+                **entry,
+                "program": binding.program,
+                "reachable": None if check is None else check.met,
+                "action": "" if check is None else check.action,
+            }
+        )
+    return {
+        "configured": store.path.is_file(),
+        "capabilities": described,
+    }
+
+
+async def handle_get_capabilities(request: web.Request) -> web.Response:
+    """GET each capability's bound provider, and whether it can be reached.
+
+    The write side of this surface has no second door: ``capabilities`` is one of
+    the engine's :data:`CONFIG_ONLY_PATHS`, so the agent-facing ``write_config``
+    MCP tool refuses it and an operator-confirmed surface is the only path that
+    can bind one. This read is the other half of that pair.
+    """
+    try:
+        payload = await asyncio.to_thread(_capabilities_snapshot)
+    except (EngineFloorViolation, UnknownCapability) as exc:
+        # A stored section the engine refuses to resolve at all. Reported as its
+        # own failure rather than allowed to unwind, and NEVER as the all-builtin
+        # map an unconfigured document legitimately resolves to: those two are the
+        # same shape and opposite facts, and conflating them would show a refused
+        # document as a clean one. Named rather than caught as CapabilityError so a
+        # future sibling is not swallowed silently.
+        return _refuse("capabilities_unreadable", str(exc), status=422)
+    except ConfigValidationError as exc:
+        # The same condition reached through the config layer: a section that is
+        # not an object, or an entry naming a capability the engine does not have.
+        # Must precede any ValueError arm -- ConfigValidationError derives it.
+        return _refuse(
+            "capabilities_unreadable",
+            "; ".join(str(error) for error in exc.errors),
+            status=422,
+        )
+    except ConfigLoadError as exc:
+        return _refuse("config_unreadable", str(exc), status=409)
+    except OSError as exc:
+        return _refuse("config_unreadable", str(exc), status=503)
+    return web.json_response(payload)
+
+
 # --- the form vocabulary ----------------------------------------------------
 
 
@@ -834,6 +988,188 @@ async def handle_get_config_registry(request: web.Request) -> web.Response:
     return web.json_response(_registry_payload())
 
 
+# --- the delivery workflow and its gates ------------------------------------
+
+#: Cap on a rendered gate name. The write door constrains a gate name to a
+#: non-empty string and nothing else, so the ceiling is here for the reason
+#: :data:`~..engine.delivery.MAX_PRESET_NAME_CHARS` exists on the preset display:
+#: a hand-edited document must not be able to set the width of a surface's row.
+MAX_GATE_NAME_CHARS = 64
+
+#: Run point of a stage that is not part of the delivery flow, and of the flow
+#: itself. Projected per stage because the fact lives in two engine modules --
+#: ``DELIVERY_FLOW_STAGES`` is fixed in the flow and the teardown stage is
+#: executed by archive -- and a client keeping its own copy of it would be one
+#: rename away from telling an operator that teardown runs with the others.
+RUN_POINT_ISOLATION = "isolation"
+RUN_POINT_DELIVERY = "delivery"
+RUN_POINT_ARCHIVE = "archive"
+
+#: Which point each declared delivery stage runs at. A stage absent from this map
+#: projects an empty run point, which means "this projection has no answer for a
+#: stage the engine grew" and must NOT be read as "does not run": an unmapped
+#: stage is a table to extend, not a stage to describe as inert.
+_STAGE_RUN_POINTS: dict[str, str] = {
+    ISOLATE_STAGE: RUN_POINT_ISOLATION,
+    **{stage: RUN_POINT_DELIVERY for stage in DELIVERY_FLOW_STAGES},
+    TEARDOWN_STAGE: RUN_POINT_ARCHIVE,
+}
+
+
+def _gate_payload(gate: QualityGate) -> dict[str, Any]:
+    """One configured gate, as a form reads it.
+
+    ``blocking`` travels beside ``severity`` because it is the ENGINE's own
+    reading of that severity. A client deciding for itself whether a severity
+    stops a run is how a surface comes to describe a flow the engine does not
+    run.
+
+    The name and the declaring path are document-authored -- the write door
+    constrains the name to a non-empty string and nothing more -- so both are
+    rendered through ``sanitized`` on the way to a label, for the same reason
+    ``StageOrigin`` sanitizes its own preset name.
+    """
+    return {
+        "name": sanitized(gate.name, limit=MAX_GATE_NAME_CHARS),
+        "position": gate.position,
+        "severity": gate.severity,
+        "blocking": gate.blocking,
+        # The templates as configured, which is what a configuration surface is
+        # editing: a rendered argv would have run-time variables substituted and
+        # could not be written back.
+        "commands": [list(command.source) for command in gate.commands],
+        "origin": gate.origin.value,
+        "declared_at": sanitized(gate.declared_at),
+    }
+
+
+def _user_preset_names(document: Mapping[str, Any]) -> list[str]:
+    """The user-defined workflow preset names, in declaration order.
+
+    App level only, and read from the document rather than resolved per project:
+    ``_check_workflow`` admits definitions app-wide alone, so a project has no
+    preset set of its own to offer. The bundled names are NOT merged in here --
+    they are constants and travel on the registry read, and a chooser that could
+    not tell the two apart is the ambiguity reserving bundled names prevents.
+    """
+    workflow = document.get(SECTION_WORKFLOW)
+    if not isinstance(workflow, Mapping):
+        return []
+    definitions = workflow.get(WORKFLOW_PRESETS_KEY)
+    if not isinstance(definitions, Mapping):
+        return []
+    return [sanitized(str(name), limit=MAX_PRESET_NAME_CHARS) for name in definitions]
+
+
+def _workflow_snapshot(project: str | None) -> dict[str, Any]:
+    """BLOCKING — the delivery workflow in force for *project*, and the gates.
+
+    A projection of what the engine resolved, never a second resolution.
+    ``stage_origins`` answers which layer supplied each stage's commands, and it
+    is consumed rather than reproduced for the reason its own module states: the
+    layering lives in :class:`~..engine.delivery.DeliveryWorkflow`, and a surface
+    that re-derived it would name the wrong layer with confidence on the first
+    day the two disagreed. Both distinctions that module is required to keep
+    therefore survive to the wire untouched -- a stage nobody defines says
+    ``unconfigured`` rather than reporting the preset's name, and a user-defined
+    preset says ``user_preset`` rather than being flattened onto a bundled one.
+
+    Built from ONE read of the document, like its sibling reads: ``stage_origins``
+    and ``load_quality_gates`` each take what they are given, so a write landing
+    between two reads cannot produce a reply whose stages and gates come from
+    different documents.
+
+    ``argv`` is added beside the engine row's command COUNT because a form edits
+    commands and a count cannot be edited. It comes from the same
+    ``DeliveryWorkflow`` instance ``stage_origins`` resolved against, so it is
+    that stage's resolved commands rather than a second reading of precedence.
+
+    An unparseable gate list is reported as unreadable with ``gates`` NULL rather
+    than as an empty list, because the engine refuses delivery outright in that
+    case: "no gates" would tell an operator that nothing is configured when what
+    is actually true is that every check is off until the document is repaired.
+
+    A ``ValueError`` from the display path is deliberately not caught here. It
+    means a resolution layer with no display answer, which is an engine invariant
+    rather than a document to repair, and reporting it as a validation failure
+    would send an operator to edit configuration that is correct.
+    """
+    store = _config_store()
+    document = store.document()
+    workflow = DeliveryWorkflow(document, project=project)
+    selection = workflow.selected_preset()
+    stages: list[dict[str, Any]] = []
+    for origin in stage_origins(workflow):
+        row = origin.to_json_object()
+        resolved = workflow.stage(origin.stage)
+        row["argv"] = [list(command.source) for command in resolved.commands] if resolved else []
+        row["runs_at"] = _STAGE_RUN_POINTS.get(origin.stage, "")
+        stages.append(row)
+    payload: dict[str, Any] = {
+        "configured": store.path.is_file(),
+        "project": project,
+        # The selection, separately from the stages it supplied: a preset is
+        # changed by selecting another one, and an overridden stage is changed
+        # where the override is declared. Null when nothing selected one.
+        "preset": (
+            {
+                "name": sanitized(selection.name, limit=MAX_PRESET_NAME_CHARS),
+                "origin": selection.origin.value,
+                "declared_at": sanitized(selection.declared_at),
+                "bundled": selection.bundled,
+            }
+            if selection is not None
+            else None
+        ),
+        "stages": stages,
+        "user_presets": _user_preset_names(document),
+        # The flow's own order, so a client renders which stages a delivery runs
+        # without inferring it from the schema order every stage appears in.
+        "delivery_flow_stages": list(DELIVERY_FLOW_STAGES),
+        # Gates are app-level: ``load_quality_gates`` takes no project, and a
+        # project does not select a different set. Relayed so a form can say so
+        # rather than implying the list resolves for the project above.
+        "gates_scope_is_app": True,
+    }
+    try:
+        gates = load_quality_gates(document)
+    except ConfigValidationError as exc:
+        payload["gates"] = None
+        payload["gates_unreadable"] = True
+        payload["gate_errors"] = [
+            {"path": error.path, "message": error.message} for error in exc.errors
+        ]
+    else:
+        payload["gates"] = [_gate_payload(gate) for gate in gates]
+        payload["gates_unreadable"] = False
+        payload["gate_errors"] = []
+    return payload
+
+
+async def handle_get_config_workflow(request: web.Request) -> web.Response:
+    """GET the delivery workflow in force for a project, and the gate list.
+
+    Project-scoped like the resolved read, because a project selects its own
+    preset and may override a stage; the gate list beside it is not, and says so.
+    """
+    project = request.query.get("project") or None
+    try:
+        payload = await asyncio.to_thread(_workflow_snapshot, project)
+    except ConfigValidationError as exc:
+        # A stored workflow nobody can act on: an unknown preset name, or a stage
+        # whose commands do not parse. Reported by path like the resolved read's
+        # equivalent arm, and ABOVE nothing that catches ValueError, which this
+        # derives. Distinct from the gate arm inside the snapshot: a workflow that
+        # does not resolve has no stage rows to state a failure against, while an
+        # unreadable gate list still has a workflow worth showing beside it.
+        return _refuse("config_invalid", "; ".join(str(error) for error in exc.errors), status=422)
+    except ConfigLoadError as exc:
+        return _refuse("config_unreadable", str(exc), status=409)
+    except OSError as exc:
+        return _refuse("config_unreadable", str(exc), status=503)
+    return web.json_response(payload)
+
+
 # --- the per-source autonomy grid --------------------------------------------
 
 
@@ -965,6 +1301,350 @@ async def handle_get_sources(request: web.Request) -> web.Response:
     except OSError as exc:
         return _refuse("config_unreadable", str(exc), status=503)
     return web.json_response(payload)
+
+
+# --- provider conformance: a job, never a request ---------------------------
+#
+# The bundled suite decides this shape; nothing here is a matter of taste.
+# ``suite_for`` gives a document capability five fixtures, four of which run the
+# repeatability check and so call the candidate a SECOND time on the same
+# request: nine invocations, each spawning a child process through the package's
+# sandbox chokepoint. It generates a >= 256 KiB requirements document on every
+# call and writes every fixture document to disk. It is fully synchronous, and it
+# enforces NO aggregate deadline of its own -- it measures each call and reports,
+# with no cap, no cancellation and no watchdog. Inline in a handler that blocks
+# the gateway's event loop for the whole run; behind a blocking request it holds
+# the request open for minutes. So the POST starts a job and returns, the GET
+# polls a stored report, and the run happens in a worker thread.
+
+
+#: Per-invocation deadline a conformance run puts on the candidate.
+#:
+#: Chosen HERE and deliberately NOT read from ``binding.timeout_s``.
+#: :meth:`CapabilityRegistry.timeout_for` lets a per-binding ``timeout_s`` sit
+#: ABOVE the app setting's floor with no clamp, which is right for a real
+#: invocation -- a provider whose work is genuinely slower is a reason to raise
+#: its own ceiling rather than everyone's -- and wrong for a probe an operator
+#: started from a page. Nine invocations with no aggregate deadline means the
+#: binding's number is multiplied by nine: at this bound the worst case is a
+#: couple of minutes, and at a binding declaring ``timeout_s: 300`` it would be
+#: roughly three quarters of an hour of held resources for a check nobody is
+#: watching.
+CONFORMANCE_DEADLINE_S = 10
+
+#: A run is in flight; no outcome exists yet.
+CONFORMANCE_RUNNING = "running"
+
+#: A run finished and its report is attached.
+CONFORMANCE_COMPLETE = "complete"
+
+#: A run started and produced no report — the suite itself could not be carried
+#: out. Its own status rather than ``complete`` with an empty report, because
+#: "complete, no failures" is exactly how the absence of an outcome gets read as
+#: a pass.
+CONFORMANCE_FAILED = "failed"
+
+#: No run has been started for this capability on this gateway.
+CONFORMANCE_ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class _ConformanceJob:
+    """One capability's most recent conformance run.
+
+    Held in memory only, which is a decision rather than an omission: a report
+    describes the binding it ran against, and nothing durable would say that the
+    binding is still that one. A restarted gateway therefore reports ``absent``
+    and an operator runs the check again, instead of being shown a verdict about
+    configuration that may have changed while the process was down.
+    """
+
+    capability: str
+    job_id: str
+    #: The label the report's ``candidate`` carries: the program, or the transport
+    #: name when the binding names no program.
+    candidate: str
+    #: Digest of the binding this run was started against.
+    fingerprint: str
+    status: str
+    report: dict[str, Any] | None = None
+    error: str = ""
+
+
+#: The most recent run per capability. Keyed by CAPABILITY rather than by job id
+#: because "is one already running for this capability" is the question the POST
+#: has to answer, and a second index keyed the other way would be a second thing
+#: to keep consistent with this one.
+_CONFORMANCE_JOBS: dict[str, _ConformanceJob] = {}
+
+#: Strong references to the in-flight background tasks. ``asyncio`` keeps only a
+#: weak reference to a running task, so a task nobody else holds can be collected
+#: mid-run — and the job would stay recorded as running for the life of the
+#: gateway, with the poll route reporting a run that is not happening.
+_CONFORMANCE_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _binding_fingerprint(binding: Binding) -> str:
+    """A digest of everything about *binding* that decides what a run invokes.
+
+    Digested rather than relayed because ``env`` may carry a credential: a client
+    needs to know THAT the binding moved, never what it moved to. Every field the
+    transport reads is in it, so editing an argument or a token invalidates an
+    earlier report the same way replacing the program does.
+    """
+    material = json.dumps(
+        {
+            "transport": binding.transport,
+            "command": list(binding.argv),
+            "env": dict(sorted(binding.env.items())),
+            "timeout_s": binding.timeout_s,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _conformance_binding(capability: str) -> Binding:
+    """BLOCKING — the binding *capability* resolves to.
+
+    ``require_delegable`` first, so a floor name is refused as a floor name rather
+    than as a missing key in the resolved map.
+    """
+    require_delegable(capability)
+    return resolve_bindings(_config_store())[capability]
+
+
+def _run_conformance(capability: str, binding: Binding) -> dict[str, Any]:
+    """BLOCKING — put *binding*'s provider through *capability*'s bundled suite.
+
+    :class:`TransportCandidate` is built straight from the binding rather than
+    reached through the registry, and that is the point of the whole route: the
+    registry degrades a broken provider to its builtin and continues, which is
+    right for a run and would hide precisely what a conformance report exists to
+    reveal.
+
+    ``deadline_s`` is :data:`CONFORMANCE_DEADLINE_S`. ``root`` is left unset so
+    the runner materialises its fixtures in a temporary directory it removes:
+    passing one would leave a quarter of a megabyte of fixture documents behind
+    per run, since a caller-owned root is deliberately not cleaned up.
+    """
+    transport = transport_for(binding)
+    if transport is None:
+        raise ValueError(
+            f"the binding for {capability} names no program to run, so there is "
+            "nothing to put through the suite"
+        )
+    candidate = TransportCandidate(
+        transport=transport, label=binding.program or binding.transport
+    )
+    return verify(candidate, capability, deadline_s=CONFORMANCE_DEADLINE_S).to_json_object()
+
+
+def _record_conformance(job: _ConformanceJob) -> None:
+    """Store *job* unless a newer run for the same capability has replaced it.
+
+    The concurrency refusal below means a second run cannot start while this one
+    is recorded as running, so supersession should be unreachable — checked
+    anyway, because a background task writing over a state it has not read is how
+    a stale verdict outlives the run that replaced it.
+    """
+    recorded = _CONFORMANCE_JOBS.get(job.capability)
+    if recorded is not None and recorded.job_id != job.job_id:
+        logger.warning(
+            "spec-engine: conformance job %s for %s was superseded; result discarded",
+            job.job_id,
+            job.capability,
+        )
+        return
+    _CONFORMANCE_JOBS[job.capability] = job
+
+
+async def _conformance_worker(job: _ConformanceJob, binding: Binding) -> None:
+    """Run the suite off the event loop and record whatever it produced."""
+    try:
+        report = await asyncio.to_thread(_run_conformance, job.capability, binding)
+    except Exception as exc:  # noqa: BLE001 - nothing may escape a background task
+        # Broad in two directions. The runner already turns a candidate's own
+        # crash into a failed CHECK, so anything arriving here is the run failing
+        # to happen at all -- an unwritable temporary directory, a binding with no
+        # program. And an exception escaping a background task leaves the job
+        # recorded as running for the life of the gateway while the poll route
+        # reports a run nobody is doing.
+        logger.warning(
+            "spec-engine: conformance run for %s did not complete",
+            job.capability,
+            exc_info=True,
+        )
+        _record_conformance(
+            replace(job, status=CONFORMANCE_FAILED, error=f"{exc.__class__.__name__}: {exc}")
+        )
+        return
+    _record_conformance(replace(job, status=CONFORMANCE_COMPLETE, report=report))
+
+
+def _conformance_payload(
+    capability: str, job: _ConformanceJob | None, *, current: str
+) -> dict[str, Any]:
+    """One capability's conformance state, with the run's verdict above the checks.
+
+    ``report.passed`` is the engine's own verdict and is deliberately not "no
+    failures": it is false whenever a declared check never ran or the suite
+    produced nothing, so a surface reading the top of this payload cannot present
+    a greener answer than the report supports. That ordering matters for one check
+    in particular. The transport SIGKILLs a provider's child AT its deadline, so a
+    provider that ignored the deadline still MEASURES as answering inside the
+    grace period: ``timeout_honoring`` typically PASSES while the other four
+    checks fail with "the candidate raised TransportFailure". That green check is
+    reassurance about nothing, and the verdict is what a reader must take away.
+
+    ``stale`` is derived here rather than left to a client. A client is never
+    shown the binding's ``env`` values, so any fingerprint it computed would be a
+    fingerprint of something else — and comparing the wrong two things is how an
+    earlier outcome goes on being presented as describing the current binding.
+    """
+    if job is None:
+        return {
+            "capability": capability,
+            "status": CONFORMANCE_ABSENT,
+            "job_id": "",
+            "candidate": "",
+            "binding_fingerprint": "",
+            "binding_current": current,
+            "stale": False,
+            "deadline_s": CONFORMANCE_DEADLINE_S,
+            "error": "",
+            "report": None,
+        }
+    return {
+        "capability": capability,
+        "status": job.status,
+        "job_id": job.job_id,
+        "candidate": job.candidate,
+        "binding_fingerprint": job.fingerprint,
+        "binding_current": current,
+        "stale": current != job.fingerprint,
+        "deadline_s": CONFORMANCE_DEADLINE_S,
+        "error": job.error,
+        "report": job.report,
+    }
+
+
+async def _binding_or_refusal(capability: str) -> Binding | web.Response:
+    """*capability*'s binding, or the refusal to send instead of one.
+
+    Shared by both conformance routes so the two cannot answer a refused document
+    differently. The arms mirror the capability read's: a floor or unknown name is
+    the engine refusing the question, an unresolvable section is a repair, an
+    unparseable file is a 409 and a disk failure a 503.
+    """
+    if not capability:
+        return _refuse("field_required", "a conformance run needs the capability to check")
+    try:
+        return await asyncio.to_thread(_conformance_binding, capability)
+    except EngineFloorViolation as exc:
+        # Named rather than caught as CapabilityError so a future sibling is not
+        # swallowed. The floor is not bindable, so there is no candidate to check.
+        return _refuse("engine_floor_capability", str(exc), status=422)
+    except UnknownCapability as exc:
+        return _refuse("unknown_capability", str(exc), status=404)
+    except ConfigValidationError as exc:
+        # Must precede any ValueError arm -- ConfigValidationError derives it.
+        return _refuse(
+            "capabilities_unreadable",
+            "; ".join(str(error) for error in exc.errors),
+            status=422,
+        )
+    except ConfigLoadError as exc:
+        return _refuse("config_unreadable", str(exc), status=409)
+    except OSError as exc:
+        return _refuse("config_unreadable", str(exc), status=503)
+
+
+async def handle_post_conformance(request: web.Request) -> web.Response:
+    """Start a conformance run against a capability's configured provider.
+
+    Operator-only and SEL-audited because it SPAWNS the operator-configured
+    program — up to nine times — which is authority no app-minted token gets
+    inside this app's namespace.
+
+    Returns ``202`` with a job id and no outcome. The reasoning is in the section
+    comment above: the suite is synchronous, spawns a child per invocation, and
+    caps nothing in aggregate.
+    """
+    body = await _json_object(request)
+    if isinstance(body, web.Response):
+        return body
+    capability = _text(body, "capability")
+    binding = await _binding_or_refusal(capability)
+    if isinstance(binding, web.Response):
+        return binding
+    if binding.is_builtin:
+        return _refuse(
+            "builtin_binding",
+            f"{capability} is bound to its builtin, so there is no configured "
+            "provider to check; the engine verifies its own builtins in its suite",
+            status=409,
+        )
+    # Read the current state and claim it in ONE synchronous stretch, with no
+    # await between the two statements: handlers run on the gateway's single
+    # event loop, so a coroutine that does not yield cannot be interleaved. A lock
+    # would guard nothing the loop does not already guarantee -- but splitting
+    # these two with an await WOULD let two POSTs both pass the check and both
+    # start a run against the same program.
+    running = _CONFORMANCE_JOBS.get(capability)
+    if running is not None and running.status == CONFORMANCE_RUNNING:
+        return _refuse(
+            "conformance_running",
+            f"a conformance run for {capability} is already in progress as job "
+            f"{running.job_id}; it invokes the configured provider up to nine "
+            "times, so a second run would double that load against one program",
+            status=409,
+        )
+    job = _ConformanceJob(
+        capability=capability,
+        job_id=uuid.uuid4().hex,
+        candidate=binding.program or binding.transport,
+        fingerprint=_binding_fingerprint(binding),
+        status=CONFORMANCE_RUNNING,
+    )
+    _CONFORMANCE_JOBS[capability] = job
+    task = asyncio.create_task(_conformance_worker(job, binding))
+    _CONFORMANCE_TASKS.add(task)
+    task.add_done_callback(_CONFORMANCE_TASKS.discard)
+    _sel_event(
+        caller=_actor(request) or SURFACE_INITIATOR,
+        operation="spec_engine_conformance_run",
+        outcome="success",
+        resources=(
+            f"capability={capability} transport={binding.transport} "
+            f"program={binding.program} job={job.job_id}"
+        ),
+    )
+    return web.json_response(
+        {"ok": True, **_conformance_payload(capability, job, current=job.fingerprint)},
+        status=202,
+    )
+
+
+async def handle_get_conformance(request: web.Request) -> web.Response:
+    """GET whether a conformance run is in flight, finished, or was never started.
+
+    The binding is resolved on every poll rather than only when a run starts,
+    because ``stale`` is the answer to "does this report still describe what is
+    configured" and that answer changes when the document does, not when the run
+    does.
+    """
+    capability = request.match_info.get("capability", "")
+    binding = await _binding_or_refusal(capability)
+    if isinstance(binding, web.Response):
+        return binding
+    return web.json_response(
+        _conformance_payload(
+            capability,
+            _CONFORMANCE_JOBS.get(capability),
+            current=_binding_fingerprint(binding),
+        )
+    )
 
 
 # --- the setup assistant ----------------------------------------------------
@@ -1601,7 +2281,23 @@ def register_routes(app: web.Application) -> None:
     add("PUT", f"{PREFIX}/config", _mutate(handle_put_config, operation="config_write"))
     add("GET", f"{PREFIX}/config/resolved", _read(handle_get_resolved_config))
     add("GET", f"{PREFIX}/config/registry", _read(handle_get_config_registry))
+    add("GET", f"{PREFIX}/config/workflow", _read(handle_get_config_workflow))
     add("GET", f"{PREFIX}/config/sources", _read(handle_get_sources))
+    add("GET", f"{PREFIX}/config/capabilities", _read(handle_get_capabilities))
+
+    # Conformance is a JOB. The POST is operator-only because it spawns the
+    # operator-configured program up to nine times; the GET polls the report it
+    # left behind. See the section comment beside the handlers.
+    add(
+        "POST",
+        f"{PREFIX}/config/conformance",
+        _mutate(handle_post_conformance, operation="conformance_run"),
+    )
+    add(
+        "GET",
+        f"{PREFIX}/config/conformance/{{capability}}",
+        _read(handle_get_conformance),
+    )
 
     # The setup flow. All three are POSTs behind the operator guard, and the first
     # two write nothing: they read a project path the CALLER names, so leaving them

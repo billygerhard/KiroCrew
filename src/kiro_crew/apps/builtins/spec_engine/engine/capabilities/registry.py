@@ -529,17 +529,16 @@ class CapabilityRegistry:
         return response
 
     def _transport_for(self, binding: Binding) -> CapabilityTransport | None:
-        """Build the transport for *binding*, or ``None`` when it is unusable."""
+        """The transport for *binding*: an injected one when present, else built.
+
+        Injection is this registry's own concern — a test or a host substituting a
+        transport for one it configured — so it stays here, and the construction
+        every caller shares is :func:`transport_for`.
+        """
         injected = self._transports.get(binding.transport)
         if injected is not None:
             return injected
-        if not binding.argv:
-            return None
-        if binding.transport == TRANSPORT_COMMAND:
-            return CommandProviderTransport(argv=binding.argv, env=binding.env)
-        if binding.transport == TRANSPORT_MCP:
-            return McpProviderTransport(argv=binding.argv, env=binding.env)
-        return None
+        return transport_for(binding)
 
     def _finish(
         self,
@@ -573,6 +572,29 @@ class CapabilityRegistry:
                 cost=result.cost_credits or None,
             )
         return result
+
+
+def transport_for(binding: Binding) -> CapabilityTransport | None:
+    """The transport *binding* names, or ``None`` when the binding is unusable.
+
+    Module-level rather than a registry method because the registry is not the
+    only caller: the conformance runner builds its candidate from a binding
+    deliberately OUTSIDE the invocation path, since the registry degrades a
+    broken provider to its builtin and would hide the failure a conformance
+    report exists to reveal. Two spellings of this construction is how the copy
+    that drifts becomes the one a report is built from.
+
+    ``None`` covers both ways a binding names no transport this can build: an
+    external transport with no argv, and the builtin, which is not reached over a
+    transport at all.
+    """
+    if not binding.argv:
+        return None
+    if binding.transport == TRANSPORT_COMMAND:
+        return CommandProviderTransport(argv=binding.argv, env=binding.env)
+    if binding.transport == TRANSPORT_MCP:
+        return McpProviderTransport(argv=binding.argv, env=binding.env)
+    return None
 
 
 def external_identity(

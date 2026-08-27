@@ -64,6 +64,7 @@ from .conformance import (
     CHECK_TIMEOUT_HONORING,
     DEFAULT_DEADLINE_S,
     DEFAULT_GRACE_S,
+    SCHEMA_VIOLATION_CHARS,
     BuiltinCandidate,
     Candidate,
     CheckResult,
@@ -139,6 +140,7 @@ from .registry import (
     external_identity,
     resolve_bindings,
     response_from_payload,
+    transport_for,
 )
 from .schemas import (
     CURRENT_SCHEMA_VERSION,
@@ -213,6 +215,7 @@ __all__ = [
     "REQUEST",
     "RESPONSE",
     "REVIEW_PROVIDER",
+    "SCHEMA_VIOLATION_CHARS",
     "TRANSPORT_BUILTIN",
     "TRANSPORT_COMMAND",
     "TRANSPORT_MCP",
@@ -281,6 +284,7 @@ __all__ = [
     "schema_for",
     "suite_for",
     "supplement",
+    "transport_for",
     "validate_response",
     "verify",
     "verify_builtin",
