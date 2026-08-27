@@ -83,7 +83,18 @@ DECLARED_ROOTS: tuple[str, ...] = (
 #: than a root because that directory belongs to no single app: each app's files
 #: are identified by name there, the same convention the provenance scan uses for
 #: the Prior_App's ``SpecBuilder*`` fixtures.
-DECLARED_TEST_PREFIXES: tuple[str, ...] = ("website/src/test/SpecEngine",)
+#:
+#: Two spellings because the directory holds two kinds of file under the same
+#: convention: ``SpecEngine*`` for the suites, which are named after the
+#: component they mount, and ``specEngine*`` for the test-only modules those
+#: suites import, which follow the repository's camelCase module naming. Both
+#: name this app as plainly as the other; neither is an exemption from the fence,
+#: which is why a shared helper of ours belongs here rather than in
+#: :data:`BOUNDARY_ALLOWLIST`.
+DECLARED_TEST_PREFIXES: tuple[str, ...] = (
+    "website/src/test/SpecEngine",
+    "website/src/test/specEngine",
+)
 
 #: Paths outside the Spec_App's trees this branch is allowed to change, each with
 #: the one-line justification that admits it. Reviewed, never inferred: a change
@@ -107,12 +118,6 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         "website/src/test/ProjectPicker.test.tsx",
         "That picker's own suite: the reserved-band geometry is asserted where the "
         "geometry lives.",
-    ),
-    (
-        "website/src/test/specEngineFetchStub.ts",
-        "A test-only helper under the shared test tree, answering this app's own read "
-        "surface for the suites that mount its page; it names no route any other app "
-        "serves, and the alternative is one hand-rolled fetch router per suite.",
     ),
     (
         "website/src/components/appstore/appManifest.ts",

@@ -43,6 +43,7 @@ from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.apps.builtins.spec_engine.backend import routes
+from kiro_crew.apps.builtins.spec_engine.engine import local_analyzer
 from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
     AutonomyDecision,
     AutonomyLevel,
@@ -1626,6 +1627,88 @@ class TestTheCapabilityReadJoinsEachBindingToItsReachability:
         per-project layer, so a project-scoped read would imply a scope that does
         not exist and let two projects appear to bind different providers."""
         assert list(inspect.signature(routes._capabilities_snapshot).parameters) == []
+
+    @pytest.mark.asyncio
+    async def test_the_whole_join_rests_on_one_read_of_the_document(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every answer in a row must come from the SAME document.
+
+        The join has several engine reads behind it — the registry's bindings, its
+        description, the per-capability resolved timeout, and the provider checks —
+        and each of them resolves the store independently. ``ConfigStore.document``
+        re-reads and re-parses the file every call, so without a pinned read a
+        write landing partway through yields a row whose halves describe different
+        documents. That is not a cosmetic skew here: a binding read from the new
+        document has no matching check in a report built from the old one, so the
+        row renders ``reachable: null`` — which this payload's contract means
+        "builtin, not applicable". A configured external provider would be
+        reported as a builtin.
+
+        Counted rather than raced, because the interleaving is what a test cannot
+        schedule reliably: exactly one read means there is no window to interleave.
+        """
+        reads: list[str] = []
+        original_document = ConfigStore.document
+        original_store = routes._config_store
+
+        def _counting_document(self: ConfigStore) -> dict[str, Any]:
+            reads.append("document")
+            return original_document(self)
+
+        def _counting_store() -> ConfigStore:
+            reads.append("store")
+            return original_store()
+
+        monkeypatch.setattr(ConfigStore, "document", _counting_document)
+        monkeypatch.setattr(routes, "_config_store", _counting_store)
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        assert reply.status == 200
+        assert reads.count("document") == 1, (
+            "the capability join must read the document exactly once; "
+            f"observed {reads.count('document')} reads: {reads}"
+        )
+        # Non-vacuous: the reply really is the composed seven-row join, so the
+        # single read above was enough to answer the whole payload rather than
+        # evidence that nothing was read because nothing was built.
+        assert len(reply.body["capabilities"]) == len(DELEGABLE_CAPABILITIES)
+
+    def test_a_pinned_store_refuses_to_write(self, home: Path) -> None:
+        """The pinned read is a snapshot, and a snapshot must not be a write base.
+
+        ``ConfigStore.write`` merges its patch onto ``self.document()``. Writing
+        through a store whose document is frozen would merge onto a read taken
+        arbitrarily long ago and silently drop every change that landed since, so
+        the refusal is the class's reason for being a class rather than a dict.
+        """
+        pinned = routes._PinnedStore(routes._config_store())
+        assert pinned.document() is pinned.document(), "the pinned read must be one object"
+        with pytest.raises(RuntimeError, match="cannot write"):
+            pinned.write({}, surface=routes.SETUP_SURFACE)
+
+    @pytest.mark.asyncio
+    async def test_the_analysis_builtin_named_is_the_one_a_run_would_bind(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The provider named must be the provider that would serve the call.
+
+        ``AnalysisEngine`` binds the analysis capability through
+        ``local_analyzer.register``, so a run is served by the structural
+        analyzer. Until that registration runs over the registry, the capability
+        resolves to the shipped declared-skip default — which reports NO COVERAGE
+        under a different name. Naming that default here would tell an operator
+        their analysis capability is served by something a run never uses.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/capabilities")
+        entries = {entry["capability"]: entry for entry in reply.body["capabilities"]}
+        provider = entries["analysis"]["provider"]
+        assert provider["name"] == local_analyzer.PROVIDER_NAME
+        assert provider["nature"] == "deterministic", (
+            "the structural analyzer computes its answer; reporting it as "
+            "model-backed would claim a cost it does not incur"
+        )
 
 
 # --- the form vocabulary ------------------------------------------------------

@@ -169,6 +169,44 @@ const EMPTY_REGISTRY = {
  * read of an empty thing. A suite that IS about a route passes its own fixture,
  * so no default here is ever the subject of an assertion.
  */
+/**
+ * One `/config/capabilities` row as the real route composes it for a builtin.
+ *
+ * Mirrors the engine's own `CapabilityRegistry.describe()` entry plus the three
+ * fields the route joins on (`program`, `reachable`, `action`). Kept as a builder
+ * rather than seven literals so the SHAPE is stated once: a row that gained a
+ * field in the route and not here would otherwise be a divergence spread across
+ * seven copies. `version` is omitted when absent, because the engine omits it
+ * rather than sending an empty string.
+ */
+function builtinCapabilityRow(
+  capability: string,
+  providerName: string,
+  nature: "deterministic" | "model_backed",
+  version?: string,
+): Record<string, unknown> {
+  return {
+    capability,
+    transport: "builtin",
+    provider: {
+      name: providerName,
+      kind: "builtin",
+      nature,
+      transport: "builtin",
+      ...(version === undefined ? {} : { version }),
+    },
+    configured: false,
+    declared_at: "",
+    timeout_s: 120,
+    program: "",
+    // Builtin: the engine's reachability check skips it, so this is "not
+    // applicable" rather than false. Coercing it to false would render every
+    // unconfigured capability as a broken provider.
+    reachable: null,
+    action: "",
+  };
+}
+
 const DEFAULTS: Record<RouteKey, Responder> = {
   // The configured shell, carrying a project ENTRY rather than a bare document:
   // first run is "no project entry", so `{}` here would put unrelated suites on
@@ -207,11 +245,28 @@ const DEFAULTS: Record<RouteKey, Responder> = {
       levels: ["authoring", "execution", "delivery", "integration"],
     },
   },
-  // The real route answers for ALL seven delegable capabilities and cannot
-  // return an empty list, so a suite that is about this pane passes its own
-  // fixture. The empty list is the neutral default: the shape the route returns,
-  // rendering nothing.
-  capabilities: { body: { configured: true, capabilities: [] } },
+  // The unconfigured answer the real route returns: one row for EVERY one of the
+  // seven delegable capabilities, each on its builtin. The route cannot return an
+  // empty list — `resolve_bindings` pre-seeds all seven — so an empty default
+  // would be a shape no route ever serves, and a suite rendering off it would be
+  // asserting against fiction. `reachable` is null on every row because a builtin
+  // is reachable by construction and the engine's check skips it; null here means
+  // "not applicable", NOT "unreachable". Only the analysis builtin carries a
+  // `version`. A suite that is about this pane passes its own fixture.
+  capabilities: {
+    body: {
+      configured: true,
+      capabilities: [
+        builtinCapabilityRow("analysis", "local-analyzer", "deterministic", "1"),
+        builtinCapabilityRow("authoring", "engine-authoring-turn", "model_backed"),
+        builtinCapabilityRow("review", "engine-review-turn", "model_backed"),
+        builtinCapabilityRow("implementation", "engine-implementation-dispatch", "model_backed"),
+        builtinCapabilityRow("validation_rules", "engine-validation-rules", "deterministic"),
+        builtinCapabilityRow("watch_sources", "engine-watch-sources", "deterministic"),
+        builtinCapabilityRow("model_catalog", "engine-model-catalog-host", "deterministic"),
+      ],
+    },
+  },
   // The shape `GET /config/workflow` really returns: one row per DECLARED stage
   // (so an unconfigured stage is present and says so), the selection separately
   // from the stages it supplied, and `gates` NULL only when the stored list

@@ -104,9 +104,14 @@ ENGINE_FLOOR_CAPABILITIES: tuple[str, ...] = (
 #: How a delegated capability is reached.
 TRANSPORTS: tuple[str, ...] = ("builtin", "mcp", "command")
 
-#: Delivery stages, in the order the pipeline runs them by default. A workflow
-#: may declare its own order so verify-class gates can sit before submit, after
-#: it, or both.
+#: Delivery stages, in the order the pipeline runs them. The order is FIXED, not
+#: declarable: the flow hardcodes it and teardown is run at archive rather than in
+#: sequence, so a workflow configures each stage's COMMANDS and never its
+#: position. The "before submit, after it, or both" freedom belongs to a quality
+#: gate's :data:`GATE_POSITIONS` — the constant directly below — which is a
+#: property of the gate, not of this tuple. This tuple travels to the operator
+#: surface as ``delivery_stages``, where no control may offer a reorder, so a
+#: claim here that stages can be reordered would be read as one that may.
 DELIVERY_STAGES: tuple[str, ...] = ("isolate", "submit", "verify", "publish", "teardown")
 
 #: Where a quality gate runs relative to raising the review artifact. ``both``

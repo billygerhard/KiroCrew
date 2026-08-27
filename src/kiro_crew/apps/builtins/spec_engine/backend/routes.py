@@ -124,7 +124,7 @@ import uuid
 from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, NoReturn
 
 from aiohttp import web
 
@@ -133,6 +133,7 @@ from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.sel import sel
 
 from ..engine import audit as engine_audit
+from ..engine import local_analyzer
 from ..engine import review_queue as engine_review_queue
 from ..engine import runs as engine_runs
 from ..engine import setup as engine_setup
@@ -733,6 +734,54 @@ def _no_model_catalog() -> tuple[str, ...]:
     return ()
 
 
+class _PinnedStore(ConfigStore):
+    """A read-only store that serves ONE read of the document to every consumer.
+
+    :meth:`ConfigStore.document` re-reads and re-parses the file on every call,
+    and :meth:`ConfigStore.effective` rests on it, so a snapshot that joins
+    several engine answers takes each of them from a DIFFERENT read of the same
+    file. A write landing partway through produces a reply whose halves describe
+    different documents — and for the capability join that is not a cosmetic
+    skew: a binding read from the new document has no matching check in a report
+    built from the old one, so the row renders ``reachable: null``, which this
+    payload's own contract means "builtin, not applicable". A configured external
+    provider would be reported as a builtin.
+
+    Everything the join needs routes through the store, so pinning one read here
+    pins all of them: :meth:`CapabilityRegistry.bindings`,
+    :meth:`~CapabilityRegistry.describe` (including the per-capability
+    ``timeout_for``, which resolves a setting), and ``_provider_checks``.
+
+    REFUSES to write, and that is the point of the class rather than an
+    afterthought: :meth:`ConfigStore.write` merges its patch onto
+    ``self.document()``, so a write through a pinned store would merge onto a
+    read taken arbitrarily long ago and silently drop every change that landed
+    since. A pinned store is for one reply and is then discarded.
+    """
+
+    def __init__(self, store: ConfigStore) -> None:
+        super().__init__(store.root)
+        # The one read. Taken before the existence check so a document written
+        # between the two cannot report `configured: false` while its own
+        # contents are being served.
+        self._pinned = store.document()
+        self._existed = store.path.is_file()
+
+    @property
+    def document_exists(self) -> bool:
+        """Whether a document was on disk at the moment this store pinned it."""
+        return self._existed
+
+    def document(self) -> dict[str, Any]:
+        return self._pinned
+
+    def write(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise RuntimeError(
+            "a pinned store is a read snapshot and cannot write: "
+            "ConfigStore.write merges onto document(), which is frozen here"
+        )
+
+
 def _capabilities_snapshot() -> dict[str, Any]:
     """BLOCKING — every delegable capability's bound provider and its reachability.
 
@@ -745,13 +794,22 @@ def _capabilities_snapshot() -> dict[str, Any]:
     against — so a binding this surface calls reachable is one a run would accept,
     rather than a second PATH lookup that could disagree with the gate.
 
+    Built from ONE read of the document, like its sibling reads: the join runs
+    against a :class:`_PinnedStore`, so a write landing partway through cannot
+    produce a row whose description and binding come from different documents.
+    See that class for why this particular join corrupts rather than merely skews.
+
     ``register_builtins`` runs over the registry for one reason: until it does,
     authoring, review and implementation resolve to the shipped deterministic
     no-coverage default, which reports a path that spends credits as one that
-    spends nothing. The model resolver it needs is never called — ``describe``
-    reads provider IDENTITIES and serves no request, and the host catalog's
-    identity is deterministic whatever it would resolve — so an empty catalog here
-    cannot reach a payload.
+    spends nothing. ``local_analyzer.register`` runs for the same reason and is
+    the same class of fact: it is what binds the analysis builtin in a real run,
+    so without it this surface names the declared-skip default that reports no
+    coverage while a run would report the structural analyzer. The model resolver
+    ``register_builtins`` needs is never called — ``describe`` reads provider
+    IDENTITIES and serves no request, and the host catalog's identity is
+    deterministic whatever it would resolve — so an empty catalog here cannot
+    reach a payload.
 
     ``reachable`` is three-valued on purpose. A builtin binding is reachable by
     construction (it is this engine), so the engine's check skips it entirely and
@@ -763,9 +821,10 @@ def _capabilities_snapshot() -> dict[str, Any]:
     does not exist. The one project-sensitive value is the resolved timeout, which
     therefore travels at app scope.
     """
-    store = _config_store()
+    store = _PinnedStore(_config_store())
     registry = CapabilityRegistry(store)
     register_builtins(registry, model_resolver=_no_model_catalog)
+    local_analyzer.register(registry)
     bindings = registry.bindings()
     # Keyed by declaring path, which is what both sides of the join hold: a
     # delegated binding always carries the dotted path it was declared at, and the
@@ -788,7 +847,7 @@ def _capabilities_snapshot() -> dict[str, Any]:
             }
         )
     return {
-        "configured": store.path.is_file(),
+        "configured": store.document_exists,
         "capabilities": described,
     }
 
