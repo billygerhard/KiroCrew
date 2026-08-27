@@ -207,19 +207,30 @@ function builtinCapabilityRow(
   };
 }
 
+/** A plausible binding digest. The routes always emit a sha256 hex string here. */
+const STUB_FINGERPRINT = "0".repeat(64);
+
 /**
  * One capability's conformance state, in the shape BOTH conformance routes return.
  *
  * The GET returns this object; the POST returns it with `ok: true` added. Kept as
  * a builder for the same reason as {@link builtinCapabilityRow}: the shape is
  * stated once, so a field the routes gain cannot be missing from one default and
- * present in the other. Every one of the ten fields the routes emit is here —
+ * present in the other. Every one of the eleven fields the routes emit is here —
  * a default carrying a subset would be a shape no route returns, and a panel
  * authored against it would render off fiction.
  *
+ * The VALUES are held to the same standard as the field names. `binding_current`
+ * is always a digest, never "" — the routes compute it from the resolved binding
+ * on every reply, so an empty string is a state neither route can produce. A
+ * default with a job likewise carries a fingerprint EQUAL to it, because the POST
+ * sets both from the one digest it just computed, which is what makes `stale`
+ * false at the moment a run starts.
+ *
  * `stale` is derived server-side and is never a client's own comparison: a client
  * is not shown the binding's env, so any fingerprint it computed would digest
- * something else.
+ * something else. `is_builtin` describes what is configured NOW, so a client can
+ * tell that a re-run is refused even when a stored report reads `complete`.
  */
 function conformanceState(
   over: {
@@ -227,16 +238,21 @@ function conformanceState(
     jobId?: string;
     candidate?: string;
     report?: unknown;
+    isBuiltin?: boolean;
   } = {},
 ): Record<string, unknown> {
+  const hasJob = over.jobId !== undefined;
   return {
     capability: "review",
     status: over.status ?? "absent",
     job_id: over.jobId ?? "",
     candidate: over.candidate ?? "",
-    binding_fingerprint: "",
-    binding_current: "",
+    // Empty only in the no-run state, where the routes leave it empty too; with a
+    // job it equals binding_current, as the POST sets it.
+    binding_fingerprint: hasJob ? STUB_FINGERPRINT : "",
+    binding_current: STUB_FINGERPRINT,
     stale: false,
+    is_builtin: over.isBuiltin ?? false,
     // The server's per-invocation cap, not the binding's timeout_s. Present even
     // with no run, because a panel must state the cost before offering to start.
     deadline_s: 10,

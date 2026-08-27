@@ -3711,14 +3711,60 @@ class TestConformanceIsAJobAndNotARequest:
         assert reply.status == 200, reply.body
         assert reply.body["status"] == routes.CONFORMANCE_NOT_APPLICABLE
         assert reply.body["status"] != routes.CONFORMANCE_ABSENT
+        assert reply.body["is_builtin"] is True
         # Non-vacuous: the POST really does refuse this same capability, so the two
         # answers are being compared against each other rather than asserted apart.
         assert refused.status == 409, refused.body
         assert refused.body["code"] == "builtin_binding"
 
     @pytest.mark.asyncio
+    async def test_a_report_kept_after_rebinding_to_the_builtin_says_it_cannot_rerun(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+    ) -> None:
+        """The one state where `status` alone cannot answer "can I run this".
+
+        A capability rebound to its builtin AFTER a run keeps its report, so the
+        poll reports ``complete`` — correctly, the outcome is real — while the POST
+        refuses it. Without ``is_builtin`` a client would offer a re-run the server
+        declines, which is the same disagreement ``not_applicable`` was added to
+        close, surviving in the state where a report exists.
+        """
+        _write_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+            assert started.status == 202, started.body
+            assert started.body["is_builtin"] is False, "the run was against a real program"
+            await _drain_conformance()
+            # Rebind to the builtin with the report already stored.
+            _write_document({"version": 1})
+            polled = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+            refused = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
+        assert polled.status == 200, polled.body
+        # The report survives — rebinding does not delete an outcome that happened.
+        assert polled.body["report"] is not None
+        assert polled.body["stale"] is True, "the report no longer describes the binding"
+        # ...and the payload says a re-run is impossible, which `status` cannot.
+        assert polled.body["is_builtin"] is True
+        assert refused.status == 409, refused.body
+        assert refused.body["code"] == "builtin_binding"
+
+    @pytest.mark.asyncio
     async def test_the_in_flight_task_is_held_by_a_strong_reference(
-        self, recorded_sel: RecordedSel, enabled: None, home: Path
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
     ) -> None:
         """A run nobody holds can be collected mid-flight.
 
@@ -3729,10 +3775,17 @@ class TestConformanceIsAJobAndNotARequest:
         ``_drain_conformance`` reads, so a refactor dropping the ``add()`` would
         quietly turn that helper into a no-op and every other test in this class
         would keep passing. Asserted directly for that reason.
+
+        Takes ``recorded_verify`` and ``no_conformance_jobs`` like every sibling:
+        the substituted runner is what keeps this from spawning the real suite's
+        nine child processes, and the cleared table is what keeps the started-run
+        assertion from depending on whatever an earlier test left behind.
         """
         _write_document(_BOUND_ANALYSIS)
         async with _client() as client:
-            started = await _post(client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"})
+            started = await _post(
+                client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+            )
             # 202: the run was ACCEPTED, not completed. A job start that answered
             # 200 would read as an outcome.
             assert started.status == 202, started.body

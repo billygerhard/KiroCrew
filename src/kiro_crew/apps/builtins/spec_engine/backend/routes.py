@@ -1557,7 +1557,7 @@ async def _conformance_worker(job: _ConformanceJob, binding: Binding) -> None:
 
 
 def _conformance_payload(
-    capability: str, job: _ConformanceJob | None, *, current: str
+    capability: str, job: _ConformanceJob | None, *, current: str, is_builtin: bool
 ) -> dict[str, Any]:
     """One capability's conformance state, with the run's verdict above the checks.
 
@@ -1575,16 +1575,25 @@ def _conformance_payload(
     shown the binding's ``env`` values, so any fingerprint it computed would be a
     fingerprint of something else — and comparing the wrong two things is how an
     earlier outcome goes on being presented as describing the current binding.
+
+    ``is_builtin`` travels because ``status`` alone cannot answer "can this be
+    re-run". A capability rebound to its builtin AFTER a run still has a report,
+    so it reports ``complete`` with ``stale`` set while the POST refuses it with
+    ``builtin_binding`` — and a client offering the re-run its status implies would
+    be offering something the server declines. The flag is the resolved binding's,
+    not the run's: it describes what is configured NOW, which is the question a
+    re-run control has to ask.
     """
     if job is None:
         return {
             "capability": capability,
-            "status": CONFORMANCE_ABSENT,
+            "status": CONFORMANCE_NOT_APPLICABLE if is_builtin else CONFORMANCE_ABSENT,
             "job_id": "",
             "candidate": "",
             "binding_fingerprint": "",
             "binding_current": current,
             "stale": False,
+            "is_builtin": is_builtin,
             "deadline_s": CONFORMANCE_DEADLINE_S,
             "error": "",
             "report": None,
@@ -1597,6 +1606,7 @@ def _conformance_payload(
         "binding_fingerprint": job.fingerprint,
         "binding_current": current,
         "stale": current != job.fingerprint,
+        "is_builtin": is_builtin,
         "deadline_s": CONFORMANCE_DEADLINE_S,
         "error": job.error,
         "report": job.report,
@@ -1695,7 +1705,13 @@ async def handle_post_conformance(request: web.Request) -> web.Response:
         ),
     )
     return web.json_response(
-        {"ok": True, **_conformance_payload(capability, job, current=job.fingerprint)},
+        {
+            "ok": True,
+            # Never a builtin: a builtin binding was refused above, before any job
+            # was created, so a job reaching this line is always against a
+            # configured external provider.
+            **_conformance_payload(capability, job, current=job.fingerprint, is_builtin=False),
+        },
         status=202,
     )
 
@@ -1713,21 +1729,21 @@ async def handle_get_conformance(request: web.Request) -> web.Response:
     checked" would invite an operator to start a run they cannot start. A stored
     report is still reported when one exists — rebinding to the builtin does not
     delete the outcome of a run against the provider that was there before, it
-    only makes it ``stale``.
+    only makes it ``stale`` — and ``is_builtin`` travels beside it so a client can
+    tell that the re-run the report's status implies is nonetheless refused.
     """
     capability = request.match_info.get("capability", "")
     binding = await _binding_or_refusal(capability)
     if isinstance(binding, web.Response):
         return binding
-    job = _CONFORMANCE_JOBS.get(capability)
-    payload = _conformance_payload(
-        capability,
-        job,
-        current=_binding_fingerprint(binding),
+    return web.json_response(
+        _conformance_payload(
+            capability,
+            _CONFORMANCE_JOBS.get(capability),
+            current=_binding_fingerprint(binding),
+            is_builtin=binding.is_builtin,
+        )
     )
-    if job is None and binding.is_builtin:
-        payload["status"] = CONFORMANCE_NOT_APPLICABLE
-    return web.json_response(payload)
 
 
 # --- the setup assistant ----------------------------------------------------
