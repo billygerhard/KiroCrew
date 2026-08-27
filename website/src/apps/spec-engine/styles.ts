@@ -400,6 +400,18 @@ table.se-grid td[data-origin="default"] .se-glevelbtn{color:var(--muted-strong)}
    sized for a whole document: a cell patch is a handful of lines, and a fixed 320px
    of mostly blank would push the confirm out of view. */
 pre.se-gpatch{height:auto;max-height:200px}
+/* The disclosure holding that patch. A native details/summary expanding IN FLOW:
+   the summary leads with plain language, and the exact payload is one activation
+   away rather than drawn over the page — this layout has no overlay at all, and a
+   confirmation an operator has to dismiss something to read is the failure the
+   no-overlay rule exists to prevent. Its own margin so the summary does not touch
+   the sentence above it. */
+.se-disc{margin-top:9px}
+.se-disc>summary{font-size:11.5px;color:var(--muted);cursor:pointer;
+  padding:2px 0;list-style-position:inside}
+.se-disc>summary:hover{color:var(--text-strong)}
+.se-disc>summary:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+.se-disc>pre{margin-top:7px}
 /* The document editor. A FIXED height, not a cap: a document that grew with its
    line count would push the save controls off the pane. */
 textarea.se-json{width:100%;resize:vertical;min-height:220px}

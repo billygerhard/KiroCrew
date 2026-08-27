@@ -3168,6 +3168,14 @@
         "values_not_at_their_default": "Values that are not at their default",
         "withheld_at": "Withheld at"
       },
+      "formReview": {
+        "authorises_commands_to_run": "The commands in this change are executed by the engine on this machine, with the engine's own permissions, every time the stage or gate they belong to runs.",
+        "binds_a_capability_to_an_external_program": "The engine checks the shape of the command and nothing else — there is no list of allowed programs at the write door or at the execution door — so this confirmation is the only gate on which program runs.",
+        "only_an_operator_confirmation_writes_this": "{{path}} is a path the engine reserves to an operator-confirmed surface: the agent's own write tool refuses it, so this confirmation is the only way it can be written.",
+        "raises_an_untrusted_class_authority": "Authority granted here is granted to every author that class catches, not only to the submitters you have in mind.",
+        "removes_a_gate_from_the_flow": "With the gate gone, nothing runs its checks and the flow proceeds as though they had passed. The engine's own format and phase validation still applies.",
+        "show_the_exact_patch": "Show the exact patch this confirm sends"
+      },
       "manifest": {
         "description": "Turn a request into a reviewed spec and then execute it. Any agent that can call MCP tools drives the whole workflow: the engine vends the authoring, orchestration and review instructions, validates the native documents it produces, and refuses to advance a phase whose document does not validate or lacks a live approval. Nothing about the format lives in a prompt an agent can forget or paraphrase.",
         "display_name": "Spec Engine",

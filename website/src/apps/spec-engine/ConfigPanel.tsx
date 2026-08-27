@@ -551,6 +551,117 @@ interface ReviewedChange {
 }
 
 /**
+ * An authority a confirm hands over, beyond the values the patch spells.
+ *
+ * Four kinds, because four are what a write on this pane can actually grant, and
+ * each is invisible in the JSON: a level string does not say who the class catches,
+ * a removed gate is an absence, a bound command is a program this app never vetted,
+ * and a stage's argv is a program that will be run. A caller declares which of the
+ * four its patch performs; the CARD states what each one means, so the statement
+ * cannot vary between the forms that make the same grant.
+ */
+type ConsequenceKind =
+  | 'authority'
+  | 'gate_removed'
+  | 'external_program'
+  | 'commands_run'
+
+/**
+ * What each authority change means, in the card's own words.
+ *
+ * Card-owned rather than caller-supplied, which is the opposite choice from
+ * {@link ReviewedChange}'s sentence and for a stated reason: a change's sentence
+ * describes values only the caller knows, while a consequence describes what the
+ * ENGINE does with the authority, which is the same fact whichever form granted it.
+ * Two forms wording "these commands are executed" differently is two forms an
+ * operator has to read separately to notice they say the same thing.
+ *
+ * Keys, not resolved strings, for `ORIGIN_KEY`'s reason: a module-level `i18nT()`
+ * runs once at import and would freeze the table's language.
+ */
+const CONSEQUENCE_KEY: Record<ConsequenceKind, string> = {
+  authority: 'apps.specEngine.formReview.raises_an_untrusted_class_authority',
+  gate_removed: 'apps.specEngine.formReview.removes_a_gate_from_the_flow',
+  external_program: 'apps.specEngine.formReview.binds_a_capability_to_an_external_program',
+  commands_run: 'apps.specEngine.formReview.authorises_commands_to_run',
+}
+
+/**
+ * The order the card states consequences in, most authority first.
+ *
+ * Fixed rather than the caller's order, so two forms granting the same pair of
+ * authorities state them in the same sequence, and the widest grant is never the
+ * last line of a block a reader has stopped reading.
+ */
+const CONSEQUENCE_ORDER: readonly ConsequenceKind[] = [
+  'authority',
+  'gate_removed',
+  'external_program',
+  'commands_run',
+]
+
+/** One authority change a patch performs, as its caller declares it. */
+interface Consequence {
+  /** Which of the four grants this is. Selects the card's own statement. */
+  kind: ConsequenceKind
+  /** The path the grant lands at. Display and React key; never parsed back. */
+  path: string
+  /**
+   * The caller's sentence naming the subject, when it has one to name.
+   *
+   * Optional because the card's statement stands alone: a form that can say WHICH
+   * class rises from which rung to which says so here, and a form whose subject is
+   * already the change sentence above passes nothing rather than repeating it.
+   */
+  sentence?: string
+}
+
+/**
+ * The fenced paths *patch* actually writes to, resolved against its own keys.
+ *
+ * The patterns are the engine's `CONFIG_ONLY_PATHS`, relayed by `GET /config` so
+ * this side keeps no second copy of which sections the agent's `write_config` tool
+ * refuses. A `*` segment stands for any one key, which is how
+ * `projects.*.workflow` covers every project entry.
+ *
+ * Walked over the patch's own OBJECT keys rather than matched against a dotted
+ * string, because a project key is a filesystem path and holds dots of its own: a
+ * dotted rendering of `projects` + `/src/a.b` + `workflow` cannot be split back
+ * into three segments, and the pattern would silently stop matching the entries it
+ * exists to cover. The returned paths are dotted for display only, built from the
+ * keys that actually matched.
+ */
+export function fencedPatchPaths(patch: Document, patterns: readonly string[]): string[] {
+  const found: string[] = []
+  for (const pattern of patterns) {
+    const segments = pattern.split('.')
+    // Breadth-first over the patch, one pattern segment per level, so a `*`
+    // expands to every key present at that level rather than to a guess.
+    let reached: Array<{ node: unknown; path: readonly string[] }> = [
+      { node: patch, path: [] },
+    ]
+    for (const segment of segments) {
+      const next: Array<{ node: unknown; path: readonly string[] }> = []
+      for (const { node, path } of reached) {
+        if (!isObject(node)) continue
+        const keys = segment === '*' ? Object.keys(node) : [segment]
+        for (const key of keys) {
+          // `in` would answer for an inherited name; the patch's containers are
+          // prototype-less, but a caller's staged object need not be.
+          if (!Object.prototype.hasOwnProperty.call(node, key)) continue
+          next.push({ node: node[key], path: [...path, key] })
+        }
+      }
+      reached = next
+    }
+    for (const { path } of reached) found.push(dotted(path))
+  }
+  // Sorted so two renders of one patch state the fences in one order, and unique
+  // so two patterns reaching the same path do not say it twice.
+  return [...new Set(found)].sort()
+}
+
+/**
  * The copy one form's review card renders with, resolved by its caller.
  *
  * Resolved strings rather than catalog keys: every key stays a whole literal at its
@@ -575,31 +686,52 @@ interface FormReviewLabels {
 }
 
 /**
- * The exact change a confirm would write, before it is written.
+ * The change a confirm would write, in plain language, with the exact patch behind
+ * a disclosure.
  *
  * Shared by every form on this pane and by the autonomy grid, because the guarantee
- * is one guarantee: the patch is shown as the payload ITSELF, pretty-printed, since
- * approving a plan means approving what will be written — the setup flow's rule and
- * the reason this card exists at all. The sentences beside it are not a second
- * description of the patch; they say what each line MEANS, which the JSON cannot.
+ * is one guarantee. What leads is the summary: sentences naming each change and what
+ * it does, then the authority the confirm hands over, then the patch itself one
+ * disclosure away. That ordering is the whole of this card's job — approving a
+ * configuration change means approving what it DOES, and a reader who meets a JSON
+ * payload first is a reader approving a payload. The patch is not demoted out of
+ * reach: it is exact, complete, and reachable in one activation, because approving a
+ * plan still means approving what will be written.
  *
- * Three properties belong to the card rather than to any caller:
+ * Four properties belong to the card rather than to any caller:
  *
- * 1. **The patch shown is the patch sent.** The caller hands over one object and
- *    confirms with the same one, so a rendering cannot drift from a payload.
- * 2. **A refusal retains stored state.** The engine's reason is rendered by the path
+ * 1. **What is submitted is what the disclosure showed.** The card renders one
+ *    string and hands `onConfirm` the value PARSED BACK from that same string, so
+ *    the request cannot carry a path, a key or a value the disclosure did not
+ *    display. A caller cannot hold a second object to send instead, because it does
+ *    not supply one at confirm time — it receives one. That is the difference
+ *    between a summary that is trustworthy and a summary that authorises something
+ *    nobody read.
+ * 2. **A consequence is stated before the confirm control.** Four authority changes
+ *    are invisible in a patch — raising an untrusted class, removing a gate, binding
+ *    a capability to an external program, and authorising commands to run — so the
+ *    card states each in its own words, above the button, in a fixed order.
+ * 3. **A fenced path says why an operator is the one confirming.** The paths the
+ *    engine reserves to an operator-confirmed surface are read from `GET /config`'s
+ *    relay of its own `CONFIG_ONLY_PATHS`, never from a copy on this side, and a
+ *    patch touching one says so: the agent's write tool refuses these, which is why
+ *    this confirmation is the only way they can be written.
+ * 4. **A refusal retains stored state.** The engine's reason is rendered by the path
  *    it names, the staged changes stay put to be corrected, and NOTHING is
  *    invalidated — so the surface behind the card keeps stating what is persisted
  *    rather than what was submitted.
- * 3. **A consequence goes in flow, never in a dialog.** Callers pass consequences as
- *    a node rendered under the patch, for the same reason the removal confirmation
- *    is a sibling block: a consequence stated in an overlay is one that can be
- *    dismissed, and the strip carrying the kill switch must never be covered.
+ *
+ * And one that belongs to the layout: a consequence goes in flow, never in a dialog,
+ * for the same reason the removal confirmation is a sibling block — a consequence
+ * stated in an overlay is one that can be dismissed, and the strip carrying the kill
+ * switch must never be covered. The disclosure is a `<details>` for the same reason:
+ * it expands in place and draws nothing over the page.
  */
-function FormReview({
+export function FormReview({
   changes,
   patch,
   labels,
+  authorises,
   consequences,
   writing,
   error,
@@ -609,34 +741,108 @@ function FormReview({
   changes: readonly ReviewedChange[]
   patch: Document
   labels: FormReviewLabels
-  /** Statements the patch cannot carry, rendered under it. */
+  /** The authority this patch hands over, declared by kind. */
+  authorises?: readonly Consequence[]
+  /** Statements the patch cannot carry, rendered with the declared ones. */
   consequences?: React.ReactNode
   writing: boolean
   error: unknown
-  onConfirm: () => void
+  /** Called with the patch the disclosure showed, which is the one to send. */
+  onConfirm: (patch: Document) => void
   onDiscard: () => void
 }) {
+  // The engine's own list of the paths it fences to an operator-confirmed surface,
+  // read here rather than threaded through every form: each form that ever composes
+  // a patch would otherwise be one more place the list can be forgotten, and this
+  // shares the page's cache entry for the same key rather than adding a read.
+  const config = useQuery({
+    queryKey: QK.config,
+    queryFn: () => specEngineApi.config(),
+    retry: false,
+  })
+  // `isError` before the data, the pane's rule everywhere: React Query keeps the
+  // last successful body across a failing refetch, and a fence claimed on a read
+  // that did not happen is a claim about the engine's policy made up by this side.
+  // Absent marks are the safe direction — an unmarked fenced path loses one
+  // explanatory line, while a marked unfenced one asserts a refusal that is not real.
+  const fenced = useMemo(
+    () =>
+      config.isError || !config.data
+        ? []
+        : fencedPatchPaths(patch, config.data.config_only_paths),
+    [config.isError, config.data, patch],
+  )
+  // Rendered once and handed back on confirm, so the two cannot be computed
+  // separately. See property 1 above: this is the whole mechanism behind it.
+  const shown = useMemo(() => JSON.stringify(patch, null, 2), [patch])
+  const declared = useMemo(() => {
+    const listed = authorises ?? []
+    return CONSEQUENCE_ORDER.flatMap((kind) => {
+      const matching = listed.filter((entry) => entry.kind === kind)
+      return matching.length === 0 ? [] : [{ kind, entries: matching }]
+    })
+  }, [authorises])
   return (
     <div className="se-qbox">
       <h3>{labels.heading}</h3>
-      {/* The payload itself. Not a rendering of it: a summary an operator approves
-          is a summary the write can differ from without anybody noticing. */}
-      <pre className="se-json se-gpatch">{JSON.stringify(patch, null, 2)}</pre>
+      {/* Plain language leads. Each sentence says what one line of the patch MEANS,
+          which the JSON cannot, and the JSON is one disclosure below. */}
       {changes.map((change) => (
         <p className="se-note" key={change.path}>
           {change.sentence}
         </p>
       ))}
-      {consequences}
+      {fenced.map((path) => (
+        <p className="se-note" key={`fenced:${path}`}>
+          {i18nT('apps.specEngine.formReview.only_an_operator_confirmation_writes_this', {
+            path,
+          })}
+        </p>
+      ))}
+      {(declared.length > 0 || consequences) && (
+        /* In flow above the confirm, never a dialog: the same rule the removal
+           confirmation follows, and for the same reason. */
+        <div className="se-arm">
+          {declared.map(({ kind, entries }) => (
+            <Fragment key={kind}>
+              {entries.map((entry) =>
+                entry.sentence === undefined ? null : (
+                  <p key={`${kind}:${entry.path}`}>
+                    <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                    {entry.sentence}
+                  </p>
+                ),
+              )}
+              <p>
+                <AlertTriangle className="lucide-inline" aria-hidden="true" />
+                {i18nT(CONSEQUENCE_KEY[kind])}
+              </p>
+            </Fragment>
+          ))}
+          {consequences}
+        </div>
+      )}
+      <details className="se-disc">
+        <summary>{i18nT('apps.specEngine.formReview.show_the_exact_patch')}</summary>
+        {/* The payload itself, pretty-printed. Not a rendering of it, and not a
+            second derivation for display: the confirm sends this very text parsed
+            back, so a summary an operator approves cannot differ from the write. */}
+        <pre className="se-json se-gpatch">{shown}</pre>
+      </details>
+      <p className="se-note">{labels.exactly}</p>
       <div className="se-acts" style={{ marginTop: 9 }}>
-        <button type="button" className="se-btn se-danger" disabled={writing} onClick={onConfirm}>
+        <button
+          type="button"
+          className="se-btn se-danger"
+          disabled={writing}
+          onClick={() => onConfirm(JSON.parse(shown) as Document)}
+        >
           {writing ? labels.writing : labels.confirm}
         </button>
         <button type="button" className="se-btn" disabled={writing} onClick={onDiscard}>
           {labels.discard}
         </button>
       </div>
-      <p className="se-note">{labels.exactly}</p>
       {/* Loose inequality on purpose: a caller handing over `mutation.error`
           before any failure passes `undefined`, and a strict null check would
           render an empty refusal beside "nothing was written" for a write that
@@ -668,7 +874,10 @@ function FormReview({
  * One consequence gets its own statement because it is not legible in the patch:
  * raising the least-trusted class. That class is where an author the engine cannot
  * classify lands, so a rung granted there is a rung granted to anyone at all, and
- * nothing in the JSON says which class that is.
+ * nothing in the JSON says which class that is. It is declared as the card's
+ * `authority` kind rather than rendered here, so this grant and the same grant made
+ * from any other form read as one act; the per-edit sentence naming the class and
+ * both rungs travels with it, because only this surface knows those.
  */
 function GridReview({
   reviewed,
@@ -686,7 +895,8 @@ function GridReview({
   leastTrusted: string
   writing: boolean
   error: unknown
-  onConfirm: () => void
+  /** Called with the patch the card showed, which is the one to send. */
+  onConfirm: (patch: Document) => void
   onDiscard: () => void
 }) {
   const raising = reviewed.filter(
@@ -718,26 +928,18 @@ function GridReview({
           'apps.specEngine.sourcesSection.nothing_was_written_so_the_matrix_is_stored_state',
         ),
       }}
-      consequences={
-        raising.length > 0 && (
-          /* In flow under the patch, never a dialog: the same rule the removal
-             confirmation follows, and for the same reason — a consequence stated in
-             an overlay is a consequence stated where it can be dismissed. */
-          <div className="se-arm">
-            {raising.map(({ edit, cell }) => (
-              <p key={dotted(gridCellSegments(edit))}>
-                <AlertTriangle className="lucide-inline" aria-hidden="true" />
-                {i18nT('apps.specEngine.sourcesSection.this_raises_the_least_trusted_class', {
-                  klass: edit.klass,
-                  specType: edit.specType,
-                  oldLevel: cell.level,
-                  newLevel: edit.level,
-                })}
-              </p>
-            ))}
-          </div>
-        )
-      }
+      authorises={raising.map(({ edit, cell }) => ({
+        kind: 'authority' as const,
+        path: dotted(gridCellSegments(edit)),
+        // The subject sentence: which class, which spec type, and both rungs. The
+        // card adds what raising an untrusted class's authority MEANS.
+        sentence: i18nT('apps.specEngine.sourcesSection.this_raises_the_least_trusted_class', {
+          klass: edit.klass,
+          specType: edit.specType,
+          oldLevel: cell.level,
+          newLevel: edit.level,
+        }),
+      }))}
       writing={writing}
       error={error}
       onConfirm={onConfirm}
@@ -1067,7 +1269,7 @@ function SourcesSection({
               leastTrusted={leastTrusted}
               writing={write.isPending}
               error={write.isError ? write.error : null}
-              onConfirm={() => write.mutate(patch)}
+              onConfirm={(sending) => write.mutate(sending)}
               onDiscard={discard}
             />
           )}
@@ -1989,7 +2191,7 @@ function SettingsForm({
               }}
               writing={write.isPending}
               error={write.isError ? write.error : null}
-              onConfirm={() => write.mutate(patch)}
+              onConfirm={(sending) => write.mutate(sending)}
               onDiscard={discard}
             />
           )}
@@ -3023,7 +3225,7 @@ function ProfilesForm({
           }
           writing={write.isPending}
           error={write.isError ? write.error : null}
-          onConfirm={() => write.mutate(patch)}
+          onConfirm={(sending) => write.mutate(sending)}
           onDiscard={discard}
         />
       )}
@@ -4841,7 +5043,7 @@ function SourceForm({
           }
           writing={write.isPending}
           error={write.isError ? write.error : null}
-          onConfirm={() => write.mutate(patch)}
+          onConfirm={(sending) => write.mutate(sending)}
           onDiscard={discard}
         />
       )}

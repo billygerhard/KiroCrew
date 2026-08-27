@@ -3912,6 +3912,14 @@
         "values_not_at_their_default": "Valori che non sono al loro predefinito",
         "withheld_at": "Trattenuto in"
       },
+      "formReview": {
+        "authorises_commands_to_run": "I comandi di questa modifica vengono eseguiti dal motore su questa macchina, con i permessi del motore stesso, ogni volta che la fase o il controllo a cui appartengono viene eseguito.",
+        "binds_a_capability_to_an_external_program": "Il motore controlla la forma del comando e nient'altro — non esiste un elenco di programmi ammessi né alla porta di scrittura né a quella di esecuzione — quindi questa conferma è l'unico controllo su quale programma viene eseguito.",
+        "only_an_operator_confirmation_writes_this": "{{path}} è un percorso che il motore riserva a una superficie confermata da un operatore: lo strumento di scrittura dell'agente lo rifiuta, quindi questa conferma è l'unico modo per scriverlo.",
+        "raises_an_untrusted_class_authority": "L'autorità concessa qui è concessa a ogni autore che quella classe comprende, non solo a chi invia e hai in mente.",
+        "removes_a_gate_from_the_flow": "Senza il controllo, nulla esegue le sue verifiche e il flusso procede come se fossero passate. La validazione di formato e di fase del motore stesso resta valida.",
+        "show_the_exact_patch": "Mostra la patch esatta che questa conferma invia"
+      },
       "manifest": {
         "description": "Trasforma una richiesta in una specifica revisionata e poi eseguila. Qualsiasi agente in grado di chiamare strumenti MCP guida l'intero flusso di lavoro: il motore fornisce le istruzioni di stesura, orchestrazione e revisione, convalida i documenti nativi che produce e rifiuta di avanzare a una fase il cui documento non è valido o è privo di un'approvazione valida. Nulla del formato risiede in un prompt che un agente possa dimenticare o parafrasare.",
         "display_name": "Spec Engine",

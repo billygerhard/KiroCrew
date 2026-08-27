@@ -3851,6 +3851,14 @@
         "values_not_at_their_default": "Werte, die nicht auf ihrem Standard stehen",
         "withheld_at": "Zurückgehalten unter"
       },
+      "formReview": {
+        "authorises_commands_to_run": "Die Befehle in dieser Änderung werden von der Engine auf diesem Rechner mit den Rechten der Engine ausgeführt, jedes Mal wenn die zugehörige Stufe oder das zugehörige Gate läuft.",
+        "binds_a_capability_to_an_external_program": "Die Engine prüft nur die Form des Befehls und nichts weiter — es gibt weder an der Schreibtür noch an der Ausführungstür eine Liste erlaubter Programme —, daher ist diese Bestätigung die einzige Kontrolle darüber, welches Programm läuft.",
+        "only_an_operator_confirmation_writes_this": "{{path}} ist ein Pfad, den die Engine einer von einem Operator bestätigten Oberfläche vorbehält: das Schreibwerkzeug des Agenten verweigert ihn, daher ist diese Bestätigung der einzige Weg, ihn zu schreiben.",
+        "raises_an_untrusted_class_authority": "Hier erteilte Befugnisse gelten für jeden Autor, den diese Klasse erfasst, nicht nur für die Einsender, die Sie im Sinn haben.",
+        "removes_a_gate_from_the_flow": "Ohne das Gate führt nichts seine Prüfungen aus, und der Ablauf fährt fort, als wären sie bestanden. Die Format- und Phasenprüfung der Engine selbst gilt weiterhin.",
+        "show_the_exact_patch": "Den exakten Patch anzeigen, den diese Bestätigung sendet"
+      },
       "manifest": {
         "description": "Verwandeln Sie eine Anfrage in eine geprüfte Spezifikation und führen Sie sie dann aus. Jeder Agent, der MCP-Tools aufrufen kann, steuert den gesamten Ablauf: Die Engine liefert die Anweisungen für Erstellung, Orchestrierung und Prüfung, validiert die daraus entstehenden nativen Dokumente und verweigert den Übergang zu einer Phase, deren Dokument nicht validiert oder deren Freigabe fehlt. Nichts am Format steckt in einem Prompt, den ein Agent vergessen oder umformulieren kann.",
         "display_name": "Spec Engine",

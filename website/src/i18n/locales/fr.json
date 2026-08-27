@@ -3912,6 +3912,14 @@
         "values_not_at_their_default": "Valeurs qui ne sont pas à leur valeur par défaut",
         "withheld_at": "Masqué à"
       },
+      "formReview": {
+        "authorises_commands_to_run": "Les commandes de ce changement sont exécutées par le moteur sur cette machine, avec les droits du moteur, chaque fois que l'étape ou le contrôle auquel elles appartiennent s'exécute.",
+        "binds_a_capability_to_an_external_program": "Le moteur vérifie la forme de la commande et rien d'autre — il n'existe aucune liste de programmes autorisés, ni à la porte d'écriture ni à celle d'exécution — donc cette confirmation est le seul garde-fou sur le programme exécuté.",
+        "only_an_operator_confirmation_writes_this": "{{path}} est un chemin que le moteur réserve à une surface confirmée par un opérateur : l'outil d'écriture de l'agent le refuse, donc cette confirmation est le seul moyen de l'écrire.",
+        "raises_an_untrusted_class_authority": "L'autorité accordée ici est accordée à tout auteur que cette classe recouvre, et pas seulement aux soumetteurs que vous avez en tête.",
+        "removes_a_gate_from_the_flow": "Sans ce contrôle, rien n'exécute ses vérifications et le flux continue comme si elles avaient réussi. La validation de format et de phase du moteur lui-même s'applique toujours.",
+        "show_the_exact_patch": "Afficher le patch exact que cette confirmation envoie"
+      },
       "manifest": {
         "description": "Transformez une demande en spécification révisée, puis exécutez-la. Tout agent capable d'appeler des outils MCP pilote l'ensemble du flux : le moteur fournit les instructions de rédaction, d'orchestration et de revue, valide les documents natifs produits et refuse de passer à une phase dont le document n'est pas valide ou dont l'approbation manque. Rien du format ne réside dans un prompt qu'un agent pourrait oublier ou reformuler.",
         "display_name": "Spec Engine",

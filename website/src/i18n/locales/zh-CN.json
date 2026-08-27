@@ -3790,6 +3790,14 @@
         "values_not_at_their_default": "不处于默认值的项",
         "withheld_at": "隐去位置"
       },
+      "formReview": {
+        "authorises_commands_to_run": "此变更中的命令由引擎在本机以引擎自身的权限执行，每次其所属阶段或关卡运行时都会执行。",
+        "binds_a_capability_to_an_external_program": "引擎只检查命令的形状，别无其他——写入入口和执行入口都没有允许程序的名单——因此这次确认是对运行哪个程序的唯一把关。",
+        "only_an_operator_confirmation_writes_this": "{{path}} 是引擎保留给经操作者确认的界面的路径：代理自身的写入工具会拒绝它，因此这次确认是唯一能写入它的途径。",
+        "raises_an_untrusted_class_authority": "在此授予的权限会授予该类涵盖的每一位作者，而不只是你心中想到的提交者。",
+        "removes_a_gate_from_the_flow": "关卡移除后，其检查不会运行，流程会按通过处理继续。引擎自身的格式与阶段校验仍然生效。",
+        "show_the_exact_patch": "查看此确认将发送的确切补丁"
+      },
       "manifest": {
         "description": "把需求变成经过评审的规格，然后直接执行。只要能调用 MCP 工具，任何智能体都可以推进整个工作流：引擎提供撰写、编排与评审指令，校验其产出的原生文档，并拒绝进入文档未通过校验或缺少有效批准的阶段。格式相关内容不会放进提示词，以免智能体遗忘或改写。",
         "display_name": "Spec Engine",
