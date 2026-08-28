@@ -3867,10 +3867,10 @@
         "show_the_exact_patch": "查看此确认将发送的确切补丁"
       },
       "gateForm": {
-        "a_confirm_writes_exactly_this_patch": "确认后发送的就是上面这份补丁，走的是本面板其他改动使用的同一条受保护写入路径。",
+        "a_confirm_writes_exactly_this_patch": "确认后发送的就是上面这份补丁，经由本面板其他改动同样使用的受保护写入路径。",
         "a_gate_change_writes_the_whole_list": "改动一个门禁会整体替换整份列表，因此本表单无法表示的条目会因为编辑另一个门禁而被改写。",
         "add_a_quality_gate": "添加质量门禁",
-        "an_unreadable_list_refuses_delivery": "列表无法读取期间，引擎会直接拒绝交付，因此不会发布任何内容。这与「没有门禁」不同：在文档修好之前，所有检查都处于关闭状态。",
+        "an_unreadable_list_refuses_delivery": "列表无法读取期间，引擎会直接拒绝交付，因此不会发布任何内容。这与“没有门禁”不同：在文档修好之前，所有检查都处于关闭状态。",
         "choose_a_definition_to_copy": "选择要复制的内置定义",
         "choose_a_position_for_gate": "{{gate}} 的运行位置",
         "choose_a_position_for_the_new_gate": "新门禁的运行位置",
@@ -3893,7 +3893,7 @@
         "keep_the_gate": "保留门禁",
         "name_for_the_new_gate": "新门禁的名称",
         "no_gate_is_configured": "没有配置任何门禁，因此没有门禁会运行。",
-        "nothing_was_written_so_the_gates_are_stored": "什么都没有写入，所以上面的门禁仍是已保存的状态。待写入的改动还在这里，可以改好后重新发送。",
+        "nothing_was_written_so_the_gates_are_stored": "什么都没有写入，所以上面的门禁仍是已保存状态。待写入的改动还在这里，可以改好后重新发送。",
         "one_command_per_line": "每行一条命令，参数用空格分隔。引擎把每条当作一个程序及其参数来运行，不经过 shell。",
         "position_both": "在生成评审工件之前和之后",
         "position_both_effect": "会运行两次：之前的阻塞失败意味着评审工件根本不会生成，之后的阻塞失败意味着改动不会发布。",

@@ -70,6 +70,17 @@ export const SOURCES = 'sources'
 /** Key holding the autonomy grid inside a source object. */
 export const AUTONOMY_KEY = 'autonomy'
 
+/**
+ * Section holding the quality gates.
+ *
+ * A LIST rather than an object, unlike every other section named here, and that
+ * changes how a form patches it: the store's merge replaces an array wholesale, so
+ * there is no per-gate path to stage and a change to one gate is a write of the
+ * whole list. Declaration order is the order the gates run in at their position, so
+ * the list is also not a set the form may reorder freely.
+ */
+export const QUALITY_GATES = 'quality_gates'
+
 /** A JSON object as it arrives from the read. */
 export type Document = Record<string, unknown>
 
