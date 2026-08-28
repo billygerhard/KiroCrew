@@ -18,7 +18,9 @@
  *    argument is not split by anything the argument itself contains; an operator
  *    still has to be able to type an argument that holds a space. The quoting the
  *    parser honours is the minimum that makes that expressible, and it is the same
- *    shape a rendered command delimits an otherwise-invisible argument in.
+ *    shape a rendered command delimits an otherwise-invisible argument in — a
+ *    resemblance that helps a reader and is NOT a round trip, because the display
+ *    escapes nothing inside a token. See {@link parseCommandLine}.
  * 3. **Naming the paths a write lands at, and reading the preset names a write uses
  *    as path segments out of the document** rather than off the route, whose names
  *    are capped for display.
@@ -185,9 +187,22 @@ export function needsDelimiting(argument: string): boolean {
  * will split or join these again, so an argument holding a space has to be
  * expressible here or it is not expressible at all. Single and double quotes both
  * group; a backslash escapes the next character inside double quotes and outside
- * them. That is also the shape the resolved commands are DISPLAYED in — an argument
- * {@link needsDelimiting} is shown between quotes — so the text an operator copies
- * off a stage row parses back to the argv it was rendered from.
+ * them.
+ *
+ * The direction that is guaranteed, and the one production depends on, is that
+ * EVERY argv the engine can run is expressible in this field: quote each argument
+ * and escape the quote and backslash inside it, and this parser returns that argv
+ * argument for argument. A surviving property asserts exactly that.
+ *
+ * The other direction does NOT hold and nothing may be built on it. A stage row's
+ * rendering delimits an argument {@link needsDelimiting} for a READER — so the
+ * boundary is visible — and it deliberately escapes nothing inside the token,
+ * because the token is the payload's own bytes and the byte-equality claim is made
+ * against them. So a rendered `a"b c` comes back through here as two arguments, and
+ * a bare `a\b` comes back as `ab`. Nothing pre-fills a command field from a rendered
+ * command, which is why the rendering owes no round trip; a future formatter that
+ * wanted one would have to escape exactly what this parser unescapes, and would be
+ * a different function from the display path.
  *
  * An unterminated quote yields the argument it opened rather than an error: this
  * runs on every keystroke, and refusing a half-typed line would make the field

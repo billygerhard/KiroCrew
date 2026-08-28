@@ -44,6 +44,18 @@
  * that cap arrives as `<cap chars> [...]`, and a write spending that string
  * addresses a path no document holds — which for `workflow.preset` is the selection
  * the engine then refuses to resolve at all.
+ *
+ * ## The delimiting rule, asserted through what it changes
+ *
+ * The last group is about `needsDelimiting`, and it deliberately does NOT assert
+ * the rule against a restatement of itself: `needsDelimiting(a) === (a === '' ||
+ * /\s/.test(a))` passes against every implementation, including a wrong one,
+ * because both sides move together. What the rule is FOR is that a rendered command
+ * line stays an unambiguous reading of one argv, so that is what is asserted — an
+ * argument holding whitespace renders differently from the several arguments its
+ * whitespace would otherwise make it look like, and an argv needing no delimiter
+ * gets none. Each half falsifies a rule the other cannot: never delimiting collides
+ * the first, always delimiting breaks the second.
  */
 import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
@@ -93,6 +105,59 @@ const ARGUMENT = fc.oneof(
   fc.constantFrom('git', 'add', '--all', '-m', 'a b', '', 'a"b', "a'b", 'a\\b', '  ', '\t'),
   fc.string({ maxLength: 6 }),
 )
+
+/**
+ * An argument a single space could not separate from its neighbours.
+ *
+ * One holding whitespace of its own, or holding nothing at all. These are the two
+ * shapes the delimiting rule exists for, so the property below generates them
+ * directly rather than filtering them out of {@link ARGUMENT} and spending most of
+ * its runs on cases it cannot say anything about.
+ */
+const INVISIBLE_ARGUMENT = fc.constantFrom(
+  '',
+  ' ',
+  '  ',
+  '\t',
+  '\n',
+  'a b',
+  'a  b',
+  ' lead',
+  'trail ',
+  'a\tb',
+)
+
+/** An argument a space already separates: non-empty, and holding no whitespace. */
+const VISIBLE_ARGUMENT = fc.oneof(
+  fc.constantFrom('git', 'add', '--all', '-m', 'a"b', "a'b", 'a\\b', 'HEAD~1'),
+  fc.string({ minLength: 1, maxLength: 6 }).filter((argument) => !/\s/.test(argument)),
+)
+
+/**
+ * One command line the way a stage row renders it.
+ *
+ * A mirror of `StageCommands`: one space between tokens, an argument
+ * {@link needsDelimiting} wrapped in quotes, and nothing escaped INSIDE a token,
+ * because a token carries the payload's own bytes and that is what the
+ * byte-equality claim above is made against. The form's real rendering is pinned
+ * against this same shape by name in `SpecEngineWorkflowForm.test.tsx`
+ * (`git commit -m "a b"`), so the mirror cannot drift from the JSX unnoticed.
+ */
+function renderedLine(argv: readonly string[]): string {
+  return argv.map((argument) => (needsDelimiting(argument) ? `"${argument}"` : argument)).join(' ')
+}
+
+/**
+ * What a reader actually SEES of that line.
+ *
+ * HTML collapses a run of whitespace, so two renderings that differ only in how
+ * much whitespace they contain are one line on screen. Comparing the raw strings
+ * would let a delimiting rule that forgot the empty argument pass: `prog  after`
+ * and `prog after` are two strings and one indistinguishable command.
+ */
+function visible(line: string): string {
+  return line.replace(/\s+/g, ' ').trim()
+}
 
 /** One argv. Non-empty, because the write door refuses an empty command. */
 const ARGV = fc.array(ARGUMENT, { minLength: 1, maxLength: 4 })
@@ -364,15 +429,41 @@ describe('a preset name a write spends is the document’s own', () => {
 })
 
 describe('a rendered argument that would vanish is delimited', () => {
-  it('delimits exactly the arguments a reader could not otherwise see', () => {
+  it('keeps an argument holding whitespace apart from the arguments it looks like', () => {
     fc.assert(
-      fc.property(ARGUMENT, (argument) => {
-        // The tokens are separated by a single space, so the arguments that need a
-        // delimiter are precisely the ones a space cannot separate: one holding
-        // whitespace of its own, and an empty one. Anything else is delimited for no
-        // reason, and a shell-looking quotation the engine does not apply is a lie
-        // about what runs.
-        expect(needsDelimiting(argument)).toBe(argument === '' || /\s/.test(argument))
+      fc.property(
+        fc.array(ARGUMENT, { maxLength: 2 }),
+        INVISIBLE_ARGUMENT,
+        fc.array(ARGUMENT, { maxLength: 2 }),
+        (before, argument, after) => {
+          const one = [...before, argument, ...after]
+          // The same characters with whitespace doing the separating instead: the
+          // one argument becomes however many its own whitespace splits it into,
+          // and none at all when it holds nothing but whitespace. These are two
+          // DIFFERENT commands — the engine spawns argv with no shell, so
+          // `git commit -m` plus one argument holding `a b` runs differently from
+          // the same words as two arguments — and an operator reading the row has
+          // no other way to tell which one is configured.
+          const many = [
+            ...before,
+            ...argument.split(/\s+/).filter((part) => part !== ''),
+            ...after,
+          ]
+          expect(visible(renderedLine(one))).not.toBe(visible(renderedLine(many)))
+        },
+      ),
+      { numRuns: 500 },
+    )
+  })
+
+  it('adds no quotation to a command whose every argument is already visible', () => {
+    fc.assert(
+      fc.property(fc.array(VISIBLE_ARGUMENT, { minLength: 1, maxLength: 4 }), (argv) => {
+        // The other half, and not a symmetry preference: quotes the engine does not
+        // apply are a claim about what runs. A rule that delimited everything would
+        // keep every command above distinguishable and still show an operator
+        // `"git" "add"` for an argv holding neither quote.
+        expect(renderedLine(argv)).toBe(argv.join(' '))
       }),
       { numRuns: 300 },
     )

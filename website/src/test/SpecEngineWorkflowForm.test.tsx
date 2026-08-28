@@ -345,6 +345,20 @@ function shownPatch(): Record<string, unknown> {
   return JSON.parse((pre as HTMLElement).textContent ?? '{}') as Record<string, unknown>
 }
 
+/**
+ * The unwritten-work count on the delivery tab, or `''` when it carries none.
+ *
+ * Read off the TAB rather than off the form's own line, because the tab is the only
+ * place the count is visible once a read fails: the form's error branch states the
+ * refusal instead of its rows. Only the pending count renders inside a stage tab —
+ * the document's problem and advisory marks are the advanced stage's — so this is
+ * that number and nothing else.
+ */
+function deliveryPending(): string {
+  const tab = screen.getByRole('tab', { name: new RegExp(`^${C.stage_delivery}`) })
+  return tab.querySelector('.se-filter-count')?.textContent ?? ''
+}
+
 afterEach(() => {
   cleanup()
   calls.length = 0
@@ -752,6 +766,48 @@ describe('a preset name too long to display is still the name that is written', 
     ).toBe(true)
   })
 
+  it('refuses the removal the app-wide selection would strand', async () => {
+    // The APP half of the same comparison, and the half a short name proves nothing
+    // about: the defect being guarded is a comparison made against the route's
+    // capped rendering, which is only a different string past the cap.
+    expect(LONG_NAME.length).toBeGreaterThan(registry().workflow_preset_name_limit)
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName('app')) },
+      workflow: {
+        body: workflowWithLongName({
+          preset: {
+            name: CAPPED_NAME,
+            origin: 'app_config',
+            declared_at: 'workflow.preset',
+            bundled: false,
+          },
+        }),
+      },
+    })
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: copy(T.remove_the_preset, { preset: LONG_NAME }),
+      }),
+    )
+    // `workflow.preset` holds the document's own spelling, so the refusal has to be
+    // read from there: compared against the capped rendering this removal would be
+    // OFFERED, and confirming it would leave the app-wide selection naming a preset
+    // nothing defines — which the engine answers by refusing to resolve the workflow
+    // at all, taking the read down with no in-form way back.
+    expect(
+      within(block()).getByText(
+        copy(T.removal_is_refused_the_app_selects_it, { preset: LONG_NAME }),
+      ),
+    ).toBeTruthy()
+    expect(
+      (
+        within(block()).getByRole('button', {
+          name: T.review_the_exact_change,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true)
+  })
+
   it('refuses a second definition of that name rather than merging into the first', async () => {
     await openDelivery({
       config: { body: snapshot(storedWithLongName()) },
@@ -856,5 +912,41 @@ describe('a failed read states itself', () => {
     )
     // And no chooser is left offering names nobody re-read.
     expect(within(block()).queryByRole('group', { name: T.presets_bundled_with_the_app })).toBeNull()
+  })
+
+  it('keeps reporting a typed definition once the workflow read is refused', async () => {
+    const client = await openDelivery({
+      workflow: [{ body: workflow() }, failure(409, 'config_unreadable')],
+    })
+    fireEvent.change(within(block()).getByLabelText(T.the_preset_name), {
+      target: { value: 'my-flow' },
+    })
+    fireEvent.change(draftField('submit'), { target: { value: 'make ship' } })
+    await waitFor(() => expect(deliveryPending()).toBe('1'))
+    void client.invalidateQueries({ queryKey: QK.workflow('') })
+    await waitFor(() =>
+      expect(screen.getByText(T.could_not_read_the_delivery_workflow)).toBeTruthy(),
+    )
+    // The stage rows go with the read and the typed definition does NOT: it is held
+    // in this form's own state, because the name is part of every path a definition
+    // writes and a refused name would have nowhere to hold a draft. So a count taken
+    // from the rows reports the definition as gone the moment a refetch fails, on
+    // the one branch that exists to say what the form is still holding — and the
+    // operator reads "no unwritten changes" over work that is sitting right there.
+    expect(deliveryPending()).toBe('1')
+  })
+
+  it('reports nothing when the read it refused was holding nothing', async () => {
+    // The opposite pole, and the test above cannot do without it: a count wired to
+    // any constant, or stuck at its last value, would satisfy that assertion alone.
+    const client = await openDelivery({
+      workflow: [{ body: workflow() }, failure(409, 'config_unreadable')],
+    })
+    expect(deliveryPending()).toBe('')
+    void client.invalidateQueries({ queryKey: QK.workflow('') })
+    await waitFor(() =>
+      expect(screen.getByText(T.could_not_read_the_delivery_workflow)).toBeTruthy(),
+    )
+    expect(deliveryPending()).toBe('')
   })
 })

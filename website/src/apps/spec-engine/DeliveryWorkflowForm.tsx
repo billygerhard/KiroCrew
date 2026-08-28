@@ -393,21 +393,28 @@ export function DeliveryWorkflowForm({
   // reason: a control must show what it writes.
   const userPresets = useMemo(() => documentPresetNames(document), [document])
   const rows = useMemo(() => (state ? workflowStageRows(state) : []), [state])
-  const declaredStages = useMemo(() => rows.map((row) => row.stage), [rows])
 
   const trimmed = draftName.trim()
   const refusal = presetNameRefusal(trimmed, bundledPresets, userPresets, nameLimit)
   // The stages the draft actually declares, parsed from what was typed. Blank lines
   // and blank stages drop out: the write door refuses an empty command, and a
   // preset entry must declare at least one stage.
+  //
+  // Keyed off the DRAFT rather than off the stages the last read declared, and that
+  // is the load-bearing part. A key here can only have been created by typing into a
+  // rendered stage's field, so while the read stands the two are the same set — and
+  // when the read is REFUSED the rows empty while the typed text survives in
+  // component state. Iterating the rows would then make every definition
+  // disappear from the count on exactly the branch that exists to report what the
+  // form is still holding, which is the badge dropping to zero over unwritten work.
   const draftCommands = useMemo(() => {
     const found: Array<{ stage: string; commands: string[][] }> = []
-    for (const stage of declaredStages) {
-      const commands = parseCommandBlock(draftStages[stage] ?? '')
+    for (const [stage, text] of Object.entries(draftStages)) {
+      const commands = parseCommandBlock(text)
       if (commands.length > 0) found.push({ stage, commands })
     }
     return found
-  }, [declaredStages, draftStages])
+  }, [draftStages])
 
   // The staged edits hold ONLY the preset selection and a preset removal. The
   // definition edits are DERIVED from the draft below rather than accumulated,
@@ -454,7 +461,9 @@ export function DeliveryWorkflowForm({
       <div className="se-blk">
         {/* What it HOLDS, not what it can review: with no read the form cannot say
             what a staged edit means, and a badge that dropped to zero here would
-            report unwritten work as gone. */}
+            report unwritten work as gone. The same quantity the main return
+            reports, which is why the definitions are counted off the draft rather
+            than off the rows a failed read leaves empty. */}
         <PendingCount
           count={edits.edits.length + definitionEdits.length}
           onCount={onPendingCount}
