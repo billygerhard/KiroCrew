@@ -140,7 +140,7 @@ function registry(over: Record<string, unknown> = {}) {
  *
  * The pane renders only a stage's own groups, so a fixture spread across four areas
  * would put this suite's rows behind four navigations for no gain: what is under
- * test is the form, and the areas are `SpecEngineConfigStages.test.tsx`. Derived
+ * test is the form, and the areas are `SpecEngineConfigTabs.test.tsx`. Derived
  * from the FINAL settings list rather than from a literal, so a case that replaces
  * `settings` — the unknown-kind row, whose group nothing else declares — is placed
  * on the same stage as the rest instead of folding into the advanced area.

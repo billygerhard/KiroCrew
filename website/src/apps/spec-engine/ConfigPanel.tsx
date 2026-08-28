@@ -183,9 +183,23 @@ function PendingCount({
   count: number
   onCount?: (count: number) => void
 }) {
+  const report = useRef<((count: number) => void) | undefined>(onCount)
   useEffect(() => {
+    report.current = onCount
     onCount?.(count)
   }, [count, onCount])
+  // Unmount reports ZERO, because a surface that is no longer mounted holds no
+  // unwritten edits — and the pane's total is a sum over surfaces that never
+  // evicted a key. Without this the pane states a count including edits it has
+  // already discarded. Reachable: a refused vocabulary read collapses every
+  // group into one advanced area, the operator stages an edit on a surface
+  // there, then a successful refetch re-expands the five stages and unmounts
+  // that surface — its edits are genuinely gone while its count would remain.
+  //
+  // Its own effect with an empty dependency list, NOT a cleanup on the reporting
+  // effect above: that one re-runs on every count change, so its cleanup would
+  // report a spurious zero between every real value.
+  useEffect(() => () => report.current?.(0), [])
   return null
 }
 
