@@ -1016,6 +1016,14 @@ def _registry_payload() -> dict[str, Any]:
         # provoking it.
         "engine_floor": list(ENGINE_FLOOR_CAPABILITIES),
         "workflow_presets": list(WORKFLOW_PRESET_NAMES),
+        # How wide a preset name may be before the display path caps it. Projected
+        # for a reason the other vocabularies do not share: a form that DEFINES a
+        # preset name must be able to refuse one this pane could only ever show
+        # truncated. Every reader of a preset name here -- the selection, a stage's
+        # origin, the user-defined list -- renders it through `sanitized`, so a
+        # longer name would be shown as something no document holds, and the
+        # surface that created it would be the surface that cannot display it.
+        "workflow_preset_name_limit": MAX_PRESET_NAME_CHARS,
         # Gate presets travel as whole entries rather than names, for the reason
         # the source and cost-profile presets do: a form adds a gate as a COPY of
         # one, and a client holding only names would have to invent the argv it

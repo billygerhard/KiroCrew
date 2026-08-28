@@ -513,6 +513,20 @@ export interface RegistryPayload {
    * defines rather than a set this side invented.
    */
   workflow_presets?: string[]
+  /**
+   * How many characters a workflow preset name may hold before it is capped.
+   *
+   * Every reading of a preset name on `/config/workflow` — the selection, a stage's
+   * origin, the user-defined list — is rendered through the engine's display
+   * truncation at this width, so a longer name is one this pane can only ever show
+   * as a string no document holds. A form that DEFINES a name refuses one past it
+   * rather than creating a name it would then have to misreport.
+   *
+   * Optional in the TYPE and not in the route, for `stages`' reason: an older
+   * gateway serves no such key, and no length is then refused — a cap this side
+   * invented would refuse a name the engine displays perfectly well.
+   */
+  workflow_preset_name_limit?: number
 }
 
 /**
@@ -602,6 +616,15 @@ export interface WorkflowState {
   preset: { name: string; origin: string; declared_at: string; bundled: boolean } | null
   /** One row per DECLARED stage, in the engine's own order. */
   stages: StageOrigin[]
+  /**
+   * The user-defined preset names, each rendered through the display cap.
+   *
+   * A DISPLAY reading, like `QualityGate.name` and for the same reason: a name
+   * longer than the cap arrives truncated, so it is not the key the document holds
+   * and cannot be used as a path segment or compared against a stored selection.
+   * `DeliveryWorkflowForm` reads those names from the document instead, and uses
+   * this list to state nothing it would then write.
+   */
   user_presets: string[]
   /** Which stages the delivery flow itself runs, in flow order. */
   delivery_flow_stages: string[]

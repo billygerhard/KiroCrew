@@ -41,6 +41,15 @@
  * 6. **A removal that would strand a selection is refused, naming what selects
  *    it.** A `disabled` control with no reason leaves no next action, and the next
  *    action is to point those projects elsewhere.
+ * 7. **A preset name has ONE spelling here.** Every name this form writes as a path
+ *    segment, and every name it compares a stored selection against, is read from
+ *    the document; the route's own list of them is capped for display, so a name
+ *    past that cap arrives as a string no document holds. Feeding a display value
+ *    into a write path is how a chooser comes to select a preset nothing defines —
+ *    which the engine answers by refusing to resolve the workflow at all, taking
+ *    the whole read down and leaving no in-form way back. The definition field
+ *    refuses a name longer than the cap for the same reason, so this form cannot
+ *    create the name it would then have to misreport.
  *
  * Every write is per-stage or per-leaf and never wholesale. That is load-bearing
  * for the confirmation card rather than a tidiness preference: its fence matcher
@@ -49,7 +58,7 @@
  * outside would carry the fenced write with nothing flagging it. See
  * `workflowRows.presetStageSegments`.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { fmtNumber } from '../../i18n/format'
@@ -69,6 +78,8 @@ import {
 } from './configDocument'
 import { useStagedEdits } from './useStagedEdits'
 import {
+  documentPresetNames,
+  needsDelimiting,
   parseCommandBlock,
   presetSegments,
   presetSelectionSegments,
@@ -166,30 +177,67 @@ export function appSelectsPreset(document: Document, preset: string): boolean {
  * bundled preset name and cannot be redefined`, so offering the write and letting
  * it fail would spend a confirmation to learn something the projection already
  * says. `taken` is this form's: an existing definition would be MERGED into rather
- * than created, which is an edit to that preset and not the addition on offer.
+ * than created, which is an edit to that preset and not the addition on offer, and
+ * it is checked against the names the DOCUMENT holds so a name the display had to
+ * cap is still recognised as taken.
+ *
+ * `long` is the display cap, and refusing here is a choice between two ways of
+ * keeping the stored name and the shown name from diverging. The write door admits
+ * a name of any length; every read that renders one caps it at *limit*. So a
+ * longer name is writable and then permanently displayed — in the selection line,
+ * in a stage's origin, in this chooser — as a string no document holds. The other
+ * way out would be for this form to cap every name it displays, which means
+ * reimplementing the engine's truncation here and showing an operator a label they
+ * cannot search their document for. Refusing the name is the one that leaves a
+ * single spelling of every name in play, and the typed stage commands survive it
+ * for the same reason the other two refusals leave them alone.
+ *
+ * A *limit* of zero means the projection did not answer, and no length is refused:
+ * an older gateway that serves no cap must not turn every name into a refusal.
  */
 export function presetNameRefusal(
   name: string,
   bundled: readonly string[],
   defined: readonly string[],
-): '' | 'reserved' | 'taken' {
+  limit: number,
+): '' | 'reserved' | 'taken' | 'long' {
   if (name === '') return ''
   if (bundled.includes(name)) return 'reserved'
   if (defined.includes(name)) return 'taken'
+  if (limit > 0 && name.length > limit) return 'long'
   return ''
 }
 
-/** One stage's argument list, each argument its own byte-equal token. */
+/**
+ * One stage's argument list, each argument its own byte-equal token.
+ *
+ * The tokens are separated by rendered text rather than by styling, and an argument
+ * that would otherwise vanish into its neighbours — one holding whitespace, or an
+ * empty one — is delimited. Both matter for the same reason: the engine spawns this
+ * argv with NO shell, so `git commit -m` followed by one argument holding `a b` is a
+ * different command from the same words as five arguments, and a rendering with no
+ * separation at all shows the operator neither. The delimiters are punctuation
+ * around the token, never inside it: each span still carries the payload's exact
+ * bytes, which is what the byte-equality claim is made against.
+ */
 function StageCommands({ row }: { row: WorkflowStageRow }) {
   return (
     <ul className="se-names" data-stage-commands={row.stage}>
       {row.commands.map((command, index) => (
         <li className="se-evid-item se-m" key={`${index}:${command.join('\u0000')}`}>
-          {command.map((argument, position) => (
-            <span className="se-val" key={position} data-argument={position}>
-              {argument}
-            </span>
-          ))}
+          {command.map((argument, position) => {
+            const delimited = needsDelimiting(argument)
+            return (
+              <Fragment key={position}>
+                {position > 0 ? ' ' : ''}
+                {delimited ? '"' : ''}
+                <span className="se-val" data-argument={position}>
+                  {argument}
+                </span>
+                {delimited ? '"' : ''}
+              </Fragment>
+            )
+          })}
         </li>
       ))}
     </ul>
@@ -333,13 +381,22 @@ export function DeliveryWorkflowForm({
   })
 
   const bundledPresets = registry.data?.workflow_presets ?? NO_NAMES
+  const nameLimit = registry.data?.workflow_preset_name_limit ?? 0
   const state: WorkflowState | undefined = workflow.isError ? undefined : workflow.data
-  const userPresets = state?.user_presets ?? NO_NAMES
+  // The names a write uses as a path segment, and the names a removal is checked
+  // against, come from the DOCUMENT. The route's `user_presets` answers the same set
+  // but renders each name through the display cap, so a longer one arrives as a
+  // string no document holds — and this form spends those names on
+  // `workflow.preset`, on `workflow.presets.<name>`, and on the comparison that
+  // decides whether removing a preset would strand a project's selection. One
+  // spelling for all four, which is the rule the gate form states for the same
+  // reason: a control must show what it writes.
+  const userPresets = useMemo(() => documentPresetNames(document), [document])
   const rows = useMemo(() => (state ? workflowStageRows(state) : []), [state])
   const declaredStages = useMemo(() => rows.map((row) => row.stage), [rows])
 
   const trimmed = draftName.trim()
-  const refusal = presetNameRefusal(trimmed, bundledPresets, userPresets)
+  const refusal = presetNameRefusal(trimmed, bundledPresets, userPresets, nameLimit)
   // The stages the draft actually declares, parsed from what was typed. Blank lines
   // and blank stages drop out: the write door refuses an empty command, and a
   // preset entry must declare at least one stage.
@@ -376,8 +433,8 @@ export function DeliveryWorkflowForm({
   // A staged removal whose preset has left the document is dropped: it would
   // resurrect nothing, and no sentence on the card would describe it. That
   // departure can arrive from this form, from the document editor, or on any
-  // refetch, so it reconciles against the current answer rather than trusting the
-  // document to hold still between a click and its confirm.
+  // refetch, so it reconciles against the document's current names rather than
+  // trusting it to hold still between a click and its confirm.
   const { reconcile } = edits
   useEffect(() => {
     reconcile(
@@ -436,7 +493,20 @@ export function DeliveryWorkflowForm({
   const selection = workflow.data.preset
   const selectionSegments = presetSelectionSegments(project)
   const stagedSelection = edits.stagedAt(selectionSegments)
-  const chosen = stagedSelection ? String(stagedSelection.value ?? '') : (selection?.name ?? '')
+  // What the chooser marks as pressed is what THIS path holds, read from the
+  // document rather than from the route's resolved selection. Two reasons, and the
+  // second is the load-bearing one. A resolved name is capped for display, and this
+  // control writes the name it shows. And the resolved answer is inherited: a
+  // project with no selection of its own resolves to the app's, so marking that as
+  // pressed here would say the project selects a preset when what is true is that
+  // it inherits one — which the "in force" statement above says in words, with the
+  // origin and the declaring path the route alone can supply.
+  const storedChoice = nodeAt(document, selectionSegments)
+  const chosen = stagedSelection
+    ? String(stagedSelection.value ?? '')
+    : typeof storedChoice === 'string'
+      ? storedChoice
+      : ''
 
   // Plain functions rather than `useCallback`: each closes over the mutation
   // object, which React Query hands back fresh on every render, so a memo here
@@ -686,6 +756,13 @@ export function DeliveryWorkflowForm({
           <p className="se-note" role="alert">
             {i18nT('apps.specEngine.workflowForm.a_preset_of_that_name_is_already_defined', {
               name: trimmed,
+            })}
+          </p>
+        )}
+        {refusal === 'long' && (
+          <p className="se-note" role="alert">
+            {i18nT('apps.specEngine.workflowForm.the_name_is_longer_than_a_name_can_be_shown', {
+              limit: fmtNumber(nameLimit),
             })}
           </p>
         )}

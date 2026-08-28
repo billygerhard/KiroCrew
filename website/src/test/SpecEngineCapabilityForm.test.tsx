@@ -40,6 +40,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
+import { QK } from '../apps/spec-engine/api'
 import {
   argvFromText,
   bindingEdits,
@@ -775,6 +776,81 @@ describe('staging a binding, and what the confirmation says it would write', () 
     // would teach a reader to discount the sentence when it is true.
     expect(panel().textContent).not.toContain(R.authorises_commands_to_run)
     expect(panel().textContent).not.toContain(R.binds_a_capability_to_an_external_program)
+  })
+
+  it('offers no return to the builtin for a capability nothing declares', async () => {
+    // With no stored entry the "return" is a deletion of a key that is not there: the
+    // patch would be a no-op and the card's sentence would say a command, environment
+    // entries and a timeout are removed when none were ever declared. Refused with
+    // the reason on screen, because a disabled control with no reason leaves an
+    // operator with no next act.
+    await openStage()
+    const row = capabilityRow('authoring')
+    expect(
+      within(row).getByRole('button', { name: B.stage_the_return_to_the_builtin }),
+    ).toBeDisabled()
+    expect(
+      within(row).getByText(B.nothing_is_declared_so_there_is_nothing_to_return),
+    ).toBeTruthy()
+    expect(
+      within(panel()).getByRole('button', { name: B.review_the_exact_binding_change }),
+    ).toBeDisabled()
+  })
+
+  it('offers it for a capability that IS declared, so the refusal is not universal', async () => {
+    await openStage({
+      config: {
+        body: snapshot({
+          capabilities: { authoring: { transport: 'command', command: ['old'] } },
+        }),
+      },
+      capabilities: {
+        body: capabilities([
+          row({ capability: 'analysis' }),
+          row({
+            capability: 'authoring',
+            transport: 'command',
+            configured: true,
+            declared_at: 'capabilities.authoring',
+            program: 'old',
+            reachable: true,
+          }),
+          row({ capability: 'validation_rules' }),
+        ]),
+      },
+    })
+    fireEvent.click(within(capabilityRow('authoring')).getByRole('button', { name: 'builtin' }))
+    const control = within(capabilityRow('authoring')).getByRole('button', {
+      name: B.stage_the_return_to_the_builtin,
+    })
+    expect(control).toBeEnabled()
+    expect(
+      within(capabilityRow('authoring')).queryByText(
+        B.nothing_is_declared_so_there_is_nothing_to_return,
+      ),
+    ).toBeNull()
+  })
+
+  it('reports the same quantity on the badge when the read behind it is refused', async () => {
+    // One rebind writes four leaves and is ONE act. The count reported while a read
+    // is refused has to be the same quantity the main return reports, or the stage
+    // badge jumps from one to four the moment a refetch fails, with nothing staged in
+    // between. And the edits have to still be THERE to report: a refused read renders
+    // no row, so reconciling the staged edits against the rendered rows would discard
+    // them, and every count would be a truthful zero over destroyed work.
+    const client = await openStage({
+      capabilities: [
+        { body: capabilities(AUTHORING.map((capability) => row({ capability }))) },
+        { status: 503, body: { code: 'unavailable', error: 'gone' } },
+      ],
+    })
+    bind('authoring', 'my-writer\n--json', ['REGION', 'eu'], '60')
+    const authoringTab = screen.getByRole('tab', { name: new RegExp(`^${C.stage_authoring}`) })
+    await waitFor(() => expect(authoringTab).toHaveTextContent(/1/))
+    await client.invalidateQueries({ queryKey: QK.capabilities })
+    await within(panel()).findByText(B.could_not_read_the_capability_bindings)
+    expect(authoringTab).toHaveTextContent(/1/)
+    expect(authoringTab.textContent).not.toMatch(/4/)
   })
 
   it('sends exactly the patch the disclosure showed, and re-reads rather than adopting it', async () => {

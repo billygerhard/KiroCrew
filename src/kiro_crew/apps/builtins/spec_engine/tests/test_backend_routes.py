@@ -51,6 +51,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.autonomy import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.capabilities.contracts import (
     DISPLAY_TRUNCATION_NOTICE,
+    sanitized,
 )
 from kiro_crew.apps.builtins.spec_engine.engine.config import (
     AUTONOMY_LEVELS,
@@ -85,6 +86,7 @@ from kiro_crew.apps.builtins.spec_engine.engine.config.profiles import (
 )
 from kiro_crew.apps.builtins.spec_engine.engine.delivery import (
     DELIVERY_FLOW_STAGES,
+    MAX_PRESET_NAME_CHARS,
     WORKFLOW_PRESET_NAMES,
     WORKFLOW_PRESETS,
     gate_presets,
@@ -1938,6 +1940,28 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
         assert reply.body["workflow_presets"] == list(WORKFLOW_PRESET_NAMES)
 
     @pytest.mark.asyncio
+    async def test_the_preset_name_cap_is_the_display_paths_own_ceiling(
+        self, recorded_sel: RecordedSel, enabled: None, home: Path
+    ) -> None:
+        """The cap travels as the engine's own number rather than as a copy.
+
+        A form that defines a preset name refuses one longer than this, because
+        every reader of a preset name on this route renders it through
+        ``sanitized`` at exactly this limit: a longer name would be displayed as
+        a string no document holds. A copy kept on the far side would drift from
+        the ceiling the display actually applies.
+        """
+        async with _client() as client:
+            reply = await _get(client, f"{routes.PREFIX}/config/registry")
+        assert reply.body["workflow_preset_name_limit"] == MAX_PRESET_NAME_CHARS
+        # The cap the projection ACTUALLY applies, not merely the constant it
+        # reports: a name at the limit survives whole and one character more does
+        # not, so the number a form refuses against is the number that is enforced.
+        limit = reply.body["workflow_preset_name_limit"]
+        assert sanitized("x" * limit, limit=limit) == "x" * limit
+        assert sanitized("x" * (limit + 1), limit=limit) != "x" * (limit + 1)
+
+    @pytest.mark.asyncio
     async def test_the_engine_floor_is_projected_apart_from_the_bindable_names(
         self, recorded_sel: RecordedSel, enabled: None, home: Path
     ) -> None:
@@ -2115,6 +2139,7 @@ class TestTheFormVocabularyReadProjectsTheEnginesOwnConstants:
             "capabilities",
             "engine_floor",
             "workflow_presets",
+            "workflow_preset_name_limit",
             "gate_presets",
             "stages",
         )

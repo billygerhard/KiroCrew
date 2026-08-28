@@ -346,6 +346,56 @@ describe('the positions and severities the engine declares', () => {
     expect(text).toContain(T.severity_advisory_effect)
   })
 
+  it('takes whether a failure stops the run from the engine, not from its own table', async () => {
+    await openGates()
+    // The payload's `blocking` is the ENGINE's reading of the severity, and it is
+    // what the stop/not-stop fact is rendered from.
+    expect(gateRow('tests').querySelector('[data-blocking="true"]')).not.toBeNull()
+    expect(within(gateRow('tests')).getByText(T.a_failure_stops_the_run)).toBeTruthy()
+    expect(gateRow('audit').querySelector('[data-blocking="false"]')).not.toBeNull()
+    expect(within(gateRow('audit')).getByText(T.a_failure_does_not_stop_the_run)).toBeTruthy()
+  })
+
+  it('states the effect of a severity this pane has no words for', async () => {
+    // The prose table is keyed by the severities this pane knows. A severity the
+    // engine adds later earns no sentence from it — and the payload was carrying the
+    // answer the whole time, so the row says what a failure does regardless.
+    const gates = storedGates()
+    gates[1].severity = 'fatal'
+    await openGates({
+      registry: { body: registry({ gate_severities: ['blocking', 'advisory', 'fatal'] }) },
+      config: { body: snapshot({ quality_gates: gates }) },
+      workflow: {
+        body: workflow({
+          gates: gates.map((gate, index) => ({
+            ...gate,
+            // The engine reads `fatal` as blocking; this pane has no prose for it.
+            blocking: gate.severity !== 'advisory',
+            origin: 'app_config',
+            declared_at: `quality_gates[${index}]`,
+          })),
+        }),
+      },
+    })
+    const row = gateRow('audit')
+    expect(row.textContent).toContain('fatal')
+    expect(within(row).getByText(T.a_failure_stops_the_run)).toBeTruthy()
+  })
+
+  it('withholds the engine’s reading once a draft has changed that severity', async () => {
+    await openGates()
+    // The stored flag describes the severity being REPLACED, so relaying it here
+    // would state the effect of the choice the operator just moved away from.
+    choose(
+      gateRow('tests'),
+      T.choose_a_severity_for_gate.replace('{{gate}}', 'tests'),
+      T.severity_advisory,
+    )
+    expect(gateRow('tests').querySelector('[data-blocking]')).toBeNull()
+    // The pane's own prose still describes the drafted severity.
+    expect(within(gateRow('tests')).getByText(T.severity_advisory_effect)).toBeTruthy()
+  })
+
   it('offers no gate control at all when the vocabularies were not read', async () => {
     // An older gateway sends neither tuple. Offering a list this side invented would
     // offer what the write door then refuses by path.
@@ -413,6 +463,37 @@ describe('an unreadable gate list against an empty one', () => {
       T.could_not_read_the_quality_gates,
     )
     expect(within(block()).queryByText(T.no_gate_is_configured)).toBeNull()
+  })
+
+  it('never says no gate runs while a DRAFT is what removed them all', async () => {
+    await openGates()
+    // Remove both gates, leaving the draft empty and the document untouched.
+    for (const name of ['tests', 'audit']) {
+      fireEvent.click(
+        within(gateRow(name)).getByRole('button', {
+          name: T.remove_the_gate.replace('{{gate}}', name),
+        }),
+      )
+      const armed = block().querySelector(`[data-gate-armed="${name}"]`) as HTMLElement
+      fireEvent.change(
+        within(armed).getByLabelText(T.type_the_name_to_confirm.replace('{{gate}}', name)),
+        { target: { value: name } },
+      )
+      fireEvent.click(
+        within(armed).getByRole('button', {
+          name: T.confirm_the_removal.replace('{{gate}}', name),
+        }),
+      )
+    }
+    const found = block()
+    // Nothing is written until the card is confirmed, so both stored gates are
+    // still in force and still running: the document-scoped sentence would be
+    // false, and it is the one an operator would act on.
+    expect(within(found).queryByText(T.no_gate_is_configured)).toBeNull()
+    expect(found.querySelector('[data-gates-state="empty"]')).toBeNull()
+    expect(within(found).getByText(T.the_draft_leaves_no_gate)).toBeTruthy()
+    // And the removals are still there to be confirmed.
+    expect(within(found).getByRole('button', { name: T.review_the_exact_change })).toBeEnabled()
   })
 })
 
@@ -648,6 +729,31 @@ describe('removing a gate', () => {
         { name: 'tests', position: 'pre_submit', severity: 'blocking', commands: [['make', 'test']] },
       ],
     })
+  })
+
+  it('keeps each surviving gate’s own declaring path after one is removed', async () => {
+    await openGates()
+    // `tests` is at index 0 and `audit` at index 1, so removing the FIRST moves the
+    // survivor to index 0 in the rows while the route still describes the document.
+    fireEvent.click(
+      within(gateRow('tests')).getByRole('button', {
+        name: T.remove_the_gate.replace('{{gate}}', 'tests'),
+      }),
+    )
+    const armed = block().querySelector('[data-gate-armed="tests"]') as HTMLElement
+    fireEvent.change(
+      within(armed).getByLabelText(T.type_the_name_to_confirm.replace('{{gate}}', 'tests')),
+      { target: { value: 'tests' } },
+    )
+    fireEvent.click(
+      within(armed).getByRole('button', {
+        name: T.confirm_the_removal.replace('{{gate}}', 'tests'),
+      }),
+    )
+    // Its own path, not the removed gate's: a path indexed by the row's position
+    // would send an operator to edit the wrong entry of the document.
+    expect(within(gateRow('audit')).getByText('quality_gates[1]')).toBeTruthy()
+    expect(gateRow('audit').textContent).not.toContain('quality_gates[0]')
   })
 })
 

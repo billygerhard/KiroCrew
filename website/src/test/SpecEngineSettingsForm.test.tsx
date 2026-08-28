@@ -290,10 +290,19 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
  * only edit already-configured settings would be a form that cannot configure
  * anything. The filter itself has its own describe block below, which does not
  * reveal.
+ *
+ * The reveal is asserted rather than attempted. A silent no-op here leaves every
+ * defaulted row hidden, and the cases below then fail one by one with "unable to
+ * find element" — pointing at forty tests instead of at this helper.
  */
 async function openRows(answers: Parameters<typeof stub>[0] = {}) {
   const client = await openConfig(answers)
-  revealEverySetting()
+  const control = revealControl()
+  expect(
+    control,
+    'the reveal control is not on screen, so no row at its bundled default can be shown',
+  ).not.toBeNull()
+  fireEvent.click(control as HTMLElement)
   await waitFor(() =>
     expect(settingRows().length).toBeGreaterThan(0),
   )
@@ -301,19 +310,31 @@ async function openRows(answers: Parameters<typeof stub>[0] = {}) {
 }
 
 /**
- * Show the rows at their bundled default too, if the control is on screen.
+ * The control that shows the rows at their bundled default, or `null`.
  *
- * Guarded rather than asserted, because `openConfig` also reaches states with no
+ * Matched on the label's leading TEXT rather than on its interpolated count: the
+ * count is the size of the stage's whole vocabulary, so a fixture that adds or
+ * filters a setting would stop matching a count written here and every reveal would
+ * silently no-op. `null` is a real answer — `openConfig` also reaches states with no
  * rows and therefore no control: a refused read, and a vocabulary the engine
  * registers nothing in.
  */
-function revealEverySetting() {
-  const control = within(block()).queryByRole('button', { name: showEverySettingLabel() })
-  if (control) fireEvent.click(control)
+function revealControl(): HTMLElement | null {
+  return within(block()).queryByRole('button', { name: SHOW_EVERY_SETTING })
 }
 
-/** The reveal control's label for a vocabulary of *count* settings. */
-function showEverySettingLabel(count = 6): string {
+/** The reveal control's label, up to the count it interpolates. */
+const SHOW_EVERY_SETTING = new RegExp(
+  `^${C.show_every_setting.split('{{count}}')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+/**
+ * The reveal control's label for a vocabulary of *count* settings.
+ *
+ * Derived from the fixture rather than written as a literal, so adding a setting to
+ * it moves this too.
+ */
+function showEverySettingLabel(count = registry().settings.length): string {
   return C.show_every_setting.replace('{{count}}', String(count))
 }
 

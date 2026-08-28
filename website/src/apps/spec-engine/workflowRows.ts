@@ -1,7 +1,7 @@
 /**
  * The delivery workflow's rows, and the argv text a definition is typed as.
  *
- * Two jobs, both pure, both deliberately kept out of the form module:
+ * Three jobs, all pure, all deliberately kept out of the form module:
  *
  * 1. **Turning `GET /config/workflow` into rows to render.** This is where the
  *    guarantee lives that the pane derives NO precedence of its own. The route
@@ -14,10 +14,14 @@
  *    otherwise observable: a re-derivation that happened to agree with the engine
  *    on today's documents would pass every behavioural test and name the wrong
  *    layer on the first day the two disagreed.
- * 2. **Parsing and formatting one command line.** The engine runs argv with no
- *    shell, so an argument is not split by anything the argument itself contains;
- *    an operator still has to be able to type an argument that holds a space. The
- *    quoting here is the minimum that makes that possible and round-trips.
+ * 2. **Parsing one typed command line.** The engine runs argv with no shell, so an
+ *    argument is not split by anything the argument itself contains; an operator
+ *    still has to be able to type an argument that holds a space. The quoting the
+ *    parser honours is the minimum that makes that expressible, and it is the same
+ *    shape a rendered command delimits an otherwise-invisible argument in.
+ * 3. **Naming the paths a write lands at, and reading the preset names a write uses
+ *    as path segments out of the document** rather than off the route, whose names
+ *    are capped for display.
  *
  * The WORDS for a stage, a run point and a source all live in the form, because
  * they are catalog keys and a module-level `i18nT()` would freeze the language at
@@ -26,7 +30,7 @@
  * branch on one of those names inside a row builder is a second resolver.
  */
 import type { StageOrigin, WorkflowState } from './api'
-import { PROJECTS } from './configDocument'
+import { PROJECTS, isObject, nodeAt, type Document } from './configDocument'
 
 /** The `workflow` section. The engine's `SECTION_WORKFLOW`. */
 export const WORKFLOW = 'workflow'
@@ -126,6 +130,27 @@ export function presetSegments(preset: string): string[] {
 }
 
 /**
+ * The user-defined preset names the DOCUMENT holds, in declaration order.
+ *
+ * The route projects the same set, but it renders each name through `sanitized` at
+ * the display cap, so a name longer than that arrives as `<cap chars> [...]` — a
+ * string no document holds. That is fine for a label and wrong for everything else
+ * this form does with a name: it is a path segment in every write, and the value
+ * `workflow.preset` and `projects.*.workflow.preset` are compared against to
+ * decide whether a removal would strand a selection. Reading them here from the
+ * one document the rest of the form already resolves against keeps the name that
+ * is displayed and the name that is written from being able to disagree — the rule
+ * the gate form states for the same reason: a control must show what it writes.
+ *
+ * Declaration order rather than sorted, matching the route, so a chooser does not
+ * reorder itself when a definition is added.
+ */
+export function documentPresetNames(document: Document): string[] {
+  const node = nodeAt(document, [WORKFLOW, WORKFLOW_PRESETS])
+  return isObject(node) ? Object.keys(node) : []
+}
+
+/**
  * The path one stage's commands inside a definition are written at.
  *
  * PER STAGE, and that is the point rather than a detail. A patch replacing the
@@ -141,30 +166,16 @@ export function presetStageSegments(preset: string, stage: string): string[] {
 }
 
 /**
- * Whether one argument has to be quoted for {@link formatCommand} to round-trip.
+ * Whether one argument has to be delimited for a reader to see where it begins.
  *
- * A backslash counts, and it is the case a first version of this got wrong: a bare
- * `a\b` re-parses as `ab`, because the parser honours an escape outside quotes too.
+ * An argument holding whitespace — or holding nothing at all — is invisible beside
+ * its neighbours in a rendered command line, and the engine spawns argv with NO
+ * shell, so nothing downstream would split or rejoin it. The delimiters are how a
+ * display keeps the boundary an operator has to see; the argument's own bytes are
+ * carried untouched beside them.
  */
-function needsQuoting(argument: string): boolean {
-  return argument === '' || /[\s"'\\]/.test(argument)
-}
-
-/**
- * One argv rendered as a line an operator can edit, and re-parse to the same argv.
- *
- * Double-quoted with backslash escapes for the arguments that need it and bare
- * for the ones that do not, so the common case reads as the command it is. The
- * round trip through {@link parseCommandLine} is property-tested: this text is
- * what an operator corrects, and a formatting that did not re-parse to the same
- * argv would silently rewrite a command on the way through the field.
- */
-export function formatCommand(argv: readonly string[]): string {
-  return argv
-    .map((argument) =>
-      needsQuoting(argument) ? `"${argument.replace(/([\\"])/g, '\\$1')}"` : argument,
-    )
-    .join(' ')
+export function needsDelimiting(argument: string): boolean {
+  return argument === '' || /\s/.test(argument)
 }
 
 /**
@@ -174,7 +185,9 @@ export function formatCommand(argv: readonly string[]): string {
  * will split or join these again, so an argument holding a space has to be
  * expressible here or it is not expressible at all. Single and double quotes both
  * group; a backslash escapes the next character inside double quotes and outside
- * them, matching what {@link formatCommand} emits.
+ * them. That is also the shape the resolved commands are DISPLAYED in — an argument
+ * {@link needsDelimiting} is shown between quotes — so the text an operator copies
+ * off a stage row parses back to the argv it was rendered from.
  *
  * An unterminated quote yields the argument it opened rather than an error: this
  * runs on every keystroke, and refusing a half-typed line would make the field
@@ -230,9 +243,4 @@ export function parseCommandBlock(text: string): string[][] {
     .split('\n')
     .map((line) => parseCommandLine(line))
     .filter((argv) => argv.length > 0)
-}
-
-/** Command lines as a block of text, one command per line. */
-export function formatCommandBlock(commands: readonly (readonly string[])[]): string {
-  return commands.map((command) => formatCommand(command)).join('\n')
 }

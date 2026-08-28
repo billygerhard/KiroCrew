@@ -67,6 +67,9 @@ function registry(over: Record<string, unknown> = {}) {
     levels: [],
     stages: PIPELINE_STAGES,
     workflow_presets: ['git-pull-request', 'local-only'],
+    // The engine's display cap on a preset name, which is what the definition field
+    // refuses past. The number is the route's, not this suite's.
+    workflow_preset_name_limit: 64,
     ...over,
   }
 }
@@ -173,17 +176,58 @@ function workflow(over: Record<string, unknown> = {}) {
 /**
  * The stored document.
  *
+ * The two user-defined presets are DEFINED here as well as projected, because that
+ * is the only way they can exist: `user_presets` is the route's reading of this very
+ * section. The form takes the names it writes with from here rather than from the
+ * route, so a fixture that declared them on one side only would be a document no
+ * engine could have produced.
+ *
  * `acme` selects `house-style`, so removing that preset must be refused and name
  * it; `unused-preset` is selected by nothing, so removing it must be offered.
  */
 function stored() {
   return {
-    workflow: { preset: 'git-pull-request' },
+    workflow: {
+      preset: 'git-pull-request',
+      presets: {
+        'house-style': { stages: { verify: [['make', 'check']] } },
+        'unused-preset': { stages: { submit: [['true']] } },
+      },
+    },
     projects: {
       acme: { path: '/src/acme', workflow: { preset: 'house-style' } },
       solo: { path: '/src/solo' },
     },
   }
+}
+
+/**
+ * A preset name past the display cap, and the capped rendering the route sends.
+ *
+ * The engine's own display path is `sanitized(name, limit)`, which appends a
+ * truncation notice, so the two are different strings — which is the whole point:
+ * everything this form writes has to be spelled the first way.
+ */
+const LONG_NAME = `long-${'x'.repeat(80)}`
+const CAPPED_NAME = `${LONG_NAME.slice(0, 64)} [...]`
+
+/** The document with {@link LONG_NAME} defined, and *selected* by whatever selects it. */
+function storedWithLongName(selects: 'nothing' | 'app' | 'project' = 'nothing') {
+  const doc = stored()
+  doc.workflow.presets = {
+    ...doc.workflow.presets,
+    [LONG_NAME]: { stages: { submit: [['true']] } },
+  } as (typeof doc)['workflow']['presets']
+  if (selects === 'app') doc.workflow.preset = LONG_NAME
+  if (selects === 'project') doc.projects.acme.workflow = { preset: LONG_NAME }
+  return doc
+}
+
+/** The workflow read as the route composes it for {@link storedWithLongName}. */
+function workflowWithLongName(over: Record<string, unknown> = {}) {
+  // Capped, exactly as `_user_preset_names` sends it. A test that put the raw name
+  // here would be testing a route that does not exist.
+  return workflow({ user_presets: ['house-style', 'unused-preset', CAPPED_NAME], ...over })
 }
 
 function snapshot(doc: Record<string, unknown>, over: Record<string, unknown> = {}) {
@@ -273,6 +317,20 @@ function renderedArgv(stage: string): string[][] {
   )
 }
 
+/**
+ * What one stage's commands actually READ as, one line per command.
+ *
+ * The whole line's text, deliberately not each argument's own span: reading the
+ * spans is blind to what separates them, so a rendering that painted
+ * `gitcommit-ma b` would satisfy every per-argument assertion while showing an
+ * operator a command with no visible argument boundaries at all.
+ */
+function renderedCommandLines(stage: string): string[] {
+  const list = stageRow(stage).querySelector(`[data-stage-commands="${stage}"]`)
+  if (!list) return []
+  return [...list.querySelectorAll('li')].map((item) => item.textContent ?? '')
+}
+
 /** The draft command field for one stage. */
 function draftField(stage: string): HTMLTextAreaElement {
   const row = block().querySelector(`.se-setting[data-draft-stage="${stage}"]`)
@@ -346,6 +404,29 @@ describe('the stages render the commands the engine resolved', () => {
     ])
     expect(renderedArgv('verify')).toEqual([['make', 'check']])
     expect(renderedArgv('publish')).toEqual([['gh', 'pr', 'merge', '--squash']])
+  })
+
+  it('separates the arguments it renders, and delimits one holding a space', async () => {
+    await openDelivery()
+    // Asserted on the LINE and not on the argument spans, because the spans cannot
+    // see what lies between them: with no separator these same spans paint
+    // `gitcommit-ma b`, and the argv the engine spawns with no shell is then
+    // unreadable in exactly the surface that exists to show it.
+    expect(renderedCommandLines('submit')).toEqual([
+      'git commit -m "a b"',
+      'git push --set-upstream origin HEAD',
+    ])
+    // And the delimiters are punctuation AROUND the token, never inside it: the
+    // argument itself is still the payload's own bytes, unquoted and unescaped.
+    expect(renderedArgv('submit')[0][3]).toBe('a b')
+  })
+
+  it('delimits an empty argument, which would otherwise not be there at all', async () => {
+    const one = workflow()
+    one.stages = [{ ...one.stages[1], argv: [['prog', '', 'after']] }]
+    await openDelivery({ workflow: { body: one } })
+    expect(renderedCommandLines('submit')).toEqual(['prog "" after'])
+    expect(renderedArgv('submit')).toEqual([['prog', '', 'after']])
   })
 
   it('keeps the engine’s declared stage order and declares no order of its own', async () => {
@@ -580,7 +661,7 @@ describe('removing a user-defined preset', () => {
 
   it('is refused when the app-wide selection names it', async () => {
     const doc = stored()
-    doc.workflow = { preset: 'unused-preset' }
+    doc.workflow.preset = 'unused-preset'
     await openDelivery({ config: { body: snapshot(doc) } })
     fireEvent.click(
       within(block()).getByRole('button', {
@@ -592,6 +673,159 @@ describe('removing a user-defined preset', () => {
         copy(T.removal_is_refused_the_app_selects_it, { preset: 'unused-preset' }),
       ),
     ).toBeTruthy()
+  })
+})
+
+/**
+ * A preset name the route had to cap for display.
+ *
+ * Every case here is the same defect with a different consequence: the route sends
+ * `<64 chars> [...]`, and any of these paths that spent that string would spend a
+ * name no document holds. The first is the severe one — it takes the whole workflow
+ * read down and leaves no in-form way back, because `DeliveryWorkflow` refuses to
+ * resolve a selection naming a preset nothing defines.
+ */
+describe('a preset name too long to display is still the name that is written', () => {
+  it('selects the name the document holds, never the capped rendering', async () => {
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName()) },
+      workflow: { body: workflowWithLongName() },
+    })
+    const mine = within(block()).getByRole('group', { name: T.presets_you_defined })
+    // What is marked as chosen is read from the document too, so the pressed state
+    // and the write agree on one spelling: `house-style` is what `workflow.preset`
+    // holds in this fixture, and the capped rendering would match no button at all.
+    expect(
+      within(block())
+        .getByRole('group', { name: T.presets_bundled_with_the_app })
+        .querySelector('[aria-pressed="true"]')?.textContent,
+    ).toBe('git-pull-request')
+    fireEvent.click(within(mine).getByRole('button', { name: LONG_NAME }))
+    expect(mine.querySelector('[aria-pressed="true"]')?.textContent).toBe(LONG_NAME)
+    fireEvent.click(within(block()).getByRole('button', { name: T.review_the_exact_change }))
+    // The whole point: `workflow.preset` naming a preset nothing defines is a
+    // ConfigValidationError, the route answers 422, and the workflow read fails —
+    // so this form would have written the one value that takes itself off the air.
+    expect(shownPatch()).toEqual({ workflow: { preset: LONG_NAME } })
+    expect(JSON.stringify(shownPatch())).not.toContain(CAPPED_NAME)
+  })
+
+  it('removes the entry the document holds, so the removal removes something', async () => {
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName()) },
+      workflow: { body: workflowWithLongName() },
+    })
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: copy(T.remove_the_preset, { preset: LONG_NAME }),
+      }),
+    )
+    fireEvent.click(within(block()).getByRole('button', { name: T.review_the_exact_change }))
+    // A deletion at the capped path would delete NOTHING while the card said the
+    // preset was removed.
+    expect(shownPatch()).toEqual({ workflow: { presets: { [LONG_NAME]: null } } })
+  })
+
+  it('refuses the removal a project’s selection would strand', async () => {
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName('project')) },
+      workflow: { body: workflowWithLongName() },
+    })
+    fireEvent.click(
+      within(block()).getByRole('button', {
+        name: copy(T.remove_the_preset, { preset: LONG_NAME }),
+      }),
+    )
+    // The comparison is against the document's own selection values, so the
+    // refusal holds for a name the display had to cap too.
+    expect(
+      within(block()).getByText(
+        copy(T.removal_is_refused_projects_select_it, { preset: LONG_NAME, projects: 'acme' }),
+      ),
+    ).toBeTruthy()
+    expect(
+      (
+        within(block()).getByRole('button', {
+          name: T.review_the_exact_change,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true)
+  })
+
+  it('refuses a second definition of that name rather than merging into the first', async () => {
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName()) },
+      workflow: { body: workflowWithLongName() },
+    })
+    fireEvent.change(draftField('submit'), { target: { value: 'make ship' } })
+    fireEvent.change(within(block()).getByLabelText(T.the_preset_name), {
+      target: { value: LONG_NAME },
+    })
+    // Against the DOCUMENT's names: a taken check that only knew the capped
+    // rendering would let this through, and the write would merge into the existing
+    // definition instead of creating one.
+    expect(
+      within(block()).getByText(copy(T.a_preset_of_that_name_is_already_defined, { name: LONG_NAME })),
+    ).toBeTruthy()
+    expect(draftField('submit').value).toBe('make ship')
+  })
+
+  it('refuses a typed name past the cap, keeping the typed stage commands', async () => {
+    await openDelivery()
+    fireEvent.change(draftField('submit'), { target: { value: 'make ship' } })
+    fireEvent.change(within(block()).getByLabelText(T.the_preset_name), {
+      target: { value: LONG_NAME },
+    })
+    // The other half of keeping one spelling of every name: this form must not be
+    // able to CREATE a name it could then only ever show truncated.
+    expect(
+      within(block()).getByText(copy(T.the_name_is_longer_than_a_name_can_be_shown, { limit: '64' })),
+    ).toBeTruthy()
+    expect(draftField('submit').value).toBe('make ship')
+    expect(
+      (
+        within(block()).getByRole('button', {
+          name: T.review_the_exact_change,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true)
+  })
+
+  it('marks the preset in force as chosen under the name the document spells it', async () => {
+    await openDelivery({
+      config: { body: snapshot(storedWithLongName('app')) },
+      // The route resolves the selection and caps its name, so the payload's
+      // `preset.name` is the truncated one. Marking the chooser from THAT would mark
+      // nothing: no button carries a name the document does not hold.
+      workflow: {
+        body: workflowWithLongName({
+          preset: {
+            name: CAPPED_NAME,
+            origin: 'app_config',
+            declared_at: 'workflow.preset',
+            bundled: false,
+          },
+        }),
+      },
+    })
+    const mine = within(block()).getByRole('group', { name: T.presets_you_defined })
+    expect(mine.querySelector('[aria-pressed="true"]')?.textContent).toBe(LONG_NAME)
+  })
+
+  it('refuses no length at all when the projection does not carry the cap', async () => {
+    // An older gateway serves no such key, and a cap invented on this side would
+    // refuse a name the engine would have displayed perfectly well.
+    const older = registry()
+    delete (older as { workflow_preset_name_limit?: number }).workflow_preset_name_limit
+    await openDelivery({ registry: { body: older } })
+    fireEvent.change(within(block()).getByLabelText(T.the_preset_name), {
+      target: { value: LONG_NAME },
+    })
+    expect(
+      within(block()).queryByText(
+        copy(T.the_name_is_longer_than_a_name_can_be_shown, { limit: '64' }),
+      ),
+    ).toBeNull()
   })
 })
 

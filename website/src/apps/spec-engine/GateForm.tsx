@@ -64,6 +64,14 @@
  *    answers the questions only it can (unreadable versus empty, the declaring path,
  *    the engine's own reading of a severity) and the editable rows come from the
  *    pane's own read of the document, handed in as `document`.
+ *
+ *    The two per-row answers taken from the route — the declaring path and the
+ *    engine's reading of the severity — are keyed by the gate's position in the
+ *    STORED list rather than by its position in the rows on screen, because a
+ *    staged removal shifts every later row while the route still describes the
+ *    document. The severity reading is withheld rather than relayed when a draft has
+ *    changed that gate's severity, since the stored flag then describes the severity
+ *    being replaced.
  * 2. **Expressibility is a property of the whole list, not of one gate.** A write
  *    carries every entry, so one entry this form cannot represent would be reshaped by
  *    a change to a different one. When any entry fails {@link storedGates} the form
@@ -739,6 +747,45 @@ export function GateForm({
   const expressible = stored !== null && list !== null && readsAgree(stored, list)
   const editable = expressible && positions.length > 0 && severities.length > 0
   const rows: ReadonlyArray<GateDraft | QualityGate> = expressible ? present : (list ?? [])
+  // How many gates the DOCUMENT holds, which is what "no gate is configured" is a
+  // claim about. Never `rows.length`: a draft that removes every gate has written
+  // nothing, so the stored gates are still in force and still running, and saying
+  // no gate runs would be false for exactly as long as the draft is unconfirmed.
+  const configured = stored !== null ? stored.length : (list?.length ?? 0)
+
+  /**
+   * Where a row's declaration lives, or the section a new one would land in.
+   *
+   * Keyed by the gate's position in the STORED list rather than by its position in
+   * the rows: a staged removal shifts every later row, and the route's answers
+   * describe the document, so an index-for-index read would show a surviving gate
+   * the declaring path of the gate that used to sit where it now sits. `readsAgree`
+   * has already established that the two readings line up index for index, and no
+   * rename is offered, so the name is a stable identity between them. A gate the
+   * draft ADDS is declared nowhere yet and falls back to the section.
+   */
+  const declaringPath = (gate: GateDraft | QualityGate, index: number): string => {
+    const at =
+      expressible && stored !== null ? stored.findIndex((entry) => entry.name === gate.name) : index
+    return (at >= 0 ? list?.[at]?.declared_at : '') || dotted([QUALITY_GATES])
+  }
+
+  /**
+   * Whether a failure of this gate stops the run, as the ENGINE reads its severity.
+   *
+   * The payload's own `blocking`, so a severity this pane has no words for still
+   * says what it does to a run — the table below it is prose and would fall silent.
+   * `null` when the payload cannot answer for the severity on screen: a draft that
+   * changed the severity is asking about a reading the engine has not made, and the
+   * stored flag describes the severity being replaced rather than the new one.
+   */
+  const blockingFact = (gate: GateDraft | QualityGate, index: number): boolean | null => {
+    const at =
+      expressible && stored !== null ? stored.findIndex((entry) => entry.name === gate.name) : index
+    const row = at >= 0 ? list?.[at] : undefined
+    if (!row || row.severity !== gate.severity) return null
+    return row.blocking
+  }
 
   return (
     <div className="se-blk" data-gates-unreadable={shown.gates_unreadable}>
@@ -780,7 +827,7 @@ export function GateForm({
             {i18nT('apps.specEngine.gateForm.repair_the_list_in_the_document')}
           </p>
         </div>
-      ) : rows.length === 0 ? (
+      ) : configured === 0 && rows.length === 0 ? (
         <div data-gates-state="empty">
           <p className="se-note">{i18nT('apps.specEngine.gateForm.no_gate_is_configured')}</p>
           {/* The other half an operator needs, and the reason the empty state is not
@@ -792,6 +839,13 @@ export function GateForm({
         </div>
       ) : (
         <>
+          {rows.length === 0 && (
+            /* Gates ARE stored and the draft would leave none. Not the empty state:
+               nothing is written yet, so what runs today is still the stored list. */
+            <p className="se-note" role="status" data-gates-state="drafted-empty">
+              {i18nT('apps.specEngine.gateForm.the_draft_leaves_no_gate')}
+            </p>
+          )}
           {!expressible && (
             /* The honest state, and no controls: a change to one gate rewrites the
                whole list, so one entry this form cannot represent would be reshaped by
@@ -822,9 +876,7 @@ export function GateForm({
                   {/* The declaring path is the route's, which is the only reading that
                       has one: a draft entry nobody has written yet is declared
                       nowhere, so it falls back to the section it will land in. */}
-                  <span className="se-kv-path">
-                    {list?.[index]?.declared_at || dotted([QUALITY_GATES])}
-                  </span>
+                  <span className="se-kv-path">{declaringPath(gate, index)}</span>
                 </span>
                 <p className="se-note">
                   {i18nT('apps.specEngine.gateForm.the_position')}
@@ -850,6 +902,17 @@ export function GateForm({
                   <span className="se-m">{severityLabel(gate.severity)}</span>
                 </p>
                 <p className="se-note">{severityEffect(gate.severity) || NONE}</p>
+                {blockingFact(gate, index) !== null && (
+                  /* The engine's own reading of the severity, beside this pane's
+                     prose for it: the prose is a table keyed by the severities this
+                     pane knows, and a severity the engine adds later would earn no
+                     sentence at all while the payload was already answering. */
+                  <p className="se-note" data-blocking={String(blockingFact(gate, index))}>
+                    {blockingFact(gate, index)
+                      ? i18nT('apps.specEngine.gateForm.a_failure_stops_the_run')
+                      : i18nT('apps.specEngine.gateForm.a_failure_does_not_stop_the_run')}
+                  </p>
+                )}
                 {editable && (
                   <VocabularyChoice
                     label={i18nT('apps.specEngine.gateForm.choose_a_severity_for_gate', {

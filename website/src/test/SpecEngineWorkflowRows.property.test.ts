@@ -35,6 +35,15 @@
  * suite makes about the route, and for the same reason. The label table naming all
  * five lives in the FORM, which is presentation — it turns an answer into words and
  * decides nothing.
+ *
+ * ## The names a write spends
+ *
+ * A third group covers the other half of "a rendered command is a stored command":
+ * the preset names the form uses as PATH SEGMENTS come from the document, not from
+ * the route, whose own list of them is rendered through a display cap. A name past
+ * that cap arrives as `<cap chars> [...]`, and a write spending that string
+ * addresses a path no document holds — which for `workflow.preset` is the selection
+ * the engine then refuses to resolve at all.
  */
 import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
@@ -43,12 +52,26 @@ import { resolve } from 'node:path'
 
 import type { StageOrigin, WorkflowState } from '../apps/spec-engine/api'
 import {
-  formatCommand,
+  documentPresetNames,
+  needsDelimiting,
   parseCommandBlock,
   parseCommandLine,
   presetStageSegments,
   workflowStageRows,
 } from '../apps/spec-engine/workflowRows'
+
+/**
+ * One argv as a line an operator could have typed it on.
+ *
+ * The test's own quoter, not production's: nothing in the pane formats an argv into
+ * an editable field, so a formatter there would be code with no caller. This one
+ * exists to generate the input side of the parser's obligation — every argv has to
+ * be expressible — and it is deliberately maximal, quoting whatever might not
+ * survive bare.
+ */
+function quoted(argv: readonly string[]): string {
+  return argv.map((argument) => `"${argument.replace(/([\\"])/g, '\\$1')}"`).join(' ')
+}
 
 /** The engine's own delivery stage names, plus one it could grow. */
 const STAGE = fc.constantFrom('isolate', 'submit', 'verify', 'publish', 'teardown', 'notify_only')
@@ -237,22 +260,29 @@ describe('the pane derives no delivery precedence of its own', () => {
   })
 })
 
-describe('a typed command round-trips through the field that renders it', () => {
-  it('re-parses a formatted argv to the same argv', () => {
+describe('a typed command expresses every argv the engine can run', () => {
+  it('parses an argument holding whitespace, or none at all, back to itself', () => {
     fc.assert(
       fc.property(ARGV, (argv) => {
-        // The operator corrects the TEXT, so a formatting that did not re-parse to
-        // the same argv would silently rewrite the command on the way through.
-        expect(parseCommandLine(formatCommand(argv))).toEqual(argv)
+        // The quoter is the TEST's, and deliberately so: production has no
+        // formatter, because nothing pre-fills these fields — the operator types the
+        // commands. What production depends on is the other direction, that the
+        // parser can express any argv the engine might be asked to run, including
+        // the two shapes a whitespace split cannot reach: an argument containing a
+        // space and an empty one. A parser that dropped either would make a command
+        // untypeable rather than misparse a typed one.
+        expect(parseCommandLine(quoted(argv))).toEqual(argv)
       }),
       { numRuns: 500 },
     )
   })
 
-  it('re-parses a formatted block to the same commands, dropping none', () => {
+  it('drops a blank line rather than composing a command with no program', () => {
     fc.assert(
       fc.property(fc.array(ARGV, { minLength: 1, maxLength: 4 }), (commands) => {
-        const text = commands.map((argv) => formatCommand(argv)).join('\n')
+        // A trailing newline is how a textarea reads after every finished line, and
+        // the write door refuses an empty command.
+        const text = `${commands.map((argv) => quoted(argv)).join('\n\n')}\n`
         expect(parseCommandBlock(text)).toEqual(commands)
       }),
       { numRuns: 300 },
@@ -272,6 +302,79 @@ describe('every path a definition writes addresses one stage', () => {
         expect(segments).toEqual(['workflow', 'presets', preset, 'stages', stage])
       }),
       { numRuns: 200 },
+    )
+  })
+})
+
+describe('a preset name a write spends is the document’s own', () => {
+  it('returns the stored keys byte-for-byte, however long, in document order', () => {
+    fc.assert(
+      fc.property(
+        fc.array(
+          fc.oneof(
+            fc.constantFrom('house-style', 'my-flow'),
+            // Past the route's display cap, which is the case the whole thing is
+            // about: the route sends `<cap chars> [...]` for this name, and a write
+            // spending that string addresses a path no document holds.
+            fc.string({ minLength: 65, maxLength: 90 }),
+            fc.string({ minLength: 1, maxLength: 8 }),
+          ),
+          { minLength: 1, maxLength: 4 },
+        ),
+        (names) => {
+          const presets: Record<string, unknown> = {}
+          for (const name of names) presets[name] = { stages: { submit: [['true']] } }
+          const document = { workflow: { presets } }
+          // Object key order IS document order for string keys that are not array
+          // indices, and the route projects the same order, so a chooser does not
+          // reorder itself when a definition lands.
+          expect(documentPresetNames(document)).toEqual(Object.keys(presets))
+          for (const name of documentPresetNames(document)) {
+            // A name reshaped here would write somewhere else, so each one is a key
+            // the document actually holds — and never the display path's rendering
+            // of it, which for a long name ends in a truncation notice.
+            expect(presets[name]).toBeDefined()
+            expect(name.endsWith(' [...]')).toBe(false)
+          }
+        },
+      ),
+      { numRuns: 200 },
+    )
+  })
+
+  it('answers nothing for a document that declares no preset section', () => {
+    fc.assert(
+      fc.property(
+        fc.oneof(
+          fc.constant({}),
+          fc.constant({ workflow: {} }),
+          // A stored shape the form cannot read as a preset map. An empty answer is
+          // right here and a THROW would not be: the pane renders this document.
+          fc.constant({ workflow: { presets: [] } }),
+          fc.constant({ workflow: { presets: 'nonsense' } }),
+          fc.constant({ workflow: 7 }),
+        ),
+        (document) => {
+          expect(documentPresetNames(document as Record<string, unknown>)).toEqual([])
+        },
+      ),
+      { numRuns: 50 },
+    )
+  })
+})
+
+describe('a rendered argument that would vanish is delimited', () => {
+  it('delimits exactly the arguments a reader could not otherwise see', () => {
+    fc.assert(
+      fc.property(ARGUMENT, (argument) => {
+        // The tokens are separated by a single space, so the arguments that need a
+        // delimiter are precisely the ones a space cannot separate: one holding
+        // whitespace of its own, and an empty one. Anything else is delimited for no
+        // reason, and a shell-looking quotation the engine does not apply is a lie
+        // about what runs.
+        expect(needsDelimiting(argument)).toBe(argument === '' || /\s/.test(argument))
+      }),
+      { numRuns: 300 },
     )
   })
 })

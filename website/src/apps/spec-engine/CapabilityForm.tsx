@@ -355,8 +355,7 @@ interface ReviewedBinding {
 }
 
 /** *edits* grouped per capability, keeping only capabilities in *rendered*. */
-function reviewBindings(
-  edits: readonly StagedEdit[],
+function reviewBindings(  edits: readonly StagedEdit[],
   rendered: readonly string[],
 ): ReviewedBinding[] {
   const groups: ReviewedBinding[] = []
@@ -381,6 +380,29 @@ function reviewBindings(
     }
   }
   return groups
+}
+
+/**
+ * How many capabilities the staged edits touch, for a badge with no read behind it.
+ *
+ * The same QUANTITY {@link reviewBindings} reports — capabilities, one act each —
+ * rather than the number of leaves those acts write. One rebind stages a transport,
+ * a command, an environment entry and a timeout; counting leaves would make the
+ * stage badge jump from one to four the moment a read failed and this became the
+ * reachable count, with nothing staged in between.
+ *
+ * Computed without the reads, because the branches that use it are the ones where a
+ * read is refused or has not landed: what the form HOLDS is still true then, and a
+ * badge dropping to zero there would report unwritten work as gone.
+ */
+function stagedCapabilityCount(edits: readonly StagedEdit[]): number {
+  const seen = new Set<string>()
+  for (const edit of edits) {
+    if (edit.segments[0] !== CAPABILITIES) continue
+    const capability = edit.segments[1]
+    if (capability !== undefined) seen.add(capability)
+  }
+  return seen.size
 }
 
 /**
@@ -675,7 +697,17 @@ function CapabilityRow({
         </>
       )}
       <div className="se-acts">
-        <button type="button" className="se-btn se-sm" disabled={problem !== ''} onClick={onStage}>
+        <button
+          type="button"
+          className="se-btn se-sm"
+          // A return to the builtin is the REMOVAL of a stored entry, so with nothing
+          // stored there is nothing to stage: the patch would be `{<capability>: null}`
+          // over a key that does not exist, and the card's sentence would say a
+          // command, environment entries and a timeout are removed when none were ever
+          // declared. Refused with the reason beside it rather than silently inert.
+          disabled={problem !== '' || (!external && !stored.present)}
+          onClick={onStage}
+        >
           {external
             ? i18nT('apps.specEngine.capabilityForm.stage_this_binding')
             : i18nT('apps.specEngine.capabilityForm.stage_the_return_to_the_builtin')}
@@ -686,6 +718,11 @@ function CapabilityRow({
           </button>
         )}
       </div>
+      {!external && !stored.present && (
+        <p className="se-note">
+          {i18nT('apps.specEngine.capabilityForm.nothing_is_declared_so_there_is_nothing_to_return')}
+        </p>
+      )}
     </div>
   )
 }
@@ -813,10 +850,16 @@ export function CapabilityForm({
   // A staged edit for a capability this stage no longer renders is dropped: the
   // projection can move a capability to another stage, and an edit no row shows is
   // one no sentence describes and no confirm clears.
+  //
+  // Only against an ANSWERED read, though. A refused read renders no row at all, so
+  // reconciling against it would drop every staged edit on the pane — which is the
+  // work the error branch's own badge exists to keep reporting, and a transient
+  // refetch failure would silently discard it.
   const { reconcile } = edits
   useEffect(() => {
+    if (bindings.isError || !bindings.data) return
     reconcile((edit) => edit.segments[0] === CAPABILITIES && rendered.includes(edit.segments[1]))
-  }, [rendered, reconcile])
+  }, [bindings.isError, bindings.data, rendered, reconcile])
 
   const draftFor = useCallback(
     (row: CapabilityBinding, stored: StoredBinding) =>
@@ -873,8 +916,10 @@ export function CapabilityForm({
       <div className="se-blk">
         {/* What this form HOLDS, not what it can review: with no read it cannot say
             what a staged edit means, and a badge dropping to zero here would report
-            unwritten work as gone. */}
-        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
+            unwritten work as gone. Capabilities and not leaves, the same quantity
+            the main return reports, so a failing read cannot move the badge on its
+            own. */}
+        <PendingCount count={stagedCapabilityCount(edits.edits)} onCount={onPendingCount} />
         {heading}
         {bindings.isError && (
           <>
@@ -909,7 +954,7 @@ export function CapabilityForm({
   if (!bindings.data || !registry.data || !config.data) {
     return (
       <div className="se-blk">
-        <PendingCount count={edits.edits.length} onCount={onPendingCount} />
+        <PendingCount count={stagedCapabilityCount(edits.edits)} onCount={onPendingCount} />
         {heading}
         <p className="se-note">
           {i18nT('apps.specEngine.capabilityForm.reading_the_capability_bindings')}
