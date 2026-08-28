@@ -192,10 +192,17 @@ export function PendingCount({
   // Unmount reports ZERO, because a surface that is no longer mounted holds no
   // unwritten edits — and the pane's total is a sum over surfaces that never
   // evicted a key. Without this the pane states a count including edits it has
-  // already discarded. Reachable: a refused vocabulary read collapses every
-  // group into one advanced area, the operator stages an edit on a surface
-  // there, then a successful refetch re-expands the five stages and unmounts
-  // that surface — its edits are genuinely gone while its count would remain.
+  // already discarded. Reachable: the engine projects a stage this pane has no
+  // words for, the fold puts every surface on the one advanced area, the operator
+  // stages an edit there, then the projection expands and that surface unmounts
+  // while a fresh one mounts elsewhere — the edits are genuinely gone (staged
+  // state is per-component) while its contribution to the total would remain.
+  //
+  // NOT the refused-vocabulary read, though that folds the pane the same way:
+  // every form on the folded area returns its refusal ahead of any control, so
+  // nothing there can stage a counted edit and the total is zero on both sides of
+  // the transition. A guard built on that path would pass while exercising
+  // nothing, which is why the test uses the fold above.
   //
   // Its own effect with an empty dependency list, NOT a cleanup on the reporting
   // effect above: that one re-runs on every count change, so its cleanup would
