@@ -3694,7 +3694,11 @@ class TestConformanceIsAJobAndNotARequest:
 
     @pytest.mark.asyncio
     async def test_a_builtin_binding_is_not_applicable_rather_than_never_checked(
-        self, recorded_sel: RecordedSel, enabled: None, home: Path
+        self,
+        recorded_sel: RecordedSel,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
     ) -> None:
         """The poll and the start must not disagree about whether there is work.
 
@@ -3780,8 +3784,20 @@ class TestConformanceIsAJobAndNotARequest:
         the substituted runner is what keeps this from spawning the real suite's
         nine child processes, and the cleared table is what keeps the started-run
         assertion from depending on whatever an earlier test left behind.
+
+        GATED, because substituting the runner removed the very slowness a naive
+        version of this assertion depended on. The fake returns in microseconds,
+        so the task completes and its done-callback discards it from the set
+        before an ungated assertion can read it — a wall-clock race that passes
+        under the repo's parallel addopts only because that run is an order of
+        magnitude slower. Blocking the fake makes both assertions hold by
+        construction rather than by timing: non-empty WHILE the worker is held,
+        empty only after it is released and drained.
         """
         _write_document(_BOUND_ANALYSIS)
+        import threading
+
+        recorded_verify.gate = threading.Event()
         async with _client() as client:
             started = await _post(
                 client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
@@ -3789,10 +3805,16 @@ class TestConformanceIsAJobAndNotARequest:
             # 202: the run was ACCEPTED, not completed. A job start that answered
             # 200 would read as an outcome.
             assert started.status == 202, started.body
-            assert routes._CONFORMANCE_TASKS, (
-                "the in-flight run is not in the module's task set, so nothing holds "
+            # Read while the fake is still blocked on its gate, so the task cannot
+            # have settled and been discarded yet. Asserting it is NOT DONE is the
+            # real property — a strong reference to a RUNNING task — and it is what
+            # makes this independent of host timing: merely being present is
+            # satisfiable by a settled task whose discard callback has not yet run.
+            assert any(not task.done() for task in routes._CONFORMANCE_TASKS), (
+                "no in-flight run is held in the module's task set, so nothing holds "
                 "a strong reference to it and it can be collected mid-run"
             )
+            recorded_verify.gate.set()
             await _drain_conformance()
         assert not routes._CONFORMANCE_TASKS, (
             "a settled task was never discarded from the set, which leaks one entry "
