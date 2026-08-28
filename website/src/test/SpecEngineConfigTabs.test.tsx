@@ -232,11 +232,24 @@ function sources() {
   }
 }
 
+/**
+ * Whether the app-wide `config/resolved` read should refuse from now on.
+ *
+ * A flag the test flips rather than a read counter, because the pane mounts a
+ * settings form per stage and they share one query key with no `staleTime`: each new
+ * observer triggers its own refetch, so "the second read" lands during mount and a
+ * counter would fail the read before the test had staged anything.
+ */
+let refuseResolved = false
+
 function stub(answers: { registry?: Answer; config?: Answer } = {}) {
   stubSpecEngineFetch(
     {
       registry: answers.registry ?? { body: registry() },
-      resolved: { body: resolved() },
+      resolved: ({ params }) =>
+        refuseResolved && (params.get('project') ?? '') === ''
+          ? { status: 503, body: { code: 'config_unreadable', error: 'gone' } }
+          : { body: resolved() },
       sources: { body: sources() },
       config: answers.config ?? { body: snapshot(stored()) },
     },
@@ -355,6 +368,7 @@ function sourceField(field: string): HTMLElement {
 afterEach(() => {
   vi.unstubAllGlobals()
   calls.length = 0
+  refuseResolved = false
 })
 
 describe('the pane presents the pipeline stages with the shared context above them', () => {
@@ -629,6 +643,27 @@ describe('a stage states the unwritten work its own surfaces hold', () => {
     // later with no explanation.
     show(SETTINGS_STAGE)
     expect(tab(DOCUMENT_STAGE)).toHaveTextContent(C.unsaved_edits)
+  })
+
+  it('keeps reporting a stage\u2019s count while that stage\u2019s read is refused', async () => {
+    // The reason `PendingCount` is called from each form's error and pending guards
+    // as well as its main return. A form whose read fails stops rendering its rows,
+    // but the edits it staged are still there and still headed for a patch: a badge
+    // that dropped to zero on a failed refetch would report unwritten work as gone,
+    // and the operator's next act would be to walk away from it.
+    const client = await openConfig()
+    fireEvent.change(retryRow(), { target: { value: '9' } })
+    await waitFor(() => expect(tab(SETTINGS_STAGE)).toHaveTextContent(/1/))
+    refuseResolved = true
+    await client.invalidateQueries({ queryKey: ['spec-engine', 'config', 'resolved'] })
+    show(SETTINGS_STAGE)
+    // The refusal is stated, so this is the failed-read state and not a stale render.
+    await within(panelOf(SETTINGS_STAGE)).findByText(C.could_not_resolve_the_configuration)
+    // And the count survived it, on the tab and in the pane-level total both.
+    expect(tab(SETTINGS_STAGE)).toHaveTextContent(/1/)
+    expect(
+      screen.getByText(new RegExp(C.unwritten_changes_across_every_stage)),
+    ).toHaveTextContent(/1/)
   })
 
   it('drops a stage\u2019s count when its surface discards the staged changes', async () => {
