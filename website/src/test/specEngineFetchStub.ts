@@ -258,6 +258,23 @@ function builtinCapabilityRow(
 const STUB_FINGERPRINT = "0".repeat(64);
 
 /**
+ * The minimum a `complete` report carries, in `ConformanceReport.to_json_object()`'s
+ * shape. `declined_detections` and `excused` are present because the engine's own
+ * serializers emit them — a report without them is a shape no route returns, and
+ * the "declined N planted defects" qualifier cannot be rendered without them.
+ */
+const STUB_REPORT: Record<string, unknown> = {
+  capability: "review",
+  candidate: "/usr/bin/true",
+  passed: true,
+  declared_checks: [],
+  declared_fixtures: [],
+  gaps: [],
+  declined_detections: 0,
+  results: [],
+};
+
+/**
  * One capability's conformance state, in the shape BOTH conformance routes return.
  *
  * The GET returns this object; the POST returns it with `ok: true` added. Kept as
@@ -307,8 +324,15 @@ function conformanceState(
     // The server's per-invocation cap, not the binding's timeout_s. Present even
     // with no run, because a panel must state the cost before offering to start.
     deadline_s: 10,
-    error: "",
-    report: over.report ?? null,
+    // Derived from `status` for the same reason the job fields are: `failed` MEANS
+    // the suite could not be carried out, and the worker always records a reason
+    // as "ClassName: message", so an empty error beside it is a state no route
+    // returns. Every other status carries no error.
+    error: status === "failed" ? "TransportFailure: the candidate could not be run" : "",
+    // Likewise `complete` MEANS a report exists — a recorded complete job always
+    // carries a serialized one — so a null report beside it is unreachable. A
+    // caller may pass its own; only the no-report statuses default to null.
+    report: over.report ?? (status === "complete" ? STUB_REPORT : null),
   };
 }
 
@@ -459,7 +483,7 @@ const DEFAULTS: Record<RouteKey, Responder> = {
       gate_errors: [],
     },
   },
-  // Both conformance routes answer the SAME ten-field shape — the GET directly,
+  // Both conformance routes answer the SAME eleven-field shape — the GET directly,
   // the POST with `ok: true` added — so both defaults are built from one builder.
   // `absent` is the neutral state: no run has been started for this capability on
   // this gateway. `deadline_s` is present and non-zero even with no run, because
