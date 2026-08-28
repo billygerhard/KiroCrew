@@ -56,6 +56,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import * as fc from 'fast-check'
+import i18next from 'i18next'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
@@ -999,6 +1000,46 @@ describe('the operator-facing strings', () => {
     ] as const
     for (const key of keys) {
       expect(C[key], key).not.toContain('{{')
+    }
+  })
+
+  it('resolves a stage label at render rather than at import', async () => {
+    // The stage-to-catalog mapping holds unresolved KEYS. A module-level `i18nT()`
+    // would run once when this module first loads — which happened before this test
+    // did, in English — and bake that language in forever. So the language is changed
+    // BEFORE the pane mounts: a frozen map then renders English labels into a German
+    // pane, and only a per-render lookup gets this right.
+    //
+    // `i18nT` is a plain call rather than a hook, so nothing re-renders a mounted
+    // pane on a language change; switching first is also the only order that can
+    // observe the property at all.
+    const D = de.apps.specEngine.configPanel
+    try {
+      await i18next.changeLanguage('de')
+      stub()
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false, refetchInterval: false } },
+      })
+      render(
+        <QueryClientProvider client={client}>
+          <SpecEnginePage />
+        </QueryClientProvider>,
+      )
+      fireEvent.click(
+        await screen.findByRole('button', {
+          name: new RegExp(de.apps.specEngine.specEnginePage.configuration),
+        }),
+      )
+      await screen.findByRole('tablist', { name: D.configuration_stages })
+      expect(
+        screen.getByRole('tab', { name: new RegExp(`^${D.stage_intake}`) }),
+      ).toBeInTheDocument()
+      // The sentence too, since it comes from the same kind of map.
+      expect(screen.getByText(D.stage_intake_summary)).toBeInTheDocument()
+      // And no English label leaked through, which a partially frozen map would show.
+      expect(screen.queryByRole('tab', { name: new RegExp(`^${C.stage_intake}$`) })).toBeNull()
+    } finally {
+      await i18next.changeLanguage('en')
     }
   })
 })
