@@ -32,7 +32,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { FormReview, fencedPatchPaths } from '../apps/spec-engine/ConfigPanel'
 import type { Document } from '../apps/spec-engine/configDocument'
 import en from '../i18n/locales/en.json'
-import { stubSpecEngineFetch, failure, type Responder } from './specEngineFetchStub'
+import {
+  stubSpecEngineFetch,
+  failure,
+  expectEverySpecEngineRouteAnswered,
+  type Responder,
+} from './specEngineFetchStub'
 
 const F = en.apps.specEngine.formReview
 
@@ -175,6 +180,11 @@ function fencedMarks(): string[] {
 
 afterEach(() => {
   cleanup()
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('what the card leads with', () => {

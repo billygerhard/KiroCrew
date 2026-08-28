@@ -61,6 +61,7 @@ import {
   TRANSPORTS,
   failure,
   stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
   type Answer,
   type Call,
   type Responder,
@@ -454,6 +455,11 @@ async function openStage(
 afterEach(() => {
   vi.unstubAllGlobals()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the check is offered where there is something to check', () => {

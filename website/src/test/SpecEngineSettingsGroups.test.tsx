@@ -26,7 +26,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
-import { stagesUnder, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  stagesUnder,
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 const T = en.apps.specEngine.settingsForm
 const C = en.apps.specEngine.configPanel
@@ -177,6 +182,11 @@ function jumpNav(): HTMLElement | null {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the rows are grouped into the registry’s subsections', () => {

@@ -43,7 +43,12 @@ import pt from '../i18n/locales/pt.json'
 import ru from '../i18n/locales/ru.json'
 import zh from '../i18n/locales/zh-CN.json'
 
-import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  PIPELINE_STAGES,
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 const T = en.apps.specEngine.gateForm
 const C = en.apps.specEngine.configPanel
@@ -257,6 +262,11 @@ function fill(label: string, value: string) {
 afterEach(() => {
   cleanup()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the quality gates as the pane lists them', () => {

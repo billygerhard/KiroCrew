@@ -34,7 +34,11 @@ import { SE_CSS } from '../apps/spec-engine/styles'
 import { getBuiltinIcon } from '../apps/builtinIcons'
 import { getBuiltinComponent } from '../apps/builtinRegistry'
 import en from '../i18n/locales/en.json'
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 const T = en.apps.specEngine.specEnginePage
 
@@ -133,6 +137,11 @@ const setupNav = (container: HTMLElement) =>
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the no-overlay rule', () => {

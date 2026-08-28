@@ -53,7 +53,12 @@ const G = en.apps.specEngine.sourcesSection
 const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
-import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  PIPELINE_STAGES,
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -453,6 +458,11 @@ afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the bundled presets are the only way a source is added', () => {

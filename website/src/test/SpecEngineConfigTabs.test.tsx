@@ -79,7 +79,13 @@ const SF = en.apps.specEngine.sourceForm
 const G = en.apps.specEngine.sourcesSection
 const P = en.apps.specEngine.specEnginePage
 
-import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  PIPELINE_STAGES,
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+  type Responder,
+} from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -243,7 +249,35 @@ function sources() {
  */
 let refuseResolved = false
 
-function stub(answers: { registry?: Answer; config?: Answer } = {}) {
+/**
+ * Whether the stage projection has EXPANDED yet, for the collapse-to-expand case.
+ *
+ * A module flag rather than a read queue, for `refuseResolved`'s reason: the
+ * registry key has one entry and several observers, so "the second read" is not a
+ * moment a test can aim at. The test flips this and then invalidates the key, which
+ * makes the transition an act rather than a race.
+ */
+let expandStages = false
+
+/**
+ * The whole vocabulary under ONE stage this pane has no words for.
+ *
+ * `resolveStages` folds an unnamed stage into the advanced area contents and all —
+ * the documented behaviour for an engine that grew a stage before the pane learned
+ * its name — so the pane collapses to a single area holding every surface. That is
+ * the reachable collapse: the registry ANSWERED, so every form renders its controls
+ * and an edit staged there is a real one, which a refused registry read could not
+ * produce (each form's own `isError` guard returns ahead of its controls).
+ */
+const FOLDED_STAGES = [
+  {
+    id: 'provisioning',
+    setting_groups: ['watch', 'limits'],
+    capabilities: ['watch_sources', 'model_catalog'],
+  },
+]
+
+function stub(answers: { registry?: Responder; config?: Answer } = {}) {
   stubSpecEngineFetch(
     {
       registry: answers.registry ?? { body: registry() },
@@ -370,6 +404,12 @@ afterEach(() => {
   vi.unstubAllGlobals()
   calls.length = 0
   refuseResolved = false
+  expandStages = false
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the pane presents the pipeline stages with the shared context above them', () => {
@@ -687,6 +727,62 @@ describe('a stage states the unwritten work its own surfaces hold', () => {
     await waitFor(() => expect(tab(SETTINGS_STAGE).textContent).toBe(SETTINGS_STAGE))
     // And the pane-level total goes with it rather than outliving the badge it sums.
     expect(screen.queryByText(new RegExp(C.unwritten_changes_across_every_stage))).toBeNull()
+  })
+
+  it('drops the total when a re-expanded stage list unmounts the surface holding it', async () => {
+    // The other direction of the same rule, and the one that is NOT a discard the
+    // operator performed. The pane's total sums a record keyed `<stage>/<surface>`
+    // that the surfaces themselves write into, and nothing evicts a key — so a
+    // surface that stops being MOUNTED has to report zero on the way out or the pane
+    // keeps stating unwritten changes that no longer exist anywhere. An operator
+    // reading that total goes looking for work to write and finds a form holding
+    // nothing, or worse, writes a patch believing it carries an edit it does not.
+    //
+    // Reachable, and this is the reachable path rather than a contrived unmount: the
+    // engine projects a stage this pane has no words for, `resolveStages` folds it
+    // into the advanced area, and with one area left that area carries every surface
+    // — including the watch-source form, which normally lives on intake. Staging
+    // there keys the count under `advanced`. When the projection then expands, the
+    // advanced area stops being the whole pane, its copy of the source form unmounts,
+    // and the fresh one on intake holds nothing. The staged edit is genuinely gone.
+    const client = await openConfig(
+      { registry: () => ({ body: registry({ stages: expandStages ? PIPELINE_STAGES : FOLDED_STAGES }) }) },
+      C.stage_advanced,
+    )
+    // One area, and it is the advanced one: the fold happened.
+    expect(
+      within(screen.getByRole('tablist', { name: C.configuration_stages }))
+        .getAllByRole('tab')
+        .map((element) => element.textContent),
+    ).toEqual([C.stage_advanced])
+    const folded = panelOf(C.stage_advanced)
+    const enabled = folded.querySelector('.se-setting[data-source-field="enabled"]')
+    expect(enabled, 'the source form is on the folded area').not.toBeNull()
+    fireEvent.click(within(enabled as HTMLElement).getByRole('checkbox'))
+    // Staged, counted on the only tab there is, and summed into the pane's total.
+    await waitFor(() => expect(tab(C.stage_advanced)).toHaveTextContent(/1/))
+    expect(
+      screen.getByText(new RegExp(C.unwritten_changes_across_every_stage)),
+    ).toHaveTextContent(/1/)
+
+    // The engine's projection catches up with the pane's vocabulary.
+    expandStages = true
+    await client.invalidateQueries({ queryKey: ['spec-engine', 'config-registry'] })
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole('tablist', { name: C.configuration_stages })).getAllByRole('tab'),
+      ).toHaveLength(ALL_STAGES.length),
+    )
+
+    // The edit is gone with the surface that held it, so the pane states no total at
+    // all — not a total of one against a form that has nothing staged.
+    await waitFor(() =>
+      expect(screen.queryByText(new RegExp(C.unwritten_changes_across_every_stage))).toBeNull(),
+    )
+    // And no stage claims a count either: neither the area that folded nor the one
+    // the form moved to.
+    expect(tab(C.stage_advanced).textContent).toBe(C.stage_advanced)
+    expect(tab(SOURCES_STAGE).textContent).toBe(SOURCES_STAGE)
   })
 })
 

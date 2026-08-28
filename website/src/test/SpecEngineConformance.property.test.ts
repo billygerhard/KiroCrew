@@ -312,8 +312,18 @@ describe('a conformance verdict never reads better than the report', () => {
     // alone, `qualified` appeared so rarely that a renderer reporting a declined
     // detection as an unqualified pass passed five hundred runs. A property that
     // never reaches a reading says nothing about it.
+    //
+    // SEEDED, and that is the whole difference between a coverage claim and a coin
+    // toss. Unseeded, `fc.sample` draws from a fresh generator every run and this
+    // assertion samples a random variable whose `passed` count sits close to the
+    // boundary it is compared against: measured over twenty consecutive runs it
+    // landed on exactly 20 once, failing a test nothing had changed. Raising the
+    // sample size or lowering the threshold would only widen a margin that is still
+    // probabilistic — the defect is that the claim was not reproducible, so the fix
+    // is to make the draw fixed. The counts then move only when the GENERATOR moves,
+    // which is the thing this guard is actually about.
     const seen = new Map<Reading, number>()
-    for (const state of fc.sample(STATE, 600)) {
+    for (const state of fc.sample(STATE, { numRuns: 600, seed: 20260828 })) {
       const reading = ceiling(state)
       seen.set(reading, (seen.get(reading) ?? 0) + 1)
     }

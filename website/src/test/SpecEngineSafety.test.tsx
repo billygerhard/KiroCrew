@@ -38,7 +38,12 @@ import en from '../i18n/locales/en.json'
 const T = en.apps.specEngine.safetyPanel
 const P = en.apps.specEngine.specEnginePage
 
-import { stubSpecEngineFetch, PENDING, type Answer } from './specEngineFetchStub'
+import {
+  stubSpecEngineFetch,
+  PENDING,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read what was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -172,6 +177,11 @@ const postedSwitch = () =>
 afterEach(() => {
   vi.unstubAllGlobals()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the reading rule', () => {

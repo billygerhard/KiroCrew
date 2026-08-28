@@ -227,6 +227,12 @@ BOUNDARY_ALLOWLIST: tuple[tuple[str, str], ...] = (
         ".spec_engine_mutation_probe.lock",
         "Lock the engine's mutation-probe harness leaves beside the tree; carries no source.",
     ),
+    (
+        ".gitignore",
+        "The shared ignore list, given the two entries that keep this project's own "
+        "scratch out of a reviewer's diff: website/tmp/ and the mutation-probe lock. "
+        "Additive lines only, both naming paths no other app writes.",
+    ),
 )
 
 #: Allowlist entries that legitimately match nothing. Everything else must match a

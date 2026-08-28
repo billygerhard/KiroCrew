@@ -29,9 +29,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import inspect
 import itertools
-import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path

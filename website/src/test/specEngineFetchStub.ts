@@ -33,7 +33,7 @@
  * A suite keeps its own fixtures and passes them as overrides; the defaults here
  * are only the neutral answer for a route a suite is not about.
  */
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 
 /** The app's URL namespace, matching `api.ts`'s own `API` constant. */
 export const SE_API = "/api/apps/spec-engine";
@@ -688,6 +688,9 @@ export function stubSpecEngineFetch(
         // Recorded AND refused. Falling through to any real payload is what let a
         // missing branch reach a component as the wrong shape and throw in render.
         unanswered.push(url);
+        // Also onto the module ledger, so `expectEverySpecEngineRouteAnswered`
+        // reaches a suite that never kept this stub's handle.
+        missed.push(url);
         answer = failure(
           UNANSWERED_STATUS,
           UNANSWERED_CODE,
@@ -721,3 +724,41 @@ export function stubSpecEngineFetch(
     unanswered: () => [...unanswered],
   };
 }
+
+/**
+ * Every URL no route matched, across every stub installed since the last check.
+ *
+ * A module-level ledger rather than a handle each test threads, because the
+ * suites install the stub from their own helpers and mostly discard the return
+ * value — so the only assertion that reaches all of them is one that does not
+ * need the handle.
+ */
+const missed: string[] = [];
+
+/**
+ * Assert that the page asked for nothing this table does not answer, and reset.
+ *
+ * Call from `afterEach` in every suite that installs the stub. Without it a
+ * product URL can DRIFT out from under the table — a route renamed, a query
+ * parameter moved into the path — and the suite still passes: the 599 refusal
+ * reaches the surface as an ordinary `SpecEngineApiError`, so a test whose
+ * subject IS a read failure renders exactly the copy it was asserting for and
+ * goes green while reading nothing the product would really have sent. That is
+ * the one failure this stub cannot make visible on its own, because from inside
+ * the stub a URL nobody covered and a URL nobody should cover look identical.
+ *
+ * Draining is what makes a failure attributable: the misses belong to the test
+ * whose `afterEach` reported them rather than accumulating onto a later one.
+ * Draining happens BEFORE the assertion so a failing test does not poison the
+ * rest of the file.
+ *
+ * A suite that deliberately drives an uncovered URL — the harness's own suite is
+ * the only one — asserts `stub.unanswered()` directly instead and does not call
+ * this.
+ */
+export function expectEverySpecEngineRouteAnswered(): void {
+  const seen = [...missed];
+  missed.length = 0;
+  expect(seen, "the page read URLs the spec-engine fetch stub has no route for").toEqual([]);
+}
+

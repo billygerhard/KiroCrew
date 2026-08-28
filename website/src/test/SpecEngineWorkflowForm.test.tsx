@@ -38,7 +38,13 @@ import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import { QK } from '../apps/spec-engine/api'
 import en from '../i18n/locales/en.json'
 
-import { PIPELINE_STAGES, stubSpecEngineFetch, failure, type Answer } from './specEngineFetchStub'
+import {
+  PIPELINE_STAGES,
+  stubSpecEngineFetch,
+  failure,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 const T = en.apps.specEngine.workflowForm
 const C = en.apps.specEngine.configPanel
@@ -362,6 +368,11 @@ function deliveryPending(): string {
 afterEach(() => {
   cleanup()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the workflow in force names its source per stage', () => {

@@ -56,7 +56,12 @@ const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
 import { declaredGroups } from '../apps/spec-engine/stages'
-import { stagesUnder, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import {
+  stagesUnder,
+  stubSpecEngineFetch,
+  expectEverySpecEngineRouteAnswered,
+  type Answer,
+} from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -442,6 +447,11 @@ function selectProject(name: string) {
 afterEach(() => {
   vi.unstubAllGlobals()
   calls.length = 0
+  // Nothing the page asked for went unanswered by the shared stub. Without this a
+  // product URL can drift out from under the table and this suite still passes: the
+  // stub's 599 refusal reaches the surface as an ordinary error, so a test whose
+  // subject is a read failure renders the copy it asserts for either way.
+  expectEverySpecEngineRouteAnswered()
 })
 
 describe('the rows are generated from the registry', () => {

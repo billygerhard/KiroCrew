@@ -3810,7 +3810,7 @@
         "an_environment_value_is_written_and_never_read_back": "Um valor introduzido aqui é escrito no documento e nunca é devolvido a este painel.",
         "an_operator_declared_this_binding": "Um operador declarou esta ligação.",
         "an_unusable_provider_falls_back_to_the_builtin": "Se um fornecedor ligado não puder ser usado, o motor recorre à implementação integrada desta capacidade em vez de parar a execução. É o que o motor faz; não é um relato de que esteja a acontecer agora.",
-        "binding_one_of_these_is_refused": "Nomear uma destas na secção «capabilities» é recusado em vez de ignorado, por isso nada aqui oferece ligar alguma: {{names}}.",
+        "binding_one_of_these_is_refused": "Nomear uma destas na secção capabilities é recusado em vez de ignorado, por isso nada aqui oferece ligar alguma: {{names}}.",
         "bindings_apply_to_every_project": "Estas ligações aplicam-se a todos os projetos. O motor lê-as de uma única secção de âmbito da aplicação e não tem camada por projeto.",
         "blank_inherits_the_app_wide_timeout": "Deixe em branco para herdar o tempo limite de capacidade de âmbito da aplicação.",
         "capabilities_the_engine_always_runs": "Capacidades que o motor executa sempre por si",

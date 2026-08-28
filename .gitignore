@@ -89,6 +89,16 @@ kirocrew-data.tar.gz
 # deliverables (e.g. temp-screenshots/) are unaffected. (`*.log` is already ignored above.)
 .pr-body.md
 .r*-logs/
+# Frontend gate scratch: logs, probe scripts and payload dumps written while
+# running the vitest / eslint / i18n gates from inside `website/`. Ignored so
+# `git status` stays readable and staging a change never has to be done by
+# explicit file name to step around it.
+website/tmp/
+# Held while a mutation probe has a source file temporarily altered, so two
+# probes cannot plant conflicting defects in the same tree at once. Its presence
+# after a probe means a plant was not restored — which is why it must be visible
+# in the worktree and must never be committed.
+.spec_engine_mutation_probe.lock
 
 # AI attribution tracking data
 .attribution/
