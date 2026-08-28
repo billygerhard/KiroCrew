@@ -4110,6 +4110,7 @@
         "the_registry_kind_is_not_editable_here": "El registro describe este ajuste como {{kind}}, para lo que este formulario no tiene control. Su valor almacenado se muestra tal cual; cámbialo en la vista JSON.",
         "this_scope_cannot_be_written_here": "Este ámbito no tiene ruta en este formulario: o su destino no está seleccionado, o el formulario no tiene una dirección para él. Escríbelo en la vista JSON.",
         "unwritten_setting_changes": "Cambios de ajustes sin escribir",
+        "where_the_value_comes_from": "De dónde procede el valor",
         "write_the_change": "Escribir el cambio",
         "wrote_the_change_and_re_read_the_settings": "Se escribió el cambio y los ajustes se volvieron a leer del almacén."
       },

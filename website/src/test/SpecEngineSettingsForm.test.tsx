@@ -275,19 +275,46 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
 }
 
 /**
- * Open the pane and wait until the generated rows are on screen.
+ * Open the pane, reveal every setting, and wait until the generated rows are on
+ * screen.
  *
  * The heading renders in all three of the block's states — reading, refused, and
  * generated — so waiting on it alone would let an assertion run against the
  * reading state. A test about a refusal or an empty vocabulary waits on its own
  * text instead.
+ *
+ * Every setting is REVEALED here because the surface renders only the rows whose
+ * in-force value is not the bundled default, and five of this fixture's six are
+ * defaulted. The cases in this file are about generation, scoping, staging and
+ * writing, each of which has to hold for a defaulted row too — a form that could
+ * only edit already-configured settings would be a form that cannot configure
+ * anything. The filter itself has its own describe block below, which does not
+ * reveal.
  */
 async function openRows(answers: Parameters<typeof stub>[0] = {}) {
   const client = await openConfig(answers)
+  revealEverySetting()
   await waitFor(() =>
     expect(settingRows().length).toBeGreaterThan(0),
   )
   return client
+}
+
+/**
+ * Show the rows at their bundled default too, if the control is on screen.
+ *
+ * Guarded rather than asserted, because `openConfig` also reaches states with no
+ * rows and therefore no control: a refused read, and a vocabulary the engine
+ * registers nothing in.
+ */
+function revealEverySetting() {
+  const control = within(block()).queryByRole('button', { name: showEverySettingLabel() })
+  if (control) fireEvent.click(control)
+}
+
+/** The reveal control's label for a vocabulary of *count* settings. */
+function showEverySettingLabel(count = 6): string {
+  return C.show_every_setting.replace('{{count}}', String(count))
 }
 
 /**
@@ -797,6 +824,220 @@ describe('a failed read is doubt, not a form', () => {
       expect(screen.getAllByText(C.could_not_resolve_the_configuration).length).toBeGreaterThan(0),
     )
     expect(settingRows()).toHaveLength(0)
+  })
+})
+
+describe('the rows at their bundled default are collapsed', () => {
+  it('renders only the settings that are not at their bundled default', async () => {
+    // The whole point of the filter: an operator who changed one setting meets one
+    // row, not six. Five of this fixture's six resolve to the bundled default.
+    await openConfig()
+    await waitFor(() => expect(settingRows().length).toBeGreaterThan(0))
+    expect(settingRows()).toHaveLength(1)
+    expect(row('limits.task_retry_limit')).toBeInTheDocument()
+    // And the five are counted rather than silently absent, so the surface says
+    // what it is not showing.
+    const counted = within(block()).getByText(new RegExp(C.settings_at_their_bundled_default))
+    expect(counted).toHaveTextContent('5')
+    // Named to make the count non-vacuous: a defaulted key is nowhere on the row
+    // list, not merely uncounted.
+    expect(
+      within(block()).queryByText('budget.warn_fraction', { selector: '.se-kv-path, .se-m' }),
+    ).toBeNull()
+  })
+
+  it('shows every setting on request, without leaving the stage', async () => {
+    await openConfig()
+    await waitFor(() => expect(settingRows().length).toBeGreaterThan(0))
+    const stage = screen.getByRole('tab', { name: new RegExp(`^${C.stage_execution}`) })
+    expect(stage).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(within(block()).getByRole('button', { name: showEverySettingLabel() }))
+    expect(settingRows()).toHaveLength(6)
+    expect(row('budget.warn_fraction')).toBeInTheDocument()
+    // The same stage is still the active one: revealing is not a navigation, and a
+    // control that moved the operator elsewhere to show six rows would have cost
+    // them every staged edit on the stage they left.
+    expect(screen.getByRole('tab', { name: new RegExp(`^${C.stage_execution}`) })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    // And it goes back, so the collapsed reading is reachable again in place.
+    fireEvent.click(
+      within(block()).getByRole('button', { name: C.show_only_values_not_at_their_default }),
+    )
+    expect(settingRows()).toHaveLength(1)
+  })
+
+  it('keeps a row whose value equals the default because somebody pinned it there', async () => {
+    // The reason the filter reads the ORIGIN and not only the value. A setting
+    // pinned to a value that happens to equal the bundled default is a decision,
+    // and it is distinguishable from an untouched setting by nothing else — hiding
+    // it would hide the pin, and a later change to the bundled default would then
+    // move a value the operator believed they had fixed.
+    await openConfig({
+      resolved: {
+        body: resolved({
+          settings: [
+            effective('limits.task_retry_limit', 7, {
+              origin: 'app_config',
+              declared_at: 'limits.task_retry_limit',
+              is_default: false,
+            }),
+            effective('budget.warn_fraction', 0.8, {
+              origin: 'app_config',
+              declared_at: 'budget.warn_fraction',
+              is_default: false,
+            }),
+            effective('delivery.auto_integrate', false),
+            effective('notify.channel', 'dashboard'),
+            effective('watch.interval_s', 300),
+            effective('concurrency.global_max_runs', 4),
+          ],
+        }),
+      },
+    })
+    await waitFor(() => expect(settingRows().length).toBeGreaterThan(1))
+    expect(settingRows()).toHaveLength(2)
+    expect(row('budget.warn_fraction')).toBeInTheDocument()
+    expect(
+      within(block()).getByText(new RegExp(C.settings_at_their_bundled_default)),
+    ).toHaveTextContent('4')
+  })
+
+  it('keeps a row whose in-force value disagrees with the declared default', async () => {
+    // A payload claiming the bundled default over a value that is not the bundled
+    // default is a payload disagreeing with itself, and the value in force is then
+    // one nobody can account for. Shown, because that is the last thing to hide
+    // from the person configuring the engine.
+    await openConfig({
+      resolved: {
+        body: resolved({
+          settings: [
+            // Registry default is 300; the read claims 999 is the default.
+            effective('watch.interval_s', 999),
+            effective('limits.task_retry_limit', 2),
+            effective('budget.warn_fraction', 0.8),
+            effective('delivery.auto_integrate', false),
+            effective('notify.channel', 'dashboard'),
+            effective('concurrency.global_max_runs', 4),
+          ],
+        }),
+      },
+    })
+    await waitFor(() => expect(settingRows().length).toBeGreaterThan(0))
+    expect(settingRows()).toHaveLength(1)
+    expect(row('watch.interval_s')).toBeInTheDocument()
+  })
+
+  it('keeps a row holding a staged edit after the defaults are hidden again', async () => {
+    // An edit whose row is not rendered is an edit no sentence describes, no confirm
+    // clears and no reconciliation drops — and it would still reach the patch. So a
+    // staged row is pinned visible until the edit is withdrawn or written.
+    await openRows()
+    fireEvent.change(control('watch.interval_s'), { target: { value: '90' } })
+    expect(unwritten()).toContain(T.unwritten_setting_changes)
+    fireEvent.click(
+      within(block()).getByRole('button', { name: C.show_only_values_not_at_their_default }),
+    )
+    // The configured row and the staged one, and nothing else.
+    expect(settingRows()).toHaveLength(2)
+    expect(row('watch.interval_s')).toHaveAttribute('data-staged', 'true')
+    expect(unwritten()).toContain(T.unwritten_setting_changes)
+    // Withdrawn, the row goes back to being one of the collapsed defaults. The
+    // withdrawal is emptying the control rather than typing 300 back: at app scope
+    // the bundled default is not what the path stores, so typing it PINS the
+    // setting there, which is a real change and stays staged.
+    fireEvent.change(control('watch.interval_s'), { target: { value: '' } })
+    expect(settingRows()).toHaveLength(1)
+    expect(unwritten()).toBe('')
+  })
+
+  it('states that every setting is at its default rather than showing nothing', async () => {
+    await openConfig({
+      resolved: {
+        body: resolved({
+          settings: [
+            effective('limits.task_retry_limit', 2),
+            effective('budget.warn_fraction', 0.8),
+            effective('delivery.auto_integrate', false),
+            effective('notify.channel', 'dashboard'),
+            effective('watch.interval_s', 300),
+            effective('concurrency.global_max_runs', 4),
+          ],
+        }),
+      },
+    })
+    expect(
+      await within(block()).findByText(C.every_setting_is_at_its_bundled_default),
+    ).toBeInTheDocument()
+    expect(settingRows()).toHaveLength(0)
+    // Distinct from the empty vocabulary: the engine registers six settings here.
+    expect(within(block()).queryByText(T.no_setting_is_registered)).toBeNull()
+    // And they are all reachable, which is what makes this a collapse and not a loss.
+    fireEvent.click(within(block()).getByRole('button', { name: showEverySettingLabel() }))
+    expect(settingRows()).toHaveLength(6)
+  })
+})
+
+describe('where a value came from is a per-row disclosure', () => {
+  it('puts the origin and the declaring path behind a disclosure, value outside', async () => {
+    await openRows()
+    const retries = row('limits.task_retry_limit')
+    const disclosure = retries.querySelector('details.se-disc')
+    expect(disclosure).not.toBeNull()
+    // Closed by default: three resolution lines on every one of twenty-one rows is
+    // what made this pane read as a registry dump.
+    expect((disclosure as HTMLDetailsElement).open).toBe(false)
+    expect(within(disclosure as HTMLElement).getByText(C.origin_app_config)).toBeInTheDocument()
+    // The declaring path, which shares its element with the separator, so it is read
+    // off the element rather than matched as whole text.
+    const declared = (disclosure as HTMLElement).querySelector('.se-src')
+    expect(declared).not.toBeNull()
+    expect(declared).toHaveTextContent('limits.task_retry_limit')
+    // The bundled default is in there too, so "at its bundled default" is a claim a
+    // reader can check rather than one this surface merely asserts.
+    expect(disclosure?.textContent).toContain(C.origin_bundled_default)
+    expect(
+      within(disclosure as HTMLElement).getByText('2', { selector: '.se-m' }),
+    ).toBeInTheDocument()
+    // The value in force stays OUTSIDE the disclosure: once a staged edit occupies
+    // the control it is the only thing on screen distinguishing 5 staged from 5
+    // stored.
+    const inForce = within(retries).getByText(new RegExp(T.in_force))
+    expect(inForce).toHaveTextContent('7')
+    expect(disclosure?.contains(inForce)).toBe(false)
+  })
+
+  it('expands in place, drawing nothing over the page', async () => {
+    await openRows()
+    const disclosure = row('limits.task_retry_limit').querySelector(
+      'details.se-disc',
+    ) as HTMLDetailsElement
+    // A `<details>` rather than a popup, for the reason every disclosure on this
+    // pane is one: the strip carrying the kill switch must never be covered.
+    expect(disclosure.tagName).toBe('DETAILS')
+    expect(disclosure.style.position).toBe('')
+    const summary = within(disclosure).getByText(T.where_the_value_comes_from)
+    expect(summary.tagName).toBe('SUMMARY')
+  })
+
+  it('never renders the engine’s own origin identifier as user-facing text', async () => {
+    await openRows()
+    const text = block().textContent ?? ''
+    for (const identifier of [
+      'bundled_default',
+      'app_config',
+      'cost_profile',
+      'project_config',
+      'source_config',
+    ]) {
+      expect(text, identifier).not.toContain(identifier)
+    }
+    // Non-vacuous: the plain-language readings of two of those origins ARE on
+    // screen, so the absence above is about the wire tokens and not about an empty
+    // surface.
+    expect(text).toContain(C.origin_app_config)
+    expect(text).toContain(C.origin_bundled_default)
   })
 })
 

@@ -3366,6 +3366,7 @@
         "the_registry_kind_is_not_editable_here": "The registry describes this setting as {{kind}}, which this form has no control for. Its stored value is shown as it is; change it in the JSON view.",
         "this_scope_cannot_be_written_here": "This scope has no path on this form: either its target is not selected, or this form has no address for it. Write it in the JSON view.",
         "unwritten_setting_changes": "Unwritten setting changes",
+        "where_the_value_comes_from": "Where the value comes from",
         "write_the_change": "Write the change",
         "wrote_the_change_and_re_read_the_settings": "Wrote the change and re-read the settings from the store."
       },

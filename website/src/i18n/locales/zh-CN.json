@@ -3988,6 +3988,7 @@
         "the_registry_kind_is_not_editable_here": "注册表将此设置描述为 {{kind}}，本表单没有对应控件。已按存储原样显示其值；请在 JSON 视图中修改。",
         "this_scope_cannot_be_written_here": "该作用域在本表单中没有写入路径：可能未选定目标，或表单没有对应地址。请在 JSON 视图中写入。",
         "unwritten_setting_changes": "未写入的设置更改",
+        "where_the_value_comes_from": "该值的来源",
         "write_the_change": "写入更改",
         "wrote_the_change_and_re_read_the_settings": "已写入更改，并从存储重新读取设置。"
       },

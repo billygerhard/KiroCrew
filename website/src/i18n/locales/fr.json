@@ -4110,6 +4110,7 @@
         "the_registry_kind_is_not_editable_here": "Le registre décrit ce réglage comme {{kind}}, pour quoi ce formulaire n'a aucun contrôle. Sa valeur stockée est affichée telle quelle ; modifiez-la dans la vue JSON.",
         "this_scope_cannot_be_written_here": "Cette portée n'a pas de chemin sur ce formulaire : soit sa cible n'est pas sélectionnée, soit le formulaire n'a pas d'adresse pour elle. Écrivez-la dans la vue JSON.",
         "unwritten_setting_changes": "Modifications de réglages non écrites",
+        "where_the_value_comes_from": "D'où vient la valeur",
         "write_the_change": "Écrire la modification",
         "wrote_the_change_and_re_read_the_settings": "La modification a été écrite et les réglages ont été relus depuis le magasin."
       },

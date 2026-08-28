@@ -3988,6 +3988,7 @@
         "the_registry_kind_is_not_editable_here": "레지스트리는 이 설정을 {{kind}}(으)로 기술하며, 이 양식에는 해당 입력이 없습니다. 저장된 값을 그대로 보여 주니 JSON 보기에서 바꾸세요.",
         "this_scope_cannot_be_written_here": "이 범위는 이 양식에서 기록할 경로가 없습니다. 대상이 선택되지 않았거나, 양식에 해당 주소가 없습니다. JSON 보기에서 기록하세요.",
         "unwritten_setting_changes": "기록되지 않은 설정 변경",
+        "where_the_value_comes_from": "이 값의 출처",
         "write_the_change": "변경 기록하기",
         "wrote_the_change_and_re_read_the_settings": "변경을 기록하고 설정을 저장소에서 다시 읽었습니다."
       },

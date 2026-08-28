@@ -133,6 +133,7 @@ import {
   type PendingEdit,
   type StagedEdit,
 } from './configDocument'
+import { bundledDefaultCount, shownSettings } from './settingDefaults'
 import { useStagedEdits } from './useStagedEdits'
 
 /** Separator between two identifiers on one line. Punctuation, not copy. */
@@ -176,7 +177,7 @@ const SOURCES_GRID_ID = 'se-sources-grid'
  * and a parent setState during a child's render is a render-phase side effect
  * React refuses.
  */
-function PendingCount({
+export function PendingCount({
   count,
   onCount,
 }: {
@@ -524,7 +525,7 @@ const EDIT_SENTENCE_KEY: Record<SourceGridCell['origin'], string> = {
  * a level replacing a level, a timeout replacing a default, a source entry being
  * removed. The card owns the shape of the confirmation, never the copy inside it.
  */
-interface ReviewedChange {
+export interface ReviewedChange {
   /** The dotted path, for display and as the React key. Never parsed back. */
   path: string
   /** One plain-language sentence naming the old and the new state. */
@@ -582,7 +583,7 @@ const CONSEQUENCE_ORDER: readonly ConsequenceKind[] = [
 ]
 
 /** One authority change a patch performs, as its caller declares it. */
-interface Consequence {
+export interface Consequence {
   /** Which of the four grants this is. Selects the card's own statement. */
   kind: ConsequenceKind
   /** The path the grant lands at. Display and React key; never parsed back. */
@@ -1531,9 +1532,12 @@ function SettingControl({
  * 2. **The registry's own summary is the help text.** It is the sentence the
  *    engine wrote about the setting; a second sentence maintained here would be a
  *    second description to drift.
- * 3. **The value in force and its ORIGIN.** A control showing `2` cannot tell an
- *    operator whether somebody chose 2 or the app ships 2, and those call for
- *    opposite actions.
+ * 3. **The value in force stays on the row; where it CAME FROM is one activation
+ *    away.** A control showing `2` cannot tell an operator whether somebody chose 2
+ *    or the app ships 2, and those call for opposite actions — so the origin, the
+ *    declaring path and the bundled default are all on the row, behind a per-row
+ *    disclosure rather than in its default rendering. Three resolution lines on
+ *    every one of twenty-one rows is what made this pane read as a registry dump.
  * 4. **A staged edit is marked as unwritten, beside the value still in force.**
  *    Collapsing the two would leave a refused write displaying the submitted value
  *    as though it were stored.
@@ -1604,22 +1608,49 @@ function SettingRow({
         />
       )}
       <p className="se-note">{setting.summary}</p>
+      {/* The value in force stays in the row's default rendering, outside the
+          disclosure below, and that is not an oversight about progressive
+          disclosure: once a staged edit occupies the control it is the only thing
+          on screen distinguishing "5 staged" from "5 stored", and collapsing the
+          two would leave a refused write showing the submitted value as though it
+          were persisted. */}
       <p className="se-note">
         {i18nT('apps.specEngine.settingsForm.in_force')}
         {SEP}
         <span className="se-m">{shownValue(inForce?.value)}</span>
-        {SEP}
-        {/* Its own element, because the origin is the half of this line a reader
-            acts on: a value of 2 somebody chose and a 2 the app ships call for
-            opposite actions, and only the origin distinguishes them. */}
-        <span>{originText(inForce)}</span>
-        {inForce && inForce.declared_at !== '' && (
-          <span className="se-src">
-            {SEP}
-            {inForce.declared_at}
-          </span>
-        )}
       </p>
+      {/* Where the value came from, one activation away.
+          Origin, declaring path and the bundled default are RESOLUTION detail: none
+          of them is needed to change the value, and all three on every row is how
+          twenty-one settings read as a registry dump. They stay reachable per row
+          rather than being dropped, because a value of 2 somebody chose and a 2 the
+          app ships call for opposite actions and only the origin distinguishes
+          them.
+          A `<details>` for the reason every disclosure on this pane is one: it
+          expands in place and draws nothing over the page, whose kill-switch strip
+          must never be covered. */}
+      <details className="se-disc">
+        <summary>{i18nT('apps.specEngine.settingsForm.where_the_value_comes_from')}</summary>
+        <p className="se-note">
+          {/* Plain language, from the engine's origin enum through `ORIGIN_KEY`. The
+              enum's own spelling never reaches the screen: `bundled_default` is a
+              wire token, not a sentence an operator reads. */}
+          <span>{originText(inForce)}</span>
+          {inForce && inForce.declared_at !== '' && (
+            <span className="se-src">
+              {SEP}
+              {inForce.declared_at}
+            </span>
+          )}
+        </p>
+        {/* The default the row would fall back to, so "at its bundled default" is a
+            claim a reader can check rather than one this surface asserts. */}
+        <p className="se-note">
+          {i18nT('apps.specEngine.configPanel.origin_bundled_default')}
+          {SEP}
+          <span className="se-m">{shownValue(setting.default)}</span>
+        </p>
+      </details>
       {control !== undefined && offers.length > 0 && (
         <div
           className="se-acts"
@@ -1892,6 +1923,16 @@ function GroupedSettings({
  *    re-read as what is in force, and the registry's own defaults are emphatically
  *    not that.
  *
+ * ## The rows at their bundled default are collapsed, not absent
+ *
+ * An operator who changed three settings should meet those three. So the rendered
+ * rows are the ones whose in-force value is not the bundled default, the count of
+ * the rest is stated, and one control on the stage reveals them — see
+ * `settingDefaults`, which owns the decision and states why it reads BOTH the
+ * engine's origin and the registry's declared default. A row holding a staged edit
+ * is pinned visible whatever the filter says, because an edit with no row is an edit
+ * no sentence describes and no confirm clears while it still reaches the patch.
+ *
  * ## One instance per pipeline stage
  *
  * `groups` narrows the generated fields to the setting GROUPS one stage presents —
@@ -1929,6 +1970,10 @@ export function SettingsForm({
   const [source, setSource] = useState('')
   const [reviewing, setReviewing] = useState(false)
   const [wrote, setWrote] = useState(false)
+  // Whether the rows at their bundled default are shown too. Per FORM, so it is per
+  // pipeline stage: revealing execution's defaults is not a statement about intake's,
+  // and the control is on the stage so using it never navigates away from one.
+  const [everySetting, setEverySetting] = useState(false)
 
   const registry = useQuery({
     queryKey: QK.registry,
@@ -2020,6 +2065,21 @@ export function SettingsForm({
   useEffect(() => {
     reconcile((edit) => addressable.has(JSON.stringify(edit.segments)))
   }, [addressable, reconcile])
+
+  // How many of this stage's rows resolve to their bundled default, and which rows
+  // are therefore rendered. Counted over EVERY generated field rather than over the
+  // rendered ones, because the count is the answer to "what am I not being shown"
+  // and it must not change when the reveal control does.
+  const atDefault = bundledDefaultCount(fields)
+  const shownFields = useMemo(
+    () =>
+      shownSettings(fields, everySetting, (field) =>
+        field.segments === null ? false : edits.stagedAt(field.segments) !== undefined,
+      ),
+    // `edits` is the hook's own memo over its list, so this recomputes when a row
+    // is staged or withdrawn and not on every render. `stagedAt` reads that list.
+    [fields, everySetting, edits],
+  )
 
   // `isError` first, then the data: see property 4 above. Both reads are named
   // because they fail for different reasons and only one of them is repairable
@@ -2149,12 +2209,44 @@ export function SettingsForm({
             </div>
           )}
           <GroupedSettings
-            fields={fields}
+            fields={shownFields}
             stagedAt={edits.stagedAt}
             onScope={chooseScope}
             onStage={stage}
             onWithdraw={withdraw}
           />
+          {/* Only the rows that are not at their bundled default were rendered
+              above, so this states what was left out and offers it. Below the rows
+              and not above them: with the common case three rows long, the count and
+              its control sit where the list ends rather than ahead of it.
+
+              In flow, for the jump navigation's reason — the pane's layout holds
+              only because nothing on it is drawn over anything else — and on the
+              stage, so asking for every setting never navigates away from it. */}
+          {shownFields.length === 0 && (
+            <p className="se-note">
+              {i18nT('apps.specEngine.configPanel.every_setting_is_at_its_bundled_default')}
+            </p>
+          )}
+          <div className="se-acts" style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              className="se-btn se-sm"
+              aria-pressed={everySetting}
+              onClick={() => setEverySetting((shown) => !shown)}
+            >
+              {everySetting
+                ? i18nT('apps.specEngine.configPanel.show_only_values_not_at_their_default')
+                : i18nT('apps.specEngine.configPanel.show_every_setting', {
+                    count: fmtNumber(fields.length),
+                  })}
+            </button>
+            <span className="se-lbl">
+              {i18nT('apps.specEngine.configPanel.settings_at_their_bundled_default')}
+              {SEP}
+              <span className="se-m">{fmtNumber(atDefault)}</span>
+            </span>
+          </div>
           <div className="se-acts" style={{ marginTop: 9 }}>
             <button
               type="button"

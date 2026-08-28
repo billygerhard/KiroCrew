@@ -4049,6 +4049,7 @@
         "the_registry_kind_is_not_editable_here": "Das Register beschreibt diese Einstellung als {{kind}}, wofür dieses Formular kein Steuerelement hat. Der gespeicherte Wert wird unverändert angezeigt; ändern Sie ihn in der JSON-Ansicht.",
         "this_scope_cannot_be_written_here": "Dieser Bereich hat in diesem Formular keinen Pfad: entweder ist sein Ziel nicht ausgewählt, oder das Formular kennt keine Adresse dafür. Schreiben Sie ihn in der JSON-Ansicht.",
         "unwritten_setting_changes": "Nicht geschriebene Einstellungsänderungen",
+        "where_the_value_comes_from": "Woher der Wert kommt",
         "write_the_change": "Die Änderung schreiben",
         "wrote_the_change_and_re_read_the_settings": "Die Änderung wurde geschrieben und die Einstellungen wurden erneut aus dem Speicher gelesen."
       },

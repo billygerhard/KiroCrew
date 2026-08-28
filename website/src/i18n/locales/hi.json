@@ -4049,6 +4049,7 @@
         "the_registry_kind_is_not_editable_here": "रजिस्ट्री इस सेटिंग को {{kind}} बताती है, जिसके लिए इस फ़ॉर्म में कोई नियंत्रण नहीं है। संग्रहित मान जैसा है वैसा दिखाया गया है; इसे JSON दृश्य में बदलें।",
         "this_scope_cannot_be_written_here": "इस स्कोप का इस फ़ॉर्म पर कोई पथ नहीं है: या तो उसका लक्ष्य चुना नहीं गया, या फ़ॉर्म के पास उसका पता नहीं है। इसे JSON दृश्य में लिखें।",
         "unwritten_setting_changes": "बिना लिखे सेटिंग बदलाव",
+        "where_the_value_comes_from": "यह मान कहाँ से आया है",
         "write_the_change": "बदलाव लिखें",
         "wrote_the_change_and_re_read_the_settings": "बदलाव लिख दिया और सेटिंग स्टोर से फिर पढ़ लीं।"
       },

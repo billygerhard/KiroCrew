@@ -3988,6 +3988,7 @@
         "the_registry_kind_is_not_editable_here": "レジストリはこの設定を {{kind}} と記述しており、このフォームには対応する入力がありません。保存されている値をそのまま表示します。変更は JSON ビューで行ってください。",
         "this_scope_cannot_be_written_here": "このスコープにはこのフォーム上の書き込み先がありません。対象が選ばれていないか、フォームがその宛先を持っていません。JSON ビューで書き込んでください。",
         "unwritten_setting_changes": "未書き込みの設定変更",
+        "where_the_value_comes_from": "この値の出どころ",
         "write_the_change": "変更を書き込む",
         "wrote_the_change_and_re_read_the_settings": "変更を書き込み、設定をストアから読み直しました。"
       },

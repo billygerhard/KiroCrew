@@ -4110,6 +4110,7 @@
         "the_registry_kind_is_not_editable_here": "Il registro descrive questa impostazione come {{kind}}, per cui questo modulo non ha un controllo. Il valore memorizzato è mostrato così com'è; modificalo nella vista JSON.",
         "this_scope_cannot_be_written_here": "Questo ambito non ha un percorso in questo modulo: o la sua destinazione non è selezionata, o il modulo non ha un indirizzo per essa. Scrivilo nella vista JSON.",
         "unwritten_setting_changes": "Modifiche alle impostazioni non scritte",
+        "where_the_value_comes_from": "Da dove proviene il valore",
         "write_the_change": "Scrivi la modifica",
         "wrote_the_change_and_re_read_the_settings": "La modifica è stata scritta e le impostazioni sono state rilette dall'archivio."
       },

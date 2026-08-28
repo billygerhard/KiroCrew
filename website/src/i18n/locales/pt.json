@@ -4110,6 +4110,7 @@
         "the_registry_kind_is_not_editable_here": "O registro descreve esta configuração como {{kind}}, para o que este formulário não tem controle. O valor armazenado é mostrado como está; altere-o na visão JSON.",
         "this_scope_cannot_be_written_here": "Este escopo não tem caminho neste formulário: ou seu destino não está selecionado, ou o formulário não tem endereço para ele. Grave-o na visão JSON.",
         "unwritten_setting_changes": "Alterações de configuração não escritas",
+        "where_the_value_comes_from": "De onde vem o valor",
         "write_the_change": "Gravar a alteração",
         "wrote_the_change_and_re_read_the_settings": "A alteração foi gravada e as configurações foram lidas de novo do armazenamento."
       },

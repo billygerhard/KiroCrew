@@ -47,9 +47,17 @@ function setting(key: string, over: Record<string, unknown> = {}) {
   }
 }
 
-/** One resolved setting, in `EffectiveValue.to_json_object`'s shape. */
+/**
+ * One resolved setting, in `EffectiveValue.to_json_object`'s shape.
+ *
+ * App-configured rather than defaulted, because a settings surface renders only the
+ * rows whose in-force value is not the bundled default: a fixture of defaulted
+ * values would collapse every subsection this suite is about into a count. The
+ * grouping is the subject here, so the vocabulary is one an operator has configured
+ * — and the collapsing itself is `SpecEngineSettingsForm.test.tsx`'s.
+ */
 function effective(key: string, value: unknown = 1): Record<string, unknown> {
-  return { key, value, origin: 'bundled_default', declared_at: '', is_default: true }
+  return { key, value, origin: 'app_config', declared_at: key, is_default: false }
 }
 
 /**
