@@ -89,7 +89,11 @@ export function StageAdvanced({
         config={config}
         onPendingCount={reporterFor(surfaceKey(stage.id, 'profiles'))}
       />
-      <StageCapabilities capabilities={stage.capabilities} />
+      <StageCapabilities
+        stage={stage.id}
+        capabilities={stage.capabilities}
+        reporterFor={reporterFor}
+      />
       <div className="se-blk">
         <h3>{i18nT('apps.specEngine.configPanel.tab_json_view')}</h3>
         <p className="se-note">

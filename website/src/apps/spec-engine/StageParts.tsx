@@ -6,8 +6,7 @@
  * the shared shape is stated once and each panel stays short enough to read in one
  * pass.
  */
-import { i18nT } from '../../i18n/t'
-
+import { CapabilityForm } from './CapabilityForm'
 import { SettingsForm } from './ConfigPanel'
 import { stageLabel, stageSummary, surfaceKey } from './stages'
 
@@ -66,30 +65,29 @@ export function StageSettings({
 }
 
 /**
- * The delegable capabilities the engine places in this stage, by name.
+ * The delegable capabilities the engine places in this stage, as bindable rows.
  *
- * Named rather than omitted because the placement is the engine's: a capability it
- * declares delegable is bindable whether or not this pane has a form for it, and a
- * stage that listed none of them would leave an operator no way to see that the
- * authoring stage is configured entirely by its providers. Names only, and no
- * control that would attempt a binding — the binding form is its own change.
+ * The placement is the engine's: a capability it declares delegable is bindable
+ * from here, and a stage that listed none of them would leave an operator no way to
+ * see that the authoring stage is configured entirely by its providers. A stage the
+ * engine places no capability in renders nothing, which delivery genuinely does —
+ * delivery runs an ordered sequence of stage COMMANDS rather than a bound provider.
  *
- * Rendered as identifiers rather than prose because that is what they are: the
- * engine's own capability names, the same tokens a configuration document and a
- * refusal-by-path speak.
+ * The form itself lives in its own module: what each capability costs, whether its
+ * program can be found, and what an external binding does and does not promise are
+ * a set of claims worth reading in one place, and none of them belongs in the
+ * arrangement of a stage panel.
  */
-export function StageCapabilities({ capabilities }: { capabilities: readonly string[] }) {
-  if (capabilities.length === 0) return null
+export function StageCapabilities({
+  stage,
+  capabilities,
+  reporterFor,
+}: {
+  stage: string
+  capabilities: readonly string[]
+  reporterFor: (surface: string) => (count: number) => void
+}) {
   return (
-    <div className="se-blk">
-      <h3>{i18nT('apps.specEngine.configPanel.capabilities_this_stage_governs')}</h3>
-      <ul className="se-names">
-        {capabilities.map((capability) => (
-          <li key={capability} className="se-evid-item se-m">
-            {capability}
-          </li>
-        ))}
-      </ul>
-    </div>
+    <CapabilityForm stage={stage} capabilities={capabilities} reporterFor={reporterFor} />
   )
 }

@@ -199,6 +199,32 @@ export function stagesUnder(stage: string, groups: readonly string[]) {
   }));
 }
 
+/**
+ * How a delegated capability may be reached, as `schema.TRANSPORTS` declares it.
+ *
+ * Transcribed rather than invented, and in the engine's own order: a transport
+ * chooser is generated from this, so a list that disagreed with the tuple would
+ * offer a transport the write door refuses.
+ */
+export const TRANSPORTS = ["builtin", "mcp", "command"];
+
+/**
+ * The capabilities the engine always executes itself, as
+ * `schema.ENGINE_FLOOR_CAPABILITIES` declares them.
+ *
+ * Naming one of these in the `capabilities` section is REFUSED rather than
+ * ignored, which is why a surface showing capabilities names them and offers no
+ * control that would attempt one.
+ */
+export const ENGINE_FLOOR_CAPABILITIES = [
+  "format_validation",
+  "phase_gates",
+  "autonomy_resolution",
+  "budget_enforcement",
+  "claim_ledger",
+  "audit_log",
+];
+
 /** The empty setting vocabulary: enough for the generated forms to render nothing. */
 const EMPTY_REGISTRY = {
   settings: [],
@@ -207,6 +233,13 @@ const EMPTY_REGISTRY = {
   roles: [],
   levels: [],
   stages: PIPELINE_STAGES,
+  // The extension seams' closed sets. Present even in the EMPTY registry, for
+  // `stages`' reason: the route composes each from its owning tuple on every read,
+  // so a payload without them is a shape it never returns — and a capability form
+  // reading off one would offer no transport at all, which is a degradation the
+  // form handles but not a state a suite should be asserting against.
+  transports: TRANSPORTS,
+  engine_floor: ENGINE_FLOOR_CAPABILITIES,
 };
 
 /**

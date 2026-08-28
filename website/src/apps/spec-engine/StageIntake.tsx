@@ -57,7 +57,11 @@ export function StageIntake({
         onPendingCount={reporterFor(surfaceKey(stage.id, 'sources'))}
       />
       <SourcesSection chosen={gridSource} onChoose={onGridSource} />
-      <StageCapabilities capabilities={stage.capabilities} />
+      <StageCapabilities
+        stage={stage.id}
+        capabilities={stage.capabilities}
+        reporterFor={reporterFor}
+      />
     </>
   )
 }

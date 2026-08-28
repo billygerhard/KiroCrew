@@ -32,7 +32,11 @@ export function StageExecution({
         groups={stage.groups}
         reporterFor={reporterFor}
       />
-      <StageCapabilities capabilities={stage.capabilities} />
+      <StageCapabilities
+        stage={stage.id}
+        capabilities={stage.capabilities}
+        reporterFor={reporterFor}
+      />
     </>
   )
 }
