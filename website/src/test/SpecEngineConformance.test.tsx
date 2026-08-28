@@ -703,6 +703,25 @@ describe('a completed run is presented verdict first', () => {
     expect(reason.textContent?.length).toBe(MAX_REASON_CHARS + REASON_TRUNCATION_NOTICE.length)
     expect(reason.textContent?.endsWith(REASON_TRUNCATION_NOTICE)).toBe(true)
   })
+
+  it('treats the run’s own failure reason as hostile text too', async () => {
+    // `error` is the one reported reason the panel labels as such while it comes
+    // from the worker rather than from a check. Provider bytes cannot reach it — a
+    // candidate's crash becomes a failed check inside the runner — but an operating
+    // system message quotes a path an operator chose, and its length is unbounded at
+    // the source, so it earns the same narrowing as every other reason here.
+    const hostile = `OSError: \u0001\u0002/tmp/${'p'.repeat(MAX_REASON_CHARS)}`
+    await openStage({
+      conformance: { body: state({ status: 'failed', report: null, error: hostile }) },
+    })
+    const panel = await waitFor(() => panelFor('analysis'))
+    const shown = panel.querySelector('[data-run-error="true"]') as HTMLElement
+    expect(shown).not.toBeNull()
+    // Control bytes gone, and the cut marked rather than silent.
+    expect(shown.textContent).not.toContain('\u0001')
+    expect(shown.textContent).not.toContain('\u0002')
+    expect(shown.textContent?.endsWith(REASON_TRUNCATION_NOTICE)).toBe(true)
+  })
 })
 
 describe('an outcome that no longer describes the binding is not presented as current', () => {

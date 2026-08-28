@@ -38,6 +38,7 @@ import * as fc from 'fast-check'
 import type { ConformanceReport, ConformanceState } from '../apps/spec-engine/api'
 import {
   READING_RANK,
+  checkRows,
   conformanceView,
   presentedRows,
   type Reading,
@@ -373,6 +374,46 @@ describe('a conformance verdict never reads better than the report', () => {
       }),
       { numRuns: 300 },
     )
+  })
+
+  it('carries no check row while a run is in flight', () => {
+    // The rows and the running sentence are ONE answer. Flooring only the reading
+    // would leave a payload that arrived `running` beside an earlier report printing
+    // that run's per-check outcomes directly beneath the sentence promising no
+    // earlier outcome is shown — the verdict withheld and the evidence for it
+    // displayed. The generator draws the report's presence independently of `status`
+    // precisely so this pairing is reachable here even though the routes never emit
+    // it.
+    //
+    // Scoped to `running` on purpose: `earlier_binding` floors its VERDICT while
+    // still relaying the rows, because a report about a since-changed binding is
+    // evidence that binding produced and the panel says which binding it describes.
+    fc.assert(
+      fc.property(STATE_FROM_INDEPENDENT_FIELDS, (state) => {
+        const view = conformanceView(state)
+        if (view.situation === 'running') {
+          expect(view.checks).toEqual([])
+          expect(view.declined).toBe(0)
+          expect(view.gaps).toEqual([])
+        }
+      }),
+      { numRuns: 500 },
+    )
+  })
+
+  it('rejects a view that keeps the earlier run’s rows while a run is in flight', () => {
+    // Falsifiability for the property above, in the shape the defect actually took:
+    // rows derived from the report's mere presence rather than from the situation.
+    expect(() =>
+      fc.assert(
+        fc.property(STATE_FROM_INDEPENDENT_FIELDS, (state) => {
+          const view = conformanceView(state)
+          const keptRows = state.report === null ? [] : checkRows(state.report)
+          if (view.situation === 'running') expect(keptRows).toEqual([])
+        }),
+        { numRuns: 500 },
+      ),
+    ).toThrow()
   })
 
   it('rejects a renderer that reads the passed flag and nothing else', () => {

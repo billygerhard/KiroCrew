@@ -305,8 +305,19 @@ function situationOf(
  */
 export function conformanceView(state: ConformanceState | null | undefined): ConformanceView {
   const report = state?.report ?? null
-  const checks = report === null ? [] : checkRows(report)
   const situation = situationOf(state, report)
+  // Withheld only while a run is IN FLIGHT, where the panel states in words that no
+  // earlier outcome is shown: flooring the reading alone would leave that sentence
+  // sitting directly above the earlier run's per-check outcomes — the verdict
+  // withheld and the evidence for it displayed. The routes replace the job with a
+  // report-less one on start, so this makes the shape unrepresentable rather than
+  // repairing something reachable.
+  //
+  // `earlier_binding` deliberately keeps its rows: a report about a binding that has
+  // since changed is still evidence that binding produced, the panel says so, and
+  // only its VERDICT is floored.
+  const running = situation === 'running'
+  const checks = report === null || running ? [] : checkRows(report)
   return {
     situation,
     // A reading only where a report describes the binding in force. Every other
@@ -314,10 +325,17 @@ export function conformanceView(state: ConformanceState | null | undefined): Con
     // verdict in it — not a pass, and not a failure either.
     reading: situation === 'complete' && report !== null ? reading(report, checks) : 'no_outcome',
     checks,
-    declined: report?.declined_detections ?? 0,
-    gaps: report?.gaps ?? [],
-    error: state?.error ?? '',
-    candidate: state?.candidate ?? '',
+    declined: running ? 0 : report?.declined_detections ?? 0,
+    gaps: running ? [] : report?.gaps ?? [],
+    // Narrowed here rather than at the render site, for the reason this module
+    // applies to every other reported string: a surface that assumed the other end
+    // had removed control characters would be relying on the other end never
+    // changing. Neither string carries provider bytes today — a candidate's own
+    // crash becomes a failed check inside the runner, and `error` is the worker's
+    // own `ClassName: message` — but an operating-system message quotes a path an
+    // operator chose, and length is unbounded at the source either way.
+    error: reasonText(state?.error ?? ''),
+    candidate: reasonText(state?.candidate ?? ''),
     // The server's own answer about the binding as it is now, not a reading of the
     // run's status: a capability rebound to its builtin polls `complete` while the
     // start is refused, so offering the run its status implies would offer

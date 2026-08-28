@@ -523,7 +523,7 @@ const DEFAULTS: Record<RouteKey, Responder> = {
       gate_errors: [],
     },
   },
-  // Both conformance routes answer the SAME eleven-field shape — the GET directly,
+  // Both conformance routes answer the SAME shape — the GET directly,
   // the POST with `ok: true` added — so both defaults are built from one builder.
   // `absent` is the neutral state: no run has been started for this capability on
   // this gateway. `deadline_s` is present and non-zero even with no run, because
