@@ -63,6 +63,7 @@ import { i18nT } from '../../i18n/t'
 
 import { QK, specEngineApi, type CapabilityBinding, type ProviderIdentity } from './api'
 import { FormReview, PendingCount, Refused } from './ConfigPanel'
+import { ConformancePanel } from './ConformancePanel'
 import {
   DELETE,
   buildFormPatch,
@@ -610,6 +611,11 @@ function CapabilityRow({
       <p className="se-note">
         {i18nT('apps.specEngine.capabilityForm.an_unusable_provider_falls_back_to_the_builtin')}
       </p>
+      {/* Only where the binding IN FORCE reaches outside the engine. A builtin has
+          nothing to check — the engine verifies its own builtins in its own suite —
+          and this is the resolved transport rather than the draft's, because the
+          suite runs against what is bound and not against what is being typed. */}
+      {row.transport !== BUILTIN && <ConformancePanel capability={capability} />}
       <TransportChoice
         capability={capability}
         transports={transports}

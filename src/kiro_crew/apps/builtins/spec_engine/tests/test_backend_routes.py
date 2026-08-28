@@ -4099,6 +4099,35 @@ class TestTheConformanceStateIsHonestAboutWhatItHas:
         assert after.body["report"] is not None
 
     @pytest.mark.asyncio
+    async def test_the_invocation_bound_is_the_suites_own_and_differs_by_capability(
+        self, recorded_sel: RecordedSel, no_conformance_jobs: None, enabled: None, home: Path
+    ) -> None:
+        """A surface must state what a run costs BEFORE offering to start one.
+
+        Projected rather than left to a client because the figure is not one
+        figure: ``analysis`` has five fixtures and four of them make a second call
+        for the repeatability check, while ``watch_sources`` has one fixture making
+        two calls. A client holding a single number would state the wrong one for
+        every non-document capability.
+
+        Both are pinned as LITERALS rather than recomputed from ``suite_for`` here,
+        which would only assert that one expression equals itself. A suite that
+        grows a fixture has to move these numbers, which is the point: the copy an
+        operator reads changes with it.
+        """
+        _store_document(_BOUND_ANALYSIS)
+        async with _client() as client:
+            document = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+            other = await _get(client, f"{routes.PREFIX}/config/conformance/watch_sources")
+        # Present with no run recorded, which is the state the number exists for.
+        assert document.body["status"] == "absent"
+        assert document.body["max_invocations"] == 9
+        # `watch_sources` is on its builtin here, so this is also the case where the
+        # bound has to be stated beside a capability that cannot be run at all.
+        assert other.body["max_invocations"] == 2
+        assert other.body["max_invocations"] != document.body["max_invocations"]
+
+    @pytest.mark.asyncio
     async def test_an_edited_environment_value_also_makes_the_report_stale(
         self,
         recorded_sel: RecordedSel,

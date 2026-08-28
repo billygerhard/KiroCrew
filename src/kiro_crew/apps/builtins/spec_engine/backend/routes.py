@@ -122,7 +122,7 @@ import logging
 import shutil
 import uuid
 from dataclasses import dataclass, replace
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, NoReturn
 
@@ -149,6 +149,7 @@ from ..engine.budget import killswitch as engine_killswitch
 from ..engine.budget import ledger as engine_ledger
 from ..engine.budget import switch as engine_switch
 from ..engine.capabilities import (
+    CHECK_REPEATABILITY,
     Binding,
     CapabilityRegistry,
     EngineFloorViolation,
@@ -157,6 +158,7 @@ from ..engine.capabilities import (
     register_builtins,
     require_delegable,
     resolve_bindings,
+    suite_for,
     transport_for,
     verify,
 )
@@ -1405,6 +1407,34 @@ async def handle_get_sources(request: web.Request) -> web.Response:
 #: watching.
 CONFORMANCE_DEADLINE_S = 10
 
+
+@lru_cache(maxsize=None)
+def _max_invocations(capability: str) -> int:
+    """The most times a run will invoke *capability*'s candidate.
+
+    Projected rather than left to a client, for the reason every vocabulary on
+    this surface is: the number is a property of the bundled suite and it is not
+    the same for every capability — a document capability's five fixtures make
+    nine calls and a non-document capability's single fixture makes two — so a
+    client holding one figure would state the wrong one for four of the seven, and
+    would go on stating it after the suite changed.
+
+    An UPPER bound, and the surface has to say so. A fixture whose first call
+    raised or answered off-schema returns before the repeatability check, so it
+    spends one call rather than two; nothing here can know in advance which
+    fixtures will get that far.
+
+    Cached because :func:`suite_for` GENERATES its oversized fixture's document —
+    a quarter of a megabyte — on every call, and the poll route asks this on every
+    poll. The answer is a constant per capability for the life of the process, so
+    the generated document is built once per capability and discarded rather than
+    once per request.
+    """
+    return sum(
+        2 if CHECK_REPEATABILITY in fixture.checks else 1 for fixture in suite_for(capability)
+    )
+
+
 #: A run is in flight; no outcome exists yet.
 CONFORMANCE_RUNNING = "running"
 
@@ -1591,6 +1621,10 @@ def _conformance_payload(
     be offering something the server declines. The flag is the resolved binding's,
     not the run's: it describes what is configured NOW, which is the question a
     re-run control has to ask.
+
+    ``deadline_s`` and ``max_invocations`` are both present with NO run recorded,
+    which is the state they exist for: they describe what starting a run would do,
+    so a surface has to be able to state them before it offers to start one.
     """
     if job is None:
         return {
@@ -1603,6 +1637,7 @@ def _conformance_payload(
             "stale": False,
             "is_builtin": is_builtin,
             "deadline_s": CONFORMANCE_DEADLINE_S,
+            "max_invocations": _max_invocations(capability),
             "error": "",
             "report": None,
         }
@@ -1616,6 +1651,7 @@ def _conformance_payload(
         "stale": current != job.fingerprint,
         "is_builtin": is_builtin,
         "deadline_s": CONFORMANCE_DEADLINE_S,
+        "max_invocations": _max_invocations(capability),
         "error": job.error,
         "report": job.report,
     }

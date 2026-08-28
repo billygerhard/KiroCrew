@@ -636,6 +636,110 @@ export interface WorkflowState {
 }
 
 /**
+ * One assertion class evaluated against one fixture, from
+ * `CheckResult.to_json_object()`.
+ *
+ * `detail` is ENGINE prose that may quote a provider's own bytes — the
+ * `malformed-response` fixture exists precisely to make a provider echo attacker
+ * authored JSON into a schema error. The engine narrows it at the point the reason
+ * is composed, so a surface never depends on its own escaping for safety; a
+ * surface nonetheless treats it as hostile text, renders it as a text child and
+ * caps its length, because two independent narrowings is the difference between a
+ * guarantee and an assumption.
+ *
+ * `excused` is what `passed` cannot say. A check that passed by FINDING a planted
+ * defect and one that passed because the candidate declared it did not look are the
+ * same boolean, and only this number tells them apart — which is why a pass beside
+ * a non-zero count is a qualified pass and never an unqualified one.
+ */
+export interface ConformanceCheckResult {
+  check: string
+  fixture: string
+  passed: boolean
+  detail: string
+  excused: number
+}
+
+/**
+ * What a candidate did with a capability's whole suite, from
+ * `ConformanceReport.to_json_object()`.
+ *
+ * `passed` is deliberately NOT "no failures": the engine computes it as no
+ * failures AND no gaps, so a suite that ran nothing, or that never evaluated an
+ * assertion class it declared, reports false. A surface must therefore never
+ * recompute a verdict from the results alone — and must never read better than
+ * this flag.
+ *
+ * It is also not the whole story in the other direction. `declined_detections` does
+ * NOT enter `passed` — declining to look is an honest answer and does not fail the
+ * suite — so a report can carry `passed: true` beside a non-zero count. The
+ * engine's own summary line qualifies its verdict in that case, and so must any
+ * surface: an unqualified pass about a candidate that examined nothing is the one
+ * reading this report exists to prevent.
+ *
+ * `gaps` and `declared_checks` are the same obligation from the other side: a
+ * declared check with no result is a failure OF THE RUN, not an absent check.
+ */
+export interface ConformanceReport {
+  capability: string
+  candidate: string
+  passed: boolean
+  declared_checks: string[]
+  declared_fixtures: string[]
+  gaps: string[]
+  declined_detections: number
+  results: ConformanceCheckResult[]
+}
+
+/**
+ * One capability's conformance run, from either conformance route.
+ *
+ * The suite invokes a provider once per fixture and again for the repeatability
+ * check — up to nine calls for a document capability — spawning a child process
+ * each time, with no aggregate deadline of its own. So this is a JOB: the POST
+ * starts one and answers `202` with `status: 'running'` and no report, and the GET
+ * polls. A surface that waited for an outcome would hold a request open for
+ * minutes.
+ *
+ * Four fields carry contracts a renderer cannot infer from their types:
+ *
+ * - **`status` is five-valued and two of them are not "nothing was wrong".**
+ *   `failed` means the run could not be carried out and produced NO report, which
+ *   is why it is not `complete` with an empty one. `not_applicable` means the
+ *   capability is on its builtin, so no run can be started at all.
+ * - **`stale` is derived server-side and is never a client's own comparison.** A
+ *   client is not shown the binding's environment values, so any fingerprint it
+ *   computed would digest something else — and comparing the wrong two things is
+ *   how an earlier outcome goes on being presented as describing the current
+ *   binding.
+ * - **`is_builtin` describes what is configured NOW, not what the run was
+ *   against.** A capability rebound to its builtin after a run keeps its report,
+ *   so it polls `complete` while the POST refuses it: `status` alone cannot answer
+ *   whether a re-run is possible.
+ * - **`deadline_s` and `max_invocations` describe what STARTING a run would do,**
+ *   so both arrive with no run recorded. `max_invocations` is an upper bound — a
+ *   fixture whose first call raised never reaches its repeatability call — and it
+ *   differs by capability, which is why it is projected rather than held here.
+ */
+export interface ConformanceState {
+  capability: string
+  status: 'running' | 'complete' | 'failed' | 'absent' | 'not_applicable'
+  job_id: string
+  candidate: string
+  binding_fingerprint: string
+  binding_current: string
+  stale: boolean
+  is_builtin: boolean
+  /** The server's per-invocation cap. Never the binding's own `timeout_s`. */
+  deadline_s: number
+  /** The most calls a run makes against the provider. An upper bound. */
+  max_invocations: number
+  /** Why a run did not happen, `''` for every other status. */
+  error: string
+  report: ConformanceReport | null
+}
+
+/**
  * One setting's value in force, from `EffectiveValue.to_json_object`.
  *
  * `origin` and `declared_at` are the reason this read exists. A surface showing
@@ -975,7 +1079,12 @@ const postJson = <T>(path: string, body: unknown): Promise<T> =>
     body: JSON.stringify(body),
   })
 
-// ── the fifteen routes ────────────────────────────────────────────────────
+// ── the app's routes ──────────────────────────────────────────────────────
+//
+// Uncounted on purpose: the number was already wrong before the extension seams
+// added to it, and a count in a banner restales on the next route either way. The
+// registered set is pinned where it can be enforced, in the backend's own
+// registered-surface test.
 
 export const specEngineApi = {
   /**
@@ -1141,6 +1250,37 @@ export const specEngineApi = {
     return request<WorkflowState>(`${API}/config/workflow${query}`)
   },
 
+  /**
+   * GET whether a capability's provider has been through the conformance suite.
+   *
+   * A poll, and the only way to read an outcome: the run is a job. It answers
+   * `running` while one is in flight, `complete` with a report when one finished,
+   * `failed` when the suite could not be carried out at all, `absent` when nobody
+   * has run one, and `not_applicable` when the capability is on its builtin.
+   *
+   * The binding is resolved on EVERY poll rather than only when a run starts,
+   * because `stale` answers "does this report still describe what is configured"
+   * and that changes when the document does, not when the run does.
+   */
+  conformance: (capability: string): Promise<ConformanceState> =>
+    request<ConformanceState>(`${API}/config/conformance/${encodeURIComponent(capability)}`),
+
+  /**
+   * Start a conformance run against a capability's configured provider.
+   *
+   * Returns as soon as the job is recorded, with `status: 'running'` and no
+   * report — never an outcome. The suite spawns a child process per invocation and
+   * caps nothing in aggregate, so a caller that awaited a verdict would be holding
+   * a request open for minutes.
+   *
+   * Refused with `conformance_running` when a run for that capability is already in
+   * flight, and with `builtin_binding` when the capability is on its builtin. Both
+   * reasons are the server's own and are relayed rather than reworded, because they
+   * name the load a second run would put on one program.
+   */
+  startConformance: (capability: string): Promise<{ ok: boolean } & ConformanceState> =>
+    postJson(`${API}/config/conformance`, { capability }),
+
   /** GET the kill switch's state and the runs a stop would park. */
   killSwitch: (): Promise<KillSwitchSnapshot> => request<KillSwitchSnapshot>(`${API}/kill-switch`),
 
@@ -1284,6 +1424,21 @@ export const QK = {
    * the document, so a write that changes a stage or a gate must refresh it.
    */
   workflow: (project: string) => ['spec-engine', 'config', 'workflow', project] as const,
+  /**
+   * One capability's conformance run, keyed by the capability it checked.
+   *
+   * Per capability because a run is per capability: the server refuses a second
+   * concurrent run for the same one and keeps at most one outcome for each, so a
+   * shared entry would show one provider's verdict beside another's binding.
+   *
+   * Under the config key's prefix, which is what makes a binding change invalidate
+   * the outcome. The payload's `stale` and `is_builtin` are both derived from the
+   * binding as it is NOW, so a rebind has to refetch this — an entry left behind
+   * would keep answering `complete` and `stale: false` about a provider that is no
+   * longer bound.
+   */
+  conformance: (capability: string) =>
+    ['spec-engine', 'config', 'conformance', capability] as const,
   /**
    * The form vocabularies.
    *

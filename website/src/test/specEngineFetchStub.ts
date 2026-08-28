@@ -313,7 +313,7 @@ const STUB_REPORT: Record<string, unknown> = {
  * The GET returns this object; the POST returns it with `ok: true` added. Kept as
  * a builder for the same reason as {@link builtinCapabilityRow}: the shape is
  * stated once, so a field the routes gain cannot be missing from one default and
- * present in the other. Every one of the eleven fields the routes emit is here —
+ * present in the other. Every one of the twelve fields the routes emit is here —
  * a default carrying a subset would be a shape no route returns, and a panel
  * authored against it would render off fiction.
  *
@@ -357,6 +357,13 @@ function conformanceState(
     // The server's per-invocation cap, not the binding's timeout_s. Present even
     // with no run, because a panel must state the cost before offering to start.
     deadline_s: 10,
+    // The suite's own upper bound on how many times a run calls the provider, and
+    // present with no run for `deadline_s`' reason: both describe what STARTING a
+    // run would do. Nine is the document-capability figure — five fixtures, four of
+    // which call a second time for the repeatability check — and a non-document
+    // capability's single fixture makes two, which is why the route projects it
+    // rather than letting a client hold one number.
+    max_invocations: 9,
     // Derived from `status` for the same reason the job fields are: `failed` MEANS
     // the suite could not be carried out, and the worker always records a reason
     // as "ClassName: message", so an empty error beside it is a state no route
