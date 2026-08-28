@@ -126,7 +126,14 @@ function StageContents(props: {
     return <StageExecution stage={stage} project={project} reporterFor={reporterFor} />
   }
   if (stage.id === 'delivery') {
-    return <StageDelivery stage={stage} project={project} reporterFor={reporterFor} />
+    return (
+      <StageDelivery
+        stage={stage}
+        config={config}
+        project={project}
+        reporterFor={reporterFor}
+      />
+    )
   }
   return (
     <StageAdvanced

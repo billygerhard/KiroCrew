@@ -347,6 +347,81 @@ export interface StageVocabulary {
 }
 
 /**
+ * The provider a capability resolves to, from `ProviderIdentity.to_json_object()`.
+ *
+ * `kind` and `nature` answer two different questions and only one of them is a
+ * cost signal. `nature` is hardcoded `model_backed` for EVERY external binding,
+ * not because the engine knows the program reasons but because it cannot know, so
+ * it is a cost class for a BUILTIN only. A reader deciding whether a capability
+ * spends credits must branch on `kind` first and read `nature` only for a builtin
+ * — `capabilityForm.costSignal` is the one place that decision is made, and it is
+ * written so `nature` is unreachable for anything else.
+ *
+ * `version` is omitted rather than sent empty when the provider declares none.
+ */
+export interface ProviderIdentity {
+  name: string
+  kind: 'builtin' | 'external'
+  nature: 'deterministic' | 'model_backed'
+  transport: string
+  version?: string
+}
+
+/**
+ * One delegable capability's binding, from `GET /config/capabilities`.
+ *
+ * The engine's own `CapabilityRegistry.describe()` entry joined with the
+ * reachability answer a run's prerequisite gate reports against, so a binding
+ * this surface calls reachable is one a run would accept.
+ *
+ * Three fields carry contracts a renderer cannot infer from their types:
+ *
+ * - **`reachable` is three-valued.** `null` means NOT APPLICABLE — the binding is
+ *   on its builtin, which is reachable by construction, so the engine's check
+ *   skips it. Rendering `null` as a broken provider would mark every unconfigured
+ *   capability as failing.
+ * - **`program` is `argv[0]` only,** and the environment never travels at all.
+ *   The stored command and the environment NAMES are read from the document
+ *   instead; an environment VALUE is never sent to this pane by either read.
+ * - **`action` is the engine's own remediation string,** naming the "or unset it
+ *   to use the builtin" escape. Relayed, never composed on this side.
+ *
+ * `timeout_s` is the RESOLVED deadline one call gets — the binding's own override
+ * when it declares one, otherwise the app's `timeouts.capability_s` — so it is
+ * not the value a form writes back.
+ */
+export interface CapabilityBinding {
+  capability: string
+  transport: string
+  configured: boolean
+  /** Dotted path of the declaration, `''` when nothing declares the binding. */
+  declared_at: string
+  timeout_s: number
+  provider: ProviderIdentity
+  program: string
+  reachable: boolean | null
+  action: string
+}
+
+/**
+ * Every delegable capability's binding, from `GET /config/capabilities`.
+ *
+ * A REFUSED document does not arrive here at all: the route answers 422 with no
+ * `capabilities` key, so the read fails and a caller states the failure. That
+ * matters because an all-builtin list is exactly what an UNCONFIGURED document
+ * legitimately resolves to — the two are the same shape and opposite facts, and a
+ * surface that fell back to one would show a refused document as a clean one.
+ *
+ * `configured` is about the DOCUMENT existing on disk, not about any binding
+ * being declared, so `configured: true` beside seven builtin rows is an ordinary
+ * state rather than a contradiction.
+ */
+export interface CapabilitiesPayload {
+  configured: boolean
+  capabilities: CapabilityBinding[]
+}
+
+/**
  * The vocabularies the configuration forms are generated FROM, from
  * `_registry_payload`.
  *
@@ -384,6 +459,157 @@ export interface RegistryPayload {
    * reason.
    */
   stages?: StageVocabulary[]
+  /**
+   * How a delegated capability may be reached: `builtin`, `mcp`, `command`.
+   *
+   * Projected so a transport chooser offers exactly what the write door accepts.
+   * Optional in the TYPE and not in the route, for `stages`' reason — a payload
+   * without it is one an older gateway served, and a chooser then offers nothing
+   * rather than a list this side invented.
+   */
+  transports?: string[]
+  /**
+   * The capabilities the engine always executes itself, in its own order.
+   *
+   * Naming one in the `capabilities` section is REFUSED rather than ignored, so a
+   * surface showing capabilities names these and offers no control that would
+   * attempt one. Projected rather than copied for the same reason as every other
+   * vocabulary here: the refusal is the engine's list, not this side's.
+   */
+  engine_floor?: string[]
+  /**
+   * Where a quality gate may sit relative to raising the review artifact:
+   * `pre_submit`, `post_submit`, or `both`.
+   *
+   * Its own tuple on the engine's side rather than a `Setting.choices` — no
+   * setting declares choices and a test is armed to fail the moment one does — and
+   * projected rather than copied here for `transports`' reason: the write door
+   * enforces this exact set, so a chooser built from a list kept on this side would
+   * offer what the door then refuses by path.
+   */
+  gate_positions?: string[]
+  /** Whether a gate's failure stops the flow: `blocking` or `advisory`. */
+  gate_severities?: string[]
+  /**
+   * The bundled gate declarations, whole and ready to write.
+   *
+   * Entries rather than names, for the reason the source and cost-profile presets
+   * travel whole: a gate is added as a COPY of one, and a surface holding only a
+   * name would have to invent the argv it claims to have copied.
+   */
+  gate_presets?: GatePreset[]
+  /**
+   * The workflow preset names the engine BUNDLES, in its own order.
+   *
+   * Two jobs, and both need the engine's list rather than a copy: a preset chooser
+   * has to tell a bundled name from a user-defined one, and a form defining a
+   * preset has to refuse a bundled name BEFORE composing a write, because the write
+   * door refuses one — `'<name>' is a bundled preset name and cannot be redefined`.
+   * A list kept on this side would either miss a reserved name the engine added, or
+   * reserve one it never did.
+   *
+   * Optional in the TYPE and not in the route, for `stages`' reason: an older
+   * gateway serves no such key, and the chooser then offers only what the document
+   * defines rather than a set this side invented.
+   */
+  workflow_presets?: string[]
+}
+
+/**
+ * One bundled quality-gate declaration, from `gate_presets()`.
+ *
+ * The engine's own deep copy, so editing what a form staged cannot reach back into
+ * the bundled table. It carries no `origin` or `declared_at`: both describe a
+ * declaration in a document, and a preset is not in one yet.
+ */
+export interface GatePreset {
+  name: string
+  position: string
+  severity: string
+  /** One argv per command, in the order the gate runs them. */
+  commands: string[][]
+}
+
+/**
+ * One configured quality gate, from `GET /config/workflow`.
+ *
+ * `blocking` travels beside `severity` because it is the ENGINE's own reading of
+ * that severity. A client deciding for itself which severities stop a run is how a
+ * surface comes to describe a flow the engine does not run.
+ *
+ * `name` and `declared_at` are document-authored, and both arrive sanitized and
+ * length-capped so a hand-edited document cannot set the width of a row. That makes
+ * the name a DISPLAY value rather than a key: a capped one is not what the document
+ * stores, and writing it back would rename the gate. `GateForm` refuses to compose
+ * a write over a name it can see was capped.
+ */
+export interface QualityGate {
+  name: string
+  /** `pre_submit`, `post_submit`, or `both`. One of `gate_positions`. */
+  position: string
+  /** `blocking` or `advisory`. One of `gate_severities`. */
+  severity: string
+  blocking: boolean
+  /** The engine's `ValueOrigin` for the declaration. Never user-facing text. */
+  origin: string
+  /** The command templates as CONFIGURED, run-time variables unexpanded. */
+  commands: string[][]
+  /** Dotted path of the declaration, `''` when nothing declares it. */
+  declared_at: string
+}
+
+/**
+ * One delivery stage and which layer supplied its commands, from
+ * `preset_display.stage_origins()` plus the two fields the route joins on.
+ *
+ * `source` is deliberately NOT a `ValueOrigin`: `bundled_preset` and `user_preset`
+ * are not configuration layers, and flattening them onto one answer would lose the
+ * distinction a preset chooser exists to show.
+ */
+export interface StageOrigin {
+  stage: string
+  source: 'bundled_preset' | 'user_preset' | 'app_override' | 'project_override' | 'unconfigured'
+  preset: string
+  declared_at: string
+  bundled: boolean
+  from_preset: boolean
+  skipped: boolean
+  summary: string
+  /** How many commands the stage runs. The engine's serializer sends a count. */
+  commands: number
+  /** The resolved commands, added by the route so a form can render them. */
+  argv: string[][]
+  /** `isolation`, `delivery`, or `archive`; `''` for a stage nothing places. */
+  runs_at: string
+}
+
+/**
+ * The delivery workflow in force for one project, and the app-wide gate list.
+ *
+ * Both readings arrive in one payload because they come from ONE read of the
+ * document: a write landing between two requests could otherwise produce stages and
+ * gates that describe different documents.
+ *
+ * `gates: []` and `gates: null` are DIFFERENT ANSWERS and neither may stand in for
+ * the other. Null with `gates_unreadable` means the stored list could not be
+ * parsed, and the engine then refuses delivery OUTRIGHT — so rendering it as "no
+ * gates configured" would tell an operator that nothing is configured when what is
+ * true is that every check is off until the document is repaired.
+ */
+export interface WorkflowState {
+  configured: boolean
+  project: string | null
+  preset: { name: string; origin: string; declared_at: string; bundled: boolean } | null
+  /** One row per DECLARED stage, in the engine's own order. */
+  stages: StageOrigin[]
+  user_presets: string[]
+  /** Which stages the delivery flow itself runs, in flow order. */
+  delivery_flow_stages: string[]
+  /** Always true: `load_quality_gates` takes no project. */
+  gates_scope_is_app: boolean
+  gates: QualityGate[] | null
+  gates_unreadable: boolean
+  gate_errors: Array<{ path: string; message: string }>
 }
 
 /**
@@ -854,6 +1080,44 @@ export const specEngineApi = {
    */
   sources: (): Promise<SourcesPayload> => request<SourcesPayload>(`${API}/config/sources`),
 
+  /**
+   * GET every delegable capability's bound provider, and whether it can be reached.
+   *
+   * A document read, so it can refuse: a stored `capabilities` section the engine
+   * will not resolve answers 422 with no `capabilities` key at all rather than
+   * degrading to the all-builtin map an unconfigured document returns. A caller
+   * must therefore state the failure and NOT fall back — those two payloads are
+   * the same shape and opposite facts.
+   *
+   * Takes no project. The engine reads bindings from ONE app-wide section with no
+   * per-project layer, so a project parameter would imply a scope that does not
+   * exist.
+   */
+  configCapabilities: (): Promise<CapabilitiesPayload> =>
+    request<CapabilitiesPayload>(`${API}/config/capabilities`),
+
+  /**
+   * GET the delivery workflow in force for a project, and the app-wide gate list.
+   *
+   * Project-scoped like {@link resolvedConfig}, because a project selects its own
+   * workflow preset and may override a stage. The gate list is NOT project-scoped —
+   * `load_quality_gates` takes no project — and the payload says so in
+   * `gates_scope_is_app` rather than leaving a caller to infer it from the heading
+   * the stages sit under.
+   *
+   * One request for both because the route reads the document ONCE: two requests
+   * could straddle a write and return stages and gates from different documents.
+   *
+   * An unparseable gate list arrives as `gates: null` with `gates_unreadable`, never
+   * as an empty list, and a caller must keep the two apart: the engine refuses
+   * delivery outright on an unreadable list, so "no gates" would report every check
+   * as absent by choice when the truth is that they are off until a repair.
+   */
+  configWorkflow: (project?: string): Promise<WorkflowState> => {
+    const query = project ? `?project=${encodeURIComponent(project)}` : ''
+    return request<WorkflowState>(`${API}/config/workflow${query}`)
+  },
+
   /** GET the kill switch's state and the runs a stop would park. */
   killSwitch: (): Promise<KillSwitchSnapshot> => request<KillSwitchSnapshot>(`${API}/kill-switch`),
 
@@ -975,6 +1239,28 @@ export const QK = {
    * otherwise.
    */
   sources: ['spec-engine', 'config', 'sources'] as const,
+  /**
+   * The capability bindings and their reachability.
+   *
+   * Under the config key's prefix, for {@link QK.sources}' reason: it is a read OF
+   * the document, so a write that rebinds a capability must refresh it. A stale
+   * binding beside a fresh document would name the provider an operator just
+   * replaced.
+   */
+  capabilities: ['spec-engine', 'config', 'capabilities'] as const,
+  /**
+   * The delivery workflow in force, keyed by the project it resolves FOR.
+   *
+   * Keyed by project for {@link QK.resolved}'s reason: a project selects its own
+   * preset and may override a stage, so one cache entry for two projects would show
+   * a workflow under a project it is not in force for. The app-wide gate list rides
+   * along in the same payload and is the same for every key, which is what the
+   * payload's own `gates_scope_is_app` says out loud.
+   *
+   * Under the config key's prefix, for {@link QK.sources}' reason: it is a read OF
+   * the document, so a write that changes a stage or a gate must refresh it.
+   */
+  workflow: (project: string) => ['spec-engine', 'config', 'workflow', project] as const,
   /**
    * The form vocabularies.
    *
