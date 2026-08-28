@@ -53,7 +53,7 @@ const G = en.apps.specEngine.sourcesSection
 const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -153,6 +153,7 @@ function registry(over: Record<string, unknown> = {}) {
     roles: ['design'],
     efforts: ['low', 'high'],
     levels: ['authoring', 'execution'],
+    stages: PIPELINE_STAGES,
     ...over,
   }
 }
@@ -288,7 +289,14 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
-  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
+  // The watch-source form lives in the intake area: the engine places both the
+  // `watch` setting group and the `watch_sources` capability there.
+  await screen.findByRole('tablist', { name: C.configuration_stages })
+  // Present unless the vocabulary read was REFUSED, in which case the pane has no
+  // stages to lay out and folds everything into the advanced area — the case the
+  // refusal tests below are for.
+  const intake = screen.queryByRole('tab', { name: new RegExp(`^${C.stage_intake}`) })
+  if (intake) fireEvent.click(intake)
   await screen.findByRole('heading', { name: T.watch_source_definitions })
   return client
 }

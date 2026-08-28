@@ -1,5 +1,5 @@
 /**
- * The configuration pane leads with forms, and the raw document is one tab over.
+ * The configuration pane leads with forms, and the raw document is one area over.
  *
  * The pane grew around its JSON editor: the document was the first thing an operator
  * met and, for most of what is stored, the only place to change it. This suite pins
@@ -10,15 +10,16 @@
  *     problems and advisories for the persisted document, not a read-only preview.
  *     A pane that showed the document anyway would have moved the raw view rather
  *     than demoted it, and the whole point is which of the two an operator meets.
- *     Shown, not mounted: the pane's four panels all stay mounted so switching tabs
- *     cannot discard staged work, so what is asserted here is visibility.
- *   - **One tab shows it, and showing it gives back the WHOLE editor.** The JSON
+ *     Shown, not mounted: the pane's stage panels all stay mounted so switching
+ *     stages cannot discard staged work, so what is asserted here is visibility.
+ *   - **One area shows it, and showing it gives back the WHOLE editor.** The JSON
  *     view is the escape hatch for shapes no form expresses, so a read-only or
  *     partial version of it would re-create the dead ends this pane exists to
- *     remove.
- *   - **Leaving the tab does not discard a draft, and the tab says it is holding
+ *     remove. It is the advanced area rather than a pipeline stage because it edits
+ *     the whole document and so is scoped to no one step.
+ *   - **Leaving the area does not discard a draft, and the stage says it is holding
  *     one.** Half-written JSON is a legitimate state of an editor. If leaving the
- *     tab dropped it silently, the tab would be a data-loss button.
+ *     area dropped it silently, the stage tab would be a data-loss button.
  *   - **Both surfaces refresh from a FRESH read after any write, in both
  *     directions.** They read one query, so a save in the JSON view re-renders the
  *     forms and a form write re-renders the document — neither adopts what it just
@@ -30,8 +31,8 @@
  * The shared review card and the patch builder behind every form write are asserted
  * where they are exercised: `SpecEngineSources.test.tsx` drives the card end to end
  * through the autonomy grid, and `SpecEngineFormPatch.property.test.ts` holds the
- * minimality property both share. The tab structure itself — semantics, badges, and
- * staged-state survival across switches — is `SpecEngineConfigTabs.test.tsx`.
+ * minimality property both share. The stage structure itself — semantics, badges,
+ * and staged-state survival across switches — is `SpecEngineConfigTabs.test.tsx`.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -43,7 +44,7 @@ import en from '../i18n/locales/en.json'
 const T = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -100,7 +101,14 @@ function stub(answers: {
       // leads, and the generated form's own properties live in
       // `SpecEngineSettingsForm.test.tsx`.
       registry: {
-        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+        body: {
+          settings: [],
+          source_presets: [],
+          profile_presets: [],
+          roles: [],
+          levels: [],
+          stages: PIPELINE_STAGES,
+        },
       },
       // No source at all: the grid's own properties are asserted in
       // `SpecEngineSources.test.tsx`, and a fixture here would be a second place
@@ -136,11 +144,15 @@ async function openConfig() {
   const nav = await screen.findByRole('button', { name: new RegExp(P.configuration) })
   fireEvent.click(nav)
   await screen.findByText(T.projects)
+  // The stage list arrives from `/config/registry`, which settles after the config
+  // read the projects table waits on. Awaited here so every helper below can read
+  // the tabs synchronously instead of each racing the same read.
+  await screen.findByRole('tablist', { name: T.configuration_stages })
   return { client, ...rendered }
 }
 
 /**
- * The tab named *label*.
+ * The stage tab named *label*.
  *
  * Matched as a prefix rather than exactly, because a tab's accessible name grows
  * the marks it is carrying — an unsaved draft, the engine's problem and advisory
@@ -150,9 +162,16 @@ function tab(label: string): HTMLElement {
   return screen.getByRole('tab', { name: new RegExp(`^${label}`) })
 }
 
-/** The tab that shows the JSON view. */
+/**
+ * The stage that holds the document editor.
+ *
+ * The advanced area, because the editor edits the WHOLE document and so is scoped
+ * to no one step of the pipeline. Its marks ride here too — the unsaved draft and
+ * the engine's problem and advisory counts — since this is the only area the
+ * editor is rendered in.
+ */
 function toggle(): HTMLElement {
-  return tab(T.tab_json_view)
+  return tab(T.stage_advanced)
 }
 
 /** The document editor's textarea. */
@@ -193,9 +212,9 @@ describe('the pane opens on the forms and not on the document', () => {
     // document holds, so SEEING it means the JSON reached the operator unbidden.
     //
     // Not-visible rather than not-present, and the difference is deliberate: the
-    // pane keeps all four panels mounted so switching tabs cannot discard a staged
-    // edit or a half-written draft. What is demoted is what an operator meets, and
-    // that is exactly what visibility states.
+    // pane keeps every stage panel mounted so switching stages cannot discard a
+    // staged edit or a half-written draft. What is demoted is what an operator
+    // meets, and that is exactly what visibility states.
     const name = T.the_configuration_document
     expect(screen.getByRole('textbox', { name, hidden: true })).not.toBeVisible()
     expect(
@@ -239,10 +258,13 @@ describe('the pane opens on the forms and not on the document', () => {
     expect(toggle()).toHaveTextContent(new RegExp(`${T.advisories}\\s*1`))
   })
 
-  it('offers exactly one tab that shows the view', async () => {
+  it('offers exactly one area that shows the view', async () => {
     stub({})
     await openConfig()
-    expect(screen.getAllByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) })).toHaveLength(1)
+    // One area, not one per stage: the editor edits the whole document, so a second
+    // copy on a pipeline stage would be a second draft of the same text.
+    expect(screen.getAllByRole('tab', { name: new RegExp(`^${T.stage_advanced}`) })).toHaveLength(1)
+    expect(screen.getAllByRole('heading', { name: T.tab_json_view, hidden: true })).toHaveLength(1)
     expect(toggle()).toHaveAttribute('aria-selected', 'false')
     // The sentence saying what the view is FOR travels with the view itself now, so
     // it is on the panel rather than beside a toggle.
@@ -290,16 +312,16 @@ describe('the JSON view, once asked for', () => {
     expect(screen.getByText(T.withheld_at)).toBeInTheDocument()
   })
 
-  it('leaves the tab without discarding a draft, and says it is holding one', async () => {
+  it('leaves the area without discarding a draft, and says it is holding one', async () => {
     stub({})
     await openConfig()
     fireEvent.click(toggle())
     fireEvent.change(editor(), { target: { value: '{ "limits": { ' } })
-    // Leaving the tab is not a discard. State held inside the editor would be
+    // Leaving the area is not a discard. State held inside the editor would be
     // dropped by an unmount, and the operator would have no way to know it had been.
-    fireEvent.click(tab(T.tab_settings))
+    fireEvent.click(tab(T.stage_execution))
     expect(screen.queryByRole('textbox', { name: T.the_configuration_document })).toBeNull()
-    // And the tab that holds it says so, so a pane showing no editor is not read as
+    // And the stage that holds it says so, so a pane showing no editor is not read as
     // a pane holding no draft.
     expect(toggle()).toHaveTextContent(T.unsaved_edits)
     fireEvent.click(toggle())
@@ -364,11 +386,11 @@ describe('a failed read is doubt, not an empty form', () => {
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
     expect(await screen.findByText(P.could_not_read_the_configuration)).toBeInTheDocument()
     expect(screen.queryByRole('grid', { name: T.configured_projects })).toBeNull()
-    // And no tabs at all: a refusal is not a set of surfaces with one of them
-    // showing, and the JSON tab in particular would offer an editor over values that
-    // are not there.
+    // And no stages at all: a refusal is not a set of surfaces with one of them
+    // showing, and the advanced area in particular would offer an editor over values
+    // that are not there.
     expect(screen.queryByRole('tablist')).toBeNull()
-    expect(screen.queryByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) })).toBeNull()
+    expect(screen.queryByRole('tab', { name: new RegExp(`^${T.stage_advanced}`) })).toBeNull()
   })
 
   it('drops a form it had already rendered when a refetch fails', async () => {

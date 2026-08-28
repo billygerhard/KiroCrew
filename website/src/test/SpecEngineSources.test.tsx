@@ -43,7 +43,7 @@ const P = en.apps.specEngine.specEnginePage
 /** The engine's wildcard key, as it appears inside a declaring path. */
 const WILDCARD = 'default'
 
-import { stubSpecEngineFetch, held, type Answer } from './specEngineFetchStub'
+import { PIPELINE_STAGES, stubSpecEngineFetch, held, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -132,7 +132,14 @@ function stub(answers: {
       // and the generated form's own properties live in
       // `SpecEngineSettingsForm.test.tsx`.
       registry: {
-        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+        body: {
+          settings: [],
+          source_presets: [],
+          profile_presets: [],
+          roles: [],
+          levels: [],
+          stages: PIPELINE_STAGES,
+        },
       },
       sources: ({ read, written }) =>
         (written ? answers.sourcesAfterPut : undefined) ??
@@ -174,12 +181,15 @@ async function openConfig() {
   )
   const nav = await screen.findByRole('button', { name: new RegExp(P.configuration) })
   fireEvent.click(nav)
-  // The pane's editing surfaces are tabs now, and only the active one is reachable:
-  // an inactive panel carries `hidden`, which takes it out of the accessibility tree
-  // the role queries read. The grid shares the Watch sources tab with the form that
-  // links into it. The section heading is found by ROLE rather than by text, because
-  // that tab's label is the same words.
-  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
+  // The pane's editing surfaces are one area per pipeline stage now, and only the
+  // active one is reachable: an inactive panel carries `hidden`, which takes it out
+  // of the accessibility tree the role queries read. The grid shares the intake area
+  // with the form that links into it, because the engine places both the `watch`
+  // setting group and the `watch_sources` capability in intake. The section heading is
+  // found by ROLE rather than by text, because other copy on the pane uses the same
+  // words.
+  await screen.findByRole('tablist', { name: C.configuration_stages })
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${C.stage_intake}`) }))
   await screen.findByRole('heading', { name: T.watch_sources })
   await waitFor(() => expect(screen.queryByText(T.reading_the_watch_sources)).toBeNull())
   return { client, ...rendered }
@@ -426,9 +436,9 @@ describe('doubt about the read never renders as authority', () => {
       </QueryClientProvider>,
     )
     fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
-    // The grid lives on the Watch sources tab, and only the active tab's panel is
+    // The grid lives in the intake area, and only the active area's panel is
     // reachable: an inactive one carries `hidden`.
-    fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_watch_sources}`) }))
+    fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.stage_intake}`) }))
     await screen.findByText(T.reading_the_watch_sources)
     expect(screen.queryByText(T.no_watch_source_is_configured)).toBeNull()
     release()

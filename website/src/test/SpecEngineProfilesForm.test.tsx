@@ -52,7 +52,7 @@ const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -116,6 +116,7 @@ function registry(over: Record<string, unknown> = {}) {
     roles: ['design', 'review', 'implement'],
     efforts: ['low', 'medium', 'high'],
     levels: ['authoring', 'execution'],
+    stages: PIPELINE_STAGES,
     ...over,
   }
 }
@@ -229,10 +230,13 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
-  // The pane's editing surfaces are tabs now, and only the active one is reachable:
-  // an inactive panel carries `hidden`, which takes it out of the accessibility tree
-  // the role queries read. This form lives on the Cost profiles tab.
-  fireEvent.click(await screen.findByRole('tab', { name: new RegExp(`^${C.tab_cost_profiles}`) }))
+  // The pane's editing surfaces are one area per pipeline stage now, and only the
+  // active one is reachable: an inactive panel carries `hidden`, which takes it out
+  // of the accessibility tree the role queries read. This form lives in the advanced
+  // area, because a cost profile assigns a model per ROLE and the engine's roles span
+  // authoring and execution both, so no single stage owns it.
+  await screen.findByRole('tablist', { name: C.configuration_stages })
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${C.stage_advanced}`) }))
   await screen.findByRole('heading', { name: T.cost_profiles })
   return client
 }

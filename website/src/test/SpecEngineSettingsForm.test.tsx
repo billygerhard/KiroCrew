@@ -55,7 +55,8 @@ const C = en.apps.specEngine.configPanel
 const P = en.apps.specEngine.specEnginePage
 const L = C.setting_labels
 
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { declaredGroups } from '../apps/spec-engine/stages'
+import { stagesUnder, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -132,6 +133,22 @@ function registry(over: Record<string, unknown> = {}) {
     levels: [],
     ...over,
   }
+}
+
+/**
+ * The registry payload with every group its settings declare under ONE stage.
+ *
+ * The pane renders only a stage's own groups, so a fixture spread across four areas
+ * would put this suite's rows behind four navigations for no gain: what is under
+ * test is the form, and the areas are `SpecEngineConfigStages.test.tsx`. Derived
+ * from the FINAL settings list rather than from a literal, so a case that replaces
+ * `settings` — the unknown-kind row, whose group nothing else declares — is placed
+ * on the same stage as the rest instead of folding into the advanced area.
+ */
+function registryOneStage(over: Record<string, unknown> = {}) {
+  const payload = registry(over)
+  const keys = (payload.settings as Array<{ key: string }>).map((entry) => entry.key)
+  return { ...payload, stages: stagesUnder('execution', declaredGroups(keys)) }
 }
 
 /** One resolved setting, in `EffectiveValue.to_json_object`'s shape. */
@@ -216,7 +233,7 @@ function stub(answers: {
 }) {
   stubSpecEngineFetch(
     {
-      registry: answers.registry ?? { body: registry() },
+      registry: answers.registry ?? { body: registryOneStage() },
       resolved: ({ written }) =>
         (written ? answers.resolvedAfterPut : undefined) ??
         answers.resolved ?? { body: resolved() },
@@ -240,6 +257,19 @@ async function openConfig(answers: Parameters<typeof stub>[0] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
+  // One area per pipeline stage, and only the active one is in the accessibility
+  // tree the role queries read: an inactive panel carries `hidden`. This fixture
+  // places every group it declares under execution, so that is the area to open —
+  // falling back to the advanced area, which is where the settings surface lands
+  // when there is no vocabulary to place at all: a refused read, or an engine that
+  // registers no setting. Both are cases this suite covers.
+  await screen.findByRole('tablist', { name: C.configuration_stages })
+  for (const label of [C.stage_execution, C.stage_advanced]) {
+    const stage = screen.queryByRole('tab', { name: new RegExp(`^${label}`) })
+    if (!stage) continue
+    fireEvent.click(stage)
+    if (screen.queryByRole('heading', { name: T.settings })) break
+  }
   await screen.findByRole('heading', { name: T.settings })
   return client
 }
@@ -421,7 +451,7 @@ describe('the rows are generated from the registry', () => {
   })
 
   it('states the empty vocabulary rather than an empty form', async () => {
-    await openConfig({ registry: { body: registry({ settings: [] }) } })
+    await openConfig({ registry: { body: registryOneStage({ settings: [] }) } })
     expect(await screen.findByText(T.no_setting_is_registered)).toBeInTheDocument()
     expect(settingRows()).toHaveLength(0)
   })
@@ -706,7 +736,7 @@ describe('a vocabulary this form cannot edit', () => {
   it('renders the read-only fallback and routes to the JSON view', async () => {
     await openRows({
       registry: {
-        body: registry({
+        body: registryOneStage({
           settings: [
             {
               key: 'exotic.window',
@@ -761,7 +791,7 @@ describe('a failed read is doubt, not a form', () => {
     // resolved read exists to distinguish.
     await openConfig({
       resolved: { status: 422, body: { code: 'config_invalid', error: 'out of range' } },
-      registry: { body: registry() },
+      registry: { body: registryOneStage() },
     })
     await waitFor(() =>
       expect(screen.getAllByText(C.could_not_resolve_the_configuration).length).toBeGreaterThan(0),

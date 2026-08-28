@@ -66,7 +66,7 @@ const P = en.apps.specEngine.specEnginePage
  */
 const ELIDED = '<elided>'
 
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { PIPELINE_STAGES, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 /** Every request the page made, so an assertion can read the body that was sent. */
 const calls: Array<{ url: string; method: string; body: unknown }> = []
@@ -197,7 +197,14 @@ function stub(answers: {
       // its resolution, and the generated form's own properties live in
       // `SpecEngineSettingsForm.test.tsx`.
       registry: {
-        body: { settings: [], source_presets: [], profile_presets: [], roles: [], levels: [] },
+        body: {
+          settings: [],
+          source_presets: [],
+          profile_presets: [],
+          roles: [],
+          levels: [],
+          stages: PIPELINE_STAGES,
+        },
       },
       // No source at all, because these tests are about the document and its
       // resolution: the grid's own properties are asserted in
@@ -224,8 +231,8 @@ function stub(answers: {
  * Render the page and switch to the configuration pane.
  *
  * Waits on the projects table rather than on the editor, because the pane leads
- * with the forms: the JSON view is a tab of its own, and its editor is not reachable
- * until {@link openJson} activates it — which is the property
+ * with the forms: the JSON view is a surface of the advanced area, and its editor is
+ * not reachable until {@link openJson} activates that area — which is the property
  * `SpecEngineFormSurface.test.tsx` asserts.
  */
 async function openConfig() {
@@ -243,14 +250,19 @@ async function openConfig() {
 }
 
 /**
- * Activate the JSON view tab, returning its save control.
+ * Activate the stage that holds the document editor, returning its save control.
  *
- * A tab rather than a toggle: the pane's editing surfaces are four tabs, and only
- * the active one is reachable — an inactive panel carries `hidden`, which takes it
- * out of the accessibility tree the role queries read.
+ * The editor is a surface of the advanced area rather than a tab of its own: it
+ * edits the WHOLE document, so it is not scoped to any one step of the pipeline.
+ * Only the active area is reachable — an inactive panel carries `hidden`, which
+ * takes it out of the accessibility tree the role queries read.
  */
 async function openJson() {
-  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${T.tab_json_view}`) }))
+  // Awaited rather than read: the stage list arrives from `/config/registry`, which
+  // settles after the config read the projects table waits on, so a synchronous
+  // `getByRole` here races the read that produces the tabs.
+  await screen.findByRole('tablist', { name: T.configuration_stages })
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${T.stage_advanced}`) }))
   return screen.findByRole('button', { name: T.validate_and_save })
 }
 

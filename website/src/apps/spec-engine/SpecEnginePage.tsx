@@ -50,8 +50,10 @@
  *
  * The inspector's BODY belongs to `ReviewQueuePanel.tsx`, which is keyed by the
  * selected run so its state cannot outlive the selection. The configuration pane
- * (the document as the write path, its resolved read beside it) belongs to
- * `ConfigPanel.tsx`, and the four-step setup flow to `SetupFlowPanel.tsx` — the
+ * belongs to `ConfigPane.tsx` — one area per pipeline stage, with the shell in
+ * `ConfigStageShell.tsx`, each stage's panel in its own `Stage*.tsx`, and the forms
+ * those panels arrange in `ConfigPanel.tsx`. The four-step setup flow belongs to
+ * `SetupFlowPanel.tsx` — the
  * step rail lives there rather than here because its state IS the flow's state, and
  * a rail rendered from the shell would have to be told what step it was on. The
  * kill switch — its reading, its dot and its arm-then-confirm control — and the
@@ -99,7 +101,7 @@ import {
   type WaitingOn,
 } from './api'
 import { SE_CSS } from './styles'
-import { ConfigPane } from './ConfigPanel'
+import { ConfigPane } from './ConfigPane'
 import { RowFlags, RunInspectorBody } from './ReviewQueuePanel'
 import { KillSwitchControls, switchReading } from './SafetyPanel'
 import { SetupFlowPanel } from './SetupFlowPanel'

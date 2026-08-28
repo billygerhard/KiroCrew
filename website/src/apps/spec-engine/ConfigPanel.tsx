@@ -157,39 +157,6 @@ const APP_DEFAULTS_ROW_KEY = 'app-defaults'
  */
 const SOURCES_GRID_ID = 'se-sources-grid'
 
-/** One of the configuration pane's four editing surfaces. */
-type TabId = 'settings' | 'profiles' | 'sources' | 'json'
-
-/**
- * The pane's four editing surfaces, in render order.
- *
- * Deliberately a fixed table rather than derived from data, unlike every other
- * list on this pane: these four entries name the pane's OWN components, so a
- * fifth surface is a code change whichever way this is written. Deriving them
- * would only add a layer that cannot vary.
- *
- * The label keys are whole literals at their own entries so the key-reference
- * gate can resolve each one, and they are keys rather than resolved strings
- * because a module-level `i18nT()` runs once at import and would freeze the
- * labels in whichever language happened to be active then.
- */
-const SECTION_TABS: ReadonlyArray<{ id: TabId; labelKey: string }> = [
-  { id: 'settings', labelKey: 'apps.specEngine.configPanel.tab_settings' },
-  { id: 'profiles', labelKey: 'apps.specEngine.configPanel.tab_cost_profiles' },
-  { id: 'sources', labelKey: 'apps.specEngine.configPanel.tab_watch_sources' },
-  { id: 'json', labelKey: 'apps.specEngine.configPanel.tab_json_view' },
-]
-
-/** The DOM id of *tab*'s control, so its panel can name what labels it. */
-function tabControlId(tab: TabId): string {
-  return `se-tab-${tab}`
-}
-
-/** The DOM id of *tab*'s panel, so its control can name what it controls. */
-function tabPanelId(tab: TabId): string {
-  return `se-panel-${tab}`
-}
-
 /**
  * Report *count* to *onCount* whenever it changes, and render nothing.
  *
@@ -290,7 +257,7 @@ function codeOf(error: unknown): string {
 }
 
 /** A refusal block: the sentence a reader acts on, with the code underneath. */
-function Refused({ title, error }: { title: string; error: unknown }) {
+export function Refused({ title, error }: { title: string; error: unknown }) {
   const code = codeOf(error)
   const text = error instanceof Error ? error.message : ''
   return (
@@ -992,7 +959,7 @@ function GridReview({
  * into this matrix for the source it is editing, and a selection held here as well
  * would let the link name one source while the grid rendered another.
  */
-function SourcesSection({
+export function SourcesSection({
   chosen,
   onChoose,
 }: {
@@ -1910,12 +1877,33 @@ function GroupedSettings({
  *    refetch: rows filled from a retained answer would present values nobody
  *    re-read as what is in force, and the registry's own defaults are emphatically
  *    not that.
+ *
+ * ## One instance per pipeline stage
+ *
+ * `groups` narrows the generated fields to the setting GROUPS one stage presents —
+ * the leading dot-segment of a registry key, which is `Setting.group` on the
+ * engine's side. The pane mounts one of these per stage, each filtered to the
+ * groups the ENGINE placed in that stage, so a stage shows the settings that govern
+ * it and no others.
+ *
+ * The filter is over projected group names and never over a list of keys, which is
+ * the whole reason the stage projection carries groups: a setting the engine adds
+ * to a mapped group appears on its stage with no edit here. Omitting `groups`
+ * generates every setting the registry declares, which is what a caller wants when
+ * it is not one stage's surface.
+ *
+ * Each instance keeps its OWN staging, and that is correct rather than a
+ * compromise: a stage's review card shows and its patch carries exactly the edits
+ * staged on that stage, so confirming one stage's change cannot write another's.
  */
-function SettingsForm({
+export function SettingsForm({
   project,
+  groups,
   onPendingCount,
 }: {
   project: string
+  /** The setting groups to generate, or every group when omitted. */
+  groups?: readonly string[]
   /** Report how many staged changes this form would review, for the tab badge. */
   onPendingCount?: (count: number) => void
 }) {
@@ -1971,7 +1959,17 @@ function SettingsForm({
     // untouched, so the rows keep showing the store's own state.
   })
 
-  const settings = registry.data?.settings ?? NO_SETTINGS
+  const projected = registry.data?.settings ?? NO_SETTINGS
+  // Narrowed to the stage's groups when the caller named any. `settingGroup` is
+  // total -- a key with no dot is its own whole group -- so nothing is dropped by
+  // the split itself, only by not belonging to the groups asked for.
+  const settings = useMemo(
+    () =>
+      groups === undefined
+        ? projected
+        : projected.filter((setting) => groups.includes(settingGroup(setting.key))),
+    [projected, groups],
+  )
   const inForce = useMemo(() => {
     const found = new Map<string, EffectiveSetting>()
     for (const value of resolved.data?.settings ?? []) found.set(value.key, value)
@@ -2662,7 +2660,7 @@ function copySourceOf(
  *    every row here comes from, and the resolved pane beside it renders the very
  *    roles this write changes.
  */
-function ProfilesForm({
+export function ProfilesForm({
   config,
   onPendingCount,
 }: {
@@ -3902,7 +3900,7 @@ function SourceCommand({ entry, preset }: { entry: Document; preset: SourcePrese
  * form does not show — so the name is displayed as the key it is and a rename is the
  * JSON view's.
  */
-function SourceForm({
+export function SourceForm({
   config,
   onShowGrid,
   onOpenJson,
@@ -5063,7 +5061,7 @@ function SourceForm({
  * unsaved edits the editor would call clean — or, worse, close over a draft
  * without saying it is holding one.
  */
-function isDirty(text: string | null, document: unknown): boolean {
+export function isDirty(text: string | null, document: unknown): boolean {
   return text !== null && text !== documentText(document)
 }
 /**
@@ -5081,7 +5079,7 @@ function isDirty(text: string | null, document: unknown): boolean {
  * local on purpose — a parse error, an empty-patch note and a save's advisories all
  * describe the last attempt, and there is nothing to lose by asking again.
  */
-function DocumentEditor({
+export function DocumentEditor({
   config,
   text,
   onText,
@@ -5328,7 +5326,7 @@ function projectRows(document: Document): ProjectRow[] {
  * elements with selection following focus, so the rail's advertised `j`/`k` keys
  * work here too and no row is reachable only by pointer.
  */
-function ProjectsTable({
+export function ProjectsTable({
   config,
   project,
   onSelect,
@@ -5694,7 +5692,7 @@ function MatchTrace({ role, document }: { role: ResolvedRole; document: Document
  * controls for one reading is how a pane comes to claim a resolution for a
  * project other than the one whose row is highlighted.
  */
-function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: string }) {
+export function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: string }) {
   const client = useQueryClient()
   const [selectedRole, setSelectedRole] = useState<string>('')
   const [everySetting, setEverySetting] = useState(false)
@@ -5884,337 +5882,6 @@ function ResolvedPane({ config, project }: { config: ConfigSnapshot; project: st
           </>
         )}
       </div>
-    </>
-  )
-}
-
-/**
- * The pane's four editing surfaces as a tab list, and what each one is holding.
- *
- * The surfaces used to stack in one scroll, which made an operator read past four
- * of them to reach the fifth. They are tabs now — but a tab that HIDES unwritten
- * work would be worse than the stack, so every tab states what its surface holds:
- * a staged-change count for the three forms, and for the JSON view the draft it
- * is carrying plus the engine's problems and advisories for the saved document.
- *
- * Neither fact is decoration. A draft the operator has not saved survives leaving
- * the tab, so the tab has to SAY it is holding one; otherwise an unvisited JSON
- * tab looks like a clean pane and the draft reappears later with no explanation.
- * And the problems and advisories are only rendered INSIDE that view, so their
- * counts are stated out here: a pane that silently withheld "this document has
- * three problems" behind an unvisited tab would read as a healthy configuration.
- *
- * The keyboard is the WAI-ARIA tabs pattern with activation on focus movement:
- * ArrowLeft/ArrowRight move the selection, which is safe here precisely because
- * every panel is already mounted — showing one costs nothing, so there is no
- * reason to make the operator press a second key to see it. Visually it is the
- * pane's existing flat filter-pill idiom, in flow: no overlay, no popup, nothing
- * positioned over the surfaces it switches between.
- */
-function SectionTabs({
-  active,
-  pending,
-  dirty,
-  problems,
-  advisories,
-  onActivate,
-}: {
-  active: TabId
-  /** Staged changes each tab's surfaces are holding, keyed by tab. */
-  pending: Record<TabId, number>
-  /** Whether the JSON view is holding an unsaved draft. */
-  dirty: boolean
-  problems: number
-  advisories: number
-  onActivate: (tab: TabId) => void
-}) {
-  const move = (from: number, step: number) => {
-    // Wrapping, per the tabs pattern: the ends of the list are not walls, and an
-    // arrow press that does nothing reads as a dead key.
-    const next = (from + step + SECTION_TABS.length) % SECTION_TABS.length
-    onActivate(SECTION_TABS[next].id)
-    // Focus follows selection, so the arrow keys move the reader as well as the
-    // panel. Read from the document rather than held in a ref: the control that
-    // is being moved to may not have rendered as selected yet.
-    document.getElementById(tabControlId(SECTION_TABS[next].id))?.focus()
-  }
-  return (
-    <div
-      className="se-filters se-tabs"
-      role="tablist"
-      aria-label={i18nT('apps.specEngine.configPanel.configuration_sections')}
-    >
-      {SECTION_TABS.map((tab, index) => (
-        <button
-          key={tab.id}
-          id={tabControlId(tab.id)}
-          type="button"
-          role="tab"
-          className="se-filter"
-          aria-selected={tab.id === active}
-          aria-controls={tabPanelId(tab.id)}
-          // One tab stop for the whole list: the arrows move between tabs, so a
-          // stop per tab would put four stops between the table and the panel.
-          tabIndex={tab.id === active ? 0 : -1}
-          onClick={() => onActivate(tab.id)}
-          onKeyDown={(event) => {
-            if (event.key === 'ArrowRight') {
-              event.preventDefault()
-              move(index, 1)
-            } else if (event.key === 'ArrowLeft') {
-              event.preventDefault()
-              move(index, -1)
-            }
-          }}
-        >
-          {i18nT(tab.labelKey)}
-          {pending[tab.id] > 0 && (
-            <span className="se-filter-count">{fmtNumber(pending[tab.id])}</span>
-          )}
-          {tab.id === 'json' && dirty && (
-            <span className="se-filter-mark">
-              {i18nT('apps.specEngine.configPanel.unsaved_edits')}
-            </span>
-          )}
-          {tab.id === 'json' && problems > 0 && (
-            <span className="se-filter-mark">
-              {i18nT('apps.specEngine.configPanel.problems')}
-              <span className="se-filter-count">{fmtNumber(problems)}</span>
-            </span>
-          )}
-          {tab.id === 'json' && advisories > 0 && (
-            <span className="se-filter-mark">
-              {i18nT('apps.specEngine.configPanel.advisories')}
-              <span className="se-filter-count">{fmtNumber(advisories)}</span>
-            </span>
-          )}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-/**
- * One tab's surfaces, mounted whether or not the tab is the active one.
- *
- * `hidden` rather than a conditional render, and that is the whole point of this
- * wrapper. Unmounting a panel would drop everything its forms hold that is not
- * yet written: the staged edits in `useStagedEdits`, an armed removal and the
- * name typed to confirm it, a half-written add, and the scope each row is
- * targeting. An operator who switched tabs to check one number and came back to
- * an emptied form would have lost work with nothing saying so — so the panels
- * stay mounted and only their visibility changes.
- */
-function SectionPanel({
-  tab,
-  active,
-  children,
-}: {
-  tab: TabId
-  active: TabId
-  children: React.ReactNode
-}) {
-  return (
-    <div
-      id={tabPanelId(tab)}
-      role="tabpanel"
-      aria-labelledby={tabControlId(tab)}
-      hidden={tab !== active}
-    >
-      {children}
-    </div>
-  )
-}
-
-/**
- * The whole configuration pane: the forms, the resolution beside them, and the
- * document on request.
- *
- * Takes the config read rather than performing its own, so the page's first-run
- * detection and this pane cannot disagree about whether a document exists — and a
- * read that FAILED is rendered here as the refusal it is, because `config_unreadable`
- * means a document exists and cannot be parsed, which is a repair and not an empty
- * form to fill in. The refusal is read BEFORE the data for the SourcesSection's
- * reason: React Query retains the last successful answer across a failing refetch,
- * and a form filled from a retained answer would present values nobody re-read as
- * what is in force.
- *
- * ## The forms lead and the document is on request
- *
- * The pane used to open on the raw document, which made JSON the only way to change
- * most of what is stored. It now opens on the forms, and the document editor sits
- * on the last of four tabs with its full behavior intact — the same textarea, the
- * same patch-computing save, the same problems and advisories. Nothing is read-only
- * and no shape has become unreachable; what changed is which of the two an operator
- * meets first.
- *
- * ## Four tabs, and the two properties that make them safe
- *
- * The editing surfaces are {@link SectionTabs}, not a single scroll: five dense
- * surfaces stacked meant reading past four of them to reach the fifth. Splitting
- * them costs nothing only because of two things, and both are load-bearing rather
- * than polish:
- *
- * 1. **Hidden panels stay mounted.** {@link SectionPanel} hides with `hidden`, so
- *    switching tabs cannot drop a form's staged edits, an armed removal, or
- *    half-typed text. The JSON draft is lifted to this pane for the same reason it
- *    always was, and now covers leaving the tab as well as closing the view.
- * 2. **Hidden work is announced.** Each form reports its reviewable staged count to
- *    the tab that holds it, so an operator confirming a patch can never be looking
- *    at a pane that shows no sign of the edits staged one tab over.
- *
- * The projects table and the project selection stay ABOVE the tabs, because the row
- * selected there governs every tab and the resolved column beside them all.
- */
-export function ConfigPane({
-  config,
-  error,
-  pending,
-}: {
-  config: ConfigSnapshot | undefined
-  error: unknown
-  pending: boolean
-}) {
-  // The selected project lives here, above both halves of the pane: the table on
-  // the left is what selects it and the resolved read on the right is what it is
-  // read FOR, and a copy on either side is how the two come to disagree.
-  const [chosenProject, setChosenProject] = useState<string>(APP_WIDE)
-  // The source the autonomy grid shows, held here rather than in the section: the
-  // source form links into that matrix for the source it is editing, and a copy of
-  // the selection on either side is how the two come to disagree.
-  const [gridSource, setGridSource] = useState('')
-  // Which of the four editing surfaces is showing. Settings is the default: it is
-  // the most-visited surface, and the JSON view stays demoted at the far end.
-  const [activeTab, setActiveTab] = useState<TabId>('settings')
-  // How much unwritten work each tab is holding, reported by the surfaces on it.
-  // Held here rather than derived, because the forms own their own staging: the
-  // pane observes the counts and never becomes a second place they live.
-  const [pendingByTab, setPendingByTab] = useState<Record<TabId, number>>({
-    settings: 0,
-    profiles: 0,
-    sources: 0,
-    json: 0,
-  })
-  // The editor's unsaved text, held here so leaving the JSON tab does not discard it.
-  const [draft, setDraft] = useState<string | null>(null)
-  // Normalized against the document itself, not against how the entry left it:
-  // a selection whose entry is gone — removed through its row, deleted in the
-  // JSON editor beside the table, or dropped by an external write picked up on
-  // refetch — falls back to app defaults. Without this, no row matches, the
-  // grid loses its only tab stop, and the resolved view renders the app-wide
-  // layers under a heading naming a project the document no longer lists —
-  // which reads as "this project inherits everything" rather than "this
-  // project is gone".
-  const documentProjects = config?.document[PROJECTS]
-  const chosenKnown =
-    chosenProject === APP_WIDE ||
-    (isObject(documentProjects) &&
-      Object.prototype.hasOwnProperty.call(documentProjects, chosenProject))
-  const project = chosenKnown ? chosenProject : APP_WIDE
-  // The stored state collapses too, so a later re-add of the same name cannot
-  // silently snap the selection back to it with no operator action.
-  useEffect(() => {
-    if (!chosenKnown) setChosenProject(APP_WIDE)
-  }, [chosenKnown])
-  // One stable reporter per form, so a form's count effect fires on the count
-  // changing rather than on every render of this pane. The identity guard keeps a
-  // report of an unchanged count from re-rendering the pane at all.
-  const report = useMemo(() => {
-    const at = (tab: TabId) => (count: number) => {
-      setPendingByTab((current) =>
-        current[tab] === count ? current : { ...current, [tab]: count },
-      )
-    }
-    return { settings: at('settings'), profiles: at('profiles'), sources: at('sources') }
-  }, [])
-  return (
-    <>
-      <section className="se-cfg">
-        <div className="se-cfg-head">
-          {/* A filename, not copy: translating it would name a file that does not exist. */}
-          <h1 className="se-m">config.json</h1>
-          <span className="se-sort">
-            {i18nT('apps.specEngine.specEnginePage.the_write_path_validated_on_save')}
-          </span>
-        </div>
-        <div className="se-cfg-body">
-          {error ? (
-            <Refused
-              title={i18nT('apps.specEngine.specEnginePage.could_not_read_the_configuration')}
-              error={error}
-            />
-          ) : pending || !config ? (
-            <p className="se-note">
-              {i18nT('apps.specEngine.specEnginePage.reading_the_configuration')}
-            </p>
-          ) : (
-            <>
-              {/* The question this pane is opened with is "which configuration
-                  governs which project", and the answer must not sit under a
-                  fixed-height editor. Above the tabs and outside them, because the
-                  row selected here governs every one of them: a selection inside a
-                  tab would be a selection three surfaces could not see. */}
-              <ProjectsTable config={config} project={project} onSelect={setChosenProject} />
-              <SectionTabs
-                active={activeTab}
-                pending={pendingByTab}
-                dirty={isDirty(draft, config.document)}
-                problems={config.errors.length}
-                advisories={config.advisories.length}
-                onActivate={setActiveTab}
-              />
-              {/* Beside the table because the row selected there is what these
-                  values are resolved FOR: a settings form and a resolution for two
-                  different projects is the disagreement the shared selection
-                  exists to prevent. */}
-              <SectionPanel tab="settings" active={activeTab}>
-                <SettingsForm project={project} onPendingCount={report.settings} />
-              </SectionPanel>
-              {/* Its own tab because a role's model and effort are the other half
-                  of what a project runs on, and they live nowhere else: a project
-                  SELECTS a profile rather than overriding roles in it. */}
-              <SectionPanel tab="profiles" active={activeTab}>
-                <ProfilesForm config={config} onPendingCount={report.profiles} />
-              </SectionPanel>
-              {/* The form and the grid it links into share one tab: the form's
-                  enable consequence links to the matrix showing how far that
-                  source's items may run unattended, and a link that crossed tabs
-                  would hide the very thing it points at. */}
-              <SectionPanel tab="sources" active={activeTab}>
-                <SourceForm
-                  config={config}
-                  onShowGrid={setGridSource}
-                  onOpenJson={() => setActiveTab('json')}
-                  onPendingCount={report.sources}
-                />
-                <SourcesSection chosen={gridSource} onChoose={setGridSource} />
-              </SectionPanel>
-              {/* Last, and still the escape hatch: everything the forms express is
-                  edited on them, and this is what reaches a shape they cannot. */}
-              <SectionPanel tab="json" active={activeTab}>
-                <p className="se-note">
-                  {i18nT('apps.specEngine.configPanel.the_json_view_edits_what_no_form_expresses')}
-                </p>
-                <DocumentEditor config={config} text={draft} onText={setDraft} />
-              </SectionPanel>
-            </>
-          )}
-        </div>
-      </section>
-      <section
-        className="se-inspector"
-        aria-label={i18nT('apps.specEngine.specEnginePage.resolved_configuration')}
-      >
-        {error || pending || !config ? (
-          <div className="se-insp-body">
-            <p className="se-note">
-              {i18nT('apps.specEngine.configPanel.the_resolved_read_needs_the_document_first')}
-            </p>
-          </div>
-        ) : (
-          <ResolvedPane config={config} project={project} />
-        )}
-      </section>
     </>
   )
 }

@@ -326,6 +326,27 @@ export interface ProfilePreset {
 }
 
 /**
+ * One pipeline stage as `_registry_payload` projects it.
+ *
+ * `setting_groups` are `Setting.group` values — the leading dot-segment of a
+ * registry key — in the setting registry's own declaration order, and
+ * `capabilities` are delegable capability names in schema declaration order. The
+ * placement itself is `engine/config/pipeline.py`'s, projected so a setting or
+ * capability the engine adds is placed by the engine rather than by a table kept
+ * on this side of the wire.
+ *
+ * These are PIPELINE stages — which part of the pipeline a knob governs — and not
+ * the autonomy ladder, whose rungs share three of these names and answer how much
+ * authority a run holds. Nothing derived from this may become an input to a gate,
+ * prerequisite or budget decision.
+ */
+export interface StageVocabulary {
+  id: string
+  setting_groups: string[]
+  capabilities: string[]
+}
+
+/**
  * The vocabularies the configuration forms are generated FROM, from
  * `_registry_payload`.
  *
@@ -351,6 +372,18 @@ export interface RegistryPayload {
   /** The effort ladder a role assignment may name, least effort first. */
   efforts: string[]
   levels: string[]
+  /**
+   * The pipeline stages the configuration surface is organised around, each
+   * carrying the setting groups and delegable capabilities it presents.
+   *
+   * Optional in the TYPE and not in the route: the route composes it from
+   * `PIPELINE_STAGES` on every read, so a payload without it is one this pane
+   * is reading from an older gateway. Named optional so that case renders the
+   * whole vocabulary in one advanced area rather than throwing — see
+   * `stages.resolveStages`, which folds an unclaimed group there for the same
+   * reason.
+   */
+  stages?: StageVocabulary[]
 }
 
 /**

@@ -452,6 +452,10 @@ textarea.se-json{width:100%;resize:vertical;min-height:220px}
 .se-evid-row[data-approved="true"]{color:var(--text-strong)}
 .se-subj{font-size:11px;color:var(--muted);overflow-wrap:anywhere}
 .se-evid-item{display:block;margin-top:5px}
+/* A plain list of engine identifiers — capability names under a pipeline stage.
+   Unstyled markers because these are names rather than prose, and the reader is
+   scanning for one of them rather than reading down the list. */
+.se-names{list-style:none;margin:0;padding:0}
 .se-offer{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:5px 0;
   border-bottom:1px solid var(--border)}
 .se-offer:last-of-type{border-bottom:none}

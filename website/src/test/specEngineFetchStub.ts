@@ -153,6 +153,52 @@ export type RouteKey =
 
 export type SpecEngineRoutes = Partial<Record<RouteKey, Responder>>;
 
+/**
+ * The pipeline stages, in `_registry_payload`'s `stages` shape and with the
+ * engine's own placement.
+ *
+ * Present even in the EMPTY registry, unlike the vocabularies beside it, because
+ * the configuration pane's areas are generated from it: a payload without `stages`
+ * folds every group into one advanced area, which is a real degradation the pane
+ * handles but not a shape the route ever returns. A suite that is about the pane
+ * would then be asserting against fiction.
+ *
+ * The group and capability placement is `engine/config/pipeline.py`'s, transcribed
+ * rather than invented — authoring genuinely holds no setting group, and delivery
+ * genuinely holds no delegable capability.
+ */
+export const PIPELINE_STAGES = [
+  { id: "intake", setting_groups: ["watch"], capabilities: ["watch_sources"] },
+  {
+    id: "authoring",
+    setting_groups: [],
+    capabilities: ["analysis", "authoring", "validation_rules"],
+  },
+  {
+    id: "execution",
+    setting_groups: ["concurrency", "limits", "timeouts", "budget"],
+    capabilities: ["review", "implementation"],
+  },
+  { id: "delivery", setting_groups: ["delivery", "notify"], capabilities: [] },
+  { id: "advanced", setting_groups: ["telemetry"], capabilities: ["model_catalog"] },
+];
+
+/**
+ * The five stages with every one of *groups* placed under *stage*.
+ *
+ * For a suite whose subject is a FORM rather than the pane's areas: it declares one
+ * area holding everything that suite's vocabulary contains, so the suite navigates
+ * once and then reads its own rows. A legitimate projection shape — the engine
+ * already places four groups under execution — and not a fiction, which is what
+ * omitting `stages` altogether would be.
+ */
+export function stagesUnder(stage: string, groups: readonly string[]) {
+  return PIPELINE_STAGES.map((entry) => ({
+    ...entry,
+    setting_groups: entry.id === stage ? [...groups] : [],
+  }));
+}
+
 /** The empty setting vocabulary: enough for the generated forms to render nothing. */
 const EMPTY_REGISTRY = {
   settings: [],
@@ -160,6 +206,7 @@ const EMPTY_REGISTRY = {
   profile_presets: [],
   roles: [],
   levels: [],
+  stages: PIPELINE_STAGES,
 };
 
 /**
@@ -222,10 +269,14 @@ const STUB_FINGERPRINT = "0".repeat(64);
  *
  * The VALUES are held to the same standard as the field names. `binding_current`
  * is always a digest, never "" — the routes compute it from the resolved binding
- * on every reply, so an empty string is a state neither route can produce. A
- * default with a job likewise carries a fingerprint EQUAL to it, because the POST
- * sets both from the one digest it just computed, which is what makes `stale`
- * false at the moment a run starts.
+ * on every reply, so an empty string is a state neither route can produce. The
+ * job-bearing fields are derived from `status`, not from whether a caller
+ * happened to pass a job id: every status except `absent` and `not_applicable`
+ * MEANS a job exists, so a caller asking for `complete` cannot accidentally build
+ * an empty job id beside it, nor an empty fingerprint beside a finished run. A
+ * present job's fingerprint EQUALS `binding_current`, because the POST sets both
+ * from the one digest it just computed, which is what makes `stale` false at the
+ * moment a run starts.
  *
  * `stale` is derived server-side and is never a client's own comparison: a client
  * is not shown the binding's env, so any fingerprint it computed would digest
@@ -241,14 +292,14 @@ function conformanceState(
     isBuiltin?: boolean;
   } = {},
 ): Record<string, unknown> {
-  const hasJob = over.jobId !== undefined;
+  const status = over.status ?? "absent";
+  // A job exists for every status except the two that mean "no run happened".
+  const hasJob = status !== "absent" && status !== "not_applicable";
   return {
     capability: "review",
-    status: over.status ?? "absent",
-    job_id: over.jobId ?? "",
-    candidate: over.candidate ?? "",
-    // Empty only in the no-run state, where the routes leave it empty too; with a
-    // job it equals binding_current, as the POST sets it.
+    status,
+    job_id: hasJob ? over.jobId ?? "job-stub-0001" : "",
+    candidate: over.candidate ?? (hasJob ? "/usr/bin/true" : ""),
     binding_fingerprint: hasJob ? STUB_FINGERPRINT : "",
     binding_current: STUB_FINGERPRINT,
     stale: false,

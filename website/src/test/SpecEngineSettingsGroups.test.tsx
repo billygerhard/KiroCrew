@@ -26,7 +26,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SpecEnginePage from '../apps/spec-engine/SpecEnginePage'
 import en from '../i18n/locales/en.json'
-import { stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
+import { stagesUnder, stubSpecEngineFetch, type Answer } from './specEngineFetchStub'
 
 const T = en.apps.specEngine.settingsForm
 const C = en.apps.specEngine.configPanel
@@ -65,13 +65,31 @@ const SHIPPED = [
   'concurrency.global_max_runs',
 ]
 
+/**
+ * The registry payload for *keys*, with every group they declare placed in ONE
+ * pipeline stage.
+ *
+ * The pane is organised by pipeline stage now, and a stage renders only its own
+ * groups — so a fixture spread across four stages would have four one-group
+ * subsections and no jump navigation anywhere, which is a claim about the SHELL
+ * rather than about the grouping this suite is for. One area holding all of them is
+ * a projection the engine itself produces (it places four groups under execution),
+ * and it keeps every claim here about the subsections.
+ */
 function registry(keys: string[]) {
+  const groups: string[] = []
+  for (const key of keys) {
+    const dot = key.indexOf('.')
+    const group = dot < 0 ? key : key.slice(0, dot)
+    if (!groups.includes(group)) groups.push(group)
+  }
   return {
     settings: keys.map((key) => setting(key)),
     source_presets: [],
     profile_presets: [],
     roles: [],
     levels: [],
+    stages: stagesUnder('execution', groups),
   }
 }
 
@@ -120,6 +138,11 @@ async function openRows(keys: string[], over: Parameters<typeof stub>[1] = {}) {
     </QueryClientProvider>,
   )
   fireEvent.click(await screen.findByRole('button', { name: new RegExp(P.configuration) }))
+  // One area per pipeline stage, and only the active one is in the accessibility
+  // tree the role queries read: an inactive panel carries `hidden`. This suite's
+  // fixture places every group under execution, so that is the area to open.
+  await screen.findByRole('tablist', { name: C.configuration_stages })
+  fireEvent.click(screen.getByRole('tab', { name: new RegExp(`^${C.stage_execution}`) }))
   await screen.findByRole('heading', { name: T.settings })
   await waitFor(() => expect(block().querySelectorAll('.se-setting').length).toBeGreaterThan(0))
 }
