@@ -583,6 +583,24 @@ describe('the transport chooser and the fields each transport accepts', () => {
     expect(block.textContent).toContain(B.the_engine_declared_no_transport)
   })
 
+  it('offers none either when the payload carries no transports key at all', async () => {
+    // The distinct case, and the one a hard-coded FALLBACK would slip through: an
+    // older gateway omits the key rather than sending it empty, and `?? [...]` at the
+    // read site would then quietly offer a vocabulary this pane made up. Asserted
+    // separately because an empty array is present and a missing key is not, so a
+    // test over the first cannot fail for the second.
+    const payload = registry()
+    delete (payload as { transports?: unknown }).transports
+    await openStage({ registry: { body: payload } })
+    const authoring = capabilityRow('authoring')
+    for (const transport of TRANSPORTS) {
+      expect(within(authoring).queryAllByRole('button', { name: transport })).toHaveLength(0)
+    }
+    expect((authoring.closest('.se-blk') as HTMLElement).textContent).toContain(
+      B.the_engine_declared_no_transport,
+    )
+  })
+
   it('collects no command, environment or deadline while the transport is the builtin', async () => {
     await openStage()
     const authoring = capabilityRow('authoring')
