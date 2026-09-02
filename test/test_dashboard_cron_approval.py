@@ -139,6 +139,7 @@ class TestCronCreateModel:
         mock_job.approval_mode = ""
         mock_job.silent = False
         mock_job.model = ""
+        mock_job.harness = ""
         mock_state.crons.add_job_async = AsyncMock(return_value=mock_job)
         request = MagicMock()
         request.app = {"state": mock_state}
@@ -237,6 +238,7 @@ class TestCronListFields:
         mock_job.command = ""
         mock_job.last_error = ""
         mock_job.model = ""
+        mock_job.harness = ""
         mock_job.folder_id = ""
         mock_job.session_key = ""
 

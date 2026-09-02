@@ -208,6 +208,10 @@ class SlotProjection:
             "agent": slot.agent,
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
+            # Empty means "inherit the configured default", NOT "unknown": a
+            # picker renders the default row as preselected for an empty value
+            # rather than showing nothing selected. (wave-2 harness binding)
+            "harness": slot.harness,
             # The backend's own withhold verdict for `model`: true = the account
             # cannot run the pin (this session is on the backend default), false
             # = it can, null = not known yet. Carried so the frontend reads the

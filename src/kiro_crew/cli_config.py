@@ -9,7 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-from kiro_crew import beacon
+from kiro_crew import beacon, security
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     ConfigReadError,
@@ -22,6 +22,61 @@ from kiro_crew.hooks import safe_read_file
 from kiro_crew.sel import sel
 
 _MISSING = object()
+
+
+def _raw_config_file(path: Path) -> dict | None:
+    """Best-effort raw contents of the config file a write is about to land in.
+
+    The key guard needs the ON-DISK value to catch a write that deletes a protected
+    key by replacing the section holding it. It must be the raw file rather than the
+    merged config: base and overlay merge per leaf, so an overlay write can only
+    destroy what the overlay itself defines.
+
+    Absent, unreadable, or non-object returns None — "nothing on disk this write
+    could destroy" — which opens no hole: a corrupt base aborts the update
+    downstream, and the overlay path resets a corrupt file by design.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _refuse_protected_key(
+    key: str, value: object, *, operation: str, existing: dict | None = None
+) -> bool:
+    """Print and audit a refusal when *key*/*value* writes an operator-only key.
+
+    Returns True when the write must not proceed. The reason comes from
+    ``security.protected_config_write`` so the CLI, and any later setter that
+    grows the same guard, refuse the same set of keys for the same stated reason.
+
+    *existing* is the raw content of the file this write lands in, which is what
+    lets the guard see a section write that DELETES a protected key rather than
+    authoring one. It is read before the config lock is taken, so a definition
+    added between that read and the write is not seen; the race costs a deletion
+    an operator could equally have performed by hand, and closing it would mean
+    moving the refusal inside the lock-held mutate callback.
+    """
+    reason = security.protected_config_write(key, value, existing)
+    if not reason:
+        return False
+    print(f"❌ Refusing this write — {reason}.", file=sys.stderr)
+    print(
+        "   Edit config.json directly (kirocrew config edit) to change it.",
+        file=sys.stderr,
+    )
+    # Audited like the other enforcement points on this path: a refused write is
+    # the interesting event, and the trail names which key was refused.
+    sel().log_api_access(
+        caller="cli",
+        operation=operation,
+        outcome="denied",
+        source="cli",
+        resources=f"{key or '*'} (operator-only config key)",
+    )
+    return True
 
 
 def _config_cmd(args: argparse.Namespace) -> None:
@@ -74,6 +129,14 @@ def _config_cmd(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            # Whole-object form of the key guard below: an empty key means `data`
+            # replaces the entire config, so a protected key nested anywhere in it
+            # is authored by this write — and one nested anywhere in the file being
+            # replaced is deleted by it, which is why the current file is passed.
+            if _refuse_protected_key(
+                "", data, operation="config_set_file", existing=_raw_config_file(config_path())
+            ):
+                sys.exit(1)
             update_config_locked(config_path(), mutate=lambda _: data, on_corrupt="reset")
             sel().log_api_access(
                 caller="cli",
@@ -93,6 +156,26 @@ def _config_cmd(args: argparse.Namespace) -> None:
                 print("       kirocrew config set --file <path.json>", file=sys.stderr)
                 sys.exit(1)
             parsed = _parse_value(value)
+            # Key-level write guard, placed FIRST and before the local/base split
+            # for the same reason the beacon gate below is: `--local` writes the
+            # overlay, which takes precedence over the base file, so a guard on
+            # one half only leaves the other half as the way around it. Some
+            # config values are not settings whose worst case the loader clamps —
+            # `agent.harnesses` names an executable the gateway spawns — and this
+            # command is one an agent can run through its bash tool, taking the
+            # config lock itself rather than passing the file-edit gate.
+            #
+            # The guard also needs the file this write lands in, because a section
+            # write deletes a protected key it does not mention: which file that is
+            # differs by branch, so it is resolved with the same `use_local` split
+            # the write itself uses.
+            if _refuse_protected_key(
+                key,
+                parsed,
+                operation="config_set",
+                existing=_raw_config_file(config_local_path() if use_local else config_path()),
+            ):
+                sys.exit(1)
             # Fourth write path to telemetry.beacon_enabled, after the dashboard
             # PATCH and `telemetry enable`. Gated here too, and BEFORE the
             # local/base split so it covers both: `--local` writes the overlay,

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.acp.client import (
-    _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
     AcpAuthRequired,
     AcpError,
@@ -30,11 +29,12 @@ from kiro_crew.acp.client import (
     AcpProcessDied,
     advertised_model_ids,
     model_is_unusable,
+    not_logged_in_message,
 )
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_handle import WatchdogSettings
-from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE, STOP_REASON_END_TURN
+from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
@@ -258,7 +258,7 @@ class AcpSessionProvider(LLMProvider):
             # NOT an AcpError) escapes both the AcpProcessDied and AcpError
             # handlers and surfaces as an unhandled crash.
             if self._runtime.saw_not_logged_in():
-                raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                raise AcpAuthRequired(not_logged_in_message(self._runtime.harness_id)) from exc
             raise AcpProcessDied(str(exc)) from exc
         except AcpRuntimeError as exc:
             # Base AcpRuntimeError (e.g. prompt()'s "turn already active"
@@ -270,6 +270,16 @@ class AcpSessionProvider(LLMProvider):
     async def steer(self, message: str) -> bool:
         """Forward a mid-turn steer to the session handle (kiro _session/steer)."""
         return await self._guarded(self._handle.steer(message))
+
+    @property
+    def harness_id(self) -> str:
+        """The harness the backing runtime runs — for usage attribution and errors.
+
+        Delegated rather than stored: the runtime owns the binding (or resolves it
+        from the legacy alias when nobody bound it), and a second copy here could
+        disagree with the process that is actually serving the session.
+        """
+        return self._runtime.harness_id
 
     @property
     def last_steer_monotonic(self) -> float:
@@ -310,7 +320,7 @@ class AcpSessionProvider(LLMProvider):
         AcpError (e.g. chat_runner) and lands on its generic `except Exception`
         (raw error card, no retry/reset). Mirrors stream()'s translation."""
         if self._runtime.saw_not_logged_in():
-            return AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE)
+            return AcpAuthRequired(not_logged_in_message(self._runtime.harness_id))
         return AcpProcessDied(str(exc))
 
     async def _guarded(self, awaitable: Any) -> Any:
@@ -482,12 +492,13 @@ class AcpSessionProvider(LLMProvider):
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child signs in from kiro-cli's own store.
 
-        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
-        H5/H14), read off the runtime's backend for the same reason
-        :attr:`backend` is: this provider fronts whichever backend the runtime
-        spawned.
+        Delegated to the runtime rather than re-derived, for the same reason
+        :attr:`backend` reads off it: this provider fronts whichever harness the
+        runtime spawned, and the runtime holds the bound descriptor the capability
+        is read from. One answer, so the two cannot disagree about the same
+        process.
         """
-        return self._runtime.acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._runtime.uses_kiro_identity_store
 
     def has_active_turn(self) -> bool:
         """True if a prompt turn is currently in progress.

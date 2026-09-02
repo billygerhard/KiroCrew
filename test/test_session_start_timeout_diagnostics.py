@@ -183,8 +183,9 @@ async def test_session_load_timeout_names_the_servers_that_never_reported(monkey
     rt = _runtime()
     rt._can_load_session = True
     monkeypatch.setattr(
-        "kiro_crew.acp.runtime.pooled_session_servers",
-        lambda *_a, **_k: _roster("alpha", "beta"),
+        rt,
+        "_session_mcp_servers",
+        AsyncMock(return_value=_roster("alpha", "beta")),
     )
     _stage(rt, METHOD_MCP_SERVER_INITIALIZED, "alpha")
     rt._send_and_await = AsyncMock(  # type: ignore[method-assign]

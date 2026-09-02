@@ -39,6 +39,7 @@ from kiro_crew.validation import (
     MAX_SHORT_STRING,
     SLACK_THREAD_TS_RE,
     ValidationError,
+    is_harness_id,
     normalize_lesson_category,
     validate_string_field,
     validate_tool_args,
@@ -300,6 +301,23 @@ async def api_crons_create(request: web.Request) -> web.Response:
             # "auto" sentinel (canonical key with no pinned provider id):
             # explicit inherit — same as leaving model unset.
             model_val = ""
+    # Per-job ACP harness override. Shape-checked only: whether the id names a
+    # registered, available harness is judged when the job FIRES (see
+    # cron.resolve_job_harness), so a job may legitimately be written for a
+    # harness the operator is about to install.
+    harness_raw = body.get("harness")
+    if harness_raw is not None and not isinstance(harness_raw, str):
+        # A numeric/bool JSON `harness` would raise on .strip() (HTTP 500) — 400.
+        return web.json_response(
+            {"error": "invalid harness format", "code": "invalid_harness"}, status=400
+        )
+    harness_val = (harness_raw or "").strip()
+    if harness_val and (
+        len(harness_val) > MAX_SHORT_STRING or not is_harness_id(harness_val)
+    ):
+        return web.json_response(
+            {"error": "invalid harness format", "code": "invalid_harness"}, status=400
+        )
     # Build the job FULLY-FORMED in a single locked add_job_async transaction.
     # Passing every optional field into the locked build+persist (rather than
     # mutating the returned job and calling a bare, unlocked `_save()`) closes
@@ -309,6 +327,7 @@ async def api_crons_create(request: web.Request) -> web.Response:
         "channel": channel,
         "agent_id": (agent_id or ""),
         "model": model_val,
+        "harness": harness_val,
         "silent": bool(silent),
         "timezone": (timezone_val or ""),
         "strict_schedule": bool(strict_schedule),
@@ -528,6 +547,20 @@ async def api_cron_update(request: web.Request) -> web.Response:
             if resolved_model == "":
                 m = ""
         kwargs["model"] = m
+    if "harness" in body:
+        harness_raw = body["harness"]
+        if harness_raw is not None and not isinstance(harness_raw, str):
+            return web.json_response(
+                {"error": "invalid harness format", "code": "invalid_harness"}, status=400
+            )
+        h = (harness_raw or "").strip()
+        if h and (len(h) > MAX_SHORT_STRING or not is_harness_id(h)):
+            return web.json_response(
+                {"error": "invalid harness format", "code": "invalid_harness"}, status=400
+            )
+        # Assigned on presence, so an empty value clears the override back to
+        # "inherit the default harness" rather than reading as no-op.
+        kwargs["harness"] = h
     # Validate channel if being updated
     if "channel" in kwargs:
         ch = (kwargs["channel"] or "").strip() or None
@@ -1370,6 +1403,9 @@ async def api_crons(request: web.Request) -> web.Response:
                 for a in (j.agent_sequence or [])
             ],
             "model": redact_credentials(redact_exfiltration_urls(j.model or "")[0])[0] or None,
+            # Serialized so the cron editor round-trips the stored override
+            # instead of clearing it on the next save. null = inherit.
+            "harness": redact_credentials(redact_exfiltration_urls(j.harness or "")[0])[0] or None,
             "channel": redact_credentials(redact_exfiltration_urls(j.channel or "")[0])[0] or None,
             "approval_mode": redact_credentials(redact_exfiltration_urls(j.approval_mode or "")[0])[
                 0

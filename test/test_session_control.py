@@ -2431,6 +2431,7 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
     child.mode = "orchestrator"
     child._artifact = "my-artifact"
     child.reasoning_effort = "high"
+    child.harness = "kas"
     child.color_index = 3
     child.title = "Pinned title"
     child._titled = True
@@ -2455,6 +2456,7 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         assert key in meta, f"slot-owned field {key!r} missing after an empty-window forced save"
     assert meta.get("artifact") == "my-artifact"
     assert meta.get("reasoning_effort") == "high"
+    assert meta.get("harness") == "kas"
     assert meta.get("color_index") == 3
     assert meta.get("title") == "Pinned title"
     assert meta.get("title_origin") == "user"

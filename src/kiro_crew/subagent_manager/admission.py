@@ -41,6 +41,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         max_turns: int = 0,
         model: str | None = None,
         reasoning_effort: str = "",
+        harness: str = "",
         allowed_tools: list[str] | None = None,
         bare: bool = False,
         cwd: str = "",
@@ -57,6 +58,8 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _effort_dropped: str = "",
+        _harness_selection: str = "",
     ) -> SubagentInfo | None:
         """Spawn a subagent for *task*.
 
@@ -292,6 +295,125 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 )
             )
 
+        # --- Harness: resolve, refuse, and reconcile the effort level with it ---
+        # Pre-dispatch on purpose. Everything downstream (the queue entry, the
+        # session-sharing decision, every reporting surface) needs the RESOLVED
+        # id, and a selection that cannot be served has to cost this spawn rather
+        # than a started run that silently ran somewhere else.
+        #
+        # A drained member skips resolution: its harness was resolved and
+        # validated when it was first submitted, and re-validating on drain would
+        # refuse work for an availability blip during a wait the caller never saw
+        # — while ALSO newly probing the default path, which nothing does today.
+        from kiro_crew.agent_sdk.harness import CAPABILITY_REASONING_EFFORT
+        from kiro_crew.subagent import (
+            _harness_model_reason,
+            _parent_harness_id,
+            _resolve_spawn_harness,
+        )
+
+        harness_id = (harness or "").strip()
+        harness_selection = _harness_selection
+        effort_dropped = _effort_dropped
+        if not _from_queue:
+            explicitly_selected = bool(harness_id)
+            # WHOSE binding is inherited: a continuation resumes the
+            # conversation's own session, so the harness that holds the transcript
+            # is the CONVERSATION's binding — not that of whichever session
+            # happens to be dispatching the follow-up. Reading the dispatcher's
+            # would refuse a continuation whenever the dispatcher's harness is
+            # unavailable, even though the resumed run is not served by it, and
+            # would stamp the run with a harness that did not run it.
+            inherited = _parent_harness_id(
+                self._manager._sessions, conversation_key or parent_session_key
+            )
+            binding, harness_err = _resolve_spawn_harness(harness_id, inherited)
+            if binding is None:
+                logger.warning("Subagent spawn refused: %s", harness_err)
+                try:
+                    sel().log_tool_invocation(
+                        session_key=parent_session_key or "",
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="rejected_harness",
+                        error=harness_err,
+                        metadata={"harness": harness_id, "task": _redacted_task[:120]},
+                    )
+                except Exception:
+                    logger.debug("SEL audit failed for harness rejection", exc_info=True)
+                return self._manager._announce_rejection(
+                    SubagentInfo(
+                        id=agent_id,
+                        task=_redacted_task,
+                        agent=agent,
+                        parent_session_key=parent_session_key,
+                        # The REQUESTED id, so a refusal says what was asked for
+                        # rather than reading as a run on some other harness.
+                        harness=harness_id,
+                        done=True,
+                        error=f"spawn refused: {harness_err}",
+                        batch_id=batch_id,
+                        batch_total=max(0, int(batch_total)),
+                    )
+                )
+            harness_id = binding.harness_id
+            # What session creation gets told (see ``_harness_selection``). The
+            # resolved id for a pick this run actually made, ``""`` for a run that
+            # made none and for a continuation, whose session knows its own
+            # binding better than this call does.
+            harness_selection = (
+                binding.harness_id
+                if explicitly_selected or (inherited and not conversation_key)
+                else ""
+            )
+            model_err = _harness_model_reason(binding, model or "")
+            if model_err:
+                logger.warning("Subagent spawn refused: %s", model_err)
+                try:
+                    sel().log_tool_invocation(
+                        session_key=parent_session_key or "",
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="rejected_harness_model",
+                        error=model_err,
+                        metadata={
+                            "harness": harness_id,
+                            "model": model or "",
+                            "task": _redacted_task[:120],
+                        },
+                    )
+                except Exception:
+                    logger.debug("SEL audit failed for harness-model rejection", exc_info=True)
+                return self._manager._announce_rejection(
+                    SubagentInfo(
+                        id=agent_id,
+                        task=_redacted_task,
+                        agent=agent,
+                        parent_session_key=parent_session_key,
+                        harness=harness_id,
+                        model=model or "",
+                        done=True,
+                        error=f"spawn refused: {model_err}",
+                        batch_id=batch_id,
+                        batch_total=max(0, int(batch_total)),
+                    )
+                )
+            if reasoning_effort and not binding.descriptor.capabilities.has(
+                CAPABILITY_REASONING_EFFORT
+            ):
+                # Dropped rather than passed through: a level this harness cannot
+                # honour would still force the dedicated-process path (~3-5s,
+                # ~400MB per run) for an effect it never has, which at fan-out
+                # scale is the whole cost of the feature and none of its benefit.
+                logger.info(
+                    "Subagent spawn: dropping reasoning_effort %r — harness %r "
+                    "declares no effort support",
+                    reasoning_effort,
+                    harness_id,
+                )
+                effort_dropped = reasoning_effort
+                reasoning_effort = ""
+
         now = time.monotonic()
         should_queue, slot_free = self._manager._should_stagger_queue(now)
         if should_queue:
@@ -346,6 +468,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     "max_turns": max_turns,
                     "model": model,
                     "reasoning_effort": reasoning_effort,
+                    "harness": harness_id,
                     "allowed_tools": allowed_tools,
                     "bare": bare,
                     "cwd": resolved_cwd,
@@ -361,6 +484,8 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     "include_project": include_project,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
+                    "_harness_selection": harness_selection,
+                    "_effort_dropped": effort_dropped,
                 }
             )
             logger.info(
@@ -390,6 +515,11 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 agent=agent,
                 app=app,
                 queued=True,
+                # The resolved inherited/selected harness, written down on the
+                # info as well as the queue dict: a queued member's parent may be
+                # gone by the time it drains, so the id cannot be re-derived and
+                # the completion event must report the harness the run will use.
+                harness=harness_id,
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
                 include_memory=include_memory,
@@ -439,6 +569,9 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             max_turns=max_turns,
             model=model or "",
             reasoning_effort=reasoning_effort or "",
+            harness=harness_id,
+            _harness_selection=harness_selection,
+            effort_dropped=effort_dropped,
             allowed_tools=list(allowed_tools) if allowed_tools else [],
             bare=bare,
             cwd=resolved_cwd,

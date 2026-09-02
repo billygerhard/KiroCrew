@@ -146,6 +146,38 @@ class TestDoctor:
 
         monkeypatch.setattr(_doc.sandbox, "detect_backend", lambda config_mode="auto": "namespace")
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_crash_dumps(self, monkeypatch):
+        """Pin the Loop-stall Crash Dumps section host-independently.
+
+        The merged-in section reads the real ``get_dumps_dir()`` and reports a
+        recent dump as a HARD issue (doctor exits 1). A developer host that
+        actually stalled the loop in the last week therefore fails every doctor
+        exit-status assertion here, which would report the runner rather than the
+        behaviour under test. Pin the newest-dump probe to "none found" (the
+        healthy path) exactly as the sandbox/embedding pins neutralize their own
+        host facts."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(_doc, "newest_dump_with_stacks", lambda dumps_dir: None)
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_managed_service(self, monkeypatch):
+        """Pin the Managed Service section host-independently.
+
+        The merged-in section asks ``service_controller`` whether the INSTALLED
+        service definition carries the managed-service policy marker. A developer
+        host with a service installed before that marker existed answers ``False``,
+        which doctor reports as the hard issue "managed service definition is
+        outdated" (exit 1) — a fact about the runner, not the behaviour under test.
+        Pin it to ``None`` (no managed service installed), which skips the section
+        entirely, the clean baseline these tests assume."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(
+            _doc.service_controller, "installed_service_has_managed_marker", lambda: None
+        )
+
     def test_doctor_with_kiro(self, tmp_path):
         agent_file = tmp_path / "kirocrew.json"
         # A minimally healthy agent config so doctor walks the whole MCP
@@ -620,6 +652,7 @@ class TestCronCli:
                 every_secs=300,
                 channel="C0AP77JJSN6",
                 approval_mode="",
+                harness="",
             )
 
     def test_cron_add_with_cron_expr_and_channel(self, tmp_path):
@@ -654,6 +687,7 @@ class TestCronCli:
                 cron_expr="0 9 * * 1-5",
                 channel="C0APAPQ5GSY",
                 approval_mode="",
+                harness="",
             )
 
     def test_cron_add_with_approval_mode(self, tmp_path):
@@ -688,13 +722,14 @@ class TestCronCli:
                 every_secs=600,
                 channel=None,
                 approval_mode="auto",
+                harness="",
             )
             mock_sel.return_value.log_api_access.assert_called_once_with(
                 caller="cli",
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ghi approval_mode=auto agent=default silent=False",
+                resources="job_id=ghi approval_mode=auto agent=default harness=default silent=False",
             )
 
     def test_cron_add_with_silent(self):
@@ -729,6 +764,7 @@ class TestCronCli:
                 every_secs=300,
                 channel=None,
                 approval_mode="",
+                harness="",
             )
             # silent is set via post-create mutation, mirroring agent_id
             assert mock_job.silent is True
@@ -866,6 +902,7 @@ class TestCronCli:
                 every_secs=600,
                 channel=None,
                 approval_mode="",
+                harness="",
             )
             assert mock_job.agent_id == "customer360-code-agent"
             mock_svc._save.assert_called_once()
@@ -876,7 +913,7 @@ class TestCronCli:
                 operation="cron.add",
                 outcome="allowed",
                 source="cli",
-                resources="job_id=ag1 approval_mode=default agent=customer360-code-agent silent=False",
+                resources="job_id=ag1 approval_mode=default agent=customer360-code-agent harness=default silent=False",
             )
 
     def test_cron_add_with_agent_cron_expr(self, tmp_path):
@@ -907,6 +944,7 @@ class TestCronCli:
                 cron_expr="0 9 * * 1-5",
                 channel=None,
                 approval_mode="",
+                harness="",
             )
             assert mock_job.agent_id == "ea-briefing"
             mock_svc._save.assert_called_once()
@@ -4100,6 +4138,16 @@ class TestDoctorStt:
         monkeypatch.setattr(_doc, "_load_llama_class", lambda: object)
         monkeypatch.setattr(_doc, "model_file_present", lambda path=None: False)
         monkeypatch.setattr(_doc.sandbox, "detect_backend", lambda config_mode="auto": "namespace")
+        # The merged-in Loop-stall Crash Dumps section reads the real dumps dir and
+        # reports a recent dump as a hard issue; pin it to the healthy "none found"
+        # path so an STT exit-status assertion cannot report the host's last stall.
+        monkeypatch.setattr(_doc, "newest_dump_with_stacks", lambda dumps_dir: None)
+        # The merged-in Managed Service section reports an installed service whose
+        # definition predates the policy marker as a hard issue; pin it to "no
+        # managed service" (None) so the section skips on a developer host.
+        monkeypatch.setattr(
+            _doc.service_controller, "installed_service_has_managed_marker", lambda: None
+        )
         # POSIX severity: a missing prerequisite is a hard issue. The Windows note
         # arm is pinned in ``TestDoctor::test_doctor_stt_marker_arms_match_platform``.
         monkeypatch.setattr(_doc.platform_compat, "IS_WINDOWS", False)

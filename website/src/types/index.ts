@@ -383,12 +383,40 @@ export interface SessionTrashResult {
   refused: SessionTrashRefusal[]
 }
 
+/** One ACP harness as a selection surface sees it.
+ *
+ *  `available` is a judgement about the MACHINE right now (is the executable
+ *  there, did a recent start fail), not about the descriptor, so it can flip
+ *  between two listings without anything being reconfigured. `reason` is empty
+ *  exactly when `available` is true.
+ *
+ *  `serviceable` is the other, independent reason a row cannot be picked: THIS
+ *  BUILD cannot start a session on it (no legacy backend identifier, so the
+ *  capability gates would answer for kiro-cli). It carries no reason because the
+ *  verdict is the same for every such row — the explanation is a catalog string on
+ *  the surface, not untranslated prose from the gateway. Absent means serviceable,
+ *  which is what a gateway predating the field is saying about every row it
+ *  serves. */
+export interface HarnessListing {
+  id: string
+  display_name: string
+  available: boolean
+  reason: string
+  bundled?: boolean
+  serviceable?: boolean
+}
+
 export interface CronJob {
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
   cron_expr?: string | null; every?: number | null; every_secs?: number | null
   at?: number | null; created_ts?: number | null
   agent?: string; model?: string; channel?: string; approval_mode?: string; silent?: boolean
+  /** ACP harness this job's runs use. Null/absent inherits the configured
+   *  default. Checked when the job fires rather than when it is saved, so a
+   *  value here can name a harness that is not installed yet — that run fails
+   *  with a reason naming it and the job stays scheduled. */
+  harness?: string | null
   /** Crews a sequence job runs, in order. Takes PRECEDENCE over `agent` at run
    *  time, so any consumer attributing a job to a crew must read this first. */
   agent_sequence?: string[]
@@ -826,6 +854,13 @@ export interface ChatSlot {
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
+  /** ACP harness this session is created on. Empty means "inherit the configured
+   * default" — the value every session minted before harnesses were selectable
+   * carries — so a picker renders the default row as preselected rather than
+   * showing nothing chosen. Bound at BIRTH and never rewritten: changing the
+   * choice recreates the slot (the same shape a memory-mode switch takes),
+   * because a live session owns its harness for its whole life. */
+  harness?: string
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */

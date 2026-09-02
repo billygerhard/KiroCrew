@@ -142,6 +142,18 @@ _SEND_MESSAGE_CHANNEL_TYPES: frozenset[str] = frozenset(CHANNEL_SESSION_NAMESPAC
 logger = logging.getLogger(__name__)
 
 
+def _harness_of(info: Any) -> str:
+    """The harness id recorded on *info*, or ``""`` when it carries none.
+
+    Type-guarded rather than truthiness-guarded: a ``SubagentInfo`` double answers
+    every attribute with a mock, and a mock reaching a JSON body is a 500 from the
+    encoder instead of an absent field. ``""`` is also the honest answer for a
+    record written before harness binding — never the default harness's name.
+    """
+    value = getattr(info, "harness", "")
+    return value if isinstance(value, str) else ""
+
+
 def _read_text_or_none(path: Path) -> str | None:
     """Read ``path`` as UTF-8, or return None if it does not exist.
 
@@ -194,6 +206,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 "cwd": body.get("cwd", ""),
                 "model": body.get("model", ""),
                 "reasoning_effort": body.get("reasoning_effort", ""),
+                "harness": body.get("harness", ""),
                 "include_memory": body.get("include_memory", True),
                 "include_lessons": body.get("include_lessons", True),
                 "include_project": body.get("include_project", True),
@@ -232,6 +245,7 @@ async def api_spawn(request: web.Request) -> web.Response:
     cwd = cleaned.get("cwd") or ""
     model = cleaned.get("model") or ""
     reasoning_effort = cleaned.get("reasoning_effort") or ""
+    harness = cleaned.get("harness") or ""
     # Batch/wave identity (transport-layer params from spawn_run MCP, like
     # approval_mode/silent above): validated inline, bounded, never LLM-schema.
     batch_id = str(body.get("batch_id", "") or "")[:32]
@@ -253,6 +267,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         cwd=cwd,
         model=model or None,
         reasoning_effort=reasoning_effort,
+        harness=harness,
         approval_mode=approval_mode or None,
         silent=silent,
         batch_id=batch_id,
@@ -292,12 +307,32 @@ async def api_spawn(request: web.Request) -> web.Response:
             status=400,
         )
     resp: dict[str, object] = {"id": info.id, "task": task, "status": "spawned"}
-    # Server-side effort verdict: only this side knows the model the factory's
-    # effort gate will see (explicit per-call value, else the subagent role
-    # pin, else the session chain for the effective agent — a crew's pin, else
-    # a non-sentinel global). Additive, optional key — reporting only, never
+    # The harness that will serve the run — echoed even when the caller named
+    # none, because an inherited or defaulted selection is precisely the case the
+    # caller cannot work out for itself.
+    resolved_harness = _harness_of(info)
+    if resolved_harness:
+        resp["harness"] = resolved_harness
+    # Server-side effort verdict, on ONE key for both halves of the same
+    # question. Only this side knows either input: which harness resolved (this
+    # call may have inherited or defaulted it) and which model the factory's
+    # effort gate will see (explicit per-call value, else the subagent role pin,
+    # else the session chain for the effective agent — a crew's pin, else a
+    # non-sentinel global). Additive, optional keys — reporting only, never
     # changes whether the spawn happened.
-    if reasoning_effort:
+    #
+    # The HARNESS verdict is checked first and short-circuits: a harness that
+    # cannot honour effort at all makes the model's capability moot, and
+    # reporting the model reason there would send the caller to change a pin that
+    # would not help.
+    harness_drop = getattr(info, "effort_dropped", "")
+    if isinstance(harness_drop, str) and harness_drop:
+        resp["effort_dropped"] = (
+            f"harness {resolved_harness!r} does not support effort configuration"
+            if resolved_harness
+            else "the resolved harness does not support effort configuration"
+        )
+    elif reasoning_effort:
         # Mirror _run_inner's agent inheritance so the verdict judges the same
         # agent the session will actually use.
         verdict_agent = agent or (
@@ -753,6 +788,15 @@ async def api_spawn_list(request: web.Request) -> web.Response:
         ]
         if withheld:
             entry["context_withheld"] = withheld
+        # Attribution: which harness served this run and what it actually ran on.
+        # Present only when known, so a record written before harness binding
+        # reads as "unknown" rather than as a run on the default harness.
+        harness = _harness_of(info)
+        if harness:
+            entry["harness"] = harness
+        resolved_model = getattr(info, "resolved_model", "")
+        if isinstance(resolved_model, str) and resolved_model:
+            entry["resolved_model"] = resolved_model
         agents.append(entry)
     return web.json_response({"agents": agents})
 
@@ -803,6 +847,10 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         # Like model and the context groups: a retry must run at the SAME
         # effort as the run it replaces, or it is a different experiment.
         reasoning_effort=old.reasoning_effort,
+        # Same rule for the harness, and here it is also what keeps the retry
+        # comparable: re-resolving would silently move the retry to the current
+        # default if the original had inherited a different harness.
+        harness=_harness_of(old),
         approval_mode=old.approval_mode or None,
         silent=old.silent,
         # A retry must see the SAME context scope as the run it replaces —

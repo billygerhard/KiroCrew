@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import math
 import os
@@ -2115,86 +2114,6 @@ class TestOAuthAuthorizationUrlRedaction:
         cleaned, warnings = redact_exfiltration_urls(self.NOTION_URL)
         assert cleaned != self.NOTION_URL
         assert warnings
-
-    def test_diagnostic_identifies_long_query_parameter_shape(self) -> None:
-        opaque_state = "Ab9_" * 64
-        url = "https://id.example-idp.com/authorize?state=" + opaque_state
-
-        diagnostic = security.diagnose_oauth_url_credential(url)
-
-        assert diagnostic is not None
-        assert diagnostic.rule == "exfil_query_length"
-        assert diagnostic.component == "query_parameter"
-        assert diagnostic.parameter == "state"
-        assert diagnostic.shape.length == len(opaque_state)
-        assert diagnostic.shape.ascii_uppercase == 64
-        assert diagnostic.shape.ascii_lowercase == 64
-        assert diagnostic.shape.digits == 64
-        assert diagnostic.shape.symbols == 64
-
-    def test_diagnostic_identifies_standard_param_bare_secret_rule(self) -> None:
-        url = self.NOTION_URL.replace(self.STATE, self.BARE_AWS_SECRET_ALNUM, 1)
-
-        diagnostic = security.diagnose_oauth_url_credential(url)
-
-        assert diagnostic is not None
-        assert diagnostic.rule == "credential_scan_bare_secret_raw"
-        assert diagnostic.component == "query_parameter"
-        assert diagnostic.parameter == "state"
-        assert diagnostic.shape.length == len(self.BARE_AWS_SECRET_ALNUM)
-
-    def test_credential_shaped_parameter_name_is_omitted(self) -> None:
-        raw_name = self.GITHUB_TOKEN
-        url = f"https://api.notion.com/v1/oauth/authorize?{raw_name}=x"
-
-        diagnostic = security.diagnose_oauth_url_credential(url)
-
-        assert diagnostic is not None
-        assert diagnostic.parameter is None
-        assert raw_name not in json.dumps(diagnostic.as_dict(), sort_keys=True)
-
-    def test_unrecognized_parameter_name_is_omitted_from_diagnostic_and_log(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        raw_name = "opaqueCredentialLikeKey"
-        opaque_value = "Ab9_" * 64
-        url = f"https://id.example-idp.com/authorize?{raw_name}={opaque_value}"
-
-        diagnostic = security.diagnose_oauth_url_credential(url)
-
-        assert diagnostic is not None
-        assert diagnostic.rule == "exfil_query_length"
-        assert diagnostic.parameter is None
-        with caplog.at_level("WARNING", logger="kiro_crew.security"):
-            assert oauth_url_contains_credential(url) is True
-        output = json.dumps(diagnostic.as_dict(), sort_keys=True) + "\n" + caplog.text
-        assert raw_name not in output
-        assert opaque_value not in output
-
-    def test_diagnostic_and_log_never_disclose_parameter_value(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        raw_value = self.GITHUB_TOKEN
-        url = self.NOTION_URL.replace(self.STATE, raw_value, 1)
-
-        diagnostic = security.diagnose_oauth_url_credential(url)
-        assert diagnostic is not None
-        assert diagnostic.rule == "fixed_credential_raw"
-        assert diagnostic.component == "query_parameter"
-        assert diagnostic.parameter == "state"
-
-        with caplog.at_level("WARNING", logger="kiro_crew.security"):
-            assert oauth_url_contains_credential(url) is True
-
-        serialized = json.dumps(diagnostic.as_dict(), sort_keys=True)
-        logged = "\n".join(record.getMessage() for record in caplog.records)
-        digest = hashlib.sha256(raw_value.encode()).hexdigest()
-        for output in (serialized, repr(diagnostic), logged):
-            assert url not in output
-            assert raw_value not in output
-            assert raw_value[:16] not in output
-            assert raw_value[-16:] not in output
-            assert digest not in output
 
     @pytest.mark.parametrize(
         "url",
@@ -6944,6 +6863,91 @@ class TestBareTokenProtectedLeaves:
             for prefix in security.crew_home_prefixes():
                 anchored = f"echo forged > ~/{prefix}/{leaf}"
                 assert is_sensitive_bash_command(anchored) is not None, anchored
+
+
+class TestWriteProtectedConfigKeys:
+    """Key-level write guard for config values the file-level guards cannot cover.
+
+    ``config.json`` is on the write-only PATH tier and is deliberately absent from
+    ``_WRITE_PROTECTED_BASH_LEAVES`` (that matcher is verb-independent, so listing
+    it would deny the routine config READS the tier exists to preserve). Neither
+    guard sees ``kirocrew config set``, which takes the config lock itself — so a
+    key whose value is not merely a setting needs refusing by NAME.
+    """
+
+    def test_the_harness_key_is_protected(self) -> None:
+        # Pinned against the list, not only the predicate: dropping the entry must
+        # fail here rather than silently reopening the setter.
+        assert "agent.harnesses" in security.write_protected_config_keys()
+
+    def test_the_key_itself_is_refused(self) -> None:
+        reason = security.protected_config_write("agent.harnesses", {})
+        assert "agent.harnesses is operator-only" in reason
+
+    def test_a_path_inside_the_key_is_refused(self) -> None:
+        assert security.protected_config_write("agent.harnesses.evil.executable", "/tmp/pwn")
+
+    def test_an_ancestor_carrying_the_key_is_refused(self) -> None:
+        assert security.protected_config_write("agent", {"harnesses": {"evil": {}}})
+        # Whole-config replacement (the ``--file`` form) passes an empty key.
+        assert security.protected_config_write("", {"agent": {"harnesses": {}}})
+
+    def test_an_ancestor_that_does_not_carry_the_key_is_allowed(self) -> None:
+        # The ancestor case is decided by the VALUE. A guard that refused every
+        # ancestor write would break ordinary section writes while passing every
+        # refusal test above.
+        assert security.protected_config_write("agent", {"approval_mode": "interactive"}) == ""
+        assert security.protected_config_write("", {"agent": {"model": "auto"}}) == ""
+
+    def test_a_non_mapping_ancestor_value_cannot_carry_the_key(self) -> None:
+        # A scalar or list sets no nested key, and treating one as if it could
+        # would refuse writes that author nothing.
+        assert security.protected_config_write("agent", "auto") == ""
+        assert security.protected_config_write("agent", ["harnesses"]) == ""
+
+    def test_an_ancestor_write_that_deletes_the_key_is_refused(self) -> None:
+        # Setting a parent replaces the whole node beneath it, so this write
+        # destroys an operator's definition while naming nothing protected.
+        # Deletion is a modification: it can retire the harness a session expects.
+        on_disk = {"agent": {"harnesses": {"mine": {"executable": "/opt/agy/agy-acp"}}}}
+        reason = security.protected_config_write("agent", {"approval_mode": "auto"}, on_disk)
+        assert "agent.harnesses is operator-only" in reason
+        assert "replace the section that currently defines it" in reason
+        # Whole-config replacement destroys it the same way.
+        assert security.protected_config_write("", {"session": {"pool_size": 3}}, on_disk)
+
+    def test_a_non_mapping_ancestor_still_deletes_what_is_on_disk(self) -> None:
+        # The value-based half passes a scalar (it carries no nested key), so this
+        # is the case that a value-only guard reads as innocuous while it wipes the
+        # section.
+        on_disk = {"agent": {"harnesses": {"mine": {}}}}
+        assert security.protected_config_write("agent", "auto", on_disk)
+        assert security.protected_config_write("agent", ["harnesses"], on_disk)
+
+    def test_an_ancestor_write_is_allowed_when_nothing_is_on_disk(self) -> None:
+        # The control for the delete half: it is decided by what the file HOLDS, so
+        # a config with no harness definition keeps ordinary section writes working.
+        on_disk = {"agent": {"model": "auto", "harness": "kiro"}}
+        assert security.protected_config_write("agent", {"approval_mode": "auto"}, on_disk) == ""
+        assert security.protected_config_write("", {"agent": {"model": "auto"}}, on_disk) == ""
+
+    def test_a_non_ancestor_write_never_consults_the_existing_value(self) -> None:
+        # `agent.model` is a sibling, not an ancestor, so it replaces no node that
+        # holds a definition: an on-disk harness must not start failing leaf writes.
+        on_disk = {"agent": {"harnesses": {"mine": {}}}}
+        assert security.protected_config_write("agent.model", "auto", on_disk) == ""
+        assert security.protected_config_write("dashboard.bot_name", "Crew", on_disk) == ""
+
+    def test_unrelated_keys_are_untouched(self) -> None:
+        for key in ("dashboard.bot_name", "agent.harness", "agent.model", "session.pool_size"):
+            assert security.protected_config_write(key, "x") == "", key
+
+    def test_the_reason_names_the_key_and_explains_itself(self) -> None:
+        # The refusal is reachable by an operator typing the same command, so it
+        # has to say what was refused and why rather than just failing.
+        reason = security.protected_config_write("agent.harnesses", {})
+        assert reason.startswith("agent.harnesses is operator-only: ")
+        assert "executable the gateway spawns" in reason
 
 
 class TestKiroAgentsDirWriteProtection:

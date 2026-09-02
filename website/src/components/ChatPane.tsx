@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { Cpu, X } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
@@ -24,6 +24,7 @@ import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useHarnesses, harnessRow } from '../hooks/useHarnesses'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -246,8 +247,37 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const availableModels = useAvailableModels()
+  // Scoped to THIS pane's session harness: a picker must offer the catalog of the
+  // harness that will serve the turn, never another harness's.
+  const availableModels = useAvailableModels({ harness: paneSlot?.harness || '' })
   const modelDD = useFilteredDropdown(availableModels)
+  // The bound harness's display name for the header chip, resolved against the
+  // SAME listing the welcome-screen picker uses (reused query, no new endpoint).
+  // `paneSlot.harness` empty means the default harness; harnessRow resolves ''
+  // to the listing's own default row, so the chip names the real harness for
+  // every chat including the default one. While the listing is still loading or
+  // its fetch failed it has no rows and no default, so we show the neutral
+  // default-harness label rather than flashing (loading) or freezing on (error)
+  // the raw stored id; once a good listing lands, an id it does not carry falls
+  // back to that raw id so the chip never renders blank.
+  const harnessState = useHarnesses()
+  const harnessRowForSlot = harnessRow(harnessState, paneSlot?.harness || '')
+  const harnessListingUnknown = harnessState.isLoading || harnessState.isError
+  const harnessLabel = harnessRowForSlot
+    ? (harnessRowForSlot.display_name || harnessRowForSlot.id)
+    : (harnessListingUnknown
+        ? i18nT('components.harnessSelector.default_harness')
+        : (paneSlot?.harness || i18nT('components.harnessSelector.default_harness')))
+  // The fixity clause is honest only for an explicitly-pinned slot: a resolved
+  // default ('' harness) follows whatever the configured default is NOW, which
+  // an operator can change after the chat existed, so it was never fixed at
+  // creation. Pick the tooltip/aria string accordingly.
+  const harnessPinned = !!(paneSlot?.harness)
+  const harnessServingLabel = i18nT(
+    harnessPinned
+      ? 'components.chatPane.harness_serving_pinned'
+      : 'components.chatPane.harness_serving',
+  )
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -664,6 +694,21 @@ export default function ChatPane({
           )}
           <span className="flex-1" />
           {running && <span className="shrink-0 text-[10px] text-ok font-mono">{streamState}</span>}
+          {/* Read-only harness chip: names the AI harness this chat is bound to,
+           *  for every chat including the default. The binding is immutable for a
+           *  pinned slot (wave-1 semantics); a resolved-default slot follows the
+           *  configured default. Display-only either way — the picker lives on
+           *  the welcome screen. Same muted-chip shape as the fork tag above,
+           *  with the Cpu glyph the HarnessSelector uses. */}
+          <span
+            data-testid="chat-pane-harness-chip"
+            className="shrink-0 inline-flex items-center gap-1 text-[10px] text-muted bg-bg-hover rounded-full px-1.5 py-0.5 max-w-[38%]"
+            title={harnessServingLabel}
+            aria-label={harnessServingLabel}
+          >
+            <Cpu size={10} className="shrink-0 opacity-70" />
+            <span className="truncate">{harnessLabel}</span>
+          </span>
           {onSplitRight && (
             <button onClick={onSplitRight} title={i18nT('components.chatPane.split_right_d')} aria-label={i18nT('components.chatPane.split_right')} className="shrink-0 p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors">
               <SplitGlyph />
@@ -799,6 +844,8 @@ export default function ChatPane({
           onStop={onStop}
           autoFocusKey={slotKey}
           agentName={paneAgentName}
+          harnessLabel={harnessLabel}
+          harnessTitle={harnessServingLabel}
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           contextPct={contextPct}

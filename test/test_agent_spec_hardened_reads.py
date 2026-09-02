@@ -910,6 +910,10 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("mcp_stub_eligibility", "dashboard"),
     ],
     "kiro_crew/mcp_discovery.py": [("mcp_discovery_agent_config", "unknown")],
+    "kiro_crew/mcp_gateway/session_servers.py": [
+        ("mcp_gateway_session_servers", "unknown"),
+        ("mcp_gateway_session_servers", "unknown"),
+    ],
     "kiro_crew/session.py": [
         ("forward:operation", "forward:source"),
         ("resolve_agent_model", "unknown"),

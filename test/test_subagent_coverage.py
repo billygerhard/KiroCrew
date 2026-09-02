@@ -1453,7 +1453,8 @@ class TestScanKeepStates:
             rows = mgr._scan_keep_states()
         assert [r[0] for r in rows] == ["c1"]
         assert rows[0][2] == "sid-1"
-        assert rows[0][5] == 42.0
+        assert rows[0][5] == ""  # no harness recorded on this run
+        assert rows[0][6] == 42.0
 
     def test_unreadable_entry_is_skipped(self, tmp_path: Path) -> None:
         mgr = _manager()

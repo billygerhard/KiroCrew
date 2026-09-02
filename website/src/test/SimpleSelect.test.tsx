@@ -40,6 +40,36 @@ describe('SimpleSelect', () => {
     expect(screen.getByRole('combobox', { name: 'Copy from' })).toHaveTextContent('— none —')
   })
 
+  it('disabledOptions render but cannot be chosen', async () => {
+    // A row whose presence is the explanation (a harness this build cannot
+    // serve): hiding it would make "not offered" indistinguishable from
+    // "does not exist", so the row renders with the click removed.
+    const onChange = vi.fn()
+    render(
+      <SimpleSelect options={['kiro', 'codex']} value="kiro" onChange={onChange} disabledOptions={['codex']} aria-label="Harness" />
+    )
+    fireEvent.click(screen.getByRole('combobox', { name: 'Harness' }))
+    const row = await screen.findByRole('option', { name: 'codex' })
+    expect(row).toHaveAttribute('data-disabled')
+    fireEvent.click(row)
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('the CURRENT value is never disabled, whatever the caller passed', async () => {
+    // A stored setting has to stay displayable and re-selectable: Radix will
+    // not render a disabled item as the selected one, so disabling the current
+    // value would silently drop it from the trigger.
+    const onChange = vi.fn()
+    render(
+      <SimpleSelect options={['kiro', 'codex']} value="codex" onChange={onChange} disabledOptions={['codex']} aria-label="Harness" />
+    )
+    const trigger = screen.getByRole('combobox', { name: 'Harness' })
+    expect(trigger).toHaveTextContent('codex')
+    fireEvent.click(trigger)
+    const row = await screen.findByRole('option', { name: 'codex' })
+    expect(row).not.toHaveAttribute('data-disabled')
+  })
+
   it('Escape closes only the select, not a window-level Escape host (modal)', async () => {
     // Regression: Radix dismisses from a document listener, so without
     // stopPropagation in ui/select the same keydown reached the workspace

@@ -5350,6 +5350,8 @@
       "earlier_messages_open_session": "以前のメッセージ — セッション全体を開く（分割表示を閉じます）",
       "earlier_messages_unavailable": "以前のメッセージはこのセッションの履歴では利用できなくなりました。",
       "forked_from": "{{name}} からフォーク",
+      "harness_serving": "このチャットを処理する AI ハーネス",
+      "harness_serving_pinned": "このチャットを処理する AI ハーネス — チャット作成時に固定されます",
       "model_list": "モデルリスト",
       "session_ready_type_a_message_to_start": "セッション準備完了。メッセージを入力して開始してください。",
       "split_down": "下に分割",
@@ -5878,6 +5880,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "このチャットは {{name}} では開始できません: {{reason}}",
+      "default": "デフォルト",
+      "default_harness": "デフォルトのハーネス",
+      "harness_list": "ハーネス一覧",
+      "harness_list_unavailable": "ハーネス一覧を取得できません — 再試行中",
+      "harness_name": "ハーネス: {{name}}",
+      "invalid_reason": "無効な記述子 — {{reason}}",
+      "no_harnesses_registered": "登録されたハーネスがありません",
+      "not_registered": "未登録",
+      "not_serviceable": "このビルドではまだ対応していません",
+      "unavailable_reason": "利用できません — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "このジョブの短いラベル",
       "add": "追加",
@@ -5897,6 +5912,10 @@
       "every_interval": "毎回の間隔",
       "failed_to_save": "保存に失敗しました",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "スケジュールどおりに正確に実行。デフォルトではジョブはランダムに分散され、トラフィックスパイクが軽減されます。",
+      "harness": "ハーネス",
+      "harness_inherit": "ハーネス: 継承",
+      "harness_not_serviceable": "{{name}} — このビルドではまだ対応していません",
+      "harness_unavailable": "{{name}} — 利用不可（{{reason}}）",
       "hide_in_chat": "チャットで非表示",
       "hours": "時間",
       "how_often_this_job_runs": "このジョブの実行頻度",
@@ -5927,6 +5946,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "このジョブが実行するときエージェントに送信されるプロンプトまたはタスク",
       "timezone": "タイムゾーン",
       "weekly_schedule": "週次スケジュール",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "このジョブを実行する ACP ハーネス。既定を使う場合は「継承」のままにします。",
       "which_agent_handles_this_job_leave_default_for_t": "このジョブを処理するエージェント。プライマリエージェントの場合はデフォルトのままにしてください。"
     },
     "jobLogsView": {
@@ -9223,6 +9243,7 @@
       "retry": "再試行",
       "roll_the_folder_list_up": "フォルダー一覧を巻き上げる",
       "running_queued": "{{started}} 件実行中 · {{queued}} 件待機中",
+      "running_on_harness": "{{name}} で実行中",
       "running_session_other": "実行中のセッション {{count}} 件",
       "search_older_sessions": "以前のセッションを検索…",
       "search_sessions": "セッションを検索…",
@@ -9640,25 +9661,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "稼働中の Pod がないままディスクに残る Pod ホーム"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "エージェントバックエンド",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code は通常、実行前に承認を求め、{{productName}} がその要求を審査します。しかし Claude 自身の設定（プロジェクト内の .claude/settings.json を含む）で事前承認されたツールは要求を出さないため、拒否ルールと監査ログはその呼び出しを認識しません。",
-        "could_not_load_the_agent_backend": "エージェントバックエンドを読み込めませんでした。",
-        "could_not_save_the_agent_backend": "エージェントバックエンドを保存できませんでした。",
-        "default_all_features_supported": "デフォルト。すべての機能に対応しています。",
-        "experimental": "実験的",
-        "install_check_failed": "このマシンにインストールされているか確認できませんでした。",
-        "installed_restart_required": "このマシンにインストール済みですが、使用するにはこの gateway を再起動する必要があります。",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "設定を読み込んでいます…",
-        "missing_components": "このマシンにありません: {{components}}",
-        "missing_components_with_command": "このマシンにありません: {{components}}。次でインストールします: {{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "新しいセッションはこのエージェントを使用します。すでに開いているセッションは開始時のエージェントを維持し、ここで切り替えてもセッション中に変わることはありません。",
-        "retry": "再試行",
-        "set_is_fixed_at_gateway_start": "ここに表示されるエージェントは gateway の起動時に決まります。管理された環境ではポリシーで対象を制限できます。ポリシーの変更は次回の起動時に反映されます。"
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "crew 上でチャット",
         "chat_on_a_crew_desc": "作成メニューに「New chat on crew」を追加します。接続済みの crew 上で実行されるセッションを開始します。未完成です: その crew 自身のペインで開き、crew 上で実行中のセッションはまだここに表示されません。",
@@ -9672,10 +9674,6 @@
     "developerPage": {
       "developer": "デベロッパー",
       "tabs": {
-        "agentBackend": {
-          "description": "新しいセッションが起動するエージェント — Kiro CLI、Claude Code、KAS",
-          "label": "エージェントバックエンド"
-        },
         "archive": {
           "description": "ローテーション/圧縮済みセッション履歴（7 日間保持）",
           "label": "アーカイブ"
@@ -11996,6 +11994,47 @@
         "zoom_font": "ズーム＆フォント",
         "zoom_level": "ズームレベル",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "AI バックエンド",
+        "badge_available": "利用可能",
+        "badge_bundled": "同梱",
+        "badge_invalid": "無効",
+        "badge_missing": "未インストール",
+        "badge_not_serviceable": "未対応",
+        "badge_operator": "運用者定義",
+        "badge_restart_required": "再起動が必要",
+        "badge_unavailable": "利用不可",
+        "default_harness": "既定のハーネス",
+        "default_harness_unset": "未設定",
+        "failed_to_load_config": "現在の設定の読み込みに失敗しました。",
+        "failed_to_load_harnesses": "ハーネス一覧の読み込みに失敗しました。",
+        "failed_to_save": "保存に失敗しました",
+        "harness_list_unavailable": "ハーネス一覧を読み込めなかったため、利用可否は表示されません。",
+        "harness_not_serviceable": "{{name}} — このビルドでは未対応",
+        "harness_unavailable": "{{name}} — 利用不可（{{reason}}）",
+        "harnesses_are_defined_in_config_and_authenticate": "ハーネスは config.json で定義し、それぞれが自分で認証します。{{productName}} はプロバイダーの資格情報を保存しません。",
+        "install_check_failed": "このマシンにインストールされているか確認できませんでした。",
+        "installed_restart_required": "このマシンにはインストールされていますが、使用する前にこのゲートウェイを再起動する必要があります。",
+        "legacy_backend": "従来の ACP バックエンド",
+        "legacy_backend_kas": "KAS（kiro-agent）",
+        "legacy_backend_kiro": "Kiro CLI（既定）",
+        "legacy_backend_outranked": "既定のハーネスが設定されている間は無視されます。",
+        "legacy_backend_stored": "{{value}}（保存済み、選択不可）",
+        "missing_components": "このマシンに不足しています: {{components}}",
+        "missing_components_with_command": "このマシンに不足しています: {{components}}。次でインストール: {{command}}",
+        "no_harnesses_registered": "登録されているハーネスはありません。",
+        "not_serviceable_note": "このビルドはこのハーネスでセッションを開始できません。",
+        "operator_entry_conflicts": "この id のハーネス定義は却下されました: {{reason}}",
+        "registered_harnesses": "登録済みのハーネス",
+        "resolves_to": "新しいセッションは {{name}} で開始します。",
+        "resolves_to_not_serviceable": "新しいセッションは {{name}} に解決されますが、このビルドではセッションを開始できません。",
+        "resolves_to_unavailable": "新しいセッションは {{name}} に解決されますが、実行できません: {{reason}}",
+        "retry": "再試行",
+        "retry_config": "設定を再読み込み",
+        "retry_harness_list": "ハーネス一覧を再読み込み",
+        "the_older_key_read_as_an_alias_of_a_harness": "従来のバックエンドキー。登録済みハーネスの別名として読み取られます。",
+        "which_harness_new_sessions_start_on": "新しいセッションを開始するハーネス。実行中のセッションは開始時のハーネスを保持します。"
       },
       "importPanel": {
         "agent_data": "エージェントデータ",

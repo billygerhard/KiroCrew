@@ -971,8 +971,10 @@ class _MapSpy:
         self._sid = sid
         self._provider = provider
 
-    def set(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
-        self.entries[key] = (sid, provider, cwd)
+    def set(
+        self, key: str, sid: str, *, provider: str = "", cwd: str = "", harness: str = ""
+    ) -> None:
+        self.entries[key] = (sid, provider, cwd, harness)
 
     def get(self, key: str) -> str | None:
         return self._sid
@@ -993,11 +995,16 @@ class TestConversationMapSeams:
         mgr.seed_conversation("subagent:a", "")
         assert spy.entries == {}
 
-    def test_seeding_records_provider_and_cwd(self, mgr) -> None:
+    def test_seeding_records_provider_and_cwd_and_harness(self, mgr) -> None:
+        """The harness travels with the sid: a native session id is meaningful
+        only inside the store that minted it, so seeding one without its harness
+        leaves the entry reading as "the current default"."""
         spy = _MapSpy()
         mgr._session_map = spy
-        mgr.seed_conversation("subagent:a", "sid-1", provider="acp", cwd="/tmp/wt")
-        assert spy.entries == {"subagent:a": ("sid-1", "acp", "/tmp/wt")}
+        mgr.seed_conversation(
+            "subagent:a", "sid-1", provider="acp", cwd="/tmp/wt", harness="kas"
+        )
+        assert spy.entries == {"subagent:a": ("sid-1", "acp", "/tmp/wt", "kas")}
 
     def test_forgetting_returns_the_sid_and_clears_the_mark(self, mgr) -> None:
         mgr._session_map = _MapSpy(sid="sid-1")

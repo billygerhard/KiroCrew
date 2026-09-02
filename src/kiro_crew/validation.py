@@ -97,6 +97,43 @@ ALLOWED_HOOK_EVENTS = frozenset(
 # Valid agent name pattern (alphanumeric, hyphens, underscores)
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$")
 
+# Harness identifier grammar (lowercase kebab, at most 32 characters) — the same
+# rule ``acp.harness_descriptor`` enforces on a registered descriptor's id, spelled
+# again here rather than imported: this module is loaded by the stdio MCP server on
+# every tool call, and importing the ACP package for one regex would pull the
+# registry (and the config read behind it) into that path. The two spellings are
+# pinned together by a test that feeds the same candidates through both, so a
+# change to either grammar fails rather than drifting. ``\Z`` (not ``$``) because
+# ``FieldSpec`` matches with ``re.match``, and ``$`` also matches before a trailing
+# newline.
+#
+# Deliberately the SHAPE only. Whether an id names a registered, AVAILABLE harness
+# is a question about the machine right now, and its answer is not stable enough to
+# gate a write on: a cron job written while a harness is uninstalled must still be
+# writable, and a spawn's validator runs in the MCP server, which cannot see the
+# gateway's configuration at all. Both surfaces resolve and refuse at use time
+# instead. An EMPTY value never reaches the pattern (``FieldSpec`` skips it) and
+# means "inherit / clear the override" at every surface that accepts one.
+_HARNESS_ID_RE = re.compile(r"^[a-z0-9-]{1,32}\Z")
+
+
+def is_harness_id(value: str) -> bool:
+    """Whether ``value`` is a well-formed harness identifier.
+
+    The public reader of the grammar above, for the surfaces that check a harness
+    id OUTSIDE a ``FieldSpec``: a rehydrated history line, a CLI flag, a dashboard
+    cron write. They share this instead of each importing the pattern, so the one
+    module that owns the grammar can change how it is spelled — anchoring, length,
+    charset — without every caller having to know it is a regex at all.
+
+    Shape only, for the reason the pattern's own comment gives: whether an id names
+    a REGISTERED, available harness is a question about the machine right now, and
+    every surface answers it at use time. An empty value is not an id — callers that
+    accept "inherit the default" test for it before asking.
+    """
+    return bool(_HARNESS_ID_RE.match(value))
+
+
 # Artifact slug grammar — mirrors kiro_crew.artifacts._SLUG_RE (kept here so
 # consumers outside the store module share one public definition). Used to
 # validate the companion-chat `artifact` slot binding at EVERY
@@ -981,6 +1018,13 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
         # defer to the role_efforts['subagent'] pin, else the provider default".
         FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+        # Optional ACP harness for the subagent(s), batch-wide like ``model``.
+        # ``""`` means "inherit the spawning session's harness". Membership is
+        # NOT checked here: which harnesses exist depends on the gateway's
+        # configuration, which this validator (running in the stdio MCP server)
+        # cannot see — the gateway refuses an unknown or unavailable id with a
+        # reason naming it, and this layer only pins the shape.
+        FieldSpec("harness", str, max_len=MAX_SHORT_STRING, pattern=_HARNESS_ID_RE),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -2202,6 +2246,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         FieldSpec("at_time", str, max_len=100),
         FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        FieldSpec("harness", str, max_len=MAX_SHORT_STRING, pattern=_HARNESS_ID_RE),
         FieldSpec("silent", bool),
         FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
         FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
@@ -2800,6 +2845,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("every", int, min_val=60, max_val=86400 * 30),
             FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
             FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+            FieldSpec("harness", str, max_len=MAX_SHORT_STRING, pattern=_HARNESS_ID_RE),
             FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
             FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
             FieldSpec("approval_mode", str, max_len=10, pattern=re.compile(r"^(auto)?$")),

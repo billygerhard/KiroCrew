@@ -716,6 +716,8 @@ class RunEventCoordinator(ManagerComponent):
                     session_key,
                     agent=agent or None,
                     approval_policy=parent_policy,
+                    harness=info._harness_selection,
+                    harness_prebound=True,
                     **extra_kwargs,
                 )
                 is_cc = self._manager._is_cc_provider(client)
@@ -728,6 +730,14 @@ class RunEventCoordinator(ManagerComponent):
                 session_key,
                 agent=agent or None,
                 approval_policy=parent_policy,
+                # The harness this run was validated, recorded and reported under.
+                # ``_harness_selection`` (not ``harness``): a run that made no
+                # pick and a continuation both defer to the session's own binding,
+                # while a run whose parent is a non-default-bound harness must not
+                # be stamped with a harness nobody named. ``harness_prebound``
+                # tells creation the spawn gate already resolved and validated this.
+                harness=info._harness_selection,
+                harness_prebound=True,
                 **extra_kwargs,
             )
             # Fail CLOSED on a continuation that did not actually resume:
@@ -1641,7 +1651,17 @@ class RunEventCoordinator(ManagerComponent):
         """Decide whether a subagent should use the shared-runtime path.
 
         All must hold: session_sharing config True; parent session exists and
-        is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare).
+        is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare);
+        and this subagent is bound to the SAME harness as the parent, because the
+        shared runtime IS one harness's process — a subagent bound to another
+        cannot borrow it, and running it there anyway would execute the task on a
+        harness nobody selected while every surface reported the one that was.
+
+        The harness comparison is deliberately fail-OPEN: an unreadable parent
+        binding (``""``) is not treated as a mismatch, because reading it as one
+        would push every spawn onto a dedicated process the moment session
+        binding stopped answering, for a session that today can only be running
+        the default harness anyway.
         """
         try:
             cfg = KiroCrewConfig.load()
@@ -1652,6 +1672,17 @@ class RunEventCoordinator(ManagerComponent):
         if info.model or info.allowed_tools or info.bare:
             return False
         if not info.parent_session_key:
+            return False
+        from kiro_crew.subagent import _parent_harness_id
+
+        parent_harness = _parent_harness_id(self._manager._sessions, info.parent_session_key)
+        if parent_harness and info.harness and parent_harness != info.harness:
+            logger.info(
+                "Subagent %s: dedicated process — bound to harness %r, parent runs %r",
+                info.id,
+                info.harness,
+                parent_harness,
+            )
             return False
         return self._manager._sessions.is_session_sharing_eligible(info.parent_session_key)
 

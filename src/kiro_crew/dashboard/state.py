@@ -2981,6 +2981,7 @@ class _ChatSlot:
         "title",
         "agent",
         "model",
+        "harness",
         "_model_withheld",
         "_model_withheld_for",
         "reasoning_effort",
@@ -3142,11 +3143,19 @@ class _ChatSlot:
         mode: str = "",
         memory_mode: str = "persistent",
         ephemeral: bool = False,
+        harness: str = "",
     ) -> None:
         self.key = key
         self.title = title or key
         self.agent = agent
         self.model = model
+        # ACP harness this slot's session is created on. ``""`` inherits the
+        # configured default at creation time, which is what every slot minted
+        # before harnesses were selectable reads as. Set at BIRTH and never
+        # rewritten: the session binds it for its whole life, so changing the
+        # choice means a new slot (the surface recreates one, exactly as a
+        # memory-mode switch does) rather than retargeting a bound session.
+        self.harness = harness
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
         # two directly: the pairing is what makes the verdict self-invalidating
@@ -6018,6 +6027,7 @@ class DashboardState:
         linked_session_key: str = "",
         channel_origin: bool = False,
         origin: str | None = None,
+        harness: str = "",
         *,
         # Opt-in for the survey's "new user" session counter, DISTINCT from the
         # origin tag: ``SlotOrigin.USER`` carries the ``slots:user`` privacy
@@ -6063,6 +6073,7 @@ class DashboardState:
             model=model,
             mode=mode,
             memory_mode=memory_mode or "persistent",
+            harness=harness,
         )
         if requested_name and requested_name != name:
             # The caller asked for a human-readable name (e.g. "Artifact: My

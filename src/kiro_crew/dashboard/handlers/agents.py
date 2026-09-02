@@ -13,7 +13,7 @@ import stat
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from aiohttp import web
 
@@ -36,6 +36,16 @@ from kiro_crew.agent_discovery import (
     project_agent_names,
     spec_model,
     spec_str,
+)
+from kiro_crew.agent_sdk.harness import (
+    HARNESS_KIRO,
+    MODEL_SOURCE_STATIC,
+    UnknownHarness,
+    default_harness_id,
+)
+from kiro_crew.agent_sdk.harness import registry as harness_registry
+from kiro_crew.agent_sdk.harness import (
+    unserviceable_reason,
 )
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
@@ -1975,8 +1985,219 @@ def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
     return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
 
 
+def _harness_model_row(model_id: str, display_name: str = "", description: str = "") -> dict:
+    """One ``/api/models`` row for a harness-scoped catalog.
+
+    ``context_window_tokens`` is included only when the central window authority
+    actually knows the id. Emitting a 0 (or a guess) would be worse than omitting
+    it: the picker renders its occupancy meter from this number, and a 0 reads as
+    "no context at all" while an invented value misreports every turn's headroom.
+    Absent means "unknown", which the client already handles — the kiro path omits
+    the field too whenever ``--list-models`` did not report one.
+    """
+    row: dict = {
+        "model_name": model_id,
+        "display_name": display_name or model_id,
+        "description": description,
+    }
+    window = model_registry.model_window(model_id)
+    if window:
+        row["context_window_tokens"] = int(window)
+    return row
+
+
+def _static_harness_models(models: Iterable[str]) -> list[dict]:
+    """Descriptor-declared model ids in the ``/api/models`` row shape.
+
+    For a harness whose ``model_source`` is ``static``: it cannot enumerate over
+    ACP, so its descriptor's list IS the catalog. Rows carry the same keys the
+    kiro path emits so one picker renders both without a per-harness branch.
+    """
+    rows: list[dict] = []
+    for model in models:
+        name = str(model or "").strip()
+        if name:
+            rows.append(_harness_model_row(name))
+    return rows
+
+
+def _advertised_harness_models(state: Any, harness_id: str) -> list[dict]:
+    """The models a LIVE session on ``harness_id`` advertised, or ``[]``.
+
+    Generalizes the kiro ``_capture_available_models`` path to any harness: the
+    list a harness reports at ``session/new`` is the only tier-aware answer it
+    gives, and it exists only while a session on THAT harness is live.
+
+    The provider's DECLARED harness is what filters — never "the first live
+    provider" — because serving one harness's catalog for another would put models
+    the asked-about harness has never heard of into the picker, and a creation on
+    one of them fails at the wire with a rejection the user cannot connect to
+    their choice. A provider that declares no harness is skipped for the same
+    reason: it cannot vouch for any harness's catalog.
+
+    ``[]`` is a real answer, not a failure: it means no session on that harness
+    has started yet, so nothing has been advertised. The caller decides how to
+    render "not known yet".
+    """
+    if not harness_id:
+        return []
+    try:
+        providers = state.sessions.active_providers()
+    except (KeyError, AttributeError):
+        return []
+    # Newest session first, for the reason ``_entitled_kiro_models`` documents: a
+    # session started before a plan change still holds the list it captured then.
+    for provider in reversed(list(providers)):
+        if getattr(provider, "harness_id", "") != harness_id:
+            continue
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            advertised = getter()
+        except Exception:
+            continue
+        rows = [
+            _harness_model_row(
+                str(m.get("modelId") or ""),
+                str(m.get("name") or ""),
+                str(m.get("description") or ""),
+            )
+            for m in advertised or []
+            if isinstance(m, dict) and m.get("modelId")
+        ]
+        if rows:
+            return rows
+    return []
+
+
+async def api_harnesses(request: web.Request) -> web.Response:
+    """GET /api/harnesses — every registered harness, with availability.
+
+    One row per registered harness: ``id``, ``display_name``, ``available``,
+    ``reason`` (empty exactly when available), ``bundled``, and ``serviceable``.
+    Unavailable rows are INCLUDED — a selection surface renders them visible,
+    marked, and unselectable with their reason, which is what keeps one missing
+    binary from looking like a harness Kiro Crew does not support.
+
+    ``serviceable`` is the OTHER way a row cannot be picked, and it is deliberately
+    a second field rather than folded into ``available``: availability describes the
+    machine and heals when the operator installs the binary, while serviceability
+    describes this build and heals only in a later one. A harness that is registered
+    and available but carries no legacy backend identifier — Codex, every operator
+    descriptor — is refused at creation, so a surface that read only ``available``
+    would offer it as pickable and explain itself only in the error card afterwards.
+    No reason travels with it because it is not data: the verdict is identical for
+    every such row, so the explanation is a catalog string on the surface rather than
+    untranslated prose on the wire.
+
+    Operator descriptors that failed validation are served separately, under
+    ``invalid``: they are not selectable at all, so mixing them into the same
+    array would put a row a session can never run beside rows it can. An operator
+    entry colliding with a bundled id appears there while the bundled row stays in
+    ``harnesses``, so one id never yields two selectable rows.
+
+    ``default`` is the harness a session with no selection gets — the composition
+    of ``agent.default_harness`` and the legacy ``agent.acp_backend``, which is
+    the same resolution session creation performs, so the preselected entry cannot
+    disagree with what an unselected creation actually does.
+
+    ``legacy_backend`` is the ``agent.acp_backend`` spelling AS STORED, which is not
+    what ``GET /api/config/kirocrew`` reports: that field is clamped at load to a
+    selectable value, so a hand-edited ``codex`` reads back there as ``""``. A
+    Settings surface seeded from the clamped field would render kiro-cli as the
+    operator's legacy choice and, on the next change event, write that lie back over
+    the value they wrote. Served here so the alias input shows the stored spelling
+    and the resolved ``default`` beside it explains what it means.
+
+    ``legacy_backends`` is the vocabulary that input may WRITE — the selectable set
+    itself, which is also the PATCH allowlist's enum. Served rather than restated in
+    the client because the two would then be one edit apart in two languages with
+    nothing failing in between: a spelling retired here would keep being offered, and
+    Settings would write a value session creation refuses.
+
+    Off the loop: the registry reads configuration and stats each harness's
+    executable.
+    """
+
+    def _payload() -> dict:
+        reg = harness_registry()
+        cfg = KiroCrewConfig.load()
+        return {
+            "harnesses": [
+                {
+                    "id": row.id,
+                    "display_name": row.display_name,
+                    "available": row.available,
+                    "reason": row.reason,
+                    "bundled": row.bundled,
+                    "serviceable": not unserviceable_reason(row.id),
+                }
+                for row in reg.list()
+            ],
+            "invalid": [
+                {
+                    "id": row.id,
+                    "display_name": row.display_name,
+                    "available": False,
+                    "reason": row.reason,
+                    "bundled": False,
+                }
+                for row in reg.invalid()
+            ],
+            "default": default_harness_id(cfg),
+            "legacy_backend": str(getattr(cfg.agent, "acp_backend_alias", "") or ""),
+            "legacy_backends": selectable_backend_values(),
+        }
+
+    try:
+        return web.json_response(await asyncio.to_thread(_payload))
+    except Exception:
+        # Degraded rather than empty: an empty array renders a picker with no
+        # harness at all, which the client would cache as "this build has none".
+        logger.warning("api_harnesses failed; returning 503 for client retry", exc_info=True)
+        return web.json_response(
+            {"error": "harness list unavailable", "code": "harness_list_unavailable"},
+            status=503,
+        )
+
+
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — list available models from the live kiro-cli ACP session."""
+    """GET /api/models — the model catalog for a harness (kiro-cli by default).
+
+    ``?harness=<id>`` selects whose catalog is served, resolved through the
+    descriptor's ``model_source``. Absent — and for kiro-cli, whose source IS the
+    ``--list-models`` catalog below — the path is unchanged, so the default
+    composer selection behaves exactly as it always has.
+
+    One harness's catalog is NEVER served for another: a model the asked-about
+    harness does not serve would be offered, picked, and then rejected at the wire
+    with an error the user cannot connect to their choice.
+    """
+    # Type-guarded rather than trusting the mapping: aiohttp always yields a
+    # string here, but the handler is also driven directly (a request double), and
+    # a non-string that reached the registry would be reported to the caller as an
+    # unknown harness — a 404 on a request that never named one.
+    _raw_harness = request.query.get("harness")
+    harness_query = _raw_harness.strip() if isinstance(_raw_harness, str) else ""
+    if harness_query:
+        try:
+            descriptor = await asyncio.to_thread(lambda: harness_registry().get(harness_query))
+        except UnknownHarness as exc:
+            # 404, not a degraded 503: the client asked about something that does
+            # not exist, and retrying will not change the answer.
+            return web.json_response({"error": str(exc), "code": "unknown_harness"}, status=404)
+        if descriptor.model_source == MODEL_SOURCE_STATIC:
+            return web.json_response(_static_harness_models(descriptor.models))
+        if descriptor.id != HARNESS_KIRO:
+            # ``acp_advertised`` on a non-kiro harness: only a live session on that
+            # harness has a catalog, and ``[]`` says "none advertised yet" rather
+            # than "no models exist". 200 rather than 503 because it is an answer,
+            # not a failure — a 503 would make the client poll a state only the
+            # user can leave by starting a session.
+            state: DashboardState = request.app["state"]
+            return web.json_response(_advertised_harness_models(state, descriptor.id))
+
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),

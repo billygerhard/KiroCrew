@@ -43,7 +43,6 @@ from kiro_crew.acp.kas_transport import (
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
 )
@@ -152,7 +151,15 @@ class TestAuthOwnership:
         identity sweep would leave the relay serving turns on the previous
         account's credentials.
         """
-        assert ACP_BACKEND_KAS in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        # The frozenset view is retired; the membership question is now the
+        # descriptor flag KAS declares (harness id resolved from its backend
+        # spelling), which is the identity the sweep actually reads.
+        from kiro_crew.acp.harness_registry import registry
+        from kiro_crew.acp.types import harness_for_backend
+
+        harness_id = harness_for_backend(ACP_BACKEND_KAS)
+        assert harness_id is not None
+        assert registry().bound_capabilities(harness_id).has("kiro_identity_store") is True
 
     def test_the_runtime_declares_the_identity_capability(self, tmp_path):
         """The sweep reads the declared property, not the frozenset directly."""
@@ -236,11 +243,16 @@ class TestSandboxClassification:
             captured.update(kwargs)
             raise self._Abort
 
-        async def fake_bin(*, environ=None, home=None):
-            return "/usr/bin/kiro-cli"
+        # A REAL file, because resolution is followed by attestation: the
+        # descriptor-driven path refuses a candidate that does not exist, so a
+        # bare "/usr/bin/kiro-cli" would fail before reaching the sandbox call
+        # this test is about.
+        kiro_bin = tmp_path / "kiro-cli"
+        kiro_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        kiro_bin.chmod(0o755)
 
-        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
-        monkeypatch.setattr("kiro_crew.acp.runtime.ensure_agent_materialized", lambda _agent: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolve_kiro_cli", lambda *_a, **_k: str(kiro_bin))
+        monkeypatch.setattr("kiro_crew.agent.ensure_agent_materialized", lambda _agent: None)
         runtime = AcpRuntime(work_dir=tmp_path / "sbx2", sandbox_mode="off")
         with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
@@ -354,10 +366,11 @@ def kas_stub(tmp_path, monkeypatch):
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
 
-    async def fake_bin(*, environ=None, home=None) -> str:
+    def fake_bin(*_a, **_k):
+
         return str(launcher)
 
-    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
+    monkeypatch.setattr("kiro_crew.kiro_cli.resolve_kiro_cli", fake_bin)
     monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
     agents_dir = kiro_agents_dir()
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -416,17 +429,24 @@ class TestKasInvocation:
 
     @pytest.mark.asyncio
     async def test_missing_kiro_cli_fails_with_an_actionable_error(self, tmp_path, monkeypatch):
-        """No kiro-cli means no relay, and the message must say which binary."""
-        from kiro_crew.acp.session_handle import AcpRuntimeError
+        """No kiro-cli means no relay, and the message must say which binary.
 
-        async def no_bin(*, environ=None, home=None) -> None:
+        Asserted at the refusal lineage rather than as ``AcpRuntimeError``: with
+        the descriptor-driven spawn path an unresolvable executable raises
+        ``HarnessSpawnRefused`` here, and ``AcpRuntime.spawn`` is the layer that
+        converts it (covered by test_harness_spawn.py). This calls
+        ``_resolve_spawn_argv`` directly, which is below that conversion.
+        """
+        from kiro_crew.acp.harness_adapters import HarnessSpawnRefused
+
+        def no_bin(*_a, **_k):
             return None
 
-        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", no_bin)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolve_kiro_cli", no_bin)
         runtime = AcpRuntime(
             work_dir=tmp_path / "ws4",
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
-        with pytest.raises(AcpRuntimeError, match="kiro-cli"):
+        with pytest.raises(HarnessSpawnRefused, match="kiro-cli"):
             await runtime._resolve_spawn_argv()

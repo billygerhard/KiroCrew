@@ -1462,7 +1462,9 @@
       "earlier_messages_load_failed": "Couldn't load earlier messages. Scroll to the top of the session to try again.",
       "earlier_messages_open_session": "Earlier messages — open full session (closes split)",
       "earlier_messages_unavailable": "Earlier messages are no longer available in this session's history.",
-      "forked_from": "Forked from {{name}}"
+      "forked_from": "Forked from {{name}}",
+      "harness_serving": "AI harness serving this chat",
+      "harness_serving_pinned": "AI harness serving this chat — fixed when the chat was created"
     },
     "cliPanel": {
       "copied": "Copied",
@@ -1771,16 +1773,34 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "This chat cannot start on {{name}}: {{reason}}",
+      "default": "Default",
+      "default_harness": "Default harness",
+      "harness_list": "Harness list",
+      "harness_list_unavailable": "Harness list unavailable — retrying",
+      "harness_name": "Harness: {{name}}",
+      "invalid_reason": "Invalid descriptor — {{reason}}",
+      "no_harnesses_registered": "No harnesses registered",
+      "not_registered": "not registered",
+      "not_serviceable": "not supported by this build yet",
+      "unavailable_reason": "Unavailable — {{reason}}"
+    },
     "jobForm": {
       "add": "Add",
       "enter_a_valid_5_field_cron_expression": "Enter a valid 5-field cron expression",
       "failed_to_save": "Failed to save",
+      "harness": "Harness",
+      "harness_inherit": "Harness: inherit",
+      "harness_not_serviceable": "{{name}} — not supported by this build yet",
+      "harness_unavailable": "{{name}} — unavailable ({{reason}})",
       "message_is_required": "Message is required",
       "name_is_required": "Name is required",
       "save": "Save",
       "saving": "Saving...",
       "select_at_least_one_day": "Select at least one day",
-      "timezone": "Timezone"
+      "timezone": "Timezone",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "Which ACP harness runs this job. Leave on inherit for the default."
     },
     "jobLogsView": {
       "failed_to_load_history": "Failed to load history"
@@ -3358,6 +3378,7 @@
       "loop_2": "Loop · {{count}}",
       "loop_interrupted": "interrupted",
       "running_queued": "{{started}} running · {{queued}} queued",
+      "running_on_harness": "Running on {{name}}",
       "show_in_flat_view": "Show {{name}} in flat view",
       "streaming": "Streaming",
       "all_sessions": "All sessions",
@@ -3644,10 +3665,6 @@
     },
     "developerPage": {
       "tabs": {
-        "agentBackend": {
-          "description": "Which agent new sessions start — Kiro CLI, Claude Code, or KAS",
-          "label": "Agent Backend"
-        },
         "archive": {
           "description": "Rotated/compacted session history (7-day retention)",
           "label": "Archive"
@@ -4520,6 +4537,47 @@
         "on_windows_keystrokes_take_your_keyboard_focus": "On Windows, keystrokes take your keyboard focus and coordinate clicks move your real cursor — there is no per-app input route on this platform.",
         "the_app_lists_in_computer_use_json_could_not_be": "The app lists in computer_use.json could not be read, so they are shown empty here. The agent still refuses every action that depends on them until the file is valid JSON.",
         "your_chat_sessions_were_restarted_so_this_takes": "Your chat sessions were restarted so this takes effect right away — Kiro reads its tool list once per session, so an open chat would not have picked it up otherwise. Your messages are still there; the agent re-reads its context on your next message."
+      },
+      "harnessPanel": {
+        "ai_backend": "AI Backend",
+        "badge_available": "Available",
+        "badge_bundled": "Bundled",
+        "badge_invalid": "Invalid",
+        "badge_missing": "Missing",
+        "badge_not_serviceable": "Unsupported",
+        "badge_operator": "Operator",
+        "badge_restart_required": "Restart required",
+        "badge_unavailable": "Unavailable",
+        "default_harness": "Default harness",
+        "default_harness_unset": "Not set",
+        "failed_to_load_config": "Failed to load the current settings.",
+        "failed_to_load_harnesses": "Failed to load the harness list.",
+        "failed_to_save": "Failed to save",
+        "harness_list_unavailable": "The harness list did not load, so no availability is shown.",
+        "harness_not_serviceable": "{{name}} — not supported by this build",
+        "harness_unavailable": "{{name}} — unavailable ({{reason}})",
+        "harnesses_are_defined_in_config_and_authenticate": "Harnesses are defined in config.json and authenticate themselves — {{productName}} stores no provider credentials.",
+        "install_check_failed": "Could not check whether this is installed on this machine.",
+        "installed_restart_required": "Installed on this machine, but this gateway must restart before it can be used.",
+        "legacy_backend": "Legacy ACP backend",
+        "legacy_backend_kas": "KAS (kiro-agent)",
+        "legacy_backend_kiro": "Kiro CLI (default)",
+        "legacy_backend_outranked": "Ignored while a default harness is set.",
+        "legacy_backend_stored": "{{value}} (stored, not selectable)",
+        "missing_components": "Missing on this machine: {{components}}",
+        "missing_components_with_command": "Missing on this machine: {{components}}. Install with: {{command}}",
+        "no_harnesses_registered": "No harnesses registered.",
+        "not_serviceable_note": "This build cannot start a session on this harness.",
+        "operator_entry_conflicts": "Your harness entry with this id was rejected: {{reason}}",
+        "registered_harnesses": "Registered harnesses",
+        "resolves_to": "New sessions start on {{name}}.",
+        "resolves_to_not_serviceable": "New sessions resolve to {{name}}, which this build cannot start a session on.",
+        "resolves_to_unavailable": "New sessions resolve to {{name}}, which cannot run: {{reason}}",
+        "retry": "Retry",
+        "retry_config": "Retry loading the settings",
+        "retry_harness_list": "Retry loading the harness list",
+        "the_older_key_read_as_an_alias_of_a_harness": "The older backend key, read as an alias of a registered harness.",
+        "which_harness_new_sessions_start_on": "Which harness new sessions start on. A running session keeps the harness it started with."
       },
       "postureDisclosure": {
         "filter": "Filter {{label}}",

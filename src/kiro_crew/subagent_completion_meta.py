@@ -43,6 +43,7 @@ def single_completion_meta(
     note: str = "",
     requested_model: str = "",
     resolved_model: str = "",
+    harness: str = "",
 ) -> dict:
     """Structured facts for a per-agent completion card.
 
@@ -60,6 +61,12 @@ def single_completion_meta(
     — making a model-pinned review's real model auditable (issue #3582). Both
     default to ``""`` so existing callers are unchanged and the key is simply
     absent-equivalent when a provider cannot report a model.
+
+    ``harness`` is the ACP harness that served the run — the other half of the
+    attribution, since in a mixed-harness fleet the model alone does not say what
+    ran the task. ``""`` means the reporting path could not read it (a record
+    written before harness binding), NOT "the default harness": naming a harness
+    the run may not have used is worse than showing none.
     """
     return {
         "kind": "single",
@@ -70,6 +77,7 @@ def single_completion_meta(
         "note": note,
         "requestedModel": requested_model,
         "resolvedModel": resolved_model,
+        "harness": harness,
     }
 
 

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { Droplet, EyeOff, Ghost, RefreshCw, Undo2, VenetianMask } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { KiroGhost } from './KiroGhost'
+import HarnessSelector from './HarnessSelector'
 import { useTheme } from '../hooks/useTheme'
 import { getThemeBranding } from '../themeBranding'
 import { api } from '../api/client'
@@ -15,6 +16,13 @@ interface WelcomeViewProps {
   onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void
   cleanMode?: boolean
   onToggleClean?: (clean: boolean) => void
+  /** The ACP harness this new chat will run on (`''` = the configured default).
+   *  Only rendered together with `onSelectHarness`: a selector that cannot write
+   *  the pick would read as a control that silently does nothing. */
+  harness?: string
+  onSelectHarness?: (id: string) => void
+  /** True while a pick is being applied, which recreates the session. */
+  harnessPending?: boolean
 }
 
 function SuggestedPills({ setInput }: { setInput: (v: string) => void }) {
@@ -82,6 +90,9 @@ export default function WelcomeView({
   onSwitchMode,
   cleanMode,
   onToggleClean,
+  harness,
+  onSelectHarness,
+  harnessPending,
 }: WelcomeViewProps) {
   const [anonOpen, setAnonOpen] = useState(false)
   const anonBtnRef = useRef<HTMLButtonElement>(null)
@@ -205,6 +216,18 @@ export default function WelcomeView({
             document.body
           )}
         </>
+      )}
+      {onSelectHarness && (
+        /* On the welcome screen only, which is exactly where the choice is still
+           free: the harness binds when the session starts and owns it for life,
+           so a picker on a conversation already in progress could only lie or
+           destroy it. Picking here recreates the slot, the same shape the memory
+           mode switch above takes. */
+        <HarnessSelector
+          value={harness || ''}
+          onSelect={onSelectHarness}
+          disabled={harnessPending}
+        />
       )}
       {mode !== 'orchestrator' && <SuggestedPills setInput={setInput} />}
     </div>

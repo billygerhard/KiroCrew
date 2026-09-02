@@ -76,20 +76,34 @@ SKIP_PATHS = frozenset(
     }
 )
 
-# The one module allowed to DEFINE harness identifiers and membership sets.
+# The modules allowed to DEFINE harness identifiers and membership sets.
 #
-# Moved out of ``acp/types.py`` deliberately: importing anything under
-# ``kiro_crew.acp`` executes that package's ``__init__`` (client + runtime), so the
-# config loader and the dashboard could not read the vocabulary and each kept a
-# literal copy of the selectable list instead — the drift this rule exists to
-# prevent, reached by obeying it. ``acp_backends`` imports nothing from
-# ``kiro_crew.acp``, so every consumer can name the constants instead of copying
-# them. The invariant is unchanged: exactly ONE module defines them, and
-# ``acp/types.py`` now re-exports from here (an import, not an assignment, so it
-# does not match this rule).
-VOCABULARY_PATH = "src/kiro_crew/acp_backends.py"
+# ``acp_backends.py`` is the LEAF that owns the ``ACP_BACKEND_*`` identifiers and
+# the selectable registry (upstream #6593): it imports nothing from
+# ``kiro_crew.acp``, so the config loader and the dashboard can read the vocabulary
+# without importing that package's ``__init__`` (client + runtime) — the drift this
+# rule exists to prevent, once "fixed" by three literal copies. ``acp/types.py``
+# re-exports those identifiers (an import, not an assignment) and still DEFINES the
+# ``ACP_BACKENDS_ACP_RUNTIME`` behavior set and the ``_HARNESS_BACKENDS`` bridge, so
+# it stays a vocabulary home. ``harness_descriptor.py`` re-exports the identifiers
+# from the leaf and owns the CAPABILITY vocabulary (``CAPABILITY_*``,
+# ``MODEL_SOURCE_*``) that ``protocol_profile`` maps against, so it is exempt too.
+# All three are the vocabulary's home; the invariant is unchanged: the identifiers
+# are DEFINED in exactly one place (``acp_backends.py``) and everyone else imports.
+VOCABULARY_LEAF_PATH = "src/kiro_crew/acp_backends.py"
+VOCABULARY_PATH = "src/kiro_crew/acp/types.py"
+VOCABULARY_DESCRIPTOR_PATH = "src/kiro_crew/acp/harness_descriptor.py"
+VOCABULARY_PATHS = frozenset(
+    {VOCABULARY_LEAF_PATH, VOCABULARY_PATH, VOCABULARY_DESCRIPTOR_PATH}
+)
 
-SUPPRESSION = re.compile(r"harness-ok")
+# The escape hatch, and it must be self-justifying: a ``#`` comment, the
+# ``harness-ok`` token, a colon, and at least one non-space character of reason.
+# A bare ``harness-ok`` substring — or the token sitting inside a string literal
+# — does NOT suppress: the marker exists so a reviewer can grep every opt-out AND
+# read why each one models the rule wrongly, and a rationale-free (or accidental,
+# in-string) token gives the reviewer nothing to question.
+SUPPRESSION = re.compile(r"#\s*harness-ok:\s*\S")
 
 # Harness identifiers as string literals. A bare literal is forbidden even where
 # the comparison is positive, because the value of ACP_BACKEND_KIRO is the empty
@@ -131,8 +145,67 @@ RULES: tuple[Rule, ...] = (
         invariant="H5",
         pattern=re.compile(r"(?:!=\s*ACP_BACKEND_[A-Z_]+|ACP_BACKEND_[A-Z_]+\s*!=)"),
         message="harness identity tested by inequality against one backend",
-        fix="use `== ACP_BACKEND_<THIS>` or `in ACP_BACKENDS_<CAPABILITY>` — an "
+        fix="test the harness positively (`is_kiro_backend`), or read the "
+        "capability off the bound descriptor "
+        "(`registry.bound_capabilities(...).has(CAPABILITY_<X>)`) — an "
         "inequality silently captures every harness added later",
+    ),
+    Rule(
+        rule_id="positive-constant",
+        invariant="H5",
+        # The behavior-capability views are retired (wave-2 T5): a capability is
+        # read off the session's BOUND DESCRIPTOR, so a NEW equality against a
+        # backend constant — or against the ``acp_backend`` attribute — is the
+        # legacy-identifier shape the rekey exists to retire. A harness that
+        # shares one ``acp_backend`` spelling with another (an operator alias
+        # onto kiro) answers for BOTH here. Diff-scoped, so the pre-existing
+        # wire-dispatch / identity-glue sites (KAS ``== ACP_BACKEND_KAS`` in
+        # runtime/session_handle, the ``is_<harness>_backend`` properties,
+        # ``protocol_profile``, ``provider_label``) are untouched; a legitimate
+        # NEW such site opts out with a trailing ``harness-ok`` marker, which a
+        # reviewer questions.
+        #
+        # The ``acp_backend`` alternative matches ANY right-hand side and then
+        # EXEMPTS an allowlist by negative lookahead, rather than matching only a
+        # literal-looking RHS. "RHS must look like a constant" was evadable by
+        # binding the constant to a local first (``_KAS = ACP_BACKEND_KAS`` …
+        # ``acp_backend == _KAS``) — the safe default was inverted. The only
+        # legitimate ``acp_backend ==`` shapes are the binding's OWN identity
+        # (``acp_backend == harness_id``, the generic-fallback admission) and a
+        # ``binding.<attr>`` read; every other RHS, alias or constant alike,
+        # trips.
+        pattern=re.compile(
+            r"(?:==\s*ACP_BACKEND_[A-Z_]+"
+            r"|ACP_BACKEND_[A-Z_]+\s*=="
+            r"|\bacp_backend\b\s*==\s*(?!\s|harness_id\b|binding\.)"
+            r")"
+        ),
+        message="harness identity or a capability decision tested by equality "
+        "against a backend constant / the acp_backend attribute",
+        fix="read the capability off the session's bound descriptor "
+        "(`registry.bound_capabilities(harness_id).has(CAPABILITY_<X>)` / "
+        "`provider._declares(CAPABILITY_<X>)`) — the ACP_BACKENDS_* capability "
+        "views are retired; a positive constant compare here is the legacy "
+        "spelling the rekey removes",
+    ),
+    Rule(
+        rule_id="capability-view-membership",
+        invariant="H6",
+        # ``x in ACP_BACKENDS_<CAP>`` was the wave-1 opt-in form; wave-2 T5
+        # deleted every such view, so any membership read of an ``ACP_BACKENDS_``
+        # name that is NOT the surviving vocabulary gate is a reintroduced
+        # behavior view. ``ACP_BACKENDS_KNOWN`` / ``ACP_BACKENDS_SELECTABLE`` (the
+        # ``acp_backend`` vocabulary) are the only allowed names and are excluded
+        # by the negative lookahead.
+        pattern=re.compile(
+            r"\bin\s+(?:[A-Za-z_][\w.]*\.)?ACP_BACKENDS_"
+            r"(?!KNOWN\b|SELECTABLE\b)[A-Z_]+"
+        ),
+        message="membership test against a retired ACP_BACKENDS_* capability view",
+        fix="read the capability off the session's bound descriptor "
+        "(`registry.bound_capabilities(harness_id).has(CAPABILITY_<X>)`) — the "
+        "ACP_BACKENDS_* capability sets were deleted in wave-2 T5; only the "
+        "ACP_BACKENDS_KNOWN / _SELECTABLE vocabulary gate remains",
     ),
     Rule(
         rule_id="bare-literal",
@@ -154,7 +227,9 @@ RULES: tuple[Rule, ...] = (
         message="sandbox delegation derived from a negative harness test "
         "(fails OPEN: Crew's seatbelt is skipped for a harness with no "
         "internal sandbox of its own)",
-        fix="`is_kiro_cli=<backend> in ACP_BACKENDS_INTERNAL_SANDBOX`",
+        fix="`is_kiro_cli=<descriptor>.capabilities.internal_sandbox` "
+        "(or `_declares(CAPABILITY_INTERNAL_SANDBOX)`) — read the waiver off "
+        "the bound descriptor; the ACP_BACKENDS_INTERNAL_SANDBOX view is retired",
     ),
     Rule(
         rule_id="vocabulary-home",
@@ -163,7 +238,7 @@ RULES: tuple[Rule, ...] = (
         message="harness identifier or membership set defined outside the " "vocabulary module",
         fix=f"define it in {VOCABULARY_PATH} and add every new identifier to "
         "ACP_BACKENDS_KNOWN, or provider construction will not reject a typo",
-        exempt=frozenset({VOCABULARY_PATH}),
+        exempt=VOCABULARY_PATHS,
     ),
     Rule(
         rule_id="non-kiro-default",
@@ -420,6 +495,45 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         "negative-identity",
     ),
     (
+        "positive-constant",
+        "src/kiro_crew/acp/runtime.py",
+        "        if self._acp_backend == ACP_BACKEND_KAS:",
+        "positive-constant",
+    ),
+    (
+        "positive-constant-reversed",
+        "src/kiro_crew/acp/runtime.py",
+        "        if ACP_BACKEND_KAS == self._acp_backend:",
+        "positive-constant",
+    ),
+    (
+        "positive-constant-acp-backend-attr",
+        "src/kiro_crew/config/loader.py",
+        "    if agent.acp_backend == ACP_BACKEND_KAS:",
+        "positive-constant",
+    ),
+    (
+        # The evasion the RHS-allowlist rewrite closes: binding the constant to a
+        # local, then comparing against the alias. "RHS must look like a literal"
+        # passed this; "any RHS except an allowlisted name" trips it.
+        "positive-constant-acp-backend-local-alias",
+        "src/kiro_crew/acp/runtime.py",
+        "        if agent.acp_backend == _KAS:",
+        "positive-constant",
+    ),
+    (
+        "capability-view-membership",
+        "src/kiro_crew/providers/acp.py",
+        "        return self._client.backend in ACP_BACKENDS_SESSION_SHARING",
+        "capability-view-membership",
+    ),
+    (
+        "capability-view-membership-attr",
+        "src/kiro_crew/acp/runtime.py",
+        "            is_kiro_cli=self._acp_backend in types.ACP_BACKENDS_INTERNAL_SANDBOX,",
+        "capability-view-membership",
+    ),
+    (
         "vocabulary-elsewhere",
         "src/kiro_crew/providers/acp.py",
         'ACP_BACKEND_BYO = "byo"',
@@ -451,21 +565,34 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         None,
     ),
     (
-        "positive-membership",
+        "descriptor-capability-read",
         "src/kiro_crew/providers/acp.py",
-        "        return self._client.backend in ACP_BACKENDS_SESSION_SHARING",
+        "        return self._declares(CAPABILITY_SESSION_SHARING)",
         None,
     ),
     (
-        "positive-constant",
+        "descriptor-flag-read",
         "src/kiro_crew/acp/runtime.py",
-        "        if self._acp_backend == ACP_BACKEND_KAS:",
+        "            is_kiro_cli=descriptor.capabilities.internal_sandbox,",
         None,
     ),
     (
-        "sandbox-membership",
+        "vocabulary-known-membership",
+        "src/kiro_crew/providers/acp.py",
+        "        if acp_backend not in ACP_BACKENDS_KNOWN and not _fallback:",
+        None,
+    ),
+    (
+        "vocabulary-selectable-membership",
+        "src/kiro_crew/config/loader.py",
+        "    if isinstance(value, str) and value in ACP_BACKENDS_SELECTABLE:",
+        None,
+    ),
+    (
+        "positive-constant-suppressed-wire-dispatch",
         "src/kiro_crew/acp/runtime.py",
-        "            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,",
+        "        if self._acp_backend == ACP_BACKEND_KAS:  # harness-ok: KAS wire "
+        "dispatch, not a capability gate (H5)",
         None,
     ),
     (
@@ -478,6 +605,18 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         "vocabulary-at-home",
         VOCABULARY_PATH,
         'ACP_BACKEND_BYO = "byo"',
+        None,
+    ),
+    (
+        "vocabulary-at-leaf-home",
+        VOCABULARY_LEAF_PATH,
+        'ACP_BACKEND_BYO = "byo"',
+        None,
+    ),
+    (
+        "acp-backend-equals-variable-is-not-identity",
+        "src/kiro_crew/providers/acp.py",
+        "        fallback = binding is not None and acp_backend == harness_id",
         None,
     ),
     (
@@ -515,6 +654,23 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         "src/kiro_crew/acp/client.py",
         "        x = not self._is_claude  # harness-ok: dormant seam, see H5",
         None,
+    ),
+    (
+        # A bare ``harness-ok`` token with no colon+reason must NOT suppress: the
+        # violation still fires. Guards the self-justifying-marker tightening —
+        # a rationale-free opt-out gives a reviewer nothing to question.
+        "bare-harness-ok-does-not-suppress",
+        "src/kiro_crew/acp/client.py",
+        "        x = not self._is_claude  # harness-ok",
+        "negative-identity",
+    ),
+    (
+        # The token INSIDE a string literal must not suppress either — a message
+        # that merely mentions ``harness-ok`` is not an opt-out.
+        "harness-ok-in-string-does-not-suppress",
+        "src/kiro_crew/acp/client.py",
+        '        log("harness-ok path"); x = not self._is_claude',
+        "negative-identity",
     ),
 )
 

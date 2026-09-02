@@ -1,8 +1,8 @@
 """``agent.acp_backend`` is writable from the dashboard, and only to real backends.
 
-The Developer > Agent Backend switch writes this field over
+The Settings AI Backend panel's legacy-alias input writes this field over
 ``PATCH /api/config/kirocrew``, so it has to be in ``_EDITABLE_CONFIG`` at all —
-before this it was absent and every save came back "field not editable".
+without the entry every save comes back "field not editable".
 
 The load-bearing tests here used to be PARITY ones: three unrelated places each
 kept a literal copy of the selectable-backend list, and these tests stood in for a
@@ -100,9 +100,9 @@ def test_registering_an_unknown_backend_is_refused(restore_registry):
 def test_the_schema_endpoint_serves_the_same_set_as_the_allowlist():
     """GET /api/config/schema drives which options the UI enables.
 
-    The tab renders every known backend but disables any value the schema does not
-    advertise, so a schema enum that disagreed with the PATCH allowlist would show
-    an option that is enabled and then refused (or hide one that works).
+    The Settings panel offers every selectable spelling but a schema enum that
+    disagreed with the PATCH allowlist would show an option that is enabled and
+    then refused (or hide one that works).
     """
     entry: Dict[str, Any] = {"path": FIELD, "enumValues": None}
     _supply_live_enum(entry)

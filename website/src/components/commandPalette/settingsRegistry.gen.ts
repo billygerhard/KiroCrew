@@ -865,6 +865,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.default-harness",
+    "label": "Default harness",
+    "labelKey": "pages.settings.harnessPanel.default_harness",
+    "description": "Which harness new sessions start on. A running session keeps the harness it started with.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "agent.default_harness"
+  },
+  {
     "id": "chat.default-model",
     "label": "Default Model",
     "labelKey": "pages.settings.chatPanel.default_model",
@@ -952,6 +962,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "chat.legacy-acp-backend",
+    "label": "Legacy ACP backend",
+    "labelKey": "pages.settings.harnessPanel.legacy_backend",
+    "description": "The older backend key, read as an alias of a registered harness.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "agent.acp_backend"
   },
   {
     "id": "chat.link-previews",

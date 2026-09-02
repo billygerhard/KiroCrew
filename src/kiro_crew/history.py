@@ -174,6 +174,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "title",
         "agent",
         "model",
+        "harness",
         "reasoning_effort",
         "autocompact_pct",
         "mode",

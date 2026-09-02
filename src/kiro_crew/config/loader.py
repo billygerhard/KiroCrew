@@ -25,8 +25,17 @@ from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility facade
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # ``harness_selection`` imports ``config.loader`` at TYPE_CHECKING for its own
+    # ``KiroCrewConfig`` annotation; importing it here at MODULE SCOPE would close
+    # that cycle. Under ``from __future__ import annotations`` the ``_acp``
+    # factory's ``binding`` parameter can name ``HarnessBinding`` as a real type
+    # at zero import cost, so mypy checks the forwarded value instead of laundering
+    # a wrong type through ``Any`` into a runtime ``AttributeError``.
+    from kiro_crew.agent_sdk.harness import HarnessBinding
 
 from kiro_crew import __version__, model_registry, platform_compat, windows_acl
 from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
@@ -53,6 +62,17 @@ from kiro_crew.computer_use.types import MAX_TEXT_LIMIT as _CU_MAX_TEXT_LIMIT
 from kiro_crew.computer_use.types import MAX_TREE_DEPTH_LIMIT as _CU_MAX_TREE_DEPTH
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
+
+# Section DTOs and their field-level coercion live in a one-way sibling module.
+# Re-export every historical loader name so existing imports keep working while
+# KiroCrewConfig remains the compatibility facade and owns read/merge/save.
+# The four harness-config helpers (_stash_raw_acp_backend, _stored_acp_backend,
+# _normalize_harness_id, _read_harnesses) are called QUALIFIED through this module
+# import rather than added to the from-import above: that import list is the
+# loader's frozen compatibility re-export surface, pinned by identity in
+# test_config_module_boundaries — new internals the loader merely CONSUMES must
+# not widen what the facade re-exports.
+from kiro_crew.config import sections as _config_sections
 
 # Pure path primitives live in the leaf module ``config.paths`` (stdlib-only,
 # no ``kiro_crew`` imports) so the modules that only need ``config_dir()`` can
@@ -93,10 +113,6 @@ from kiro_crew.config.resolution import (  # noqa: F401
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
-
-# Section DTOs and their field-level coercion live in a one-way sibling module.
-# Re-export every historical loader name so existing imports keep working while
-# KiroCrewConfig remains the compatibility facade and owns read/merge/save.
 from kiro_crew.config.sections import (  # noqa: F401
     _BOT_NAME_MAX,
     _BOT_NAME_RE,
@@ -2314,7 +2330,14 @@ class KiroCrewConfig:
 
             # Preserve fail-closed security semantics before advisory schema
             # validation can replace malformed input with a missing-field default.
-            # Normalize resource_limits FIRST, for exactly that reason. Its
+            # Record the stored ``agent.acp_backend`` spelling FIRST: validation
+            # blanks a value outside the field's enum, and the harness alias table
+            # is the thing that decides what a stored spelling means. Without this
+            # the enum clamp happens twice over — once here, once in
+            # ``_normalize_acp_backend`` — and the operator's value is gone before
+            # anything can refuse by name (see ``_stash_raw_acp_backend``).
+            _config_sections._stash_raw_acp_backend(data)
+            # Normalize resource_limits next, for exactly that reason. Its
             # fields are declared ``int | None``, so jsonschema reads a
             # hand-edited ``512.5`` as a type violation and
             # ``_apply_field_default`` POPS the key -- deleting a ceiling the
@@ -2520,6 +2543,10 @@ class KiroCrewConfig:
                     agent_data.get("mcp_quarantine_after_failures", 3), 3
                 ),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+                default_harness=_config_sections._normalize_harness_id(
+                    agent_data.get("default_harness")
+                ),
+                harnesses=_config_sections._read_harnesses(agent_data.get("harnesses")),
                 default_agent=agent_data.get("default_agent", ""),
                 sweep_agents_backups=_safe_bool(
                     agent_data.get("sweep_agents_backups", False), False
@@ -3574,6 +3601,15 @@ class KiroCrewConfig:
             # Migration write-back is best-effort; never block startup.
             logger.warning("Config write-back failed: %s", e)
 
+        # The stored ``acp_backend`` spelling, assigned rather than constructed:
+        # it lives on the non-dataclass base ``_StoredBackendSpelling``, so it is
+        # not a field and cannot travel through __init__. Assigned AFTER the
+        # write-back above for the same reason it is not a field — it is not part
+        # of what gets serialized, so it must not be able to influence it.
+        stored_backend = _config_sections._stored_acp_backend(agent_data)
+        if stored_backend:
+            cfg.agent._acp_backend_stored = stored_backend
+
         return cfg, ticket
 
     def to_dict(self) -> dict:
@@ -4013,8 +4049,28 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            harness_id: str = "",
+            acp_backend: str | None = None,
+            binding: "HarnessBinding | None" = None,
             **_kwargs: object,
         ) -> AcpProvider:
+            # ``harness_id`` / ``acp_backend`` are the session's binding, resolved
+            # by the caller and passed as a pair. ``acp_backend=None`` means "the
+            # caller has no binding" and keeps the configured value, so every
+            # existing call site (pool prewarm, background, subagent runtimes) is
+            # unchanged; an explicit value — even the empty string, which is
+            # kiro-cli's own spelling — is honoured, which is why the sentinel is
+            # None rather than "".
+            #
+            # ``binding`` carries the SAME two halves as one object; when a caller
+            # passes it, it is forwarded to ``AcpProvider(binding=...)`` and is
+            # authoritative over the two-string kwargs, so the id a session
+            # records and the backend its process spawns as cannot be derived
+            # apart. Annotated ``HarnessBinding | None`` under TYPE_CHECKING (the
+            # real import lives in the module-top TYPE_CHECKING block to avoid a
+            # ``config.loader`` -> ``harness_selection`` module-scope edge, the
+            # reverse of which already exists); ``AcpProvider`` re-checks the type
+            # at runtime and refuses a non-``HarnessBinding``.
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
             # Canonical crew identity for the session (keys per-agent watchdog
             # windows on the handle) — one shared resolution rule, see
@@ -4099,7 +4155,9 @@ class KiroCrewConfig:
                 session_key=session_key,
                 channel_id=channel_id,
                 extra_env=extra_env,
-                acp_backend=self.agent.acp_backend,
+                acp_backend=(self.agent.acp_backend if acp_backend is None else acp_backend),
+                harness_id=harness_id,
+                binding=binding,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
                 tool_search_min_pct=tool_search_min_pct,

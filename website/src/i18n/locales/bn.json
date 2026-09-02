@@ -5439,6 +5439,8 @@
       "earlier_messages_open_session": "পূর্ববর্তী বার্তা — সম্পূর্ণ সেশন খুলুন (বিভক্ত ভিউ বন্ধ হবে)",
       "earlier_messages_unavailable": "পূর্ববর্তী বার্তাগুলি এই সেশনের ইতিহাসে আর পাওয়া যাচ্ছে না।",
       "forked_from": "{{name}} থেকে ফর্ক করা হয়েছে",
+      "harness_serving": "এই চ্যাট পরিচালনাকারী AI হার্নেস",
+      "harness_serving_pinned": "এই চ্যাট পরিচালনাকারী AI হার্নেস — চ্যাট তৈরির সময় নির্ধারিত",
       "model_list": "মডেল তালিকা",
       "session_ready_type_a_message_to_start": "সেশন প্রস্তুত। শুরু করতে একটি বার্তা লিখুন।",
       "split_down": "নিচে ভাগ করুন",
@@ -5976,6 +5978,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "এই চ্যাট {{name}}-এ শুরু করা যাবে না: {{reason}}",
+      "default": "ডিফল্ট",
+      "default_harness": "ডিফল্ট হার্নেস",
+      "harness_list": "হার্নেস তালিকা",
+      "harness_list_unavailable": "হার্নেস তালিকা পাওয়া যাচ্ছে না — আবার চেষ্টা করা হচ্ছে",
+      "harness_name": "হার্নেস: {{name}}",
+      "invalid_reason": "অবৈধ ডিস্ক্রিপ্টর — {{reason}}",
+      "no_harnesses_registered": "কোনো হার্নেস নিবন্ধিত নেই",
+      "not_registered": "নিবন্ধিত নয়",
+      "not_serviceable": "এই বিল্ডে এখনও সমর্থিত নয়",
+      "unavailable_reason": "উপলব্ধ নয় — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "এই জবের জন্য একটি সংক্ষিপ্ত লেবেল",
       "add": "জব যোগ করো",
@@ -5995,6 +6010,10 @@
       "every_interval": "প্রতি নির্দিষ্ট বিরতিতে",
       "failed_to_save": "সেভ করা যায়নি",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "কোনো জিটার ছাড়াই ঠিক নির্ধারিত সময়ে চালান। ডিফল্টভাবে, ট্রাফিকের স্পাইক কমাতে জবগুলো এলোমেলোভাবে ছড়িয়ে দেওয়া হয়।",
+      "harness": "হার্নেস",
+      "harness_inherit": "হার্নেস: ইনহেরিট",
+      "harness_not_serviceable": "{{name}} — এই বিল্ডে এখনও সমর্থিত নয়",
+      "harness_unavailable": "{{name}} — অনুপলব্ধ ({{reason}})",
       "hide_in_chat": "চ্যাটে লুকান",
       "hours": "ঘণ্টা",
       "how_often_this_job_runs": "এই জব কত ঘন ঘন চলে",
@@ -6025,6 +6044,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "এই জব চালু হলে এজেন্টকে পাঠানো প্রম্পট বা টাস্ক",
       "timezone": "টাইমজোন",
       "weekly_schedule": "সাপ্তাহিক সময়সূচি",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "এই জব কোন ACP হার্নেস চালায়। ডিফল্টের জন্য ইনহেরিট-এ রেখে দিন।",
       "which_agent_handles_this_job_leave_default_for_t": "কোন এজেন্ট এই জব পরিচালনা করবে। প্রধান এজেন্টের জন্য ডিফল্ট রেখে দিন।"
     },
     "jobLogsView": {
@@ -9362,6 +9382,7 @@
       "retry": "আবার চেষ্টা করুন",
       "roll_the_folder_list_up": "ফোল্ডারের তালিকা সংকুচিত করুন",
       "running_queued": "{{started}} চলছে · {{queued}} সারিতে",
+      "running_on_harness": "{{name}}-এ চলছে",
       "running_session_one": "{{count}}টি চলমান সেশন",
       "running_session_other": "{{count}}টি চলমান সেশন",
       "search_older_sessions": "পুরোনো সেশন খুঁজুন…",
@@ -9786,25 +9807,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "কোনও সক্রিয় পড ছাড়াই ডিস্কে থাকা পড হোম"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "এজেন্ট ব্যাকএন্ড",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code সাধারণত কাজ করার আগে অনুমতি চায়, এবং {{productName}} সেই অনুরোধ যাচাই করে। কিন্তু Claude-এর নিজের সেটিংসে আগেই অনুমোদিত টুল — প্রকল্পের ভিতরের .claude/settings.json সহ — কিছু জিজ্ঞাসা করে না, তাই অস্বীকৃতির নিয়ম ও অডিট লগ সেই কলটি দেখতে পায় না।",
-        "could_not_load_the_agent_backend": "এজেন্ট ব্যাকএন্ড লোড করা যায়নি।",
-        "could_not_save_the_agent_backend": "এজেন্ট ব্যাকএন্ড সংরক্ষণ করা যায়নি।",
-        "default_all_features_supported": "ডিফল্ট। সব বৈশিষ্ট্য সমর্থিত।",
-        "experimental": "পরীক্ষামূলক",
-        "install_check_failed": "এই মেশিনে এটি ইনস্টল করা আছে কিনা তা যাচাই করা যায়নি।",
-        "installed_restart_required": "এই মেশিনে ইনস্টল করা আছে, তবে ব্যবহারের আগে এই gateway পুনরায় চালু করতে হবে।",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "কনফিগারেশন লোড হচ্ছে…",
-        "missing_components": "এই মেশিনে অনুপস্থিত: {{components}}",
-        "missing_components_with_command": "এই মেশিনে অনুপস্থিত: {{components}}। ইনস্টল করুন: {{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "নতুন সেশনগুলি এই এজেন্ট ব্যবহার করে। ইতিমধ্যে খোলা সেশন যে এজেন্টে শুরু হয়েছিল সেটিই ধরে রাখে — এখানে বদলালে চলমান সেশন বদলায় না।",
-        "retry": "আবার চেষ্টা করুন",
-        "set_is_fixed_at_gateway_start": "এখানে কোন এজেন্টগুলি দেখা যাবে তা gateway চালু হওয়ার সময় নির্ধারিত হয়। পরিচালিত ডিপ্লয়মেন্ট নীতির মাধ্যমে এই সেট সীমিত করতে পারে; নীতি সম্পাদনা পরবর্তী চালুর সময় কার্যকর হয়।"
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "কোনো crew-এ চ্যাট",
         "chat_on_a_crew_desc": "তৈরির মেনুতে “New chat on crew” যোগ করে, যা একটি সংযুক্ত crew-এ চলা সেশন শুরু করে। অসম্পূর্ণ: এটি সেই crew-এর নিজস্ব প্যানেলে খোলে, এবং crew-এ চলা সেশনগুলি এখনও এখানে তালিকাভুক্ত হয় না।",
@@ -9818,10 +9820,6 @@
     "developerPage": {
       "developer": "ডেভেলপার",
       "tabs": {
-        "agentBackend": {
-          "description": "নতুন সেশন কোন এজেন্ট চালু করে — Kiro CLI, Claude Code বা KAS",
-          "label": "এজেন্ট ব্যাকএন্ড"
-        },
         "archive": {
           "description": "রোটেট/সংক্ষিপ্ত করা সেশন ইতিহাস (7 দিন সংরক্ষণ)",
           "label": "আর্কাইভ"
@@ -12165,6 +12163,47 @@
         "zoom_font": "জুম ও ফন্ট",
         "zoom_level": "জুম লেভেল",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "AI ব্যাকএন্ড",
+        "badge_available": "উপলব্ধ",
+        "badge_bundled": "অন্তর্ভুক্ত",
+        "badge_invalid": "অবৈধ",
+        "badge_missing": "অনুপস্থিত",
+        "badge_not_serviceable": "অসমর্থিত",
+        "badge_operator": "অপারেটরের",
+        "badge_restart_required": "পুনরায় চালু করা প্রয়োজন",
+        "badge_unavailable": "অনুপলব্ধ",
+        "default_harness": "ডিফল্ট হার্নেস",
+        "default_harness_unset": "সেট করা নেই",
+        "failed_to_load_config": "বর্তমান সেটিংস লোড করা যায়নি।",
+        "failed_to_load_harnesses": "হার্নেসের তালিকা লোড করা যায়নি।",
+        "failed_to_save": "সেভ করা যায়নি",
+        "harness_list_unavailable": "হার্নেসের তালিকা লোড হয়নি, তাই উপলব্ধতা দেখানো হচ্ছে না।",
+        "harness_not_serviceable": "{{name}} — এই বিল্ডে সমর্থিত নয়",
+        "harness_unavailable": "{{name}} — অনুপলব্ধ ({{reason}})",
+        "harnesses_are_defined_in_config_and_authenticate": "হার্নেস config.json-এ নির্ধারিত হয় এবং নিজেরাই প্রমাণীকরণ করে — {{productName}} কোনও প্রদানকারীর ক্রেডেনশিয়াল সংরক্ষণ করে না।",
+        "install_check_failed": "এই মেশিনে এটি ইনস্টল করা আছে কিনা তা যাচাই করা যায়নি।",
+        "installed_restart_required": "এই মেশিনে ইনস্টল করা আছে, তবে ব্যবহারের আগে এই গেটওয়ে পুনরায় চালু করতে হবে।",
+        "legacy_backend": "পুরোনো ACP ব্যাকএন্ড",
+        "legacy_backend_kas": "KAS (kiro-agent)",
+        "legacy_backend_kiro": "Kiro CLI (ডিফল্ট)",
+        "legacy_backend_outranked": "ডিফল্ট হার্নেস সেট থাকলে এটি উপেক্ষা করা হয়।",
+        "legacy_backend_stored": "{{value}} (সংরক্ষিত, নির্বাচনযোগ্য নয়)",
+        "missing_components": "এই মেশিনে অনুপস্থিত: {{components}}",
+        "missing_components_with_command": "এই মেশিনে অনুপস্থিত: {{components}}। ইনস্টল করুন: {{command}}",
+        "no_harnesses_registered": "কোনও হার্নেস নিবন্ধিত নেই।",
+        "not_serviceable_note": "এই বিল্ড এই হার্নেসে সেশন শুরু করতে পারে না।",
+        "operator_entry_conflicts": "এই id সহ আপনার হার্নেস এন্ট্রি বাতিল করা হয়েছে: {{reason}}",
+        "registered_harnesses": "নিবন্ধিত হার্নেস",
+        "resolves_to": "নতুন সেশন {{name}}-এ শুরু হবে।",
+        "resolves_to_not_serviceable": "নতুন সেশন {{name}}-এ সমাধান হয়, কিন্তু এই বিল্ড সেখানে সেশন শুরু করতে পারে না।",
+        "resolves_to_unavailable": "নতুন সেশন {{name}}-এ সমাধান হয়, যা চালানো যাচ্ছে না: {{reason}}",
+        "retry": "আবার চেষ্টা করুন",
+        "retry_config": "সেটিংস আবার লোড করুন",
+        "retry_harness_list": "হার্নেসের তালিকা আবার লোড করুন",
+        "the_older_key_read_as_an_alias_of_a_harness": "পুরোনো ব্যাকএন্ড কী, যা নিবন্ধিত হার্নেসের উপনাম হিসেবে পড়া হয়।",
+        "which_harness_new_sessions_start_on": "নতুন সেশন কোন হার্নেসে শুরু হয়। চলমান সেশন যে হার্নেসে শুরু হয়েছিল সেটিতেই থাকে।"
       },
       "importPanel": {
         "agent_data": "এজেন্ট ডেটা",

@@ -35,6 +35,7 @@ import SimpleSelect from '../components/SimpleSelect'
 import FolderConfigModal from '../components/FolderConfigModal'
 import ModelDropdownList from '../components/ModelDropdownList'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useHarnesses, harnessRow } from '../hooks/useHarnesses'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useDndSensors } from '../hooks/useDndSensors'
 import { useSessionPalette } from '../hooks/useSessionPalette'
@@ -586,6 +587,11 @@ interface Slot {
   // positive claim only: a falsy value never means "mismatch".
   effective_agent?: string
   model?: string  // '' / absent = provider-default ("auto")
+  /** ACP harness this session is bound to. '' / absent = the configured
+   *  default. Surfaced only in the row tooltip, and only when it differs from
+   *  the default, so a non-default binding is discoverable without adding a
+   *  chip to the row. */
+  harness?: string
   // Message count from the slot payload. Already carried by every ChatSlot
   // (redux seeds it in addSlotOptimistic and SessionGridView renders it); it was
   // simply never declared on this local view of the type.
@@ -1427,6 +1433,21 @@ const SessionRow = memo(function SessionRow({
   const ime = useImeGuard()
   const simplifiedToolNames = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
+  // The bound harness, surfaced in the row tooltip — but ONLY when it is set AND
+  // differs from the configured default, so a default-harness row gains no
+  // clutter (R5.2). Resolved to a display name via the same `/api/harnesses`
+  // listing the picker uses; `useHarnesses` empties on error and while loading,
+  // so `harnessRow` returns undefined then and the row stays silent — never
+  // flashing the raw id. `defaultId` is '' until the listing lands, and the
+  // guard `s.harness !== harnessState.defaultId` means a `kiro` row whose default
+  // IS `kiro` is redundant and suppressed.
+  const harnessState = useHarnesses()
+  const harnessRowForSlot = s.harness && s.harness !== harnessState.defaultId
+    ? harnessRow(harnessState, s.harness)
+    : undefined
+  const harnessTip = harnessRowForSlot
+    ? i18nT('pages.chatSidebar.running_on_harness', { name: harnessRowForSlot.display_name || harnessRowForSlot.id })
+    : ''
   // ── Slot-scoped store reads ──────────────────────────────────────────────
   // Each subscription selects THIS slot's entry, so a write to another slot's
   // status/loop/queue/run leaves this row's subscription value untouched and
@@ -1923,7 +1944,7 @@ const SessionRow = memo(function SessionRow({
                 *  every sidebar commit for a crossfade that fires only on the
                 *  rare agent switch, and the repo's animation invariant is
                 *  framer-only (no new CSS @keyframes). */}
-              <span key={agentName || 'empty'} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 || agentDiverged ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</span>
+              <span key={agentName || 'empty'} className={`truncate min-w-0 shrink-0 ${resolvedSlotTags.length > 0 || agentDiverged ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</span>
               {agentDiverged && (
                 // Plain secondary TEXT, deliberately not a badge, a colour or an
                 // icon. It is informational — the session works, it is simply
@@ -2081,7 +2102,7 @@ const SessionRow = memo(function SessionRow({
             <div
               data-session-title
               className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : 'truncate'}`}
-              title={s.title && s.title !== s.key ? s.title : s.key}
+              title={`${s.title && s.title !== s.key ? s.title : s.key}${harnessTip ? ` — ${harnessTip}` : ''}`}
             >
               {/* No separate fork glyph: forked titles already carry the
                   persisted "↳ " marker (chat_fork.py _FORK_TITLE_MARKER). Keeping
@@ -5168,7 +5189,7 @@ function ChatSidebar({
           (1px border + mt-0.5 + 6px of the h-10 row around the h-7 button). */}
       <div className="flex justify-between items-center px-2 mt-0.5 h-10">
         <div className={`flex items-center gap-1.5 min-w-0 flex-1 ${collapsible && !isMobile ? 'pl-9' : 'pl-1.5'}`}>
-          {!tinyHeader && <span className="sessions-panel-title text-sm font-semibold text-text-strong tracking-[.04em] truncate">{i18nT('pages.chatSidebar.sessions')}</span>}
+          {!tinyHeader && <span className="sessions-panel-title text-sm font-semibold text-text-strong tracking-[.04em] truncate min-w-0">{i18nT('pages.chatSidebar.sessions')}</span>}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <DropdownMenu>

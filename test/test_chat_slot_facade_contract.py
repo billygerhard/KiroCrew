@@ -20,6 +20,7 @@ _TO_DICT_KEYS = (
     "agent",
     "effective_agent",
     "model",
+    "harness",
     "model_withheld",
     "reasoning_effort",
     "mode",

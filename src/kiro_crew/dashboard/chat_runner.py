@@ -608,11 +608,11 @@ async def _steer_policy_notice(
     reason inside the SAME turn, so the fallback recovery continuation (a second
     billed turn) is not needed.
 
-    Opt-in by positive capability, never by harness identity: a backend outside
-    ``ACP_BACKENDS_STEER`` has no ``_session/steer``, reports
-    ``supports_steer`` False, and keeps the recovery-continuation behaviour
-    unchanged. ``getattr`` guards the attribute because the reject paths also run
-    against minimal test doubles.
+    Opt-in by positive capability, never by harness identity: a harness that does
+    not declare ``steer`` has no ``_session/steer``, reports ``supports_steer``
+    False, and keeps the recovery-continuation behaviour unchanged. ``getattr``
+    guards the attribute because the reject paths also run against minimal test
+    doubles.
 
     Appends the notice to *notices* (the turn's pending list, settled later by the
     ``steering_consumed`` echo) and returns whether it was written. Best-effort:
@@ -3744,6 +3744,11 @@ async def _eager_spawn(
                     crew_agent=crew_alias,
                     model=slot.model or agent_model or None,
                     cwd=slot.project or None,
+                    # Same binding the real first turn will ask for. They MUST
+                    # agree: an eager session spawned on the default harness
+                    # would be claimed by a first turn that named another one,
+                    # and the turn would run on a process nobody bound.
+                    harness=slot.harness or "",
                     speculative=True,
                     speculative_resume=allow_resume,
                     reasoning_effort_override=slot.reasoning_effort or None,
@@ -5786,6 +5791,14 @@ async def _run_chat(
             crew_agent=crew_alias,
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
+            # The harness the slot was CREATED with. Empty inherits the configured
+            # default, which is what every slot minted before harnesses were
+            # selectable carries, so this changes nothing for them. A non-empty
+            # value is refused rather than substituted when it cannot serve — the
+            # composer already resolved it at slot creation, but the machine can
+            # change in between, and running the turn on a different harness than
+            # the tab names is the substitution this feature exists to prevent.
+            harness=slot.harness or "",
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True

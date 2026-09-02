@@ -29,8 +29,11 @@ superset. The one frame that stops arriving is ``_kiro/auth/getAccessToken``,
 which is the point.
 
 Sandbox posture is unchanged by the switch, and this is the reason Crew's own
-seatbelt must stay on (see ``ACP_BACKENDS_INTERNAL_SANDBOX`` in
-:mod:`kiro_crew.acp.types`). KAS implements its own OS sandbox -- seatbelt on
+seatbelt must stay on (KAS's descriptor declares ``internal_sandbox=False`` — the
+``ACP_BACKENDS_INTERNAL_SANDBOX`` view that once encoded this is retired, wave-2
+T5; the grant now lives on the descriptor in
+:mod:`kiro_crew.acp.harness_registry`). KAS implements its own OS sandbox --
+seatbelt on
 macOS, bubblewrap on Linux -- selected by an ``--sandbox`` argument on its ACP
 server, and it wraps each bash command rather than the agent process. kiro-cli's
 relay does NOT pass that argument (``spawn_kas_process`` builds exactly

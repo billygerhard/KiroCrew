@@ -5439,6 +5439,8 @@
       "earlier_messages_open_session": "पुराने संदेश — पूरा सत्र खोलें (विभाजित दृश्य बंद हो जाएगा)",
       "earlier_messages_unavailable": "पुराने संदेश इस सत्र के इतिहास में अब उपलब्ध नहीं हैं।",
       "forked_from": "{{name}} से फ़ोर्क किया गया",
+      "harness_serving": "इस चैट को चलाने वाला AI हार्नेस",
+      "harness_serving_pinned": "इस चैट को चलाने वाला AI हार्नेस — चैट बनाते समय तय किया गया",
       "model_list": "मॉडल सूची",
       "session_ready_type_a_message_to_start": "सेशन तैयार है। शुरू करने के लिए कोई संदेश टाइप करें।",
       "split_down": "नीचे विभाजित करें",
@@ -5976,6 +5978,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "यह चैट {{name}} पर शुरू नहीं हो सकती: {{reason}}",
+      "default": "डिफ़ॉल्ट",
+      "default_harness": "डिफ़ॉल्ट हार्नेस",
+      "harness_list": "हार्नेस सूची",
+      "harness_list_unavailable": "हार्नेस सूची उपलब्ध नहीं — दोबारा कोशिश जारी",
+      "harness_name": "हार्नेस: {{name}}",
+      "invalid_reason": "अमान्य डिस्क्रिप्टर — {{reason}}",
+      "no_harnesses_registered": "कोई हार्नेस पंजीकृत नहीं",
+      "not_registered": "पंजीकृत नहीं",
+      "not_serviceable": "इस बिल्ड में अभी समर्थित नहीं",
+      "unavailable_reason": "उपलब्ध नहीं — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "इस जॉब के लिए एक छोटा लेबल",
       "add": "जोड़ें",
@@ -5995,6 +6010,10 @@
       "every_interval": "हर अंतराल",
       "failed_to_save": "सहेजा नहीं जा सका",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "जिटर के बिना ठीक निर्धारित समय पर चलाएँ। डिफ़ॉल्ट रूप से, ट्रैफ़िक स्पाइक कम करने के लिए जॉब्स को यादृच्छिक रूप से फैलाया जाता है।",
+      "harness": "हार्नेस",
+      "harness_inherit": "हार्नेस: इनहेरिट",
+      "harness_not_serviceable": "{{name}} — इस बिल्ड में अभी समर्थित नहीं",
+      "harness_unavailable": "{{name}} — अनुपलब्ध ({{reason}})",
       "hide_in_chat": "चैट में छिपाएँ",
       "hours": "घंटे",
       "how_often_this_job_runs": "यह जॉब कितनी बार चलती है",
@@ -6025,6 +6044,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "यह जॉब चलने पर एजेंट को भेजा जाने वाला प्रॉम्प्ट या कार्य",
       "timezone": "टाइमज़ोन",
       "weekly_schedule": "साप्ताहिक शेड्यूल",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "यह जॉब कौन-सा ACP हार्नेस चलाता है। डिफ़ॉल्ट के लिए इनहेरिट पर छोड़ें।",
       "which_agent_handles_this_job_leave_default_for_t": "यह जॉब कौन सा एजेंट संभालेगा। मुख्य एजेंट के लिए डिफ़ॉल्ट पर छोड़ दें।"
     },
     "jobLogsView": {
@@ -9362,6 +9382,7 @@
       "retry": "फिर कोशिश करें",
       "roll_the_folder_list_up": "फ़ोल्डर सूची समेटें",
       "running_queued": "{{started}} चल रहे · {{queued}} कतार में",
+      "running_on_harness": "{{name}} पर चल रहा है",
       "running_session_one": "{{count}} चल रहा सत्र",
       "running_session_other": "{{count}} चल रहे सत्र",
       "search_older_sessions": "पुराने सत्र खोजें…",
@@ -9786,25 +9807,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "बिना किसी सक्रिय पॉड के डिस्क पर बचे पॉड होम"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "एजेंट बैकएंड",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code आमतौर पर कार्य करने से पहले अनुमति मांगता है, और {{productName}} उस अनुरोध की जांच करता है। लेकिन Claude की अपनी सेटिंग्स में पहले से स्वीकृत टूल — जिसमें प्रोजेक्ट के अंदर की .claude/settings.json भी शामिल है — कुछ नहीं पूछता, इसलिए अस्वीकृति नियम और ऑडिट लॉग उस कॉल को नहीं देखते।",
-        "could_not_load_the_agent_backend": "एजेंट बैकएंड लोड नहीं किया जा सका।",
-        "could_not_save_the_agent_backend": "एजेंट बैकएंड सहेजा नहीं जा सका।",
-        "default_all_features_supported": "डिफ़ॉल्ट। सभी सुविधाएँ समर्थित हैं।",
-        "experimental": "प्रयोगात्मक",
-        "install_check_failed": "यह जाँचा नहीं जा सका कि यह इस मशीन पर इंस्टॉल है या नहीं।",
-        "installed_restart_required": "इस मशीन पर इंस्टॉल है, लेकिन उपयोग से पहले इस gateway को पुनः आरंभ करना होगा।",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "कॉन्फ़िगरेशन लोड हो रहा है…",
-        "missing_components": "इस मशीन पर अनुपस्थित: {{components}}",
-        "missing_components_with_command": "इस मशीन पर अनुपस्थित: {{components}}। इससे इंस्टॉल करें: {{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "नए सत्र इस एजेंट का उपयोग करते हैं। पहले से खुला सत्र उसी एजेंट पर बना रहता है जिससे वह शुरू हुआ था — यहाँ बदलने से चालू सत्र नहीं बदलता।",
-        "retry": "पुनः प्रयास करें",
-        "set_is_fixed_at_gateway_start": "यहाँ कौन-से एजेंट दिखते हैं यह gateway शुरू होने पर तय होता है। प्रबंधित परिनियोजन नीति द्वारा इस समूह को सीमित कर सकता है; उस नीति में बदलाव अगली शुरुआत पर लागू होता है।"
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "किसी crew पर चैट करें",
         "chat_on_a_crew_desc": "बनाने के मेनू में “New chat on crew” जोड़ता है, जो किसी जुड़े हुए crew पर चलने वाला सत्र शुरू करता है। अपूर्ण: यह उसी crew के अपने पैनल में खुलता है, और crew पर चल रहे सत्र अभी यहाँ सूचीबद्ध नहीं होते।",
@@ -9818,10 +9820,6 @@
     "developerPage": {
       "developer": "डेवलपर",
       "tabs": {
-        "agentBackend": {
-          "description": "नए सत्र कौन-सा एजेंट शुरू करते हैं — Kiro CLI, Claude Code या KAS",
-          "label": "एजेंट बैकएंड"
-        },
         "archive": {
           "description": "घुमाया/संक्षिप्त किया गया सत्र इतिहास (7 दिन तक रखा जाता है)",
           "label": "संग्रह"
@@ -12165,6 +12163,47 @@
         "zoom_font": "ज़ूम और फ़ॉन्ट",
         "zoom_level": "ज़ूम स्तर",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "AI बैकएंड",
+        "badge_available": "उपलब्ध",
+        "badge_bundled": "अंतर्निहित",
+        "badge_invalid": "अमान्य",
+        "badge_missing": "अनुपस्थित",
+        "badge_not_serviceable": "असमर्थित",
+        "badge_operator": "ऑपरेटर का",
+        "badge_restart_required": "पुनरारंभ आवश्यक",
+        "badge_unavailable": "अनुपलब्ध",
+        "default_harness": "डिफ़ॉल्ट हार्नेस",
+        "default_harness_unset": "सेट नहीं",
+        "failed_to_load_config": "वर्तमान सेटिंग्स लोड नहीं हो सकीं।",
+        "failed_to_load_harnesses": "हार्नेस सूची लोड नहीं हो सकी।",
+        "failed_to_save": "सहेजा नहीं जा सका",
+        "harness_list_unavailable": "हार्नेस सूची लोड नहीं हुई, इसलिए उपलब्धता नहीं दिखाई जा रही है।",
+        "harness_not_serviceable": "{{name}} — इस बिल्ड में समर्थित नहीं",
+        "harness_unavailable": "{{name}} — अनुपलब्ध ({{reason}})",
+        "harnesses_are_defined_in_config_and_authenticate": "हार्नेस config.json में परिभाषित होते हैं और स्वयं प्रमाणीकरण करते हैं — {{productName}} कोई प्रदाता क्रेडेंशियल संग्रहीत नहीं करता।",
+        "install_check_failed": "यह जाँचा नहीं जा सका कि यह इस मशीन पर इंस्टॉल है या नहीं।",
+        "installed_restart_required": "इस मशीन पर इंस्टॉल है, लेकिन उपयोग से पहले इस गेटवे को पुनरारंभ करना होगा।",
+        "legacy_backend": "पुराना ACP बैकएंड",
+        "legacy_backend_kas": "KAS (kiro-agent)",
+        "legacy_backend_kiro": "Kiro CLI (डिफ़ॉल्ट)",
+        "legacy_backend_outranked": "डिफ़ॉल्ट हार्नेस सेट होने पर इसे नज़रअंदाज़ किया जाता है।",
+        "legacy_backend_stored": "{{value}} (संग्रहीत, चयन योग्य नहीं)",
+        "missing_components": "इस मशीन पर अनुपस्थित: {{components}}",
+        "missing_components_with_command": "इस मशीन पर अनुपस्थित: {{components}}. इससे इंस्टॉल करें: {{command}}",
+        "no_harnesses_registered": "कोई हार्नेस पंजीकृत नहीं है।",
+        "not_serviceable_note": "यह बिल्ड इस हार्नेस पर सेशन शुरू नहीं कर सकता।",
+        "operator_entry_conflicts": "इस id वाली हार्नेस प्रविष्टि अस्वीकृत कर दी गई: {{reason}}",
+        "registered_harnesses": "पंजीकृत हार्नेस",
+        "resolves_to": "नए सेशन {{name}} पर शुरू होंगे।",
+        "resolves_to_not_serviceable": "नए सेशन {{name}} पर हल होते हैं, लेकिन यह बिल्ड उस पर सेशन शुरू नहीं कर सकता।",
+        "resolves_to_unavailable": "नए सेशन {{name}} पर हल होते हैं, जो चल नहीं सकता: {{reason}}",
+        "retry": "फिर कोशिश करें",
+        "retry_config": "सेटिंग्स फिर से लोड करें",
+        "retry_harness_list": "हार्नेस सूची फिर से लोड करें",
+        "the_older_key_read_as_an_alias_of_a_harness": "पुरानी बैकएंड कुंजी, जिसे पंजीकृत हार्नेस के उपनाम के रूप में पढ़ा जाता है।",
+        "which_harness_new_sessions_start_on": "नए सेशन किस हार्नेस पर शुरू होते हैं। चल रहा सेशन उसी हार्नेस पर बना रहता है जिस पर वह शुरू हुआ था।"
       },
       "importPanel": {
         "agent_data": "एजेंट डेटा",

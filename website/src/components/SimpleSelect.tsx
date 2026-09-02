@@ -48,6 +48,13 @@ export interface SimpleSelectProps {
   /** Trigger text when the current value has no matching option (legacy values). */
   triggerFallback?: string
   disabled?: boolean
+  /** Option values that render but cannot be chosen. For a row whose presence is
+   *  the explanation — a harness this build cannot serve — where hiding it would
+   *  make "not offered" indistinguishable from "does not exist" and leave the
+   *  operator nothing to act on. The label still carries the reason; this only
+   *  removes the click. A value in here that is also the CURRENT value stays
+   *  displayed, so a stored setting is never silently dropped from view. */
+  disabledOptions?: string[]
   style?: React.CSSProperties
   /** Forwarded to the trigger so a caption's `<label htmlFor>` can name it
    *  (SettingsField pairs this with its label association). Optional: the
@@ -61,10 +68,14 @@ export interface SimpleSelectProps {
   'aria-label'?: string
 }
 
-export default function SimpleSelect({ options, optionLabels, value, onChange, action, clearLabel, triggerFallback, disabled, style, id, className, 'aria-label': ariaLabel }: SimpleSelectProps) {
+export default function SimpleSelect({ options, optionLabels, value, onChange, action, clearLabel, triggerFallback, disabled, disabledOptions, style, id, className, 'aria-label': ariaLabel }: SimpleSelectProps) {
   const isTouch = useIsTouchDevice()
   const toRadix = (v: string) => (v === '' ? EMPTY_VALUE_SENTINEL : v)
   const fromRadix = (v: string) => (v === EMPTY_VALUE_SENTINEL ? '' : v)
+  // The CURRENT value is never disabled, whatever the caller passed: a stored
+  // setting has to stay displayable, and Radix will not render a disabled item as
+  // the selected one.
+  const isDisabledOption = (v: string) => !!disabledOptions?.includes(v) && v !== value
   // '' is selectable only when the options include it or a clearLabel row exists;
   // otherwise an empty value means "nothing selected" and the trigger shows the fallback.
   const emptySelectable = clearLabel !== undefined || options.includes('')
@@ -112,7 +123,7 @@ export default function SimpleSelect({ options, optionLabels, value, onChange, a
           <NativeSelectOption value={EMPTY_VALUE_SENTINEL}>{clearLabel}</NativeSelectOption>
         )}
         {options.map((opt, i) => (
-          <NativeSelectOption key={opt} value={toRadix(opt)}>{label(opt, i)}</NativeSelectOption>
+          <NativeSelectOption key={opt} value={toRadix(opt)} disabled={isDisabledOption(opt)}>{label(opt, i)}</NativeSelectOption>
         ))}
       </NativeSelect>
     )
@@ -141,7 +152,7 @@ export default function SimpleSelect({ options, optionLabels, value, onChange, a
             <SelectItem value={EMPTY_VALUE_SENTINEL}>{clearLabel}</SelectItem>
           )}
           {options.map((opt, i) => (
-            <SelectItem key={opt} value={toRadix(opt)}>
+            <SelectItem key={opt} value={toRadix(opt)} disabled={isDisabledOption(opt)}>
               {label(opt, i)}
             </SelectItem>
           ))}

@@ -144,7 +144,9 @@ class TestSteerStartupGrace:
 
 
 class TestConversationRegistryRebuild:
-    def _keep_run(self, run_id: str, *, sid: str = "sid-x", conv_key: str = "") -> None:
+    def _keep_run(
+        self, run_id: str, *, sid: str = "sid-x", conv_key: str = "", harness: str = ""
+    ) -> None:
         create_agent_folder(run_id, task="t")
         update_state(
             run_id,
@@ -153,6 +155,7 @@ class TestConversationRegistryRebuild:
             provider="acp",
             cwd="",
             conversation_key=conv_key,
+            harness=harness,
         )
 
     def test_scan_keep_states_finds_only_keep_runs(self) -> None:
@@ -162,11 +165,24 @@ class TestConversationRegistryRebuild:
         found = mgr._scan_keep_states()
         ids = {t[0] for t in found}
         assert ids == {"keeprun1"}
-        conv_id, conv_key, sid, provider, _cwd, last_used = found[0]
+        conv_id, conv_key, sid, provider, _cwd, harness, last_used = found[0]
         assert conv_key == "subagent:keeprun1"
         assert sid == "sid-x"
         assert provider == "acp"
+        assert harness == ""
         assert last_used > 0
+
+    def test_scan_reads_the_recorded_harness_binding(self) -> None:
+        """``write_state`` records the harness; the scan must read it back.
+
+        A rebuilt map entry without it records "no binding", which resolves to
+        whatever the CURRENT default harness is — so a keep run created on one
+        harness would be resumed on another, replaying nothing.
+        """
+        mgr = _manager()
+        self._keep_run("keepkas", harness="kas")
+        found = mgr._scan_keep_states()
+        assert found[0][5] == "kas"
 
     def test_scan_uses_recorded_conversation_key(self) -> None:
         """A continuation run's state points at the ORIGINAL conversation."""
@@ -184,10 +200,24 @@ class TestConversationRegistryRebuild:
         self._keep_run("keeprun1")
         await mgr._rebuild_conversation_registry()
         sessions.seed_conversation.assert_called_once_with(
-            "subagent:keeprun1", "sid-x", provider="acp", cwd=""
+            "subagent:keeprun1", "sid-x", provider="acp", cwd="", harness=""
         )
         sessions.mark_continuable.assert_called_with("subagent:keeprun1")
         assert "subagent:keeprun1" in mgr._conversations
+
+    @pytest.mark.asyncio
+    async def test_rebuild_seeds_the_harness_the_run_recorded(self) -> None:
+        """The restart-rebuild path binds the map entry, like the continue path.
+
+        Without this the entry survives a restart binding-less and a later
+        resume runs on the current default harness instead of the run's own.
+        """
+        sessions = _mock_sessions()
+        sessions.resumable_sid = MagicMock(side_effect=[None, "sid-x"])
+        mgr = _manager(sessions)
+        self._keep_run("keepkas", harness="kas")
+        await mgr._rebuild_conversation_registry()
+        assert sessions.seed_conversation.call_args.kwargs["harness"] == "kas"
 
     @pytest.mark.asyncio
     async def test_rebuild_skips_released_conversations(self) -> None:

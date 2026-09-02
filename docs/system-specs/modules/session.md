@@ -73,10 +73,15 @@ and returning `AcpSessionHandle | _ProviderBgSession`. Dispatch is via
 `_bg_backend_supports_runtime()` — positive membership in
 `ACP_BACKENDS_ACP_RUNTIME`, never an inequality (harness parity):
 
-- **runtime-capable backend** (`ACP_BACKENDS_ACP_RUNTIME`) — each caller (title
-  generation, suggestions, folders, nav) gets its **own** ephemeral `sessionId`
-  multiplexed on a single shared `_bg_runtime` (an `AcpRuntime` spawned under
-  the CONFIGURED backend), created lazily under `_bg_runtime_lock`.
+- **kiro (`acp`)** — the only provider with a multiplexed `AcpRuntime` to share,
+  so this branch is the one every build takes. Which HARNESS may share a pooled
+  runtime is a separate question, answered by the `acp_runtime_pool` capability on
+  the bound descriptor; `_bg` runs `kirocrew-lite` on the configured default
+  harness and carries no per-session binding.
+  Each caller (title generation, suggestions, folders, nav) gets its **own**
+  ephemeral `sessionId` multiplexed on a single shared `_bg_runtime` (an
+  `AcpRuntime` spawned under the CONFIGURED backend), created lazily under
+  `_bg_runtime_lock`.
   `create_session()` runs **outside** the lock so independent callers aren't
   serialized. The runtime is respawned-and-retried once on `AcpRuntimeDead`
   (`max_retries=1`, 2 attempts total).
@@ -412,6 +417,27 @@ parent snapshot + accumulated side history.
 - `remove()`: deletes mapping — explicit tab delete, no resume expected.
 - `close_all()`: saves all active mappings before killing processes.
 - `start_pool()`: prunes stale entries (files deleted by kiro-cli GC).
+
+**The harness travels with the sid.** A `set()` also records the session's bound
+harness (`SessionMap.get_harness`), because a native session id is meaningful only
+inside the store that minted it: resuming one on a different harness replays
+nothing and starts a fresh conversation under an id the map still trusts.
+`get_or_create` reads that recording — not the current default — for a resume, and
+refuses with a harness-named error when the harness is gone or cannot run; a
+RECENT SPAWN FAILURE does not gate a resume, since only a successful spawn clears
+that record and honouring it would refuse every resume for the whole failure
+window. An explicit `harness=` that disagrees with the recording is refused
+(`HarnessBindingConflict`, both harnesses named) rather than reconciled, and the
+same refusal covers a LIVE session's `harness_id` — the fast path returns before
+the recorded check runs, so without it an edited selection is silently honoured as
+whatever the running process already is — see
+[providers.md](providers.md) § Harness binding. `""` means "no binding recorded" (an entry written before binding existed,
+or a caller with nothing to record) and is read as "the configured default", which
+is what such a session actually ran on — never as kiro-cli specifically.
+`SessionManager.get_harness(key)` answers from the LIVE `_Session.harness_id`
+first and the map second, because the map entry is only written once a native
+session id exists. Resolution and refusal rules are in
+[providers.md](providers.md) § Harness binding.
 
 ### Asking for a fresh conversation on a slot that stays open
 

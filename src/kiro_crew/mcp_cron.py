@@ -1067,6 +1067,13 @@ def _list_tools() -> list[dict[str, Any]]:
                         "or global default. Applies when the job's session is created; a running "
                         "persistent session keeps its current model until it is reset.",
                     },
+                    "harness": {
+                        "type": "string",
+                        "description": "ACP harness override for this job (e.g. 'kiro', 'kas'). "
+                        "Empty or omitted inherits the configured default harness. Validated "
+                        "when the job fires, not now: a harness that is not installed yet is "
+                        "accepted here and fails that run with a reason naming it.",
+                    },
                     "skip_dates": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1219,6 +1226,12 @@ def _list_tools() -> list[dict[str, Any]]:
                         "Empty string clears the override (inherits from agent/global). Applies "
                         "when the job's session is created; a running persistent session keeps "
                         "its current model until it is reset.",
+                    },
+                    "harness": {
+                        "type": "string",
+                        "description": "ACP harness override for this job (e.g. 'kiro', 'kas'). "
+                        "Empty string clears the override (inherits the configured default "
+                        "harness). Validated when the job fires, not now.",
                     },
                 },
                 "required": ["job_id"],
@@ -1413,6 +1426,10 @@ def _render_cron_list_compact(jobs: list[Any]) -> str:
             # _sanitize applies the full redact_credentials +
             # redact_exfiltration_urls chain required for LLM-controlled values.
             extras.append(f"model={_sanitize(model_val)}")
+        harness_raw = getattr(j, "harness", "")
+        harness_val = harness_raw.strip() if isinstance(harness_raw, str) else ""
+        if harness_val:
+            extras.append(f"harness={_sanitize(harness_val)}")
         if channel:
             extras.append(f"channel={_sanitize(channel)}")
         last_status = getattr(j, "last_status", None)
@@ -1851,6 +1868,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # ... bool), so a non-bool falls back to the field default rather than
         # being coerced from a raw-truthy value.
         agent = args.get("agent", "")
+        # Shape-validated by CRON_ADD_SCHEMA; NOT checked against the registry
+        # here, because the registry answers for the machine as it is right now
+        # and the run is what has to judge it (cron.resolve_job_harness).
+        harness_arg = str(args.get("harness") or "").strip()
         silent = args.get("silent", False)
         approval_mode = args.get("approval_mode", "")
         session_key = _authz_session_key()
@@ -1882,6 +1903,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 agent_id=agent or "",
                 approval_mode=approval_mode or "",
                 model=model_arg,
+                harness=harness_arg,
                 silent=bool(silent),
                 strict_schedule=strict_schedule if isinstance(strict_schedule, bool) else False,
                 hide_in_chat=hide_in_chat if isinstance(hide_in_chat, bool) else False,
@@ -1971,6 +1993,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                     # "auto" sentinel — explicit inherit, same as clearing.
                     m = ""
             kwargs["model"] = m
+        if "harness" in args:
+            # Presence, not truthiness: "" is how the override is cleared back
+            # to inherit, and a falsy skip would make it one-way.
+            kwargs["harness"] = str(args["harness"] or "").strip()
         if "cron_expr" in args and args["cron_expr"]:
             kwargs["cron_expr"] = args["cron_expr"]
         if "every" in args and args["every"]:

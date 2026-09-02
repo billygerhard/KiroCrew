@@ -133,6 +133,12 @@ class TerminalCoordinator(ManagerComponent):
                 # CC/raw path has completed at least one turn, so its
                 # ``_resolved_model_id`` is populated (refreshed in ``_run``).
                 "model": info.resolved_model,
+                # The harness that served the run, beside the model for the same
+                # reason: in a mixed-harness fleet "which model" is only half the
+                # attribution, and a consumer cannot infer the other half from the
+                # configured default (this run may have inherited or been pinned
+                # to something else).
+                "harness": info.harness,
                 # Carry the requested pin on the terminal report too, redacted
                 # like the spawn frame: after a reconnect the completed card is
                 # rebuilt from this event alone, so without it the live-downgrade

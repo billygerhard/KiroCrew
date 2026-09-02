@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, FileDiff } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, FileDiff, Cpu } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import RejectDropdown from './RejectDropdown'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -400,6 +400,13 @@ interface ChatInputProps {
   voicePendingCaretRef?: React.MutableRefObject<number | null>
   /** Chat-level controls in input bar */
   agentName?: string
+  /** Bound-harness display name for the read-only footer chip. Empty/absent
+   *  hides the chip (e.g. a caller that has no slot context). Display-only:
+   *  the harness picker lives on the welcome screen; the binding is immutable
+   *  once the chat exists. */
+  harnessLabel?: string
+  /** Tooltip/aria text for the harness chip (pinned vs resolved-default variant). */
+  harnessTitle?: string
   agentSource?: string
   modelName?: string
   onAgentClick?: (rect: DOMRect) => void
@@ -761,6 +768,8 @@ function ChatInput({
   voicePendingCaretRef,
   onClearVoiceError,
   agentName,
+  harnessLabel,
+  harnessTitle,
   agentSource,
   modelName,
   onAgentClick,
@@ -3748,8 +3757,24 @@ function ChatInput({
               aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents') : i18nT('components.chatInput.agent', { name: agentName })}
             >
               <Bot size={13} className="shrink-0 opacity-70" />
-              {!shelfCompact && <span className="truncate max-w-[160px]">{agentName}</span>}
+              {!shelfCompact && <span className="truncate min-w-0 max-w-[160px]">{agentName}</span>}
             </button>
+          )}
+          {!!harnessLabel && (
+            /* Read-only harness chip: names the AI harness serving this chat.
+               A plain span, not a button — the binding is immutable after
+               creation (the picker lives on the welcome screen), so nothing
+               here may look clickable. Mirrors the agent chip's shelf styling
+               and the Cpu glyph the HarnessSelector uses. */
+            <span
+              data-testid="chat-input-harness-chip"
+              className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md text-muted"
+              title={harnessTitle || harnessLabel}
+              aria-label={harnessTitle || harnessLabel}
+            >
+              <Cpu size={13} className="shrink-0 opacity-70" />
+              {!shelfCompact && <span className="truncate min-w-0 max-w-[160px]">{harnessLabel}</span>}
+            </span>
           )}
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:
@@ -3771,7 +3796,7 @@ function ChatInput({
                 the ambiguity this label exists to remove. The enclosing shelf
                 group is flex-1/min-w-0, so both segments still shrink below
                 these caps on a narrow window. */}
-            {!shelfCompact && <span className="truncate max-w-[160px]">{project ? (project.split('/').filter(Boolean).pop() || project) : i18nT('components.chatInput.project')}</span>}
+            {!shelfCompact && <span className="truncate min-w-0 max-w-[160px]">{project ? (project.split('/').filter(Boolean).pop() || project) : i18nT('components.chatInput.project')}</span>}
           </button>
           {!shelfCompact && !!projectBranch && (
             <>
@@ -3917,7 +3942,7 @@ function ChatInput({
               disabled={isRunning}
               title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_model') : i18nT('components.chatInput.model_2', { name: modelName })}
             >
-              <span className="truncate max-w-[180px]">{modelName}</span>
+              <span className="truncate min-w-0 max-w-[180px]">{modelName}</span>
               {onReasoningEffortClick && !shelfCompact && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS
 from kiro_crew.providers.acp import (
     TOOL_SEARCH_DEFAULT_MIN_PCT,
     TOOL_SEARCH_DEFAULT_MIN_TOKENS,
@@ -130,6 +130,22 @@ class TestApplyToolSearchOverlay:
         provider._apply_tool_search_overlay()
         assert not _cli_json(tmp_path).exists()
 
+    def test_kas_backend_skips(self, tmp_path):
+        """KAS does not declare ``mcp_tool_search``, so the toggle is inert there.
+
+        A deliberate change of behaviour: the gate used to be "not claude", so KAS
+        received this write as a consequence of a negative test rather than of
+        anything it demonstrated. Tool Search is written into kiro-cli's own
+        workspace ``cli.json``; a harness that reads no such file gains nothing
+        from the write and only acquires a settings file inside the user's project
+        directory.
+        """
+        provider = _build_provider(backend=ACP_BACKEND_KAS)
+        provider._client._work_dir = tmp_path
+        provider._tool_search = True
+        provider._apply_tool_search_overlay()
+        assert not _cli_json(tmp_path).exists()
+
     def test_none_value_skips(self, tmp_path):
         provider = _build_provider(backend="")
         provider._client._work_dir = tmp_path
@@ -157,6 +173,69 @@ class TestInitWiring:
             mock_client.return_value.backend = ACP_BACKEND_CLAUDE
             AcpProvider(acp_backend=ACP_BACKEND_CLAUDE, tool_search=True)
         ats.assert_not_called()
+
+
+# ── Effort overlay: the channel and the capability are separate questions ────
+
+
+class TestApplyEffortOverlay:
+    def test_kiro_writes_the_overlay(self, tmp_path):
+        provider = _build_provider(backend="")
+        provider._client._work_dir = tmp_path
+        provider._client._model = "claude-opus-4.7"
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        provider._apply_effort_overlay()
+        data = json.loads(_cli_json(tmp_path).read_text(encoding="utf-8"))
+        assert data["chat.modelDefaults"]["claude-opus-4.7"]
+
+    def test_kas_backend_skips(self, tmp_path, caplog):
+        """KAS does not declare ``reasoning_effort``, so no level is written.
+
+        The same deliberate change as Tool Search above, and consistent with the
+        spawn path, which already drops a per-spawn effort level for KAS and
+        reports the drop — one build must not answer "does KAS honour effort" two
+        different ways. The drop is logged because it can also come from a
+        configured ``agent.role_efforts`` pin that no surface asked about.
+        """
+        provider = _build_provider(backend=ACP_BACKEND_KAS)
+        provider._client._work_dir = tmp_path
+        provider._client._model = "claude-opus-4.7"
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with caplog.at_level("DEBUG", logger="kiro_crew.providers.acp"):
+            provider._apply_effort_overlay()
+        assert not _cli_json(tmp_path).exists()
+        assert "declares no effort support" in caplog.text
+
+    def test_claude_backend_skips_even_though_it_honours_effort(self, tmp_path):
+        """The claude seam declares ``reasoning_effort`` and still gets no overlay.
+
+        The overlay is kiro-cli's settings CHANNEL, not the feature: claude takes
+        its level from a live ``session/set_config_option``. Gating on the effort
+        capability alone would write kiro's settings file for it.
+        """
+        provider = _build_provider(backend=ACP_BACKEND_CLAUDE)
+        provider._client._work_dir = tmp_path
+        provider._client._model = "claude-opus-4.7"
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        assert provider.supports_reasoning_effort is True
+        provider._apply_effort_overlay()
+        assert not _cli_json(tmp_path).exists()
+
+    @pytest.mark.asyncio
+    async def test_change_effort_refuses_on_a_harness_without_the_capability(self, tmp_path):
+        """A live change is reported unsupported rather than half-applied.
+
+        Returning False leaves the dashboard UI as it is; pushing the slash
+        command anyway would set a level on the running session that no respawn
+        could reproduce, because nothing writes it down.
+        """
+        provider = _build_provider(backend=ACP_BACKEND_KAS)
+        provider._client._work_dir = tmp_path
+        provider._client._model = "claude-opus-4.7"
+        provider._effort_per_model = {}
+        assert await provider.change_effort("high") is False
+        provider._client.send_command.assert_not_called()
+        assert not _cli_json(tmp_path).exists()
 
 
 # ── Config plumbing ──────────────────────────────────────────────────────────

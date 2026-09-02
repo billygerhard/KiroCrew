@@ -2,6 +2,7 @@ import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
   AppContributor,
   ChatSlot,
+  HarnessListing,
   IssueSource,
   McpApplyChange,
   PullRequestCheck,
@@ -2441,6 +2442,26 @@ export const api = {
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
   models: () => fetch('/api/models').then(j),
+  /** Registered ACP harnesses, each marked available or not with a reason.
+   *  Unavailable rows are returned deliberately: a selection surface shows them
+   *  so an operator can see WHY a harness cannot be picked, rather than watching
+   *  it vanish.
+   *
+   *  `invalid` carries operator descriptors that failed validation — never
+   *  selectable, so they are a separate array from the pickable rows. `default`
+   *  is the harness an unselected creation runs on, and `legacy_backend` is the
+   *  `agent.acp_backend` spelling as STORED (the config GET reports it clamped),
+   *  which is what an alias input must be seeded from. `legacy_backends` is the
+   *  vocabulary that input may WRITE — served rather than restated in the client,
+   *  where it would be one edit away from offering a spelling the gateway refuses. */
+  harnesses: () => fetch('/api/harnesses').then(j) as Promise<{ harnesses?: HarnessListing[]; invalid?: HarnessListing[]; default?: string; legacy_backend?: string; legacy_backends?: string[] }>,
+  /** The model catalog of ONE harness, resolved from its descriptor's model
+   *  source. Always sent with an explicit id: `/api/models` with no parameter
+   *  answers for kiro-cli, so reusing it for another harness would offer models
+   *  that harness has never heard of — picked here, refused at the wire, with an
+   *  error the user cannot connect to their choice. */
+  harnessModels: (harness: string) =>
+    fetch('/api/models?harness=' + encodeURIComponent(harness)).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
@@ -2883,7 +2904,7 @@ export const api = {
     if (before !== undefined) p.set('before', String(before))
     return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '?' + p, { signal }).then(j)
   },
-  createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}) }).then(j),
+  createChatSlot: (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string, harness?: string) => post('/api/chat/slots', { ...(name ? { name } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(memory_mode ? { memory_mode } : {}), ...(title ? { title } : {}), ...(clean_mode !== undefined ? { clean_mode } : {}), ...(artifact ? { artifact } : {}), ...(folder_id ? { folder_id } : {}), ...(harness ? { harness } : {}) }).then(j),
   /** Inject silent background context into a slot — consumed on the next user
    * message. Used by the artifact companion chat to name the bound artifact so
    * the user's first message needs no slug boilerplate. */

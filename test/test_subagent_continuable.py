@@ -209,15 +209,27 @@ class TestContinueConversation:
         # First check: no mapping. After seeding: mapping present.
         sessions.resumable_sid = MagicMock(side_effect=[None, "sid-from-state"])
         manager = _manager(sessions)
-        state = {"session_id": "sid-from-state", "provider": "acp", "cwd": "/tmp/x"}
+        state = {
+            "session_id": "sid-from-state",
+            "provider": "acp",
+            "cwd": "/tmp/x",
+            "harness": "kas",
+        }
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), \
                 patch("kiro_crew.subagent.read_state", return_value=state), \
                 patch("kiro_crew.subagent.update_state") as upd:
             info = manager.continue_conversation("origrun2", "follow-up")
             assert info is not None and not info.error, info.error
             await manager._tasks[info.id]
+        # The harness is seeded beside the sid: an entry with no binding reads as
+        # the CURRENT default, so a run recorded on another harness would be
+        # resumed there and load nothing.
         sessions.seed_conversation.assert_called_once_with(
-            "subagent:origrun2", "sid-from-state", provider="acp", cwd="/tmp/x"
+            "subagent:origrun2",
+            "sid-from-state",
+            provider="acp",
+            cwd="/tmp/x",
+            harness="kas",
         )
         # Promotion: original run's state marked keep so the pruner retains it.
         upd.assert_any_call("origrun2", keep=True)

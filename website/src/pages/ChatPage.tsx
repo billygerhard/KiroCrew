@@ -154,6 +154,7 @@ import WelcomeView from '../components/WelcomeView'
 import { usePanelTabs, openPanelView, clearInlineDraft, getInlineDraft, claimAppAutoOpen, useAnyLiveAppTab } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { useHarnesses, harnessRow } from '../hooks/useHarnesses'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
@@ -1336,7 +1337,30 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(installedAgents)
   const filteredAgents = filteredAgentsByName
-  const availableModels = useAvailableModels()
+  // The active session's harness, read here (not at `currentSlot` below) because
+  // the model list is keyed on it: a picker must offer the catalog of the harness
+  // that will serve the turn, never another harness's.
+  const activeHarness = useAppSelector(s => s.dashboard.slots.find(sl => sl.key === s.chat.activeSlot)?.harness || '')
+  const availableModels = useAvailableModels({ harness: activeHarness })
+  // The bound harness's display name for the composer-shelf chip, mirroring
+  // ChatPane's semantics: '' resolves to the listing's default row; while the
+  // listing is loading/errored show the neutral default-harness label rather
+  // than flashing a raw id; post-load an id missing from the listing falls
+  // back to the raw id.
+  const harnessStateForChip = useHarnesses()
+  const harnessRowForChip = harnessRow(harnessStateForChip, activeHarness)
+  const harnessChipLabel = harnessRowForChip
+    ? (harnessRowForChip.display_name || harnessRowForChip.id)
+    : ((harnessStateForChip.isLoading || harnessStateForChip.isError)
+        ? i18nT('components.harnessSelector.default_harness')
+        : (activeHarness || i18nT('components.harnessSelector.default_harness')))
+  const harnessChipTitle = i18nT(
+    activeHarness ? 'components.chatPane.harness_serving_pinned' : 'components.chatPane.harness_serving',
+  )
+  // Which harness an unselected slot really runs on. Read from the same listing
+  // the picker reads (one cache entry, no extra fetch) so a re-pick of the
+  // resolved default is recognised as the same harness rather than as a change.
+  const resolvedDefaultHarness = useHarnesses().defaultId
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
@@ -5031,6 +5055,50 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [activeSlot, dispatch, setPendingProject])
 
   const currentSlot = slots.find(s => s.key === activeSlot)
+  /** Apply a harness pick from the welcome screen by RECREATING the session.
+   *
+   *  A harness is bound for the session's whole life, so there is nothing to
+   *  switch — the same reason the memory-mode and clean toggles beside it
+   *  recreate rather than patch. Create-first-then-delete for the same focus
+   *  reason they have, and the old slot survives a failed create: if the gateway
+   *  refuses the harness (missing binary, failed validation, a build that cannot
+   *  serve it) the user keeps the session they had and reads the refusal, which
+   *  names the harness. Nothing falls back to another harness here or on the
+   *  gateway — a refusal is the answer. */
+  const harnessPick = useMutation({
+    mutationFn: async (id: string) => {
+      if (!activeSlot) return
+      const old = slots.find(s => s.key === activeSlot)
+      // A model id belongs to ONE harness's catalog. Carrying it across a harness
+      // CHANGE would bind the new session to a model the picked harness never
+      // advertised: the create stores it verbatim, nothing validates a model
+      // against a harness, and the composer's picker — correctly re-fetched for
+      // the new harness — would not even list it. The first turn is where that
+      // surfaces, as a wire error the user cannot connect to their choice.
+      // Dropping it inherits the harness's own default, which is what "I picked a
+      // backend, not a model" means. Re-picking the SAME harness keeps the model,
+      // because then the catalog it came from is the catalog still in force — and
+      // a slot storing no harness is compared through the RESOLVED default, so
+      // naming the harness it was already running on is not a change either.
+      const sameHarness = (old?.harness || resolvedDefaultHarness) === id
+      await dispatch(createSlot({
+        agent: old?.agent || defaultAgent || undefined,
+        model: sameHarness ? (old?.model || undefined) : undefined,
+        harness: id,
+        mode: old?.mode || undefined,
+        memory_mode: old?.memory_mode || undefined,
+        clean_mode: old?.clean_mode,
+        folder_id: old?.folder_id ?? null,
+        color_index: old?.color_index ?? null,
+        color_hex: old?.color_hex ?? null,
+        project: old?.project ?? null,
+      })).unwrap()
+      // Only reached when the create succeeded, so a refused harness never
+      // destroys the conversation it was picked from.
+      try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
+    },
+    onError: (e) => { dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e))) },
+  })
   // One source for both same-meaning markers in the agent pop-up: the row's check and
   // the default-agent row's label. Reading the slot twice let them disagree.
   const activeAgentName = currentSlot?.agent || defaultAgent || 'default'
@@ -8061,6 +8129,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   setInput={setInput}
                   memoryMode={currentSlot?.memory_mode ?? 'persistent'}
                   cleanMode={currentSlot?.clean_mode}
+                  harness={currentSlot?.harness || ''}
+                  harnessPending={harnessPick.isPending}
+                  onSelectHarness={(id) => harnessPick.mutate(id)}
                   onSwitchMode={async (newMode) => {
                     if (!activeSlot) return
                     // Create-first-then-delete: deleting the active slot first
@@ -8072,6 +8143,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     const opts = {
                       agent: old?.agent || defaultAgent || undefined,
                       model: old?.model || undefined,
+                      harness: old?.harness || undefined,
                       mode,
                       memory_mode: newMode,
                       folder_id: old?.folder_id ?? null,
@@ -8088,6 +8160,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     const opts = {
                       agent: old?.agent || defaultAgent || undefined,
                       model: old?.model || undefined,
+                      harness: old?.harness || undefined,
                       mode,
                       clean_mode: clean,
                       folder_id: old?.folder_id ?? null,
@@ -8606,6 +8679,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onVoiceStop={voiceInputSupported ? stopVoice : undefined}
               voiceCaptureActive={voice.recording}
               agentName={activeAgentName}
+              harnessLabel={harnessChipLabel}
+              harnessTitle={harnessChipTitle}
               agentSource={installedAgents.find(a => a.name === activeAgentName)?.source}
               modelName={shownModel}
               onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); setAgentDropdown(!agentDropdown) } : undefined}

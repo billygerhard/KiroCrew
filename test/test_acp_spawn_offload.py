@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import kiro_crew.acp.client as client_mod
+import kiro_crew.acp.harness_adapters as adapters_mod
 import kiro_crew.acp.runtime as runtime_mod
 from kiro_crew.acp.client import AcpClient, _resolve_spawn_env
 from kiro_crew.acp.runtime import AcpRuntime
@@ -264,9 +265,6 @@ class TestRuntimeSpawnOffLoop:
         class _StopSpawn(Exception):
             pass
 
-        async def resolve_bin(*, environ=None, home=None) -> str:
-            return "/usr/bin/kiro-cli"
-
         async def stop_spawn(*args, **kwargs):
             raise _StopSpawn()
 
@@ -274,8 +272,10 @@ class TestRuntimeSpawnOffLoop:
             cgroup_threads.append(threading.current_thread())
             return argv
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(
+            runtime_mod, "resolve_spawn_executable", lambda descriptor: "/usr/bin/kiro-cli"
+        )
+        monkeypatch.setattr(adapters_mod.KiroAdapter, "pre_spawn", lambda *a, **kw: None)
         monkeypatch.setattr(
             runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None)
         )
@@ -361,9 +361,6 @@ class TestSpawnCancellationSandboxCleanup:
     ) -> None:
         sandbox_file = self._sandbox_file(tmp_path)
 
-        async def resolve_bin(*, environ=None, home=None) -> str:
-            return "/usr/bin/kiro-cli"
-
         def _cgroup(argv):
             if raise_in == "cgroup":
                 raise asyncio.CancelledError()
@@ -372,8 +369,10 @@ class TestSpawnCancellationSandboxCleanup:
         def _krb5(env):
             raise asyncio.CancelledError()
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr(
+            runtime_mod, "resolve_spawn_executable", lambda descriptor: "/usr/bin/kiro-cli"
+        )
+        monkeypatch.setattr(adapters_mod.KiroAdapter, "pre_spawn", lambda *a, **kw: None)
         monkeypatch.setattr(
             runtime_mod,
             "wrap_argv",
@@ -526,11 +525,14 @@ class TestRuntimeShieldSurvivesAFailedAppend:
 
     @staticmethod
     def _patch_prelude(monkeypatch, tmp_path, mock_proc):
-        async def resolve_bin(*, environ=None, home=None) -> str:
-            return "/usr/bin/kiro-cli"
+        # A REAL file: resolution is followed by attestation, so a path that does
+        # not exist is refused before the spawn window these tests exercise.
+        kiro_bin = tmp_path / "kiro-cli"
+        kiro_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        kiro_bin.chmod(0o755)
 
-        monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
-        monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
+        monkeypatch.setattr("kiro_crew.kiro_cli.resolve_kiro_cli", lambda *_a, **_k: str(kiro_bin))
+        monkeypatch.setattr("kiro_crew.agent.ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None))
         monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: list(argv))
         monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)

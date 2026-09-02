@@ -205,6 +205,7 @@ class OrphanStallMonitor(ManagerComponent):
                 note="orphaned by gateway restart",
                 requested_model=str(state.get("requested_model") or ""),
                 resolved_model=str(state.get("resolved_model") or ""),
+                harness=str(state.get("harness") or ""),
             )
         else:
             msg = (
@@ -220,6 +221,7 @@ class OrphanStallMonitor(ManagerComponent):
                 note="lost to gateway restart",
                 requested_model=str(state.get("requested_model") or ""),
                 resolved_model=str(state.get("resolved_model") or ""),
+                harness=str(state.get("harness") or ""),
             )
 
         # Redact before any delivery path (injection or Slack DM)

@@ -807,6 +807,7 @@ class SessionAllocationService:
         *,
         provider: str = "",
         cwd: str = "",
+        harness: str = "",
     ) -> None:
         if sid:
             self._owner._session_map.set(
@@ -814,6 +815,7 @@ class SessionAllocationService:
                 sid,
                 provider=provider,
                 cwd=cwd,
+                harness=harness,
             )
 
     def forget_conversation(self, key: str) -> str | None:
@@ -1063,6 +1065,8 @@ class SessionAllocationService:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        harness: str = "",
+        harness_prebound: bool = False,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -1075,6 +1079,10 @@ class SessionAllocationService:
         """
         owner = self._owner
         constants = self._deps.constants
+        # Harness selection lives in a leaf module; imported locally to keep this
+        # allocation module free of the acp package at import time.
+        from kiro_crew.agent_sdk.harness import HarnessBindingConflict
+
         key = owner._fold_key(key)
         stale_provider: LLMProvider | None = None
         stale_session: Any | None = None
@@ -1116,6 +1124,19 @@ class SessionAllocationService:
                             # a crash rather than an eviction.
                             await record_session_ended(key, end_reason=END_REASON_EVICTED)
                     if alive:
+                        # A live session's binding outranks a selection made
+                        # after it started: the process answering this key
+                        # belongs to one harness, so honouring a disagreeing id
+                        # would serve the turn on the harness the session is
+                        # bound to while the caller was told it got the one it
+                        # named. Refused with both named; an AGREEING id is not a
+                        # disagreement (surfaces that re-send their stored
+                        # selection every run keep working), and a live binding of
+                        # "" is a session created before bindings existed.
+                        _live_harness = (getattr(session, "harness_id", "") or "").strip()
+                        _wanted_harness = (harness or "").strip()
+                        if _live_harness and _wanted_harness and _wanted_harness != _live_harness:
+                            raise HarnessBindingConflict(_wanted_harness, _live_harness)
                         session.last_used = time.monotonic()
                         if (
                             self._deps.is_claude_provider(session.provider)
@@ -1180,6 +1201,41 @@ class SessionAllocationService:
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
 
+        # Bind the harness BEFORE the pool is consulted. Precedence:
+        #   1. the caller's explicit selection, validated and REFUSED when the
+        #      harness is unknown or unavailable — no session, no substitute;
+        #   2. otherwise this session's OWN recorded binding when it has one (a
+        #      resume must return to the harness that minted ``resume_sid``; that
+        #      id names a transcript inside one harness's store, so loading it
+        #      elsewhere replays nothing), else the configured default.
+        # The two cannot be combined: an explicit selection that DISAGREES with a
+        # recorded binding is refused rather than reconciled.
+        from kiro_crew.agent_sdk.harness import (
+            pooled_harness_id,
+            resolve_session_harness,
+        )
+
+        _recorded_harness = owner._session_map.get_harness(key) if resume_sid else ""
+        _explicit_harness = (harness or "").strip()
+        if _recorded_harness and _explicit_harness and _explicit_harness != _recorded_harness:
+            raise HarnessBindingConflict(_explicit_harness, _recorded_harness)
+        _requested_harness = _explicit_harness or _recorded_harness
+        _binding = await asyncio.to_thread(
+            resolve_session_harness,
+            _requested_harness,
+            owner._cfg,
+            # Not a fresh CHOICE in two cases, and only the recorded-failure
+            # question turns on it: this session returning to its own binding,
+            # and a caller threading a selection its own gate resolved a moment
+            # ago (``harness_prebound``).
+            recorded=(harness_prebound and bool(_explicit_harness))
+            or (not _explicit_harness and bool(_recorded_harness)),
+        )
+        # A pooled process was spawned before any session claimed it, so nobody
+        # bound it and it runs the LEGACY-aliased harness. A session bound
+        # anywhere else must not claim one.
+        _pool_harness = await asyncio.to_thread(pooled_harness_id, owner._cfg)
+
         self._deps.logger.info(
             "Pool decision: key=%s resume_sid=%s model=%s agent=%s "
             "pool_size=%d pool_qsize=%d cwd=%s pool_cwd=%s",
@@ -1206,6 +1262,8 @@ class SessionAllocationService:
             pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
+        elif _binding.harness_id != _pool_harness:
+            pool_decision = "bypass_harness"
         elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
             # Same reason as bypass_effort above, for the effort a CREW pins
             # rather than one a caller passed: a pooled child was spawned under
@@ -1313,6 +1371,11 @@ class SessionAllocationService:
                 model_override=model,
                 cwd=effective_cwd,
                 extra_env=extra_env,
+                # The session's harness binding, passed as ONE object: the
+                # provider takes both halves (``harness_id`` it reports on,
+                # ``acp_backend`` its process spawns as) from this unit, so the
+                # id a session records and the backend it runs cannot drift.
+                binding=_binding,
                 **extra_factory_kwargs,
             )
             provider_switched = False
@@ -1400,6 +1463,7 @@ class SessionAllocationService:
                         first_turn=first_turn,
                         approval_policy=approval_policy,
                         agent=agent or "",
+                        harness_id=_binding.harness_id,
                     )
                     replay_needed = getattr(provider, "_history_replay_needed", False) is True
                     if provider_switched or replay_needed:
@@ -1439,6 +1503,7 @@ class SessionAllocationService:
                                 sid,
                                 provider=provider_label,
                                 cwd=provider_cwd,
+                                harness=_binding.harness_id,
                             )
                     elif not is_stateless and self._deps.is_claude_provider(provider):
                         sid = provider.session_id

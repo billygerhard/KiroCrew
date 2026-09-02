@@ -190,6 +190,10 @@ export interface ParsedSingleCompletion {
    *  the backend `resolvedModel` meta key; the card shows this and flags a
    *  downgrade when it differs from `requestedModel`. */
   resolvedModel: string
+  /** ACP harness that served the run, '' when the reporting path could not read
+   *  it. Mirrors the backend `harness` meta key. '' is NOT the default harness:
+   *  naming a harness the run may not have used is worse than naming none. */
+  harness: string
   /** Everything after the header block — the agent's own output. */
   body: string
 }
@@ -301,6 +305,7 @@ function fromMeta(content: string, meta: Record<string, unknown> | undefined): P
       task: isStr(d.task) ? d.task.trim() : '',
       requestedModel: isStr(d.requestedModel) ? d.requestedModel : '',
       resolvedModel: isStr(d.resolvedModel) ? d.resolvedModel : '',
+      harness: isStr(d.harness) ? d.harness : '',
       body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
     }
   }
@@ -412,9 +417,11 @@ export function parseSubagentCompletion(
     agentName: m[2] || '',
     outcome: OUTCOME_BY_GLYPH[glyph[0]] || 'ok',
     task: (task?.[1] || '').trim(),
-    // Legacy scrollback prose never carried a model; the meta path supplies it.
+    // Legacy scrollback prose never carried a model or a harness; the meta path
+    // supplies both.
     requestedModel: '',
     resolvedModel: '',
+    harness: '',
     body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
   }
 }

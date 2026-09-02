@@ -111,14 +111,20 @@ class ContinuationCoordinator(ManagerComponent):
         self._manager._sessions.mark_continuable(conv_key)
         self._manager._conversations[conv_key] = last_used if last_used is not None else time.time()
 
-    def _scan_keep_states_impl(self) -> list[tuple[str, str, str, str, str, float]]:
+    def _scan_keep_states_impl(self) -> list[tuple[str, str, str, str, str, str, float]]:
         """Blocking scan for keep runs (#1114): read every ``state.json``
         under the subagents dir and collect the promoted conversations.
 
-        Returns ``(conv_id, conv_key, sid, provider, cwd, last_used)`` tuples.
+        Returns ``(conv_id, conv_key, sid, provider, cwd, harness, last_used)``
+        tuples. ``harness`` travels with the sid because a map entry seeded
+        without it records "no binding", which later resolves to the CURRENT
+        default — so a keep run created on one harness would be resumed on
+        another, replaying nothing. ``write_state`` records it, so the rebuild
+        reads it from the same file the sid comes from.
+
         Runs in an executor — no event-loop work here.
         """
-        out: list[tuple[str, str, str, str, str, float]] = []
+        out: list[tuple[str, str, str, str, str, str, float]] = []
         try:
             base = _subagents_dir()
             entries = list(base.iterdir()) if base.is_dir() else []
@@ -142,6 +148,7 @@ class ContinuationCoordinator(ManagerComponent):
                         sid,
                         str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
                         str(state.get("cwd") or ""),
+                        str(state.get("harness") or ""),
                         last_used,
                     )
                 )
@@ -179,16 +186,19 @@ class ContinuationCoordinator(ManagerComponent):
         # iterate newest-first — an oldest-first order would seed a stale
         # last_used and let the SAME pass's sweep expire (and delete) a
         # conversation whose real last-use is recent.
-        found.sort(key=lambda t: t[5], reverse=True)
+        found.sort(key=lambda t: t[6], reverse=True)
         seeded = 0
-        for conv_id, conv_key, sid, provider, cwd, last_used in found:
+        for conv_id, conv_key, sid, provider, cwd, harness, last_used in found:
             if conv_key in self._manager._conversations:
                 continue  # live registration wins over the disk snapshot
             # Same on-demand seeding as continue_conversation (also on-loop):
             # the map entry is what makes release_conversation able to find
-            # and delete files.
+            # and delete files. The harness travels with the sid so a rebuilt
+            # entry carries the same binding the continuation path seeds.
             if sid and not self._manager._sessions.resumable_sid(conv_key):
-                self._manager._sessions.seed_conversation(conv_key, sid, provider=provider, cwd=cwd)
+                self._manager._sessions.seed_conversation(
+                    conv_key, sid, provider=provider, cwd=cwd, harness=harness
+                )
             # Resumability gate: SessionMap.get self-prunes entries whose
             # session files are missing, so this also rejects RELEASED
             # conversations whose continuation runs still carry a stale
@@ -271,6 +281,10 @@ class ContinuationCoordinator(ManagerComponent):
                     sid,
                     provider=str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
                     cwd=str(state.get("cwd") or ""),
+                    # The run's OWN harness, from the same record as its sid: a
+                    # seeded entry with no binding reads as "the default", and
+                    # resuming a sid minted by another harness loads nothing.
+                    harness=str(state.get("harness") or ""),
                 )
         # Re-check: SessionMap.get self-prunes entries whose session files
         # are missing, so a surviving mapping == resumable files on disk.

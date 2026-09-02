@@ -821,15 +821,22 @@ def test_runtime_reuses_clients_oversize_drain_helper():
     assert runtime_mod.OversizeLineUnrecoverable is client_mod.OversizeLineUnrecoverable
 
 
-def test_runtime_uses_clients_augmented_kiro_bin_resolver():
-    """spawn() must resolve kiro-cli via the SAME augmented-PATH resolver as
+def test_runtime_resolves_kiro_cli_through_the_same_discovery_as_the_client():
+    """spawn() must resolve kiro-cli via the SAME augmented-PATH discovery as
     AcpClient (honours KIROCREW_KIRO_BIN + augmented_path so a non-login gateway
     finds a ~/.local/bin install). A bare shutil.which(PATH) duplicate regressed
-    the kiro/_bg path to 'kiro-cli not found in PATH'. Assert single-source."""
-    import kiro_crew.acp.client as client_mod
-    import kiro_crew.acp.runtime as runtime_mod
+    the kiro/_bg path to 'kiro-cli not found in PATH'. The runtime now reaches it
+    through the kiro adapter rather than through the client's own helper, so
+    assert both sides call the one discovery function."""
+    import inspect
 
-    assert runtime_mod._resolve_kiro_bin_for_spawn is client_mod._resolve_kiro_bin_for_spawn
+    import kiro_crew.acp.client as client_mod
+    import kiro_crew.acp.harness_adapters as adapters_mod
+
+    adapter_src = inspect.getsource(adapters_mod.KiroAdapter.resolve_executable)
+    client_src = inspect.getsource(client_mod._resolve_kiro_bin)
+    assert "resolve_kiro_cli" in adapter_src
+    assert "resolve_kiro_cli" in client_src
 
 
 @pytest.mark.parametrize("backend", [None, ACP_BACKEND_KAS])
@@ -857,7 +864,7 @@ async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(back
     have to answer the same question.
     """
     import kiro_crew.acp.client as client_mod
-    import kiro_crew.acp.runtime as runtime_mod
+    from kiro_crew.acp.harness_adapters import HarnessSpawnRefused
 
     searched = [os.path.join(os.sep, "managed-bin"), os.path.join(os.sep, "path-bin")]
     unsearched = os.path.join(os.sep, "never-checked")
@@ -865,14 +872,19 @@ async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(back
     if backend is not None:
         rt._acp_backend = backend
 
-    async def _no_bin(*, environ=None, home=None):
-        return None
-
     with (
-        patch.object(runtime_mod, "_resolve_kiro_bin_for_spawn", _no_bin),
+        # Our resolver seam: the runtime resolves the CLI through the descriptor
+        # adapter's candidate chain (resolve_spawn_executable ->
+        # _resolve_kiro_cli_candidate -> kiro_cli.resolve_kiro_cli), not the old
+        # module-level _resolve_kiro_bin_for_spawn. A None resolution triggers the
+        # canonical kiro_cli_not_found_message, which names the searched dirs.
+        patch("kiro_crew.kiro_cli.resolve_kiro_cli", lambda *a, **k: None),
         patch.object(client_mod, "known_kiro_cli_dirs", return_value=searched),
     ):
-        with pytest.raises(AcpRuntimeError) as raised:
+        # _resolve_spawn_argv raises the resolver's own HarnessSpawnRefused,
+        # whose message _spawn_admitted preserves verbatim into AcpRuntimeError
+        # (str(exc)); this asserts the diagnostic at the seam that produces it.
+        with pytest.raises(HarnessSpawnRefused) as raised:
             await rt._resolve_spawn_argv()
 
     message = str(raised.value)
@@ -1093,12 +1105,12 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         wrapped["spawn_kwargs"] = kwargs
         raise _StopSpawn()
 
-    async def resolve_installed(*, environ=None, home=None):
+    def resolve_installed(descriptor):
         return launch_path
 
     monkeypatch.setattr(
         runtime_mod,
-        "_resolve_kiro_bin_for_spawn",
+        "resolve_spawn_executable",
         resolve_installed,
     )
     monkeypatch.setattr(runtime_mod, "wrap_argv", capture_wrap)
@@ -4270,9 +4282,10 @@ class TestAcpRuntimeLoadSession:
         assert load_params["mcpServers"] == new_params["mcpServers"]
 
     @pytest.mark.asyncio
-    async def test_load_session_resolves_stubs_off_the_event_loop(self, monkeypatch):
-        """The overlay lookup stats and reads files; like create_session it must
-        run via asyncio.to_thread, not on the loop thread."""
+    async def test_load_session_resolves_servers_off_the_event_loop(self, monkeypatch):
+        """The delivery lookup stats and reads files (the overlay, the agent spec,
+        and on a cache miss config.json for the descriptor); like create_session it
+        must run via asyncio.to_thread, not on the loop thread."""
         import threading
 
         import kiro_crew.acp.runtime as rt_mod
@@ -4284,11 +4297,11 @@ class TestAcpRuntimeLoadSession:
         loop_thread = threading.current_thread()
         seen: list[threading.Thread] = []
 
-        def _recording_pooled(overlay_dir, agent, channel_id=None):
+        def _recording_delivery(descriptor, agent, channel_id=None, **kwargs):
             seen.append(threading.current_thread())
-            return []
+            return rt_mod.McpDelivery(harness=descriptor.id, mode="file_fed")
 
-        monkeypatch.setattr(rt_mod, "pooled_session_servers", _recording_pooled)
+        monkeypatch.setattr(rt_mod, "delivery_servers", _recording_delivery)
 
         async def _fake_send(method, params, timeout=None):
             if method == METHOD_SESSION_LOAD:
@@ -4298,16 +4311,18 @@ class TestAcpRuntimeLoadSession:
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
         await rt.load_session("/k/sid.json", "sid-t", cwd="/w", agent="kirocrew")
 
-        assert seen, "load_session never consulted pooled_session_servers"
+        assert seen, "load_session never resolved the session's MCP servers"
         assert all(t is not loop_thread for t in seen)
 
     def test_every_session_request_builder_consults_pooled_servers(self):
         """#3528 guard: the stub injection now lives at multiple call sites in
         two files, and this bug was exactly one of them silently sending [].
         Enumerate every function that issues session/new or session/load and
-        assert each one consults the pooled-stub resolution (either
-        pooled_session_servers directly or the _pooled_mcp_servers hook), so a
-        fourth builder — or a regression in an existing one — fails here
+        assert each one resolves the session's MCP servers — either the pooled
+        stubs directly (``pooled_session_servers``) or the per-harness delivery
+        that subsumes them (``delivery_servers`` / the client's
+        ``_session_mcp_servers`` hook, whose file-fed mode IS the pooled stubs)
+        — so a fifth builder, or a regression in an existing one, fails here
         instead of shipping another silent un-pooling path."""
         import ast
         import inspect
@@ -4317,6 +4332,15 @@ class TestAcpRuntimeLoadSession:
 
         _SEND_FUNCS = {"_send_request", "_send_and_await"}
         _SESSION_METHODS = {"METHOD_SESSION_NEW", "METHOD_SESSION_LOAD"}
+        # Any of these consults the pooled stubs: the delivery resolver returns
+        # them verbatim for a file-fed harness, and the whole authorized map
+        # (stubs included, since the overlay is preferred) for a wire-fed one.
+        _RESOLVERS = (
+            "pooled_session_servers",
+            "_pooled_mcp_servers",
+            "delivery_servers",
+            "_session_mcp_servers",
+        )
 
         def _builders(module) -> dict[str, str]:
             src = inspect.getsource(module)
@@ -4355,9 +4379,10 @@ class TestAcpRuntimeLoadSession:
             "_initialize_session",
         } <= builders.keys(), f"expected builders missing from scan: {sorted(builders)}"
         for name, body in builders.items():
-            assert "pooled_session_servers" in body or "_pooled_mcp_servers" in body, (
-                f"{name} issues session/new or session/load but never consults "
-                "the pooled broker stubs — it would un-pool its sessions (#3528)"
+            assert any(resolver in body for resolver in _RESOLVERS), (
+                f"{name} issues session/new or session/load but never resolves the "
+                "session's MCP servers — it would un-pool its sessions, or send a "
+                "wire-fed harness none at all (#3528)"
             )
 
 
@@ -6159,13 +6184,10 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
-    async def resolve_kiro_bin(*, environ=None, home=None):
-        return "/fake/kiro"
-
     monkeypatch.setattr(
         runtime_mod,
-        "_resolve_kiro_bin_for_spawn",
-        resolve_kiro_bin,
+        "resolve_spawn_executable",
+        lambda descriptor: "/fake/kiro",
     )
     monkeypatch.setattr(
         runtime_mod,
@@ -6200,7 +6222,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
+async def test_runtime_spawn_names_its_own_browser_session(monkeypatch, tmp_path):
     """A subagent gets its own playwright-cli browser, not the parent's.
 
     AcpRuntime builds its child environment independently of AcpClient, so this
@@ -6219,10 +6241,13 @@ async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
         captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
-    async def resolve_kiro_bin(*, environ=None, home=None):
-        return "/fake/kiro"
+    # A REAL file: resolution is followed by attestation, so a path that does not
+    # exist is refused before the spawn window this test is about.
+    fake_kiro = tmp_path / "kiro-cli"
+    fake_kiro.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_kiro.chmod(0o755)
 
-    monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
+    monkeypatch.setattr("kiro_crew.kiro_cli.resolve_kiro_cli", lambda *_a, **_k: str(fake_kiro))
     monkeypatch.setattr(
         runtime_mod,
         "wrap_argv",

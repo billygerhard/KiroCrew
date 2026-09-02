@@ -69,6 +69,7 @@ class TestMetaHelperShapes:
             "note": "",
             "requestedModel": "",
             "resolvedModel": "",
+            "harness": "",
         }
 
     def test_single_carries_requested_and_resolved_model(self) -> None:

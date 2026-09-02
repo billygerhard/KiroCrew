@@ -1355,6 +1355,14 @@ Examples:
         "Empty or omitted uses the default kirocrew agent.",
     )
     cron_add.add_argument(
+        "--harness",
+        dest="harness",
+        default="",
+        help="ACP harness for this job (e.g. 'kiro', 'kas'). Empty or omitted "
+        "inherits the configured default harness. Checked when the job runs, "
+        "so a harness you have not installed yet is accepted here.",
+    )
+    cron_add.add_argument(
         "--silent",
         action="store_true",
         help="Suppress auto-delivery; agent controls notifications",
@@ -1385,6 +1393,13 @@ Examples:
         dest="agent",
         default=None,
         help="New agent name (empty string resets to default kirocrew agent)",
+    )
+    cron_update.add_argument(
+        "--harness",
+        dest="harness",
+        default=None,
+        help="New ACP harness for this job (empty string resets to the "
+        "configured default harness)",
     )
     cron_update.add_argument(
         "--approval-mode",

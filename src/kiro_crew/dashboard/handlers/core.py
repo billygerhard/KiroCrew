@@ -1462,6 +1462,34 @@ def _agent_values() -> set[str]:
     return {"", *KiroCrewConfig.load().agents}
 
 
+def _validate_default_harness(value: str, request: web.Request) -> str | None:
+    """Refuse a ``agent.default_harness`` value no registered harness answers to.
+
+    Registration, not availability, is the bar. A harness whose binary is missing
+    stays writable on purpose: the registry answers for the machine as it is right
+    now, an operator may set the default before installing the tool, and the value
+    heals into effect on the next listing (R6.5). What is refused is a name nothing
+    in the registry carries — a typo — because the load path degrades that to
+    kiro-cli with only a log line, so accepting it here would persist a setting the
+    operator can never see take effect.
+
+    Invalid operator descriptors are unreachable through this gate for the same
+    reason they are unreachable through every selection surface: they are not in
+    ``list()``, so their ids are not offered and not accepted.
+    """
+    from kiro_crew.agent_sdk.harness import registry as harness_registry
+
+    if not value:
+        return None
+    ids = [row.id for row in harness_registry().list()]
+    if value in ids:
+        return None
+    return (
+        f"unknown harness {value!r}; registered harnesses are: {', '.join(ids)} "
+        "(or empty to use the default)"
+    )
+
+
 def _active_advertised_ids(request: web.Request) -> list[str] | None:
     """Advertised model ids from the first active provider, or None if unknown.
 
@@ -1554,14 +1582,32 @@ def _selectable_acp_backends() -> list[str]:
 
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
-    # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
-    # ``values_fn`` rather than a literal, because the set WIDENS after this module
-    # is imported: an edition registers a backend from
-    # ``ProviderRegistry.register_acp_backends`` at boot, and the old literal left
-    # it rejected here with a misleading "invalid value". Resolved per request
-    # against the one code owner, so this can no longer drift from what
-    # ``AcpProvider`` will actually serve — which is what the parity test used to
-    # stand in for.
+    # Which harness a new session starts on when nobody picks one. Validated
+    # against the REGISTRY rather than a fixed list: the vocabulary is bundled
+    # descriptors plus whatever the operator defined in ``agent.harnesses``, so a
+    # literal enum here would refuse an operator's own harness. ``agent.harnesses``
+    # itself stays unwritable — a descriptor names a binary Kiro Crew spawns.
+    "agent.default_harness": {
+        "type": "str",
+        "max_len": 32,
+        "pattern": r"^[a-z0-9-]*$",
+        "validate_fn": _validate_default_harness,
+        # The refusal's prose is a diagnostic (it lists the registered ids), so it
+        # travels as data behind a translated prefix on the surface; this code is
+        # what tells that surface which refusal it received.
+        "deny_code": "unknown_harness",
+    },
+    # The legacy backend key, kept editable as an ALIAS input: an install that has
+    # always named its backend here keeps doing so, and the harness registry's
+    # alias table decides which descriptor that spelling means. The enum uses a
+    # ``values_fn`` rather than a literal because the selectable set WIDENS after
+    # this module is imported: an edition registers a backend from
+    # ``ProviderRegistry.register_acp_backends`` at boot, and a frozen literal
+    # left it rejected here with a misleading "invalid value". Resolved per
+    # request against the one code owner (``acp_backends.selectable_backend_values``),
+    # so it can no longer drift from what ``AcpProvider`` will actually serve, and
+    # a policy-denied backend is not offerable either. ``agent.default_harness``
+    # outranks this when both are set.
     "agent.acp_backend": {"type": "enum", "values_fn": _selectable_acp_backends},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
@@ -1862,9 +1908,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             resources=resources,
         )
 
-    def _deny(msg: str, resources: str = "", status: int = 400) -> web.Response:
+    def _deny(msg: str, resources: str = "", status: int = 400, code: str = "") -> web.Response:
         _log_sel("denied", resources or msg)
-        return web.json_response({"error": msg}, status=status)
+        body: dict[str, str] = {"error": msg}
+        if code:
+            body["code"] = code
+        return web.json_response(body, status=status)
 
     try:
         body = await request.json()
@@ -1935,7 +1984,11 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if validate_fn:
             reason = validate_fn(value, request)
             if reason:
-                return _deny(reason, f"{path_key}={value}")
+                # The reason is prose the caller renders BEHIND a translated prefix
+                # of its own, so the code is what says which refusal this is. A
+                # field declaring no code keeps the pre-existing codeless body
+                # rather than acquiring a generic one that means nothing.
+                return _deny(reason, f"{path_key}={value}", code=spec.get("deny_code", ""))
     elif spec["type"] == "dict":
         # One-level record written ATOMICALLY as a single value, for settings
         # where multiple scalar fields form one verdict and a partial write is
@@ -2176,15 +2229,20 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     # reload_provider_factory() must NOT be used here: it clears _sessions and
     # shuts every provider down, which is correct for a provider switch but
     # would kill in-flight turns just because a default changed.
+    #
+    # The two harness keys join them for the same reason and one more: a warm-pool
+    # process was spawned on the previously-aliased harness, and a session bound to
+    # the new default cannot claim it. Draining is what keeps the change from
+    # looking like it did not take — and the session manager's own config snapshot
+    # is what resolves the default, so it has to be re-read here.
+    #
+    # ``refresh_defaults()`` and NOT ``reload_provider_factory()``: switching the
+    # default harness must not kill in-flight turns on live sessions, which keep
+    # the harness they were started on.
     if path_key in (
         "agent.model",
         "agent.reasoning_effort",
-        # The ACP backend is captured when the provider factory is built, and a
-        # pre-warmed kiro-cli process must not serve a session that asked for
-        # KAS — refresh_defaults() rebuilds the factory and drains the pool.
-        # NOT reload_provider_factory(): switching the default backend must not
-        # kill in-flight turns on live sessions, which keep the backend they
-        # were started on.
+        "agent.default_harness",
         "agent.acp_backend",
     ) or path_key.startswith("agent.role_efforts."):
         state = request.app["state"]

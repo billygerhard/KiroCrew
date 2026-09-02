@@ -179,7 +179,7 @@ is `/settings/<key>`. Panels live in `pages/settings/`.
 |---|---|---|---|---|
 | `overview` | Health hero, stat cards, memory and usage drill-ins | `OverviewPanel.tsx` → `pages/OverviewPage.tsx` | `handlers_system.py` | `GET /api/status`, `GET /api/system` |
 | `imports` | Import config and history from another tool | `ImportPanel.tsx` | `handlers/onboarding_import.py`, `handlers/portability.py` | `GET /api/onboarding/import/scan`, `POST /api/onboarding/import/apply` |
-| `chat` | Chat behavior preferences | `ChatPanel.tsx` | `handlers/core.py` | `GET,PUT,PATCH /api/config/kirocrew` |
+| `chat` | Chat behavior preferences, incl. the agent harness inventory | `ChatPanel.tsx`, `HarnessPanel.tsx` | `handlers/core.py`, `handlers/agents.py` | `GET,PUT,PATCH /api/config/kirocrew`, `GET /api/harnesses`, `GET /api/acp-backends` |
 | `display` | Theme, density, language | `DisplayPanel.tsx` | `handlers/themes.py`, `handlers/core.py` | `GET,POST /api/themes`, `GET,PUT /api/config/theme` |
 | `voice` | TTS voice and dictation engine | `VoicePanel.tsx`, `SttSettings.tsx` | `chat_voice.py`, `handlers/core.py` | `GET,PUT /api/voice/config`, `GET /api/voice/voices`, `GET,PUT /api/config/stt` |
 | `notifications` | Which events notify, and on which channel | `NotificationsPanel.tsx` | `handlers/messaging.py` | `GET /api/notifications/channels`, `PUT /api/notifications/channels/settings` |
@@ -215,7 +215,6 @@ not where a user manages their own data.
 | `mcp-pool` | MCP connection pool state | `pages/settings/McpManagement.tsx` | `handlers/mcp.py` | `GET /api/mcp/active`, `GET /api/mcp/scopes`, `POST /api/mcp/probe` |
 | `memory` | Memory graph visualizer | `pages/overview/MemoryGraphTab.tsx` | `handlers/memory.py` | `GET /api/memory/graph` |
 | `config` | Raw Kiro Crew and agent config editors | `pages/overview/KiroCrewCfgTab.tsx`, `AgentCfgTab.tsx` | `handlers/core.py`, `handlers/agents.py` | `GET,PUT,PATCH /api/config/kirocrew`, `GET,PUT /api/agent/config` |
-| `agent-backend` | Which agent harness backend is live | `pages/developer/AgentBackendTab.tsx` | `handlers/acp_backend_status.py`, `handlers/kiro_prerequisite.py` | `GET /api/acp-backends`, `GET /api/kiro-prerequisite` |
 | `feature-previews` | Toggle unreleased surfaces on | `pages/developer/FeaturePreviewsTab.tsx` | — (client flags) | — |
 | `archive` | Consolidated session archive browser | `pages/SessionArchive.tsx` | `handlers/sessions.py` | `GET /api/session/archive`, `GET /api/session/archive/{name}` |
 

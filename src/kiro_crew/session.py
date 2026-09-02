@@ -333,9 +333,10 @@ def _provider_uses_kiro_identity_store(provider: Any) -> bool:
 
     Reads the capability the object DECLARES (harness-parity H14) rather than
     probing private attributes: ``LLMProvider`` declares it with a safe default of
-    False, ``AcpProvider`` / ``AcpSessionProvider`` grant it by membership in
-    ``ACP_BACKENDS_KIRO_IDENTITY_STORE``, and ``AcpRuntime`` declares the same
-    property under the same name because the sweep reaches shared runtimes too.
+    False, ``AcpProvider`` / ``AcpSessionProvider`` answer from the
+    ``kiro_identity_store`` flag on their bound harness descriptor, and
+    ``AcpRuntime`` declares the same property under the same name, off the same
+    flag, because the sweep reaches shared runtimes too.
 
     Fails CLOSED on anything that does not declare it -- a test double or a future
     holder is left running rather than recycled on a store it may never read.
@@ -865,6 +866,12 @@ class _Session:
     # False so every existing construction site is unaffected.
     retire_on_identity_change: bool = False
     prompt_count: int = 0
+    # The ACP harness this session is bound to, resolved once at creation and
+    # never re-read. The binding is a SNAPSHOT for the same reason the backend
+    # spelling is: a persisted default change must not retarget a conversation
+    # that is already running, and the native session id in the map names a
+    # transcript that exists only inside this harness's own store.
+    harness_id: str = ""
     consecutive_failures: int = 0
     # Bounded rather than plain: a release() call that lands on this object
     # after get_or_create() has already replaced it at the session key (see
@@ -1945,12 +1952,79 @@ class SessionManager:
         model: str | None = None,
         cwd: str | None = None,
         extra_env: dict[str, str] | None = None,
+        harness: str = "",
+        harness_prebound: bool = False,
         speculative: bool = False,
         speculative_resume: bool = False,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
-        """Claim or allocate a session and return its held lease."""
+        """Return ``(LLMProvider, is_new, resumed)`` for *key*, creating if needed.
+
+        Delegates to the allocation boundary, which owns the live-session
+        registry, warm pool, resume, and harness binding. The harness kwargs
+        are forwarded verbatim (see ``harness`` / ``harness_prebound`` below).
+
+        ``resumed`` is True when the session was restored via ACP session/load
+        (kiro-cli has full native history — skip thread history injection).
+
+        For new sessions, tries the warm pool first for instant startup.
+        If the session is mid-compaction, creates a fresh one instead.
+        Acquires the per-session semaphore before returning — caller MUST
+        call ``release(key)`` when done.
+
+        Args:
+            agent: Optional agent name for ``session/set_mode``.  Non-default
+                agents skip the warm pool (cold start only).
+            model: Optional model override for the session.  When ``None``,
+                falls back to the global ``agent.model`` config — but only when
+                the named agent does not pin its own model (a per-agent pin
+                outranks the global fallback) and the global is not a sentinel
+                value like ``"auto"``, in which case it stays ``None`` to let
+                the backend resolve from the agent's own JSON config.  Flows
+                through to the provider factory as the ``model_override`` kwarg.
+            harness: Optional ACP harness id for the session. ``""`` (the
+                default, and what every caller exposing no selector passes)
+                resolves to the configured default harness on a fresh session and
+                to the session's OWN recorded binding on a resume — never to
+                whatever the default happens to be now. An explicit value is
+                validated against the registry BEFORE anything is spawned and
+                REFUSES with a harness-named error when the harness is unknown or
+                unavailable; it is never quietly served by a different harness.
+                Bound for the session's lifetime once resolved.
+            harness_prebound: The caller already resolved and validated
+                ``harness`` for THIS session creation a moment ago (the spawn
+                path, which must refuse a bad selection before it dispatches).
+                Availability is still checked — the machine can change between
+                the two answers — but a recorded spawn failure does not gate it,
+                so the second resolution asks the same question the first did
+                instead of re-litigating the choice and refusing work the gate
+                just admitted. Ignored when ``harness`` is empty.
+            speculative: The caller is pre-creating the session ahead of a real
+                first turn (eager spawn) rather than running one.  Three atomic
+                consequences, all inside this method so no caller-side
+                check-then-act window exists: the one-shot first-turn flag is
+                never consumed (a speculative creator registers the session
+                with it still armed; a speculative claimant leaves it as-is);
+                a key with a resume mapping raises
+                :class:`SpeculativeResumeRefused` instead of resuming (unless
+                ``speculative_resume`` opts in), because
+                the real first turn must be the one that observes
+                ``resumed=True``; and the returned ``is_new`` reflects the
+                flag's state without consuming it.
+            speculative_resume: Only meaningful with ``speculative=True``.
+                Opts in to speculatively resuming a persisted session
+                (resume prefetch): instead of refusing a resumable key, the
+                speculative creator performs the session/load and registers
+                the session with the one-shot observation armed as
+                :attr:`FirstTurnState.RESUMED` when the load actually
+                restored the transcript. The first real claimant consumes it
+                atomically under the per-session semaphore and receives
+                ``(provider, True, True)``, preserving its
+                history-injection decision exactly as if it had performed the
+                resume itself.
+        """
+
         return await self._allocation_boundary().get_or_create(
             key,
             agent=agent,
@@ -1961,6 +2035,8 @@ class SessionManager:
             extra_env=extra_env,
             speculative=speculative,
             speculative_resume=speculative_resume,
+            harness=harness,
+            harness_prebound=harness_prebound,
             _won_race_retries=_won_race_retries,
             **extra_factory_kwargs,
         )
@@ -2195,13 +2271,46 @@ class SessionManager:
         """Return the persisted resume SID for a folded key."""
         return self._allocation_boundary().resumable_sid(key)
 
+    def get_harness(self, key: str) -> str:
+        """The harness id *key*'s session is bound to, or ``''`` when unrecorded.
+
+        The LIVE session's own binding when one is registered, else the session
+        map's persisted record. The live record wins because it is the authority
+        for a running session: the map entry is only written once a native session
+        id exists, so between session creation and that write the map would answer
+        "unrecorded" for a session that is demonstrably running on a harness.
+
+        ``''`` means "no binding recorded" — an entry written before harness
+        binding, or a surface that creates sessions without one — and callers must
+        NOT read it as kiro-cli: a spawn that inherits it resolves the configured
+        default instead, which is what such a session is actually running on.
+        In-memory only (no pruning, no rewrite), so it is safe to call from the
+        event loop.
+        """
+        folded = self._fold_key(key)
+        live = self._sessions.get(folded)
+        if live is not None and live.harness_id:
+            return live.harness_id
+        return self._session_map.get_harness(folded)
+
     def resumable_hint(self, key: str) -> bool:
         """Return whether a folded key has resumable state."""
         return self._allocation_boundary().resumable_hint(key)
 
-    def seed_conversation(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
-        """Seed a persisted conversation mapping."""
-        self._allocation_boundary().seed_conversation(key, sid, provider=provider, cwd=cwd)
+    def seed_conversation(
+        self, key: str, sid: str, *, provider: str = "", cwd: str = "", harness: str = ""
+    ) -> None:
+        """Seed a persisted conversation mapping.
+
+        ``harness`` travels with the sid: seeding the sid alone records "no
+        binding", which resolves to the CURRENT default, and a resume of one
+        harness's sid under another replays nothing. The caller reads it from
+        the same ``state.json`` the sid came from, so the two halves describe
+        one run.
+        """
+        self._allocation_boundary().seed_conversation(
+            key, sid, provider=provider, cwd=cwd, harness=harness
+        )
 
     def forget_conversation(self, key: str) -> str | None:
         """Delete a persisted conversation and continuable mark."""

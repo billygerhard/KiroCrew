@@ -1179,6 +1179,38 @@ def read_turn_model(source: object) -> str:
     return "auto" if _source_requests_auto(source) else ""
 
 
+def _resolve_harness(harness: str, source: object) -> str:
+    """The harness to attribute a usage row to, or ``""`` for unattributed.
+
+    An explicit caller value wins; otherwise the provider chain is asked, which is
+    where the answer lives on every surface that never picks a harness (cron, the
+    task runner, hooks). ``harness_id`` is declared on the ``LLMProvider`` ABC with
+    an empty default, so a non-ACP provider or a test double answers ``""`` and the
+    row is recorded UNATTRIBUTED rather than credited to a harness it never ran on
+    — the only honest fallback, since defaulting to kiro-cli would silently move a
+    mixed-harness fleet's tokens onto one row and destroy exactly the distinction
+    per-harness reporting exists to make.
+
+    Walks the wrapper chain rather than reading one level, for the reason
+    :func:`read_effective_model` documents: the object that knows is nested under
+    the provider once the session-provider swap has happened. Never raises — an
+    attribution read must not be able to lose a turn's numbers.
+    """
+    explicit = (harness or "").strip()
+    if explicit:
+        return explicit
+    if source is None:
+        return ""
+    try:
+        for node in _wrapper_chain(source):
+            candidate = getattr(node, "harness_id", "")
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _resolve_model(model: str, model_source: object) -> str:
     """Resolve the model to record, retaining a known Auto selection.
 
@@ -1226,6 +1258,7 @@ def _build_token_record(
     ctx_blocks: dict[str, int] | None = None,
     phase: str = "",
     app: str = "",
+    harness: str = "",
 ) -> dict[str, Any]:
     """Build the JSONL token-usage record dict (no I/O).
 
@@ -1292,6 +1325,12 @@ def _build_token_record(
         # context_* are int-coerced so a bad value can't break json.dumps.
         "surface": surface or "",
         "agent": agent or "",
+        # The harness that actually served the turn, so a mixed-harness fleet
+        # reports per harness. "" is UNATTRIBUTED, not kiro-cli: rows written
+        # before binding existed carry no key at all, and a reader that folded
+        # either into the default harness would credit it with every other
+        # harness's tokens.
+        "harness": harness or "",
         "context_used": _coerce_int(context_used),
         "context_window": _coerce_int(context_window),
         # Per-turn injection breakdown: block label -> characters, from
@@ -1378,6 +1417,7 @@ def persist_token_record(
     phase: str = "",
     app: str = "",
     model_source: object = None,
+    harness: str = "",
 ) -> None:
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
@@ -1409,6 +1449,9 @@ def persist_token_record(
     """
     try:
         model = _resolve_model(model, model_source)
+        # Same source the model is recovered from: the provider that served the
+        # turn is the one that knows which harness ran it.
+        harness = _resolve_harness(harness, model_source)
         now = datetime.now().astimezone()
         _write_token_record(
             _build_token_record(
@@ -1425,6 +1468,7 @@ def persist_token_record(
                 ctx_blocks=ctx_blocks,
                 phase=phase,
                 app=app,
+                harness=harness,
             ),
             now,
         )
@@ -1447,6 +1491,7 @@ async def persist_token_record_async(
     phase: str = "",
     app: str = "",
     model_source: object = None,
+    harness: str = "",
     emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
@@ -1487,6 +1532,9 @@ async def persist_token_record_async(
     """
     try:
         model = _resolve_model(model, model_source)
+        # Same source the model is recovered from: the provider that served the
+        # turn is the one that knows which harness ran it.
+        harness = _resolve_harness(harness, model_source)
         now = datetime.now().astimezone()
         record = _build_token_record(
             slot_key,
@@ -1502,6 +1550,7 @@ async def persist_token_record_async(
             ctx_blocks=ctx_blocks,
             phase=phase,
             app=app,
+            harness=harness,
         )
         # Before the offloaded write: a file-write failure must not cost the
         # latency sample, which needs nothing from disk.

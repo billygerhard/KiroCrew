@@ -2,6 +2,16 @@
 
 ## Public provider boundary
 
+> **There is no standalone Claude Code *provider* in Kiro Crew.** The public fork
+> runs one transport and one provider — `kiro-cli` over the Agent Client Protocol
+> (`agent.provider` is fixed to `acp`) — while the ACP *harness* behind that
+> transport is chosen per session from the harness registry (see
+> `docs/system-specs/modules/providers.md`). The removed standalone provider, the
+> removed Bedrock provider, the removed agent-renderer / mirror modules, their
+> config fields, and the dashboard provider selector were all removed during
+> de-Amazoning. There is no provider to choose; there is a harness to choose — and
+> after upstream #7301 Claude Code is one of the selectable public harnesses.
+
 `AgentConfig.provider` admits only the ACP provider, and
 `KiroCrewConfig.create_provider_factory()` constructs `AcpProvider`. Harness
 choice is a separate field, `agent.acp_backend`, and the public build now offers
@@ -21,6 +31,17 @@ does buy an edition is reach once the id is known: it lands in the config gate, 
 dashboard PATCH allowlist and `GET /api/config/schema` together
 (`test_a_registered_backend_reaches_the_allowlist`,
 `test_a_registered_backend_reaches_the_schema_endpoint`).
+
+`acp/client.py` owns the whole Claude Code spawn path (`ACP_BACKEND_CLAUDE`, the
+`_is_claude` branch, `_resolve_claude_acp_bin`) and the adapter it drives is a
+PUBLIC npm package, so the public build genuinely serves a session with it — which
+is why `BASELINE_SELECTABLE_BACKENDS` includes it after upstream #7301. Whether it
+is USABLE on a given machine is a separate, machine-local question answered by
+executable resolution (and, once stage 3 lands, `agent_sdk.backend_install`): a
+missing `claude-agent-acp` lists the harness as *unavailable* with the binary
+reason, not *unserviceable*. The dashboard exposes a harness choice, never a
+provider choice. **Do not re-add a standalone provider or a provider selector** —
+see the repo-root `CLAUDE.md`.
 
 `acp_backends.resolve_selected_backend()` normalizes an `agent.acp_backend` value
 this deployment cannot select to the Kiro harness. This boundary is load-bearing:

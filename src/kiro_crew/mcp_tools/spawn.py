@@ -261,6 +261,19 @@ def schemas() -> list[dict[str, Any]]:
                             "a long-lived delegation workstream."
                         ),
                     },
+                    "harness": {
+                        "type": "string",
+                        "description": (
+                            "Optional ACP harness for the subagent(s) — the tool "
+                            "that drives the model (e.g. 'kiro'). Batch-wide. "
+                            "Omit to run on the same harness as this session, "
+                            "which is almost always what you want. An unknown or "
+                            "unavailable harness REFUSES the spawn (it is never "
+                            "swapped for a working one), so pass one only when "
+                            "you have a reason to move the task to a different "
+                            "backend."
+                        ),
+                    },
                     **_context_group_props,
                 },
             },
@@ -537,6 +550,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     cwd = args.get("cwd") or ""
     model = args.get("model") or ""
     reasoning_effort = args.get("reasoning_effort") or ""
+    harness = args.get("harness") or ""
     keep = bool(args.get("keep"))
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
     # same context a normal session would.
@@ -551,8 +565,9 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     agent_ids: list[str] = []
     agent_names: list[str] = []
     # (subagent id, reason) pairs from the server's effort verdict — the
-    # gateway resolves the effective model (per-call value, else role pin,
-    # else unpinned) and reports when the requested effort cannot apply.
+    # gateway resolves both the effective model (per-call value, else role pin,
+    # else unpinned) and the harness the spawn landed on, and reports whichever
+    # of the two prevents the requested effort from applying.
     effort_drops: list[tuple[str, str]] = []
     # (subagent id, note) pairs for the delivery mirror: the resolved model and
     # the family settings key a requested effort is delivered under.
@@ -625,6 +640,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["model"] = model
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
+        if harness:
+            body["harness"] = harness
         if keep:
             body["keep"] = True
         if not inc_memory:
@@ -671,11 +688,14 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     spawn_lines: list[str] = []
     # Server-computed effort verdicts (never a rejection — gated on agent_ids
     # so a total-failure result keeps its "Error:" first line, which SEL and
-    # callers test as a prefix). The gateway resolves the effective model
-    # (per-call value, else the subagent role pin, else unpinned/"auto") at
-    # accept time, so — unlike the old client-side check — this also reports
-    # the default case where no per-call model was passed and the effort
-    # would otherwise be dropped silently.
+    # callers test as a prefix). The gateway resolves both inputs at accept
+    # time — the effective model (per-call value, else the subagent role pin,
+    # else unpinned/"auto") AND the harness this spawn resolved onto, which may
+    # have been inherited or defaulted — so, unlike the old client-side check,
+    # this reports the default case where no per-call model was passed and the
+    # effort would otherwise be dropped silently. Both halves arrive on the one
+    # ``effort_dropped`` key carrying whichever reason applied, so this layer
+    # neither decides nor guesses either.
     if agent_ids:
         for drop_ids, drop_reason in _collapse_effort_verdicts(effort_drops):
             spawn_lines.append(
@@ -869,7 +889,21 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
                 progress = f" ({', '.join(parts)})"
             _withheld = a.get("context_withheld") or []
             scope = f"  ctx-withheld: {','.join(_withheld)}" if _withheld else ""
-            lines.append(f"{a['id']}  [{status}]{err}{progress}{scope}  {_redact(a['task'])[:60]}")
+            # Attribution clause, rendered only for a record that carries one: a
+            # run whose harness is unknown must not read as one on the default.
+            # The model beside it is the one the session actually SERVED, so a
+            # pinned run that was downgraded is visible here rather than only in
+            # the dashboard card.
+            harness = _redact(str(a.get("harness", "") or ""))
+            served = _redact(str(a.get("resolved_model", "") or ""))
+            if harness:
+                attribution = f"  harness: {harness}" + (f" ({served})" if served else "")
+            else:
+                attribution = ""
+            lines.append(
+                f"{a['id']}  [{status}]{err}{progress}{scope}{attribution}  "
+                f"{_redact(a['task'])[:60]}"
+            )
     # Always append available agents (fresh read from disk). Same grammar filter and
     # redaction as the two rosters above, via the shared helper: this output is a
     # tool RESULT, so it lands in the same model context, and a spec's ``name``

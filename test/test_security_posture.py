@@ -254,7 +254,19 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "slack/events.py": 2,
     "slack/gateway.py": 6,
     "slack/handler.py": 3,
-    "subagent_manager/admission.py": 4,
+    # 4 -> 6: the wave-2 harness transplant added two audit/log writes on the
+    # pre-dispatch harness-resolution path (a refused-harness SEL row and the
+    # effort/harness reconcile note), both reading the module's already
+    # baseline-redacted `_redacted_task`. They run in the SAME process the four
+    # pre-existing sites do — the gateway daemon, which deliberately does not
+    # compose a companion (it never runs `boot_platform`; see
+    # `mcp_gateway/app_call.py` "this daemon is not the composition process",
+    # the identical reason `mcp_gateway/backend.py` is baselined here). Baseline
+    # is the honest answer for these; `redact_log_via_context` would resolve to
+    # the same OSS pass while paying a per-line lazy resolution on the event
+    # loop, and they read the shared `_redacted_task` local, so they cannot be
+    # converted independently of the four that keep it.
+    "subagent_manager/admission.py": 6,
     "voice_reply.py": 4,
 }
 

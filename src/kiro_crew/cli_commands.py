@@ -90,6 +90,7 @@ from kiro_crew.validation import (
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
     WORKSPACE_NAME_RE,
+    is_harness_id,
     normalize_lesson_category,
 )
 from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore, _lesson_display_text
@@ -955,6 +956,37 @@ def _agent_reset_model(args: argparse.Namespace) -> None:
     print("   It now tracks the shipped default; restart the gateway to apply.")
 
 
+def _warn_unresolvable_harness(harness: str) -> None:
+    """Warn on stderr when *harness* is not something the registry can serve now.
+
+    A warning and never a refusal: the write is legitimate even for a harness
+    that does not exist yet — the operator may be about to install it, and the
+    run is what judges the machine (see ``cron.resolve_job_harness``). Without
+    this line, though, a typo is silent until the job's first fire, which for a
+    weekly schedule is a week away.
+
+    Stays quiet when the registry itself cannot answer. Its verdict is advisory
+    here, so a broken or unreadable harness configuration must not turn a valid
+    cron write into a scary message about the wrong thing.
+    """
+    try:
+        from kiro_crew.agent_sdk.harness import UnknownHarness, registry
+    except Exception:
+        return
+    try:
+        available, reason = registry().availability(harness)
+    except UnknownHarness:
+        available, reason = False, "not registered"
+    except Exception:
+        return
+    if not available:
+        print(
+            f"Warning: harness {harness!r} is not usable right now ({reason}). "
+            f"Saved anyway — the job is checked again each time it runs.",
+            file=sys.stderr,
+        )
+
+
 def _cron(args: argparse.Namespace) -> None:
     """Dispatch cron subcommands, translating a refused write into an error.
 
@@ -1089,7 +1121,16 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         channel = (getattr(args, "channel", None) or "").strip() or None
         approval_mode = getattr(args, "approval_mode", "") or ""
         agent = (getattr(args, "agent", "") or "").strip()
+        harness = (getattr(args, "harness", "") or "").strip()
         silent = getattr(args, "silent", False)
+        if harness and not is_harness_id(harness):
+            print(
+                "Error: invalid harness id (lowercase letters, digits, hyphens)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if harness:
+            _warn_unresolvable_harness(harness)
         if agent and not _AGENT_NAME_RE.match(agent):
             print(
                 "Error: invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)",
@@ -1108,6 +1149,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 cron_expr=cron_expr,
                 channel=channel,
                 approval_mode=approval_mode,
+                harness=harness,
             )
         elif every:
             job = svc.add_job(
@@ -1116,6 +1158,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 every_secs=every,
                 channel=channel,
                 approval_mode=approval_mode,
+                harness=harness,
             )
         else:
             print("Provide --every or --cron")
@@ -1138,7 +1181,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             source="cli",
             resources=(
                 f"job_id={job.id} approval_mode={approval_mode or 'default'} "
-                f"agent={agent or 'default'} silent={silent}"
+                f"agent={agent or 'default'} harness={harness or 'default'} silent={silent}"
             ),
         )
         print(f"Added job: {job.id} ({job.name}) [{sched_desc}]")
@@ -1168,6 +1211,18 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 )
                 sys.exit(1)
             kwargs["agent_id"] = agent_val
+        if getattr(args, "harness", None) is not None:
+            harness_val = args.harness.strip()
+            if harness_val and not is_harness_id(harness_val):
+                print(
+                    "Error: invalid harness id (lowercase letters, digits, hyphens)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if harness_val:
+                _warn_unresolvable_harness(harness_val)
+            # Assigned even when empty: "" is the reset to the default harness.
+            kwargs["harness"] = harness_val
         if getattr(args, "approval_mode", None) is not None:
             kwargs["approval_mode"] = "" if args.approval_mode == "default" else args.approval_mode
         if not kwargs:

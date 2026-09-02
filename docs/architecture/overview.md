@@ -30,8 +30,14 @@ Three layers sit beneath Kiro Crew, and the distinction matters:
    surfaces onto that runtime and adds everything a runtime deliberately has no
    opinion about.
 
-Kiro Crew is **KiroACP-only**: `agent.provider` is fixed to `acp`, and kiro-cli is
-a hard requirement.
+Kiro Crew drives every harness over **one transport**: `agent.provider` is fixed
+to `acp`, and kiro-cli is a hard requirement — it is the first-class harness, the
+default, and the only one whose readiness gates first-run onboarding. Other
+ACP-speaking harnesses (KAS, Codex, an operator's own) are selectable per chat,
+per spawn, and per cron job through the harness registry, and degrade to
+"unavailable" without blocking the gateway. See
+[`../system-specs/modules/providers.md`](../system-specs/modules/providers.md)
+§ Harness registry.
 
 | Capability | kiro-cli alone | With Kiro Crew |
 |---|---|---|

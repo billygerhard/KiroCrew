@@ -403,6 +403,47 @@ def pytest_internalerror(excrepr, excinfo) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _restore_harness_registry():
+    """Snapshot + restore the process-global harness registry around every test.
+
+    ``harness_registry.registry()`` is a process singleton whose ``_descriptors``
+    cache several tests MUTATE directly (the capability-gate and provider-binding
+    suites inject probe descriptors, because the registry exposes no writer for a
+    harness definition — a pinned security property). Those suites used an
+    assign/delete ``_registered`` helper, which is not a save/restore: an id
+    already present in the loaded cache is DELETED on exit and, because
+    ``_ensure_loaded`` short-circuits on an unchanged fingerprint, never
+    repopulated for the rest of the worker. A later registry read (e.g.
+    ``resolve_session_harness`` in ``test_provider_binding_parity``) then sees a
+    pristine-or-not registry decided purely by pytest-randomly's order — an
+    order-dependent flake with no production-code change.
+
+    Snapshotting the whole ``_descriptors`` dict and the load-state markers
+    (``_fingerprint`` / ``_invalid`` / ``_configured_default``) and restoring them
+    after every test makes each hermetic regardless of scheduling, and does it at
+    the framework level so no per-suite helper can reintroduce the leak. Restores
+    what the test INHERITED (not a forced reload) so a leak from an earlier test
+    is not re-charged to every test after it.
+    """
+    from kiro_crew.acp.harness_registry import registry
+
+    reg = registry()
+    with reg._lock:
+        descriptors = dict(reg._descriptors)
+        fingerprint = reg._fingerprint
+        invalid = dict(reg._invalid)
+        configured_default = reg._configured_default
+    try:
+        yield
+    finally:
+        with reg._lock:
+            reg._descriptors = dict(descriptors)
+            reg._fingerprint = fingerprint
+            reg._invalid = dict(invalid)
+            reg._configured_default = configured_default
+
+
+@pytest.fixture(autouse=True)
 def _release_stt_engine():
     """Never let a loaded speech model outlive the test that loaded it.
 

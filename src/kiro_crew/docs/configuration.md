@@ -99,6 +99,25 @@ typo costs you a line in the log rather than a gateway that will not start.
 
 Set via `kirocrew config set agent.acp_backend kas`.
 
+### Choosing it from Settings
+
+**Settings → Chat → AI Backend** lists every registered harness with its
+availability and, when it cannot run, the reason — a missing binary, a descriptor
+of yours that failed validation, or a recent spawn failure. Two rows are writable
+there: **Default harness** (`agent.default_harness`) and the **Legacy ACP backend**
+above (`agent.acp_backend`), which is read as an alias of a harness id so an
+install that has always named its backend there keeps working unchanged.
+`agent.default_harness` wins when both are set.
+
+Neither write needs a gateway restart, and neither retargets a running session: a
+session binds its harness when it is created and keeps it for life, so the change
+applies to the next session you start.
+
+Harness definitions themselves (`agent.harnesses`) are **not** editable from
+Settings or by the agent's own tools — a descriptor names a binary Kiro Crew will
+spawn, so it is yours to write in `config.json`. Settings shows what the registry
+made of each entry, including the reason a rejected one is unusable.
+
 ## Key Settings
 
 ```json

@@ -26,17 +26,22 @@ import pytest
 
 from kiro_crew import acp_backends
 from kiro_crew.acp import client as acp_client
+from kiro_crew.acp import harness_adapters
 from kiro_crew.acp import runtime as acp_runtime
+from kiro_crew.acp.harness_descriptor import CAPABILITY_INTERNAL_SANDBOX
+from kiro_crew.acp.harness_registry import (
+    BUNDLED_DESCRIPTORS,
+    HARNESS_CLAUDE,
+    HARNESS_KIRO,
+    registry,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
-    ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SESSION_SHARING,
-    ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
     PROVIDER_LABEL_CLAUDE,
@@ -215,27 +220,33 @@ def test_selectability_has_one_logged_gate() -> None:
 
 
 def test_session_sharing_is_opt_in() -> None:
-    """H6: session-sharing eligibility is membership, not the absence of claude.
+    """H6: session-sharing eligibility is a declared capability, not "not claude".
 
-    The property must read the set, so a harness added to ``ACP_BACKENDS_KNOWN``
-    and nowhere else is ineligible by default instead of inheriting eligibility.
+    The property must read the flag off the session's bound harness descriptor,
+    so a harness that is merely registered is ineligible by default instead of
+    inheriting eligibility. Reading a capability CONSTANT is what makes that
+    checkable: a harness id compared here would be the shape H6 forbids.
     """
     source = inspect.getsource(providers_acp.AcpProvider.is_session_sharing_eligible.fget)
-    assert "ACP_BACKENDS_SESSION_SHARING" in source
+    assert "CAPABILITY_SESSION_SHARING" in source
+    assert "_declares(" in source
     assert "not " not in source.split('"""')[-1], "eligibility derived from a negation"
 
-    assert ACP_BACKEND_KIRO in ACP_BACKENDS_SESSION_SHARING
-    # claude-agent-acp runs one process per session (AcpClient), so it cannot
-    # host a multiplexed subagent session however the call site is written.
-    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_SESSION_SHARING
+    # The ACP_BACKENDS_SESSION_SHARING view is retired; the grant lives on the
+    # descriptor. kiro-cli declares it; claude-agent-acp (one AcpClient per
+    # session, cannot host a multiplexed subagent session) does not.
+    assert registry().get(HARNESS_KIRO).capabilities.session_sharing is True
+    assert registry().get(HARNESS_CLAUDE).capabilities.session_sharing is False
 
 
 def test_steer_is_opt_in() -> None:
-    """H6: the ``_session/steer`` extension is claimed by membership."""
+    """H6: the ``_session/steer`` extension is claimed by a declared capability."""
     source = inspect.getsource(acp_client.AcpClient.supports_steer.fget)
-    assert "ACP_BACKENDS_STEER" in source
-    assert ACP_BACKEND_KIRO in ACP_BACKENDS_STEER
-    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_STEER
+    assert "CAPABILITY_STEER" in source
+    assert "_declares(" in source
+    # The ACP_BACKENDS_STEER view is retired; read the grant off the descriptor.
+    assert registry().get(HARNESS_KIRO).capabilities.steer is True
+    assert registry().get(HARNESS_CLAUDE).capabilities.steer is False
 
 
 def test_steer_capability_declares_its_stamp() -> None:
@@ -280,14 +291,32 @@ def test_steer_capability_declares_its_stamp() -> None:
 
 
 def test_is_kiro_cli_is_positive() -> None:
-    """H7: the sandbox-delegation flag is membership at every spawn site.
+    """H7: the sandbox-delegation flag is an opt-in claim at every spawn site.
 
     This is the one identity test that fails OPEN. ``wrap_argv`` treats it as
     "this harness carries its own internal sandbox, which cannot nest inside
     ours, so skip ours" — granted to a harness without one, it leaves the agent
     process unconfined. A negative form grants it to every future harness.
+
+    Three positive spellings are accepted, and they are the same claim read from
+    two places: the ``internal_sandbox`` attribute on the session's bound
+    descriptor, and the ``CAPABILITY_INTERNAL_SANDBOX`` constant naming that flag
+    — which is where the grant is declared. What is refused is a negation, an
+    inequality, or a hardcoded ``True``: the waiver has to be READ, and a literal
+    grant is the fail-open shape that no behavioural test downstream can see (the
+    flag reaches ``wrap_argv`` and then the kernel, not a return value anything
+    asserts on). A literal ``False`` is allowed — that direction only ever adds
+    Crew's own confinement.
+
+    ``AcpClient._spawn`` is scanned as well as ``ensure_ready``: the client's
+    ``wrap_argv`` call lives in the former, so scanning only the latter made this
+    check pass vacuously for the whole AcpClient family.
     """
-    for spawn in (acp_runtime.AcpRuntime.spawn, acp_client.AcpClient.ensure_ready):
+    for spawn in (
+        acp_runtime.AcpRuntime.spawn,
+        acp_client.AcpClient.ensure_ready,
+        acp_client.AcpClient._spawn,
+    ):
         source = inspect.getsource(spawn)
         for line in source.splitlines():
             if "is_kiro_cli=" not in line:
@@ -296,30 +325,47 @@ def test_is_kiro_cli_is_positive() -> None:
             assert (
                 "not " not in value and "!=" not in value
             ), f"{spawn.__qualname__} derives is_kiro_cli from a negation: {line.strip()}"
-            assert "ACP_BACKENDS_INTERNAL_SANDBOX" in value or value.strip().startswith(
-                ("True", "False")
-            ), f"{spawn.__qualname__} must use membership or a literal: {line.strip()}"
+            assert not value.strip().startswith(
+                "True"
+            ), f"{spawn.__qualname__} hardcodes the sandbox waiver: {line.strip()}"
+            assert (
+                CAPABILITY_INTERNAL_SANDBOX in value
+                or "CAPABILITY_INTERNAL_SANDBOX" in value
+                or "internal_sandbox" in value
+                or value.strip().startswith("False")
+            ), (
+                f"{spawn.__qualname__} must read the capability off the descriptor "
+                f"or a literal False: {line.strip()}"
+            )
 
-    assert ACP_BACKENDS_INTERNAL_SANDBOX == frozenset({ACP_BACKEND_KIRO}), (
-        "only kiro-cli ships an internal OS sandbox; adding a member here waives "
-        "Kiro Crew's own seatbelt for that harness on macOS"
+    # The ACP_BACKENDS_INTERNAL_SANDBOX view is retired; the grant is declared on
+    # the descriptor, so the same claim has to hold there: a bundled harness that
+    # gained the flag would take Crew's seatbelt off.
+    granting = {
+        d.id for d in BUNDLED_DESCRIPTORS if d.capabilities.has(CAPABILITY_INTERNAL_SANDBOX)
+    }
+    assert granting == {HARNESS_KIRO}, (
+        f"{sorted(granting - {HARNESS_KIRO})} claim an internal sandbox; the flag "
+        "makes wrap_argv skip Kiro Crew's own seatbelt for that harness"
     )
 
 
 def test_capability_sets_are_subsets_of_known_backends() -> None:
-    """H8: a capability cannot be granted to an identifier nothing recognizes.
+    """H8: the ``acp_backend`` vocabulary set names only recognized backends.
 
-    A member that is not in ``ACP_BACKENDS_KNOWN`` is dead config at best and a
-    typo that silently grants nothing at worst.
+    The behavior capability views are retired (wave-2 T5); the one selectable
+    vocabulary set that remains must still name only known backends — a member
+    outside ``ACP_BACKENDS_KNOWN`` is dead config at best and a typo that
+    silently selects nothing at worst.
     """
     for name, members in (
         # The registry, not a constant: ``register_selectable_backend`` already
         # refuses an unknown id, so this is the belt to that braces — a member
         # arriving some other way still has to be a backend the code recognizes.
         ("selectable_backends()", selectable_backends()),
-        ("ACP_BACKENDS_SESSION_SHARING", ACP_BACKENDS_SESSION_SHARING),
-        ("ACP_BACKENDS_STEER", ACP_BACKENDS_STEER),
-        ("ACP_BACKENDS_INTERNAL_SANDBOX", ACP_BACKENDS_INTERNAL_SANDBOX),
+        # The behavior capability VIEWS (session-sharing, steer, internal-sandbox)
+        # were retired in wave-2 T5; ``ACP_BACKENDS_ACP_RUNTIME`` is the one set
+        # that remains, and it too must name only known backends.
         ("ACP_BACKENDS_ACP_RUNTIME", ACP_BACKENDS_ACP_RUNTIME),
     ):
         assert members <= ACP_BACKENDS_KNOWN, f"{name} names an unknown backend"
@@ -342,18 +388,28 @@ def test_unknown_backend_rejected_at_construction() -> None:
 
 
 def test_kiro_spawn_argv_keeps_its_own_branch() -> None:
-    """H9: the Kiro branch keeps agent materialization and the model pin.
+    """H9: the Kiro path keeps agent materialization and the model pin.
 
     kiro-cli discovers selectable modes from ``~/.kiro/agents/*.json`` at
     startup, so a missing agent file makes a later ``set_mode`` fail with "Mode
     not found"; and ``--model`` at spawn is the only way to run a model outside
-    the agent's own provider. A dict-of-builders refactor that treats Kiro as one
-    entry among N drops both without failing anything else.
+    the agent's own provider. The descriptor migration is exactly the
+    dict-of-builders shape that could drop both silently, so both are pinned
+    where they now live: the conventions on the kiro descriptor, the
+    materialization in the kiro adapter's pre-spawn hook. Byte-identity of the
+    rendered argv is pinned separately by ``test_harness_spawn.py``.
     """
-    source = inspect.getsource(acp_runtime.AcpRuntime._resolve_spawn_argv)
+    kiro = registry().get(HARNESS_KIRO)
+    assert kiro.agent_args == ("--agent", "{agent}")
+    assert kiro.model_args == ("--model", "{model}")
+
+    source = inspect.getsource(harness_adapters.KiroAdapter.pre_spawn)
     assert "ensure_agent_materialized" in source
-    assert '"--model"' in source
-    assert '"--agent"' in source
+
+    # The model is offered to rendering at all: a spawn path that stopped passing
+    # it would leave model_args permanently unemitted and nothing else would fail.
+    render = inspect.getsource(acp_runtime.AcpRuntime._render_spawn_argv)
+    assert "model=" in render and "agent=" in render
 
 
 def test_handshake_is_per_backend() -> None:
@@ -484,15 +540,31 @@ def test_only_overlay_readers_are_written_to() -> None:
     gated on anything wider leaves a stale overlay in the user's workspace that no
     later clear can reach — and the overlay names an effort level, so a harness
     that DOES read the file later inherits a level nobody set for it.
+
+    The gate has two equivalent spellings post-merge and either satisfies this
+    test: ``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` membership (the leaf-set register),
+    or the bound descriptor's capability reads (``supports_reasoning_effort`` +
+    ``is_acp_runtime_backend`` for the effort overlay, ``supports_mcp_tool_search``
+    for tool search) — the descriptor grants mirror the set for every bundled
+    harness (pinned by ``test_harness_capability_views``) and additionally answer
+    for operator harnesses, which are never members of a leaf set and must
+    therefore never collect an overlay.
     """
+    _GUARDS = {
+        "_apply_effort_overlay": ("supports_reasoning_effort", "is_acp_runtime_backend"),
+        "_apply_tool_search_overlay": ("supports_mcp_tool_search",),
+    }
     for fn in (
         providers_acp.AcpProvider._apply_effort_overlay,
         providers_acp.AcpProvider._apply_tool_search_overlay,
     ):
         source = inspect.getsource(fn)
-        assert (
-            "ACP_BACKENDS_KIRO_SLASH_COMMANDS" in source
-        ), f"{fn.__name__}: overlay write is not scoped to the overlay's readers"
+        membership_gated = "ACP_BACKENDS_KIRO_SLASH_COMMANDS" in source
+        descriptor_gated = all(name in source for name in _GUARDS[fn.__name__])
+        assert membership_gated or descriptor_gated, (
+            f"{fn.__name__}: overlay write is not scoped to the overlay's readers "
+            f"(neither the membership set nor the descriptor guards {_GUARDS[fn.__name__]} appear)"
+        )
 
 
 def test_codex_spawn_keeps_its_own_branch() -> None:

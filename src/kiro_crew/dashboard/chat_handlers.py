@@ -26,6 +26,12 @@ from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.harness import (
+    HarnessNotServiceable,
+    HarnessUnavailable,
+    UnknownHarness,
+    resolve_session_harness,
+)
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
@@ -1998,6 +2004,45 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
 _CREATABLE_MODES = ("", "orchestrator", "crew", "design-critique")
 
 
+async def _resolve_create_harness(raw: Any) -> tuple[str, web.Response | None]:
+    """Validate a requested harness id, returning ``(harness_id, refusal)``.
+
+    An empty request resolves to ``""`` — "inherit the configured default" — and
+    is deliberately NOT probed: that is the path every session took before
+    harnesses were selectable, and probing it here would move a signed-out
+    kiro-cli failure out of the spawn (where the user already knows that message)
+    and into slot creation.
+
+    An explicit id is resolved through the shared session resolver, so the
+    composer's verdict cannot drift from what session creation will decide a
+    moment later. Every refusal names the harness, and none of them substitutes a
+    different one: the three lineages are told apart by ``code`` so the client can
+    say whether the remedy is a different pick, an install, or a sign-in.
+
+    Off the loop: the resolver reads configuration and stats the executable.
+    """
+    requested = str(raw or "").strip()
+    if not requested:
+        return "", None
+    try:
+        binding = await asyncio.to_thread(resolve_session_harness, requested)
+    except UnknownHarness as exc:
+        return "", web.json_response({"error": str(exc), "code": "unknown_harness"}, status=400)
+    except HarnessUnavailable as exc:
+        # 409, not 400: the request is well-formed and the machine is what
+        # refuses it, so the same body may succeed once the operator installs or
+        # signs into the harness.
+        return "", web.json_response({"error": str(exc), "code": "harness_unavailable"}, status=409)
+    except HarnessNotServiceable as exc:
+        return "", web.json_response(
+            {"error": str(exc), "code": "harness_not_serviceable"}, status=409
+        )
+    # The CANONICAL id, never the requested spelling: an alias resolves to the
+    # descriptor it names, and storing the alias would make the slot report a
+    # harness id no listing contains.
+    return binding.harness_id, None
+
+
 async def api_chat_slot_create(request: web.Request) -> web.Response:
     """POST /api/chat/slots — create a new chat slot."""
     state: DashboardState = request.app["state"]
@@ -2008,6 +2053,16 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     name = body.get("name")
     agent = body.get("agent", "")
     model = body.get("model", "")
+    # ACP harness the session will be created on. Resolved and REFUSED here,
+    # because a chat slot is created moments before its session is: an
+    # unavailable selection is a fact now, not a maybe, and creating the slot
+    # anyway would leave a tab labelled with a harness whose first turn fails —
+    # or worse, one served by whatever the default happens to be. Cron takes the
+    # opposite posture deliberately (it judges at fire time, which can be days
+    # later).
+    harness, harness_refusal = await _resolve_create_harness(body.get("harness", ""))
+    if harness_refusal is not None:
+        return harness_refusal
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
     # handler returns, so the dashboard renders it at the top level for a frame
@@ -2141,12 +2196,31 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 ephemeral=body.get("ephemeral"),
                 app=request.get("app", ""),
                 origin=request_slot_origin(request.get("app", "")),
+                harness=harness,
                 # Human request-layer path: the dashboard new-chat tab. The
                 # origin conjunct in state.py still excludes app-token callers.
                 count_user_session=True,
             )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=409)
+        if harness and slot.harness != harness:
+            # ``name`` can address an ALREADY-EXISTING slot, which
+            # ``get_or_create_slot`` returns untouched — the harness is bound at
+            # birth and never rewritten. Silently returning that slot would hand
+            # the caller a session on a harness they did not ask for and report it
+            # as the one they did, so the disagreement is named instead. Both ids
+            # appear because the remedy depends on which the caller meant.
+            return web.json_response(
+                {
+                    "error": (
+                        f"session {slot.key!r} is already bound to harness "
+                        f"{slot.harness or '(default)'!r} and cannot be re-created on "
+                        f"{harness!r}"
+                    ),
+                    "code": "harness_binding_conflict",
+                },
+                status=409,
+            )
         if slot.is_restricted:
             logger.info("Slot %s created with memory_mode=%s", slot.key, slot.memory_mode)
         # App ownership check (App Kit §5.2), same deny-by-default rule as

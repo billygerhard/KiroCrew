@@ -5350,6 +5350,8 @@
       "earlier_messages_open_session": "更早的消息 — 打开完整会话（关闭分屏）",
       "earlier_messages_unavailable": "更早的消息在此会话的历史记录中不再可用。",
       "forked_from": "分叉自 {{name}}",
+      "harness_serving": "为此对话提供服务的 AI harness",
+      "harness_serving_pinned": "为此对话提供服务的 AI harness — 在对话创建时固定",
       "model_list": "模型列表",
       "session_ready_type_a_message_to_start": "会话就绪。输入消息即可开始。",
       "split_down": "向下分屏",
@@ -5878,6 +5880,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "此对话无法在 {{name}} 上启动：{{reason}}",
+      "default": "默认",
+      "default_harness": "默认 harness",
+      "harness_list": "harness 列表",
+      "harness_list_unavailable": "无法获取 harness 列表 — 正在重试",
+      "harness_name": "harness：{{name}}",
+      "invalid_reason": "描述符无效 — {{reason}}",
+      "no_harnesses_registered": "尚未注册任何 harness",
+      "not_registered": "未注册",
+      "not_serviceable": "此版本尚不支持",
+      "unavailable_reason": "不可用 — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "此任务的简短标签",
       "add": "添加",
@@ -5897,6 +5912,10 @@
       "every_interval": "固定间隔",
       "failed_to_save": "保存失败",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "严格按计划触发，不加抖动。默认情况下任务会随机分散，以减少流量峰值。",
+      "harness": "运行框架",
+      "harness_inherit": "运行框架：继承",
+      "harness_not_serviceable": "{{name}} — 此版本尚不支持",
+      "harness_unavailable": "{{name}} — 不可用（{{reason}}）",
       "hide_in_chat": "在聊天中隐藏",
       "hours": "小时",
       "how_often_this_job_runs": "此任务的运行频率",
@@ -5927,6 +5946,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "此任务触发时发送给代理的提示词或任务",
       "timezone": "时区",
       "weekly_schedule": "每周计划",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "运行此任务的 ACP 运行框架。保持“继承”以使用默认值。",
       "which_agent_handles_this_job_leave_default_for_t": "由哪个代理处理此任务。保持默认则使用主代理。"
     },
     "jobLogsView": {
@@ -9224,6 +9244,7 @@
       "retry": "重试",
       "roll_the_folder_list_up": "收起文件夹列表",
       "running_queued": "{{started}} 个运行中 · {{queued}} 个已排队",
+      "running_on_harness": "运行于 {{name}}",
       "running_session_other": "{{count}} 个运行中的会话",
       "search_older_sessions": "搜索较早的会话…",
       "search_sessions": "搜索会话…",
@@ -9640,25 +9661,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "磁盘上没有对应运行 Pod 的遗留主目录"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "代理后端",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code 通常会先请求批准，{{productName}} 会对该请求做把关。但如果某个工具已在 Claude 自身设置里预先批准（包括项目内那份 .claude/settings.json），它就不会再请求，因此拒绝规则和审计日志看不到这次调用。",
-        "could_not_load_the_agent_backend": "无法加载代理后端。",
-        "could_not_save_the_agent_backend": "无法保存代理后端。",
-        "default_all_features_supported": "默认。支持所有功能。",
-        "experimental": "实验性",
-        "install_check_failed": "无法检查本机是否已安装。",
-        "installed_restart_required": "本机已安装，但此 gateway 需重启后才能使用。",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "正在加载配置…",
-        "missing_components": "本机缺少：{{components}}",
-        "missing_components_with_command": "本机缺少：{{components}}。安装命令：{{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "新会话使用此代理。已打开的会话保持启动时所用的代理；在此切换不影响正在进行的会话。",
-        "retry": "重试",
-        "set_is_fixed_at_gateway_start": "此处显示哪些 agent 在 gateway 启动时确定。受管部署可通过策略限制该集合；修改策略需下次启动才生效。"
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "在 crew 上聊天",
         "chat_on_a_crew_desc": "在新建菜单里加入“New chat on crew”，用它创建的会话运行在已连接的 crew 上。尚未完善：它会打开该 crew 自己的面板，而运行在 crew 上的会话还不会显示在这里。",
@@ -9672,10 +9674,6 @@
     "developerPage": {
       "developer": "开发者",
       "tabs": {
-        "agentBackend": {
-          "description": "新会话启动哪个代理 — Kiro CLI、Claude Code 或 KAS",
-          "label": "代理后端"
-        },
         "archive": {
           "description": "已轮转/压缩的会话历史（保留 7 天）",
           "label": "归档"
@@ -11996,6 +11994,47 @@
         "zoom_font": "缩放与字体",
         "zoom_level": "缩放级别",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "AI 后端",
+        "badge_available": "可用",
+        "badge_bundled": "内置",
+        "badge_invalid": "无效",
+        "badge_missing": "缺失",
+        "badge_not_serviceable": "不受支持",
+        "badge_operator": "自定义",
+        "badge_restart_required": "需要重启",
+        "badge_unavailable": "不可用",
+        "default_harness": "默认运行框架",
+        "default_harness_unset": "未设置",
+        "failed_to_load_config": "加载当前设置失败。",
+        "failed_to_load_harnesses": "加载运行框架列表失败。",
+        "failed_to_save": "保存失败",
+        "harness_list_unavailable": "运行框架列表未加载，因此不显示可用状态。",
+        "harness_not_serviceable": "{{name}} — 此版本不支持",
+        "harness_unavailable": "{{name}} — 不可用（{{reason}}）",
+        "harnesses_are_defined_in_config_and_authenticate": "运行框架在 config.json 中定义，并各自完成身份验证——{{productName}} 不存储任何供应商凭据。",
+        "install_check_failed": "无法检查此项是否已安装在本机上。",
+        "installed_restart_required": "已安装在本机上，但此网关必须重启后才能使用。",
+        "legacy_backend": "旧版 ACP 后端",
+        "legacy_backend_kas": "KAS（kiro-agent）",
+        "legacy_backend_kiro": "Kiro CLI（默认）",
+        "legacy_backend_outranked": "设置了默认运行框架时将被忽略。",
+        "legacy_backend_stored": "{{value}}（已存储，不可选择）",
+        "missing_components": "本机缺失：{{components}}",
+        "missing_components_with_command": "本机缺失：{{components}}。安装命令：{{command}}",
+        "no_harnesses_registered": "未注册任何运行框架。",
+        "not_serviceable_note": "此版本无法在该运行框架上启动会话。",
+        "operator_entry_conflicts": "你使用此 id 的运行框架条目已被拒绝：{{reason}}",
+        "registered_harnesses": "已注册的运行框架",
+        "resolves_to": "新会话将在 {{name}} 上启动。",
+        "resolves_to_not_serviceable": "新会话解析为 {{name}}，但此版本无法在其上启动会话。",
+        "resolves_to_unavailable": "新会话解析为 {{name}}，但它无法运行：{{reason}}",
+        "retry": "重试",
+        "retry_config": "重新加载设置",
+        "retry_harness_list": "重新加载运行框架列表",
+        "the_older_key_read_as_an_alias_of_a_harness": "较旧的后端键，作为已注册运行框架的别名读取。",
+        "which_harness_new_sessions_start_on": "新会话在哪个运行框架上启动。正在运行的会话会保留其启动时的运行框架。"
       },
       "importPanel": {
         "agent_data": "代理数据",

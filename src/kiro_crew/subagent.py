@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 
 from kiro_crew import name_grant, platform_compat
 from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
+from kiro_crew.agent_sdk.harness import (
+    MODEL_SOURCE_STATIC,
+    HarnessBinding,
+    HarnessNotServiceable,
+    HarnessUnavailable,
+    UnknownHarness,
+    resolve_session_harness,
+)
 from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
 from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
 from kiro_crew.context import (
@@ -598,6 +606,90 @@ def _subagent_default_effort() -> str:
         return val if isinstance(val, str) else ""
     except Exception:
         return ""
+
+
+def _parent_harness_id(sessions: SessionManager, parent_session_key: str) -> str:
+    """The harness the SPAWNING session is bound to, or ``""`` when unrecorded.
+
+    ``""`` is not kiro-cli: it means this session carries no binding to inherit
+    (an entry written before harness binding existed, a surface that creates
+    sessions without one, or a spawn with no parent at all), and the caller then
+    resolves the configured default. Reading it as kiro-cli would be the same
+    identity-by-absence mistake the harness-parity invariants exist to prevent.
+
+    Never raises and never returns a non-string: a duck-typed session manager
+    (every test double is one) answers with a mock, which is not a harness id.
+    """
+    if not parent_session_key:
+        return ""
+    try:
+        recorded = sessions.get_harness(parent_session_key)
+    except Exception:
+        logger.debug("Unreadable harness binding for %s", parent_session_key, exc_info=True)
+        return ""
+    return recorded.strip() if isinstance(recorded, str) else ""
+
+
+def _resolve_spawn_harness(requested: str, inherited: str) -> tuple[HarnessBinding | None, str]:
+    """``(binding, reason)`` for a spawn that asked for ``requested``.
+
+    One of the two is always empty. The reason is a refusal, never a fallback:
+    dispatching a spawn onto a harness the caller did not name — while reporting
+    the run under the name it did — is the substitution per-spawn selection exists
+    to make impossible, so an unknown, unavailable, or unserviceable selection
+    fails THAT spawn and leaves its batch siblings alone.
+
+    Three inputs, in precedence order:
+
+    * ``requested`` — an explicit per-spawn ``harness``. Validated as a fresh
+      pick: registered, available, and serviceable by this build.
+    * ``inherited`` — the binding of the session this run continues on: the
+      spawning session's own for a fresh spawn, and the CONVERSATION's own for a
+      continuation, which is where the transcript being resumed lives. Used when
+      nothing was requested, and validated the same way EXCEPT that a recently
+      recorded spawn failure does not gate it: the session is alive on this
+      harness, so one other attempt's failure says nothing about it.
+    * neither — the configured default harness, resolved WITHOUT an availability
+      probe, which is what keeps a spawn that selects nothing byte-identical to
+      today's path: kiro-cli's absence still surfaces from the spawn itself, with
+      the message it has always had, rather than as a new pre-dispatch refusal.
+    """
+    try:
+        if requested:
+            return resolve_session_harness(requested), ""
+        if inherited:
+            return resolve_session_harness(inherited, recorded=True), ""
+        return resolve_session_harness(), ""
+    except (UnknownHarness, HarnessUnavailable, HarnessNotServiceable) as exc:
+        # Every one of these names the harness in its message, which is what the
+        # caller needs to act; the type distinguishes "no such harness" from
+        # "that one cannot run here" for a surface that wants to say more.
+        return None, str(exc)
+
+
+def _harness_model_reason(binding: HarnessBinding, model: str) -> str:
+    """Why ``binding``'s harness cannot serve ``model``, or ``""`` when it can.
+
+    Only a harness that DECLARES its catalog (``model_source: static``) can refuse
+    a model here. A harness that enumerates its models over ACP has no catalog
+    before a session exists, so validating against it would mean refusing every
+    model pin on the default harness — the failure would be Kiro Crew's, not the
+    caller's. Such a pin is carried through and answered by the harness itself.
+
+    The ``auto`` sentinel is never refused: it is "let the backend pick", so it
+    names no model that could be absent from a list.
+    """
+    descriptor = binding.descriptor
+    if not model or model == DEFAULT_MODEL:
+        return ""
+    if descriptor.model_source != MODEL_SOURCE_STATIC:
+        return ""
+    if model in descriptor.models:
+        return ""
+    return (
+        f"model {model!r} is not served by harness {descriptor.id!r} "
+        f"(valid models: {', '.join(descriptor.models)})"
+    )
 
 
 def _spawn_effective_model(model: str, agent: str) -> str:
@@ -1323,6 +1415,34 @@ class SubagentInfo:
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
     reasoning_effort: str = ""
+    # The ACP harness this run is bound to, resolved ONCE at spawn: the explicit
+    # per-spawn ``harness`` when one was given, else the spawning session's own
+    # binding, else the configured default. Always the RESOLVED id, never the
+    # caller's blank argument — an empty value on a started run would be
+    # indistinguishable from "nobody knows which harness served this", and an
+    # unattributed run is exactly what a mixed-harness fleet cannot afford. It is
+    # also what every reporting surface (completion meta, spawn_list, the
+    # subagent WS frames) reads, so those attribute a run to the harness it ran
+    # on rather than to whatever the default happens to be at read time.
+    harness: str = ""
+    # What session creation is TOLD this run selected, as opposed to ``harness``
+    # (the resolved id every surface reports). The two differ in the cases where
+    # threading the resolved id would change behaviour rather than preserve it: a
+    # run that selected nothing threads ``""`` so session creation resolves the
+    # default itself, keeping the un-probed default path un-probed, and a
+    # continuation threads ``""`` so session creation resumes the conversation's
+    # OWN recorded binding — the harness that holds the transcript being resumed.
+    # An explicit pick and an inherited parent binding ARE threaded, because a
+    # fresh subagent session resolves the DEFAULT from an empty value, which for a
+    # non-default-bound parent is a different harness than the one this run was
+    # validated, recorded and reported under.
+    _harness_selection: str = ""
+    # The reasoning-effort level DROPPED because ``harness`` does not declare the
+    # capability, kept beside the (now empty) ``reasoning_effort`` so the spawn
+    # result can report the drop. A drop is reported, never a refusal: the level
+    # is an optimization of the same task, so failing the spawn over it would
+    # cost the work for nothing.
+    effort_dropped: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     bare: bool = False
     # Continuable conversations (spawn_run keep=True / spawn_continue):
@@ -2023,6 +2143,7 @@ class SubagentManager:
         max_turns: int = 0,
         model: str | None = None,
         reasoning_effort: str = "",
+        harness: str = "",
         allowed_tools: list[str] | None = None,
         bare: bool = False,
         cwd: str = "",
@@ -2039,6 +2160,8 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _effort_dropped: str = "",
+        _harness_selection: str = "",
     ) -> SubagentInfo | None:
         return self._admission.spawn_impl(
             task,
@@ -2047,6 +2170,7 @@ class SubagentManager:
             max_turns,
             model,
             reasoning_effort,
+            harness,
             allowed_tools,
             bare,
             cwd,
@@ -2063,6 +2187,8 @@ class SubagentManager:
             _agent_prevalidated,
             _from_queue,
             _preassigned_id,
+            _effort_dropped,
+            _harness_selection,
         )
 
     async def _safe_announce(self, info: SubagentInfo) -> None:
@@ -2087,7 +2213,7 @@ class SubagentManager:
     ) -> None:
         return self._continuation._promote_conversation_impl(conv_id, conv_key, last_used)
 
-    def _scan_keep_states(self) -> list[tuple[str, str, str, str, str, float]]:
+    def _scan_keep_states(self) -> list[tuple[str, str, str, str, str, str, float]]:
         return self._continuation._scan_keep_states_impl()
 
     async def _rebuild_conversation_registry(self) -> None:

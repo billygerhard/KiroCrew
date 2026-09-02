@@ -5528,6 +5528,8 @@
       "earlier_messages_open_session": "Messaggi precedenti — apri la sessione completa (chiude la vista divisa)",
       "earlier_messages_unavailable": "I messaggi precedenti non sono più disponibili nella cronologia di questa sessione.",
       "forked_from": "Diramato da {{name}}",
+      "harness_serving": "Harness IA che serve questa chat",
+      "harness_serving_pinned": "Harness IA che serve questa chat — fissato alla creazione della chat",
       "model_list": "Elenco dei modelli",
       "session_ready_type_a_message_to_start": "Sessione pronta. Digita un messaggio per iniziare.",
       "split_down": "Dividi in basso",
@@ -6074,6 +6076,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "Questa chat non può iniziare su {{name}}: {{reason}}",
+      "default": "Predefinito",
+      "default_harness": "Harness predefinito",
+      "harness_list": "Elenco degli harness",
+      "harness_list_unavailable": "Elenco degli harness non disponibile — nuovo tentativo",
+      "harness_name": "Harness: {{name}}",
+      "invalid_reason": "Descrittore non valido — {{reason}}",
+      "no_harnesses_registered": "Nessun harness registrato",
+      "not_registered": "non registrato",
+      "not_serviceable": "non ancora supportato da questa versione",
+      "unavailable_reason": "Non disponibile — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "Una breve etichetta per questo job",
       "add": "Aggiungi",
@@ -6093,6 +6108,10 @@
       "every_interval": "Ogni intervallo",
       "failed_to_save": "Salvataggio non riuscito",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "Attiva esattamente secondo la pianificazione senza jitter. Per impostazione predefinita, i job vengono distribuiti in modo casuale per ridurre i picchi di traffico.",
+      "harness": "Harness",
+      "harness_inherit": "Harness: eredita",
+      "harness_not_serviceable": "{{name}} — non ancora supportato da questa versione",
+      "harness_unavailable": "{{name}} — non disponibile ({{reason}})",
       "hide_in_chat": "Nascondi nella chat",
       "hours": "ore",
       "how_often_this_job_runs": "Con quale frequenza viene eseguito questo job",
@@ -6123,6 +6142,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "Il prompt o l'attività inviata all'agente quando questo job si attiva",
       "timezone": "Fuso orario",
       "weekly_schedule": "Pianificazione settimanale",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "Quale harness ACP esegue questo job. Lascia su «eredita» per usare quello predefinito.",
       "which_agent_handles_this_job_leave_default_for_t": "Quale agente gestisce questo job. Lascia il valore predefinito per l'agente principale."
     },
     "jobLogsView": {
@@ -9500,6 +9520,7 @@
       "retry": "Riprova",
       "roll_the_folder_list_up": "Comprimi l'elenco delle cartelle",
       "running_queued": "{{started}} in esecuzione · {{queued}} in coda",
+      "running_on_harness": "In esecuzione su {{name}}",
       "running_session_many": "{{count}} sessioni in esecuzione",
       "running_session_one": "{{count}} sessione in esecuzione",
       "running_session_other": "{{count}} sessioni in esecuzione",
@@ -9932,25 +9953,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "Home di pod rimasti su disco senza un pod attivo"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "Backend dell’agente",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code di norma chiede il permesso prima di agire, e {{productName}} filtra quella richiesta. Ma uno strumento pre-approvato nelle impostazioni di Claude — incluso un .claude/settings.json all'interno del progetto — non chiede nulla, quindi le regole di rifiuto e il registro di audit non vedono quella chiamata.",
-        "could_not_load_the_agent_backend": "Non è stato possibile caricare il backend dell’agente.",
-        "could_not_save_the_agent_backend": "Impossibile salvare il backend dell’agente.",
-        "default_all_features_supported": "Predefinito. Tutte le funzionalità sono supportate.",
-        "experimental": "Sperimentale",
-        "install_check_failed": "Non è stato possibile verificare se è installato su questa macchina.",
-        "installed_restart_required": "Installato su questa macchina, ma questo gateway deve riavviarsi prima di poterlo usare.",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "Caricamento della configurazione…",
-        "missing_components": "Mancante su questa macchina: {{components}}",
-        "missing_components_with_command": "Mancante su questa macchina: {{components}}. Installalo con: {{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "Le nuove sessioni usano questo agente. Una sessione già aperta mantiene quello con cui è stata avviata: cambiarlo qui non la modifica a metà sessione.",
-        "retry": "Riprova",
-        "set_is_fixed_at_gateway_start": "Quali agenti compaiono qui viene deciso all'avvio del gateway. Un deployment gestito può limitare l'insieme tramite policy; modificare quella policy ha effetto al prossimo avvio."
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "Chatta su un Crew",
         "chat_on_a_crew_desc": "Aggiunge “New chat on crew” al menu di creazione, che avvia una sessione eseguita su un Crew connesso. Incompleto: si apre nel pannello del Crew stesso e le sessioni eseguite su un Crew non sono ancora elencate qui.",
@@ -9964,10 +9966,6 @@
     "developerPage": {
       "developer": "Sviluppatore",
       "tabs": {
-        "agentBackend": {
-          "description": "Quale agente avviano le nuove sessioni: Kiro CLI, Claude Code o KAS",
-          "label": "Backend dell’agente"
-        },
         "archive": {
           "description": "Cronologia delle sessioni ruotata/compressa (conservazione di 7 giorni)",
           "label": "Archivio"
@@ -12332,6 +12330,47 @@
         "zoom_font": "Zoom e carattere",
         "zoom_level": "Livello di zoom",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "Backend IA",
+        "badge_available": "Disponibile",
+        "badge_bundled": "Incluso",
+        "badge_invalid": "Non valido",
+        "badge_missing": "Mancante",
+        "badge_not_serviceable": "Non supportato",
+        "badge_operator": "Dell’operatore",
+        "badge_restart_required": "Riavvio richiesto",
+        "badge_unavailable": "Non disponibile",
+        "default_harness": "Harness predefinito",
+        "default_harness_unset": "Non impostato",
+        "failed_to_load_config": "Impossibile caricare le impostazioni attuali.",
+        "failed_to_load_harnesses": "Impossibile caricare l’elenco degli harness.",
+        "failed_to_save": "Salvataggio non riuscito",
+        "harness_list_unavailable": "L’elenco degli harness non è stato caricato, quindi la disponibilità non viene mostrata.",
+        "harness_not_serviceable": "{{name}} — non supportato da questa versione",
+        "harness_unavailable": "{{name}} — non disponibile ({{reason}})",
+        "harnesses_are_defined_in_config_and_authenticate": "Gli harness si definiscono in config.json e si autenticano da soli: {{productName}} non memorizza credenziali dei provider.",
+        "install_check_failed": "Impossibile verificare se questo è installato su questa macchina.",
+        "installed_restart_required": "Installato su questa macchina, ma questo gateway deve essere riavviato prima di poter essere usato.",
+        "legacy_backend": "Backend ACP precedente",
+        "legacy_backend_kas": "KAS (kiro-agent)",
+        "legacy_backend_kiro": "Kiro CLI (predefinito)",
+        "legacy_backend_outranked": "Ignorato quando è impostato un harness predefinito.",
+        "legacy_backend_stored": "{{value}} (memorizzato, non selezionabile)",
+        "missing_components": "Mancante su questa macchina: {{components}}",
+        "missing_components_with_command": "Mancante su questa macchina: {{components}}. Installa con: {{command}}",
+        "no_harnesses_registered": "Nessun harness registrato.",
+        "not_serviceable_note": "Questa versione non può avviare una sessione su questo harness.",
+        "operator_entry_conflicts": "La tua voce harness con questo id è stata rifiutata: {{reason}}",
+        "registered_harnesses": "Harness registrati",
+        "resolves_to": "Le nuove sessioni partono su {{name}}.",
+        "resolves_to_not_serviceable": "Le nuove sessioni si risolvono su {{name}}, dove questa versione non può avviare una sessione.",
+        "resolves_to_unavailable": "Le nuove sessioni si risolvono su {{name}}, che non può essere eseguito: {{reason}}",
+        "retry": "Riprova",
+        "retry_config": "Ricarica le impostazioni",
+        "retry_harness_list": "Ricarica l’elenco degli harness",
+        "the_older_key_read_as_an_alias_of_a_harness": "La chiave di backend precedente, letta come alias di un harness registrato.",
+        "which_harness_new_sessions_start_on": "Su quale harness partono le nuove sessioni. Una sessione in corso mantiene l’harness con cui è iniziata."
       },
       "importPanel": {
         "agent_data": "Dati dell'agente",

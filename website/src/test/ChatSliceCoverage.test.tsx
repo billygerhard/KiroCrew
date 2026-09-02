@@ -1189,6 +1189,20 @@ describe('chatSlice thunks', () => {
     expect(apiMock.createChatSlot.mock.calls[0][5]).toBe('#4237 · a readable name')
   })
 
+  it('carries a harness selection on the create request', async () => {
+    // The harness is bound at BIRTH — there is no patch endpoint for it — so the
+    // create body is the only place a selection can travel. An omitted selection
+    // must stay omitted rather than becoming an empty string, which the gateway
+    // would have to tell apart from "inherit".
+    apiMock.createChatSlot.mockResolvedValue({ key: 'kas-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot({ harness: 'kas' }))
+    expect(apiMock.createChatSlot.mock.calls[0][9]).toBe('kas')
+    apiMock.createChatSlot.mockClear()
+    await store.dispatch(createSlot({ agent: 'kirocrew' }))
+    expect(apiMock.createChatSlot.mock.calls[0][9]).toBeUndefined()
+  })
+
   it('registers a background create without stealing focus', async () => {
     apiMock.createChatSlot.mockResolvedValue({ key: 'bg-slot' })
     apiMock.chatSlotProject.mockResolvedValue({})

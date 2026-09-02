@@ -928,8 +928,20 @@ class SessionMap:
             self._note_inbound_unbind(key, inbound, reason)
 
     @_guarded
-    def set(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
-        """Save mapping and persist to disk, preserving existing slack fields."""
+    def set(
+        self, key: str, sid: str, *, provider: str = "", cwd: str = "", harness: str = ""
+    ) -> None:
+        """Save mapping and persist to disk, preserving existing slack fields.
+
+        ``harness`` records WHICH harness's store the ``sid`` names. The two
+        belong together: a native session id is meaningful only inside the harness
+        that minted it, so resuming one on a different harness replays nothing and
+        (worse) starts a fresh conversation under an id the map still trusts. An
+        empty value records nothing — every field on this method behaves that way,
+        and a caller with no harness to report is not saying the binding changed.
+        An entry written before binding existed answers ``""``, read as "whatever
+        the default was", which is what it was.
+        """
         key = canonical_key(key)
         existing = self._data.get(key)
         if existing:
@@ -938,12 +950,16 @@ class SessionMap:
                 existing["provider"] = provider
             if cwd:
                 existing["cwd"] = cwd
+            if harness:
+                existing["harness"] = harness
         else:
             entry: dict = {"sid": sid, "slack_thread_ts": None, "slack_channel_id": None}
             if provider:
                 entry["provider"] = provider
             if cwd:
                 entry["cwd"] = cwd
+            if harness:
+                entry["harness"] = harness
             self._data[key] = entry
         self._save()
 
@@ -960,6 +976,20 @@ class SessionMap:
         if not entry:
             return ""
         return entry.get("provider", "")
+
+    def get_harness(self, key: str) -> str:
+        """The harness id this session was created on, or '' when none was recorded.
+
+        ``''`` is not "kiro-cli": it means the entry predates harness binding (or
+        was written by a caller with nothing to record), so the reader decides what
+        to do with an unrecorded binding — the resume path treats it as the
+        configured default, which is what such a session actually ran on.
+        """
+        entry = self._data.get(canonical_key(key))
+        if not entry:
+            return ""
+        harness = entry.get("harness", "")
+        return harness if isinstance(harness, str) else ""
 
     @_guarded
     def clear_sid(self, key: str) -> None:

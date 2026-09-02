@@ -9,7 +9,6 @@ import os
 import sys
 import time
 
-
 # A leading "~" is expanded because Docker `ENV` and systemd `Environment=`
 # pass one through unexpanded, and os.environ.get does not expand it -- without
 # this, KIROCREW_HOME='~/crew-data' would create a directory literally named

@@ -10,7 +10,7 @@ Covers the two primitives that shipped from the image-generation work:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -47,10 +47,10 @@ class TestRuntimeModelParam:
 
         with (
             patch(
-                "kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn",
-                new_callable=AsyncMock,
+                "kiro_crew.acp.runtime.resolve_spawn_executable",
                 return_value="/bin/kiro-cli",
             ),
+            patch("kiro_crew.acp.harness_adapters.KiroAdapter.pre_spawn"),
             patch("kiro_crew.acp.runtime.wrap_argv", side_effect=_capture),
         ):
             with pytest.raises(RuntimeError, match="abort-after-capture"):

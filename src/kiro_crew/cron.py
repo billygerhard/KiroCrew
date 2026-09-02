@@ -75,6 +75,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     ("folder_id", MAX_SHORT_STRING),
     ("session_key", MAX_SHORT_STRING),
     ("model", MAX_SHORT_STRING),
+    ("harness", MAX_SHORT_STRING),
     ("command", 5000),
     ("script", 200),
     ("timezone", 50),
@@ -590,6 +591,13 @@ class CronJob:
     # benign (they self-heal on the job's next folder move).
     folder_id: str = ""
     model: str = ""  # per-job model override (canonical key or provider id); "" = inherit
+    # Per-job ACP harness override; "" = inherit the configured default harness.
+    # A parallel axis to ``model``, and stored the same way, but judged at a
+    # different time: an unregistered id is accepted here and only refused when
+    # the job FIRES, because the registry describes the machine as it is at that
+    # moment. An operator who schedules a job before installing the harness it
+    # names, or whose harness binary is temporarily gone, keeps the schedule.
+    harness: str = ""
 
     # A sequence of MORE THAN ONE agent takes precedence over agent_id: the
     # gateway runs those agents in order, each on its own session key. A
@@ -738,6 +746,97 @@ def build_cron_session_context(job: CronJob) -> tuple[str, str]:
     # Stateless: fresh key, bare message.
     run_id = uuid.uuid4().hex[:8]
     return f"cron:{job.id}:{run_id}", job.message
+
+
+def resolve_job_harness(job: CronJob) -> tuple[str, str]:
+    """The ACP harness one run of *job* may use: ``(harness_id, refusal_reason)``.
+
+    Exactly one half is ever populated. A resolved id means the run may proceed
+    on that harness; a non-empty reason means it may not, and the reason NAMES
+    the harness so the operator learns which selection to repair rather than
+    reading a generic failure.
+
+    Judged HERE, at fire time, rather than when the job was written. The
+    registry answers for the machine as it is right now: a harness can be
+    installed, removed, or signed out of between authoring a schedule and
+    running it, and a write-time verdict would either refuse a job whose harness
+    arrives later or bless one whose binary has since gone. The cost is that a
+    typo surfaces on the first run instead of at the prompt — accepted, because
+    the alternative silently loses the self-healing property that keeps a
+    repaired harness from needing the job re-created.
+
+    Two failure directions, deliberately opposite:
+
+    **An explicit selection fails closed.** A registered-but-unavailable, an
+    unknown, and an unserviceable harness each refuse the run; anything else
+    going wrong propagates. Substituting the default would run the operator's
+    work on a backend they did not choose and report it as a success.
+
+    **An inherited selection cannot fail here at all.** A job that opted into
+    nothing must not acquire a new failure mode from this axis, so an
+    unresolvable default degrades to "no selection" and the run proceeds exactly
+    as it did before harnesses were selectable — a kiro-cli problem still
+    surfaces from the spawn, with the message it always had.
+    """
+    selected = job.harness
+    if not isinstance(selected, str):
+        # Only a hand-edited or corrupted store produces one, and it names no
+        # harness — so it is read as "unset" (the job still runs) and logged,
+        # because an override that is silently ignored is unfindable.
+        logger.warning(
+            "Cron '%s': ignoring non-string harness %r; inheriting the default",
+            job.name,
+            selected,
+        )
+        selected = ""
+    selected = selected.strip()
+    try:
+        # Deferred, and inside the try: the ACP vocabulary reaches back into the
+        # configuration loader this module already imports, and an import error
+        # on this axis must not be a new way for an inherited run to die.
+        from kiro_crew.agent_sdk.harness import resolve_session_harness
+
+        binding = resolve_session_harness(selected)
+    except Exception as exc:
+        if not selected:
+            logger.warning(
+                "Cron '%s': default harness unresolvable (%s); inheriting", job.name, exc
+            )
+            return "", ""
+        reason = _harness_refusal_reason(selected, exc)
+        if not reason:
+            raise
+        return "", reason
+    return binding.harness_id, ""
+
+
+def _harness_refusal_reason(selected: str, exc: BaseException) -> str:
+    """A one-line, harness-naming refusal for *exc*, or ``""`` when it is not one.
+
+    An empty answer means "this is not a harness verdict" — a bug, an import
+    failure, a broken registry — and the caller re-raises rather than recording
+    it as though the operator's selection were at fault.
+
+    The reasons are composed here rather than reused from ``str(exc)`` because
+    the registry's own messages are written for a developer reading a traceback
+    (they enumerate every registered id), while this text lands in
+    ``last_error``, where an operator reads it beside the job.
+    """
+    try:
+        from kiro_crew.agent_sdk.harness import (
+            HarnessNotServiceable,
+            HarnessUnavailable,
+            UnknownHarness,
+        )
+    except Exception:  # pragma: no cover - the import that already failed above
+        return ""
+    if isinstance(exc, UnknownHarness):
+        return f"harness {selected!r} is not registered"
+    if isinstance(exc, HarnessUnavailable):
+        return f"harness {selected!r} is unavailable: {exc.reason}"
+    if isinstance(exc, HarnessNotServiceable):
+        return f"harness {selected!r} cannot run this job: {exc.reason}"
+    return ""
 
 
 # ── Cron expression matching (via croniter) ──
@@ -1134,6 +1233,7 @@ def _job_from_record(j: dict[str, Any]) -> CronJob:
         hide_in_chat=j.get("hide_in_chat", False),
         folder_id=j.get("folder_id", ""),
         model=j.get("model", ""),
+        harness=j.get("harness", ""),
         agent_sequence=j.get("agent_sequence", []),
         env=j.get("env", {}),
         timeout_secs=j.get("timeout_secs", _JOB_TIMEOUT_SECS),
@@ -1705,6 +1805,7 @@ class CronService:
         enabled: bool = True,
         agent_id: str = "",
         model: str = "",
+        harness: str = "",
         silent: bool = False,
         timezone: str = "",
         skip_dates: list[str] | None = None,
@@ -1733,7 +1834,7 @@ class CronService:
         caller can strand a half-populated or invalid job on disk, and every
         create path (MCP, apps SDK, dashboard, CLI) shares one check. This
         consolidates **every** first-save field
-        (``agent_id``/``model``/``silent``/``strict_schedule``/``hide_in_chat``,
+        (``agent_id``/``model``/``harness``/``silent``/``strict_schedule``/``hide_in_chat``,
         ``command``/``script``/``agent_sequence``/``env``/``persistent_session``)
         into the same single locked build+persist, totalizing over all fields
         into the same single locked build+persist, totalizing over all fields
@@ -1764,6 +1865,7 @@ class CronService:
             enabled=enabled,
             agent_id=agent_id,
             model=model,
+            harness=harness,
             silent=silent,
             timezone=timezone,
             skip_dates=skip_dates,
@@ -1859,6 +1961,7 @@ class CronService:
         enabled: bool = True,
         agent_id: str = "",
         model: str = "",
+        harness: str = "",
         silent: bool = False,
         timezone: str = "",
         skip_dates: list[str] | None = None,
@@ -1887,7 +1990,8 @@ class CronService:
         bounds only script/command subprocesses.
 
         The optional presentation/routing fields (``agent_id``, ``model``,
-        ``silent``, ``timezone``, ``strict_schedule``, ``hide_in_chat``) are set
+        ``harness``, ``silent``, ``timezone``, ``strict_schedule``,
+        ``hide_in_chat``) are set
         here so the job is persisted **fully-formed** in the single locked
         transaction. This closes a create-then-mutate-then-unlocked-``_save``
         window (two concurrent creates could otherwise interleave at the
@@ -1912,6 +2016,7 @@ class CronService:
                 "folder_id": folder_id,
                 "session_key": session_key,
                 "model": model,
+                "harness": harness,
                 "command": command,
                 "script": script,
                 "timezone": timezone,
@@ -1968,6 +2073,7 @@ class CronService:
             approval_mode=approval_mode,
             agent_id=agent_id,
             model=str(model or "").strip(),
+            harness=str(harness or "").strip(),
             silent=silent,
             timezone=timezone,
             skip_dates=skip_dates,
@@ -2013,6 +2119,7 @@ class CronService:
         enabled: bool = True,
         agent_id: str = "",
         model: str = "",
+        harness: str = "",
         silent: bool = False,
         timezone: str = "",
         skip_dates: list[str] | None = None,
@@ -2041,7 +2148,8 @@ class CronService:
         boundaries translate it to a clean 409 / structured error.
 
         Optional presentation/routing fields (``agent_id``, ``model``,
-        ``silent``, ``timezone``, ``strict_schedule``, ``hide_in_chat``) are
+        ``harness``, ``silent``, ``timezone``, ``strict_schedule``,
+        ``hide_in_chat``) are
         applied during the single locked build+persist so callers never need a
         follow-up unlocked ``_save()`` (which could race a concurrent create and
         drop a job).
@@ -2060,6 +2168,7 @@ class CronService:
             enabled=enabled,
             agent_id=agent_id,
             model=model,
+            harness=harness,
             silent=silent,
             timezone=timezone,
             skip_dates=skip_dates,
@@ -2085,7 +2194,7 @@ class CronService:
         """Update fields on an existing job. Returns updated job or None if not found.
 
         Accepted kwargs: name, message, every_secs, cron_expr, agent_id, channel,
-        approval_mode, silent, skip_dates, timezone, thread_ts, model,
+        approval_mode, silent, skip_dates, timezone, thread_ts, model, harness,
         timeout_secs (per-wake execution budget, 1..86400).
 
         Raises :class:`CronStoreBusy` if the store lock is contended past the
@@ -2246,6 +2355,11 @@ class CronService:
                     job.folder_id = kwargs["folder_id"] or ""
                 if "model" in kwargs:
                     job.model = str(kwargs["model"] or "").strip()
+                # Assigned on mere PRESENCE, not on truthiness: an empty value
+                # is how "inherit the default harness again" is expressed, and a
+                # falsy-skip here would make the override one-way.
+                if "harness" in kwargs:
+                    job.harness = str(kwargs["harness"] or "").strip()
                 # Per-wake budget (the asyncio.wait_for deadline in
                 # _execute_with_timeout). Distinct from ``timeout``, which
                 # bounds only script/command subprocesses. This is the only
@@ -4285,6 +4399,7 @@ class CronService:
                     "hide_in_chat": j.hide_in_chat,
                     "folder_id": j.folder_id,
                     "model": j.model,
+                    "harness": j.harness,
                     "agent_sequence": j.agent_sequence,
                     "env": j.env,
                     "timeout_secs": j.timeout_secs,

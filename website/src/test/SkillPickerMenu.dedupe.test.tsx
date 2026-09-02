@@ -29,10 +29,14 @@ function Harness({ client, query = '', open = true, onSelect = vi.fn(), onClose 
   )
 }
 
-/** What the bounded client does to a wedged gateway: reject with TimeoutError. */
+/** What the bounded client does to a wedged gateway: reject with TimeoutError.
+ *  The delay must outlast the gap between prefetch and the menu's mount: if the
+ *  rejection lands first (seen on loaded CI shards at 5ms), the menu subscribes
+ *  to an already-ERRORED query and issues a second fetch — the dedupe this file
+ *  proves never gets its chance. 250ms is still far below waitFor's 1s budget. */
 const timesOut = () => () =>
   new Promise((_resolve, reject) =>
-    setTimeout(() => reject(new DOMException('deadline exceeded', 'TimeoutError')), 5))
+    setTimeout(() => reject(new DOMException('deadline exceeded', 'TimeoutError')), 250))
 
 beforeEach(() => { vi.clearAllMocks() })
 afterEach(() => { vi.restoreAllMocks() })

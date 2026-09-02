@@ -11,14 +11,24 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.acp.client import (
-    _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
     AcpAuthRequired,
     AcpClient,
     AcpError,
     advertised_model_ids,
     model_is_unusable,
+    not_logged_in_message,
 )
+from kiro_crew.acp.harness_adapters import adapter_for
+from kiro_crew.acp.harness_descriptor import (
+    CAPABILITY_ACP_RUNTIME_POOL,
+    CAPABILITY_KIRO_IDENTITY_STORE,
+    CAPABILITY_MCP_TOOL_SEARCH,
+    CAPABILITY_REASONING_EFFORT,
+    CAPABILITY_SESSION_SHARING,
+)
+from kiro_crew.acp.harness_registry import registry as harness_registry
+from kiro_crew.acp.harness_selection import HarnessBinding
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
@@ -26,12 +36,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_ACP_RUNTIME,
-    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SESSION_SHARING,
     EVENT_COMPACTION_STATUS,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
@@ -39,6 +45,7 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_KAS,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
+    harness_for_backend,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
@@ -302,11 +309,81 @@ class AcpProvider(LLMProvider):
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         crew_agent: str | None = None,
+        harness_id: str = "",
+        binding: HarnessBinding | None = None,
     ) -> None:
+        # The session's harness binding, carried as a UNIT (descriptor +
+        # acp_backend together) rather than as two strings the provider would
+        # re-derive independently. When supplied it is authoritative for BOTH
+        # halves: ``acp_backend`` is the spelling this provider spawns as and
+        # ``harness_id`` is the descriptor it reports/gates on, and taking them
+        # from one object is what keeps a session's label and its process from
+        # ever naming different harnesses. Every existing caller passes neither a
+        # binding nor a mismatched pair, so the ``binding is None`` path is the
+        # unchanged two-string behaviour (zero behavior change).
+        #
+        # A binding's profile is also threaded into AcpClient below, so a bound
+        # generic operator harness handshakes on ITS adapter's wire rather than
+        # the string-derived kiro fallback.
+        _profile_override: Any = None
+        _descriptor_override: Any = None
+        if binding is not None:
+            # ``binding`` is annotated ``HarnessBinding | None`` but the loader
+            # forwards it through an ``Any``-typed parameter (a TYPE_CHECKING-only
+            # annotation cannot be enforced at runtime), so a wrong type — a dict,
+            # say — would otherwise reach ``binding.acp_backend`` below and die on
+            # an ``AttributeError`` that never mentions harnesses. Refuse it here
+            # naming the type received.
+            if not isinstance(binding, HarnessBinding):
+                raise ValueError(
+                    "binding must be a HarnessBinding or None, got "
+                    f"{type(binding).__name__}"
+                )
+            # The binding is authoritative, but a caller that ALSO passed an
+            # explicit ``harness_id`` / ``acp_backend`` naming a different harness
+            # has stated two things that cannot both be true — the invisible
+            # precedence (binding wins) would silently discard their strings.
+            # Refuse, naming both values. Only NON-EMPTY explicit strings count as
+            # a statement: ``acp_backend=""`` is kiro-cli's own real spelling and
+            # ``harness_id=""`` is "unspecified", so neither empty default is a
+            # disagreement (this is the None-sentinel spirit the loader already
+            # applies to ``acp_backend``).
+            if acp_backend and acp_backend != binding.acp_backend:
+                raise ValueError(
+                    f"acp_backend {acp_backend!r} disagrees with binding's "
+                    f"acp_backend {binding.acp_backend!r}"
+                )
+            if harness_id and harness_id != binding.harness_id:
+                raise ValueError(
+                    f"harness_id {harness_id!r} disagrees with binding's "
+                    f"harness_id {binding.harness_id!r}"
+                )
+            acp_backend = binding.acp_backend
+            harness_id = binding.harness_id
+            # The wire dialect of the bound harness, from its adapter — the one
+            # authoritative source. Threaded into AcpClient so the client does not
+            # re-derive it from the backend string (whose unknown-value fallback is
+            # KIRO_PROFILE, wrong for a generic operator harness). See finding 1.
+            _profile_override = adapter_for(binding.descriptor).protocol_profile
+            # The bound descriptor itself, threaded so the client's spawn path
+            # renders a generic harness's argv from its own adapter. Same
+            # authoritative source as the profile/id above.
+            _descriptor_override = binding.descriptor
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
         # error. Fail at construction instead.
-        if acp_backend not in ACP_BACKENDS_KNOWN:
+        #
+        # A binding whose ``acp_backend`` is its own descriptor id is the design's
+        # generic fallback (a harness with no legacy spelling): the descriptor,
+        # not a raw config string, is the authority, so it is not the typo this
+        # guard exists to catch. It is admitted WITHOUT being added to
+        # ``ACP_BACKENDS_KNOWN`` — every ``is_*_backend`` glue below still reads
+        # False for it, so this changes no behavior for the three real backends
+        # and does NOT itself enable serving such a harness (``resolve_session_harness``
+        # still refuses to produce this binding until T6; only a direct construction
+        # exercises it).
+        _binding_generic_fallback = binding is not None and acp_backend == harness_id
+        if acp_backend not in ACP_BACKENDS_KNOWN and not _binding_generic_fallback:
             raise ValueError(
                 f"Unknown acp_backend {acp_backend!r}; "
                 f"expected one of {sorted(ACP_BACKENDS_KNOWN)}"
@@ -326,6 +403,25 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            # Wire profile of the bound harness's adapter, or None when unbound
+            # (the client then derives it from the backend string, byte-identical
+            # to the pre-binding behaviour). See finding 1 / __init__ above.
+            "protocol_profile": _profile_override,
+            # Harness identity of the bound harness, or "" when unbound (the
+            # client then derives it from the backend string via its roster,
+            # unchanged from before). Threaded from the SAME binding as the
+            # profile so the client gates on the bound descriptor rather than
+            # re-deriving the id from the backend string — whose unmapped-value
+            # fallback would hand a generic operator harness kiro-cli's sandbox
+            # waiver. See finding 1 / __init__ above.
+            "harness_id": (harness_id or "").strip(),
+            # The bound harness DESCRIPTOR, or None when unbound. Threaded from
+            # the SAME binding as the profile / harness_id so ``AcpClient._spawn``
+            # renders a generic harness's argv from its own adapter (descriptor
+            # driven) instead of hardcoding kiro-cli's — see finding 1 / the
+            # client __init__ note. None on the unbound path keeps _spawn's
+            # kiro/claude branches byte-identical.
+            "descriptor": _descriptor_override,
         }
         if agent:
             kwargs["agent"] = agent
@@ -341,6 +437,14 @@ class AcpProvider(LLMProvider):
         # runtime so per-agent watchdog windows key off the crew, never off a
         # cross-namespace name match.
         self._crew_agent: str = crew_agent or ""
+        # The harness this session is BOUND to, as its creator resolved it. It
+        # outranks the backend spelling for every REPORT: two harnesses can share
+        # one ``acp_backend`` value (an operator descriptor aliased onto kiro),
+        # so deriving the id back out of the backend would collapse them into one
+        # row. Empty means nobody bound this provider — a warm-pool process or any
+        # pre-binding caller — and :attr:`harness_id` then identifies the harness
+        # from the backend spelling, which is what such a session has always run on.
+        self._harness_id: str = (harness_id or "").strip()
         # F2 load-recovery: set True by _start_kiro_runtime_impl when a resume
         # falls back to a FRESH native session (the prior session's lock never
         # cleared). Signals SessionManager.get_or_create to replay KiroCrew's
@@ -450,6 +554,38 @@ class AcpProvider(LLMProvider):
         return str(self._client._work_dir)
 
     @property
+    def harness_id(self) -> str:
+        """The harness this session runs on — never empty, and never blocking.
+
+        The binding its creator resolved when there was one, else the harness whose
+        legacy ``acp_backend`` spelling this provider was constructed on, which is
+        what an unbound provider (a warm-pool process, any pre-binding caller) has
+        always run. Answering ``""`` would leave every usage row and every
+        harness-named error on those paths unattributed, which is the failure this
+        id exists to fix.
+
+        The backend is read as an IDENTITY, so it resolves through the bundled
+        backend spellings and NOT through ``resolve_alias``: the alias table answers
+        what a stored config key SELECTS, and it degrades a known-but-unselectable
+        harness to kiro-cli — which read here would attribute a claude-seam
+        session's usage to kiro-cli, send its signed-out user to ``kiro-cli login``,
+        and log a warning about a config key nobody read. The alias table stays the
+        fallback for a spelling with no bundled row, which provider construction
+        already rejects.
+
+        Both paths are dict lookups over in-memory data (the fallback touches no
+        configuration either), so this is safe to read on the event loop and safe to
+        read after the child process is gone — which is when usage attribution asks.
+        """
+        if self._harness_id:
+            return self._harness_id
+        backend = self._client.backend
+        identified = harness_for_backend(backend)
+        if identified is not None:
+            return identified
+        return harness_registry().resolve_alias(backend)
+
+    @property
     def is_claude_backend(self) -> bool:
         """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).
 
@@ -480,44 +616,81 @@ class AcpProvider(LLMProvider):
         """
         return self._client.backend == ACP_BACKEND_KIRO
 
+    def _declares(self, capability: str) -> bool:
+        """True when this session's bound harness declares ``capability``.
+
+        The one place a capability decision is made on this class: it reads the
+        flag off the descriptor :attr:`harness_id` names, so no gate below
+        compares a harness identifier. Non-blocking (see
+        ``HarnessRegistry.bound_capabilities``), which is what lets the properties
+        built on it stay ordinary event-loop reads.
+        """
+        return harness_registry().bound_capabilities(self.harness_id).has(capability)
+
     @property
     def is_acp_runtime_backend(self) -> bool:
         """True when this provider is served by AcpRuntime (kiro-cli or KAS).
 
-        Membership in ``ACP_BACKENDS_ACP_RUNTIME`` (harness-parity H5). Names
-        the "kiro or kas" set positively so the shared-runtime start path, the
-        cli.json overlay recovery, and the skip-live-effort branch stop being
-        spelled ``not is_claude_backend`` — which would hand the kiro-family
-        path to every harness added later. The claude AcpClient is deliberately
-        not a member: it runs one process per session and shares no runtime.
+        The ``acp_runtime_pool`` capability off the session's bound descriptor
+        (harness-parity H5). Names the "runs on the shared runtime" property
+        positively so the shared-runtime start path, the cli.json overlay
+        recovery, and the skip-live-effort branch stop being spelled ``not
+        is_claude_backend`` — which would hand the kiro-family path to every
+        harness added later. The claude AcpClient seam does not declare it: it
+        runs one process per session and shares no runtime.
         """
-        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
+        return self._declares(CAPABILITY_ACP_RUNTIME_POOL)
 
     @property
     def is_session_sharing_eligible(self) -> bool:
         """True when this provider can host multiplexed subagent sessions.
 
-        Session sharing requires a backend whose single process serves N
-        concurrent sessions via AcpRuntime demux, so it is granted by membership
-        in ``ACP_BACKENDS_SESSION_SHARING`` (harness-parity H6) rather than by
-        ``not is_claude_backend``. The Claude Code backend uses AcpClient (one
-        process per session) and is not a member, so subagents fall back to the
-        legacy per-process path — and neither does any harness added later,
-        until someone adds it deliberately.
+        Session sharing requires a harness whose single process serves N
+        concurrent sessions via AcpRuntime demux, so it is granted by the
+        ``session_sharing`` capability on the bound descriptor (harness-parity
+        H6) rather than by ``not is_claude_backend``. The Claude Code backend
+        uses AcpClient (one process per session) and does not declare it, so
+        subagents fall back to the legacy per-process path — and neither does any
+        harness added later, until someone grants it deliberately.
         """
-        return self._client.backend in ACP_BACKENDS_SESSION_SHARING
+        return self._declares(CAPABILITY_SESSION_SHARING)
 
     @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child signs in from kiro-cli's own store.
 
-        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
-        H5/H14). Declaring it here is what lets the session layer ask the
-        question through the ABC instead of probing private attributes, so an
-        adapted provider is classified by its own declaration rather than by
+        The ``kiro_identity_store`` capability off the bound descriptor
+        (harness-parity H5/H14). Declaring it here is what lets the session layer
+        ask the question through the ABC instead of probing private attributes, so
+        an adapted provider is classified by its own declaration rather than by
         whichever internal shape it happens to expose.
         """
-        return self._client.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._declares(CAPABILITY_KIRO_IDENTITY_STORE)
+
+    @property
+    def supports_reasoning_effort(self) -> bool:
+        """True when this session's harness honours a reasoning-effort level.
+
+        Read off the bound descriptor, so a harness that does not honour effort
+        has the level dropped with a log line rather than written into a settings
+        file it never reads or pushed over a config option it never advertised.
+        Which CHANNEL carries the level for a harness that does honour it is a
+        separate question — the kiro family takes it through the workspace
+        cli.json overlay at spawn, the claude seam through a live
+        ``session/set_config_option``.
+        """
+        return self._declares(CAPABILITY_REASONING_EFFORT)
+
+    @property
+    def supports_mcp_tool_search(self) -> bool:
+        """True when this session's harness honours the MCP Tool Search toggle.
+
+        The toggle is inert everywhere else: Tool Search is written into
+        kiro-cli's own workspace ``cli.json``, so a harness that does not read
+        that file gains nothing from the write and only acquires a settings file
+        inside the user's project directory.
+        """
+        return self._declares(CAPABILITY_MCP_TOOL_SEARCH)
 
     async def _start_kiro_runtime(self) -> None:
         """Spawn an AcpRuntime + session; time the kiro cold-start split.
@@ -737,6 +910,7 @@ class AcpProvider(LLMProvider):
             mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
             mcp_gateway_socket=mcp_gateway_socket,
             acp_backend=self._client.backend,
+            harness_id=self._harness_id,
             crew_agent=self._crew_agent,
         )
         _t_spawn = time.monotonic()
@@ -747,7 +921,7 @@ class AcpProvider(LLMProvider):
             # surface an actionable login prompt (parity with AcpClient) rather
             # than a generic runtime-death error.
             if runtime.saw_not_logged_in():
-                raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                raise AcpAuthRequired(not_logged_in_message(runtime.harness_id)) from exc
             raise
         finally:
             # subprocess launch + ACP `initialize` handshake
@@ -837,13 +1011,14 @@ class AcpProvider(LLMProvider):
                         mcp_gateway_settings_mcp_json=mcp_gateway_settings_mcp_json,
                         mcp_gateway_socket=mcp_gateway_socket,
                         acp_backend=self._client.backend,
+                        harness_id=self._harness_id,
                         crew_agent=self._crew_agent,
                     )
                     try:
                         await runtime.spawn()
                     except AcpRuntimeError as exc:
                         if runtime.saw_not_logged_in():
-                            raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                            raise AcpAuthRequired(not_logged_in_message(runtime.harness_id)) from exc
                         raise
                 try:
                     handle = await runtime.create_session(
@@ -852,7 +1027,7 @@ class AcpProvider(LLMProvider):
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
-                        raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
+                        raise AcpAuthRequired(not_logged_in_message(runtime.harness_id)) from exc
                     raise
                 finally:
                     # In a finally, mirroring session_load: a start that BLEW its
@@ -976,19 +1151,32 @@ class AcpProvider(LLMProvider):
     def _apply_effort_overlay(self) -> None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
 
-        Written only for the harnesses that READ it
-        (``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` — the kiro family takes effort from
-        this file at spawn); adapter harnesses use a live set_config_option push
-        instead. Also a no-op when the model is not effort-capable or no level
-        resolves. Called before every (re)spawn so resume/restart keeps the same
-        level.
+        Two capability questions, and both have to answer yes, because the
+        overlay is a CHANNEL and not the feature: ``reasoning_effort`` says the
+        harness honours an effort level at all, and ``acp_runtime_pool`` says it
+        is a kiro-family harness that takes the level from this workspace
+        ``cli.json`` at spawn. The claude seam honours effort through a live
+        ``session/set_config_option`` instead, so writing kiro's settings file
+        for it would leave a file nobody reads; a harness that honours no effort
+        gets nothing written either way. (Upstream spells the same gate as
+        ``ACP_BACKENDS_KIRO_SLASH_COMMANDS`` membership; the descriptor answers
+        identically for the bundled harnesses and extends to operator ones.)
 
-        Membership rather than "not claude": the companion clear
-        (``_clear_cli_overlay_effort`` in :meth:`change_effort`) is already
-        membership-gated, so a negation here writes an overlay for a harness the
-        clear will never reach — a stale file left in the user's workspace.
+        Also a no-op when the model is not effort-capable or no level resolves.
+        Called before every (re)spawn so resume/restart keeps the same level.
         """
-        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+        if not self.supports_reasoning_effort:
+            # Logged rather than returned silently: this drop can come from a
+            # configured pin (``agent.role_efforts``) that no surface asked about,
+            # so an invisible skip presents only as effort quietly not happening.
+            # DEBUG because it repeats on every respawn — the interactive path
+            # (``change_effort``) reports the same refusal at INFO, once.
+            logger.debug(
+                "ACP effort overlay skipped — harness %r declares no effort support",
+                self.harness_id,
+            )
+            return
+        if not self.is_acp_runtime_backend:
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -1003,14 +1191,14 @@ class AcpProvider(LLMProvider):
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        Tool Search is a kiro-cli feature read from this file at spawn, so the
-        write is scoped to the harnesses that read it; a no-op as well when no
-        toggle value was supplied (``self._tool_search is None``). Called before
-        every (re)spawn so resume/restart keeps the same setting.
+        Honoured only where the session's harness declares ``mcp_tool_search``:
+        Tool Search is a kiro-cli feature written into kiro-cli's own
+        workspace ``cli.json``, so the toggle is inert on a harness that reads no
+        such file. Also a no-op when no toggle value was supplied
+        (``self._tool_search is None``). Called before every (re)spawn so
+        resume/restart keeps the same setting.
         """
-        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
-            return
-        if self._tool_search is None:
+        if not self.supports_mcp_tool_search or self._tool_search is None:
             return
         try:
             _write_tool_search_overlay(
@@ -1110,21 +1298,30 @@ class AcpProvider(LLMProvider):
         if not model_supports_effort(model):
             logger.info("change_effort skipped — model %s does not support effort", model)
             return False
-        via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-        via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
-        if not (via_config_option or via_slash_command):
-            # Both channels are opt-in, so a harness in neither has to be reported
-            # unsupported here. Guessing one would push into a verb the adapter
-            # does not implement and reset the session on a -32601.
+        # The harness's own answer, ahead of the model's: a harness that does not
+        # honour effort has no channel to push the level down, so the level is
+        # dropped with a log line rather than written into a settings file it
+        # never reads. Reported as "unsupported" so the dashboard leaves
+        # the UI as it is instead of resetting the session.
+        if not self.supports_reasoning_effort:
             logger.info(
-                "change_effort skipped — backend %r implements no effort channel",
-                self._client.backend,
+                "change_effort skipped — harness %r does not support reasoning effort",
+                self.harness_id,
             )
             return False
-        # An adapter build may advertise no 'effort' config option; attempting to
-        # push would fail with 'Unknown config option' and reset the session.
-        # Report unsupported so the dashboard leaves the UI as-is.
-        if via_config_option and not self._client.supports_config_option("effort"):
+        # An adapter build may advertise no 'effort' config option; attempting
+        # to push would fail with 'Unknown config option' and reset the session.
+        # Report unsupported so the dashboard leaves the UI as-is. The channel
+        # question is the same descriptor read the overlay gate uses: an
+        # effort-honouring harness in the kiro family (``acp_runtime_pool``)
+        # takes the level from the cli.json overlay plus the ``/effort`` slash
+        # command, and every other effort-honouring harness (the claude seam,
+        # codex when registered, operator adapters) is on the config-option
+        # wire — not a backend-name test.
+        via_config_option = not self.is_acp_runtime_backend
+        if via_config_option and not (
+            self._client.supports_config_option("effort")
+        ):
             logger.info("change_effort skipped — adapter build exposes no 'effort' option")
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
@@ -1180,12 +1377,14 @@ class AcpProvider(LLMProvider):
         Drops the per-model override (and the kiro overlay entry) so the model
         falls back to its own default.
 
-        Returns True ONLY when a concrete default was applied LIVE to the
-        running session (kiro family with a resolvable workspace default).
-        Returns False — signalling the caller to reset the session so a cold
-        start re-resolves the true default — in the cases that cannot be reset
-        live:
-        - the config-option channel has no "reset to default" value (there is no
+        Returns True ONLY when the running session needs no reset to be at its
+        default: kiro with a resolvable workspace default (the default was pushed
+        live), or a harness that honours no effort at all (nothing was ever
+        applied, so it is already there). Returns False — signalling the caller to
+        reset the session so a cold start re-resolves the true default — in the
+        cases that cannot be reset live:
+        - a config-option adapter (claude-agent-acp and kin) has no "reset to
+          default" config value (there is no
           level to push; only a respawn drops the override), and
         - kiro with no workspace default (the model's built-in default is only
           re-applied on respawn once the overlay is cleared).
@@ -1195,6 +1394,15 @@ class AcpProvider(LLMProvider):
         model = self._client._model
         if not model_supports_effort(model):
             return False
+        if not self.supports_reasoning_effort:
+            # Nothing was ever applied on this harness, so there is nothing to
+            # clear and no live default to push; False routes the caller to a
+            # session reset it does not need, so say "already at default".
+            logger.info(
+                "clear_effort skipped — harness %r does not support reasoning effort",
+                self.harness_id,
+            )
+            return True
         self._effort_per_model.pop(model, None)
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             # No live "reset to default" — caller must reset the session. Scoped
@@ -1249,6 +1457,11 @@ class AcpProvider(LLMProvider):
         from the cli.json overlay at spawn, so this is a no-op there.
         """
         if self.is_acp_runtime_backend:
+            return
+        if not self.supports_reasoning_effort:
+            # A non-runtime harness that honours no effort has no live channel to
+            # push one; the level is dropped here rather than sent to a config
+            # option the harness never advertised.
             return
         level = self._resolve_effort()
         if not level:

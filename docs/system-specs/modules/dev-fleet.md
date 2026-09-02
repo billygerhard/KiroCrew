@@ -290,6 +290,25 @@ re-check `runtime.active_names` after the CLI returns and fail closed
 (`pod not active after start` / `pod still active after shutdown`) — a CLI exit 0
 is never taken as proof of the state change, in either direction.
 
+### Signing the pod's kiro-cli in (operator step)
+
+A pod runs with its own isolated `KIROCREW_HOME`, and its kiro-cli credential
+home is a subdirectory of it (`KIRO_HOME = <KIROCREW_HOME>/kiro`) — deliberately
+NOT the host's, so a pod never inherits or mutates the real credential store.
+That store starts empty, so a freshly-brought-up pod's kiro-cli is **signed
+out**: real chats and `spawn_run`s fail with `AcpAuthRequired` until an operator
+authenticates inside the pod. Run the login through the pod's own environment so
+it writes that isolated `KIRO_HOME`:
+
+```
+kirocrew pod exec <name> -- kiro-cli login
+```
+
+`kirocrew pod exec <name> -- <args…>` execs the given command with the pod's
+`KIROCREW_HOME` / `KIRO_HOME` in the environment, so the credentials land where
+the pod's sessions read them. Do this once after `kirocrew pod up <name>` (and
+again after the pod's HOME is reclaimed on worktree removal, which discards it).
+
 ### Pod HOME reclamation on worktree removal
 
 Removing a worktree reclaims the isolated `KIROCREW_HOME` of that worktree's pod

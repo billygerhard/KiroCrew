@@ -92,6 +92,7 @@ from kiro_crew.cron import (
     CronStoreUnreadable,
     build_cron_session_context,
     effective_wake_budget,
+    resolve_job_harness,
 )
 from kiro_crew.cron_script import run_command_sandboxed, run_script_sandboxed
 from kiro_crew.dashboard import cautious_boot, start_dashboard
@@ -381,6 +382,19 @@ def _digest_chunk_size() -> int:
 
 
 SUBAGENT_DIGEST_CHUNK_SIZE = _digest_chunk_size()
+
+
+def _info_harness(info: Any) -> str:
+    """The harness id recorded on a subagent run, or ``""`` when it has none.
+
+    Type-guarded like ``batch_id`` below and for the same reason: a completion
+    consumer is reached with duck-typed and mock ``info`` objects, and this value
+    lands in a completion-card meta dict that is serialized to the browser. ``""``
+    is the honest answer for a run with no recorded binding — the reporting
+    surfaces render "unknown", never the current default harness's name.
+    """
+    value = getattr(info, "harness", "")
+    return value if isinstance(value, str) else ""
 
 
 def _injection_slot_busy(slot: Any) -> bool:
@@ -4202,6 +4216,47 @@ class GatewayOrchestrator:
                 await _alert_cron_failure(job, gate_reason, denied=True)
                 return None
 
+            # ── Fire-time harness gate: message (LLM) jobs ──
+            # A job's harness override is judged now, not when it was written:
+            # see cron.resolve_job_harness for why the registry's answer is only
+            # meaningful at fire time. A refusal costs this RUN and nothing more
+            # — the job stays registered and unpaused, so installing the binary
+            # or signing into the harness heals the schedule with no operator
+            # action here. Off-loop because resolution reads configuration and
+            # stats an executable.
+            harness_id, harness_reason = await asyncio.to_thread(resolve_job_harness, job)
+            if harness_reason:
+                # Deliberately NOT record_failure(): a selection the machine
+                # cannot serve right now is an environment state, exactly like a
+                # governance denial or pool starvation, and counting it would
+                # auto-pause the job after _AUTO_PAUSE_THRESHOLD fires — leaving
+                # a repaired harness with a schedule that never runs again.
+                job.clear_carried_result()
+                job.last_status = "error"
+                job.last_error = redact(harness_reason)
+                # Retention-only marker: nothing was dispatched, so a one-shot
+                # must not be consumed by a run it never had. NOT
+                # fire_time_denied — that flag also parks an at-job disabled and
+                # would report this as a policy decision, which it is not.
+                job.run_never_started = True
+                try:
+                    sel().log_tool_invocation(
+                        session_key=f"cron:{job.id}",
+                        tool_name="cron_message_dispatch",
+                        tool_kind="cron_harness",
+                        outcome="refused",
+                    )
+                except Exception:
+                    logger.debug("SEL logging failed in cron harness refusal path", exc_info=True)
+                await _alert_cron_failure(job, harness_reason)
+                return None
+            if harness_id:
+                # Logged so a mixed-harness fleet can tell which backend a run was
+                # resolved onto. The session-creation calls below thread the job's
+                # OWN stored value, not this resolved id — see
+                # _acquire_with_model_fallback.
+                logger.info("Cron '%s': resolved harness %r", job.name, harness_id)
+
             def _cron_extra_env() -> dict[str, str] | None:
                 """job.env plus KIROCREW_APPROVAL_MODE when the job runs auto.
 
@@ -4235,8 +4290,22 @@ class GatewayOrchestrator:
             ) -> "tuple[LLMProvider, bool, bool, bool]":
                 """get_or_create honoring job.model; if that model is
                 unavailable, retry once with the registry default.
-                Returns (client, is_new, resumed, downgraded)."""
+                Returns (client, is_new, resumed, downgraded).
+
+                The harness passed is the job's OWN stored value, not the id
+                ``resolve_job_harness`` returned above: that id is the RESOLUTION,
+                which for an inherited job is the configured default, and handing it
+                over as an explicit selection would push every job that opted into
+                nothing onto the availability-probing explicit path — refusing an
+                ordinary run on a machine mid-kiro-install, where it has always been
+                the spawn that failed. Empty means inherit, which is what the job
+                said. Passing nothing at all is the failure this exists to close:
+                the fire-time gate would bless ``kas`` and the session would then be
+                served by the gateway's own default harness and reported as a
+                success.
+                """
                 assert self.sessions is not None
+                job_harness = job.harness.strip() if isinstance(job.harness, str) else ""
                 try:
                     client, is_new, resumed = await self.sessions.get_or_create(
                         key,
@@ -4244,6 +4313,7 @@ class GatewayOrchestrator:
                         channel_id=job.channel,
                         approval_policy=job.approval_mode,
                         model=job.model or None,
+                        harness=job_harness,
                         extra_env=_cron_extra_env(),
                     )
                     return client, is_new, resumed, False
@@ -4268,6 +4338,9 @@ class GatewayOrchestrator:
                         agent=agent_id,
                         channel_id=job.channel,
                         approval_policy=job.approval_mode,
+                        # The model is what is being retried; the harness is not, so
+                        # the retry must not quietly move the run to another one.
+                        harness=job_harness,
                         extra_env=_cron_extra_env(),
                     )
                     return client, is_new, resumed, True
@@ -6688,6 +6761,7 @@ class GatewayOrchestrator:
                 task=task_text,
                 requested_model=info.requested_model or info.model or "",
                 resolved_model=info.resolved_model or "",
+                harness=_info_harness(info),
             )
 
             parent_key = info.parent_session_key
@@ -7797,6 +7871,7 @@ class GatewayOrchestrator:
                                 task=task_preview,
                                 requested_model=info.requested_model or info.model or "",
                                 resolved_model=info.resolved_model or "",
+                                harness=_info_harness(info),
                             )
                         },
                     )

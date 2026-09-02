@@ -120,6 +120,19 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def harness_id(self) -> str:
+        """The ACP harness this provider's session actually runs on.
+
+        Declared on the ABC with a safe default so usage and model-identity
+        reporting reads a property rather than probing for one: a provider that
+        has no harness (or has not resolved one yet) answers ``""`` and the row is
+        recorded UNATTRIBUTED, which is the only honest fallback. Guessing the
+        default harness here would credit one harness's tokens to another on a
+        mixed-harness fleet, and the report exists precisely to tell them apart.
+        """
+        return ""
+
+    @property
     def child_fidelity_aware(self) -> bool:
         """Consumer opt-in for the low-fidelity CHILD permission downgrade.
 

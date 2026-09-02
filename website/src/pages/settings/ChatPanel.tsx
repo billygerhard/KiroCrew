@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup } from '../../components/settings'
 import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
+import { HarnessPanel } from './HarnessPanel'
 import { api } from '../../api/client'
 import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 import { useAvailableModels } from '../../hooks/useAvailableModels'
@@ -501,6 +502,12 @@ export function ChatPanel() {
           <button className="underline cursor-pointer bg-transparent border-none text-danger" onClick={() => mcQ.refetch()}>{i18nT('pages.settings.chatPanel.retry')}</button>
         </div>
       )}
+
+      {/* Which harness serves a session comes before which model it runs: the
+          model catalog is the harness's own. Rendered as its own component so the
+          registry listing, its two config keys, and their failure states stay out
+          of this panel's state. */}
+      <HarnessPanel />
 
       <SettingsSection title={i18nT('pages.settings.chatPanel.model')}>
         {/* Grouped by role so each block reads as "which model + how hard it

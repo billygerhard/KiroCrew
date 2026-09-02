@@ -659,7 +659,28 @@ def _managed_mcp_env() -> dict[str, str]:
     byte-for-byte what it is today (``_prune_empty`` drops an empty ``env``).
     """
     override = _valid_override_home()
-    return {"KIROCREW_HOME": str(override)} if override else {}
+    env = {"KIROCREW_HOME": str(override)} if override else {}
+    # Pin the gateway's own bound port alongside the home, for the same reason:
+    # a stdio MCP child resolves its callback port through the client chain
+    # (KIROCREW_PORT -> dashboard.url -> run-marker -> default), and on a
+    # gateway bound to a NON-default port with no port written in config —
+    # a pod is exactly this — every step short of the marker is empty. The
+    # marker step must PROVE the port's owner before trusting it, and a
+    # sandboxed host that cannot read another process's fd table fails that
+    # proof closed, so the chain falls through to the default port and every
+    # spawn callback dies with Connection refused. The gateway knows the port
+    # it bound; handing it to its own children is a statement of fact, not a
+    # guess. Prefers the post-bind truth (KIROCREW_BOUND_PORT, set by serve once
+    # the TCP bind lands) over the launch instruction (KIROCREW_PORT, how a pod
+    # starts its gateway), because a spec can be written before the bind.
+    # Empty when the gateway carries neither (default-port install).
+    bound = (
+        os.environ.get("KIROCREW_BOUND_PORT", "").strip()
+        or os.environ.get("KIROCREW_PORT", "").strip()
+    )
+    if bound.isdigit():
+        env["KIROCREW_PORT"] = bound
+    return env
 
 
 # Declaration discriminator kiro-cli reads for enterprise MCP governance. It is

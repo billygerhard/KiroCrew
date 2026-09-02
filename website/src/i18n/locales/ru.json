@@ -5617,6 +5617,8 @@
       "earlier_messages_open_session": "Более ранние сообщения — открыть полную сессию (закроет разделённый вид)",
       "earlier_messages_unavailable": "Более ранние сообщения больше недоступны в истории этой сессии.",
       "forked_from": "Ответвлено от {{name}}",
+      "harness_serving": "ИИ-обвязка, обслуживающая этот чат",
+      "harness_serving_pinned": "ИИ-обвязка, обслуживающая этот чат — задаётся при создании чата",
       "model_list": "Список моделей",
       "session_ready_type_a_message_to_start": "Сессия готова. Введите сообщение, чтобы начать.",
       "split_down": "Разделить вниз",
@@ -6172,6 +6174,19 @@
       "provider_gitlab": "GitLab",
       "jira_no_credentials": "No Jira credentials configured for this host. Add a jira_auth entry to config.json and set JIRA_API_TOKEN (or JIRA_TOKEN_<hex-host> for multi-host) in your .env file."
     },
+    "harnessSelector": {
+      "cannot_start_on_name_reason": "Этот чат нельзя запустить на {{name}}: {{reason}}",
+      "default": "По умолчанию",
+      "default_harness": "Harness по умолчанию",
+      "harness_list": "Список harness",
+      "harness_list_unavailable": "Список harness недоступен — повторная попытка",
+      "harness_name": "Harness: {{name}}",
+      "invalid_reason": "Недопустимый дескриптор — {{reason}}",
+      "no_harnesses_registered": "Нет зарегистрированных harness",
+      "not_registered": "не зарегистрирован",
+      "not_serviceable": "пока не поддерживается этой сборкой",
+      "unavailable_reason": "Недоступно — {{reason}}"
+    },
     "jobForm": {
       "a_short_label_for_this_job": "Короткое название для этого задания",
       "add": "Добавить",
@@ -6191,6 +6206,10 @@
       "every_interval": "Каждый интервал",
       "failed_to_save": "Не удалось сохранить",
       "fire_exactly_on_schedule_with_no_jitter_by_defau": "Запускать строго по расписанию, без разброса. По умолчанию задания распределяются случайным образом, чтобы снизить пики нагрузки.",
+      "harness": "Обвязка",
+      "harness_inherit": "Обвязка: наследовать",
+      "harness_not_serviceable": "{{name}} — пока не поддерживается этой сборкой",
+      "harness_unavailable": "{{name}} — недоступна ({{reason}})",
       "hide_in_chat": "Скрывать в чате",
       "hours": "часов",
       "how_often_this_job_runs": "Как часто выполняется это задание",
@@ -6221,6 +6240,7 @@
       "the_prompt_or_task_sent_to_the_agent_when_this_j": "Промпт или задача, отправляемые агенту при срабатывании задания",
       "timezone": "Часовой пояс",
       "weekly_schedule": "Недельное расписание",
+      "which_acp_harness_runs_this_job_leave_on_inherit": "Какая обвязка ACP выполняет эту задачу. Оставьте «наследовать», чтобы использовать значение по умолчанию.",
       "which_agent_handles_this_job_leave_default_for_t": "Какой агент выполняет это задание. Оставьте «По умолчанию» для основного агента."
     },
     "jobLogsView": {
@@ -9638,6 +9658,7 @@
       "retry": "Повторить",
       "roll_the_folder_list_up": "Свернуть список папок",
       "running_queued": "{{started}} в работе · {{queued}} в очереди",
+      "running_on_harness": "Работает на {{name}}",
       "running_session_few": "{{count}} активные сессии",
       "running_session_many": "{{count}} активных сессий",
       "running_session_one": "{{count}} активную сессию",
@@ -10078,25 +10099,6 @@
       "pod_homes_left_on_disk_with_no_live_pod": "Домашние каталоги подов на диске без активного пода"
     },
     "developer": {
-      "agentBackendTab": {
-        "agent_backend": "Бэкенд агента",
-        "claude_code": "Claude Code",
-        "claude_uses_its_own_permissions": "Claude Code обычно запрашивает разрешение перед действием, и {{productName}} проверяет этот запрос. Но инструмент, заранее одобренный в собственных настройках Claude — включая .claude/settings.json внутри проекта — не запрашивает ничего, поэтому правила запрета и журнал аудита не видят такой вызов.",
-        "could_not_load_the_agent_backend": "Не удалось загрузить бэкенд агента.",
-        "could_not_save_the_agent_backend": "Не удалось сохранить бэкенд агента.",
-        "default_all_features_supported": "По умолчанию. Все функции поддерживаются.",
-        "experimental": "Экспериментальный",
-        "install_check_failed": "Не удалось проверить, установлено ли это на данной машине.",
-        "installed_restart_required": "Установлено на этой машине, но перед использованием этот gateway нужно перезапустить.",
-        "kas_kiro_agent": "KAS (kiro-agent)",
-        "kiro_cli": "Kiro CLI",
-        "loading_configuration": "Загрузка конфигурации…",
-        "missing_components": "Отсутствует на этой машине: {{components}}",
-        "missing_components_with_command": "Отсутствует на этой машине: {{components}}. Установите: {{command}}",
-        "new_sessions_use_this_agent_a_session_that_is_al": "Новые сессии используют этого агента. Уже открытая сессия сохраняет того, с которым была начата, — переключение здесь не меняет её посреди сессии.",
-        "retry": "Повторить",
-        "set_is_fixed_at_gateway_start": "Какие агенты здесь появляются, определяется при запуске gateway. Управляемое развёртывание может ограничить набор политикой; изменения политики вступают в силу при следующем запуске."
-      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "Чат на Crew",
         "chat_on_a_crew_desc": "Добавляет «New chat on crew» в меню создания: запускает сессию, которая выполняется на подключённом Crew. Не завершено: она открывается в собственной панели этого Crew, а сессии, выполняемые на Crew, здесь пока не отображаются.",
@@ -10110,10 +10112,6 @@
     "developerPage": {
       "developer": "Разработчик",
       "tabs": {
-        "agentBackend": {
-          "description": "Какого агента запускают новые сессии — Kiro CLI, Claude Code или KAS",
-          "label": "Бэкенд агента"
-        },
         "archive": {
           "description": "Ротированная и сжатая история сессий (хранение 7 дней)",
           "label": "Архив"
@@ -12501,6 +12499,47 @@
         "zoom_font": "Масштаб и шрифт",
         "zoom_level": "Уровень масштаба",
         "font_family_option_opendyslexic": "OpenDyslexic"
+      },
+      "harnessPanel": {
+        "ai_backend": "ИИ-бэкенд",
+        "badge_available": "Доступна",
+        "badge_bundled": "Встроенная",
+        "badge_invalid": "Некорректная",
+        "badge_missing": "Отсутствует",
+        "badge_not_serviceable": "Не поддерживается",
+        "badge_operator": "Оператора",
+        "badge_restart_required": "Требуется перезапуск",
+        "badge_unavailable": "Недоступна",
+        "default_harness": "Обвязка по умолчанию",
+        "default_harness_unset": "Не задано",
+        "failed_to_load_config": "Не удалось загрузить текущие настройки.",
+        "failed_to_load_harnesses": "Не удалось загрузить список обвязок.",
+        "failed_to_save": "Не удалось сохранить",
+        "harness_list_unavailable": "Список обвязок не загрузился, поэтому доступность не показана.",
+        "harness_not_serviceable": "{{name}} — не поддерживается этой сборкой",
+        "harness_unavailable": "{{name}} — недоступна ({{reason}})",
+        "harnesses_are_defined_in_config_and_authenticate": "Обвязки описываются в config.json и проходят аутентификацию сами — {{productName}} не хранит учётные данные поставщиков.",
+        "install_check_failed": "Не удалось проверить, установлено ли это на этой машине.",
+        "installed_restart_required": "Установлено на этой машине, но перед использованием этот шлюз необходимо перезапустить.",
+        "legacy_backend": "Старый бэкенд ACP",
+        "legacy_backend_kas": "KAS (kiro-agent)",
+        "legacy_backend_kiro": "Kiro CLI (по умолчанию)",
+        "legacy_backend_outranked": "Игнорируется, когда задана обвязка по умолчанию.",
+        "legacy_backend_stored": "{{value}} (сохранено, выбрать нельзя)",
+        "missing_components": "Отсутствует на этой машине: {{components}}",
+        "missing_components_with_command": "Отсутствует на этой машине: {{components}}. Установите с помощью: {{command}}",
+        "no_harnesses_registered": "Обвязки не зарегистрированы.",
+        "not_serviceable_note": "Эта сборка не может запустить сеанс на этой обвязке.",
+        "operator_entry_conflicts": "Ваша запись обвязки с этим id отклонена: {{reason}}",
+        "registered_harnesses": "Зарегистрированные обвязки",
+        "resolves_to": "Новые сеансы запускаются на {{name}}.",
+        "resolves_to_not_serviceable": "Новые сеансы разрешаются в {{name}}, но эта сборка не может запустить на ней сеанс.",
+        "resolves_to_unavailable": "Новые сеансы разрешаются в {{name}}, которая не может работать: {{reason}}",
+        "retry": "Повторить",
+        "retry_config": "Загрузить настройки снова",
+        "retry_harness_list": "Загрузить список обвязок снова",
+        "the_older_key_read_as_an_alias_of_a_harness": "Старый ключ бэкенда, читаемый как псевдоним зарегистрированной обвязки.",
+        "which_harness_new_sessions_start_on": "На какой обвязке запускаются новые сеансы. Запущенный сеанс остаётся на той обвязке, с которой начался."
       },
       "importPanel": {
         "agent_data": "Данные агента",

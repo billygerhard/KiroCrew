@@ -1,8 +1,16 @@
 ## LLM Provider Abstraction
 
-KiroCrew drives a single LLM backend: `kiro-cli` over ACP. The `LLMProvider`
-interface is retained as a thin seam (consumers depend only on the ABC), but
-there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
+Kiro Crew drives every LLM through one transport — ACP over stdio — and
+`agent.provider` is fixed to `acp` with exactly one concrete provider,
+`AcpProvider`. What varies is the **harness** on the other end of that
+transport: the executable `AcpProvider` speaks ACP to. Harnesses are described
+as data in the **harness registry**, so adding or selecting one is a descriptor,
+not a code change.
+
+`kiro-cli` is the first-class harness and the default; the others are adapted to
+the seams it already runs through (harness-parity H1). See
+[`harness-parity.md`](harness-parity.md) for the invariants that governs, and
+the § Harness registry section below for the descriptor model.
 
 ### Architecture
 
@@ -20,17 +28,34 @@ there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
             ┌──────┴──────┐
             │ AcpProvider │
             │ acp.py      │
-            │ kiro-cli    │
-            └─────────────┘
+            └──────┬──────┘
+                   │  argv, capabilities, MCP delivery
+                   │  read from the bound descriptor
+         ┌─────────┴──────────┐
+         │  Harness registry   │
+         │  acp/harness_*.py   │
+         └─────────┬──────────┘
+                   │
+   ┌───────┬───────┴────┬─────────┬──────────────┐
+   │ kiro  │    KAS     │  Codex  │  operator-   │
+   │ -cli  │  (relay)   │         │  registered  │
+   └───────┴────────────┴─────────┴──────────────┘
 ```
 
 **Note:** the removed Bedrock provider and the removed standalone provider were
-**deleted** during de-Amazoning, along with their config fields and the
-multi-provider dispatch factory. `acp/client.py` keeps a dormant
-`ACP_BACKEND_CLAUDE` seam (`AcpProvider` can in principle drive
-`claude-agent-acp`) so an internal companion can re-register a Claude backend,
-but the public provider factory never selects it — `kiro-cli` is the only
-backend.
+**deleted** during de-Amazoning, along with their config fields. The
+multi-provider dispatch factory was deleted with them and has NOT come back: a
+harness is selected at `agent.acp_backend` / `agent.default_harness`, never as a
+second `agent.provider` value. `AcpProvider` serves **every** registered
+harness — bundled or operator-registered — that speaks public ACP over stdio;
+which one is decided by the session's `HarnessBinding`, authoritative from
+construction (see [harness-authoring.md](harness-authoring.md) for the descriptor
+model). `acp/client.py` keeps a dormant `ACP_BACKEND_CLAUDE` seam so the internal
+companion can override the Claude row specifically; the **bundled** Claude Code
+row is registered as nameable but not serviceable in this build (public-build
+posture), and every selection surface marks it so. That row is the ONLY
+unserviceable bundled harness — an operator descriptor naming `claude-agent-acp`
+is itself legal and serves.
 See [`../features/claude-code-provider.md`](../features/claude-code-provider.md).
 
 ### LLMProvider ABC (`providers/base.py`)
@@ -76,6 +101,144 @@ Provider-agnostic event dataclass (aliased from `AcpEvent`):
 The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
 and speaks JSON-RPC 2.0 over stdio.
 
+**Harness binding.** A session's harness is resolved ONCE, at creation, by
+`acp.harness_selection.resolve_session_harness` and then carried for the
+session's whole life:
+
+- Precedence for the DEFAULT: `agent.default_harness`, else the legacy
+  `agent.acp_backend` read through the registry's alias table. The legacy key is
+  read RAW (`AgentConfig.acp_backend_alias`, stashed before schema validation)
+  because the field itself is clamped to a SELECTABLE backend — a stored `codex`
+  reads back as kiro-cli, and resolving from the clamped field would start the
+  session on a harness the operator did not name without saying so.
+  `default_harness_id(cfg)` answers from ONE config object: the precedence gate
+  and the returned id come from the same `cfg`, never from an independent registry
+  load, because two reads of the same two keys a moment apart can name different
+  harnesses — which is how the default `/api/harnesses` advertises and the harness
+  an unselected session binds come to disagree. An `agent.default_harness` the
+  registry cannot serve is ignored with a logged reason and degrades to kiro-cli
+  (not to the legacy key, which it outranks).
+- An EXPLICIT selection is validated and refused: `UnknownHarness` /
+  `HarnessUnavailable` from the registry, or `HarnessNotServiceable` for a
+  harness in the registry's `_UNSERVICEABLE` map (the bundled Claude Code row,
+  held back by the public-build posture). A harness with no legacy `acp_backend`
+  spelling — Codex, every operator descriptor — is NOT refused: it binds with
+  `acp_backend = descriptor.id` and serves through `GenericAdapter`, and its
+  behavior gates read its own descriptor capabilities fail-closed rather than
+  kiro's. Nothing falls back.
+- An explicit selection that DISAGREES with the session's binding raises
+  `HarnessBindingConflict` naming both harnesses, before any process exists. A
+  selection outranks the default but not where the conversation IS: `resume_sid`
+  names a transcript inside the recorded harness's store, so honouring the
+  selection would `session/load` an id the other harness has never seen — loading
+  nothing and starting a fresh conversation under an id the map still trusts. A
+  recording of `""` is every pre-binding session and is not a disagreement; an
+  AGREEING selection resumes normally, which is what the surfaces that re-send a
+  stored id on every run (cron, task runner) do. The refusal is on BOTH arms: the
+  cold-start path compares against the recorded binding, and the live-session fast
+  path compares against `_Session.harness_id`, because a key with a live session
+  returns before the cold-start check ever runs. Without the second one, editing a
+  stored selection while its session sits inside the idle timeout (a cron job's
+  harness changed between runs) has the fire-time gate bless the new id while the
+  old process serves the work and the run reports success.
+- An EMPTY selection performs no availability probe, which is what keeps the
+  default path identical to the pre-binding one: a kiro-cli resolution failure
+  still surfaces from the spawn, with the message it always had.
+- `SessionManager.get_or_create(harness=…)` records the id on `_Session.harness_id`
+  and beside the sid in the session map, and passes `harness_id` + `acp_backend`
+  to the provider factory as a pair. A resume reads the session's OWN recorded
+  binding rather than the current default (the native sid names a transcript
+  inside one harness's store), and a recorded spawn failure does not gate that
+  resume — only a fresh pick. `harness_prebound=True` says the caller resolved and
+  validated this very selection a moment ago (the spawn path, which must refuse
+  before it dispatches): availability is still checked, because the machine can
+  change between the two answers, but the recorded-failure question is not re-asked
+  — the second resolution asks what the gate asked instead of refusing work the
+  gate just admitted.
+- Warm-pool processes are spawned unbound, so they run the ALIASED harness
+  (`pooled_harness_id`). A session bound elsewhere records `bypass_harness` and
+  cold-starts rather than claiming one.
+- `AcpProvider.harness_id` (declared on the `LLMProvider` ABC with an empty
+  default) is what usage and model-identity reporting attributes a turn to; `""`
+  is recorded as UNATTRIBUTED, never folded onto the default harness. An UNBOUND
+  provider or runtime identifies itself from its `acp_backend` spelling through
+  `acp.types.harness_for_backend` — the reverse of `legacy_backend_for` — and NOT
+  through `resolve_alias`, which answers what a stored config key SELECTS and
+  degrades a known-but-unselectable harness to kiro-cli: read as an identity that
+  would credit a claude-seam session's usage to kiro-cli and send its signed-out
+  user to `kiro-cli login`. The alias table stays the fallback for a spelling with
+  no bundled row.
+
+**Harness APIs.** `GET /api/harnesses` returns every registered harness
+(`id`, `display_name`, `available`, `reason`, `bundled`, `serviceable`), invalid
+operator descriptors separately under `invalid`, the resolved `default`, the raw
+stored `legacy_backend`, and `legacy_backends` — the writable legacy vocabulary,
+served from `ACP_BACKENDS_SELECTABLE` so Settings derives the alias input's options
+instead of restating the set in TypeScript. `serviceable` is a SECOND gate beside
+`available`, deliberately not folded into it: availability describes the machine and
+heals when the operator installs the binary, serviceability describes this build
+(`unserviceable_reason` reads the registry's `_UNSERVICEABLE` map — the bundled
+Claude Code row, held back by the public-build posture) and heals only in a later
+one. It carries no reason on the wire because the verdict is
+identical for every such row, so the copy is a catalog string on the surface.
+`GET /api/models?harness=<id>` serves that harness's catalog per its
+`model_source`: `static` reads the descriptor's list, `acp_advertised` on a
+non-kiro harness reads what a LIVE session on THAT harness advertised (`[]` when
+none has started), and kiro-cli keeps the `--list-models` path unchanged. An
+unknown harness answers 404 — retrying cannot make it exist.
+
+**Chat composer.** A dashboard chat carries its harness on the slot
+(`_ChatSlot.harness`, `""` = inherit the default), set at BIRTH by
+`POST /api/chat/slots`'s `harness` field and never patched afterwards — there is
+deliberately no switch endpoint, because the session binds the harness for its
+whole life. The welcome screen's picker therefore RECREATES the slot on a pick,
+the same create-then-delete shape the memory-mode and clean toggles beside it
+use. `_run_chat` and the eager-spawn path both pass `slot.harness` to
+`sessions.get_or_create`, so an eager session and the first real turn cannot
+disagree about which harness serves the conversation.
+
+The create handler resolves an explicit selection through
+`resolve_session_harness` (`_resolve_create_harness`) so the composer's verdict
+cannot drift from what session creation decides a moment later: unknown → 400
+`unknown_harness`, unavailable → 409 `harness_unavailable`, unserviceable → 409
+`harness_not_serviceable`, and a named create addressing an already-bound slot →
+409 `harness_binding_conflict`. Each names the harness and none substitutes
+another. An ABSENT selection is not resolved at all, which keeps the no-selection
+path identical to the pre-harness one (a signed-out kiro-cli still fails from the
+spawn). The stored id is persisted in the history metadata line and shape-checked
+on restore (`_restore_slot_harness`), so a tampered value reads as "inherit"
+rather than reaching every connected dashboard.
+
+Frontend rules the composer holds to: the listing feeds one `['harnesses']` cache
+entry through `useHarnesses`, whose rows EMPTY on `query.isError` because
+`available` is the field that goes stale; unavailable rows stay visible, marked,
+and unselectable with their reason, and so do unserviceable ones
+(`harnessSelectable` reads both gates, since a row this build cannot serve looks
+identical to a working one until the click); and the model picker reads
+`useAvailableModels({ harness })`, whose per-harness query key (and per-harness
+`isError` collapse to Auto-only) is what stops one harness's catalog from ever
+rendering as another's. An empty harness — or an explicit pick of the kiro id,
+which names the same catalog — keeps the historical key and fetcher, so the six
+existing pickers still share one `--list-models` spawn and keep the provider
+adapter's richer rows (credit multiplier, window seeding, degraded marking).
+
+A harness pick DROPS the slot's model unless the picked harness is the one the slot
+already runs on (compared against the resolved default, so re-naming an inherited
+harness is not a change). A model id belongs to one harness's catalog, the create
+stores it verbatim, and nothing validates a model against a harness — so carrying
+it across a change binds the new session to a model the picked harness never
+advertised and fails at the first turn.
+
+The Settings panel (`HarnessPanel`) renders the same two gates in its inventory and
+gates the resolved-default HINT on `regQ.isError` as well: that hint lives in a
+`title` attribute and a click-opened popup, so a retained availability verdict there
+would read as current with nothing on the panel contradicting it. Its default picker
+is disabled until BOTH queries succeed (a pending listing offers only the stored
+value, which is not a vocabulary to write from), a failed config GET is stated
+rather than rendered as "Not set", and a refused write shows the gateway's prose —
+which carries the registered ids — behind a translated prefix, keyed off the
+`unknown_harness` code the PATCH refusal now carries.
+
 **Dormant backend seam:** `AcpProvider`/`AcpClient` retain an `acp_backend`
 parameter (`"" ` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` → `claude-agent-acp`)
 so an internal companion can re-register a Claude backend over the same
@@ -114,13 +277,120 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 {
   "agent": {
     "provider": "acp",
-    "model": "auto"
+    "model": "auto",
+    "default_harness": "",
+    "acp_backend": "",
+    "harnesses": {}
   }
 }
 ```
 
-- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to
+  choose. A harness is NOT a provider — see § Harness registry.
+- `agent.default_harness` is the harness a session starts on when nobody picks
+  one. Empty defers to the `agent.acp_backend` alias, and it outranks that key
+  when both are set.
+- `agent.acp_backend` is retained as an alias input (`""` → kiro-cli, `"kas"` →
+  KAS), so an install that has always named its backend there keeps working.
+- `agent.harnesses` holds operator descriptors. It is in the config write-guard:
+  a descriptor names a binary Kiro Crew spawns, so an agent-invoked tool must not
+  be able to create or modify one.
+- `create_provider_factory()` returns a `Callable` that creates an `AcpProvider`
+  bound to the session's resolved harness.
+
+### Harness registry
+
+`acp/harness_descriptor.py` (the record + validation), `acp/harness_registry.py`
+(loading, bundled descriptors, availability), `acp/harness_adapters.py` (the few
+steps that cannot be data).
+
+A **descriptor** says what a harness IS: id, display name, executable resolution,
+argv template (`{executable}`, `{agent}`, `{model}`, `{workdir}` — a closed
+vocabulary), a capability set, a model source, and an MCP-delivery mode. Argv is
+rendered as a token list, never through a shell. An optional convention block
+whose value is empty is omitted rather than defaulted, so a harness with no
+`--model` flag does not inherit kiro-cli's.
+
+An **adapter** carries only what data cannot express, and only bundled
+descriptors may name one — an operator descriptor is data and gets the base
+adapter, whose every method is the generic rule. Four properties hold across the
+module: the attested executable is the one that execs (`resolve_spawn_executable`
+attests, `checked_spawn_argv` refuses any other `argv[0]`), attestation is
+uniform for bundled and operator harnesses alike, adapters do blocking work and
+are called from a worker thread, and nothing there imports the registry.
+
+Bundled harnesses:
+
+| Harness | Executable | Notes |
+|---|---|---|
+| kiro-cli (default) | `kiro-cli` | First-class. File-fed MCP: it reads its servers from its own agent spec. |
+| KAS | `kiro-cli` | Reached through kiro-cli's own ACP relay (`acp --agent-engine v3 --auth-method cli`), so it resolves the same binary. Wire-fed MCP. |
+| Codex | `codex` | Data-only; no bundled adapter — resolves to `GenericAdapter` and serves when `codex` is on `PATH`. Exactly the shape an operator descriptor takes. |
+| Claude Code | `claude-agent-acp` | The dormant seam. Nameable, not serviceable in this build (the one unserviceable bundled row). |
+| operator-registered | (descriptor) | Any public-ACP-over-stdio harness added under `agent.harnesses`; gets `GenericAdapter`. See [harness-authoring.md](harness-authoring.md). |
+
+**Capabilities are opt-in membership, never the absence of another harness.**
+Each capability is a flag on the harness's descriptor (`CapabilitySet`), and
+every consumer reads that flag off the session's **bound descriptor** at its own
+call site, **fail-closed** — an undeclared flag reads `false`. The five
+behavior-gate `ACP_BACKENDS_*` views that once collected the backends claiming
+each capability are **retired** (wave-2): reaching a harness by its legacy
+`acp_backend` spelling instead of its descriptor is the silent-capture shape
+harness-parity exists to prevent, so a set-of-backends view is no longer
+something a consumer holds. `internal_sandbox` is the one that fails OPEN — it
+makes `sandbox.wrap_argv` skip Crew's seatbelt in favour of the harness's own —
+so it is granted only where an internal sandbox has been demonstrated to exist;
+an operator descriptor that declares nothing gets Crew's wrap. The
+`acp_backend` **vocabulary** sets `ACP_BACKENDS_KNOWN` (the construction gate)
+and `ACP_BACKENDS_SELECTABLE` (what an operator may persist) are NOT views and
+survive; the added-line harness-parity gate rejects a new `ACP_BACKENDS_` name or
+a direct `acp_backend ==` / `== ACP_BACKEND_` comparison in the gated modules.
+
+**Availability is lazy and non-blocking.** Descriptors register without probing
+executables; only kiro-cli readiness gates bootstrap. A listing evaluates
+availability per row, so installing a binary heals the listing on the next
+listing with no gateway restart, and one unavailable harness never hides the
+others or takes down the gateway. Invalid operator descriptors are served
+separately by `registry.invalid()` with their reasons — never as `list()` rows.
+
+**Refusal over fallback, everywhere.** An unknown, unavailable, or unserviceable
+selection fails that session or that spawn with a reason naming the harness. No
+path substitutes a different harness, and no capability decision compares harness
+ids.
+
+#### Known shapes
+
+Two limitations are recorded here rather than fixed, because both are cases where
+the fix belongs to a change that has a second harness to test it against.
+
+**Effort delivery is channel-dispatched by identity, behind the capability
+gate.** `reasoning_effort` says a harness honours an effort level at all;
+`acp_runtime_pool` says it takes that level from the workspace `cli.json` overlay
+at spawn. Which CHANNEL a harness that honours effort uses is still decided by
+identity — `is_claude_backend` selects a live `session/set_config_option`, and
+everything else falls through to kiro's `/effort` command and overlay. The
+capability gate runs first, so a harness declaring no effort support reaches
+neither channel and this is not a regression. But a future non-runtime harness
+that DOES declare `reasoning_effort` would inherit kiro's `/effort` channel by
+falling through the `else`, which is the shape harness-parity exists to prevent.
+The fix is a channel field on the descriptor, deferred until there is a harness
+whose channel differs to name in it.
+
+**A role-pinned effort dropped for lack of harness support is logged, not
+reported.** An EXPLICIT per-spawn `reasoning_effort` that reaches a harness
+without the capability is dropped and reported on the spawn result
+(`effort_dropped`). A level that comes instead from `agent.role_efforts` is
+dropped at the provider's overlay gate and logged at DEBUG, with no spawn-result
+report. Deliberate, and consistent with the same decision on the MODEL axis: the
+caller who passed no effort did not ask about effort, so the spawn result is not
+their answer channel, and the operator who set the pin reads the gateway log.
+Reporting it would mean resolving the role pin at spawn-accept time purely for
+the report — duplicating a resolution the provider factory owns, which is the
+drift `effort_drop_reason` avoids by calling the factory's own resolver. DEBUG
+rather than the model axis's WARNING because this site re-runs on every respawn
+of a steady-state configuration, whereas the model-axis gate fires once per
+factory build; the interactive path (`change_effort`) reports the same refusal at
+INFO, once.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong
@@ -173,25 +443,34 @@ on `PATH`, and run `kiro-cli login`. `kirocrew doctor` reports its status.
 
 ## AcpProvider: shared-runtime startup
 
-`AcpProvider.start()` branches on the backend. Every shared-runtime branch below
-enters the same `AcpRuntime.spawn()` cold-start coordinator (default 2 concurrent
-spawn+initialize handshakes per gateway loop); admission is backend-neutral, so an
-adapted runtime harness neither bypasses the bound nor changes the Kiro path.
+`AcpProvider.start()` resolves the harness from the session's `HarnessBinding`
+(authoritative from construction) and enters the same `AcpRuntime.spawn()`
+cold-start coordinator (default 2 concurrent spawn+initialize handshakes per
+gateway loop); admission is backend-neutral, so an adapted or operator harness
+neither bypasses the bound nor changes the Kiro path. `AcpRuntime` renders the
+spawn argv from the bound descriptor through the adapter (`KiroAdapter` for
+kiro-cli, `GenericAdapter` for Codex and every operator descriptor), and the
+rendered argv crosses the **same attestation seam** for every harness —
+`checked_spawn_argv` refuses any `argv[0]` that is not the attested executable.
+The wire differences (protocol version, permission-option spelling) come from the
+descriptor's adapter as a `ProtocolProfile`, not from a backend-string branch.
 
-- **kiro (`is_claude_backend` False)** → `_start_kiro_runtime()`. This spawns an
-  `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
-  overlay/socket), resumes via `runtime.load_session()` when a prior transcript
-  exists or otherwise `runtime.create_session()`, applies the configured model,
-  and replaces `self._client` with an `AcpSessionProvider` (which implements the
-  same interface as `AcpClient`, so downstream callers are unchanged). Any
-  failure after `spawn()` kills the runtime so a half-initialised session never
-  leaks an orphaned `kiro-cli`.
-- **Alternate ACP backend (`is_claude_backend` True)** → legacy `AcpClient.ensure_ready()`.
+- **kiro** → `_start_kiro_runtime()`. This spawns an `AcpRuntime` (carrying the
+  provider's sandbox mode, extra env, and MCP-gateway overlay/socket), resumes
+  via `runtime.load_session()` when a prior transcript exists or otherwise
+  `runtime.create_session()`, applies the configured model, and replaces
+  `self._client` with an `AcpSessionProvider` (which implements the same
+  interface as `AcpClient`, so downstream callers are unchanged). Any failure
+  after `spawn()` kills the runtime so a half-initialised session never leaks an
+  orphaned process.
+- **The dormant Claude seam** → legacy `AcpClient.ensure_ready()`, kept only for
+  the internal companion's override; unreachable through the public factory.
 
-`AcpProvider.is_session_sharing_eligible` is membership in
-`ACP_BACKENDS_SESSION_SHARING` (harness-parity H6), not `not is_claude_backend`:
-a capability granted by the absence of one backend is inherited by every backend
-added later. It is what `SessionManager.is_session_sharing_eligible()` consults
-to decide whether a parent session can host multiplexed subagent sessions. The
-invariants governing what an added harness may and may not change are in
+`AcpProvider.is_session_sharing_eligible` reads the `session_sharing` capability
+off the session's bound descriptor (fail-closed), not `not is_claude_backend`:
+a capability granted by the absence of one backend would be inherited by every
+harness added later. It is what `SessionManager.is_session_sharing_eligible()`
+consults to decide whether a parent session can host multiplexed subagent
+sessions. The invariants governing what an added harness may and may not change
+are in
 [harness-parity.md](harness-parity.md).

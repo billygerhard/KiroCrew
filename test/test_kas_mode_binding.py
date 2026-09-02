@@ -104,11 +104,11 @@ def mode_stub(tmp_path, monkeypatch):
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
 
-    async def fake_bin(*, environ=None, home=None) -> str:
+    def fake_bin(*_a, **_k) -> str:
         return str(launcher)
 
     monkeypatch.setattr(
-        "kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin
+        "kiro_crew.kiro_cli.resolve_kiro_cli", fake_bin
     )
     monkeypatch.setenv("KAS_STUB_RECORD", str(record))
     return record

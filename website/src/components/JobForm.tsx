@@ -5,7 +5,8 @@ import { Input, SendBtn } from './ui'
 import { SettingsToggle } from './settings'
 import AgentSelector, { type KiroCrewAgent } from './AgentSelector'
 import SimpleSelect from './SimpleSelect'
-import type { CronJob } from '../types'
+import { useHarnesses } from '../hooks/useHarnesses'
+import type { CronJob, HarnessListing } from '../types'
 import type { CronPrefill } from '../utils/schedulePresets'
 import { SaveCreateLabel, expandDow } from '../utils/cronUtils'
 
@@ -35,7 +36,7 @@ export function jobKindOf(job?: CronJob): JobKind {
 
 /** Parse a CronJob into initial form state */
 function parseJobDefaults(job?: CronJob) {
-  if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
+  if (!job) return { name: '', message: '', agent: '', model: '', harness: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
   const isInterval = !!(job.every_secs || (job.schedule || '').match(/^every\s+\d+/))
   const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([sh])/); if (!m) return 3600; return m[2] === 'h' ? parseInt(m[1]) * 3600 : parseInt(m[1]) })()
   const intUnit = secs >= 86400 ? 'days' as const : secs >= 3600 ? 'hours' as const : 'minutes' as const
@@ -52,7 +53,7 @@ function parseJobDefaults(job?: CronJob) {
     weekDays = expandDow(cronParts[4]).map(d => CRON_DOW_TO_GRID[d] || 1)
     weekTime = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`
   }
-  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
+  return { name: job.name, message: job.message, agent: job.agent || '', model: job.model || '', harness: job.harness || '', channel: job.channel || '', approvalMode: job.approval_mode || '', silent: job.silent || false, strictSchedule: job.strict_schedule || false, hideInChat: job.hide_in_chat || false, jobKind: jobKindOf(job), schedMode, intVal, intUnit, weekDays, weekTime, cronExpr: cronRaw }
 }
 
 /** Build the API body from form state. Returns null if validation fails (sets error). */
@@ -77,6 +78,9 @@ function buildBody(
     // Edit mode always sends model so clearing an override ("" = inherit)
     // persists; create mode omits it when empty like other optional fields.
     if (isEdit || f.model) body.model = f.model
+    // Same edit-mode rule as the model above: clearing a harness override back
+    // to "inherit" is only expressible by SENDING the empty value.
+    if (isEdit || f.harness) body.harness = f.harness
     if (f.approvalMode) body.approval_mode = f.approvalMode
   }
   if (f.channel) body.channel = f.channel
@@ -104,6 +108,51 @@ function buildBody(
  *  current spelling is `model_name`, `name` is the legacy one, and a row that
  *  carries neither is unusable. */
 type ModelRow = { model_name?: string; name?: string; display_name?: string }
+
+/** Harness-override rows as the two parallel arrays `SimpleSelect` takes, plus
+ *  the ids it must render without offering.
+ *
+ *  Unavailable harnesses stay in the list, carry their reason in the label, and
+ *  stay SELECTABLE: a job's harness is validated when it FIRES, so scheduling one
+ *  for a harness that is not installed yet is a legitimate thing to do, and
+ *  hiding the row would make it unexpressible from this form.
+ *
+ *  Unserviceable ones are the opposite case and get the composer's treatment
+ *  instead — marked, explained, and not selectable. "Not installed yet" is a
+ *  state that changes; "this build cannot key a provider on it" is not, so a job
+ *  stored against one could never fire successfully however long it waits. The
+ *  row is still rendered rather than dropped, because a missing row would leave
+ *  the operator unable to tell "not offered" from "does not exist".
+ *
+ *  `isError` collapses the list to nothing. Availability is the whole content of
+ *  a listing and it is exactly the part that goes stale, so a fetch that did not
+ *  answer must not leave a harness rendered as pickable on an older answer.
+ *
+ *  `current` — a value the job already stores — is prepended when the listing
+ *  does not contain it, so an existing override never silently disappears from
+ *  the picker (the same rule the model row above follows). */
+export function harnessSelectRows(
+  list: HarnessListing[],
+  isError: boolean,
+  current: string,
+): { values: string[]; labels: string[]; disabled: string[] } {
+  const rows = isError ? [] : list
+  const values = rows.map(h => h.id)
+  const unserviceable = (h: HarnessListing) => h.available && h.serviceable === false
+  const labels = rows.map(h => {
+    const name = h.display_name || h.id
+    if (!h.available) {
+      return i18nT('components.jobForm.harness_unavailable', { name, reason: h.reason })
+    }
+    if (unserviceable(h)) {
+      return i18nT('components.jobForm.harness_not_serviceable', { name })
+    }
+    return name
+  })
+  const disabled = rows.filter(unserviceable).map(h => h.id)
+  if (current && !values.includes(current)) { values.unshift(current); labels.unshift(current) }
+  return { values, labels, disabled }
+}
 
 interface Props {
   job?: CronJob // if provided, edit mode
@@ -146,6 +195,13 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const [msg, setMsg] = useState(init.message)
   const [agent, setAgent] = useState(defaults.agent)
   const [model, setModel] = useState(defaults.model)
+  const [harness, setHarness] = useState(defaults.harness)
+  /** Registered harnesses, through the shared hook so this form and the chat
+   *  composer cannot disagree about the `['harnesses']` cache entry's shape.
+   *  `isError` matters: on a failed fetch the picker offers only "inherit" (plus
+   *  whatever the job already stores) rather than a stale list, because a
+   *  harness's availability is exactly the thing that goes out of date. */
+  const { harnesses: harnessList, isError: harnessError } = useHarnesses()
   const { data: modelList = [] } = useQuery<{ name: string; description?: string }[]>({
     queryKey: ['models'],
     queryFn: async () => {
@@ -196,9 +252,14 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
     return { values, labels }
   }, [modelList, model])
 
+  const harnessOptions = useMemo(
+    () => harnessSelectRows(harnessList, harnessError, harness),
+    [harnessList, harnessError, harness],
+  )
+
   const submit = async () => {
     setError(''); setSaving(true)
-    const f = { name, message: msg, agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
+    const f = { name, message: msg, agent, model, harness, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
     const body = buildBody(f, tz, setError, !!job)
     if (!body) { setSaving(false); return }
     try {
@@ -206,7 +267,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
         ? await api.updateCron(job.id, body)
         : await api.createCron(body).catch((e: Error) => ({ error: e.message }))
       if (res.error) { setError(res.error); setSaving(false); return }
-      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false) }
+      if (!job) { setName(''); setMsg(''); setWeekDays([]); setIntVal(1); setChannel(''); setModel(''); setHarness(''); setApprovalMode(''); setSilent(false); setStrictSchedule(false); setHideInChat(false) }
       onSaved()
     } catch { setError(i18nT('components.jobForm.failed_to_save')); setSaving(false) }
   }
@@ -276,6 +337,15 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             onChange={setModel}
             clearLabel={i18nT('components.jobForm.model_inherit')}
             aria-label={i18nT('components.jobForm.model')}
+          />
+          <SimpleSelect
+            options={harnessOptions.values}
+            optionLabels={harnessOptions.labels}
+            disabledOptions={harnessOptions.disabled}
+            value={harness}
+            onChange={setHarness}
+            clearLabel={i18nT('components.jobForm.harness_inherit')}
+            aria-label={i18nT('components.jobForm.harness')}
           />
           <Input placeholder={i18nT('components.jobForm.channel_id_optional')} style={{ flex: '0 0 170px' }} value={channel} onChange={e => setChannel(e.target.value)} />
           <SimpleSelect
@@ -350,6 +420,21 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             onChange={setModel}
             clearLabel={i18nT('components.jobForm.inherit_from_agent')}
             aria-label={i18nT('components.jobForm.model')}
+          />
+        </div>
+        )}
+        {!isLlmless && (
+        <div className="flex flex-col gap-1">
+          <span className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.harness')}</span>
+          <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_acp_harness_runs_this_job_leave_on_inherit')}</span>
+          <SimpleSelect
+            options={harnessOptions.values}
+            optionLabels={harnessOptions.labels}
+            disabledOptions={harnessOptions.disabled}
+            value={harness}
+            onChange={setHarness}
+            clearLabel={i18nT('components.jobForm.harness_inherit')}
+            aria-label={i18nT('components.jobForm.harness')}
           />
         </div>
         )}

@@ -6,6 +6,22 @@ The ACP layer spans **five** modules: the legacy per-session client (`acp/client
 
 ## Backend Selection
 
+**Wire differences come from the adapter's protocol profile, not a backend
+string.** The per-harness wire decisions — `initialize` `protocolVersion`, the
+`PermissionOption` field spelling WE emit, `session/set_config_option`
+availability, whether the harness emits `agent_thought_chunk` — are collected
+into a frozen `ProtocolProfile` (`acp/protocol_profile.py`) owned by the harness's
+adapter. `KIRO_PROFILE` carries today's kiro-cli bytes (date-string
+`protocolVersion` `"2025-08-22"`, kiro option spelling); `KAS_PROFILE` is
+kiro-cli's dialect in every respect EXCEPT the `initialize` `protocolVersion`,
+which the KAS relay expects as the public-ACP integer **`1`** (verified against
+`runtime.py`'s `PROTOCOL_VERSION_KAS`, not inferred from "the relay IS
+kiro-cli"); `STANDARD_ACP_PROFILE` (integer `1`, standard option spelling) serves
+the Claude seam, Codex, and every operator descriptor. Client and runtime read
+the profile from the binding's adapter, so the former `_is_claude`-style branches
+are profile reads with identical behavior (golden tests pin no byte change for
+kiro/kas).
+
 `AcpClient(acp_backend=...)` selects which subprocess to launch:
 
 - `""` (default): `kiro-cli acp --agent <name>` (resolved by `_resolve_kiro_bin`). Per-session kiro settings are layered in via the workspace overlay `<work_dir>/.kiro/settings/cli.json` (written by `AcpProvider`, not the client): reasoning **effort** (`chat.modelDefaults`) and **MCP Tool Search** (`toolSearch.enabled` + activation thresholds from `agent.tool_search_min_pct` / `tool_search_min_tokens`, gated by `agent.tool_search`, default on) — see providers.md.
@@ -115,10 +131,10 @@ that verified-identity half (arguments unverified) and
 expression for the unconditional grant paths documented in
 `security.md` § Child-fidelity split.
 
-The handshake also branches on the backend:
+The handshake reads the harness's protocol profile (see § Backend Selection):
 
-- `protocolVersion` in the `initialize` request: kiro-cli expects the date string `"2025-08-22"`; claude-agent-acp expects an integer (`1`, per the upstream ACP SDK schema).
-- claude skips `session/set_mode` and uses `session/set_config_option` (configId `model`) instead of `session/set_model`.
+- `protocolVersion` in the `initialize` request is the profile's value: kiro-cli's `KIRO_PROFILE` sends the date string `"2025-08-22"`; `KAS_PROFILE` and `STANDARD_ACP_PROFILE` send the integer `1` (per the upstream ACP SDK schema — KAS's relay expects the public-ACP integer even though it otherwise speaks kiro-cli's dialect).
+- the Claude seam skips `session/set_mode` and uses `session/set_config_option` (configId `model`) instead of `session/set_model`.
 
 Sending the wrong shape yields `-32602 Invalid params` or `-32601 Method not found`.
 
@@ -180,23 +196,81 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
 - **Model**: `set_model` is skipped for custom agents — kiro-cli uses the
   agent's own `model` field. Only the default kirocrew agent gets KiroCrew's
   configured model override.
-- **MCP servers**: backend-dependent.
-  - **kiro-cli**: `session/new` passes `mcpServers: []` — kiro-cli loads
-    servers from the agent config (respects `mcpServers` in the agent's config
-    file). Non-kirocrew agents (e.g. AIM-installed) load only their own
-    `mcpServers`. The kirocrew agent loads from global `~/.kiro/settings/mcp.json`
-    where `disabled` and `disabledTools` flags are respected. KiroCrew's dashboard
-    MCP tab writes directly to the global config.
-  - **claude-agent-acp**: does NOT read any config file or `--agent` flag, so
-    `session/new` (and `session/load`) must carry the servers in the
-    `mcpServers` param. `_claude_acp_mcp_servers()` reads the KiroCrew-owned
-    `~/.claude/agents/kirocrew.mcp.json` (kept current by
-    `agent.install_cc_agent_config`) and reshapes it to the ACP array via
-    `cc_agent.acp_servers_from_cc_map` (stdio → `{name,command,args,env:[{name,value}],type}`;
-    url → `{name,type:"http"|"sse",url,headers}`). kirocrew-core/cron are forced
-    to their canonical stdio command (overriding any stale `url`) and always
-    injected even when the registry is missing. Read per spawn so MCP
-    installs/toggles apply on the next session without a gateway restart.
+- **MCP servers**: driven by the harness descriptor's `mcp_delivery` declaration,
+  not by a per-backend branch. `_session_mcp_servers()` resolves the array for
+  both `session/new` and `session/load` through
+  `mcp_gateway.session_servers.delivery_servers(descriptor, agent, channel_id)`.
+  **Both transports** resolve it this way: `AcpClient._session_mcp_servers` and
+  `AcpRuntime._session_mcp_servers` call the same resolver and report through the
+  same `report_delivery`, so the multiplexed runtime's wire-fed harnesses (KAS)
+  receive their real converted server map rather than pooled stubs alone, and a
+  tool-less session reads identically whichever path created it.
+  - **file-fed** (kiro-cli): the harness loads servers from the agent config
+    (respects `mcpServers` in the agent's config file), so the array carries only
+    the pooled broker stubs — an empty one is ordinary. Non-kirocrew agents (e.g.
+    AIM-installed) load only their own `mcpServers`. The kirocrew agent loads from
+    global `~/.kiro/settings/mcp.json` where `disabled` and `disabledTools` flags
+    are respected. The dashboard's MCP tab writes directly to the global config.
+  - **wire-fed** (every other harness, and the default when a descriptor declares
+    nothing): the harness reads no config file or `--agent` flag of ours, so the
+    array is its only channel. `authorized_servers()` reads the session's full
+    authorized map as stored — the rewriter overlay when one exists (which keeps
+    pooling in effect), else the agent's own spec — and converts it to the
+    ACP wire shape: stdio → `{name,command,args,env:[{name,value}]}`, url →
+    `{name,type:"http"|"sse",url,headers:[{name,value}]}`. Operator-set
+    passthrough keys (`autoApprove`, `disabledTools`, the OAuth `scopes` /
+    `clientId` hints) are preserved. Read per session, so MCP installs and
+    toggles apply on the next session without a gateway restart.
+    A user-level spec Kiro Crew wrote is ceiling-filtered as written
+    (`agent._ceiling_filtered_spec`); a project spec is whatever the checkout
+    ships, since nothing in Kiro Crew writes `<project>/.kiro/agents`.
+  - **The operator's mute is applied at conversion**: an entry carrying
+    `disabled: true` is omitted with reason "disabled by the operator". The
+    dashboard's toggle (`POST /api/mcp/toggle enabled:false`) writes that flag
+    into the Kiro-global `~/.kiro/settings/mcp.json`, not onto the agent spec;
+    it reaches the spec entry the delivery path reads through
+    `rebuild_agent_config`'s merge, which keeps the muted server in `mcpServers`
+    (tightest-wins across scopes) instead of deleting it. ACP has no such field,
+    so a passed-through flag would be an ignored vendor key — the muted server
+    would be launched, with its `env`/`headers` on the wire, and reported as
+    delivered. A file-fed harness re-reads the flag from its own spec; a wire-fed
+    one never sees it. Read truthily, matching every other reader of the flag:
+    over-omitting costs visible availability, under-omitting silently un-mutes.
+    The omission is reported without the `(needs <transport>)` clause a
+    transport refusal carries: nothing is needed, so naming a transport would
+    read as a capability gap.
+  - **Agent scope**: the spec is resolved in kiro-cli's own order —
+    `<project>/.kiro/agents/*.json` first, then user-level `~/.kiro/agents` — so a
+    project agent shadows a same-named user-level one, matching how kiro-cli
+    resolves `--agent` against its cwd. `delivery_servers(..., project_dir=)`
+    carries the session's working directory for that; the client passes
+    `AcpClient._work_dir`. A caller that omits it resolves user-level specs only.
+    Getting this wrong is silent rather than loud: the wrong scope's map converts
+    cleanly and is reported as a successful delivery — which is why the winning
+    scope is recorded on the report, a project spec shadowing a user-level one is
+    a WARNING naming both paths, and two project specs declaring one name are
+    warned about rather than resolved (kiro-cli's own choice between them is
+    undefined; delivery tie-breaks on the first sorted stem and says so).
+    Rewriter overlays are written only from `~/.kiro/agents`, so a project spec
+    that declares the agent decides which servers EXIST and the overlay
+    contributes only its BROKER STUBS for names the two scopes share
+    (`_with_broker_stubs`). Membership comes from the winning scope and nothing
+    else: a stub for a name that scope does not declare would deliver a server the
+    active spec never listed, and a non-stub overlay entry is the user-level
+    spec's own copy — preferring it is the substitution this rule prevents.
+    Pooling therefore survives correct scoping instead of being its price.
+  - **Transport gating**: `initialize` records `agentCapabilities.mcpCapabilities`
+    beside the `loadSession` read. stdio is always emitted (ACP requires every
+    conformant agent to accept it); an HTTP or SSE entry is emitted only when the
+    matching flag was advertised, and each withheld server is reported by name
+    with the transport it needed. Unadvertised, malformed, and non-boolean flags
+    all mean "not advertised".
+  - **Reporting**: the delivery report (`AcpClient.mcp_delivery` —
+    harness, mode, supplying scope, delivered names, omissions with reasons) is
+    retained on the client and logged. Names only, never an entry's `env`,
+    `headers`, or `url`. A wire-fed conversion that yields nothing is a WARNING
+    naming the session as having no MCP tools, because that state is otherwise
+    indistinguishable from a harness that ignored the array.
 - **Tools/allowedTools/toolsSettings**: Applied by kiro-cli via `set_mode`.
 - **Prompt/resources/hooks**: Applied by kiro-cli via `set_mode`.
 - **deniedCommands**: Enforced by KiroCrew's `_enforce_denied_commands()` on
@@ -240,13 +314,14 @@ attempts `session/load` instead of `session/new`:
 
 1. Check `agentCapabilities.loadSession` from `initialize` response
 2. Verify `~/.kiro/sessions/cli/{sid}.json` exists on disk
-3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the pooled
-   broker stubs, re-declared so the resumed session keeps talking to the
-   shared gateway — `session/load` re-initializes the session's MCP servers,
-   so an empty list would un-pool the session; `[]` only when the gateway is
-   disabled), and `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
-   without it kiro-cli silently ignores the request). `AcpRuntime.load_session`
-   builds the same params for the multiplexed runtime.
+3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the SAME array
+   `session/new` would have sent, resolved by the harness's delivery mode —
+   `session/load` re-initializes the session's MCP servers, so sending less here
+   silently narrows a resumed session's tools: a file-fed harness un-pools itself
+   when the stubs stop shadowing its spec's same-named entries, and a wire-fed one
+   loses its servers outright), and `_meta: {"_kiro.dev/session_file": "<path>"}`
+   (required — without it kiro-cli silently ignores the request).
+   `AcpRuntime.load_session` builds the same params for the multiplexed runtime.
 4. On success (response contains `modes`): set `_session_id`, `_resumed = True`
 5. On failure (JSON-RPC error, timeout, file missing): fall through to `session/new`
 
@@ -446,7 +521,7 @@ kiro can return a `-32603` error that is an *advisory* that it substituted a dif
 
 `AcpError` (base), `AcpTimeoutError` (has `partial_output`), `AcpPermissionNeeded`, `AcpProcessDied`, `AcpAuthRequired`, `AcpPromptBusy`.
 
-- `AcpAuthRequired` — kiro-cli is not authenticated (`kiro-cli login` needed). Non-retryable: `ensure_ready()` skips the retry ladder and re-raises so callers surface the actionable message rather than reset-and-requeue.
+- `AcpAuthRequired` — the harness is not authenticated. Non-retryable: `ensure_ready()` skips the retry ladder and re-raises so callers surface the actionable message rather than reset-and-requeue. **The message names the harness that refused** (`client.not_logged_in_message(harness_id)`): kiro-cli keeps its exact `kiro-cli login` wording — it is the default harness and the one whose remedy Kiro Crew knows, and an empty id is kiro-cli's own legacy spelling — while any other harness is named and told to sign in with its own tool, WITHOUT a command, because a descriptor declares an executable and an argv template but never a login verb, so a guessed command would print an invention as an instruction. Sending a Codex or KAS user to `kiro-cli login` is worse than saying nothing: the command succeeds and the session fails again.
 - `AcpPromptBusy` — a prompt is already in progress on the session, classified from kiro-cli's "already in progress" text via `_PROMPT_BUSY_RE` and raised at prompt-dispatch sites. `slack/handler.py` catches it and auto-resets the wedged session (`sessions.reset`) before recording the failure, so the next message cold-starts cleanly.
 
 ## Process Management
@@ -722,7 +797,13 @@ are WARNING.** `_mark_dead(reason, *, expected=False)` logs the single
 `AcpRuntime dead (PID …) [returncode=…] stderr_tail: …` line at INFO when the
 death is a deliberate teardown and at WARNING otherwise; the flag changes
 severity only — futures still fail with `AcpRuntimeDead`, queues are still
-poisoned. `kill(*, expected=False)` plumbs it through, and both defaults are
+poisoned. The tail comes from `_redacted_stderr_tail()`, which runs
+`redact_exfiltration_urls` + `redact_credentials` over the last five captured
+lines — the same pair, in the same order, the `AcpClient` stderr path uses. That
+one formatter also feeds `_initialize_failure_reason`, whose reason reaches an
+exception message, a WARNING, and the harness availability record a listing
+renders, so a harness echoing a rejected key into its stderr cannot leak it into
+any of the four sinks. `kill(*, expected=False)` plumbs it through, and both defaults are
 fail-safe (WARNING), so a cleanup kill on a failure path — `initialize()`'s
 failed-spawn cleanup, `AcpProvider`'s failed-session-setup kill — and any
 future call site warns without opting in; only the deliberate teardowns of a

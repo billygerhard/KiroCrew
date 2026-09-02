@@ -105,6 +105,9 @@ type PanelTarget = PanelTargetSingle | PanelTargetSingle[]
 export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'OverviewPanel.tsx': 'overview',
   'ChatPanel.tsx': 'chat',
+  // Mounted BY ChatPanel (the harness a session runs on decides which model
+  // catalog the rows below it offer), so its settings deep-link into the same tab.
+  'HarnessPanel.tsx': 'chat',
   'VoicePanel.tsx': 'voice',
   'DisplayPanel.tsx': 'display',
   'BrowserPanel.tsx': 'browser',

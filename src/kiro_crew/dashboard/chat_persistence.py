@@ -59,7 +59,7 @@ from kiro_crew.history import (
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.validation import ARTIFACT_SLUG_RE
+from kiro_crew.validation import ARTIFACT_SLUG_RE, is_harness_id
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +269,25 @@ def save_all_slots_to_history(state: DashboardState) -> None:
         state._persist_context_snapshots()
     except Exception:
         logger.debug("Shutdown: context snapshot flush failed", exc_info=True)
+
+
+def _restore_slot_harness(slot: _ChatSlot, meta: Mapping[str, object]) -> None:
+    """Re-apply a persisted harness binding to a rehydrated slot.
+
+    Shape-checked on the way in, exactly as the artifact binding below is: the
+    metadata line is a file on disk, and this value flows into every connected
+    dashboard's slot list. A value failing the grammar is DROPPED rather than
+    corrected, which reads as "inherit the default" — the same thing every slot
+    persisted before harnesses were selectable reads as.
+
+    The slot's copy is what a picker renders; the authority for what a resumed
+    session actually runs on is the session map's own recorded binding, which
+    refuses a substitution on its own. So a dropped value here can cost a
+    correct label, never a session on the wrong harness.
+    """
+    raw = meta.get("harness")
+    if isinstance(raw, str) and is_harness_id(raw):
+        slot.harness = raw
 
 
 def _build_kiro_model_map() -> dict[str, str]:
@@ -955,6 +974,7 @@ def _rehydrate_slot_from_history(
                 logger.debug(
                     "Failed to resolve model for rehydrated slot %s", slot_name, exc_info=True
                 )
+        _restore_slot_harness(slot, meta)
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
         if meta.get("autocompact_pct") is not None:
@@ -1434,6 +1454,7 @@ def _apply_recent_session(
             slot.model = kiro_model_map.get(kiro_name, "")
         except Exception:
             logger.debug("Failed to resolve model for restored slot %s", slot_name, exc_info=True)
+    _restore_slot_harness(slot, meta)
     if meta.get("reasoning_effort"):
         slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
     if meta.get("autocompact_pct") is not None:
@@ -2682,6 +2703,13 @@ def _save_slot_to_history(
                     fields["title"] = ""
                 if slot.agent:
                     fields["agent"] = slot.agent
+                # Identity field, written only when set (mirrors the full save's
+                # ``if slot.harness``): an empty harness means "use the default",
+                # so it is not a clearable falsy value and must not be forced to
+                # "" here — the merge cannot delete the key, and rehydrate reads a
+                # persisted "" as an explicit (invalid) selection.
+                if slot.harness:
+                    fields["harness"] = slot.harness
                 if slot.workspace:
                     fields["workspace"] = slot.workspace
                 if slot.project:
@@ -2949,6 +2977,8 @@ def _save_slot_to_history(
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
+            if slot.harness:
+                meta_line["harness"] = slot.harness
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
             # Unconditional, matching the empty-window merge mirror: None is

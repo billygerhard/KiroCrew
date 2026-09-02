@@ -30,7 +30,9 @@ own gate model is [computer-use](../system-specs/modules/computer-use.md).
 
 `rebuild_agent_config()` writes exactly **one** file, `~/.kiro/agents/kirocrew.json`.
 There is no second rendered agent file and no agent-file renderer for any other
-provider: Kiro Crew is KiroACP-only.
+provider: there is exactly one provider. A harness whose descriptor declares
+wire-fed MCP delivery takes its servers in the ACP `session/new` request instead
+of from a rendered file, so it needs no renderer either.
 
 ### Provider-global scopes come from the platform seam, not the core
 

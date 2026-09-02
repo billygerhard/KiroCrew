@@ -43,17 +43,25 @@ from kiro_crew.acp.client import (
     OversizeLineUnrecoverable,
     _drain_oversize_line,
     _get_start_time,
-    _KiroExecutableTrustError,
-    _resolve_kiro_bin_for_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
-    kiro_cli_not_found_message,
 )
+from kiro_crew.acp.harness_adapters import (
+    HarnessSpawnRefused,
+    adapter_for,
+    checked_spawn_argv,
+    resolve_spawn_executable,
+)
+from kiro_crew.acp.harness_descriptor import (
+    CAPABILITY_KIRO_IDENTITY_STORE,
+    HarnessDescriptor,
+)
+from kiro_crew.acp.harness_registry import UnknownHarness
+from kiro_crew.acp.harness_registry import registry as harness_registry
 from kiro_crew.acp.kas_agents import (
     KasAgentTranslationError,
     build_kas_custom_agents,
 )
-from kiro_crew.acp.kas_transport import build_kas_argv
 from kiro_crew.acp.session_handle import (
     AcpRequestTimeout,
     AcpRuntimeDead,
@@ -66,8 +74,6 @@ from kiro_crew.acp.session_handle import (
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_INTERNAL_SANDBOX,
-    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
     METHOD_KAS_SESSION_DELETE,
@@ -83,6 +89,7 @@ from kiro_crew.acp.types import (
     METHOD_SUBAGENT_LIST_UPDATE,
     JsonRpcMessage,
     JsonRpcRequest,
+    harness_for_backend,
 )
 from kiro_crew.agent import ensure_agent_materialized
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
@@ -90,7 +97,13 @@ from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.mcp_gateway.session_servers import injection_server_names, pooled_session_servers
+from kiro_crew.mcp_gateway.session_servers import (
+    McpDelivery,
+    McpTransports,
+    delivery_servers,
+    injection_server_names,
+    report_delivery,
+)
 from kiro_crew.metrics.events import (
     CHILD_PERMISSION_DENIED,
     CHILD_PERMISSION_ROUTED,
@@ -700,6 +713,7 @@ class AcpRuntime:
         model: str | None = None,
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
+        harness_id: str = "",
         crew_agent: str = "",
     ):
         if work_dir:
@@ -718,6 +732,19 @@ class AcpRuntime:
         # later sessions inherit the claiming crew, not the pool's spawn state.
         self._crew_agent = crew_agent
         self._acp_backend = acp_backend
+        # The harness this runtime is BOUND to, when its creator resolved one. It
+        # outranks ``acp_backend``: the binding is the session's own recorded
+        # choice, while the backend is the key the provider is still constructed
+        # on, and two harnesses can share one backend spelling (a harness added
+        # later, an operator descriptor aliased onto kiro). Empty means "nobody
+        # bound me" — a warm-pool process, or any pre-binding caller — and then the
+        # legacy alias decides, exactly as it did before binding existed.
+        self._harness_id = (harness_id or "").strip()
+        # The harness this runtime spawns, resolved lazily at spawn time (never in
+        # __init__: the registry reads configuration on a cache miss, and runtimes
+        # are constructed on the event loop) and then cached for life. See
+        # _harness().
+        self._harness_descriptor: HarnessDescriptor | None = None
         if model is not None:
             if not MODEL_ID_RE.match(model):
                 raise ValueError(
@@ -790,6 +817,20 @@ class AcpRuntime:
         # response. Mirrors AcpClient._can_load_session — load_session() guards
         # on it so we never issue session/load against a backend that lacks it.
         self._can_load_session = False
+        # Transports the harness advertised at initialize, and the report of what
+        # its last session's MCP delivery actually carried. Stdio-only until the
+        # handshake says otherwise (ACP's own default), so a runtime that has not
+        # handshaked yet under-sends rather than sending a URL to a harness that
+        # never claimed HTTP.
+        self._mcp_transports: McpTransports = McpTransports()
+        #: The delivery report for the most recent session created on this runtime,
+        #: or None before the first one. Retained rather than emitted as an
+        #: ``AcpEvent`` for the reason the design records: delivery is resolved
+        #: DURING session creation, before any consumer is attached to the
+        #: session's event stream, so an event would go into a channel nobody is
+        #: reading. This is what a surface renders; the WARNING log is what an
+        #: operator sees in ``kirocrew logs``.
+        self.mcp_delivery: McpDelivery | None = None
         # promptCapabilities from the initialize response (e.g. {"image": true}).
         # Empty until the handshake completes, so callers fail CLOSED and send
         # text-only rather than guessing a modality the agent never advertised.
@@ -878,16 +919,65 @@ class AcpRuntime:
         return self._acp_backend
 
     @property
+    def harness_id(self) -> str:
+        """The harness this runtime runs — never empty, and never blocking.
+
+        The bound id when one was supplied, else the harness whose legacy
+        ``acp_backend`` spelling this runtime was constructed on. It answers even
+        before ``spawn()`` has resolved a descriptor, because the surfaces that ask
+        (usage attribution, the auth message) read it off a provider whose process
+        may already be gone. Both lookups are in-memory dicts that touch no
+        configuration, so this is safe on the event loop; :meth:`_harness`, which
+        can read config, is not.
+
+        The backend is read as an IDENTITY, which is why the bundled spellings are
+        consulted rather than ``resolve_alias``: that table answers what a stored
+        config key SELECTS and degrades a known-but-unselectable harness to
+        kiro-cli, so reading it here would attribute another harness's usage to
+        kiro-cli and warn about a config key this read never touched. The alias
+        table remains the fallback for a spelling with no bundled row.
+
+        Answering ``""`` would leave every usage row and every harness-named error
+        on the pre-binding paths unattributed — the failure this id exists to fix.
+        """
+        descriptor = self._harness_descriptor
+        if descriptor is not None:
+            return descriptor.id
+        if self._harness_id:
+            return self._harness_id
+        identified = harness_for_backend(self._acp_backend)
+        if identified is not None:
+            return identified
+        return harness_registry().resolve_alias(self._acp_backend)
+
+    def _declares(self, capability: str) -> bool:
+        """True when this runtime's bound harness declares ``capability``.
+
+        Reads the RESOLVED descriptor when :meth:`_harness` has already cached one
+        — that object IS this runtime's binding, so it answers even after the
+        operator deleted the harness definition from configuration — and otherwise
+        the registry's non-blocking read for :attr:`harness_id`. Neither path
+        touches configuration, which is what lets the capability properties below
+        stay ordinary event-loop reads while :meth:`_harness` remains
+        thread-only.
+        """
+        descriptor = self._harness_descriptor
+        if descriptor is not None:
+            return descriptor.capabilities.has(capability)
+        return harness_registry().bound_capabilities(self.harness_id).has(capability)
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this runtime's process signs in from kiro-cli's own store.
 
-        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
-        H5/H14). ``AcpRuntime`` is not an ``LLMProvider``, but the identity-change
-        sweep reaches shared runtimes as well as session providers, so it
-        declares the same capability under the same name -- letting that sweep
-        ask both families one question instead of probing private attributes.
+        The ``kiro_identity_store`` capability off the bound harness descriptor
+        (harness-parity H5/H14). ``AcpRuntime`` is not an ``LLMProvider``, but the
+        identity-change sweep reaches shared runtimes as well as session
+        providers, so it declares the same capability under the same name --
+        letting that sweep ask both families one question instead of probing
+        private attributes.
         """
-        return self._acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        return self._declares(CAPABILITY_KIRO_IDENTITY_STORE)
 
     @property
     def supports_image_prompt(self) -> bool:
@@ -1057,62 +1147,75 @@ class AcpRuntime:
             self._discard_sandbox_cleanup()
             raise
 
-    @staticmethod
-    async def _kiro_cli_missing(environ: dict[str, str], home: Path) -> str:
-        """Off-loop wrapper over the shared missing-CLI message.
+    def _harness(self) -> HarnessDescriptor:
+        """The descriptor this runtime spawns, resolved once and then cached.
 
-        Off-loop because building it expands the inherited PATH (filesystem
-        work), the same reason AcpClient._spawn defers its own call.
+        The bound ``harness_id`` decides when the creator supplied one; otherwise
+        the legacy ``acp_backend`` is resolved through the registry's alias table,
+        which is what an unbound runtime (a warm-pool process, any pre-binding
+        caller) has always been keyed on — "" -> kiro-cli, "kas" -> KAS.
+
+        Cached because the descriptor is a session-lifetime binding: a persisted
+        default change must never retarget a running runtime, and re-reading
+        config on a second spawn attempt could hand the same process two
+        different harnesses.
+
+        Blocking (the registry reads configuration on a cache miss), so callers
+        run it in a worker thread.
         """
-        return await asyncio.to_thread(kiro_cli_not_found_message, environ=environ, home=home)
+        if self._harness_descriptor is None:
+            reg = harness_registry()
+            harness_id = self._harness_id or reg.resolve_alias(self._acp_backend)
+            try:
+                self._harness_descriptor = reg.get(harness_id)
+            except UnknownHarness as exc:
+                # An unbound runtime cannot reach here (resolve_alias only ever
+                # answers a bundled id, so this would mean a bundled descriptor
+                # went missing) but a BOUND one can: the operator deleted the
+                # harness definition between session creation and this spawn.
+                # Either way it is reported as itself rather than degrading to a
+                # harness nobody asked for.
+                raise AcpRuntimeError(str(exc)) from exc
+        return self._harness_descriptor
+
+    def _render_spawn_argv(self) -> list[str]:
+        """Resolve, attest, and render the pre-sandbox argv. Blocking.
+
+        The three steps are inseparable and that ordering is the whole point:
+        resolve a candidate, attest THAT candidate, then render an argv whose
+        ``argv[0]`` is the attested path — verified by ``checked_spawn_argv``, so
+        neither a template nor an adapter can hand ``exec`` a different file than
+        the one that was checked.
+
+        Every harness-specific decision left in this method is a lookup: which
+        adapter, which convention blocks. There is no per-harness branch, which is
+        what lets a harness be added as data.
+        """
+        descriptor = self._harness()
+        adapter = adapter_for(descriptor)
+        executable = resolve_spawn_executable(descriptor)
+        argv = adapter.render_argv(
+            descriptor,
+            executable=executable,
+            agent=self._agent,
+            # The model pin (kiro-cli's ``--model``) is the ONLY reliable way to
+            # run a model outside the agent's own provider — a post-session
+            # set_model cannot cross provider boundaries, and an agent config may
+            # pin one. It reaches argv through the descriptor's model_args, which
+            # is omitted entirely when no model is pinned rather than emitting a
+            # dangling flag.
+            model=self._model or "",
+            workdir=str(self._work_dir),
+        )
+        return checked_spawn_argv(descriptor, argv, executable)
 
     async def _resolve_spawn_argv(self) -> list[str]:
-        """Pre-sandbox argv for this runtime's backend.
+        """Pre-sandbox argv for this runtime's harness, rendered off the loop.
 
-        Explicit per-backend construction: the two agents share no flags, and
-        only kiro-cli needs its agent file materialized first.
+        Off-loop because resolution stats the filesystem, attestation reads the
+        candidate, and the registry may read configuration — all blocking.
         """
-        # ONE reading of the environment drives both the search and the message
-        # that reports it, so a "not found (searched ...)" line here cannot name
-        # directories the resolve never walked -- the property AcpClient._spawn
-        # already holds, and the reason both go through
-        # kiro_cli_not_found_message instead of formatting their own text.
-        spawn_environ = dict(os.environ)
-        spawn_home = Path.home()
-
-        if self._acp_backend == ACP_BACKEND_KAS:
-            # KAS is reached through kiro-cli's own ACP relay, so it resolves the
-            # same trusted binary as the kiro backend. No --agent: KAS takes
-            # custom agents over the wire in session/new
-            # (_meta.kiro.customAgents), not from a CLI flag.
-            kas_bin = await _resolve_kiro_bin_for_spawn(environ=spawn_environ, home=spawn_home)
-            if not kas_bin:
-                raise AcpRuntimeError(await self._kiro_cli_missing(spawn_environ, spawn_home))
-            return build_kas_argv(kas_bin)
-
-        kiro_bin = await _resolve_kiro_bin_for_spawn(environ=spawn_environ, home=spawn_home)
-        if not kiro_bin:
-            raise AcpRuntimeError(await self._kiro_cli_missing(spawn_environ, spawn_home))
-
-        # Self-heal (B): kiro-cli discovers its selectable modes at startup from
-        # ~/.kiro/agents/*.json, so the managed default agent file must exist
-        # BEFORE this --agent spawn or set_mode later fails with
-        # "Mode '<agent>' not found". Regenerate it if missing (best-effort, off
-        # the loop). Non-managed agents can't be materialized here — the
-        # create_session guard fails those closed instead.
-        try:
-            await asyncio.to_thread(ensure_agent_materialized, self._agent)
-        except Exception:
-            logger.warning("pre-spawn agent materialization failed", exc_info=True)
-
-        argv: list[str] = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
-        if self._model:
-            # Pin the model at process start (mirrors `kiro-cli chat --model X`).
-            # This is the ONLY reliable way to run a non-default provider model
-            # (e.g. GPT for image generation) — post-session set_model cannot
-            # cross provider boundaries, and agent configs may pin a model.
-            argv += ["--model", self._model]
-        return argv
+        return await asyncio.to_thread(self._render_spawn_argv)
 
     async def spawn(self) -> None:
         """Start the ACP runtime behind the gateway-wide cold-start admission gate."""
@@ -1145,11 +1248,15 @@ class AcpRuntime:
             else:
                 process_state = "exited"
             logger.info(
-                "acp_cold_start stage=spawn outcome=%s duration_ms=%.1f backend=%s "
+                "acp_cold_start stage=spawn outcome=%s duration_ms=%.1f harness=%s "
                 "active_starts=%d queued_starts=%d process_state=%s",
                 outcome,
                 (time.monotonic() - started) * 1000.0,
-                self._acp_backend or "kiro",
+                # The bound harness, not the legacy backend spelling: a harness
+                # outside the acp_backend vocabulary (Codex, any operator harness)
+                # has no spelling to log, and reporting it as "" would attribute
+                # its cold start to kiro-cli.
+                self._harness_id or self._acp_backend or "kiro",
                 admission.active,
                 admission.queued,
                 process_state,
@@ -1157,44 +1264,57 @@ class AcpRuntime:
             admission.release()
 
     async def _spawn_admitted(self) -> None:
-        """Spawn and initialize after the caller has acquired cold-start admission."""
+        """Spawn the harness subprocess and complete the ACP protocol handshake."""
         if self._process is not None:
             raise AcpRuntimeError("Runtime already spawned")
 
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
         # slow storage; the loop must never wait on the kernel here.
         await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
-        # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
-        # deny rules. Keep their workspace disjoint from the named voice-decoder
-        # runtime so verified executable bytes cannot be replaced before spawn.
-        if self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX:
-            await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
 
         try:
             argv = await self._resolve_spawn_argv()
-        except _KiroExecutableTrustError as exc:
+        except HarnessSpawnRefused as exc:
+            # Trust refusals and unresolvable executables alike: one exception
+            # lineage, harness-neutral, so a harness added later cannot be
+            # spawned past a gate the first harness had to pass.
             raise AcpRuntimeError(str(exc)) from exc
 
+        descriptor = self._harness()
+        # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
+        # deny rules. Keep their workspace disjoint from the named voice-decoder
+        # runtime so verified executable bytes cannot be replaced before spawn.
+        # Keyed on the harness's OWN internal_sandbox capability (the retired
+        # ACP_BACKENDS_INTERNAL_SANDBOX frozenset is gone, wave-2): only a
+        # harness that replaces Crew's seatbelt with its own reaches this guard.
+        # Reads the descriptor cached by _resolve_spawn_argv above (resolved
+        # off-loop there), so the capability check itself does no blocking I/O.
+        if descriptor.capabilities.internal_sandbox:
+            await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
         # OSS sandbox.wrap_argv supports (argv, mode, strip_python_env). The
         # MCP-gateway overlay is NOT delivered through the sandbox: its broker
         # stubs are injected at ACP session/new (see new_session), so pooling
         # needs no bind-mount and works with sandbox mode "off". strip_python_env
-        # IS applied to keep the host PYTHONPATH/PYTHONHOME out of kiro-cli's
+        # IS applied to keep the host PYTHONPATH/PYTHONHOME out of the harness's
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
-        # is_kiro_cli drives the reviewed Kiro internal-sandbox delegation: on
-        # macOS wrap_argv skips its seatbelt because the two cannot nest; on
-        # Windows the official Kiro backend delegates by default because Crew
-        # has no native OS sandbox there. Granted by membership in
-        # ACP_BACKENDS_INTERNAL_SANDBOX (harness-parity H7), never as "not KAS":
-        # this test fails OPEN, so a harness that inherited a negative test would
-        # have Crew's seatbelt skipped in favour of an internal sandbox that never
-        # starts. KAS is a Node process with no internal sandbox, so it takes
-        # Crew's seatbelt directly, and so does every harness added later.
+        # is_kiro_cli drives the reviewed internal-sandbox delegation: on macOS
+        # wrap_argv skips its seatbelt because the two cannot nest; on Windows the
+        # official Kiro backend delegates by default because Crew has no native OS
+        # sandbox there. Granted by the descriptor's OPT-IN internal_sandbox
+        # capability (harness-parity H7), never as "not KAS": this test fails
+        # OPEN, so a harness that inherited a negative test would have Crew's
+        # seatbelt skipped in favour of an internal sandbox that never starts. KAS
+        # withholds the capability even though its argv now runs kiro-cli (the ACP
+        # relay): the relay starts the v3 engine with no --sandbox argument and
+        # KAS's sandbox factory resolves an absent config to its no-op backend, so
+        # there is no inner layer to delegate to. It takes Crew's seatbelt
+        # directly — as does every harness added later until someone declares
+        # otherwise.
         argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            is_kiro_cli=descriptor.capabilities.internal_sandbox,
             _prepare=wrap_argv,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
@@ -1215,33 +1335,30 @@ class AcpRuntime:
 
         def _resolve_env_off_loop() -> None:
             # KRB5CCNAME resolution lstat/stats /tmp/krb5cc_<uid>, and the
-            # CLI's own KIRO_API_KEY is settled here too: re-injected from the
-            # data home's .env for the kiro-cli backend (post-scrub Docker),
-            # actively stripped for a foreign backend, which must never
-            # receive it (see config.loader.inject/strip_kiro_cli_api_key) —
-            # a file read either way. Both are blocking syscalls that must not
-            # run on the loop, bundled into ONE thread hop. Guarded: the
-            # sandbox temp file is live, so a cancellation here must not
-            # orphan it.
+            # harness's pre-spawn hook runs here too: the kiro adapter
+            # materializes its agent spec and re-injects the CLI's own
+            # KIRO_API_KEY from the data home's .env (post-scrub Docker), while
+            # every other harness's default hook actively STRIPS that key — a
+            # foreign harness must never receive it. KAS takes the strip branch
+            # even though the process on the end of its argv IS a kiro-cli (the
+            # ACP relay): the v3 engine authenticates from kiro-cli's OIDC store
+            # via --auth-method cli and never reads that variable, so injecting it
+            # would widen credential exposure for a consumer that does not exist.
+            # Both hooks are blocking (file reads and a possible spec write) and
+            # must not run on the loop, so they are bundled into ONE thread hop.
+            # Guarded: the sandbox temp file is live, so a cancellation here must
+            # not orphan it.
+            #
+            # Ordering is load-bearing: this runs BEFORE
+            # scrub_agent_subprocess_env below, so a variable an adapter adds is
+            # still vetted by the scrub rather than slipping in behind it.
             resolve_krb5_ccname(env)
-            # Deferred import: this module keeps config.loader off its import
-            # graph (matches acp.client's in-file convention).
-            from kiro_crew.config.loader import (
-                inject_kiro_cli_api_key,
-                strip_kiro_cli_api_key,
+            adapter_for(descriptor).pre_spawn(
+                descriptor,
+                env=env,
+                workdir=str(self._work_dir),
+                agent=self._agent,
             )
-
-            # KIRO_API_KEY is kiro-cli's own MODEL credential for its v2
-            # agent loop, so only the kiro backend is handed it. KAS takes the
-            # strip branch even though its process is now a kiro-cli (the ACP
-            # relay): the v3 engine authenticates from kiro-cli's OIDC store via
-            # --auth-method cli and never reads this variable, so injecting it
-            # would widen credential exposure for a consumer that does not
-            # exist. Unchanged from when KAS was a bare Node process.
-            if self._acp_backend == ACP_BACKEND_KIRO:
-                inject_kiro_cli_api_key(env)
-            else:
-                strip_kiro_cli_api_key(env)
 
         await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
         # Parent-side equivalent of the launcher scrub. This is required on
@@ -1300,7 +1417,7 @@ class AcpRuntime:
         await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
 
         await self._discard_bound_workspace()
-        if self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX:
+        if descriptor.capabilities.internal_sandbox:
             self._spawn_work_dir, self._bound_workspace_fd = (
                 await bind_voice_safe_agent_workspace_async(self._work_dir)
             )
@@ -1392,7 +1509,8 @@ class AcpRuntime:
                 )
             raise
         logger.info(
-            "AcpRuntime spawned backend=%s agent=%s (PID %d)",
+            "AcpRuntime spawned harness=%s backend=%s agent=%s (PID %d)",
+            descriptor.id,
             self._acp_backend,
             self._agent or "<none>",
             self._pid,
@@ -1481,15 +1599,61 @@ class AcpRuntime:
             self._can_load_session = bool(
                 init_resp.get("agentCapabilities", {}).get("loadSession", False)
             )
+            # Transports this harness will accept in an ``mcpServers`` array, read
+            # beside ``loadSession`` from the same response. ACP guarantees stdio
+            # and makes HTTP/SSE opt-in capabilities defaulting to false, so an
+            # un-advertised transport is withheld and the omission reported rather
+            # than sent to a harness that would silently never start the server.
+            self._mcp_transports = McpTransports.from_agent_capabilities(
+                init_resp.get("agentCapabilities")
+            )
             # Retain promptCapabilities so the prompt path can gate non-text
             # blocks -- without them an image block would be sent regardless of
             # whether the agent accepts one, and a refusal would surface as a
             # generic error with no fallback.
             _prompt_caps = init_resp.get("agentCapabilities", {}).get("promptCapabilities", {})
             self._prompt_capabilities = _prompt_caps if isinstance(_prompt_caps, dict) else {}
+            adapter_for(descriptor).post_initialize(descriptor, init_resp)
             self._initialized = True
-            logger.info("AcpRuntime initialized (PID %d)", self._pid)
-        except BaseException:
+            # A harness that just completed the handshake is demonstrably usable,
+            # so drop any recorded failure from an earlier attempt instead of
+            # letting a listing keep calling it unavailable for the TTL.
+            harness_registry().clear_probe_failure(descriptor.id)
+            logger.info(
+                "AcpRuntime initialized harness=%s (PID %d)", descriptor.id, self._pid
+            )
+        except BaseException as exc:
+            # R6.3: a harness that dies during initialize — the shape an
+            # unauthenticated harness takes, since it exits rather than answering
+            # — must be reported as ITSELF. Left bare, the error names only a
+            # returncode, and on a multi-harness fleet the operator cannot tell
+            # which tool needs signing in. There is deliberately no retry on
+            # another harness: a silent substitution would run the work on a
+            # backend nobody chose.
+            reason = self._initialize_failure_reason(descriptor, exc)
+            if isinstance(exc, Exception):
+                # Only a failure the HARNESS is answerable for may cost it its
+                # availability. A cancellation says nothing about the harness: a
+                # client disconnect, a gateway shutdown, or a pool teardown
+                # cancels this task mid-handshake, and recording that would mark
+                # a healthy harness unavailable for the whole failure TTL — so
+                # ``_availability`` reports it unavailable and ``default()``
+                # degrades a configured default away from it, which is
+                # refusal-over-fallback inverted. KeyboardInterrupt and
+                # SystemExit are the same shape. Logged as well as recorded,
+                # because the re-raise below carries the enriched reason only for
+                # an AcpRuntimeError — an AcpError, OSError, or TimeoutError
+                # would otherwise compute the harness id and exit context and
+                # then drop them.
+                logger.warning("AcpRuntime: %s", reason)
+                harness_registry().note_probe_failure(descriptor.id, reason)
+            else:
+                logger.debug(
+                    "AcpRuntime: initialize aborted by %s, not recorded against the "
+                    "harness: %s",
+                    type(exc).__name__,
+                    reason,
+                )
             try:
                 # This death IS abnormal (failed spawn/handshake): kill()'s
                 # expected=False default keeps its log at WARNING.
@@ -1498,7 +1662,48 @@ class AcpRuntime:
                 logger.debug(
                     "AcpRuntime: cleanup kill after failed spawn/handshake failed", exc_info=True
                 )
+            if isinstance(exc, AcpRuntimeError):
+                # Same class, enriched message: callers discriminate on the type
+                # (AcpRuntimeDead -> auth prompt, AcpRequestTimeout -> retry) and
+                # the original text is embedded, so a caller matching on either
+                # keeps working.
+                raise type(exc)(reason) from exc
             raise
+
+    def _redacted_stderr_tail(self) -> str:
+        """The last few captured stderr lines, safe to put in a log or an error.
+
+        A harness writes whatever it likes to stderr, and what it writes when it
+        fails to authenticate is exactly the material worth redacting: a token
+        echoed back, a signed URL from a failed refresh. This tail reaches a
+        WARNING log, an exception message, and a stored availability reason a
+        listing renders, so it is scrubbed at the one place all three read from.
+        The two redactors and their order match the ACP client's own stderr path,
+        so a credential shape only one of them recognizes cannot survive on the
+        other transport.
+        """
+        if not self._stderr_lines:
+            return "<none>"
+        tail = " | ".join(self._stderr_lines[-5:])
+        tail, _ = redact_exfiltration_urls(tail)
+        tail, _ = redact_credentials(tail)
+        return tail
+
+    def _initialize_failure_reason(
+        self, descriptor: HarnessDescriptor, exc: BaseException
+    ) -> str:
+        """One line naming the harness, the failure, and the process's exit context.
+
+        The stderr tail is what makes an authentication failure legible ("not
+        logged in" appears there, never in the JSON-RPC error), and the returncode
+        separates "exited" from "still running but silent".
+        """
+        rc = self._process.returncode if self._process else None
+        detail = str(exc) or type(exc).__name__
+        return (
+            f"harness {descriptor.id!r} failed during ACP initialize: {detail} "
+            f"[returncode={rc}] stderr_tail: {self._redacted_stderr_tail()}"
+        )
 
     # Grace window for SIGTERM before escalating, and the post-SIGKILL reap
     # window. Class attributes so tests can shrink them.
@@ -2372,7 +2577,7 @@ class AcpRuntime:
         # Diagnostic context: process returncode + tail of captured stderr so
         # operators can tell an OOM/crash from a clean exit without DEBUG logs.
         rc = self._process.returncode if self._process else None
-        tail = " | ".join(self._stderr_lines[-5:]) if self._stderr_lines else "<none>"
+        tail = self._redacted_stderr_tail()
         log = logger.info if expected else logger.warning
         log(
             "AcpRuntime dead (PID %s): %s [returncode=%s] stderr_tail: %s",
@@ -2799,6 +3004,61 @@ class AcpRuntime:
             )
         return self._session_start_timeout
 
+    async def _session_mcp_servers(self, agent: str) -> list[dict[str, Any]]:
+        """The ``mcpServers`` array for one session, per this harness's delivery mode.
+
+        One resolver for ``session/new`` AND ``session/load``, because the two must
+        agree: ``session/load`` re-initializes a session's MCP servers, so an array
+        that differs from the one ``session/new`` sent silently changes the resumed
+        session's tools. The pooled-stub behaviour kiro-cli has always had is the
+        ``file_fed`` branch of :func:`delivery_servers`, so the default path's array
+        is unchanged; a wire-fed harness on this runtime (KAS) receives its real
+        converted server map instead of stubs alone, which is what makes it see any
+        tool at all.
+
+        Resolved off the event loop, descriptor included: the registry load stats —
+        and may read — ``config.json``, and computing the descriptor as an ARGUMENT
+        to ``to_thread`` would put that read back on the loop it was moved off.
+
+        ``project_dir`` is the session's own working directory, the cwd the harness
+        is spawned with, so a project-scoped agent spec shadows a same-named
+        user-level one exactly as kiro-cli resolves ``--agent`` itself.
+        """
+
+        def _resolve() -> McpDelivery:
+            return delivery_servers(
+                self._harness(),
+                agent,
+                # No channel id: the runtime has never carried one (its pooled
+                # resolver was called without it either), and the argument
+                # reaches broker stubs only — inventing a value here would stamp
+                # a caller identity on forwarded tool calls that no caller asked
+                # for.
+                None,
+                overlay_dir=self._mcp_gateway_overlay,
+                transports=self._mcp_transports,
+                project_dir=self._work_dir,
+            )
+
+        delivery = await asyncio.to_thread(_resolve)
+        self._report_mcp_delivery(delivery)
+        return list(delivery.servers)
+
+    def _report_mcp_delivery(self, delivery: McpDelivery) -> None:
+        """Retain the delivery report and log anything the session did not get.
+
+        Retained rather than emitted as an ``AcpEvent`` because delivery is
+        resolved DURING session creation, before any consumer is attached to the
+        session's event stream — an event would go into a channel nobody reads.
+        This attribute is what a surface renders; the log is what an operator sees
+        in ``kirocrew logs``.
+
+        The logging itself is :func:`report_delivery`, shared with ``AcpClient``
+        so both paths answer "why does this session have no tools" identically.
+        """
+        self.mcp_delivery = delivery
+        report_delivery(delivery)
+
     async def create_session(
         self,
         cwd: str | Path | None = None,
@@ -2814,21 +3074,21 @@ class AcpRuntime:
         if not self._initialized:
             raise AcpRuntimeError("Runtime not initialized — call spawn() first")
 
-        # Inject the shared gateway's broker stubs unless the caller supplied an
-        # explicit list. A session-injected server outranks the same-named entry
-        # in the agent spec, so this is what actually pools the servers — no file
-        # is written anywhere. Empty when the gateway is disabled.
-        if mcp_servers is None:
-            # Resolve the overlay off the event loop: the lookup stats/reads
-            # files, and blocking the loop stalls every other session's I/O.
-            mcp_servers = await asyncio.to_thread(
-                pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
-            )
         # The agent to run: an explicit request, else the runtime default. KAS
         # has no --agent spawn flag, so its default must be BOTH injected (below)
         # and activated (via set_mode after session/new); the kiro default is
         # already active from the --agent spawn.
         active_agent = agent or self._agent
+        # Deliver this session's MCP servers per the harness's declared mode
+        # unless the caller supplied an explicit list. For kiro-cli that is the
+        # pooled broker stubs, unchanged: a session-injected server outranks the
+        # same-named entry in the agent spec, so this is what actually pools the
+        # servers — no file is written anywhere, and it is empty when the gateway
+        # is disabled. For a wire-fed harness on this runtime it is the converted
+        # authorized map, which is the only way that harness learns any server at
+        # all.
+        if mcp_servers is None:
+            mcp_servers = await self._session_mcp_servers(active_agent)
         # Adapter-only seam: _kas_custom_agents returns None on the kiro backend,
         # so the kiro construction path gains no conditional, no new required
         # argument, and no new failure mode (harness-parity H13).
@@ -3045,19 +3305,18 @@ class AcpRuntime:
         if not self._can_load_session:
             raise AcpRuntimeError("Backend does not advertise session/load support")
 
-        # Re-declare the pooled broker stubs so a resumed session keeps talking
-        # to the broker — same injection as create_session() and the AcpClient
+        # Re-declare this session's MCP servers so a resumed session keeps the
+        # tools it had — same delivery as create_session() and the AcpClient
         # resume path (client.py). session/load re-initializes the session's MCP
         # servers (see the budget note below), so an empty list here is APPLIED,
-        # not ignored: the stubs stop shadowing the agent spec's same-named
-        # entries and kiro-cli spawns its own copy of every pooled server,
-        # silently un-pooling the session for the rest of its life. Resolved off
-        # the event loop — the overlay lookup stats and reads files. Empty when
-        # the shared gateway is disabled, so non-pooled installs still send [].
+        # not ignored: for kiro-cli the stubs stop shadowing the agent spec's
+        # same-named entries and it spawns its own copy of every pooled server,
+        # silently un-pooling the session for the rest of its life; for a wire-fed
+        # harness the resumed session would simply lose every tool. Resolved
+        # through the SAME resolver session/new used, because a differing array is
+        # what silently changes a resumed session's tools.
         active_agent = agent or self._agent
-        mcp_servers = await asyncio.to_thread(
-            pooled_session_servers, self._mcp_gateway_overlay, active_agent
-        )
+        mcp_servers = await self._session_mcp_servers(active_agent)
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
             "cwd": str(await self._session_work_dir(cwd)),

@@ -618,9 +618,17 @@ class _FakeProvider:
 
     @property
     def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE
+        # The frozenset view is retired; resolve the harness from the backend
+        # spelling and read the declared capability fail-closed, exactly as the
+        # real AcpProvider does through ``harness_for_backend`` +
+        # ``bound_capabilities``.
+        from kiro_crew.acp.harness_registry import registry
+        from kiro_crew.acp.types import harness_for_backend
 
-        return self.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        harness_id = harness_for_backend(self.backend) or ""
+        if not harness_id:
+            return False
+        return registry().bound_capabilities(harness_id).has("kiro_identity_store")
 
     def is_process_alive(self) -> bool:
         return True
@@ -645,9 +653,15 @@ class _FakeRuntime:
 
     @property
     def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE
+        # See _FakeProvider: the frozenset is retired; read the declared
+        # capability off the descriptor the backend spelling resolves to.
+        from kiro_crew.acp.harness_registry import registry
+        from kiro_crew.acp.types import harness_for_backend
 
-        return self._acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
+        harness_id = harness_for_backend(self._acp_backend) or ""
+        if not harness_id:
+            return False
+        return registry().bound_capabilities(harness_id).has("kiro_identity_store")
 
     def has_active_sessions(self) -> bool:
         return self._active
