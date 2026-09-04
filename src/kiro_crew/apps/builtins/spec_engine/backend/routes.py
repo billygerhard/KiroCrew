@@ -1435,6 +1435,33 @@ def _max_invocations(capability: str) -> int:
     )
 
 
+#: Slack allowed per invocation on top of the candidate's own deadline: child
+#: spawn through the sandbox chokepoint, fixture-document generation (a quarter
+#: of a megabyte per call), and the transport's pipe-drain grace. Generous on
+#: purpose — the aggregate budget below exists to catch a run that is WEDGED,
+#: not one that is merely slow on a loaded host, and a budget that fires on
+#: real work would turn honest slowness into a false ``failed`` verdict.
+CONFORMANCE_PER_CALL_OVERHEAD_S = 10
+
+
+def _run_budget_s(capability: str) -> float:
+    """The aggregate wall-clock budget one run of *capability*'s suite gets.
+
+    The suite enforces per-invocation deadlines and deliberately NO aggregate cap
+    of its own (the section comment above), so without this a run whose worker
+    thread wedges — a starved host, a child that survives its kill — stays
+    ``running`` for the life of the gateway while the poll route truthfully
+    reports a run nobody is doing, and the panel has no honest way out of "a
+    check is running". Observed live: a run against ``/bin/cat`` that completes
+    in a tenth of a second sat past a minute while the host was at load 150.
+
+    Derived from the suite's own worst case rather than hardcoded, so a suite
+    that grows a fixture grows its budget with it — and a capability whose suite
+    makes two calls is not given the nine-call budget.
+    """
+    return _max_invocations(capability) * (CONFORMANCE_DEADLINE_S + CONFORMANCE_PER_CALL_OVERHEAD_S)
+
+
 #: A run is in flight; no outcome exists yet.
 CONFORMANCE_RUNNING = "running"
 
@@ -1573,8 +1600,39 @@ def _record_conformance(job: _ConformanceJob) -> None:
 
 async def _conformance_worker(job: _ConformanceJob, binding: Binding) -> None:
     """Run the suite off the event loop and record whatever it produced."""
+    budget_s = _run_budget_s(job.capability)
     try:
-        report = await asyncio.to_thread(_run_conformance, job.capability, binding)
+        report = await asyncio.wait_for(
+            asyncio.to_thread(_run_conformance, job.capability, binding),
+            timeout=budget_s,
+        )
+    except asyncio.TimeoutError:
+        # The one exit the suite cannot produce for itself: it enforces no
+        # aggregate deadline, so a wedged thread would otherwise leave the job
+        # ``running`` for the life of the gateway. ``wait_for`` abandons the
+        # thread rather than killing it (a thread cannot be cancelled); the
+        # abandoned run finishes in the background and its outcome is discarded,
+        # because this worker has already returned and nothing else records. A
+        # re-run started after this verdict can therefore briefly overlap the
+        # abandoned run's remaining invocations — accepted, and preferred over a
+        # job no operator action can ever unstick.
+        logger.warning(
+            "spec-engine: conformance run for %s exceeded its %.0fs budget and was abandoned",
+            job.capability,
+            budget_s,
+        )
+        _record_conformance(
+            replace(
+                job,
+                status=CONFORMANCE_FAILED,
+                error=(
+                    f"the run exceeded its overall budget of {budget_s:.0f}s and was "
+                    "abandoned; the host may be overloaded, or the provider outlived "
+                    "its per-call deadline"
+                ),
+            )
+        )
+        return
     except Exception as exc:  # noqa: BLE001 - nothing may escape a background task
         # Broad in two directions. The runner already turns a candidate's own
         # crash into a failed CHECK, so anything arriving here is the run failing

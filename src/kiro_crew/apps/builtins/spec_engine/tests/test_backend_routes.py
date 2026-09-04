@@ -3937,6 +3937,82 @@ class TestConformanceIsAJobAndNotARequest:
         assert second.status == 202
         assert second.body["job_id"] != first.body["job_id"]
 
+    @pytest.mark.asyncio
+    async def test_a_run_that_outlives_its_budget_is_recorded_as_failed(
+        self,
+        recorded_sel: RecordedSel,
+        recorded_verify: _RecordedVerify,
+        no_conformance_jobs: None,
+        enabled: None,
+        home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A wedged run must end in a verdict an operator can act on.
+
+        The suite enforces per-invocation deadlines and no aggregate cap, so a
+        thread that wedges (a starved host, a child surviving its kill) would
+        leave the job ``running`` for the life of the gateway — the poll route
+        truthfully reporting a run nobody is doing, with no operator action that
+        can unstick it, since the POST refuses a new run while one is recorded as
+        running. Observed live before the budget existed.
+
+        The gate is deliberately NEVER released before the assertion: the fake IS
+        the wedge. Budget shrunk via the module's own helper so the worker times
+        out in test time rather than suite-worst-case time.
+        """
+        import threading
+
+        recorded_verify.gate = threading.Event()
+        monkeypatch.setattr(routes, "_run_budget_s", lambda capability: 0.05)
+        _write_document(_BOUND_ANALYSIS)
+        try:
+            async with _client() as client:
+                started = await _post(
+                    client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+                )
+                assert started.status == 202, started.body
+                assert started.body["status"] == "running"
+                await _drain_conformance()
+                polled = await _get(client, f"{routes.PREFIX}/config/conformance/analysis")
+                # The recovery property the budget exists to restore: a failed
+                # verdict is not ``running``, so a NEW run is accepted rather than
+                # refused with ``conformance_running`` forever.
+                restarted = await _post(
+                    client, f"{routes.PREFIX}/config/conformance", {"capability": "analysis"}
+                )
+                recorded_verify.gate.set()
+                await _drain_conformance()
+        finally:
+            recorded_verify.gate.set()
+        assert polled.status == 200, polled.body
+        assert polled.body["status"] == routes.CONFORMANCE_FAILED
+        assert polled.body["report"] is None
+        # The reason names the budget, so an operator reads "took too long" rather
+        # than a bare failure indistinguishable from a broken binding.
+        assert "budget" in polled.body["error"]
+        assert "abandoned" in polled.body["error"]
+        assert restarted.status == 202, restarted.body
+        assert restarted.body["job_id"] != started.body["job_id"]
+
+    def test_the_budget_covers_the_suites_own_worst_case(self) -> None:
+        """The budget must never fire on a run that is merely using its deadlines.
+
+        A budget below ``invocations x per-call deadline`` would fail honest slow
+        providers — every call lawfully spending its full deadline would blow the
+        aggregate — turning the watchdog into a source of false verdicts. Checked
+        against the suite's own projected invocation count so a suite that grows
+        a fixture grows the floor with it. The ceiling is a sanity bound: a budget
+        of hours would be indistinguishable from no budget at all.
+        """
+        for capability in ("analysis", "watch_sources"):
+            invocations = routes._max_invocations(capability)
+            budget = routes._run_budget_s(capability)
+            assert budget >= invocations * routes.CONFORMANCE_DEADLINE_S, (
+                f"{capability}: budget {budget}s fires on a run whose every call "
+                f"lawfully spends its {routes.CONFORMANCE_DEADLINE_S}s deadline"
+            )
+            assert budget <= 1800, f"{capability}: a {budget}s budget is no budget at all"
+
 
 class TestTheRouteChoosesTheDeadlineAndABindingCannotRaiseIt:
     """The one number this surface must not take from configuration.
