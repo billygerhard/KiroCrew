@@ -31,7 +31,7 @@
  * `pipeline.setting_group_stage`, which defaults an unmapped group to advanced for
  * the same stated reason rather than raising.
  */
-import { i18nT } from '../../i18n/t'
+import { i18nT } from './host'
 import type { StageVocabulary } from './api'
 
 /**

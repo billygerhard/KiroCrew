@@ -30,8 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.atomic_write import atomic_write
-
+from ...host import atomic_write
 from ..state import StatePersistenceError, reject_spec_tree_path, state_root, utc_now_iso
 
 logger = logging.getLogger(__name__)

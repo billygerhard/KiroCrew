@@ -114,9 +114,7 @@ import { useCallback, useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, FolderOpen } from 'lucide-react'
 
-import { i18nT } from '../../i18n/t'
-import { fmtNumber } from '../../i18n/format'
-import ProjectPicker from '../../components/ProjectPicker'
+import { i18nT, fmtNumber, ProjectPicker } from './host'
 import {
   QK,
   QK_RESOLVED_ROOT,

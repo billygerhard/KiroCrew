@@ -34,8 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir
-
+from ...host import kiro_agents_dir, project_agents_dir
 from .schema import SECTION_PROJECTS
 
 logger = logging.getLogger(__name__)

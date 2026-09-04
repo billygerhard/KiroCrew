@@ -49,10 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from kiro_crew import platform_compat
-from kiro_crew.apps.manager import app_data_dir
-from kiro_crew.atomic_write import atomic_write
-
+from ...host import app_data_dir, atomic_write, platform_compat
 from ..state import utc_now_iso
 from .advisories import ConfigWarning, WarningRecorder, document_warnings, record_config_warnings
 from .effective import EffectiveValue, resolve, resolve_all

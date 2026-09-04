@@ -64,8 +64,7 @@ import { useId, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
 
-import { i18nT } from '../../i18n/t'
-import { fmtNumber } from '../../i18n/format'
+import { i18nT, fmtNumber } from './host'
 import {
   QK,
   REFUSAL,

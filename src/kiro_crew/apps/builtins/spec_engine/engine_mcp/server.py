@@ -19,11 +19,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from kiro_crew.security import redact
-
 from ..engine.config import ConfigWarning
 from ..engine.config.store import ConfigLoadError, ConfigValidationError, ConfigWriteRefused
 from ..engine.setup import InferredSubjectRefused, SetupApprovalRequired
+from ..host import redact
 from .config_surface import write_payload, write_refusal
 from .guidance import GuidanceUnavailable, get_authoring_guidance, get_guidance
 from .operations import EngineOperations
@@ -653,7 +652,7 @@ def _handle_call(
     args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
 
     try:
-        from kiro_crew.validation import validate_mcp_tool_arguments
+        from ..host import validate_mcp_tool_arguments
 
         validate_mcp_tool_arguments(args, _input_schema(name))
     except ImportError:  # pragma: no cover - the validator ships with the package

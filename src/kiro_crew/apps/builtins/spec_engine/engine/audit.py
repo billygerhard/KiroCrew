@@ -22,8 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.platform_compat import chmod_safe
-
+from ..host import chmod_safe
 from .state import (
     SpecRef,
     StatePersistenceError,

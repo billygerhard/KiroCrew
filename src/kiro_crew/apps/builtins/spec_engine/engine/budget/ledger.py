@@ -39,8 +39,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from kiro_crew.config.paths import data_home
-
+from ...host import data_home
 from ..state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -111,7 +110,7 @@ def normalize_session_key(key: str) -> str:
     """
     # Imported lazily: the host module pulls in the dashboard's aiohttp handlers,
     # and the engine library is importable without them.
-    from kiro_crew.dashboard.handlers.usage import spend_key_for_slot
+    from ...host import spend_key_for_slot
 
     return spend_key_for_slot(key)
 

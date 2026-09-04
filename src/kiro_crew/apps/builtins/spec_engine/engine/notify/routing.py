@@ -132,7 +132,7 @@ def _redacted(text: str) -> str:
     """
     if not text:
         return text
-    from kiro_crew.platform.context import redact_via_context
+    from ...host import redact_via_context
 
     return redact_via_context(text)
 
@@ -404,7 +404,7 @@ class HostNotifier:
 
     def _payload(self, delivery: Delivery, *, url: str | None, ttl: int | None) -> Any:
         """Build the bus payload. Imported here so the bus is a runtime dependency."""
-        from kiro_crew.notifications.bus import NotificationPayload
+        from ...host import NotificationPayload
 
         return NotificationPayload(
             source=APP_NAME,

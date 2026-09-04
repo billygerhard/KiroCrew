@@ -34,7 +34,7 @@
  * its own refusal branch unreachable with it. It cannot duplicate the intake area's
  * copy: `whole` is only ever true when no other area exists.
  */
-import { i18nT } from '../../i18n/t'
+import { i18nT } from './host'
 
 import { DocumentEditor, ProfilesForm, SourceForm, SourcesSection } from './ConfigPanel'
 import { StageCapabilities, StageIntro, StageSettings } from './StageParts'

@@ -41,8 +41,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
-from kiro_crew.effort import model_supports_effort
-
+from ..host import model_supports_effort
 from .config import ROLES, ConfigStore
 from .config.profiles import CostProfile, RoleAssignment, selected_profile
 

@@ -37,9 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
-
+from ...host import atomic_write, config_dir
 from ..budget.switch import KillSwitch
 from ..config import ConfigStore
 from ..delivery.stages import CommandRunner
@@ -260,7 +258,7 @@ def run_tick_script(ctx: Any) -> None:
     subsystem: a test, the MCP server, or the UI backend all load the watcher's
     logic without loading a scheduler.
     """
-    from kiro_crew.cron_script import Report, Skip
+    from ...host import Report, Skip
 
     source = str(getattr(ctx, "message", "") or "").strip()
     report = poll_tick(sources=(source,) if source else None)

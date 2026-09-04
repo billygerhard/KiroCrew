@@ -28,8 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-from kiro_crew.effort import EFFORT_LEVELS
-
+from ...host import EFFORT_LEVELS
 from .settings import SETTING_GROUPS, SETTINGS, Scope, Setting
 
 #: Schema version of the persisted document. Bumped only when a migration ships.

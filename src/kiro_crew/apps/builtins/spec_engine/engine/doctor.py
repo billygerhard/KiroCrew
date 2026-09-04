@@ -56,8 +56,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from kiro_crew.atomic_write import atomic_write
-
+from ..host import atomic_write
 from .autonomy import AutonomyLevel
 from .budget.ceiling import DispatchOutcome
 from .budget.switch import KillSwitch, KillSwitchState

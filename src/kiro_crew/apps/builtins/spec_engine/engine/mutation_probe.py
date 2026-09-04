@@ -53,8 +53,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
-from kiro_crew import platform_compat
-
+from ..host import platform_compat
 from .delivery.stages import CommandOutcome, CommandRunner, run_argv
 
 logger = logging.getLogger(__name__)

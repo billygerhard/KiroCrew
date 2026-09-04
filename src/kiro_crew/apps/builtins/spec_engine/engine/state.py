@@ -36,8 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from kiro_crew._sqlite_compat import sqlite3
-from kiro_crew.config.paths import data_home
+from ..host import data_home, sqlite3
 
 logger = logging.getLogger(__name__)
 

@@ -58,8 +58,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { fmtNumber } from '../../i18n/format'
-import { i18nT } from '../../i18n/t'
+import { fmtNumber, i18nT } from './host'
 
 import { QK, specEngineApi, type CapabilityBinding, type ProviderIdentity } from './api'
 import { FormReview, PendingCount, Refused } from './ConfigPanel'

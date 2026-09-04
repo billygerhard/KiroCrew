@@ -204,7 +204,7 @@ def observe(required: RequiredResources | None = None) -> tuple[set[str], set[st
     # Imported lazily: this module is reachable from the app package, which the
     # host's app manager imports, so a module-level import of the bridges would
     # close an import cycle.
-    from kiro_crew.apps.bridges import app_skills_dir, registered_app_mcp_servers
+    from .host import app_skills_dir, registered_app_mcp_servers
 
     skills: set[str] = set()
     if req.app_name:

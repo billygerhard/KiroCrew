@@ -36,8 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
 
-from kiro_crew import platform_compat, sandbox
-
+from ...host import platform_compat, sandbox
 from ..config import DELIVERY_STAGES, ConfigStore, ConfigValidationError, ValueOrigin
 from .templates import CommandTemplate, MissingVariableError, TemplateError
 from .variables import RunContext, VariableError, build_variables

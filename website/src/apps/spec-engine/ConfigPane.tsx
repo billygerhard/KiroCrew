@@ -52,8 +52,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-import { fmtNumber } from '../../i18n/format'
-import { i18nT } from '../../i18n/t'
+import { fmtNumber, i18nT } from './host'
 
 import { QK, specEngineApi, type ConfigSnapshot } from './api'
 import { StagePanel, StageTabs } from './ConfigStageShell'

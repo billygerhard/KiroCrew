@@ -44,8 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
-from kiro_crew import platform_compat, sandbox
-
+from ...host import platform_compat, sandbox
 from .contracts import (
     FINDING_PROVIDER_TIMEOUT,
     FINDING_PROVIDER_UNAVAILABLE,

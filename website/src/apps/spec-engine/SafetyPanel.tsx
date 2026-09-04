@@ -63,8 +63,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle } from 'lucide-react'
 
-import { i18nT } from '../../i18n/t'
-import { fmtDateTime, fmtNumber } from '../../i18n/format'
+import { i18nT, fmtDateTime, fmtNumber } from './host'
 import {
   QK,
   REFUSAL,

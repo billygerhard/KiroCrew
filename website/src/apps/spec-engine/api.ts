@@ -39,7 +39,7 @@
  * a second place to write. A surface showing only the document cannot answer
  * "what is actually in force here", which is the question every edit is about.
  */
-import { i18nT } from '../../i18n/t'
+import { i18nT } from './host'
 
 /** The app's URL namespace. One constant so a route string cannot drift from it. */
 const API = '/api/apps/spec-engine'

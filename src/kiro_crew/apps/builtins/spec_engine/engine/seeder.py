@@ -51,12 +51,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
-from kiro_crew.apps.approval_grants import (
+from ..host import (
     posture_extra_env,
     session_posture,
     verify_session_posture,
 )
-
 from .audit import AuditLog
 from .autonomy import AutonomyDecision
 from .budget import RunAccounting

@@ -42,8 +42,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { fmtNumber } from '../../i18n/format'
-import { i18nT } from '../../i18n/t'
+import { fmtNumber, i18nT } from './host'
 
 import { QK, specEngineApi } from './api'
 import { Refused } from './ConfigPanel'

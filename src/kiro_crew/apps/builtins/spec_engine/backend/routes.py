@@ -128,10 +128,6 @@ from typing import Any, Awaitable, Callable, Mapping, NoReturn
 
 from aiohttp import web
 
-from kiro_crew.apps.manager import is_app_enabled
-from kiro_crew.effort import EFFORT_LEVELS
-from kiro_crew.sel import sel
-
 from ..engine import audit as engine_audit
 from ..engine import local_analyzer
 from ..engine import review_queue as engine_review_queue
@@ -225,6 +221,7 @@ from ..engine.watch.sources import (
     watch_source_presets,
 )
 from ..engine_mcp import setup_surface
+from ..host import EFFORT_LEVELS, is_app_enabled, sel
 
 logger = logging.getLogger(__name__)
 

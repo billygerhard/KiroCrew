@@ -560,7 +560,7 @@ def run_review_feedback_script(ctx: Any) -> None:
     Raises the scheduler's control exceptions, imported here rather than at module
     scope so the engine stays importable without the host's cron subsystem.
     """
-    from kiro_crew.cron_script import Skip
+    from ...host import Skip
 
     armed = review_feedback_armed()
     if not armed:

@@ -81,8 +81,7 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } fr
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle } from 'lucide-react'
 
-import { i18nT } from '../../i18n/t'
-import { fmtNumber } from '../../i18n/format'
+import { i18nT, fmtNumber } from './host'
 import {
   QK,
   QK_RESOLVED_ROOT,

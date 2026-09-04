@@ -91,8 +91,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 
-import { i18nT } from '../../i18n/t'
-import { fmtDuration, fmtNumber, type FormatUnit } from '../../i18n/format'
+import { i18nT, fmtDuration, fmtNumber, type FormatUnit } from './host'
 import {
   QK,
   SpecEngineApiError,
