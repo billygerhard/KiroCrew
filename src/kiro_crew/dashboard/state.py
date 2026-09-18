@@ -2454,6 +2454,7 @@ class _ChatSlot:
         "agent_kind",
         "model",
         "jev_route",
+        "acp_backend",
         "_model_withheld",
         "_model_withheld_for",
         "served_model",
@@ -2702,6 +2703,18 @@ class _ChatSlot:
         # those, which is one filter per reader and a real breakage the first time
         # one is missed. The flag leaves `model` meaning exactly what it meant.
         self.jev_route: bool = False
+        # Persisted per-chat ACP backend pick. ``None`` = inherit the global
+        # ``agent.acp_backend`` (the ordinary case); a string is an explicit
+        # pin, and ``""`` is a REAL pin -- kiro-cli's own id -- not "unset", so a
+        # chat pinned to Kiro under a non-Kiro default runs on Kiro. Mirrors
+        # ``model``: slot-owned, serialized with the slot, and re-sent into the
+        # provider factory as ``backend_override`` on every get_or_create so the
+        # chat's own harness choice wins over the configured default.
+        # Deliberately NOT a constructor keyword here — the create handler stamps
+        # it after construction, the same way the remote-execution binding is — so
+        # every other creation path (fork, channel, restore) is unaffected until it
+        # opts in by copying the field.
+        self.acp_backend: str | None = None
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
         # two directly: the pairing is what makes the verdict self-invalidating

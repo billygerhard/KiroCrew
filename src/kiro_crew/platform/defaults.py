@@ -54,21 +54,34 @@ from kiro_crew.platform.interfaces import (
 
 
 class DefaultProviderRegistry:
-    """Registers nothing: every KNOWN backend is already in the baseline."""
+    """Registers the operator's ``harnesses.json`` descriptors; nothing else.
+
+    Every BUILTIN backend is already in the baseline, so the only thing this
+    seam has to register in the public edition is what the operator declared.
+    """
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # Nothing to register, and nothing this seam could register: the baseline now
-        # covers every id in ``ACP_BACKENDS_KNOWN``, and
-        # ``register_selectable_backend`` rejects an id outside that set, so there is
-        # no id it accepts that is not already selectable. The seam stays because the
-        # ProviderRegistry protocol declares it and an edition overrides this method;
-        # an edition adding a genuinely new harness has to widen
-        # ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not an extension
-        # point this hook opens on its own.
-        return None
+        # The operator's descriptors enter through THIS seam so harness support
+        # stays additive at ``ProviderRegistry`` (harness-parity H13): the Kiro
+        # construction path in ``bootstrap_context`` gains no second registration
+        # call, and an edition that overrides this method decides for itself
+        # whether operator descriptors are honoured (it calls this base method or
+        # it does not). The builtin ids need no call: the baseline already covers
+        # every id in ``ACP_BACKENDS_KNOWN``.
+        #
+        # Best-effort, like the seam's caller: a ``harnesses.json`` that cannot be
+        # read leaves the builtin harnesses serving, which is a startable
+        # deployment. The loader reports per-descriptor problems through the
+        # registry's ``invalid`` view rather than raising, so an exception here is
+        # an unexpected fault, not a bad descriptor.
+        from kiro_crew.agent_sdk.operator_harnesses import (
+            load_and_register_operator_descriptors,
+        )
+
+        load_and_register_operator_descriptors()
 
 
 class DefaultPublishRegistry:
