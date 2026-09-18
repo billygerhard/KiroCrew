@@ -1514,6 +1514,16 @@ def _rehydrate_slot_from_history(
         # re-picks "Auto (Jev)" to route again.
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        if isinstance(meta.get("acp_backend"), str):
+            # Restored verbatim ("" included -- it is a Kiro pin, not "unset");
+            # the value re-crosses resolve_selected_backend in the provider
+            # factory on the next get_or_create, so an unselectable backend
+            # degrades to kiro there rather than being scrubbed here.
+            slot.acp_backend = str(meta["acp_backend"])
+        elif "acp_backend" in meta and meta["acp_backend"] is None:
+            # A written null is the CLEARED value (un-pinned after a pin), so
+            # replaying it must drop an earlier line's pin.
+            slot.acp_backend = None
         if meta.get("autocompact_pct") is not None:
             slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
@@ -2169,6 +2179,15 @@ def _apply_recent_session(
     # path above states: it is an owner pick, and this file is agent-writable.
     if meta.get("reasoning_effort"):
         slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+    if isinstance(meta.get("acp_backend"), str):
+        # Restored verbatim ("" included -- a Kiro pin, not "unset"); re-crosses
+        # resolve_selected_backend in the provider factory on the next
+        # get_or_create (see the twin loader above), so an unselectable value
+        # degrades to kiro there.
+        slot.acp_backend = str(meta["acp_backend"])
+    elif "acp_backend" in meta and meta["acp_backend"] is None:
+        # A written null is the CLEARED value; replaying it drops an earlier pin.
+        slot.acp_backend = None
     if meta.get("autocompact_pct") is not None:
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
@@ -3689,6 +3708,9 @@ def _save_slot_to_history(
                     # window, never a fresh read: a re-read here would be a
                     # second, unpaired observation of the queue.
                     "queued_prompts": queue_snapshot,
+                    # Per-chat ACP backend pick, mirroring ``model`` above:
+                    # slot-owned: None = inherit, "" = a Kiro pin, so written as-is.
+                    "acp_backend": slot.acp_backend,
                     # None means "follow the global threshold" and is the
                     # cleared value (rehydrate reads it with ``is not None``),
                     # so the override is CLEARABLE: written even when None,
@@ -4106,6 +4128,13 @@ def _save_slot_to_history(
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
+            # Per-chat ACP backend pick, written unconditionally like
+            # ``autocompact_pct`` below: ``None`` is the cleared "inherit the
+            # global" value and has to LAND so a restore after un-pinning does
+            # not resurrect the old pin, and ``""`` is a Kiro pin -- a real value
+            # a truthiness check would drop. The restore side accepts any string
+            # and treats null/absent as inherit.
+            meta_line["acp_backend"] = slot.acp_backend
             # Unconditional, matching the empty-window merge mirror: None is
             # the cleared "follow the global" value, not an absent field.
             meta_line["autocompact_pct"] = slot.autocompact_pct

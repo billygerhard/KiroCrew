@@ -90,9 +90,14 @@ class ProviderRegistry(Protocol):
         ...
 
     def register_acp_backends(self) -> None:
-        """Register any extra ACP backends (no-op in the public edition).
+        """Register ACP backends beyond the builtin baseline.
 
-        Consumed at boot by ``bootstrap_context`` after the context installs.
+        Consumed at boot by ``bootstrap_context`` after the context installs, and
+        it is the ONLY registration call on that path. The public edition's
+        ``DefaultProviderRegistry`` loads and registers the operator's
+        ``harnesses.json`` descriptors here; an edition that overrides this method
+        adds its own harness and decides whether operator descriptors are still
+        honoured by calling (or not calling) the default implementation.
 
         An implementation MUST also call
         ``acp_backends.register_selectable_backend(<id>)`` for anything an operator
