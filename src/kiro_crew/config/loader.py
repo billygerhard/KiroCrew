@@ -2100,8 +2100,24 @@ def workspace_dir_for(workspace: str | None = None) -> Path:
             "workspace directory",
             ws,
         )
-    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
+    return workspace_dir_from_entry(entry)
 
+
+def workspace_dir_from_entry(entry: WorkspaceConfig | None) -> Path:
+    """The directory a ``workspaces`` entry names, by the ONE placement rule.
+
+    ``entry.dir`` may be absolute (anywhere on the host) or relative to the
+    data home; an absent entry or an empty ``dir`` is the base workspace
+    directory under ``config_dir()``. :func:`workspace_dir_for` applies this
+    after its own config load; a caller that already holds a
+    :class:`KiroCrewConfig` snapshot (the folder-steering memory-store fence)
+    applies it directly to that snapshot's entries so every workspace it fences
+    comes from the same load -- a second load per name could observe a
+    different document (a concurrent write, a transient read failure) and
+    silently fall back to the base directory for a workspace the first load
+    had placed elsewhere.
+    """
+    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
     p = Path(dirname).expanduser()
     if p.is_absolute():
         return p
@@ -4647,6 +4663,18 @@ class KiroCrewConfig:
         # Migrate workspaces from flat or structured format
         raw_workspaces = data.get("workspaces", {})
         if not isinstance(raw_workspaces, dict):
+            # Reported, not just replaced: a gate that fences the memory
+            # workspaces (folder steering's silo fence) reads this table to
+            # learn WHERE the workspaces are, and an operator's absolute
+            # workspace directory that this load could not read is a directory
+            # the fence would otherwise not know to cover. Same posture as the
+            # ``dashboard.tailscale`` key: the consumer decides to fail closed.
+            logger.warning(
+                "Config 'workspaces' is not a JSON object (got %s); the workspace "
+                "table is unavailable for this load",
+                type(raw_workspaces).__name__,
+            )
+            _degraded.add(_resolution.DEGRADED_WORKSPACES)
             raw_workspaces = {}
         workspaces = _migrate_workspaces(raw_workspaces)
 

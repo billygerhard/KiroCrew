@@ -103,6 +103,10 @@ from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
     find_written_steer_row,
 )
+from kiro_crew.dashboard.chat_folders import (
+    _resolve_folder_steering_dirs,
+    slot_steering_principal,
+)
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_tag_grants import refresh_cache as refresh_tag_grants_cache
@@ -411,6 +415,38 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     subagents_attached_async,
     tool_calls_are_read_only_preparation,
 )
+
+
+def _folder_steering_turn(
+    slot: Any,
+    execution_context: Any,
+    *,
+    context_is_new: bool,
+    provider_has_history: bool,
+    needs_reinjection: bool,
+) -> bool:
+    """Whether this turn must resolve the folder's steering directories.
+
+    A template chat reads the folder tree only on the two turns that carry
+    session-start context: a fresh provider session (not a resumed one, which
+    already holds its original injection) and a reinjection after compaction.
+    Warm template turns never touch it.
+
+    A V2 MEMBER chat is different. ``build_message`` rebuilds the member's
+    essentials envelope on EVERY turn, and that envelope declares itself the
+    complete replacement for all prior snapshots ("do not keep applying removed
+    sources"). Folder steering rides inside that envelope, so a warm member turn
+    that passed no directories would hand the model a snapshot that silently
+    withdraws the folder's guides. Every turn that rebuilds the envelope resolves.
+    """
+    if (context_is_new and not provider_has_history) or needs_reinjection:
+        return True
+    return bool(
+        getattr(slot, "mode", "") == "member"
+        and getattr(slot, "agent", "")
+        and execution_context is not None
+        and getattr(execution_context, "member_id", None)
+    )
 
 
 def _require_session_memory_assignment(session_key: str, memory_store: str | None) -> None:
@@ -10921,6 +10957,47 @@ async def _run_chat(
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
             _needs_reinjection = consume_reinjection(state.sessions, session_key)
+            # Folder steering directories, resolved LIVE from the committed
+            # folder tree rather than from a value cached on the slot, so a
+            # folder edit or a re-file reaches the chats already inside it at
+            # their next session-start context with no cache to invalidate.
+            # For a template chat only the two turns that carry session-start
+            # context read the tree (a fresh provider session, or a reinjection
+            # after compaction); warm turns never touch it. A V2 MEMBER chat is
+            # different: build_message rebuilds the member's essentials
+            # envelope on EVERY turn, and that envelope declares itself the
+            # complete replacement for all prior snapshots ("do not keep
+            # applying removed sources"). Folder steering rides inside that
+            # envelope, so a warm member turn that passed no directories would
+            # hand the model a snapshot that silently withdraws the folder's
+            # guides. Resolve on every turn that rebuilds the envelope. The
+            # resolver re-validates every stored path — stat calls and
+            # realpath — so it runs off-loop. A resolution error degrades to
+            # no folder steering and a warning naming the slot; it must never
+            # fail the turn.
+            _folder_steering_dirs: tuple[str, ...] = ()
+            if slot.folder_id and _folder_steering_turn(
+                slot,
+                execution_context,
+                context_is_new=_context_is_new,
+                provider_has_history=_provider_has_history,
+                needs_reinjection=_needs_reinjection,
+            ):
+                _folder_snapshot = await state.read_folders(
+                    lambda folders: [dict(folder) for folder in folders]
+                )
+                _resolved_dirs, _steering_err = await asyncio.to_thread(
+                    _resolve_folder_steering_dirs,
+                    _folder_snapshot,
+                    slot.folder_id,
+                    slot_app=slot_steering_principal(slot, execution_context),
+                )
+                if _steering_err:
+                    logger.warning(
+                        "Folder steering unavailable for slot %s: %s", slot.key, _steering_err
+                    )
+                else:
+                    _folder_steering_dirs = tuple(_resolved_dirs)
             # Stand up this crew's OWN vector store before the offloaded build.
             # It has to happen here, on the loop, because init() is blocking file
             # IO (sqlite connect, migrations, a FAISS load) that build_message's
@@ -10974,6 +11051,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                steering_dirs=_folder_steering_dirs,
                 context_provider=client,
             )
             # The reported span is valid for the message as build_message
