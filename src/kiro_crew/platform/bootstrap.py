@@ -230,13 +230,22 @@ def bootstrap_context(cfg: "KiroCrewConfig") -> PlatformContext:
 
     set_context(ctx)
 
-    # Register any edition-contributed ACP backends now that the context is
-    # installed.  The Default ProviderRegistry.register_acp_backends() is a
-    # no-op: the public edition's selectable set is the baseline in
-    # ``acp_backends``, which already covers every KNOWN backend, so an edition
-    # only needs this seam for a harness the core does not ship.  Best-effort — a
-    # backend-registration failure must not abort boot (the provider factory
-    # still resolves).
+    # Register ACP backends through the ProviderRegistry seam now that the context
+    # is installed. In the public edition this is where the OPERATOR-authored
+    # backends (``harnesses.json``) are loaded and registered; an edition overrides
+    # the seam to add a harness the core does not ship. ONE call for both, so the
+    # Kiro construction path carries no registration conditional (harness-parity
+    # H13). It must run BEFORE anything resolves ``agent.acp_backend`` -- D4's
+    # constraint: ``resolve_selected_backend`` reads the selectable registry live
+    # (below, in the governance narrowing, and in every later
+    # ``KiroCrewConfig.load()``), so a persisted value naming an operator harness
+    # must be registered first or it silently degrades to kiro. It runs after
+    # ``set_context`` -- the descriptor loader resolves ``harnesses.json`` under
+    # the crew home, which does not reach the platform context (H3 is about the
+    # CONFIG load path; this is a separate file read at boot, not inside
+    # ``KiroCrewConfig.load``). Best-effort: a backend-registration failure must
+    # not abort boot -- the builtin harnesses keep serving, which is a startable
+    # deployment, and the provider factory still resolves.
     try:
         ctx.providers.register_acp_backends()
     except Exception:

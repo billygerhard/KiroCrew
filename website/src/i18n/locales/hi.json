@@ -6066,6 +6066,8 @@
       "session_control_ready": "तैयार",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "यह सत्र डिफ़ॉल्ट एजेंट ({{name}}) का अनुसरण करता है। इसका अपना कोई एजेंट नहीं है, इसलिए डिफ़ॉल्ट बदलने पर यह भी बदल जाता है। पिन करने के लिए क्लिक करें।",
+      "backend_fixed_at_creation": "बैकएंड यह चैट बनाते समय तय किया गया — नई चैट की स्वागत स्क्रीन पर बैकएंड चुनें।",
+      "backend_inherited_default": "यह चैट डिफ़ॉल्ट बैकएंड का अनुसरण करती है, इसलिए डिफ़ॉल्ट बदलने पर यह भी बदलती है। किसी एक को तय करने के लिए नई चैट की स्वागत स्क्रीन पर बैकएंड चुनें।",
       "model_inherited_default": "यह सत्र डिफ़ॉल्ट मॉडल ({{name}}) पर चलता है। इसका अपना कोई मॉडल नहीं है, इसलिए डिफ़ॉल्ट बदलने पर यह भी बदल जाता है। एक पिन करने के लिए क्लिक करें।"
     },
     "chatPane": {
@@ -8723,6 +8725,18 @@
       "label": "बदलाव के लिए पुनः आरंभ ज़रूरी",
       "tooltip": "{{productName}} चलते समय यह सेटिंग बदली नहीं जा सकती। सहेजा गया मान बना रहता है और {{productName}} के अगले पुनः आरंभ पर लागू होगा (सेटिंग्स → परिचय, या वह टर्मिनल जहाँ से तुमने इसे चलाया)।",
       "schema_unavailable": "यह जाँच नहीं हो सकी कि इस सेटिंग के लिए पुनः आरंभ आवश्यक है या नहीं।"
+    },
+    "backendSelector": {
+      "default_backend": "डिफ़ॉल्ट बैकएंड",
+      "backend_name": "बैकएंड: {{name}}",
+      "backend_list": "बैकएंड सूची",
+      "backend_list_unavailable": "बैकएंड सूची अनुपलब्ध",
+      "no_backends_registered": "कोई बैकएंड पंजीकृत नहीं",
+      "default": "डिफ़ॉल्ट",
+      "unroutable_see_settings": "चयन योग्य नहीं — सेटिंग्स → AI बैकएंड देखो",
+      "invalid_see_settings": "अमान्य — सेटिंग्स → AI बैकएंड देखो",
+      "backend_serving": "इस चैट का AI बैकएंड: {{name}} (डिफ़ॉल्ट का अनुसरण करता है)",
+      "backend_serving_pinned": "इस चैट का AI बैकएंड: {{name}} — चैट बनाते समय तय किया गया"
     }
   },
   "hooks": {
@@ -15434,6 +15448,24 @@
         "remove_confirm": "{{provider}} का OAuth ऐप हटाना है? क्लाइंट ID और सेव किया गया secret मिट जाएँगे, और दोबारा भरने तक {{provider}} कनेक्ट नहीं हो पाएगा।",
         "remove_confirm_action": "OAuth ऐप हटाएँ",
         "cancel": "रद्द करो"
+      },
+      "backendsPanel": {
+        "ai_backends": "AI बैकएंड",
+        "registered_backends": "पंजीकृत बैकएंड",
+        "backends_are_defined_in_config_and_need_a_restart": "बैकएंड {{productName}} होम डायरेक्टरी में harnesses.json (लेखन-सुरक्षित) में परिभाषित होते हैं, config.json के बगल में। बदलाव अगली gateway शुरुआत पर लागू होते हैं।",
+        "authoring_guide": "बैकएंड कैसे जोड़ें",
+        "change_default_in_developer": "डिफ़ॉल्ट बैकएंड बदलें: डेवलपर → एजेंट बैकएंड",
+        "backend_list_unavailable": "बैकएंड सूची अनुपलब्ध",
+        "no_backends_registered": "कोई बैकएंड पंजीकृत नहीं",
+        "badge_default": "डिफ़ॉल्ट",
+        "badge_unroutable": "चयन योग्य नहीं",
+        "badge_invalid": "अमान्य",
+        "badge_unverified": "रूटिंग सत्यापित नहीं",
+        "verify_routing": "रूटिंग सत्यापित करो",
+        "verifying": "सत्यापन हो रहा है…",
+        "verify_passed": "सत्यापित: हार्नेस ने कार्रवाई से पहले अनुमति माँगी और अस्वीकृति का सम्मान किया। अब इसे चैट के लिए चुना जा सकता है।",
+        "verify_violation": "सत्यापन विफल",
+        "verify_inconclusive": "कुछ सिद्ध नहीं हुआ"
       }
     },
     "settingsPage": {
@@ -16099,6 +16131,10 @@
       "connections": {
         "label": "OAuth ऐप",
         "description": "ऐसे प्रोवाइडर के लिए OAuth ऐप जिन्हें रजिस्टर किया गया क्लाइंट चाहिए"
+      },
+      "backends": {
+        "label": "AI बैकएंड",
+        "description": "इस बिल्ड में उपलब्ध AI बैकएंड और harnesses.json में परिभाषित बैकएंड की स्थिति"
       }
     },
     "secrets": {

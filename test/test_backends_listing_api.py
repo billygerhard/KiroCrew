@@ -1,0 +1,378 @@
+"""Unit tests for ``GET /api/backends`` (the per-chat backend picker's listing).
+
+Exercises the three arrays the composer and the Settings panel read: the
+selectable rows (id + label + which is the global default), the invalid operator
+descriptors (id -> reasons), and the unroutable ones (id -> reason). The
+operator-descriptor arrays are driven through the real boot-load against a temp
+``harnesses.json`` with a stub executable on PATH, exactly as
+``test_operator_harness_bootstrap`` does, so the endpoint is tested over the same
+registry state a real gateway would build.
+
+Every test restores the process-global registry state in a fixture (registered
+ids, the operator register, the selectable pair, the diagnostic maps) so one
+test's boot-load cannot leak into another.
+"""
+
+from __future__ import annotations
+
+import json
+import stat
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from kiro_crew.acp import harness as harness_pkg
+from kiro_crew.acp.harness import operator_registry as reg
+from kiro_crew.agent_sdk import backends as b
+from kiro_crew.dashboard.handlers.backends_listing import api_backends
+
+
+@pytest.fixture
+def clean_boot(tmp_path, monkeypatch):
+    """Snapshot/restore every registry surface the boot-load writes.
+
+    Pins ``KIROCREW_HOME`` so the routing-attestation store the selectability
+    gate reads is this test's own file.
+    """
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+    baseline = set(b._baseline)
+    selectable = set(b._selectable)
+    yield
+    b._reset_registered_backends()
+    harness_pkg._reset_operator_register()
+    reg._reset_operator_diagnostics()
+    b._baseline.clear()
+    b._baseline.update(baseline)
+    b._selectable.clear()
+    b._selectable.update(selectable)
+
+
+def _stub_executable(tmp_path, name="my-acp"):
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    exe = bindir / name
+    exe.write_text("#!/bin/sh\nexec cat\n", encoding="utf-8")
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return exe
+
+
+def _write_harnesses(tmp_path, mapping, *, attest: bool = True) -> str:
+    """Write the descriptor file; by default also record a routing attestation
+    for every valid routed entry, as a successful Verify would have (the
+    selectability gate needs the gateway's own evidence, not the declaration)."""
+    path = tmp_path / "harnesses.json"
+    path.write_text(json.dumps(mapping), encoding="utf-8")
+    if attest:
+        from kiro_crew.acp.harness.descriptor import descriptor_from_mapping
+        from kiro_crew.acp.harness.routing_verification import record_attestation
+
+        for harness_id, raw in mapping.items():
+            d, _ = descriptor_from_mapping(raw, harness_id=harness_id)
+            if d is not None and d.selectable:
+                record_attestation(d, mechanism=d.routing, evidence={"fixture": True})
+    return str(path)
+
+
+def _make_app(*, owner: bool = True) -> web.Application:
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.handlers.backends_listing import api_backend_verify
+
+    app = web.Application()
+    # The verify handler's owner predicate (kiro_prerequisite._is_dashboard_owner)
+    # reads ``state.owner_id`` and the request's signed identity; a non-owner test
+    # presents another caller.
+    app["state"] = SimpleNamespace(owner_id="owner", push_slots_update=lambda: None)
+
+    @web.middleware
+    async def _identity(request: web.Request, handler):
+        request["user"] = "owner" if owner else "someone-else"
+        request["app"] = ""
+        return await handler(request)
+
+    app.middlewares.append(_identity)
+    app.router.add_get("/api/backends", api_backends)
+    app.router.add_post("/api/backends/{id}/verify", api_backend_verify)
+    return app
+
+
+class TestBackendsEndpointShape:
+    """The payload shape every reader depends on."""
+
+    @pytest.mark.asyncio
+    async def test_returns_200_with_three_arrays(self) -> None:
+        """GET /api/backends is 200 JSON carrying backends/invalid/unroutable arrays."""
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/backends")
+            body = await resp.text()
+            assert resp.status == 200, f"expected 200, got {resp.status}: {body}"
+            assert "application/json" in resp.headers.get("Content-Type", "")
+            data = await resp.json()
+            for key in ("backends", "invalid", "unroutable"):
+                assert isinstance(data.get(key), list), f"{key} must be a list"
+
+    @pytest.mark.asyncio
+    async def test_every_selectable_row_has_id_label_and_default_flag(self) -> None:
+        """Each selectable row carries id, a non-empty label, and a bool default flag."""
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/backends")
+            data = await resp.json()
+            assert data["backends"], "the baseline build has at least kiro-cli selectable"
+            for row in data["backends"]:
+                assert set(row) == {"id", "label", "is_global_default"}
+                assert isinstance(row["id"], str)
+                assert row["label"], f"row {row['id']!r} must render a non-empty label"
+                assert isinstance(row["is_global_default"], bool)
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_global_default_and_it_is_selectable(self) -> None:
+        """The default resolves through the selectability gate, so it is always a row."""
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/backends")
+            data = await resp.json()
+            defaults = [r for r in data["backends"] if r["is_global_default"]]
+            assert len(defaults) == 1, f"expected one default, got {defaults}"
+
+    @pytest.mark.asyncio
+    async def test_rows_match_the_single_selectability_owner(self) -> None:
+        """The listing's ids are exactly ``selectable_backend_values`` (H4: one gate)."""
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/backends")
+            data = await resp.json()
+            ids = [r["id"] for r in data["backends"]]
+            assert ids == b.selectable_backend_values()
+
+
+class TestBackendsEndpointDiagnostics:
+    """The invalid / unroutable arrays, driven through the real boot-load."""
+
+    @pytest.mark.asyncio
+    async def test_valid_routed_descriptor_appears_as_a_selectable_row(
+        self, clean_boot, tmp_path
+    ) -> None:
+        """A routed operator descriptor shows up in ``backends`` with its display name."""
+        exe = _stub_executable(tmp_path)
+        path = _write_harnesses(
+            tmp_path,
+            {
+                "my-acp": {
+                    "id": "my-acp",
+                    "display_name": "My ACP",
+                    "executable": str(exe),
+                    "argv": ["{executable}", "serve"],
+                    "agent_args": ["--agent", "{agent}"],
+                    "routing": "agent_spec",
+                }
+            },
+        )
+        reg.load_and_register_operator_descriptors(path=path)
+        async with TestClient(TestServer(_make_app())) as client:
+            data = await (await client.get("/api/backends")).json()
+        row = next((r for r in data["backends"] if r["id"] == "my-acp"), None)
+        assert row is not None, "the routed descriptor must be offered"
+        assert row["label"] == "My ACP"
+        assert row["is_global_default"] is False
+        # Not misfiled into either diagnostic array.
+        assert all(r["id"] != "my-acp" for r in data["invalid"])
+        assert all(r["id"] != "my-acp" for r in data["unroutable"])
+
+    @pytest.mark.asyncio
+    async def test_unroutable_descriptor_appears_in_unroutable_with_reason(
+        self, clean_boot, tmp_path
+    ) -> None:
+        """A descriptor with no recognized routing is unroutable, not selectable."""
+        exe = _stub_executable(tmp_path, name="no-route")
+        path = _write_harnesses(
+            tmp_path,
+            {
+                "no-route": {
+                    "id": "no-route",
+                    "display_name": "No Route",
+                    "executable": str(exe),
+                    "argv": ["{executable}"],
+                    # routing omitted -> valid but unselectable
+                }
+            },
+        )
+        reg.load_and_register_operator_descriptors(path=path)
+        async with TestClient(TestServer(_make_app())) as client:
+            data = await (await client.get("/api/backends")).json()
+        row = next((r for r in data["unroutable"] if r["id"] == "no-route"), None)
+        assert row is not None, "the unroutable descriptor must be listed with a reason"
+        assert row["reason"], "an unroutable row must carry a reason"
+        assert row["label"] == "No Route"
+        assert all(r["id"] != "no-route" for r in data["backends"])
+
+    @pytest.mark.asyncio
+    async def test_malformed_descriptor_appears_in_invalid_with_reasons(
+        self, clean_boot, tmp_path
+    ) -> None:
+        """A malformed entry lands in ``invalid`` (reasons list) and nowhere else."""
+        exe = _stub_executable(tmp_path)
+        path = _write_harnesses(
+            tmp_path,
+            {
+                "bad-one": {
+                    # No executable/argv -> fails validation.
+                    "id": "bad-one",
+                    "agent_args": ["--agent", "{agent}"],
+                    "routing": "agent_spec",
+                },
+                "good-one": {
+                    "id": "good-one",
+                    "executable": str(exe),
+                    "argv": ["{executable}"],
+                    "agent_args": ["--agent", "{agent}"],
+                    "routing": "agent_spec",
+                },
+            },
+        )
+        reg.load_and_register_operator_descriptors(path=path)
+        async with TestClient(TestServer(_make_app())) as client:
+            data = await (await client.get("/api/backends")).json()
+        bad = next((r for r in data["invalid"] if r["id"] == "bad-one"), None)
+        assert bad is not None, "the malformed descriptor must be recorded invalid"
+        assert isinstance(bad["reasons"], list) and bad["reasons"], "invalid rows carry reasons"
+        # The bad one costs only its own row: the sibling still becomes selectable.
+        assert any(r["id"] == "good-one" for r in data["backends"])
+        assert all(r["id"] != "bad-one" for r in data["backends"])
+
+
+class TestBackendVerifyEndpoint:
+    """``POST /api/backends/{id}/verify``: the operator's one path to selectability."""
+
+    _ROUTED = {
+        "my-acp": {
+            "id": "my-acp",
+            "display_name": "My ACP",
+            "executable": "/opt/my-acp",
+            "argv": ["{executable}", "serve"],
+            "agent_args": ["--agent", "{agent}"],
+            "routing": "agent_spec",
+        }
+    }
+
+    @pytest.mark.asyncio
+    async def test_an_unverified_descriptor_is_listed_unroutable_and_verifiable(
+        self, clean_boot, tmp_path
+    ) -> None:
+        from kiro_crew.acp.harness.routing_verification import UNVERIFIED_REASON
+
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(tmp_path, self._ROUTED, attest=False)
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            data = await (await client.get("/api/backends")).json()
+        assert all(r["id"] != "my-acp" for r in data["backends"])
+        row = next(r for r in data["unroutable"] if r["id"] == "my-acp")
+        assert row["reason"] == UNVERIFIED_REASON
+        assert row["verifiable"] is True
+        # A descriptor with no routing at all is unroutable but NOT verifiable.
+        reg._reset_operator_diagnostics()
+        b._reset_registered_backends()
+        harness_pkg._reset_operator_register()
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(
+                tmp_path, {"no-route": {"executable": "/opt/x", "argv": ["{executable}"]}}
+            )
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            data = await (await client.get("/api/backends")).json()
+        assert next(r for r in data["unroutable"] if r["id"] == "no-route")["verifiable"] is False
+
+    @pytest.mark.asyncio
+    async def test_verify_is_owner_gated_and_audited(self, clean_boot, tmp_path, monkeypatch):
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(tmp_path, self._ROUTED, attest=False)
+        )
+        async with TestClient(TestServer(_make_app(owner=False))) as client:
+            resp = await client.post("/api/backends/my-acp/verify")
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "dashboard_owner_required"
+
+    @pytest.mark.asyncio
+    async def test_verify_refuses_an_id_with_no_pending_claim(self, clean_boot, tmp_path):
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(tmp_path, self._ROUTED)  # attested -> already selectable
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            for bad in ("claude", "nope", "my-acp"):
+                resp = await client.post(f"/api/backends/{bad}/verify")
+                assert resp.status == 404, bad
+                assert (await resp.json())["code"] == "unknown_operator_backend"
+
+    @pytest.mark.asyncio
+    async def test_a_verified_probe_makes_the_row_selectable_without_a_restart(
+        self, clean_boot, tmp_path, monkeypatch
+    ) -> None:
+        from kiro_crew.acp.harness import routing_verification as rv
+        from kiro_crew.dashboard.handlers import backends_listing as bl
+
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(tmp_path, self._ROUTED, attest=False)
+        )
+
+        async def fake_verify(descriptor, factory, **kw):
+            assert descriptor.id == "my-acp"
+            return rv.RoutingVerification(
+                rv.VERDICT_VERIFIED, "asked once", permission_requests=1, elapsed_secs=1.0
+            )
+
+        monkeypatch.setattr(rv, "verify_routing", fake_verify)
+        # The handler builds the production factory from config; keep the test off
+        # the real loader.
+        monkeypatch.setattr(bl, "_snapshot", bl._snapshot)
+        import kiro_crew.config.loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "build_provider_factory", lambda cfg: object())
+        from kiro_crew import config as config_pkg
+
+        class _Cfg:
+            agent = type("A", (), {"acp_backend": ""})()
+
+        monkeypatch.setattr(config_pkg.KiroCrewConfig, "load", staticmethod(lambda: _Cfg()))
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post("/api/backends/my-acp/verify")
+            body = await resp.json()
+            assert resp.status == 200, body
+            assert body["verdict"] == "verified" and body["verified"] is True
+            assert body["selectable"] is True
+            data = await (await client.get("/api/backends")).json()
+        assert any(r["id"] == "my-acp" for r in data["backends"])
+        assert all(r["id"] != "my-acp" for r in data["unroutable"])
+        assert rv.is_attested(reg.registered_operator_descriptor("my-acp")) is True
+        # A second verify has nothing pending to settle.
+        async with TestClient(TestServer(_make_app())) as client:
+            assert (await client.post("/api/backends/my-acp/verify")).status == 404
+
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_probe_records_nothing(self, clean_boot, tmp_path, monkeypatch):
+        from kiro_crew.acp.harness import routing_verification as rv
+
+        reg.load_and_register_operator_descriptors(
+            path=_write_harnesses(tmp_path, self._ROUTED, attest=False)
+        )
+
+        async def fake_verify(descriptor, factory, **kw):
+            return rv.RoutingVerification(rv.VERDICT_INCONCLUSIVE, "nothing attempted")
+
+        monkeypatch.setattr(rv, "verify_routing", fake_verify)
+        import kiro_crew.config.loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "build_provider_factory", lambda cfg: object())
+        from kiro_crew import config as config_pkg
+
+        class _Cfg:
+            agent = type("A", (), {"acp_backend": ""})()
+
+        monkeypatch.setattr(config_pkg.KiroCrewConfig, "load", staticmethod(lambda: _Cfg()))
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post("/api/backends/my-acp/verify")
+            body = await resp.json()
+        assert resp.status == 200
+        assert body["verdict"] == "inconclusive" and body["selectable"] is False
+        assert "my-acp" not in b.selectable_backends()
+        assert rv.load_attestations() == {}

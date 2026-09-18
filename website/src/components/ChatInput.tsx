@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Cpu, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -523,6 +523,19 @@ interface ChatInputProps {
    * gets it; a pinned chip has nothing to explain. */
   agentIsInheritedDefault?: boolean
   agentSource?: string
+  /** Bound-backend display name for the shelf chip. Empty/absent hides the
+   *  chip. The chip opens no picker: the backend picker lives on the welcome
+   *  screen and the binding is immutable after creation, so a click only
+   *  explains that. */
+  backendLabel?: string
+  /** Tooltip/aria text for the backend chip (pinned vs resolved-default variant). */
+  backendTitle?: string
+  /**
+   * True when `backendLabel` is the backend an INHERITING slot resolves to (the
+   * configured default), not a per-chat pin. The click-to-explain caption then
+   * says the chat follows the default (and changes if it does) instead of
+   * claiming a pin was fixed at creation. */
+  backendIsInheritedDefault?: boolean
   modelName?: string
   /**
    * True when `modelName` is the model an INHERITING slot actually runs on (the
@@ -949,6 +962,9 @@ function ChatInput({
   modelIsInheritedDefault,
   modelIsJevRouted,
   agentSource,
+  backendLabel,
+  backendTitle,
+  backendIsInheritedDefault,
   modelName,
   onAgentClick,
   onModelClick,
@@ -1081,6 +1097,9 @@ function ChatInput({
   // Non-null while the last approval decision failed. Rendered as a one-line
   // strip under the composer; auto-clears so it cannot become permanent chrome.
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
+  // Backend chip: whether the "fixed when the chat was created" caption is
+  // showing. Toggled by clicking the chip, which otherwise has no action.
+  const [backendChipExplained, setBackendChipExplained] = useState(false)
   // The same notice slot carries two different things: STATUS about an
   // approval that expired (nothing failed on our side) and a FAILED decision
   // submit (a rejected request). Only the latter is an error surface.
@@ -4993,6 +5012,56 @@ function ChatInput({
           </div>
           )}
           </div>
+          {!!backendLabel && (
+            /* Backend chip: names the AI backend serving this chat. The binding is
+               immutable after creation (the picker lives on the welcome screen),
+               so this does not open a picker -- it must not look like the chips
+               that do, and it must still answer a click: a click toggles the
+               explanation (role=status, so AT hears it) instead of leaving it
+               tooltip-only. Visually: lock glyph + dotted underline + help cursor,
+               no hover fill.
+
+               It lives in its OWN separated region, exactly as the app
+               session-controls group does and for the same rule:
+               `max-two-buttons-per-row` caps a horizontal group at 2 action
+               controls and forbids the grandfathered agent/project group from
+               growing. The leading divider makes this a distinct visual group
+               (the rule's stated exemption), and `relative` is the positioning
+               context for the explanation bubble. */
+            <div className="relative flex items-center shrink-0 pl-2 border-l border-border">
+              <button
+                type="button"
+                data-testid="chat-input-backend-chip"
+                className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md text-muted bg-transparent border-none cursor-help decoration-dotted underline-offset-2 hover:underline"
+                title={backendTitle || backendLabel}
+                aria-label={backendTitle || backendLabel}
+                aria-expanded={backendChipExplained}
+                onClick={() => setBackendChipExplained(v => !v)}
+              >
+                <Cpu size={13} className="shrink-0 opacity-70" />
+                {!shelfCompact && <span className="truncate min-w-0 max-w-[160px]">{backendLabel}</span>}
+                {/* The lock says "pinned"; an inheriting chat floats with the
+                    default, so it gets no lock -- glyph and caption must agree. */}
+                {!backendIsInheritedDefault && <Lock size={10} className="shrink-0 opacity-60" aria-hidden />}
+              </button>
+              {backendChipExplained && (
+                /* Anchored ABOVE the region, right-aligned to it: this region
+                   sits at the shelf's right side, so anchoring on its RIGHT edge
+                   keeps the bubble inside the composer. Width is capped at 320px
+                   and at the viewport minus the composer inset, so a 320px
+                   viewport gets a bubble that fits instead of clipping. */
+                <span
+                  role="status"
+                  data-testid="chat-input-backend-chip-explained"
+                  className="absolute bottom-full right-0 mb-1.5 z-20 w-[min(320px,calc(100vw-2rem))] px-2.5 py-2 rounded-lg bg-bg-elevated border border-border shadow-xl text-[11px] text-muted leading-snug whitespace-normal"
+                >
+                  {backendIsInheritedDefault
+                    ? i18nT('components.chatInput.backend_inherited_default')
+                    : i18nT('components.chatInput.backend_fixed_at_creation')}
+                </span>
+              )}
+            </div>
+          )}
           <div className="flex items-center shrink-0">
           {contextPct != null && (() => {
             const pct = Math.round(contextPct)
