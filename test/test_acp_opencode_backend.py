@@ -619,8 +619,10 @@ def test_a_successful_load_is_adopted_without_a_modes_block() -> None:
 
     assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_LOAD_WITHOUT_MODES
     body = inspect.getsource(AcpClient._initialize_session)
+    # The gate reads membership through the derived accessor (frozen vocabulary plus
+    # config-authored claims), so the spelling it must carry is the accessor's.
     assert (
-        '"modes" in load_resp or self.backend in ACP_BACKENDS_LOAD_WITHOUT_MODES' in body
+        '"modes" in load_resp or self.backend in load_without_modes_backends()' in body
     ), "a successful opencode load must be adopted even though it carries no modes"
 
 
@@ -636,7 +638,7 @@ def test_a_resumed_session_is_not_gated_on_a_kiro_transcript() -> None:
     assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
     body = inspect.getsource(AcpClient._initialize_session)
     assert (
-        "self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS" in body
+        "self.backend in harness_owned_sessions_backends()" in body
     ), "the resume pre-check must be a membership test, not a chain of identities"
     # The resume gate itself must carry no identity test. The ONE identity branch
     # this path legitimately holds is the per-harness MCP-array splice, which every

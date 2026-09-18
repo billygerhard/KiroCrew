@@ -153,7 +153,17 @@ export const CHUNK_BUDGETS = {
   // ceiling left at 0.04% headroom fails on the next feature's ordinary strings
   // rather than on the new library it exists to catch. Back to the 5% convention
   // over the measured size.
-  t: 905 * KB, // measured 862.2 KB on this branch rebased onto 1c7f963706 (~5% headroom)
+  // Re-measured 2026-09-22 on the config-defined-backends branch (#11863) rebased
+  // onto main @ 64f3b58119: main's catalogs ALONE now build the chunk at 926,128 B
+  // (904.4 KB) against the 905 KB ceiling -- 592 B left, or 0.06% headroom,
+  // three days after the ceiling was set. With this feature's copy it builds at
+  // 927,587 B (905.8 KB), 867 B over. The delta this branch owns is measured the
+  // same way as above (main's tree vs this tree, same node_modules): 1,459 B for
+  // its per-chat-backend copy across the 11 translated catalogs plus `en-XA`.
+  // Still 12 modules, no new dependency, no lazy boundary available for a
+  // catalog string. Fifth documented instance of the same drift. Back to the 5%
+  // convention over the measured size.
+  t: 951 * KB, // measured 905.8 KB on this branch rebased onto 64f3b58119 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -226,6 +236,13 @@ export const CHUNK_BUDGETS = {
   // covers every part -- main's drift and each surface's own cost -- with the ~5%
   // margin the lines above prescribe, so ordinary first-party growth does not
   // re-trip this entry within days.
+  // The per-chat backend surface (#11863) -- the read-only composer chip, the
+  // Welcome-view pick wiring and the slot field it reads -- adds 4,581 B of
+  // first-party app-core code on top of main (the picker's own dropdown,
+  // `BackendSelector`, is behind a lazy boundary in WelcomeView and is not in
+  // this chunk). Its merge result builds inside the ceiling above, so the
+  // number does not move for it; the cost is recorded here so the next
+  // re-measure can attribute the chunk's growth.
   App: 3714 * KB, // measured 3,641,334 B with all three surfaces (4.25% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)

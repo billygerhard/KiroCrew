@@ -52,9 +52,9 @@ from dataclasses import dataclass
 
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import (
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_INLINE_COMPACTION,
+    advertised_model_selection_backends,
     model_registry_namespace,
 )
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
@@ -146,7 +146,7 @@ def capabilities_for(backend: str) -> SessionCapabilities:
         backend=backend,
         provider_seam=(PROVIDER_CLAUDE_CODE if is_claude_backend_name(backend) else PROVIDER_ACP),
         model_id_namespace=model_registry_namespace(backend),
-        resolves_model_from_advertised_list=backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+        resolves_model_from_advertised_list=backend in advertised_model_selection_backends(),
         effort_via_config_option=backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
         compacts_inline=backend in ACP_BACKENDS_INLINE_COMPACTION,
     )

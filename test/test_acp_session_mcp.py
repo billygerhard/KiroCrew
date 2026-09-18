@@ -656,9 +656,12 @@ class TestClientSeam:
         client = self._seeded(tmp_path, agent="kirocrew")
         assert client._session_mcp_servers() == []
 
-        # Set widened, no mirror registered -> still nothing. Fail-closed.
+        # Set widened, no mirror registered -> still nothing. Fail-closed. The
+        # client reads membership through the derived accessor (frozen vocabulary
+        # plus registered claims), so widening happens at THAT seam -- the same one
+        # a config-authored descriptor's ``capabilities`` claim grows.
         monkeypatch.setattr(
-            client_mod, "ACP_BACKENDS_SESSION_MCP_ARRAY", frozenset({client.backend})
+            client_mod, "session_mcp_array_backends", lambda: frozenset({client.backend})
         )
         client._reset_state()
         client._write_claude_local_settings()  # reset ends the session's ownership

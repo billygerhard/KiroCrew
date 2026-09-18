@@ -25,6 +25,9 @@ _TO_DICT_KEYS = (
     # Present on EVERY slot, so an absent key and "pinned by hand" are not the
     # same reading for a stale client.
     "jev_route",
+    # W3 (descriptor-harness): the slot's per-chat backend pick rides to_dict
+    # beside model — same facade contract, one new key.
+    "acp_backend",
     "model_withheld",
     "served_model",
     "reasoning_effort",

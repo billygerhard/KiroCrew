@@ -1,10 +1,44 @@
 """Model-only solo admission: concrete reasons or a different configured worker.
 
-The MCP process knows task count; the gateway compares parent identity. Legacy
-bulk_data/fresh_context and named-worker payloads keep their compatibility.
-New reasons require an evidence description. These checks validate structure and
-runtime capability, never semantic value, independence or user authorization.
-Programmatic callers without the solo marker retain the existing API contract.
+``spawn_run`` / ``spawn_sub_agents`` carry a textual gate in their descriptions
+("2+ independent tasks, bulk data, or a different agent/model -- otherwise do
+it yourself"). Text is advice, and the base prompt's "delegate to a sub-agent"
+kept winning against it: a single investigation, a single fix, a single review
+each spawned one sub-agent for no parallelism gain. This module is the
+MECHANICAL half of that gate, and it is a handshake rather than a wall:
+
+1. A call that spawns exactly ONE task, names no ``solo_reason``, and asks for
+   no model / agent / crew / backend other than the caller's own is REFUSED with
+   a question -- can the caller do this itself? -- and nothing is spawned.
+2. The caller either does the work in its own session, or calls again with a
+   ``solo_reason`` from :data:`SOLO_SPAWN_REASONS`, or names a genuinely
+   different model / agent / crew / backend. Only then does the spawn proceed.
+
+The reasons are a closed vocabulary on purpose. A free-text "why" or a bare
+``confirm=true`` is rubber-stamped by the second call; a menu that does NOT
+contain "to preserve context" or "investigation" makes the caller pick a
+reason it can defend, and the reason travels into the audit log on both hosts
+and, for ``spawn_run``, into the spawn line the user reads (``spawn_sub_agents``
+returns the collected results as JSON and adds no such line).
+
+Two halves, two hosts:
+
+* :func:`solo_spawn_refusal` runs in the MCP tool process, which is the only
+  place the task COUNT is known (the gateway sees one POST per task). It knows
+  whether a model / agent / crew was NAMED, not whether it differs from the
+  caller's own, so it lets a named one through.
+* :func:`solo_spawn_difference` runs in the gateway, which knows the
+  parent session's resolved agent template, its member selection and (for a
+  dashboard slot) its model, and catches the call that named the caller's OWN
+  agent, model or crew to slip past the tool-side check. It answers with the
+  GROUND on which the named value differs, so the gateway audits every
+  outcome -- refused, let through on a reason, let through on a difference.
+  It fails OPEN when a parent fact is unknown: an un-comparable value never
+  refuses a spawn that the tool side let through.
+
+Programmatic clients (the SDK, apps posting to ``/api/spawn`` directly) are
+not gated: they do not send the ``solo`` marker, and the gate is about a
+model's decision, not an app's.
 """
 
 from __future__ import annotations
@@ -94,7 +128,7 @@ def solo_spawn_question(*, tool: str = "spawn_run") -> str:
     if tool == "spawn_sub_agents":
         differs = "an agent_or_mode that differs from your own"
     else:
-        differs = "a model, agent or crew that differs from your own"
+        differs = "a model, agent, crew or backend that differs from your own"
     return (
         "Error: solo spawn refused -- one task, no solo_reason, and nothing "
         "that differs from this session. Can you do this task yourself, here, "
@@ -112,20 +146,23 @@ def solo_spawn_refusal(
     model: str = "",
     agent: str = "",
     crew: str = "",
+    backend: str = "",
     tool: str = "spawn_run",
 ) -> str | None:
     """Tool-side gate: the refusal text, or ``None`` when the spawn may proceed.
 
     Refuses exactly the call that is one task, gives no reason, and names no
-    model / agent / crew at all. A NAMED one passes here because this process
-    cannot tell it from the caller's own; :func:`solo_spawn_difference` on
-    the gateway can, and does.
+    model / agent / crew / backend at all. A NAMED one passes here because this
+    process cannot tell it from the caller's own; :func:`solo_spawn_difference`
+    on the gateway can, and does. ``backend`` is the same class of difference
+    as ``model``: a run on another harness is not a round-trip the caller could
+    have made itself.
     """
     if task_count != 1:
         return None
     if solo_reason:
         return None
-    if _named_model(model) or agent or crew:
+    if _named_model(model) or agent or crew or backend:
         return None
     return solo_spawn_question(tool=tool)
 
@@ -180,6 +217,45 @@ def parent_slot_model(state: Any, parent_session: str) -> str:
     return "" if not isinstance(model, str) or model in _UNKNOWN_MODEL else model
 
 
+def parent_slot_backend(state: Any, parent_session: str) -> str:
+    """The backend a dashboard parent slot EFFECTIVELY runs on, or ``""`` when
+    unknown.
+
+    A slot's own ``acp_backend`` pin wins; an unpinned slot runs on the
+    deployment default (``agent.acp_backend``), which is what the provider
+    factory resolves for it. The kiro default is the empty string on the wire,
+    so ``""`` here is ambiguous between "kiro" and "unknown"; the caller treats
+    both as un-comparable and fails OPEN, exactly as :func:`parent_slot_model`
+    does for an unpinned model.
+    """
+    slots = getattr(state, "_slots", None) or {}
+    try:
+        # circular import: chat_utils imports dashboard.state, which reaches
+        # validation.py, which imports this module.
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        slot = next(
+            (slot for slot in slots.values() if effective_session_key(slot) == parent_session),
+            None,
+        )
+    except Exception:  # noqa: BLE001 - identity check is best-effort
+        return ""
+    if slot is None:
+        return ""
+    pinned = getattr(slot, "acp_backend", "") or ""
+    if isinstance(pinned, str) and pinned:
+        return pinned
+    try:
+        # Deferred: config sits below this module in the layering and a load
+        # here must never break the gate (fail open on any error).
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        default = KiroCrewConfig.load().agent.acp_backend
+    except Exception:  # noqa: BLE001 - unknown default, compare nothing
+        return ""
+    return default if isinstance(default, str) else ""
+
+
 def solo_spawn_difference(
     state: Any,
     parent_session: str,
@@ -187,16 +263,17 @@ def solo_spawn_difference(
     agent: str = "",
     model: str = "",
     crew: str = "",
+    backend: str = "",
 ) -> str:
     """Gateway roster check: on what ground is the requested agent / model /
-    crew NOT the parent's own?
+    crew / backend NOT the parent's own?
 
-    Returns the ground -- ``"crew"``, ``"agent"`` or ``"model"``, suffixed with
-    ``" (parent unknown)"`` when the parent fact could not be compared and the
-    check fails OPEN -- so the gateway can audit WHY a lone spawn was let
-    through. Returns ``""`` only when every value the caller named is the
-    parent's own, which is the case the tool-side check cannot see and the
-    reason this half exists.
+    Returns the ground -- ``"crew"``, ``"agent"``, ``"model"`` or
+    ``"backend"``, suffixed with ``" (parent unknown)"`` when the parent fact
+    could not be compared and the check fails OPEN -- so the gateway can audit
+    WHY a lone spawn was let through. Returns ``""`` only when every value the
+    caller named is the parent's own, which is the case the tool-side check
+    cannot see and the reason this half exists.
 
     ``agent`` is a provider template id and is compared against the parent's
     RESOLVED template (``sessions.get_agent``), never against its member
@@ -239,4 +316,10 @@ def solo_spawn_difference(
             return "model (parent unknown)"
         if _canonical_model(model) != _canonical_model(parent_model):
             return "model"
+    if backend:
+        parent_backend = parent_slot_backend(state, parent_session)
+        if not parent_backend:
+            return "backend (parent unknown)"
+        if backend != parent_backend:
+            return "backend"
     return ""

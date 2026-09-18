@@ -5971,6 +5971,8 @@
       "session_control_ready": "準備完了",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "このセッションはデフォルトエージェント（{{name}}）に従います。独自のエージェントを持たないため、デフォルトが変わると変わります。固定するにはクリックしてください。",
+      "backend_fixed_at_creation": "バックエンドはこのチャットの作成時に固定されています。バックエンドは新しいチャットのウェルカム画面で選択してください。",
+      "backend_inherited_default": "このチャットは既定のバックエンドに従うため、既定が変わると一緒に変わります。固定するには、新しいチャットのウェルカム画面でバックエンドを選択してください。",
       "model_inherited_default": "このセッションはデフォルトモデル（{{name}}）で動作します。独自のモデルを持たないため、デフォルトが変わると変わります。固定するにはクリックしてください。"
     },
     "chatPane": {
@@ -8605,6 +8607,18 @@
       "label": "変更には再起動が必要",
       "tooltip": "この設定は {{productName}} の実行中には変更できません。保存した値は保持され、次に {{productName}} を再起動したときに適用されます（設定 → バージョン情報、または起動したターミナルから）。",
       "schema_unavailable": "この設定に再起動が必要かどうかを確認できませんでした。"
+    },
+    "backendSelector": {
+      "default_backend": "既定のバックエンド",
+      "backend_name": "バックエンド: {{name}}",
+      "backend_list": "バックエンド一覧",
+      "backend_list_unavailable": "バックエンド一覧を取得できません",
+      "no_backends_registered": "登録されたバックエンドがありません",
+      "default": "既定",
+      "unroutable_see_settings": "選択不可 — 設定 → AI バックエンドを参照",
+      "invalid_see_settings": "無効 — 設定 → AI バックエンドを参照",
+      "backend_serving": "このチャットの AI バックエンド: {{name}}（既定に従います）",
+      "backend_serving_pinned": "このチャットの AI バックエンド: {{name}} — チャット作成時に固定されます"
     }
   },
   "hooks": {
@@ -15203,6 +15217,18 @@
         "remove_confirm": "{{provider}} の OAuth アプリを削除しますか？クライアント ID と保存済みのシークレットが削除され、再入力するまで {{provider}} は接続できません。",
         "remove_confirm_action": "OAuth アプリを削除",
         "cancel": "キャンセル"
+      },
+      "backendsPanel": {
+        "ai_backends": "AI バックエンド",
+        "registered_backends": "登録済みのバックエンド",
+        "backends_are_defined_in_config_and_need_a_restart": "バックエンドは {{productName}} のホームディレクトリにある harnesses.json（書き込み保護）で定義します。config.json と同じ場所です。変更は次回の gateway 起動時に適用されます。",
+        "authoring_guide": "バックエンドを追加する方法",
+        "change_default_in_developer": "既定のバックエンドを変更するには デベロッパー → エージェントバックエンド",
+        "backend_list_unavailable": "バックエンド一覧を取得できません",
+        "no_backends_registered": "登録されたバックエンドがありません",
+        "badge_default": "既定",
+        "badge_unroutable": "選択不可",
+        "badge_invalid": "無効"
       }
     },
     "settingsPage": {
@@ -15868,6 +15894,10 @@
       "connections": {
         "label": "OAuth アプリ",
         "description": "登録済みクライアントが必要なプロバイダー向けの OAuth アプリ"
+      },
+      "backends": {
+        "label": "AI バックエンド",
+        "description": "このビルドが提供する AI バックエンドと、harnesses.json で定義されたバックエンドの状態"
       }
     },
     "secrets": {

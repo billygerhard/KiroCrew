@@ -1,8 +1,13 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, lazy, Suspense } from 'react'
 import { createPortal } from 'react-dom'
 import { EyeOff, Ghost, RefreshCw, Undo2, VenetianMask } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { KiroGhost } from './KiroGhost'
+// Lazy on purpose (same boundary SessionAutomationPopover takes in ChatInput):
+// the picker and its useBackends fetch hook render only on the welcome screen,
+// and a static import lands them in the App chunk on every page load. The App
+// chunk sits at its per-chunk budget, so the cold path pays for itself.
+const BackendSelector = lazy(() => import('./BackendSelector'))
 import { useTheme } from '../hooks/useTheme'
 import { getThemeBranding } from '../themeBranding'
 import { api } from '../api/client'
@@ -13,6 +18,11 @@ interface WelcomeViewProps {
   setInput: (v: string) => void
   memoryMode?: string
   onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void
+  /** The pending backend pick for the next new chat (`''` = inherit the default).
+   *  When `onSelectBackend` is also given, the welcome surface renders a
+   *  BackendSelector so a new chat can choose its harness before the first send. */
+  backend?: string
+  onSelectBackend?: (id: string) => void
 }
 
 function SuggestedPills({ setInput }: { setInput: (v: string) => void }) {
@@ -78,6 +88,8 @@ export default function WelcomeView({
   setInput,
   memoryMode,
   onSwitchMode,
+  backend,
+  onSelectBackend,
 }: WelcomeViewProps) {
   const [anonOpen, setAnonOpen] = useState(false)
   const anonBtnRef = useRef<HTMLButtonElement>(null)
@@ -184,6 +196,15 @@ export default function WelcomeView({
             document.body
           )}
         </>
+      )}
+      {mode !== 'orchestrator' && onSelectBackend && (
+        // The new-chat backend (ACP harness) picker. Only rendered when the host
+        // supplies a handler, so surfaces that do not thread a pending pick (or a
+        // build with no selectable backends beyond the default) render nothing
+        // extra. The pick flows into createChatSlot on the first send.
+        <Suspense fallback={null}>
+          <BackendSelector value={backend ?? ''} onSelect={onSelectBackend} />
+        </Suspense>
       )}
       {mode !== 'orchestrator' && <SuggestedPills setInput={setInput} />}
     </div>
