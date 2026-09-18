@@ -1829,6 +1829,8 @@
       "drop_to_attach": "Drop to attach",
       "agent": "Agent: {{name}}",
       "agent_inherited_default": "This session follows the default agent ({{name}}). It has no agent of its own, so it changes if the default does. Click to pin one.",
+      "backend_fixed_at_creation": "Fixed when this chat was created — pick a backend on the Welcome screen of a new chat.",
+      "backend_inherited_default": "This chat follows the default backend, so it changes if the default does. To pin one, pick a backend on the Welcome screen of a new chat.",
       "model_inherited_default": "This session runs on the default model ({{name}}). It has no model of its own, so it changes if the default does. Click to pin one.",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
       "branch": "Branch: {{branch}}",
@@ -3362,6 +3364,18 @@
     },
     "modelDropdownList": {
       "auto_jev": "Auto (Jev)"
+    },
+    "backendSelector": {
+      "default_backend": "Default backend",
+      "backend_name": "Backend: {{name}}",
+      "backend_list": "Backend list",
+      "backend_list_unavailable": "Backend list unavailable",
+      "no_backends_registered": "No backends registered",
+      "default": "Default",
+      "unroutable_reason": "Not selectable: {{reason}}",
+      "invalid_reason": "Invalid: {{reason}}",
+      "backend_serving": "AI backend serving this chat",
+      "backend_serving_pinned": "AI backend serving this chat — fixed when the chat was created"
     }
   },
   "hooks": {
@@ -6815,6 +6829,18 @@
         "remove_confirm": "Remove the {{provider}} OAuth app? The client ID and the stored secret are deleted, and {{provider}} cannot connect until you enter them again.",
         "remove_confirm_action": "Remove OAuth app",
         "cancel": "Cancel"
+      },
+      "backendsPanel": {
+        "ai_backends": "AI Backends",
+        "registered_backends": "Registered backends",
+        "backends_are_defined_in_config_and_need_a_restart": "Backends are defined in harnesses.json in the {{productName}} home directory, next to config.json (write-protected). Edits apply on the next gateway start.",
+        "authoring_guide": "How to add a backend",
+        "backend_list_unavailable": "Backend list unavailable",
+        "no_backends_registered": "No backends registered",
+        "badge_selectable": "Selectable",
+        "badge_default": "Default",
+        "badge_unroutable": "Not selectable",
+        "badge_invalid": "Invalid"
       }
     },
     "worldsPage": {
@@ -7083,6 +7109,10 @@
       "connections": {
         "label": "OAuth Apps",
         "description": "OAuth apps for providers that need a registered client"
+      },
+      "backends": {
+        "label": "AI Backends",
+        "description": "The AI backends this build offers, and the status of backends defined in harnesses.json"
       }
     }
   },

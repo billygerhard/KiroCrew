@@ -782,7 +782,11 @@ class TestSpawnMasks:
                 harness_mod.acp_tool_gate, "adapter_expose_files", return_value=("/h/.aws/config",)
             ) as expose,
         ):
-            hidden, exposed = await harness_mod.resolve_spawn_masks("standard")
+            # resolve_spawn_masks now takes the backend id first (W2: the same
+            # enforcement path serves codex and a session_config DescriptorHarness),
+            # so codex passes its own id -- which the preflight assertion above
+            # still checks is ACP_BACKEND_CODEX.
+            hidden, exposed = await harness_mod.resolve_spawn_masks(ACP_BACKEND_CODEX, "standard")
         assert hidden == ("/h/.aws",)
         assert exposed == ("/h/.aws/config",)
         # Projected over the mask just resolved, never a re-derived one -- re-deriving
@@ -799,7 +803,8 @@ class TestSpawnMasks:
 
         with patch.object(client_mod, "_run_preflight_bounded", new=_refuse):
             with pytest.raises(RuntimeError, match="sandbox floor refused"):
-                await harness_mod.resolve_spawn_masks("off")
+                # backend id first (W2 signature change); codex passes its own.
+                await harness_mod.resolve_spawn_masks(ACP_BACKEND_CODEX, "off")
 
     @pytest.mark.asyncio
     async def test_the_spawn_refuses_a_tier_that_would_drop_the_mask(self):
@@ -856,7 +861,10 @@ class TestSpawnMasks:
         import inspect
 
         source = inspect.getsource(CodexHarness.resolve_spawn)
-        assert "resolve_spawn_masks(ctx.sandbox_mode)" in source
+        # W2 gave resolve_spawn_masks a leading backend argument so one enforcement
+        # path serves codex and a session_config DescriptorHarness; codex passes its
+        # own id via self.backend, and the tier is still read off the context.
+        assert "resolve_spawn_masks(self.backend, ctx.sandbox_mode)" in source
         assert "extra_hidden_dirs=" in source
         assert not hasattr(harness_mod, "resolve_mask_only")
 
@@ -956,7 +964,12 @@ class TestCodexIsServedByTheSharedRuntime:
                     if isinstance(node.body[0].value, ast.Constant):
                         node.body = node.body[1:]
         body = ast.unparse(tree)
-        assert "ACP_BACKENDS_ACP_RUNTIME" in body
+        # Positive membership in the shared-runtime set: either the vocabulary
+        # frozenset itself or ``acp_runtime_backends()``, the derived accessor that
+        # adds the config-authored ids registered with ``runtime=True`` (a
+        # DescriptorHarness is served only on the AcpRuntime path, so the start
+        # gate must see those ids or an operator backend spawns kiro-cli).
+        assert "ACP_BACKENDS_ACP_RUNTIME" in body or "acp_runtime_backends()" in body
         assert "is_claude_backend" not in body
 
     def test_running_here_does_not_hand_it_the_kiro_family_conventions(self):

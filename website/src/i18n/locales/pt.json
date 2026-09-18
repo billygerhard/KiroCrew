@@ -6153,6 +6153,8 @@
       "session_control_ready": "Pronto",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "Esta sessão segue o agente padrão ({{name}}). Não tem um agente próprio, então muda se o padrão mudar. Clique para fixar um.",
+      "backend_fixed_at_creation": "Fixado quando este chat foi criado — escolha um backend na tela inicial de um novo chat.",
+      "backend_inherited_default": "Este chat segue o backend padrão, então muda se o padrão mudar. Para fixar um, escolha um backend na tela inicial de um novo chat.",
       "model_inherited_default": "Esta sessão usa o modelo padrão ({{name}}). Não tem um modelo próprio, então muda se o padrão mudar. Clique para fixar um."
     },
     "chatPane": {
@@ -8833,6 +8835,18 @@
       "label": "alterações exigem reinício",
       "tooltip": "Esta configuração não pode mudar enquanto o {{productName}} está em execução. O valor salvo é mantido e aplicado na próxima vez que o {{productName}} reiniciar (Configurações → Sobre, ou o terminal de onde você o iniciou).",
       "schema_unavailable": "Não foi possível verificar se esta configuração exige reinicialização."
+    },
+    "backendSelector": {
+      "default_backend": "Backend padrão",
+      "backend_name": "Backend: {{name}}",
+      "backend_list": "Lista de backends",
+      "backend_list_unavailable": "Lista de backends indisponível",
+      "no_backends_registered": "Nenhum backend registrado",
+      "default": "Padrão",
+      "unroutable_reason": "Não selecionável: {{reason}}",
+      "invalid_reason": "Inválido: {{reason}}",
+      "backend_serving": "Backend de IA que atende este chat",
+      "backend_serving_pinned": "Backend de IA que atende este chat — fixado quando o chat foi criado"
     }
   },
   "hooks": {
@@ -15565,6 +15579,18 @@
         "remove_confirm": "Remover o app OAuth do {{provider}}? O client ID e o secret salvo são apagados, e o {{provider}} não consegue conectar até você inseri-los de novo.",
         "remove_confirm_action": "Remover app OAuth",
         "cancel": "Cancelar"
+      },
+      "backendsPanel": {
+        "ai_backends": "Backends de IA",
+        "registered_backends": "Backends registrados",
+        "backends_are_defined_in_config_and_need_a_restart": "Os backends são definidos em harnesses.json, no diretório inicial do {{productName}} ao lado de config.json (protegido contra gravação). As alterações valem a partir da próxima inicialização do gateway.",
+        "authoring_guide": "Como adicionar um backend",
+        "backend_list_unavailable": "Lista de backends indisponível",
+        "no_backends_registered": "Nenhum backend registrado",
+        "badge_selectable": "Selecionável",
+        "badge_default": "Padrão",
+        "badge_unroutable": "Não selecionável",
+        "badge_invalid": "Inválido"
       }
     },
     "settingsPage": {
@@ -16256,6 +16282,10 @@
       "connections": {
         "label": "Aplicativos OAuth",
         "description": "Apps OAuth para provedores que exigem um cliente registrado"
+      },
+      "backends": {
+        "label": "Backends de IA",
+        "description": "Os backends de IA que esta versão oferece e o status dos backends definidos em harnesses.json"
       }
     },
     "secrets": {

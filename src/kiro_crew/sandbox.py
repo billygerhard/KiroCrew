@@ -502,6 +502,25 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # gate matches no paths, so the read-only mount is what holds regardless of how
     # a command spells the way there.
     "ssh_auth_sock_consent.json",
+    # The operator-authored HARNESS DESCRIPTORS (``harnesses.json``). This is the
+    # shell-side half of the descriptor write guard: the file-edit tool gate
+    # (``security._WRITE_PROTECTED_HOME_PATHS``) fences the tool path, and — as the
+    # READONLY note above says — a command-text matcher matches no paths at all, so
+    # a kernel write denial is what holds regardless of how a command spells the way
+    # there. It is the STRONGEST class of ceiling: an entry is an EXECUTION GRANT —
+    # each descriptor names the ``executable`` and ``argv`` the gateway resolves and
+    # SPAWNS — so a sandboxed write is arbitrary code run through Crew's own trusted
+    # spawner, and the deny-list's text/argv tiers can be evaded by runtime
+    # construction (``$(printf ...)``) while a namespace/Seatbelt write denial cannot.
+    # READ-ONLY rather than hidden because the write is the whole risk: the registry
+    # must READ it on every listing to enumerate backends and Settings reads it to
+    # render the inventory, so masking it would break the feature; it holds no
+    # secret. Every legitimate WRITER (the dashboard/CLI descriptor editor) runs in
+    # the unsandboxed gateway or user process and opens the path directly. Paired
+    # with ``_CREW_PRECREATE_READONLY_FILE_LEAVES`` so the Linux mount seal has a
+    # target on an install that has never written a descriptor — which is the
+    # absent-and-therefore-writable default this list exists to close.
+    "harnesses.json",
     # The browser launcher and its vendored Node package tree. Agent browser
     # commands must read and execute this directory, while a write would choose
     # the binary the unsandboxed gateway executes during startup reclamation or
@@ -748,6 +767,15 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     "oauth_endpoints.json",
     "decisions_consent.json",
     "file_delivery_consent.json",
+    # The operator-authored harness descriptors. A foreign harness's child that
+    # reads ``harnesses.json`` learns every other backend's executable path and
+    # launch argv -- an input to how backends launch, in the same family as the
+    # governance/consent documents above. Withholding fails CLOSED: an empty or
+    # absent file reads as "only the builtin harnesses are served", the safe
+    # narrower state, exactly as an empty consent record reads as consent
+    # withheld. The write seal beside it answers forgery on the WRITE side; this
+    # entry answers the passive READ that reaches no gate and leaves no record.
+    "harnesses.json",
     "ssh_auth_sock_consent.json",
     # The paid-AWS consent grant. Unlike its sibling consent records this one stores
     # IDENTIFIERS as well as a decision -- ``Grant.to_dict`` writes ``account`` and
@@ -1431,6 +1459,19 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # operator writes one, so the lane stays UNREGISTERED and an in-sandbox launch
     # reads as unconfigured -- narrower than the truth, never wider.
     "cloud.json",
+    # The operator-authored harness descriptors satisfy both criteria the way
+    # ``file_delivery_consent.json`` does. Criterion 1 — empty means absent: the
+    # registry reads ``{}`` as "no operator descriptors", exactly what an absent
+    # file means (only the bundled in-code harnesses are served). Criterion 2 — a
+    # stale sealed read fails toward refusal: the writer publishes through
+    # ``atomic_write`` (new inode), so a sandboxed reader frozen at ``{}`` sees
+    # FEWER backends than the operator has since added — narrower than the truth,
+    # and it grants nothing, because the write seal that withholds forgery applies
+    # regardless. Without this entry the Linux mount seal skips the absent
+    # descriptor file — the DEFAULT state on an install that has never authored a
+    # descriptor — leaving that execution-grant name creatable from inside the
+    # namespace sandbox, which is precisely the hole this list closes.
+    "harnesses.json",
     # The fork-lineage sidecar satisfies both criteria the way
     # ``file_delivery_consent.json`` does: ``agent_state._read`` returns ``{}``
     # for absent, unreadable, AND an empty document alike, so a pre-created

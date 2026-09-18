@@ -6153,6 +6153,8 @@
       "session_control_ready": "Prêt",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "Cette session suit l’agent par défaut ({{name}}). Elle n’a pas d’agent propre, elle change donc si le défaut change. Cliquez pour en épingler un.",
+      "backend_fixed_at_creation": "Fixé à la création de ce chat — choisissez un backend sur l’écran d’accueil d’un nouveau chat.",
+      "backend_inherited_default": "Ce chat suit le backend par défaut et change donc avec lui. Pour en fixer un, choisissez un backend sur l’écran d’accueil d’un nouveau chat.",
       "model_inherited_default": "Cette session utilise le modèle par défaut ({{name}}). Elle n’a pas de modèle propre, elle change donc si le défaut change. Cliquez pour en épingler un."
     },
     "chatPane": {
@@ -8833,6 +8835,18 @@
       "label": "modifications : redémarrage requis",
       "tooltip": "Ce réglage ne peut pas changer pendant que {{productName}} est en cours d'exécution. La valeur enregistrée est conservée et s'applique au prochain redémarrage de {{productName}} (Réglages → À propos, ou le terminal depuis lequel vous l'avez lancé).",
       "schema_unavailable": "Impossible de vérifier si ce réglage nécessite un redémarrage."
+    },
+    "backendSelector": {
+      "default_backend": "Backend par défaut",
+      "backend_name": "Backend : {{name}}",
+      "backend_list": "Liste des backends",
+      "backend_list_unavailable": "Liste des backends indisponible",
+      "no_backends_registered": "Aucun backend enregistré",
+      "default": "Par défaut",
+      "unroutable_reason": "Non sélectionnable : {{reason}}",
+      "invalid_reason": "Non valide : {{reason}}",
+      "backend_serving": "Backend d'IA au service de ce chat",
+      "backend_serving_pinned": "Backend d'IA au service de ce chat — fixé à la création du chat"
     }
   },
   "hooks": {
@@ -15565,6 +15579,18 @@
         "remove_confirm": "Supprimer l’app OAuth {{provider}} ? L’ID client et le secret enregistré sont effacés, et {{provider}} ne pourra plus se connecter tant que vous ne les aurez pas saisis à nouveau.",
         "remove_confirm_action": "Supprimer l’app OAuth",
         "cancel": "Annuler"
+      },
+      "backendsPanel": {
+        "ai_backends": "Backends d’IA",
+        "registered_backends": "Backends enregistrés",
+        "backends_are_defined_in_config_and_need_a_restart": "Les backends sont définis dans harnesses.json, dans le répertoire d’accueil de {{productName}} à côté de config.json (protégé en écriture). Les modifications s’appliquent au prochain démarrage du gateway.",
+        "authoring_guide": "Comment ajouter un backend",
+        "backend_list_unavailable": "Liste des backends indisponible",
+        "no_backends_registered": "Aucun backend enregistré",
+        "badge_selectable": "Sélectionnable",
+        "badge_default": "Par défaut",
+        "badge_unroutable": "Non sélectionnable",
+        "badge_invalid": "Non valide"
       }
     },
     "settingsPage": {
@@ -16256,6 +16282,10 @@
       "connections": {
         "label": "Applications OAuth",
         "description": "Applications OAuth pour les fournisseurs qui exigent un client enregistré"
+      },
+      "backends": {
+        "label": "Backends d’IA",
+        "description": "Les backends d’IA proposés par cette version et l’état des backends définis dans harnesses.json"
       }
     },
     "secrets": {

@@ -226,6 +226,13 @@ export const CHUNK_BUDGETS = {
   // covers every part -- main's drift and each surface's own cost -- with the ~5%
   // margin the lines above prescribe, so ordinary first-party growth does not
   // re-trip this entry within days.
+  // The per-chat backend surface (#11863) -- the read-only composer chip, the
+  // Welcome-view pick wiring and the slot field it reads -- adds 4,581 B of
+  // first-party app-core code on top of main (the picker's own dropdown,
+  // `BackendSelector`, is behind a lazy boundary in WelcomeView and is not in
+  // this chunk). Its merge result builds inside the ceiling above, so the
+  // number does not move for it; the cost is recorded here so the next
+  // re-measure can attribute the chunk's growth.
   App: 3714 * KB, // measured 3,641,334 B with all three surfaces (4.25% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)

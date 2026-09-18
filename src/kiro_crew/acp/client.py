@@ -104,19 +104,14 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
-    ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
-    ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
-    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
-    ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
@@ -193,7 +188,12 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_NODE_ADAPTER_PACKAGES,
     ACP_BACKEND_PROCESS_NAMES,
     NODE_ADAPTER_ENTRY_SEGMENTS,
+    advertised_model_selection_backends,
+    harness_owned_sessions_backends,
     launch_for,
+    load_without_modes_backends,
+    model_via_config_option_backends,
+    session_mcp_array_backends,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
@@ -1030,6 +1030,80 @@ def _resolve_self_served_bin(backend: str) -> tuple[str | None, str]:
         return _normalize_exe_casing(on_path) or on_path, search_path
 
     return None, search_path
+
+
+def resolve_descriptor_executable(executable: str) -> tuple[str | None, str]:
+    """Resolve an OPERATOR-descriptor's executable and the PATH searched for it.
+
+    The generic form of the plain-binary ladder every single-binary bundled host
+    walks (``_resolve_opencode_bin``, ``_resolve_goose_bin``, ``_resolve_deepseek_bin``),
+    with the tool name supplied by the descriptor instead of hardcoded. A descriptor
+    host is a binary that serves ACP itself, so there is no ``node_modules`` rung
+    and no node resolution -- if an operator runs their host through a Node adapter,
+    they name the adapter's own launcher as the ``executable`` and its arguments in
+    the argv template.
+
+    Rungs, cheapest and most explicit first:
+
+    * an ABSOLUTE (or otherwise directly-executable) path is honoured verbatim.
+      This is the common operator case -- they know exactly where their binary is --
+      and it is also what makes the argv attestation load-bearing: the file the
+      descriptor named is the file that resolves, with no PATH re-resolution that
+      could pick a different one.
+    * mise, then the augmented PATH, for a bare name -- the same two rungs the
+      bundled single-binary resolvers walk, so an operator's ``"executable": "my-acp"``
+      resolves exactly as ``opencode`` does.
+
+    Returns ``(None, search_path)`` when it is absent, so the caller reports what
+    was searched rather than raising from inside the resolver -- the same contract
+    every bundled resolver keeps. No override ENV rung: a descriptor's ``executable``
+    IS the operator's explicit choice, so there is no separate variable to consult.
+    """
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    if not executable:
+        return None, search_path
+
+    # A path the operator gave directly (absolute, or relative to an executable
+    # file) is honoured as-is: it is the most explicit form and the one that keeps
+    # the attested file and the exec'd file the same.
+    if platform_compat.is_executable_file(executable):
+        # Canonicalize to an ABSOLUTE path at resolution time so the attested
+        # file cannot diverge from the exec'd file: a relative ``./host`` would
+        # otherwise re-resolve against whatever CWD the eventual spawn runs in
+        # (a session working directory need not be the gateway's), letting a
+        # different file run than the one resolution checked. abspath leaves an
+        # already-absolute operator path unchanged (the common case).
+        resolved = os.path.abspath(executable)
+        return _normalize_exe_casing(resolved) or resolved, search_path
+
+    mise_resolved = _mise_which(executable)
+    if mise_resolved:
+        return mise_resolved, search_path
+
+    on_path = shutil.which(executable, path=search_path)
+    if on_path:
+        return _normalize_exe_casing(on_path) or on_path, search_path
+
+    return None, search_path
+
+
+def descriptor_executable_not_found_message(
+    harness_id: str, executable: str, search_path: str
+) -> str:
+    """The one message for "an operator harness's executable is not where we looked".
+
+    Names the harness id, the executable the descriptor asked for, and the
+    directories actually walked (via :func:`env.describe_search_path`, the same
+    helper the kiro and single-binary paths use), so an operator whose install is
+    simply off the search sees where to look rather than a bare "not found". The
+    search path is threaded in from the resolver so the message can never name a
+    directory the search skipped.
+    """
+    return (
+        f"harness {harness_id!r}: executable {executable!r} not found "
+        f"({describe_search_path(search_path)}). Install it, put it on PATH, or set "
+        f"the descriptor's 'executable' to an absolute path in harnesses.json."
+    )
 
 
 def _opencode_readback_remedy() -> str:
@@ -5264,7 +5338,7 @@ class AcpClient:
     def _uses_advertised_model_selection(self) -> bool:
         """True when this backend sources its wire model id / seed from the
         provider's advertised list (see ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``)."""
-        return self.backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+        return self.backend in advertised_model_selection_backends()
 
     @property
     def _seeds_local_settings(self) -> bool:
@@ -5566,7 +5640,7 @@ class AcpClient:
         MCP install or toggle takes effect on the next session with no gateway
         restart.
         """
-        if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
+        if self.backend not in session_mcp_array_backends():
             return []
         if self._session_mcp_cache is None:
             self._session_mcp_cache = self._resolve_session_mcp_servers()
@@ -6657,7 +6731,7 @@ class AcpClient:
         # An advisory belongs to the request that emitted it.  A clean explicit
         # switch must not inherit the served-model attribution from startup.
         self._last_substitution_model = None
-        if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+        if self.backend in model_via_config_option_backends():
             model_id = await self._push_model_config_option(model_id, strict=True)
         else:
             await self._send_request(
@@ -7061,7 +7135,7 @@ class AcpClient:
         # resumed — would otherwise be read below as this dispatch's own
         # served model and misattribute the session.
         self._last_substitution_model = None
-        if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+        if self.backend in model_via_config_option_backends():
             sent = await self._push_model_config_option(self._model, strict=False)
             if not sent:
                 # Every spelling refused: record the session as running the
@@ -8928,7 +9002,7 @@ class AcpClient:
             # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
             # cli/<sid>.json; a missing transcript falls back to session/new
             # (a genuinely fresh start).
-            if self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+            if self.backend in harness_owned_sessions_backends():
                 # The harness keeps its own session records and resolves them from
                 # the sessionId, so there is no Crew-side file to name. Gating on
                 # the kiro transcript here would make file_ok always False -- such
@@ -8980,7 +9054,7 @@ class AcpClient:
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
-                    elif self.backend not in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+                    elif self.backend not in harness_owned_sessions_backends():
                         # The kiro family reads its transcript path from _meta. A
                         # harness that owns its sessions reads no _meta of ours,
                         # so it gets neither key rather than a kiro session_file
@@ -9004,7 +9078,7 @@ class AcpClient:
                     # response that is not an error IS the successful load -- gating
                     # it on ``modes`` would fall through to session/new and discard
                     # the conversation the harness had just restored.
-                    if "modes" in load_resp or self.backend in ACP_BACKENDS_LOAD_WITHOUT_MODES:
+                    if "modes" in load_resp or self.backend in load_without_modes_backends():
                         self._session_id = resume_sid
                         self._resumed = True
                         self._capture_available_models(load_resp)
@@ -11407,7 +11481,7 @@ class AcpClient:
         file and are not enumerated here. Only a TRUSTED identity is judged -- the
         permission payload's own prose names whatever it likes and is never read.
         """
-        if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY:
+        if self.backend not in session_mcp_array_backends():
             return False
         if not (event.mcp_identity_trusted and event.mcp_server_name):
             return False
