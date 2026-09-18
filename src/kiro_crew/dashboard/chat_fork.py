@@ -971,6 +971,11 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     # predicate as the arm itself: this route is gated on app ownership, which an
     # allow-listed non-owner passes for a slot the owner armed.
     new_slot.jev_route = slot.jev_route and is_owner_dashboard_request(request)
+    # Inherit the per-chat ACP backend pick too: a fork keeps the parent's
+    # harness the same way it keeps the parent's model (passed to
+    # get_or_create_slot above) and effort. Stamped after construction like the
+    # model pin's siblings here.
+    new_slot.acp_backend = slot.acp_backend
     # Inherit the active project directory so the fork keeps the parent's working
     # context (agent resolution, steering files, CWD) instead of falling back to
     # the config/workspace default on first message.

@@ -99,10 +99,8 @@ from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_st
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
-    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     EVENT_AGENT_SWITCHED,
@@ -156,6 +154,10 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     StructuredStatus,
     effort_config_option_id,
+)
+from kiro_crew.agent_sdk.backends import (
+    advertised_model_selection_backends,
+    model_via_config_option_backends,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config.paths import kiro_sessions_dir
@@ -572,7 +574,7 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     per-session path and ``AcpSessionHandle`` on the shared-runtime one -- and a
     second copy is free to disagree about the select's shape.
     """
-    if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+    if backend not in advertised_model_selection_backends():
         return None
     for opt in resp.get("configOptions") or []:
         if not isinstance(opt, dict) or opt.get("id") != "model" or opt.get("type") != "select":
@@ -2027,7 +2029,7 @@ class AcpSessionHandle:
             # _bg session the current model IS session/new's served default.
             return
         backend = self._runtime.acp_backend
-        if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+        if backend in model_via_config_option_backends():
             # A harness whose adapter judges the model VALUE rather than only the
             # option: the spelling Crew stored may not be the spelling this build
             # serves, so the candidate ladder decides. Non-strict, because this

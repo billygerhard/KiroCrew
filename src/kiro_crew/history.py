@@ -176,6 +176,12 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "agent",
         "model",
         "reasoning_effort",
+        # Per-chat ACP backend pin. Slot-owned for the same reason as
+        # memory_store below: the save writes the key only when a pin is set,
+        # so clearing it back to inherit-default writes NO key -- left unowned,
+        # ``carry_unowned_metadata`` would copy the stale pin forward from the
+        # existing line and the cleared chat would come back pinned on restart.
+        "acp_backend",
         "autocompact_pct",
         "mode",
         "workspace",

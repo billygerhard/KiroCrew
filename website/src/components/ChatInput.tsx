@@ -1,6 +1,6 @@
 import { Component, useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo, lazy, Suspense } from 'react'
 import { markComposerResize } from '../utils/composerResize'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Cpu, Mic, MicOff, Keyboard, Square, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, PenLine, ChevronsDownUp, ChevronsUpDown, MoreHorizontal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
 import AppIcon from './AppIcon'
 import CopyBranchButton from './CopyBranchButton'
@@ -523,6 +523,19 @@ interface ChatInputProps {
    * gets it; a pinned chip has nothing to explain. */
   agentIsInheritedDefault?: boolean
   agentSource?: string
+  /** Bound-backend display name for the shelf chip. Empty/absent hides the
+   *  chip. The chip opens no picker: the backend picker lives on the welcome
+   *  screen and the binding is immutable after creation, so a click only
+   *  explains that. */
+  backendLabel?: string
+  /** Tooltip/aria text for the backend chip (pinned vs resolved-default variant). */
+  backendTitle?: string
+  /**
+   * True when `backendLabel` is the backend an INHERITING slot resolves to (the
+   * configured default), not a per-chat pin. The click-to-explain caption then
+   * says the chat follows the default (and changes if it does) instead of
+   * claiming a pin was fixed at creation. */
+  backendIsInheritedDefault?: boolean
   modelName?: string
   /**
    * True when `modelName` is the model an INHERITING slot actually runs on (the
@@ -923,6 +936,9 @@ function ChatInput({
   agentIsInheritedDefault,
   modelIsInheritedDefault,
   agentSource,
+  backendLabel,
+  backendTitle,
+  backendIsInheritedDefault,
   modelName,
   onAgentClick,
   onModelClick,
@@ -1055,6 +1071,9 @@ function ChatInput({
   // Non-null while the last approval decision failed. Rendered as a one-line
   // strip under the composer; auto-clears so it cannot become permanent chrome.
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
+  // Backend chip: whether the "fixed when the chat was created" caption is
+  // showing. Toggled by clicking the chip, which otherwise has no action.
+  const [backendChipExplained, setBackendChipExplained] = useState(false)
   // The same notice slot carries two different things: STATUS about an
   // approval that expired (nothing failed on our side) and a FAILED decision
   // submit (a rejected request). Only the latter is an error surface.
@@ -4927,6 +4946,45 @@ function ChatInput({
               <Bot size={13} className="shrink-0 opacity-70" />
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
             </button>
+          )}
+          {!!backendLabel && (
+            /* Backend chip: names the AI backend serving this chat. The binding is
+               immutable after creation (the picker lives on the welcome screen),
+               so this does not open a picker — but it sits between two chips that
+               DO open one, so it must not look like them and must answer a click.
+               Visually: lock glyph + dotted underline + help cursor, no hover fill.
+               Behaviour: a click toggles the explanation inline (role=status, so AT
+               hears it) instead of leaving it tooltip-only. */
+            <span className="relative inline-flex items-center min-w-0">
+              <button
+                type="button"
+                data-testid="chat-input-backend-chip"
+                className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md text-muted bg-transparent border-none cursor-help decoration-dotted underline-offset-2 hover:underline"
+                title={backendTitle || backendLabel}
+                aria-label={backendTitle || backendLabel}
+                aria-expanded={backendChipExplained}
+                onClick={() => setBackendChipExplained(v => !v)}
+              >
+                <Cpu size={13} className="shrink-0 opacity-70" />
+                {!shelfCompact && <span className="truncate min-w-0 max-w-[160px]">{backendLabel}</span>}
+                {/* The lock says "pinned"; an inheriting chat floats with the
+                    default, so it gets no lock -- glyph and caption must agree. */}
+                {!backendIsInheritedDefault && <Lock size={10} className="shrink-0 opacity-60" aria-hidden />}
+              </button>
+              {backendChipExplained && (
+                /* Anchored ABOVE the chip rather than inline: a sentence in the
+                   shelf row would squeeze the sibling chips into ellipses. */
+                <span
+                  role="status"
+                  data-testid="chat-input-backend-chip-explained"
+                  className="absolute bottom-full left-0 mb-1.5 z-20 w-[320px] px-2.5 py-2 rounded-lg bg-bg-elevated border border-border shadow-xl text-[11px] text-muted leading-snug whitespace-normal"
+                >
+                  {backendIsInheritedDefault
+                    ? i18nT('components.chatInput.backend_inherited_default')
+                    : i18nT('components.chatInput.backend_fixed_at_creation')}
+                </span>
+              )}
+            </span>
           )}
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:
