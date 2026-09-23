@@ -10347,6 +10347,7 @@
         "tool_one": "{{count}} ferramenta",
         "tool_other": "{{count}} ferramentas",
         "waiting_for_your_approval_to_start": "Aguardando sua aprovação para iniciar",
+        "waiting_for_approval_in_notifications": "Aguardando sua aprovação no sino de notificações",
         "waiting_to_start_queued_behind_the_concurrency_l": "Aguardando para iniciar — na fila devido ao limite de simultaneidade",
         "stop_failed": "Não foi possível parar o subagente {{name}}",
         "stop_all_failed": "Não foi possível parar os subagentes",

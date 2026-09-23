@@ -5256,6 +5256,14 @@ const chatSlice = createSlice({
       const a = upsertSlotSub(state, slot, id)
       if (a) { a.retrying = true; a.stalled = false; a.idleSecs = undefined; a.stalledAt = undefined }
     },
+    /** A contested run's prompt went to the global feed; the tab that shows its
+     *  card is told so for as long as the prompt is parked (see `awaitingFeed`). */
+    sseSubagentAwaitingFeed(state, action: PayloadAction<{ slot: string; id: string; awaiting: boolean }>) {
+      const { slot, id } = action.payload
+      const a = upsertSlotSub(state, slot, id)
+      if (!a) return
+      a.awaitingFeed = action.payload.awaiting
+    },
     sseSubagentStalled(state, action: PayloadAction<{ slot: string; id: string; stalled: boolean; idle_secs?: number }>) {
       const { slot, id } = action.payload
       // Prototype-pollution guard is centralized in upsertSlotSub, which also
@@ -7322,7 +7330,7 @@ export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearSwitchSlotGone, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
-  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
+  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentAwaitingFeed, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,

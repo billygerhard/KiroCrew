@@ -10065,6 +10065,7 @@
         "stop_this_subagent": "停止此子代理",
         "tool_other": "{{count}} 个工具",
         "waiting_for_your_approval_to_start": "等待你的批准后开始",
+        "waiting_for_approval_in_notifications": "正在等待你在通知铃铛中批准",
         "waiting_to_start_queued_behind_the_concurrency_l": "等待开始 — 受并发上限限制正在排队",
         "stop_failed": "无法停止子代理 {{name}}",
         "stop_all_failed": "无法停止子代理",

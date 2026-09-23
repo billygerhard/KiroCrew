@@ -6399,6 +6399,7 @@
         "tool_one": "{{count}} tool",
         "tool_other": "{{count}} tools",
         "waiting_for_your_approval_to_start": "Waiting for your approval to start",
+        "waiting_for_approval_in_notifications": "Waiting for your approval in the notification bell",
         "waiting_to_start_queued_behind_the_concurrency_l": "Waiting to start — queued behind the concurrency limit"
       },
       "subagentQueued": {

@@ -399,6 +399,7 @@ def create_agent_folder(
     memory_mode="persistent",
     app="",
     execution_context=None,
+    conversation_root="",
 ) -> Path:
     from kiro_crew.execution_context import ExecutionContext, execution_for_store
 
@@ -423,6 +424,12 @@ def create_agent_folder(
         "task": task,
         "agent": agent,
         "parent_session": parent_session,
+        # The root every request keyed by this run's conversation resolves to,
+        # as stamped at admission. Read back when a continuation arrives after
+        # the in-memory records are gone (restart, eviction): the founder's
+        # value is the conversation's founding root, and a contested marker
+        # written here later keeps the contest across a restart.
+        "conversation_root": conversation_root,
         "started": time.time(),
         "max_turns": max_turns,
         "status": "running",

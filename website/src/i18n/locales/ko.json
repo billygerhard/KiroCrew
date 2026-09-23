@@ -10065,6 +10065,7 @@
         "stop_this_subagent": "이 서브에이전트 중지",
         "tool_other": "도구 {{count}}개",
         "waiting_for_your_approval_to_start": "시작하려면 승인을 기다리는 중입니다",
+        "waiting_for_approval_in_notifications": "알림 벨에서 승인을 기다리는 중",
         "waiting_to_start_queued_behind_the_concurrency_l": "시작 대기 중 — 동시 실행 한도로 대기열에 있습니다",
         "stop_failed": "서브에이전트 {{name}}을(를) 중지할 수 없습니다",
         "stop_all_failed": "서브에이전트를 중지할 수 없습니다",

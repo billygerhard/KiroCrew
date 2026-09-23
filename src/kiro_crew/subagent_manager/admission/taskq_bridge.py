@@ -1366,6 +1366,11 @@ class _TaskqBridgeMixin(ManagerComponent):
         # grants and which no start path reads.
         params.pop("_agent_prevalidated", None)
         params.pop("approval_mode", None)
+        # A row written before roots were stamped at admission carries no
+        # ``_root_session_key``. It needs none here: every window entry
+        # re-enters through ``spawn(..., _from_queue=True)``, where the gate
+        # resolves an unstamped ``subagent:`` caller to a contested root rather
+        # than re-walking a tree the restart may have left to another chat.
         return params
 
     def _evict_for_lanes(self, count: int, lanes: "Mapping[str, str] | None" = None) -> int:

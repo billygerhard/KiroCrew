@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, sseSubagentDone, sseSubagentTool, sseSubagentStalled, sseSubagentAwaitingFeed } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
@@ -379,5 +379,72 @@ describe('SubagentProgressBar — why the queued agents wait', () => {
     expect(screen.queryByTestId('subagent-wait-reason')).toBeNull()
     expect(screen.getByTestId('subagent-queued-count').getAttribute('title'))
       .toBe('Waiting to start — queued behind the concurrency limit')
+  })
+})
+
+describe('SubagentProgressBar — a contested run\'s prompt parked on the global feed', () => {
+  // A run continued from more than one chat has no tab whose Trust may answer
+  // its prompt, so the prompt lands only on the notification bell -- while its
+  // card sits in this tab. Without the hint the row reads as a run waiting for
+  // nothing (the stall this PR removes elsewhere); the frame brackets exactly the
+  // parked wait, so the hint outranks the stall verdict while set and is gone
+  // once the prompt is answered.
+  it('names the notification bell while the prompt is parked, and drops the hint when it is answered', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentTool({ slot: SLOT, id: 'a1', tool: 'shell', tool_count: 2 }))
+    store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true, idle_secs: 30 }))
+    store.dispatch(sseSubagentAwaitingFeed({ slot: SLOT, id: 'a1', awaiting: true }))
+    const { unmount } = renderBar(store)
+    const hint = screen.getByTestId('subagent-awaiting-feed')
+    expect(hint.textContent).toContain('Waiting for your approval in the notification bell')
+    expect(screen.queryByText(/possibly stalled|no activity/i)).toBeNull()
+    unmount()
+
+    store.dispatch(sseSubagentAwaitingFeed({ slot: SLOT, id: 'a1', awaiting: false }))
+    renderBar(store)
+    expect(screen.queryByTestId('subagent-awaiting-feed')).toBeNull()
+  })
+})
+
+describe('SubagentProgressBar — 30s reconcile against /api/spawn', () => {
+  // The backend names the tab each run's frames carry (`slot`) with its own
+  // mapping, so the chip compares slot to slot: a nested run (parent
+  // `subagent:<id>`) and a channel-born tab (key `slack:…`, slot not a prefix
+  // strip of the key) both stay. Only an older backend without `slot` falls
+  // back to comparing the parent key to `dashboard:<slot>`.
+  beforeEach(() => { vi.useFakeTimers(); vi.mocked(api.spawnList).mockReset() })
+
+  async function tick() { await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) }
+
+  it('keeps a nested run and a channel-rooted run whose slot matches, evicts one whose slot does not', async () => {
+    vi.mocked(api.spawnList).mockResolvedValue({ agents: [
+      { id: 'nested', done: false, parent: 'subagent:coord', slot: SLOT },
+      { id: 'channel', done: false, parent: 'slack:C1:171', slot: SLOT },
+      { id: 'elsewhere', done: false, parent: 'dashboard:other', slot: 'other' },
+    ] })
+    const store = makeStore(['nested', 'channel', 'elsewhere'])
+    renderBar(store)
+    await tick()
+    const subs = store.getState().chat.subagents
+    const live = new Set(Object.values(subs).filter(a => a.status === 'running').map(a => a.id))
+    expect(live.has('nested')).toBe(true)
+    expect(live.has('channel')).toBe(true)
+    expect(live.has('elsewhere')).toBe(false)
+    vi.useRealTimers()
+  })
+
+  it('falls back to the parent key when a backend that predates slot sends none', async () => {
+    vi.mocked(api.spawnList).mockResolvedValue({ agents: [
+      { id: 'legacy', done: false, parent: `dashboard:${SLOT}` },
+      { id: 'other', done: false, parent: 'dashboard:other' },
+    ] })
+    const store = makeStore(['legacy', 'other'])
+    renderBar(store)
+    await tick()
+    const subs = store.getState().chat.subagents
+    const live = new Set(Object.values(subs).filter(a => a.status === 'running').map(a => a.id))
+    expect(live.has('legacy')).toBe(true)
+    expect(live.has('other')).toBe(false)
+    vi.useRealTimers()
   })
 })

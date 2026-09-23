@@ -58,7 +58,7 @@ import { getViewedThreadSlot } from '../lib/viewedThread'
 import { VoicePcmPlayer, voiceBoundary, createVoiceRequestId } from '../lib/voicePlayback'
 import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
-  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
+  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentAwaitingFeed, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
 import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys, queueEntryAttachments } from '../store/chatSlice'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
@@ -2304,6 +2304,9 @@ export function useWebSocket() {
           }
           case 'subagent_tool':
             dispatch(sseSubagentTool(data as { slot: string; id: string; tool: string; turns?: number; tool_count?: number }))
+            break
+          case 'subagent_awaiting_feed':
+            dispatch(sseSubagentAwaitingFeed(data as { slot: string; id: string; awaiting: boolean }))
             break
           case 'subagent_stalled':
             dispatch(sseSubagentStalled(data as { slot: string; id: string; stalled: boolean; idle_secs?: number }))

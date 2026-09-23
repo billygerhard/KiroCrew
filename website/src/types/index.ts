@@ -1424,6 +1424,12 @@ export interface SubagentActivity {
    *  while `stalled` holds there is by definition no activity to reset it. */
   stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
+  /** The run's current permission prompt is parked on the GLOBAL approvals feed
+   *  (the notification bell), not in this tab: a run continued from more than
+   *  one chat has no tab whose Trust may answer it, but its card still lives
+   *  here, so without this the row reads as a run waiting for nothing. Set and
+   *  cleared by `subagent_awaiting_feed`, bracketing exactly the parked wait. */
+  awaitingFeed?: boolean
   approval_id?: string
   approving?: boolean
   /** Inline terminal output for native (`native:*`) cards only. Native cards

@@ -10206,6 +10206,7 @@
         "tool_one": "{{count}} Werkzeug",
         "tool_other": "{{count}} Werkzeuge",
         "waiting_for_your_approval_to_start": "Warten auf deine Genehmigung zum Starten",
+        "waiting_for_approval_in_notifications": "Warten auf deine Genehmigung in der Benachrichtigungsglocke",
         "waiting_to_start_queued_behind_the_concurrency_l": "Warten auf den Start — in der Warteschlange hinter der Parallelitätsgrenze",
         "stop_failed": "Subagent {{name}} konnte nicht gestoppt werden",
         "stop_all_failed": "Die Subagents konnten nicht gestoppt werden",

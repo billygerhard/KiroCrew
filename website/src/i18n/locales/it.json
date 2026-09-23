@@ -10347,6 +10347,7 @@
         "tool_one": "{{count}} strumento",
         "tool_other": "{{count}} strumenti",
         "waiting_for_your_approval_to_start": "In attesa della tua approvazione per avviare",
+        "waiting_for_approval_in_notifications": "In attesa della tua approvazione nella campanella delle notifiche",
         "waiting_to_start_queued_behind_the_concurrency_l": "In attesa di avvio — in coda a causa del limite di concorrenza",
         "stop_failed": "Impossibile arrestare il subagente {{name}}",
         "stop_all_failed": "Impossibile arrestare i subagenti",
