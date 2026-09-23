@@ -26,17 +26,29 @@ structure/security logic lives, so no aiohttp app is needed. Covers:
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+import kiro_crew.dashboard.handlers.themes as th_mod
+import kiro_crew.dashboard.theme_validate as tv_mod
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers.themes import (
     _atomic_write_theme_json,
     _clone_github,
     _copy_installed_theme,
 )
 from kiro_crew.dashboard.theme_validate import (
+    _THEME_FILE_CAPS,
+    _THEME_LOADER_ICONS,
+    _THEME_LOADER_ICONS_MAX,
+    _THEME_MAX_FONTS,
     _THEME_OVERLAY_DEFAULT_POSITION,
     _THEME_OVERLAY_DEFAULT_ZINDEX,
     _classify_theme_file,
@@ -44,6 +56,7 @@ from kiro_crew.dashboard.theme_validate import (
     _overrides_layout_violation,
     _resolve_theme_asset,
     _safe_theme_slug,
+    _slugify_theme_name,
     _sniff_audio,
     _theme_asset_descriptor,
     _validate_audio_manifest,
@@ -54,6 +67,7 @@ from kiro_crew.dashboard.theme_validate import (
     _validate_theme_dir,
     _validate_topbar_decls,
 )
+from kiro_crew.slugs import slug_hash_fallback
 
 # _validate_theme_data only *requires* --bg/--text/--accent and rejects unknown
 # keys, so a 3-var map per mode is a complete, valid Level-0 theme.
@@ -88,6 +102,31 @@ def _make_theme(
     return d
 
 
+def _allow_pinned_source_rename_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    themes_module: ModuleType,
+    source: Path,
+) -> None:
+    """Model POSIX rename semantics when the Windows pin blocks renames."""
+    if not themes_module.IS_WINDOWS:
+        return
+    pinned_stat = source.stat()
+    fake_fd = 2_147_483_647
+    real_fstat = os.fstat
+    real_close = os.close
+    monkeypatch.setattr(themes_module, "pin_directory", lambda _path: fake_fd)
+    monkeypatch.setattr(
+        themes_module.os,
+        "fstat",
+        lambda fd: pinned_stat if fd == fake_fd else real_fstat(fd),
+    )
+    monkeypatch.setattr(
+        themes_module.os,
+        "close",
+        lambda fd: None if fd == fake_fd else real_close(fd),
+    )
+
+
 # A valid persona: within the length cap AND carries both mandatory clauses
 # (an explicit "drop persona on request" and a "security/accuracy overrides").
 _VALID_PERSONA = (
@@ -96,6 +135,12 @@ _VALID_PERSONA = (
 )
 # A minimal but valid MP3 header (ID3 or MPEG frame sync) for the audio sniff.
 _VALID_MP3 = b"\xff\xfb\x90\x00" + b"\x00" * 64
+# A valid 1x1 PNG — pack loader images are size-capped, not magic-sniffed, but a
+# real signature keeps the fixture honest.
+_PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6360000002000154a24f9b0000000049454e44ae426082"
+)
 
 
 def _make_tiered(
@@ -149,7 +194,7 @@ def _make_full_l2(root: Path, *, slug: str = "fixture-l2") -> Path:
     """Build a full Level-2 pack in a tmp dir: persona + overlay + both topbars
     + a font + clean overrides.css + an audio manifest, with the §3.1/§3.3
     ``overlays``/``topbar`` manifest declarations populated. This replaces the
-    old shipped-sample regression — sample/test packs no longer live in the
+    old shipped-sample regression — sample/test packs do not live in the
     repo (nothing theme-bearing ships in the wheel), so the full-L2 regression
     value (validates at L2, survives the copy path + re-install, exposes a
     content-bound persona descriptor) is exercised entirely from a fixture."""
@@ -232,6 +277,99 @@ class TestValidateThemeDir:
         summary, err = _validate_theme_dir(_make_theme(tmp_path / "ok", level=2))
         assert err is None, err
         assert summary is not None and summary["level"] == 2
+
+    def test_level_one_loader_icons_are_accepted_and_described(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, level=1)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = ["star", "sparkles", "moon", "cloud"]
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        assert summary is not None
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderIcons"] == manifest["loaderIcons"]
+
+    @pytest.mark.parametrize(
+        ("level", "icons", "message"),
+        [
+            (0, ["star", "sparkles", "moon", "cloud"], "requires level 1"),
+            (1, None, "must be an array"),
+            (1, "star", "must be an array"),
+            (1, ["star", "moon", "cloud"], "must contain"),
+            (1, ["star", "sparkles", "moon", "unknown"], "unknown symbol"),
+            (1, ["star", "sparkles", "moon", "star"], "must be unique"),
+        ],
+    )
+    def test_invalid_loader_icons_are_rejected(
+        self, tmp_path: Path, level: int, icons: object, message: str
+    ) -> None:
+        d = _make_theme(tmp_path, level=level)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = icons
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and message in err
+
+    def test_backend_loader_icon_allowlist_matches_frontend(self) -> None:
+        frontend = (
+            Path(__file__).parents[1] / "website" / "src" / "themeLoaderIcons.ts"
+        ).read_text("utf-8")
+        declared = set(re.findall(r"^  ([a-z]+): [A-Z]", frontend, re.MULTILINE))
+        assert declared == _THEME_LOADER_ICONS
+        assert _THEME_LOADER_ICONS_MAX == len(declared)
+
+    def test_pack_loader_images_accepted_and_described(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        for i in range(4):
+            (d / "loader" / f"{i}.png").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == [
+            "loader/0.png", "loader/1.png", "loader/2.png", "loader/3.png",
+        ]
+
+    @pytest.mark.parametrize("count", [9, 12])
+    def test_pack_loader_images_out_of_range_rejected(
+        self, tmp_path: Path, count: int
+    ) -> None:
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        for i in range(count):
+            (d / "loader" / f"{i}.png").write_bytes(_PNG_1PX)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and "loader/" in err
+
+    def test_pack_loader_single_image_accepted(self, tmp_path: Path) -> None:
+        # One image is a valid loader on its own (rendered directly, not cycled).
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        (d / "loader" / "spin.webp").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == ["loader/spin.webp"]
+
+    def test_pack_loader_svg_and_gif_accepted(self, tmp_path: Path) -> None:
+        # SVG rides the same <img>-secure-mode asset path as logo.svg; GIF/animated
+        # formats self-animate in the <img>. Both are valid loader images.
+        d = _make_theme(tmp_path, level=1)
+        (d / "loader").mkdir()
+        (d / "loader" / "a.svg").write_text(
+            "<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>",
+            encoding="utf-8",
+        )
+        (d / "loader" / "b.gif").write_bytes(_PNG_1PX)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderImages"] == ["loader/a.svg", "loader/b.gif"]
 
     def test_l2_overlay_asset_rejected(self, tmp_path: Path) -> None:
         d = _make_theme(tmp_path)  # declares level 0 but ships an overlay
@@ -505,7 +643,7 @@ class TestCopyInstalledTheme:
         assert (dst / "theme.json").is_file()
 
     def test_oversized_source_rejected_by_copy_budget(self, tmp_path: Path) -> None:
-        # TOCTOU round 2 (Codex HIGH): a regular file swapped for a huge one
+        # A regular file swapped for a huge one
         # after any earlier walk must not exhaust memory / land in staging —
         # the copy loop enforces a hard cumulative byte ceiling itself.
         from kiro_crew.dashboard.theme_validate import _THEME_TOTAL_BYTES_BY_LEVEL
@@ -524,7 +662,7 @@ class TestCopyInstalledTheme:
     def test_source_containing_themes_dir_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Codex HIGH round 3: staging lives inside _themes_dir(), so a source
+        # Staging lives inside _themes_dir(), so a source
         # equal to (or an ancestor of) the themes dir would make the copy walk
         # recursively consume its own staging output (unbounded nesting →
         # ENAMETOOLONG → residue). Must 400 by containment, leaving no residue.
@@ -539,10 +677,291 @@ class TestCopyInstalledTheme:
             assert theme is None and status == 400, (bad, err, status)
             assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
 
+    def test_dest_ancestor_of_source_rejected_without_deleting_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Promotion displaces dest to `.old` and rmtree()s it. A source
+        # nested UNDER the directory its own slug names (dest is an ancestor)
+        # rides along in that displaced tree. Deleting the tree removes the
+        # source and unrelated siblings while the handler returns 200.
+        # The containment guard must return 400 with the source AND a sibling
+        # file intact and no staging residue. Status alone is not enough: a
+        # reject-after-delete implementation would still return 400.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = themes_root / "lcars" / "subpack"
+        src.mkdir(parents=True)
+        _write(
+            src / "theme.json",
+            {"slug": "lcars", "name": "LCARS", "emoji": "🖖", "level": 0, "formatVersion": 1},
+        )
+        _write(src / "variables.json", _VALID_VARS)
+        sibling = themes_root / "lcars" / "unrelated-sibling.txt"
+        sibling.write_text("precious", encoding="utf-8")
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "inside the install destination" in err
+        assert (src / "theme.json").is_file(), "install deleted its own source"
+        assert sibling.is_file(), "install deleted an unrelated sibling"
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_source_moved_under_dest_while_waiting_for_lock_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The source identity is pinned before lock acquisition. If the source
+        # moves beneath dest in that window, promotion restores the displaced
+        # tree and rejects the install without deleting source bytes.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+        _allow_pinned_source_rename_on_windows(monkeypatch, th_mod, src)
+        expected_manifest = (src / "theme.json").read_bytes()
+        expected_variables = (src / "variables.json").read_bytes()
+        relocated = themes_root / "lcars" / "relocated-source"
+        real_install_lock = th_mod._theme_install_lock
+
+        @contextmanager
+        def _relocating_lock(slug: str):  # type: ignore[no-untyped-def]
+            relocated.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(relocated)
+            with real_install_lock(slug):
+                yield
+
+        monkeypatch.setattr(th_mod, "_theme_install_lock", _relocating_lock)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "moved into the install destination" in err
+        assert (relocated / "theme.json").read_bytes() == expected_manifest
+        assert (relocated / "variables.json").read_bytes() == expected_variables
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_source_decoy_swap_while_waiting_for_lock_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+        _allow_pinned_source_rename_on_windows(monkeypatch, th_mod, src)
+        expected_manifest = (src / "theme.json").read_bytes()
+        expected_variables = (src / "variables.json").read_bytes()
+        relocated = themes_root / "lcars" / "relocated-source"
+        real_install_lock = th_mod._theme_install_lock
+
+        def _swap_source() -> None:
+            relocated.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(relocated)
+            src.mkdir()
+            (src / "decoy.txt").write_text("decoy", encoding="utf-8")
+
+        # The pathname hook makes the vulnerable late stat capture the decoy.
+        # The lock hook drives the same swap when identity comes from the early
+        # descriptor instead, so both implementations exercise one race.
+        real_path_stat = Path.stat
+
+        def _stat_with_pre_lock_swap(
+            path: Path, *args: object, **kwargs: object
+        ) -> os.stat_result:
+            if (
+                path == src
+                and not relocated.exists()
+                and any(themes_root.glob(".install-staging-*"))
+            ):
+                _swap_source()
+            return real_path_stat(path, *args, **kwargs)
+
+        def _swapping_lock(slug: str):  # type: ignore[no-untyped-def]
+            if not relocated.exists():
+                _swap_source()
+            return real_install_lock(slug)
+
+        monkeypatch.setattr(Path, "stat", _stat_with_pre_lock_swap)
+        monkeypatch.setattr(th_mod, "_theme_install_lock", _swapping_lock)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "moved into the install destination" in err
+        assert (relocated / "theme.json").read_bytes() == expected_manifest
+        assert (relocated / "variables.json").read_bytes() == expected_variables
+        assert (src / "decoy.txt").read_text(encoding="utf-8") == "decoy"
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_vanished_source_pin_returns_400_before_staging(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = _make_theme(tmp_path / "source")
+
+        def _missing_source(_path: object) -> int:
+            raise FileNotFoundError
+
+        monkeypatch.setattr(th_mod, "pin_directory", _missing_source)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        assert err == "source directory is not accessible"
+        assert not list(themes_root.glob(".install-staging-*"))
+        assert not list(themes_root.glob(".lcars.old-*"))
+
+    def test_dest_case_variant_ancestor_rejected_on_case_insensitive_fs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # On a case-insensitive filesystem (default macOS APFS),
+        # Path.resolve() preserves the caller's spelling while PosixPath
+        # comparison is case-sensitive: a source supplied as
+        # themes/LCARS/subpack lexically misses dest themes/lcars even though
+        # they are the same directory on disk. A lexical-only guard misses the
+        # case variant and promotion deletes the source. The inode fallback
+        # must catch it. Skipped where case spelling creates distinct paths.
+        probe = tmp_path / "CaseProbe"
+        probe.mkdir()
+        if not (tmp_path / "caseprobe").exists():
+            pytest.skip("requires a case-insensitive filesystem")
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        themes_root = tv_mod._themes_dir()
+        src = themes_root / "lcars" / "subpack"
+        src.mkdir(parents=True)
+        _write(
+            src / "theme.json",
+            {"slug": "lcars", "name": "LCARS", "emoji": "🖖", "level": 0, "formatVersion": 1},
+        )
+        _write(src / "variables.json", _VALID_VARS)
+        sibling = themes_root / "lcars" / "unrelated-sibling.txt"
+        sibling.write_text("precious", encoding="utf-8")
+        case_variant = themes_root / "LCARS" / "subpack"
+
+        theme, err, status = th_mod._do_install("local", {"path": str(case_variant)})
+
+        assert theme is None and status == 400, (theme, err, status)
+        # Two fail-closed refusals are possible, both before promotion touches
+        # the destination: the ancestor guard names the destination, or the
+        # staging read's within_root containment (fd real path in on-disk case
+        # vs the caller-cased source root) refuses the file first.
+        assert err is not None and (
+            "inside the install destination" in err or "unreadable/unsafe file" in err
+        ), err
+        assert (src / "theme.json").is_file(), "install deleted its own source"
+        assert sibling.is_file(), "install deleted an unrelated sibling"
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_staging_walks_the_pinned_directory_by_its_kernel_spelling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The staging read compares each opened file's real path with the name
+        # it was opened by. ``resolve()`` follows links but keeps the caller's
+        # case, so on a case-insensitive filesystem a source typed as
+        # ``themes/LCARS/pack`` for a directory stored as ``themes/lcars/pack``
+        # is refused as unsafe before any later guard runs
+        # (test_dest_case_variant_ancestor_rejected_on_case_insensitive_fs is
+        # that case, on such a filesystem). The install must therefore walk the
+        # source by the spelling the kernel reports for the pinned descriptor.
+        # A case-sensitive filesystem cannot spell one directory two ways, so
+        # the kernel's answer is stood in for by a second directory: the walk
+        # must follow the answer, not the path the caller supplied.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        supplied = _make_theme(tmp_path / "typed")
+        kernel = _make_theme(tmp_path / "on-disk", name="On Disk")
+        pinned: list[int] = []
+
+        def _fake_real_path(fd: int) -> str:
+            pinned.append(fd)
+            return str(kernel)
+
+        monkeypatch.setattr(th_mod, "fd_real_path", _fake_real_path)
+
+        walked: list[Path] = []
+        real_copy = th_mod._copy_installed_theme
+
+        def _spy(source: Path, dst: Path) -> None:
+            walked.append(Path(source))
+            real_copy(source, dst)
+
+        monkeypatch.setattr(th_mod, "_copy_installed_theme", _spy)
+        theme, err, status = th_mod._do_install("local", {"path": str(supplied)})
+        assert err is None and status == 200 and theme is not None
+        assert walked == [kernel]
+        assert theme["name"] == "On Disk"
+        # Asked about the descriptor pin_directory opened, not any pathname.
+        assert len(pinned) == 1 and pinned[0] >= 0
+
+    def test_themes_dir_containment_is_judged_on_the_pinned_spelling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The "source must not contain the themes directory" guard protects
+        # the staging walk from copying its own output. It must judge the
+        # spelling that walk uses -- the pinned descriptor's -- not the one the
+        # caller supplied, or a source the kernel reports as the themes
+        # directory itself would pass the guard and be walked.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        supplied = _make_theme(tmp_path)
+        themes_root = tv_mod._themes_dir()
+        themes_root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(th_mod, "fd_real_path", lambda fd: str(themes_root))
+
+        theme, err, status = th_mod._do_install("local", {"path": str(supplied)})
+        assert theme is None and status == 400, (theme, err, status)
+        assert err is not None and "must not contain the themes directory" in err
+        assert not any(p.name.startswith(".install-staging-") for p in themes_root.iterdir())
+
+    def test_staging_keeps_the_caller_spelling_when_the_kernel_has_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A host that cannot report the descriptor's path gives the install
+        # nothing better than the caller's spelling; the read-side check on
+        # every file still decides, so the install proceeds rather than
+        # refusing every local source on such a host.
+        import kiro_crew.dashboard.handlers.themes as th_mod
+        import kiro_crew.dashboard.theme_validate as tv_mod
+
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path / "cfg")
+        src = _make_theme(tmp_path)
+        monkeypatch.setattr(th_mod, "fd_real_path", lambda fd: None)
+
+        walked: list[Path] = []
+        real_copy = th_mod._copy_installed_theme
+
+        def _spy(source: Path, dst: Path) -> None:
+            walked.append(Path(source))
+            real_copy(source, dst)
+
+        monkeypatch.setattr(th_mod, "_copy_installed_theme", _spy)
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+        assert err is None and status == 200 and theme is not None
+        assert walked == [src]
+
     def test_install_validates_the_staging_snapshot_not_the_source(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # TOCTOU round 2 (Codex HIGH): validation must run on the private
+        # Validation must run on the private
         # staging copy (immutable to an attacker), NOT on the still-writable
         # source dir — otherwise content swapped in after validation gets
         # promoted unvalidated. Pin the order by capturing the path
@@ -555,10 +974,12 @@ class TestCopyInstalledTheme:
         seen: list[Path] = []
         real_validate = th_mod._validate_theme_dir
 
-        def _spy(path: Path):  # type: ignore[no-untyped-def]
+        def _spy(path: Path, **kwargs):  # type: ignore[no-untyped-def]
             seen.append(Path(path))
-            return real_validate(path)
+            seen_kwargs.append(dict(kwargs))
+            return real_validate(path, **kwargs)
 
+        seen_kwargs: list[dict] = []
         monkeypatch.setattr(th_mod, "_validate_theme_dir", _spy)
         theme, err, status = th_mod._do_install("local", {"path": str(src)})
         assert err is None and status == 200 and theme is not None
@@ -567,6 +988,10 @@ class TestCopyInstalledTheme:
         # never the caller-supplied source.
         assert seen[0] != src
         assert seen[0].name.startswith(".install-staging-")
+        # The install path must opt into the font-pin refusal; the read path is
+        # the one that tolerates a legacy pin, so losing this flag here would
+        # silently let a pinning pack install.
+        assert seen_kwargs[0].get("installing") is True
         # The promoted install came from that snapshot.
         assert (tmp_path / "cfg" / "themes" / theme["slug"] / "theme.json").is_file()
 
@@ -649,7 +1074,12 @@ class TestValidateThemeDirL1:
         assert err is not None and "forbidden selector" in err
 
     def test_too_many_fonts_rejected(self, tmp_path: Path) -> None:
-        assets = {f"styles/fonts/f{i}.woff2": b"wOF2" + b"\x00" * 8 for i in range(4)}
+        # Derived from the constant, not a literal: the cap covers both font roles
+        # (a sans set plus a mono pair), so a literal drifts the moment it moves.
+        assets = {
+            f"styles/fonts/f{i}.woff2": b"wOF2" + b"\x00" * 8
+            for i in range(_THEME_MAX_FONTS + 1)
+        }
         summary, err = _validate_theme_dir(_make_tiered(tmp_path, level=1, extra=assets))
         assert summary is None
         assert err is not None and "too many fonts" in err
@@ -932,8 +1362,8 @@ class TestDoSCeilings:
 
 
 class TestFullL2Fixture:
-    """Regression for a full Level-2 pack built in a tmp dir. Sample/test packs
-    live OUTSIDE the repo now — nothing theme-bearing ships in the wheel — so
+    """A full Level-2 pack built in a tmp dir. Sample/test packs
+    live OUTSIDE the repo — nothing theme-bearing ships in the wheel — so
     this fixture carries persona + overlays + topbar + a font + an audio
     manifest to exercise the §3.1/§3.3 overlay/topbar/audio manifest
     declarations and the content-bound persona descriptor end to end."""
@@ -965,6 +1395,7 @@ class TestFullL2Fixture:
         assert info["chars"] == len(text)
         assert info["text"] == text
 
+    @requires_symlinks
     def test_descriptor_rejects_symlinked_persona(self, tmp_path: Path) -> None:
         # TOCTOU symlink-swap: persona.md replaced by a symlink to a file outside
         # the theme dir must NOT be read. The nolink chokepoint (O_NOFOLLOW +
@@ -994,7 +1425,7 @@ class TestFullL2Fixture:
 
 # A pack-relative overlay/topbar HTML file set the resolvers can find on disk.
 def _decl_pack(root: Path, files: dict[str, object] | None = None) -> Path:
-    """Bare directory with the given rel-path files (str|bytes). Used to back
+    """Bare directory with the given rel-path files (str|bytes). Backs
     the manifest declaration validators, which resolve ``src`` against disk."""
     d = root / "decl-pack"
     d.mkdir(parents=True, exist_ok=True)
@@ -1306,6 +1737,286 @@ class TestThemeAssetDescriptor:
         assert desc["overlays"][0]["zIndex"] == _THEME_OVERLAY_DEFAULT_ZINDEX
 
 
+_TTF = b"\x00\x01\x00\x00" + b"\x00" * 16
+
+
+class TestFontRoles:
+    """A face carries the Font Family option it feeds, so a pack can ship a
+    proportional AND a monospace font and each reaches its own option."""
+
+    @staticmethod
+    def _pack(tmp_path: Path, fonts: list[dict]) -> tuple[Path, dict]:
+        files = {f"styles/fonts/{f['file']}": _TTF for f in fonts if "file" in f}
+        return _decl_pack(tmp_path, files), {"level": 1, "name": "F", "fonts": fonts}
+
+    def test_role_round_trips_for_both_roles(self, tmp_path: Path) -> None:
+        d, manifest = self._pack(
+            tmp_path,
+            [
+                {"family": "Manrope", "file": "sans.ttf", "role": "sans"},
+                {"family": "Plex Mono", "file": "mono.ttf", "role": "mono"},
+            ],
+        )
+        fonts = _theme_asset_descriptor(d, manifest, 1)["fonts"]
+        assert [(f["family"], f["role"]) for f in fonts] == [
+            ("Manrope", "sans"),
+            ("Plex Mono", "mono"),
+        ]
+
+    def test_absent_role_defaults_to_sans(self, tmp_path: Path) -> None:
+        # A pack authored before roles existed must keep its meaning: its face is
+        # the proportional one, which is the only thing the old shape could be.
+        d, manifest = self._pack(tmp_path, [{"family": "Manrope", "file": "sans.ttf"}])
+        assert _theme_asset_descriptor(d, manifest, 1)["fonts"][0]["role"] == "sans"
+
+    def test_unknown_role_falls_back_to_sans(self, tmp_path: Path) -> None:
+        # Lenient like weight/style: a typo downgrades one face rather than
+        # failing the whole install.
+        d, manifest = self._pack(
+            tmp_path, [{"family": "Manrope", "file": "sans.ttf", "role": "cursive"}]
+        )
+        assert _theme_asset_descriptor(d, manifest, 1)["fonts"][0]["role"] == "sans"
+
+    @pytest.mark.parametrize("bad_role", [[], {}, 7, None, True, ["sans"]])
+    def test_non_string_role_does_not_crash_the_descriptor(
+        self, tmp_path: Path, bad_role: object
+    ) -> None:
+        # `role` is untrusted manifest JSON. An unhashable value tested against a
+        # frozenset raises TypeError, and the descriptor is built by the
+        # theme-detail route the dashboard calls for EVERY installed pack at boot
+        # — so one malformed pack would take the whole theme list down, not just
+        # itself. It must degrade to the default role instead.
+        d, manifest = self._pack(
+            tmp_path, [{"family": "Manrope", "file": "sans.ttf", "role": bad_role}]
+        )
+        assert _theme_asset_descriptor(d, manifest, 1)["fonts"][0]["role"] == "sans"
+
+    def test_cap_admits_a_full_sans_set_plus_a_mono_pair(self, tmp_path: Path) -> None:
+        # The cap has to clear both roles at once, or shipping a mono font costs a
+        # sans weight and the type hierarchy silently loses a step.
+        fonts = [
+            {"family": "S", "file": f"s{w}.ttf", "weight": w, "role": "sans"}
+            for w in (400, 500, 600, 700)
+        ] + [
+            {"family": "M", "file": f"m{w}.ttf", "weight": w, "role": "mono"}
+            for w in (400, 500)
+        ]
+        d, manifest = self._pack(tmp_path, fonts)
+        assert len(_theme_asset_descriptor(d, manifest, 1)["fonts"]) == 6
+
+
+class TestFontRoleRejectedAtInstall:
+    """A `fonts` entry whose `role` is neither "sans" nor "mono" is REFUSED at
+    install (`installing=True`) instead of silently coercing to "sans".
+    "monospace" (the CSS keyword) is the likeliest typo for exactly the role
+    most likely to be mistyped, and `_theme_asset_descriptor`'s lenient
+    coercion (covered by `TestFontRoles` above, which must keep passing
+    unchanged) made the failure silent: the mono face renders as Sans while
+    Mono keeps the built-in JetBrains Mono. Unlike that read path,
+    `_validate_theme_dir` reads `theme.json` from disk, so these build a real
+    on-disk pack rather than passing an in-memory manifest."""
+
+    def _pack_with_font_role(self, tmp_path: Path, role: object) -> Path:
+        d = tmp_path / "role-pack"
+        d.mkdir(parents=True, exist_ok=True)
+        _write(
+            d / "theme.json",
+            {
+                "slug": "role-pack",
+                "name": "Role Pack",
+                "emoji": "🎨",
+                "level": 1,
+                "formatVersion": 1,
+                "fonts": [{"family": "Manrope", "file": "sans.ttf", "role": role}],
+            },
+        )
+        _write(d / "variables.json", _VALID_VARS)
+        (d / "styles" / "fonts").mkdir(parents=True, exist_ok=True)
+        (d / "styles" / "fonts" / "sans.ttf").write_bytes(_TTF)
+        return d
+
+    def test_unknown_role_rejected_at_install(self, tmp_path: Path) -> None:
+        d = self._pack_with_font_role(tmp_path, "monospace")
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None
+        assert "Manrope" in err
+        assert "monospace" in err
+        assert "'sans' and 'mono'" in err
+
+    def test_unknown_role_tolerated_on_re_read(self, tmp_path: Path) -> None:
+        # The theme-detail route re-runs this validator for every installed
+        # pack on read (installing=False, the default). A pack that predates
+        # this rule -- or installed before a narrower rule existed -- must
+        # keep loading there rather than 500ing and dropping out of the theme
+        # map, mirroring the font-pin rule's own install-only enforcement.
+        d = self._pack_with_font_role(tmp_path, "monospace")
+        summary, err = _validate_theme_dir(d)
+        assert err is None, err
+        assert summary is not None
+
+    @pytest.mark.parametrize("role", ["sans", "mono"])
+    def test_valid_roles_accepted_at_install(self, tmp_path: Path, role: str) -> None:
+        d = self._pack_with_font_role(tmp_path, role)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+
+    def test_absent_role_still_accepted_at_install(self, tmp_path: Path) -> None:
+        # Absent is the deliberate default case (coerces to sans on read) --
+        # not what this rule targets.
+        d = tmp_path / "no-role-pack"
+        d.mkdir()
+        _write(
+            d / "theme.json",
+            {
+                "slug": "no-role-pack",
+                "name": "No Role",
+                "emoji": "🎨",
+                "level": 1,
+                "formatVersion": 1,
+                "fonts": [{"family": "Manrope", "file": "sans.ttf"}],
+            },
+        )
+        _write(d / "variables.json", _VALID_VARS)
+        (d / "styles" / "fonts").mkdir(parents=True)
+        (d / "styles" / "fonts" / "sans.ttf").write_bytes(_TTF)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+
+    @pytest.mark.parametrize("bad_role", [[], {}, 7, True, ["sans"], None])
+    def test_non_string_role_rejected_at_install_without_crashing(
+        self, tmp_path: Path, bad_role: object
+    ) -> None:
+        # `role` is untrusted manifest JSON. Membership-testing an unhashable
+        # value (a list, a dict) against the frozenset raises TypeError if the
+        # isinstance guard is dropped -- this must return a clean error
+        # instead of crashing the install handler. An explicit JSON `null`
+        # (None) is a PRESENT non-string value: it is rejected like any other
+        # bad role, distinct from the absent-role default case above.
+        d = self._pack_with_font_role(tmp_path, bad_role)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None
+
+
+class TestOverridesFontPin:
+    """overrides.css must not pin the UI font: a pin lands below where the Font
+    Family preference is applied, so Mono/System would stop working with nothing
+    on screen explaining why. theme.json's role-tagged ``fonts`` list is the route."""
+
+    @pytest.mark.parametrize(
+        "css",
+        [
+            "body{--font-body:'X',sans-serif}",
+            "body{--mono:'X',monospace}",
+            "body{--theme-font-sans:'X',sans-serif}",
+            "body{--theme-font-mono:'X',monospace}",
+            "body{font-family:'X',sans-serif}",
+            "body{font:400 .875rem/1.55 'X',sans-serif}",
+            "body:lang(ja){font-family:'X',sans-serif}",
+            'html{font-family:"X",sans-serif}',
+            ':root{font-family:"X",sans-serif}',
+            '[data-theme="custom-x-dark"] body{font-family:"X",sans-serif}',
+            "BODY{FONT-FAMILY:'X',sans-serif}",
+            # Escaped property names: a browser decodes these while tokenizing.
+            "body{--font-b\\6f dy:'X',sans-serif}",
+            "body{f\\6f nt:400 .875rem/1.55 'X',sans-serif}",
+            # Uppercase escape: \\4F decodes to 'O', and standard property names
+            # are ASCII case-insensitive, so the browser still applies `font`.
+            "body{f\\4F nt:400 .875rem/1.55 'X',sans-serif}",
+            # Escaped SELECTOR: a browser resolves b\\6f dy to body. The uppercase
+            # form also exercises the lowercase pass — selectors arrive already
+            # case-folded, so only an uppercase-producing escape reaches it.
+            "b\\6f dy{font-family:'X',sans-serif}",
+            "b\\4F dy{font-family:'X',sans-serif}",
+        ],
+    )
+    def test_pins_are_rejected(self, css: str) -> None:
+        err = _validate_overrides_css(css, enforce_font_pins=True)
+        assert err is not None
+        assert "theme.json" in err
+
+    @pytest.mark.parametrize(
+        "css",
+        [
+            "body{--font-body:'X',sans-serif}",
+            "body{font:400 .875rem/1.55 'X',sans-serif}",
+            "body{font-family:'X',sans-serif}",
+        ],
+    )
+    def test_pins_are_tolerated_when_not_installing(self, css: str) -> None:
+        # The read path re-validates an ALREADY-INSTALLED pack. A pack that
+        # predates the font-pin rule installed legitimately, so failing it here
+        # would turn the theme-detail route into a 500 and drop the pack out of
+        # the theme map — losing its colours as well as its font. The runtime
+        # scoper still drops the pin, so the preference stays protected.
+        assert _validate_overrides_css(css) is None
+
+    @pytest.mark.parametrize(
+        "css",
+        [
+            ".topbar{font-family:'X',sans-serif}",
+            ".topbar{font:600 12px/1.2 'X',sans-serif}",
+            ".code-block{font-family:'X',monospace}",
+            "button.primary{font-family:'X',sans-serif}",
+            "body{background:#101010;color:#eee}",
+            # The shorthand match must not swallow the other font-* longhands.
+            "body{font-weight:500}",
+            "body{font-size:15px}",
+            "body{font-feature-settings:'ss01'}",
+            # The word `font:` appearing inside a VALUE is not a declaration. The
+            # check reads property names, so neither the decoded string nor a
+            # semicolon inside one may fake one.
+            'body{--label:" \\66 ont:"}',
+            'body{content:"x;font:y";color:#eee}',
+            "body::before{content:\"\";position:fixed;inset:0;pointer-events:none}",
+        ],
+    )
+    def test_narrow_surfaces_and_non_font_rules_still_pass(self, css: str) -> None:
+        # The rule must not over-reach: a face on ONE surface is legitimate
+        # theming, and an unrelated body rule is untouched.
+        assert _validate_overrides_css(css, enforce_font_pins=True) is None
+
+
+class TestLegacyPinnedPackStillLoads:
+    """A pack installed BEFORE the font-pin rule must keep loading.
+
+    The theme-detail route re-runs ``_validate_theme_dir`` on every read of an
+    installed pack and answers 500 when it fails, and the dashboard fetches that
+    route for every installed theme at boot. Enforcing the font-pin rule on that
+    path would therefore not merely revert such a pack's font — it would drop the
+    pack out of the theme map entirely, colours included.
+    """
+
+    PIN = "body{--font-body:'Legacy',sans-serif}"
+
+    def test_install_refuses_the_pin(self, tmp_path: Path) -> None:
+        d = _make_tiered(tmp_path, level=1, extra={"styles/overrides.css": self.PIN})
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and "theme.json" in err
+
+    def test_reading_the_same_pack_succeeds(self, tmp_path: Path) -> None:
+        d = _make_tiered(tmp_path, level=1, extra={"styles/overrides.css": self.PIN})
+        summary, err = _validate_theme_dir(d)
+        assert err is None, f"read path must not reject a legacy pack: {err}"
+        assert summary is not None
+        # The colours still resolve, which is the part a 500 would have taken away.
+        assert summary["dark"]["--bg"] == "#000000"
+
+    def test_structural_checks_still_apply_on_the_read_path(self, tmp_path: Path) -> None:
+        # Relaxing the font layer must not relax the security/layout layers: an
+        # external url() in an installed pack stays a hard failure on every path.
+        d = _make_tiered(
+            tmp_path,
+            level=1,
+            extra={"styles/overrides.css": ".topbar{background:url('https://evil.example/x.png')}"},
+        )
+        summary, err = _validate_theme_dir(d)
+        assert summary is None
+        assert err is not None and "forbidden pattern" in err
+
+
 class TestDeleteLock:
     """DELETE of an installed theme dir must serialize against a concurrent
     reinstall by acquiring the same per-slug install lock before rmtree
@@ -1352,7 +2063,7 @@ class TestDeleteLock:
 
 
 class TestServingReadNolink:
-    """Codex HIGH round 4: _resolve_theme_asset CHECKS the path but the route
+    """_resolve_theme_asset CHECKS the path but the route
     OPENED it later with a plain read — a swap-to-symlink in the window was
     followed (credential exfil via the asset endpoint). Serving reads now go
     through _read_theme_bytes_nolink (O_NOFOLLOW + containment)."""
@@ -1391,100 +2102,8 @@ class TestServingReadNolink:
         assert _read_theme_bytes_nolink("mypack", target) is None
 
 
-class TestWindowsGate:
-    """Arbiter item 4: the pack routes traverse hooks' POSIX-only
-    O_NOFOLLOW + fd-real-path chokepoint (no Windows impl), so they honestly
-    501 on Windows instead of 500-ing. The flag is monkeypatched True here;
-    on this (POSIX) host it defaults False, so the rest of the suite exercises
-    the normal path. The editor custom-record CRUD paths are NOT gated."""
-
-    @staticmethod
-    def _req(**match_info: object) -> object:
-        import types
-
-        async def _json() -> dict:
-            return {"source": {"type": "local", "path": "/tmp/does-not-matter"}}
-
-        r = types.SimpleNamespace(match_info=match_info)
-        r.json = _json  # type: ignore[attr-defined]
-        return r
-
-    def test_install_501_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(th_mod.api_themes_install(self._req()))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        assert b"KiroCrew#311" in resp.body
-
-    @pytest.mark.parametrize(
-        "handler,match_info",
-        [
-            ("api_theme_asset", {"slug": "wintheme", "path": "branding/logo.svg"}),
-            ("api_theme_overlay", {"slug": "wintheme", "id": "scanner"}),
-            ("api_theme_topbar", {"slug": "wintheme", "mode": "dark"}),
-        ],
-    )
-    def test_serving_routes_501_on_windows(
-        self, monkeypatch: pytest.MonkeyPatch, handler: str, match_info: dict
-    ) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(getattr(th_mod, handler)(self._req(**match_info)))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-
-    def test_delete_installed_dir_501_on_windows(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import asyncio
-        import types
-
-        import kiro_crew.dashboard.theme_validate as tv_mod
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
-        slug = "wintheme"
-        d = tv_mod._installed_theme_dir(slug)
-        d.mkdir(parents=True)
-        (d / "theme.json").write_text(
-            '{"name": "W", "level": 0, "formatVersion": 1}', encoding="utf-8"
-        )
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        req = types.SimpleNamespace(method="DELETE", match_info={"slug": slug})
-        resp = asyncio.run(th_mod.api_theme_detail(req))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        # The gate short-circuits before any rmtree — the dir is untouched.
-        assert d.is_dir()
-
-    def test_flag_false_does_not_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # With the flag False (the POSIX default), install is NOT short-circuited:
-        # it proceeds to parse the body, so invalid JSON yields the normal 400.
-        import asyncio
-        import types
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        assert th_mod._THEMES_WIN_UNSUPPORTED is False  # POSIX host default
-
-        async def _bad_json() -> dict:
-            raise ValueError("no body")
-
-        req = types.SimpleNamespace(match_info={})
-        req.json = _bad_json  # type: ignore[attr-defined]
-        resp = asyncio.run(th_mod.api_themes_install(req))
-        assert resp.status == 400
-
-
 class TestCssParserCorpus:
-    """Shared-corpus guard for the two theme-CSS parsers (PR #107 arbiter item).
+    """Shared-corpus guard for the two theme-CSS parsers.
 
     The install-time denylist (``_validate_overrides_css``) and the runtime
     positive-selector scoper (useTheme.tsx) implement different models BY
@@ -1504,7 +2123,7 @@ class TestCssParserCorpus:
 
         mismatches = []
         for case in self._corpus():
-            err = _validate_overrides_css(case["css"])
+            err = _validate_overrides_css(case["css"], enforce_font_pins=True)
             accepted = err is None
             if accepted != case["installAccepts"]:
                 mismatches.append(f"{case['name']}: expected installAccepts={case['installAccepts']}, got {accepted} (err={err})")
@@ -1517,3 +2136,359 @@ class TestCssParserCorpus:
         assert any(c["installAccepts"] for c in cases)
         assert any(not c["installAccepts"] for c in cases)
         assert any(c["installAccepts"] and not c["runtimeKeeps"] for c in cases)
+
+
+# ── _slugify_theme_name hash fallback ──────────────────────────────
+
+
+def test_theme_slug_non_ascii_names_derive_distinct_stable_slugs() -> None:
+    korean = _slugify_theme_name("\ub2e4\ud06c \ubaa8\ub4dc")
+    russian = _slugify_theme_name("\u0442\u0451\u043c\u043d\u0430\u044f \u0442\u0435\u043c\u0430")
+    assert korean.startswith("custom-")
+    assert korean != russian
+    assert korean == _slugify_theme_name("\ub2e4\ud06c \ubaa8\ub4dc")
+    # The fallback stays filesystem-safe by the repo's own traversal guard.
+    assert _safe_theme_slug(korean) == korean
+
+
+def test_theme_slug_ascii_names_are_unchanged() -> None:
+    assert _slugify_theme_name("Solarized Dark") == "solarized-dark"
+
+
+class TestThemeSlugAsciiPart:
+    """``_theme_slug_ascii_part`` is the exact hash-fallback predicate.
+
+    Asking "did this slug come from the fallback?" by matching ``custom-<16 hex>``
+    would misread a real ASCII name, so the install path asks whether the ASCII
+    filter empties instead. These pin that the split is behaviour-preserving.
+    """
+
+    def test_empty_exactly_when_the_filter_strips_everything(self) -> None:
+        assert tv_mod._theme_slug_ascii_part("\u4e3b\u9898") == ""
+        assert tv_mod._theme_slug_ascii_part("!!!") == ""
+        assert tv_mod._theme_slug_ascii_part("Solarized Dark") == "solarized-dark"
+
+    def test_a_hex_shaped_ascii_name_is_not_mistaken_for_a_fallback(self) -> None:
+        # Slugifies to custom-0123456789abcdef: same shape as the fallback, but
+        # the ASCII part is non-empty, so continuity must never be considered.
+        name = "Custom 0123456789abcdef"
+        assert _slugify_theme_name(name) == "custom-0123456789abcdef"
+        assert tv_mod._theme_slug_ascii_part(name) != ""
+
+    def test_slugify_still_composes_the_two_branches(self) -> None:
+        for name in ("Solarized Dark", "\u4e3b\u9898", "x", "---"):
+            expected = tv_mod._theme_slug_ascii_part(name) or slug_hash_fallback(
+                name, "custom"
+            )
+            assert _slugify_theme_name(name) == expected
+
+
+class TestThemeIdentitySource:
+    """The identity is the string the slug derives from: declared slug, else name."""
+
+    def test_declared_slug_wins_over_name(self) -> None:
+        assert tv_mod._theme_identity_source({"slug": "pinned", "name": "Other"}) == "pinned"
+
+    def test_blank_or_non_string_slug_falls_back_to_name(self) -> None:
+        assert tv_mod._theme_identity_source({"slug": "   ", "name": "N"}) == "N"
+        assert tv_mod._theme_identity_source({"slug": 7, "name": "N"}) == "N"
+
+    def test_total_against_a_manifest_with_no_usable_strings(self) -> None:
+        assert tv_mod._theme_identity_source({}) == ""
+        assert tv_mod._theme_identity_source({"name": 5}) == ""
+
+    def test_validate_reports_the_identity_it_slugged(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, name="\u4e3b\u9898")
+        _write(d / "theme.json", {"name": "\u4e3b\u9898", "level": 0, "formatVersion": 1})
+        summary, err = _validate_theme_dir(d)
+        assert err is None and summary is not None
+        assert summary["identity"] == "\u4e3b\u9898"
+        assert summary["slug"] == _slugify_theme_name("\u4e3b\u9898")
+
+
+# ── Legacy-custom/-pack continuity ──
+
+
+_LEGACY_A = "\u4e3b\u9898"  # all non-ASCII: the ASCII filter empties it
+_LEGACY_B = "\u30c6\u30fc\u30de"  # a DIFFERENT all-non-ASCII pack
+
+
+def _legacy_pack(root: Path, name: str) -> Path:
+    """A pack whose name filters to nothing, so its slug is a hash fallback."""
+    root.mkdir(parents=True, exist_ok=True)
+    _write(root / "theme.json", {"name": name, "emoji": "x", "level": 0, "formatVersion": 1})
+    _write(root / "variables.json", _VALID_VARS)
+    return root
+
+
+class TestLegacyCustomPackContinuity:
+    """An installed pack whose name filters to nothing sits under the constant
+    slug ``custom``. Reinstalling it must keep addressing that directory instead
+    of forking a hashed twin -- and must only do so while the directory still
+    holds THAT pack, decided inside the lock guarding it."""
+
+    def _setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
+        return tv_mod._themes_dir()
+
+    def test_reinstall_keeps_the_legacy_slug(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        themes = self._setup(tmp_path, monkeypatch)
+        _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == "custom"
+        # No hashed twin: the legacy directory is the only record.
+        assert sorted(p.name for p in themes.iterdir() if p.is_dir()) == ["custom"]
+
+    def test_a_different_pack_at_the_legacy_slug_is_not_adopted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        themes = self._setup(tmp_path, monkeypatch)
+        legacy = _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_B)
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        # The unrelated pack is untouched, not overwritten.
+        assert json.loads((legacy / "theme.json").read_text("utf-8"))["name"] == _LEGACY_B
+        assert len([p for p in themes.iterdir() if p.is_dir()]) == 2
+
+    def test_no_legacy_directory_derives_the_hashed_slug(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._setup(tmp_path, monkeypatch)
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+
+    def test_an_ascii_named_pack_never_consults_continuity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        themes = self._setup(tmp_path, monkeypatch)
+        _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        src = _make_theme(tmp_path / "src")  # slug "lcars", ASCII survives
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == "lcars"
+        assert (themes / "custom" / "theme.json").is_file()
+
+    def test_an_editor_record_on_the_legacy_slug_forks_instead_of_failing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A custom.json record owns the slug, so continuity is impossible. The
+        # install must fall back to the hashed slug, NOT return 409: forking is
+        # exactly the behaviour that shipped before continuity existed.
+        themes = self._setup(tmp_path, monkeypatch)
+        _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        themes.mkdir(parents=True, exist_ok=True)
+        _write(themes / "custom.json", {"name": "editor", "slug": "custom"})
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        assert json.loads((themes / "custom.json").read_text("utf-8"))["name"] == "editor"
+
+    def test_reinstalling_the_legacy_directory_itself_forks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # src IS themes/custom: adopting it would rename the directory onto
+        # itself, so continuity declines and the derived slug takes the copy.
+        self._setup(tmp_path, monkeypatch)
+        legacy = _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(legacy)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        assert legacy.is_dir()
+
+    def test_a_source_nested_under_the_legacy_directory_forks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A local source is allowed to sit UNDER the themes dir, so it can sit
+        # inside themes/custom itself. Adopting that target would displace the
+        # source's own ancestor and rmtree it, deleting the source and any
+        # sibling content. Continuity must decline and the derived slug takes
+        # the staged copy.
+        self._setup(tmp_path, monkeypatch)
+        legacy = _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        src = _legacy_pack(legacy / "subpack", _LEGACY_A)
+        sibling = legacy / "keepme.txt"
+        sibling.write_text("sibling content", encoding="utf-8")
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        assert src.is_dir()
+        assert sibling.read_text("utf-8") == "sibling content"
+
+    def test_identity_is_resolved_inside_the_legacy_promotion_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The load-bearing test.
+
+        The identity read and the directory replacement must be ONE critical
+        section under ``_theme_install_lock("custom")``. Resolving identity
+        before that lock (for example during validation, or under the DERIVED
+        slug's lock) leaves a window in which a concurrent install can place a
+        different pack at ``themes/custom``; the first install, still holding a
+        now-stale match, would delete it and return 200.
+
+        The test holds the legacy lock and, while holding it, performs exactly
+        the mutation that lock admits -- swapping in a different pack. If the
+        install resolved identity inside the lock it observes the swap and
+        declines continuity; if it resolved identity earlier it destroys the
+        victim. The victim's survival is the discriminating assertion: blocking
+        alone proves nothing, because the swap is under the lock either way.
+        """
+        themes = self._setup(tmp_path, monkeypatch)
+        legacy = _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        result: dict[str, object] = {}
+
+        def _install() -> None:
+            result["out"] = th_mod._do_install("local", {"path": str(src)})
+
+        lock = th_mod._theme_install_lock("custom")
+        lock.acquire()
+        worker = threading.Thread(target=_install, daemon=True)
+        worker.start()
+        try:
+            # Cannot reach its decision while the lock is held.
+            worker.join(timeout=2.0)
+            assert worker.is_alive() and "out" not in result
+            # Stand in for a concurrent install that promoted a DIFFERENT pack.
+            shutil.rmtree(legacy)
+            _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_B)
+        finally:
+            lock.release()
+
+        worker.join(timeout=30.0)
+        assert not worker.is_alive()
+        theme, err, status = result["out"]  # type: ignore[misc]
+        assert (status, err) == (200, None)
+        # Read the identity under the lock -> the pack is a different one -> fork.
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        # The victim survives: no silent data loss of unrelated content.
+        assert json.loads((legacy / "theme.json").read_text("utf-8"))["name"] == _LEGACY_B
+        assert tv_mod._installed_theme_dir(_slugify_theme_name(_LEGACY_A)).is_dir()
+        assert list(themes.glob(".install-staging-*")) == []
+        assert list(themes.glob(".custom.old-*")) == []
+
+
+class TestInstalledThemeIdentityRead:
+    """``_installed_theme_identity`` is total: every unreadable shape reads as
+    "no identity" rather than raising or matching."""
+
+    def _themes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
+        return tv_mod._themes_dir()
+
+    def test_reads_the_identity_of_an_installed_pack(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._themes(tmp_path, monkeypatch)
+        _legacy_pack(tv_mod._installed_theme_dir("custom"), _LEGACY_A)
+        assert th_mod._installed_theme_identity("custom") == _LEGACY_A
+
+    def test_missing_directory_and_missing_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._themes(tmp_path, monkeypatch)
+        assert th_mod._installed_theme_identity("custom") is None
+        tv_mod._installed_theme_dir("custom").mkdir(parents=True)
+        assert th_mod._installed_theme_identity("custom") is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [b"{not json", b"[]", b'"a string"', b"{}", b'{"name": 5}', b"\xff\xfe\x00"],
+    )
+    def test_unusable_manifest_bodies_read_as_no_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes
+    ) -> None:
+        self._themes(tmp_path, monkeypatch)
+        d = tv_mod._installed_theme_dir("custom")
+        d.mkdir(parents=True)
+        (d / "theme.json").write_bytes(body)
+        assert th_mod._installed_theme_identity("custom") is None
+
+    def test_oversized_manifest_reads_as_no_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # safe_read_file_bytes_nolink RAISES FileTooLargeError past the cap
+        # (allow_truncate=False). Uncaught, that surfaced as HTTP 500 during
+        # install; a truncated read would be a different document and must
+        # never satisfy an identity comparison either.
+        self._themes(tmp_path, monkeypatch)
+        d = tv_mod._installed_theme_dir("custom")
+        d.mkdir(parents=True)
+        padding = "p" * (_THEME_FILE_CAPS["manifest"] + 1024)
+        (d / "theme.json").write_text(
+            json.dumps({"name": _LEGACY_A, "pad": padding}), encoding="utf-8"
+        )
+        assert (d / "theme.json").stat().st_size > _THEME_FILE_CAPS["manifest"]
+        assert th_mod._installed_theme_identity("custom") is None
+
+    def test_an_oversized_legacy_manifest_does_not_fail_the_install(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        themes = self._themes(tmp_path, monkeypatch)
+        d = tv_mod._installed_theme_dir("custom")
+        d.mkdir(parents=True)
+        (d / "theme.json").write_text(
+            json.dumps({"name": _LEGACY_A, "pad": "p" * (_THEME_FILE_CAPS["manifest"] + 1)}),
+            encoding="utf-8",
+        )
+        src = _legacy_pack(tmp_path / "src" / "pack", _LEGACY_A)
+
+        theme, err, status = th_mod._do_install("local", {"path": str(src)})
+
+        # No 500: the oversized manifest is simply no identity, so the install
+        # forks to the hashed slug and the odd directory is left alone.
+        assert (status, err) == (200, None)
+        assert theme is not None and theme["slug"] == _slugify_theme_name(_LEGACY_A)
+        assert list(themes.glob(".install-staging-*")) == []
+
+    def test_hardlinked_manifest_reads_as_no_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The read chokepoint refuses a hardlinked inode (st_nlink > 1) as well
+        # as a symlink, so an alias pointing at content outside the theme dir
+        # yields no identity. `os.link` needs no special privilege, so this
+        # runs on every platform and keeps the guarantee asserted everywhere.
+        self._themes(tmp_path, monkeypatch)
+        d = tv_mod._installed_theme_dir("custom")
+        d.mkdir(parents=True)
+        outside = tmp_path / "outside.json"
+        outside.write_text(json.dumps({"name": _LEGACY_A}), encoding="utf-8")
+        os.link(outside, d / "theme.json")
+        assert (d / "theme.json").stat().st_nlink > 1
+        assert th_mod._installed_theme_identity("custom") is None
+
+    @requires_symlinks
+    def test_symlinked_manifest_reads_as_no_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._themes(tmp_path, monkeypatch)
+        d = tv_mod._installed_theme_dir("custom")
+        d.mkdir(parents=True)
+        outside = tmp_path / "outside.json"
+        outside.write_text(json.dumps({"name": _LEGACY_A}), encoding="utf-8")
+        (d / "theme.json").symlink_to(outside)
+        assert th_mod._installed_theme_identity("custom") is None

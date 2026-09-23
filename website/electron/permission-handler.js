@@ -52,6 +52,68 @@
 "use strict";
 
 /**
+ * Page permissions granted to the trusted dashboard with no OS (TCC) leg.
+ *
+ * Both members share one shape: the dashboard's own code requests them, they
+ * claim no OS resource Electron must broker (so they are answered before the
+ * media path rather than folded into its macOS machinery), and denying them is
+ * SILENT in the renderer — the exact failure mode this module's header
+ * documents for the microphone. The trust gate applies to both: an untrusted
+ * page in the embedded browser view is refused regardless of origin.
+ *
+ * - `fullscreen`: Electron routes a DOM `element.requestFullscreen()` through
+ *   these handlers as `permission === "fullscreen"`. Before it was granted,
+ *   the fullscreen button on an inline `<video>` (a file card, the media
+ *   viewer) did nothing at all when clicked. Denied to untrusted views because
+ *   a third-party page owning the whole screen can repaint it as a convincing
+ *   fake of this app.
+ *
+ * - `notifications`: the dashboard fires page-context `new Notification()` for
+ *   new unacked notifications, approvals included (useNativeNotification.ts),
+ *   and the opt-in finished-chat toast (useWebSocket.ts, `chat_done`). In a
+ *   plain browser Chromium prompts and grants, so
+ *   Chrome-tab users got native OS toasts; under this handler's blanket deny,
+ *   `Notification.permission` was pinned to 'denied' and the SAME code no-oped
+ *   silently in the packaged app — the one surface where OS notifications are
+ *   most expected. Granting here makes Electron render those constructor calls
+ *   as real OS notifications with zero renderer changes. Denied to untrusted
+ *   views so a browsed page cannot post OS toasts wearing this app's identity.
+ *
+ * This set exists because it now has TWO consumers with identical treatment.
+ * Capabilities routed through the same handler with NO consumer in this
+ * product (`pointerLock`, `keyboardLock`) stay out: widening a permission set
+ * without a consumer is how a security default quietly erodes.
+ */
+const TRUSTED_PAGE_PERMISSIONS = new Set(["fullscreen", "notifications"]);
+
+/**
+ * Trusted-page permissions that are additionally restricted to the MAIN frame.
+ *
+ * The trust/origin gate above identifies the dashboard's webContents, but a
+ * subframe shares its parent's webContents — and `isAppOrigin` treats any
+ * localhost origin as the app. Without a frame check, an iframe the dashboard
+ * embeds (a scripted localhost preview, a widget) would inherit the grant and
+ * could post OS notifications wearing this app's identity. `notifications` is
+ * therefore granted only when `details.isMainFrame` is exactly true —
+ * fail-closed when the field is absent, since only Electron's real permission
+ * callbacks (which always carry it) should ever be granted.
+ *
+ * `fullscreen` stays frame-agnostic deliberately: an inline <video> inside an
+ * embedded player frame legitimately requests fullscreen, that was the
+ * pre-existing granted behavior this change must not regress, and a fullscreen
+ * takeover is visible and user-initiated where a forged notification is not.
+ */
+const MAIN_FRAME_ONLY_PERMISSIONS = new Set(["notifications"]);
+
+/** Frame gate for MAIN_FRAME_ONLY_PERMISSIONS; true for everything else. */
+function frameOk(permission, details) {
+  return (
+    !MAIN_FRAME_ONLY_PERMISSIONS.has(permission) ||
+    details?.isMainFrame === true
+  );
+}
+
+/**
  * True when the request belongs to the app's own dashboard.
  *
  * Checks TWO sources because neither is always present:
@@ -143,9 +205,9 @@ function logDeny(kind, permission, wc, origin, details) {
 /**
  * Build the handler for session.setPermissionRequestHandler().
  *
- * Grants `media` for the app origin unless video is explicitly requested.
- * Denies every other permission type (geolocation, clipboard, notifications,
- * MIDI, …).
+ * Grants `media` for the app origin unless video is explicitly requested, plus
+ * the TRUSTED_PAGE_PERMISSIONS set (fullscreen, notifications). Denies every
+ * other permission type (geolocation, clipboard, MIDI, …).
  *
  * ── The macOS (TCC) leg ──────────────────────────────────────────────────────
  *
@@ -203,6 +265,21 @@ function createPermissionRequestHandler(deps = {}) {
     // origin as the app — so browsing to `http://localhost:<anything>` would
     // otherwise inherit the dashboard's microphone grant. A page never gets a
     // capability just for being served from loopback.
+    //
+    // Non-OS page capabilities (fullscreen, notifications) are answered HERE,
+    // before the media rule: they need the same trust gate but none of the
+    // macOS TCC machinery below, and letting one fall through would put a
+    // fullscreen click or a notification behind a microphone prompt. Logged
+    // unconditionally on refusal rather than via isNoteworthyDenial: this
+    // branch only runs on a real request (a user gesture or an explicit
+    // Notification.requestPermission()), never on Chromium's per-navigation
+    // re-checks, so it cannot become console noise.
+    if (TRUSTED_PAGE_PERMISSIONS.has(permission)) {
+      const allowed =
+        frameOk(permission, details) && !isUntrusted(wc) && originOk(wc, origin);
+      if (!allowed) audit("request", permission, wc, origin, details);
+      return callback(allowed);
+    }
     const granted =
       !isUntrusted(wc) &&
       permission === "media" &&
@@ -281,6 +358,18 @@ function createPermissionCheckHandler(deps = {}) {
     // unavailable — but a check alone grants no capability, and the REQUEST
     // handler (which does the actual granting) is always frame-originated and
     // therefore always has a webContents to match.
+    //
+    // This branch mirrors the request handler's for the reason in this
+    // module's header: a check that disagrees with the async grant is exactly
+    // what made permissions.query() report one verdict while the real request
+    // took another. For notifications the check IS the user-visible surface:
+    // the renderer reads `Notification.permission` (this handler's verdict)
+    // and never constructs a toast unless it says 'granted'.
+    if (TRUSTED_PAGE_PERMISSIONS.has(permission)) {
+      return (
+        frameOk(permission, details) && !isUntrusted(wc) && originOk(wc, origin)
+      );
+    }
     const granted =
       !isUntrusted(wc) &&
       permission === "media" &&

@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from windows_sim import builtin_open_sharing_violation
 
+from kiro_crew import history, history_search
 from kiro_crew.history import (
     _CONSOLIDATION_THRESHOLD,
+    _METADATA_CACHE_MAX,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
     ConversationLog,
@@ -88,18 +92,6 @@ class TestConversationLog:
         log = ConversationLog(base_dir=tmp_path)
         log.mark_consolidated("nonexistent", 5)  # should not raise
 
-    def test_load_transcript(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        log.append("t1", "user", "what is 2+2?")
-        log.append("t1", "assistant", "4")
-        transcript = log.load_transcript("t1")
-        assert "User: what is 2+2?" in transcript
-        assert "Assistant: 4" in transcript
-
-    def test_load_transcript_empty(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        assert log.load_transcript("nonexistent") == ""
-
     def test_safe_key_sanitizes(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
         log.append("thread:with/special chars!", "user", "hi")
@@ -117,9 +109,13 @@ class TestConversationLog:
 
     def test_rotation(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        # Need > 200 lines AND > 2MB to trigger rotation
-        content = "x" * 10000
-        for i in range(300):
+        # Rotation needs BOTH gates crossed: more than ``_SESSION_KEEP_LINES``
+        # lines and more than ``_SESSION_MAX_BYTES`` bytes. Derive the row size
+        # from the budget instead of hardcoding a byte total, so raising the cap
+        # cannot leave this test green while not reaching rotation at all.
+        rows = _SESSION_KEEP_LINES + 50
+        content = "x" * (_SESSION_MAX_BYTES // rows + 1024)
+        for i in range(rows):
             log.append("t1", "user", f"{content} msg {i}")
         path = tmp_path / "t1.jsonl"
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -134,9 +130,13 @@ class TestConversationLog:
 
     def test_rotation_resets_consolidated(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        # Need > 200 lines AND > 2MB to trigger rotation
-        content = "x" * 10000
-        for i in range(250):
+        # Row size derived from the budget for the same reason as
+        # ``test_rotation``: the assertion below only means anything if the
+        # second loop actually re-crosses the byte cap after
+        # ``mark_consolidated``, at whatever the cap is set to.
+        rows = _SESSION_KEEP_LINES + 50
+        content = "x" * (_SESSION_MAX_BYTES // rows + 1024)
+        for i in range(rows):
             log.append("t1", "user", f"{content} msg {i}")
         log.mark_consolidated("t1", 200)
         # Add more to trigger rotation again
@@ -210,8 +210,8 @@ class TestConversationLog:
     def test_update_metadata_upserts_when_file_absent(self, tmp_path):
         """update_metadata() on a not-yet-created session must create the file.
 
-        Regression: ``!ta <agent> --clean`` issued before the first message is
-        logged used to be silently dropped (the file did not exist yet), so the
+        A ``!ta <agent> --clean`` issued before the first message is logged
+        would be silently dropped (the file did not exist yet), so the
         agent/clean_mode selection lived only in memory and was lost on restart
         -- the session then resumed under the default agent with full tools.
         """
@@ -479,7 +479,7 @@ class TestListSessionsDedup:
         An older session that was recently updated should appear before a
         newer session that hasn't been touched.  Sorting by 'created' would
         put the newer-but-stale session first — that's the bug we're guarding
-        against (see commit 789209e, reverted by f04690d, re-fixed in 07a7099).
+        against.
         """
         import os
 
@@ -563,9 +563,9 @@ class TestSearchSessions:
 
     def test_matches_content(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        log.append("alpha", "user", "discussed CR-1234567 today")
+        log.append("alpha", "user", "discussed TICKET-1234567 today")
         log.append("beta", "user", "unrelated chat")
-        results = log.search_sessions("CR-1234567")
+        results = log.search_sessions("TICKET-1234567")
         keys = [s["key"] for s in results]
         assert keys == ["alpha"]
 
@@ -595,8 +595,8 @@ class TestSearchSessions:
     def test_ignores_json_structural_fields(self, tmp_path):
         """Query must match message ``content`` only, not JSON keys/values.
 
-        Regression: searching for common tokens like ``user`` or ``role``
-        used to hit every file because the raw JSONL contains
+        Searching for common tokens like ``user`` or ``role`` would otherwise
+        hit every file because the raw JSONL contains
         ``"role": "user"`` on every line.
         """
         log = ConversationLog(base_dir=tmp_path)
@@ -876,6 +876,1447 @@ class TestSearchSessions:
         assert "apollo" in hits[0]["snippet"]
         assert calls == [], "the search path must not enter _read_messages"
         assert len(log._msg_cache) == 0, "searching must not pin a parsed transcript"
+
+    def test_multi_word_query_matches_scattered_tokens(self, tmp_path):
+        """A multi-word query matches when its words appear APART, not adjacent.
+
+        Regression: the query was matched as one whole-phrase substring, so a
+        natural query like "ack contention hypotheses" silently returned nothing
+        even though the session discussed all three — the exact phrase never
+        occurs. Silent zero results are the worst failure mode for search: the
+        caller cannot tell "not in history" from "phrased it wrong".
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("hit", "user", "the ack path shows contention under load")
+        log.append("hit", "assistant", "ranked the hypotheses by expected effect")
+        log.append("miss", "user", "unrelated disk cleanup chatter")
+
+        results = log.search_sessions("ack contention hypotheses")
+
+        assert [s["key"] for s in results] == ["hit"]
+
+    def test_multi_word_query_requires_every_token(self, tmp_path):
+        """AND, not OR: a session missing one token must not surface.
+
+        OR semantics would make a common word drag in the whole corpus, which is
+        a different way of being useless than the phrase bug.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("both", "user", "contention in the hypotheses list")
+        log.append("partial", "user", "contention everywhere but no hypothesis list")
+
+        results = log.search_sessions("contention hypotheses")
+
+        assert [s["key"] for s in results] == ["both"]
+
+    def test_exact_phrase_outranks_same_words_apart(self, tmp_path):
+        """At comparable token frequency, words appearing TOGETHER rank first.
+
+        This is what ``_PHRASE_BOOST`` buys, and all it buys: adjacency wins the
+        tie. It is not an override of term frequency — a session repeating one
+        token far more often still ranks higher on raw count, which is the
+        behaviour this ranker already had for single-token queries.
+
+        Titles are written explicitly because ``list_sessions`` otherwise
+        derives a title from the first message, which would hand a
+        content-heavy session a ``_TITLE_BOOST`` and mask what is being tested.
+        """
+        (tmp_path / "apart.jsonl").write_text(
+            '{"_type": "metadata", "title": "session one"}\n'
+            '{"role": "user", "content": "ping at the start and pong at the end"}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "together.jsonl").write_text(
+            '{"_type": "metadata", "title": "session two"}\n'
+            '{"role": "user", "content": "the ping pong bench numbers"}\n',
+            encoding="utf-8",
+        )
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("ping pong")
+
+        assert {s["key"] for s in results} == {"apart", "together"}
+        assert results[0]["key"] == "together"
+
+    def test_multi_word_scattered_match_still_gets_a_snippet(self, tmp_path):
+        """A scattered multi-word match must show WHY it surfaced.
+
+        The snippet builder searched for the whole phrase, so every session that
+        newly matches on scattered tokens would otherwise come back with no
+        snippet — surfacing rows a caller cannot evaluate.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("hit", "user", "the ack path shows contention under load")
+        log.append("hit", "assistant", "ranked the hypotheses by expected effect")
+
+        results = log.search_sessions("ack contention hypotheses")
+
+        assert results[0]["snippet"], "expected a non-empty snippet"
+        assert "contention" in results[0]["snippet"].casefold()
+
+    def test_whitespace_only_query_matches_nothing_and_reads_no_file(self, tmp_path):
+        """A whitespace-only query returns [] *and* reads no session file.
+
+        It tokenizes to an empty list. Asserting only on the empty result would
+        pass with or without the early return, because a tokenless loop scores
+        nothing anyway — so this pins the I/O too: without the guard every
+        session in the scan window still gets read and folded to reach a
+        foregone conclusion.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "some content here")
+        reads: list[str] = []
+        real = log._folded_content
+
+        def counting(key: str) -> tuple[int, str]:
+            reads.append(key)
+            return real(key)
+
+        log._folded_content = counting  # type: ignore[assignment]
+
+        assert log.search_sessions("   ") == []
+        assert log.search_sessions("\t\n") == []
+        assert reads == [], "a tokenless query must not read any session file"
+
+    def test_single_token_query_behaviour_is_unchanged(self, tmp_path):
+        """One token IS the phrase — substring matching must still apply.
+
+        Guards the search-as-you-type path: a partial word has to keep matching
+        the longer word it prefixes.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "deep contention analysis")
+
+        assert [s["key"] for s in log.search_sessions("cont")] == ["alpha"]
+        assert [s["key"] for s in log.search_sessions("contention")] == ["alpha"]
+
+
+class TestSearchQueryTokens:
+    """Bounds on the parse shared by the matcher and the snippet builders.
+
+    Every needle costs one full scan of a session's text, so the needle list is
+    the knob that multiplies search cost on a user-supplied string.
+    """
+
+    @staticmethod
+    def _required_texts(query: str) -> tuple[list[str], str]:
+        needles, phrase, _ = history.parse_search_query(query)
+        return ([n.text for n in needles if n.required], phrase)
+
+    def test_repeated_terms_collapse_to_one_needle(self):
+        """A repeated term must not buy extra scans — it cannot change an AND match.
+
+        Regression: a 256-char query of repeated "a " tokenized to 128 terms and
+        drove 128 full scans per session instead of 1, stalling a keystroke-driven
+        search.
+        """
+        texts, phrase = self._required_texts("a " * 128)
+
+        assert texts == ["a"], "duplicates must collapse"
+        assert phrase == " ".join(["a"] * 128), "the phrase keeps the query as typed"
+
+    def test_distinct_terms_are_capped(self):
+        """Dedup cannot bound the distinct case, so the cap does.
+
+        Truncation keeps the FIRST terms, making the query looser rather than
+        wrong — it can admit extra results but never hide a matching session.
+        """
+        query = " ".join(f"t{i}" for i in range(history.SEARCH_MAX_TOKENS + 25))
+
+        texts, _ = self._required_texts(query)
+
+        assert len(texts) == history.SEARCH_MAX_TOKENS
+        assert texts[0] == "t0", "the cap keeps the first terms, in order"
+
+    def test_whitespace_only_query_yields_no_needles(self):
+        """No needles, so an all-required-present check cannot be vacuously true."""
+        assert history.parse_search_query("   \t\n") == ([], "", False)
+
+    def test_order_is_first_seen(self):
+        """Needle order is stable and first-seen, so the snippet fallback is predictable."""
+        texts, _ = self._required_texts("beta alpha beta gamma")
+
+        assert texts == ["beta", "alpha", "gamma"]
+
+    def test_deduped_query_still_gets_phrase_treatment(self, tmp_path):
+        """"a a" dedups to ONE token but its phrase is still two words.
+
+        Keyed off `tokens != [phrase]` rather than `len(tokens) > 1`, so the
+        session matched on the single token still resolves a snippet instead of
+        searching only for a phrase it may not contain.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("hit", "user", "the letter a stands alone here")
+
+        results = log.search_sessions("a a")
+
+        assert [s["key"] for s in results] == ["hit"]
+        assert results[0]["snippet"], "a deduped multi-word query must still snippet"
+
+
+class TestCjkSearch:
+    """CJK-aware query segmentation — gate on characters, rank on bigrams.
+
+    CJK text is written without spaces, so whitespace tokenization hands the
+    matcher a whole clause as ONE token and a multi-word query only ever
+    matches its own literal sentence. These tests pin the recall fix (character
+    gate) and the precision compensation (bigram-weighted ranking).
+    """
+
+    @staticmethod
+    def _write_cjk_session(tmp_path, key: str, content: str) -> None:
+        """Write a session file directly so CJK stays unescaped in the JSONL.
+
+        Mirrors the unicode-casefold test above: ``json.dumps`` with default
+        ``ensure_ascii=True`` would store ``\\uXXXX`` escapes, which the parser
+        unescapes anyway — writing raw keeps the fixture human-readable.
+        """
+        line = json.dumps({"role": "user", "content": content}, ensure_ascii=False)
+        (tmp_path / f"{key}.jsonl").write_text(line + "\n", encoding="utf-8")
+
+    def test_spaceless_multiword_cjk_query_matches_separated_words(self, tmp_path):
+        """"内存泄漏" must find a session whose words appear apart.
+
+        Regression: the whole run was one required substring, so only a
+        transcript containing the literal string "内存泄漏" could match — the
+        exact-sentence trap this segmentation exists to break.
+        """
+        self._write_cjk_session(tmp_path, "hit", "今天调查了内存里的数据泄漏问题")
+        self._write_cjk_session(tmp_path, "miss", "完全无关的话题")
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("内存泄漏")
+
+        assert [s["key"] for s in results] == ["hit"]
+
+    def test_cjk_gate_is_still_an_and(self, tmp_path):
+        """A session missing one query character stays disqualified."""
+        self._write_cjk_session(tmp_path, "alpha", "内存充足没有问题")
+        log = ConversationLog(base_dir=tmp_path)
+
+        assert log.search_sessions("内存泄漏") == []
+
+    def test_adjacent_cjk_match_outranks_scattered_characters(self, tmp_path):
+        """Bigram + phrase weighting puts the real word hit first.
+
+        Both sessions pass the character gate and the adjacency floor (each
+        contains at least one query bigram); the one containing the query as an
+        adjacent run must rank above the one holding only the words apart, or
+        the gate's extra recall would degrade top-N precision.
+        """
+        self._write_cjk_session(tmp_path, "scattered", "内存里的数据泄漏了")
+        self._write_cjk_session(tmp_path, "adjacent", "内存泄漏定位完成了")
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("内存泄漏")
+
+        assert [s["key"] for s in results] == ["adjacent", "scattered"]
+
+    def test_character_scatter_without_any_adjacency_is_excluded(self, tmp_path):
+        """All query characters present but never adjacent — noise, not a hit.
+
+        Individual han/kana characters are common enough that ranking alone
+        cannot keep scatter off a result page with few real hits, so the
+        adjacency floor excludes rather than down-ranks.
+        """
+        # Contains 内, 存, 泄, 漏 — but no bigram of "内存泄漏" appears adjacently.
+        self._write_cjk_session(tmp_path, "scatter", "内部保存了泄压阀和漏水的记录")
+        log = ConversationLog(base_dir=tmp_path)
+
+        assert log.search_sessions("内存泄漏") == []
+
+    def test_long_query_bigram_truncation_waives_the_adjacency_floor(self, tmp_path):
+        """A 14+-char CJK query truncates its bigram set; the floor must not
+        turn that cost cap into a hidden gate.
+
+        Regression (Design review): a session whose only adjacency hit was a
+        DROPPED bigram would be excluded by the floor — hiding results for
+        exactly the long spaceless queries the segmentation exists to serve,
+        and breaking the "truncation only loosens" safety rationale.
+        """
+        # 15 distinct chars -> 14 bigrams > _SEARCH_MAX_SCORING_EXTRAS (12).
+        query = "".join(chr(0x4E00 + i) for i in range(15))
+        # Session contains every char (satisfies the gate, capped at 12
+        # required) but adjacently only the LAST bigram — one of the two the
+        # cap drops — plus the rest scattered with separators.
+        tail_bigram = query[-2:]
+        scattered = "、".join(query[:-2]) + "。" + tail_bigram
+        self._write_cjk_session(tmp_path, "longhit", scattered)
+        log = ConversationLog(base_dir=tmp_path)
+
+        assert [s["key"] for s in log.search_sessions(query)] == ["longhit"]
+
+    def test_mixed_script_token_splits_at_script_boundary(self, tmp_path):
+        """"kirocrew部署" matches a doc where the ASCII and CJK parts sit apart."""
+        self._write_cjk_session(tmp_path, "hit", "kirocrew 的部署流程记录")
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("kirocrew部署")
+
+        assert [s["key"] for s in results] == ["hit"]
+
+    def test_single_cjk_character_query_matches(self, tmp_path):
+        self._write_cjk_session(tmp_path, "hit", "泄压阀已检查")
+        log = ConversationLog(base_dir=tmp_path)
+
+        assert [s["key"] for s in log.search_sessions("泄")] == ["hit"]
+
+    def test_cjk_match_returns_snippet(self, tmp_path):
+        """The snippet builder shares the parse, so a CJK hit still excerpts."""
+        self._write_cjk_session(tmp_path, "hit", "前情提要之后我们讨论了内存泄漏的修复方案")
+        log = ConversationLog(base_dir=tmp_path)
+
+        results = log.search_sessions("内存泄漏")
+
+        assert results and "内存泄漏" in results[0]["snippet"]
+
+
+class TestParseSearchQuery:
+    """Needle derivation — required/scoring split and its bounds."""
+
+    def test_ascii_terms_are_required_full_weight(self):
+        needles, phrase, floor = history.parse_search_query("deploy Timeout")
+
+        assert needles == [
+            history.SearchNeedle("deploy", 1.0, True),
+            history.SearchNeedle("timeout", 1.0, True),
+        ]
+        assert phrase == "deploy timeout"
+        assert floor is False, "no bigrams -> no adjacency floor"
+
+    def test_cjk_run_gates_on_chars_and_scores_on_bigrams(self):
+        needles, _, floor = history.parse_search_query("内存泄漏")
+
+        required = [n for n in needles if n.required]
+        scoring = [n for n in needles if not n.required]
+        assert [n.text for n in required] == ["内", "存", "泄", "漏"]
+        assert all(n.weight == history._CJK_CHAR_WEIGHT for n in required)
+        assert [n.text for n in scoring] == ["内存", "存泄", "泄漏"]
+        assert all(n.weight == 1.0 for n in scoring)
+        assert floor is True, "untruncated bigrams enforce the adjacency floor"
+
+    def test_single_cjk_char_run_is_a_full_weight_term(self):
+        """A lone character IS the whole term — no bigrams, no down-weighting."""
+        needles, _, _ = history.parse_search_query("泄")
+
+        assert needles == [history.SearchNeedle("泄", 1.0, True)]
+
+    def test_scoring_extras_are_capped(self):
+        """Bigrams cost one scan each, so they get their own bound."""
+        run = "".join(chr(0x4E00 + i) for i in range(40))
+
+        needles, _, floor = history.parse_search_query(run)
+
+        scoring = [n for n in needles if not n.required]
+        required = [n for n in needles if n.required]
+        assert len(scoring) == history._SEARCH_MAX_SCORING_EXTRAS
+        assert len(required) == history.SEARCH_MAX_TOKENS
+        assert floor is False, (
+            "a truncated bigram set cannot prove no-adjacency-anywhere, so the "
+            "floor is waived — truncation must only LOOSEN, never hide a session"
+        )
+
+    def test_snippet_needles_order_phrase_then_bigrams_then_chars(self):
+        """Excerpts center on the first hit, so highest-signal needles go first."""
+        needles = history.snippet_needles("内存泄漏")
+
+        assert needles[0] == "内存泄漏"
+        assert needles.index("内存") < needles.index("内")
+
+    def test_snippet_needles_empty_for_whitespace(self):
+        assert history.snippet_needles("   \t") == []
+
+    def test_snippet_needles_keep_ascii_first_seen_order(self):
+        """ASCII fallback order stays first-typed — the pre-CJK contract."""
+        needles = history.snippet_needles("beta alphabet gamma")
+
+        assert needles == ["beta alphabet gamma", "beta", "alphabet", "gamma"]
+
+
+class TestNeedlesMatchText:
+    """Single-text gate shared with title-only fallbacks (Discord resume)."""
+
+    @staticmethod
+    def _matches(query: str, text: str) -> bool:
+        needles, _, floor = history.parse_search_query(query)
+        return history.needles_match_text(needles, text.casefold(), floor)
+
+    def test_ascii_all_words_required(self):
+        assert self._matches("link specific", "Link to a Specific Session")
+        assert not self._matches("link specific", "Link to a Session")
+
+    def test_cjk_words_apart_match(self):
+        """The exact trap the whitespace word-count test never caught: a
+        spaceless CJK query is one 'word', so the old all-words gate demanded
+        the literal substring."""
+        assert self._matches("内存泄漏", "内存的泄漏问题排查")
+
+    def test_cjk_scatter_without_adjacency_rejected(self):
+        assert not self._matches("内存泄漏", "内部保存了泄压阀和漏水的记录")
+
+    def test_cjk_missing_char_rejected(self):
+        assert not self._matches("内存泄漏", "内存充足没有问题")
+
+    def test_empty_needles_match_nothing(self):
+        assert not history.needles_match_text([], "anything")
+
+
+class TestForgeReferenceSearch:
+    """Pull-request / merge-request / issue numbers as first-class queries.
+
+    A transcript names the same pull request several ways — a ``#`` sigil in prose,
+    a pasted ``…/pull/`` link, or a typed ``pr`` reference. A
+    literal-substring query finds only the spelling the searcher happened to
+    guess, so these pin the alternation, its digit boundary, and the ranking
+    hint a bare number gets.
+    """
+
+    @staticmethod
+    def _needle(query: str) -> history.SearchNeedle:
+        needles, _, _ = history.parse_search_query(query)
+        required = [n for n in needles if n.required]
+        assert len(required) == 1, f"{query!r} must gate on one reference: {required}"
+        return required[0]
+
+    @staticmethod
+    def _corpus(tmp_path) -> ConversationLog:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append(
+            "url_only",
+            "assistant",
+            "opened https://github.com/kirodotdev/KiroCrew/pull/4411 for app sync",
+        )
+        log.append("hash_form", "assistant", "babysitting PR #4411 to green")
+        log.append("prose_form", "assistant", "rebased pr 4411 onto main")
+        log.append("longer_number", "assistant", "opened /pull/44110 as a follow-up")
+        log.append("digit_noise", "assistant", "the run id was 1544110293 and it timed out")
+        log.append(
+            "gitlab_mr",
+            "assistant",
+            "see https://gitlab.com/grp/proj/-/merge_requests/12 for the fix",
+        )
+        return log
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "#4411",
+            "PR #4411",
+            "PR 4411",
+            "pr4411",
+            "pull/4411",
+            "https://github.com/kirodotdev/KiroCrew/pull/4411",
+            "https://github.com/kirodotdev/KiroCrew/pull/4411/files",
+            "kirodotdev/KiroCrew#4411",
+            "(#4411)",
+            "#4411.",
+        ],
+        ids=[
+            "sigil",
+            "word-sigil",
+            "word-number",
+            "glued",
+            "path",
+            "url",
+            "url-subpath",
+            "repo-sigil",
+            "parenthesized",
+            "trailing-period",
+        ],
+    )
+    def test_every_spelling_finds_every_spelling(self, tmp_path, query):
+        """The named defect: one reference, one result set, whatever form is typed."""
+        log = self._corpus(tmp_path)
+
+        keys = {s["key"] for s in log.search_sessions(query, 10)}
+
+        assert keys == {"url_only", "hash_form", "prose_form"}, query
+
+    def test_digit_boundary_excludes_a_longer_number(self, tmp_path):
+        """A ``#``-number query is not a prefix search — a longer number is a different PR."""
+        log = self._corpus(tmp_path)
+
+        assert [s["key"] for s in log.search_sessions("#4411", 10)] != []
+        assert "longer_number" not in {s["key"] for s in log.search_sessions("#4411", 10)}
+        assert {s["key"] for s in log.search_sessions("#44110", 10)} == {"longer_number"}
+
+    def test_digit_boundary_excludes_digits_inside_a_run_id(self, tmp_path):
+        """A reference query means the item, not the digits: a run id is not a PR."""
+        log = self._corpus(tmp_path)
+
+        assert "digit_noise" not in {s["key"] for s in log.search_sessions("#4411", 10)}
+
+    def test_naming_word_is_dropped_from_the_gate(self):
+        """Requiring the literal "pr" would disqualify a URL-only transcript.
+
+        The word introduces the number; it is not part of the reference.
+        """
+        needle = self._needle("PR 4411")
+
+        assert needle.text == "#4411"
+        assert {"pull/4411", "4411"} <= set(needle.alts)
+
+    def test_merge_request_family_is_separate(self, tmp_path):
+        """GitLab numbers merge requests apart from issues, so ``!12`` != ``#12``."""
+        log = self._corpus(tmp_path)
+        log.append("gh_issue", "assistant", "filed #12 against the parser")
+
+        assert {s["key"] for s in log.search_sessions("!12", 10)} == {"gitlab_mr"}
+        assert {s["key"] for s in log.search_sessions("MR !12", 10)} == {"gitlab_mr"}
+        assert {s["key"] for s in log.search_sessions("#12", 10)} == {"gh_issue"}
+
+    def test_gitlab_url_parses_as_a_merge_request(self):
+        needle = self._needle("https://gitlab.com/grp/proj/-/merge_requests/12")
+
+        assert needle.text == "!12"
+        assert "merge_requests/12" in needle.alts
+
+    def test_bare_number_keeps_plain_substring_recall(self, tmp_path):
+        """Numeric content search is untouched — a bare number is not a reference.
+
+        Rewriting every number into a reference would silently break searching
+        for a port, an error code or a run id.
+        """
+        log = self._corpus(tmp_path)
+
+        keys = {s["key"] for s in log.search_sessions("4411", 10)}
+
+        assert {"digit_noise", "longer_number"} <= keys, "plain digits still match"
+
+    def test_bare_number_ranks_the_real_reference_first(self, tmp_path):
+        """The ranking half: same recall, but the PR session comes first."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("noise", "assistant", "run id 1544110293 aborted, retried 1544110293 twice")
+        log.append("the_pr", "assistant", "reviewed #4411 and pushed")
+
+        keys = [s["key"] for s in log.search_sessions("4411", 10)]
+
+        assert keys[0] == "the_pr", f"reference must outrank digit noise: {keys}"
+
+    def test_bare_number_ranking_needle_cannot_gate(self):
+        """The spellings are scoring-only and NOT adjacency evidence.
+
+        Counting them as adjacency evidence would arm the CJK adjacency floor,
+        turning a ranking hint into a hidden gate that drops every session
+        matching the digits but not a reference.
+        """
+        needles, _, floor = history.parse_search_query("4411")
+
+        scoring = [n for n in needles if not n.required]
+        assert [n.text for n in needles if n.required] == ["4411"]
+        assert scoring and all(not n.adjacency for n in scoring)
+        assert floor is False
+
+    def test_repo_slug_breaks_a_cross_repo_tie(self, tmp_path):
+        """Same number in two repos: the one the query named ranks first.
+
+        The named-repo session is written FIRST, so it is the older of the two
+        and the recency boost works AGAINST it — only the repo needle can lift
+        it above the other. Written the other way round, recency alone would
+        order the rows correctly and the test would pass with no repo needle at
+        all.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("named_repo", "assistant", "kirodotdev/kirocrew#4411 needed a rebase")
+        log.append("other_repo", "assistant", "looked at #4411 in the vendor tree")
+
+        keys = [
+            s["key"]
+            for s in log.search_sessions("https://github.com/kirodotdev/kirocrew/pull/4411", 10)
+        ]
+
+        assert keys[0] == "named_repo", keys
+
+    def test_a_sigil_captured_repo_also_ranks(self, tmp_path):
+        """The repo slug is captured from `owner/repo#N` too, not only from a URL."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("named_repo", "assistant", "kirodotdev/kirocrew#4411 needed a rebase")
+        log.append("other_repo", "assistant", "looked at #4411 in the vendor tree")
+
+        keys = [s["key"] for s in log.search_sessions("kirodotdev/kirocrew#4411", 10)]
+
+        assert keys[0] == "named_repo", keys
+
+    def test_reference_expansions_are_bounded(self):
+        """Each expansion costs several scans per session, so the count is capped."""
+        over_cap = history._SEARCH_MAX_FORGE_REFS + 2
+        query = " ".join(f"#{i}" for i in range(100, 100 + over_cap))
+
+        needles, _, _ = history.parse_search_query(query)
+
+        expanded = [n for n in needles if n.alts]
+        assert len(expanded) == history._SEARCH_MAX_FORGE_REFS
+        plain = [n for n in needles if n.required and not n.alts]
+        assert plain, "tokens past the cap degrade to plain needles, never vanish"
+
+    def test_snippet_centers_on_the_spelling_present(self, tmp_path):
+        """The hit may be spelled unlike the query, so alts are snippet anchors."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("url_only", "assistant", "x " * 200 + "merged /pull/4411 today" + " y" * 200)
+
+        results = log.search_sessions("#4411", 10)
+
+        assert results[0]["snippet"], "a content hit must produce a snippet"
+        assert "pull/4411" in results[0]["snippet"]
+
+    def test_a_spelling_that_is_already_required_does_not_also_score(self):
+        """A number and its ``#`` sigil names one item twice — its hits must not count twice.
+
+        Order matters and this is the load-bearing one: with the bare number
+        FIRST a ranking hint is created before the sigil makes it redundant, so
+        the end-of-parse cleanup is what removes it. Sigil-first never creates the
+        hint at all, so that order cannot prove the cleanup works.
+        """
+        needles, _, _ = history.parse_search_query("4411 #4411")
+
+        assert sorted(n.text for n in needles if n.required) == ["#4411", "4411"]
+        assert [n for n in needles if not n.required] == []
+
+    @pytest.mark.parametrize("query", ["4411 !4411", "!4411 4411"])
+    def test_a_cross_family_repeat_does_not_score_a_required_spelling(self, query):
+        """"4411 !4411" gates the GitLab family; the hint must not re-score it.
+
+        The bare number's ranking hint is keyed on the GitHub spelling, so the
+        by-key sweep leaves it alone — but its alts carry BOTH families, and the
+        GitLab ones are exactly what the sigil made required. Every required
+        spelling (keys and the alts required needles carry) must be purged from
+        the hint, in either token order; the hint still ranks on the GitHub
+        spellings that survive.
+        """
+        needles, _, _ = history.parse_search_query(query)
+
+        required_spellings = {
+            s for n in needles if n.required for s in (n.text, *n.alts)
+        }
+        hints = [n for n in needles if not n.required]
+        assert hints, "the hint must survive on its remaining family"
+        for hint in hints:
+            assert not ({hint.text, *hint.alts} & required_spellings)
+        # The surviving hint still carries the OTHER family's spellings, at the
+        # forge weight, digit-bounded, and NOT as adjacency evidence — the
+        # rebuild must preserve the flags, not only the spellings.
+        assert any("#4411" in (n.text, *n.alts) for n in hints)
+        for hint in hints:
+            assert hint.weight == history_search._FORGE_REF_WEIGHT
+            assert hint.digit_bounded and not hint.adjacency
+
+    def test_a_provider_that_gates_every_hint_spelling_drops_the_hint(self, monkeypatch):
+        """A hint left with NO spelling of its own contributes nothing and goes.
+
+        Built-in spellings alone cannot empty a hint — its canonical form is
+        only ever a required KEY, which the by-key sweep already removes — but
+        a registered provider's alts can blanket the remainder. The purge must
+        drop the whole entry rather than emit a needle with zero effective
+        spellings.
+        """
+        gh = history_search._forge_spellings(history_search._ForgeRef("4411", False, None))
+        mr = history_search._forge_spellings(history_search._ForgeRef("4411", True, None))
+        spellings = {
+            "acme-a4411": (gh[0], *gh[1]),
+            "acme-b4411": (mr[0], *mr[1]),
+        }
+        monkeypatch.setattr(
+            history_search,
+            "_search_ref_resolver",
+            lambda token: (token, spellings[token]) if token in spellings else None,
+        )
+
+        needles, _, _ = history.parse_search_query("acme-a4411 acme-b4411 4411")
+
+        assert [n for n in needles if not n.required] == []
+        # The bare number still gates as a plain literal term.
+        assert any(n.required and n.text == "4411" for n in needles)
+
+    def test_a_single_form_query_keeps_its_ranking_hint(self):
+        """The purge must not touch a hint whose item was named only once."""
+        needles, _, _ = history.parse_search_query("4411")
+
+        hints = [n for n in needles if not n.required]
+        assert len(hints) == 1
+        assert "#4411" in (hints[0].text, *hints[0].alts)
+        assert "!4411" in (hints[0].text, *hints[0].alts)
+
+    def test_a_glued_mr_token_is_the_gitlab_family(self):
+        """The glued form carries no sigil, so its WORD names the family."""
+        assert self._needle("mr-12").text == "!12"
+        assert self._needle("mr12").text == "!12"
+        assert self._needle("pr-12").text == "#12"
+
+    def test_a_sigil_query_finds_prose_and_glued_transcripts(self, tmp_path):
+        """The transcript may never use a sigil, and the query should not care.
+
+        A session whose only mention is "pull request 4411" or "pr4411" is about
+        the item the query named; requiring one of the sigil/path spellings left
+        it unreachable.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("prose_long", "assistant", "opened pull request 4411 this morning")
+        log.append("glued", "assistant", "pr4411 needs a rebase")
+        log.append("mr_prose", "assistant", "merge request 12 was approved")
+        log.append("mr_glued", "assistant", "mr12 is the mirror of it")
+
+        assert {s["key"] for s in log.search_sessions("#4411", 10)} == {
+            "prose_long",
+            "glued",
+        }
+        assert {s["key"] for s in log.search_sessions("!12", 10)} == {
+            "mr_prose",
+            "mr_glued",
+        }
+
+    def test_prose_spellings_keep_the_digit_boundary(self, tmp_path):
+        """The added spellings end in digits, so they must not prefix-match.
+
+        Both families, since each carries its own prose and glued form.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("longer", "assistant", "opened pull request 44110 and pr44110")
+        log.append("longer_mr", "assistant", "merge request 120 and mr120 landed")
+
+        assert log.search_sessions("#4411", 10) == []
+        assert log.search_sessions("!12", 10) == []
+
+    def test_naming_one_item_twice_never_narrows_it(self, tmp_path):
+        """"#42 issue 42" must find everything either spelling finds alone.
+
+        Skipping outright in the dedup path keeps `issue` required and throws
+        away the bare-digit spelling the sigil-free occurrence contributes
+        — narrowing a query that named the item MORE ways, which the loosen-only
+        contract forbids.
+        """
+        needles, _, _ = history.parse_search_query("#42 issue 42")
+
+        required = [n for n in needles if n.required]
+        assert [n.text for n in required] == ["#42"], required
+        assert "42" in required[0].alts
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("path_only", "assistant", "reviewed pull/42 today")
+        log.append("prose_only", "assistant", "we hit issue 42 in prod")
+
+        keys = {s["key"] for s in log.search_sessions("#42 issue 42", 10)}
+
+        assert keys == {"path_only", "prose_only"}, keys
+
+    def test_one_item_named_two_ways_charges_one_budget_slot(self):
+        """A sigil and a bare spelling of one number are one item, not two.
+
+        Charging both spent a slot on a ranking hint the parse then discarded as
+        redundant, which could push a later distinct reference past the cap.
+        Asserted in both orders, since a ledger keyed by item is what makes the
+        outcome independent of which form the user typed first.
+        """
+        for query in ("#4411 4411 #5 #6", "4411 #4411 #5 #6"):
+            needles, _, _ = history.parse_search_query(query)
+            expanded = {n.text for n in needles if n.alts}
+            assert expanded == {"#4411", "#5", "#6"}, (query, expanded)
+
+    def test_the_ranking_hint_carries_both_families(self, tmp_path):
+        """A bare number ranks a GitLab mention too, not only a GitHub one.
+
+        The hint exists because a bare number cannot know which forge it means;
+        pinning only the GitHub half would let the GitLab spellings rot.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("noise", "assistant", "took 12 ms, then 12 ms again, then 12 ms")
+        log.append("the_mr", "assistant", "reviewed !12 today")
+
+        assert [s["key"] for s in log.search_sessions("12", 10)][0] == "the_mr"
+
+    def test_a_repeated_reference_does_not_spend_two_budget_slots(self):
+        """The budget counts distinct references, not tokens.
+
+        Charging per token let "#1 #1 #2 #3" spend two slots on #1 and push #3
+        past the cap, where it degraded to a plain `#3` needle and stopped
+        matching the item's other spellings (a URL mention of PR 3).
+        """
+        needles, _, _ = history.parse_search_query("#1 #1 #2 #3")
+
+        expanded = {n.text for n in needles if n.alts}
+        assert expanded == {"#1", "#2", "#3"}, expanded
+
+    def test_a_repeated_bare_number_does_not_spend_two_budget_slots(self):
+        """Same accounting for the scoring-only hints."""
+        needles, _, _ = history.parse_search_query("11 11 22 33")
+
+        hints = {n.text for n in needles if not n.required}
+        assert hints == {"#11", "#22", "#33"}, hints
+        assert sorted(n.text for n in needles if n.required) == ["11", "22", "33"]
+
+    def test_bare_number_ranking_hints_share_the_expansion_budget(self):
+        """Ranking hints cost scans too, so they draw on the same cap."""
+        query = " ".join(str(100 + i) for i in range(history._SEARCH_MAX_FORGE_REFS + 3))
+
+        needles, _, _ = history.parse_search_query(query)
+
+        hints = [n for n in needles if not n.required]
+        assert len(hints) == history._SEARCH_MAX_FORGE_REFS
+        assert len([n for n in needles if n.required]) == history._SEARCH_MAX_FORGE_REFS + 3
+
+    def test_count_needle_counts_every_spelling(self):
+        """One counter for the alternation, so matcher and ranker cannot diverge."""
+        needle = history.SearchNeedle("#7", 1.0, True, ("pull/7",), True)
+
+        assert history.count_needle(needle, "#7 and /pull/7 and #7 again") == 3
+        assert history.count_needle(needle, "#70 and /pull/70") == 0
+        assert history.count_needle(needle, "") == 0
+
+    def test_sigil_free_query_still_matches_its_own_words(self, tmp_path):
+        """The never-hide invariant: a query typed without a sigil keeps the digits.
+
+        "issue 42" gated on the digits before references existed, so a transcript
+        saying exactly that must still match — the expansion may only loosen.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("prose", "assistant", "we hit issue 42 in prod and rolled back")
+        log.append("sigil", "assistant", "filed #42 for the rollback")
+
+        assert {s["key"] for s in log.search_sessions("issue 42", 10)} == {"prose", "sigil"}
+        assert "prose" in {s["key"] for s in log.search_sessions("issue42", 10)}
+
+    def test_a_sigil_query_stays_precise(self, tmp_path):
+        """The other half: an explicit sigil never gated on bare digits, so it
+        must not start matching every standalone number."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("count", "assistant", "12 files changed, 3 insertions")
+        log.append("the_mr", "assistant", "see !12 for the fix")
+
+        assert {s["key"] for s in log.search_sessions("!12", 10)} == {"the_mr"}
+
+    def test_merge_number_is_not_a_reference_at_all(self, tmp_path):
+        """"merge 1234" is prose: "merge" names no type, so the words stay literal.
+
+        Reading it as a reference would drop "merge" from the gate and pull in
+        every session mentioning 1234. The ranking hint still surfaces the pull
+        request first, which is what someone typing it wants.
+        """
+        needles, _, _ = history.parse_search_query("merge 1234")
+        assert [n.text for n in needles if n.required] == ["merge", "1234"]
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("noise", "assistant", "merge took 1234 ms, twice: 1234 ms again")
+        log.append("gh_pr", "assistant", "merge #1234 after the rebase")
+
+        keys = [s["key"] for s in log.search_sessions("merge 1234", 10)]
+
+        assert keys[0] == "gh_pr", keys
+
+    def test_chain_only_words_do_not_make_a_reference(self):
+        """"requests 12" is prose about requests, not item 12."""
+        needles, _, _ = history.parse_search_query("requests 12")
+
+        assert [n.text for n in needles if n.required] == ["requests", "12"]
+
+    def test_a_repo_name_ending_in_a_digit_still_matches(self, tmp_path):
+        """The left boundary guards the NUMBER, not the delimiter before it.
+
+        A too-eager left boundary refuses a ``#``-number inside a repo name
+        ending in a digit — the exact reference the query named.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("digit_repo", "assistant", "see kirocrew2#4411 for the fix")
+
+        assert {s["key"] for s in log.search_sessions("kirocrew2#4411", 10)} == {"digit_repo"}
+        assert {s["key"] for s in log.search_sessions("#4411", 10)} == {"digit_repo"}
+
+    def test_digits_inside_a_longer_number_are_the_one_dropped_case(self, tmp_path):
+        """The stated exception to the recall guarantee, pinned deliberately.
+
+        A session whose only claim to the old substring match was the digits
+        sitting inside a longer number never referenced the item, and excluding
+        it is the whole purpose of the boundary — so this narrowing is intended,
+        not a regression to fix. Both edges are covered: the run id below ENDS in
+        the queried digits, which only the left guard rejects.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("trailing", "assistant", "pr build 99994411 timed out")
+        log.append("leading", "assistant", "pr build 44110293 timed out")
+
+        assert log.search_sessions("pr 4411", 10) == []
+
+    @pytest.mark.parametrize(
+        "query,still_required",
+        [
+            ("pr 4411", []),
+            ("pull request 4411", []),
+            ("issue 42", []),
+            ("merge request 12", []),
+            ("merge issue 42", ["merge"]),
+            ("merge #12", ["merge"]),
+            ("requests #12", ["requests"]),
+            ("rebase pull request #4411", ["rebase"]),
+        ],
+        ids=[
+            "one-type-word",
+            "two-word-type",
+            "issue",
+            "gitlab-two-word",
+            "term-then-type",
+            "term-only",
+            "chain-only",
+            "term-outside-the-run",
+        ],
+    )
+    def test_only_the_type_naming_suffix_leaves_the_gate(self, query, still_required):
+        """Words before the type phrase are the user's own terms, not the reference.
+
+        "merge issue 42" asks about `merge` AND issue 42; dropping `merge` would
+        return every session mentioning #42. Only the suffix that names the type
+        is discardable, and it is the SHORTEST naming suffix so a longer run
+        cannot qualify on a type word buried inside it.
+        """
+        needles, _, _ = history.parse_search_query(query)
+
+        required = sorted(n.text for n in needles if n.required and not n.alts)
+        assert required == sorted(still_required), query
+
+    def test_a_chain_only_word_before_a_sigil_stays_in_the_gate(self, tmp_path):
+        """"merge #12": the word is a search term the user typed, not a type name.
+
+        Dropping it would return every session mentioning #12. This is the same
+        rule the bare-digit branch applies — only a run that NAMES a type is
+        discardable — and the sigil branch was skipping it.
+        """
+        needles, _, _ = history.parse_search_query("merge #12")
+        assert sorted(n.text for n in needles if n.required) == ["#12", "merge"]
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("unrelated", "assistant", "filed #12 against the parser")
+        log.append("wanted", "assistant", "merge #12 once the gate is green")
+
+        assert {s["key"] for s in log.search_sessions("merge #12", 10)} == {"wanted"}
+
+    def test_a_type_word_before_a_sigil_is_still_dropped(self, tmp_path):
+        """A leading-type-word query must still reach a transcript that only has the URL."""
+        log = self._corpus(tmp_path)
+
+        keys = {s["key"] for s in log.search_sessions("pull request #4411", 10)}
+
+        assert "url_only" in keys, keys
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "#4411",
+            "!12",
+            "pr#4411",
+            "mr#12",
+            "mr!12",
+            "pr4411",
+            "pr-4411",
+            "pull/4411",
+            "pulls/4411",
+            "issues/42",
+            "merge_requests/12",
+            "kirodotdev/kirocrew#4411",
+            "kirocrew2#4411",
+            "https://github.com/kirodotdev/kirocrew/pull/4411",
+            "https://gitlab.com/grp/proj/-/merge_requests/12",
+        ],
+    )
+    def test_a_reference_always_matches_its_own_literal(self, tmp_path, token):
+        """The structural recall guarantee: the query's own text is a spelling.
+
+        The old gate required this exact string, so a shape whose derived
+        spellings happen not to cover it must still match — otherwise a query
+        fails against a transcript quoting it verbatim. `mr#12` was exactly that
+        hole: its word said GitLab, its sigil said GitHub, and none of the
+        spellings was the string typed.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("verbatim", "assistant", f"the reference is {token} in this line")
+
+        assert {s["key"] for s in log.search_sessions(token, 10)} == {"verbatim"}, token
+
+    def test_the_typed_sigil_decides_the_family(self):
+        """A word before the sigil cannot override it: "#" is the shared sequence."""
+        assert self._needle("mr#12").text == "#12"
+        assert self._needle("pr!12").text == "!12"
+
+    def test_a_path_form_matches_with_or_without_a_leading_slash(self, tmp_path):
+        """Path spellings carry no leading slash, so both writings match.
+
+        A transcript that writes ``pull/4411`` on its own was matched by the old
+        literal gate; requiring ``/pull/4411`` would have dropped it.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("no_slash", "assistant", "pull/4411 is the one that fixes it")
+
+        assert {s["key"] for s in log.search_sessions("pull/4411", 10)} == {"no_slash"}
+        assert {s["key"] for s in log.search_sessions("#4411", 10)} == {"no_slash"}
+
+    def test_merge_request_two_word_form_is_the_gitlab_family(self, tmp_path):
+        """"merge request 12" IS GitLab, and reaches the number through two words.
+
+        It ranks the merge request first rather than excluding the issue: the
+        query typed bare digits, so the digits stay a spelling (recall) and a
+        standalone "12" still qualifies. Exclusivity belongs to the sigil forms,
+        where the user was explicit — see the sigil tests. The family itself is
+        asserted on the parsed needle, because the ranking hint a bare number
+        carries would order these two rows the same way even if the reference
+        were filed under the wrong family.
+        """
+        assert self._needle("merge request 12").text == "!12"
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("gh_issue", "assistant", "filed #12 against the parser")
+        log.append("gl_mr", "assistant", "see /merge_requests/12 for the fix")
+
+        keys = [s["key"] for s in log.search_sessions("merge request 12", 10)]
+
+        assert keys[0] == "gl_mr", keys
+
+    def test_three_token_lead_chain_reaches_the_reference(self, tmp_path):
+        """A two-word type lead: both words are dropped, not just the nearest."""
+        log = self._corpus(tmp_path)
+
+        keys = {s["key"] for s in log.search_sessions("pull request #4411", 10)}
+
+        assert keys == {"url_only", "hash_form", "prose_form"}, keys
+
+
+class TestProviderSearchRefSeam:
+    """A REGISTERED source provider contributes its own id spellings.
+
+    The forge shapes above are built in. An edition that adds a source provider
+    whose ids look like ``REV-987654321`` matches none of them, so without a seam
+    its ids degrade to plain literal needles: a query finds only the exact string
+    it typed, never a transcript that cited the same item by URL. These pin the
+    seam's two consultation points -- gating on a prefixed id, and RANKING for a
+    bare number -- and the guards that keep a plugin from widening the gate or
+    breaking the search box.
+
+    The resolvers here are deliberately fake and generic: the seam is provider
+    agnostic, and a test naming a real provider would encode one consumer's URL
+    shapes into core's contract.
+    """
+
+    @staticmethod
+    @pytest.fixture(autouse=True)
+    def _clean_registry():
+        """The resolver registry is module state, so isolate every test."""
+        history_search.reset_search_ref_resolver_for_tests()
+        yield
+        history_search.reset_search_ref_resolver_for_tests()
+
+    @staticmethod
+    def _resolver(token: str):
+        """Recognize ``ref-<digits>``, ``items/ref-<digits>`` and bare digits."""
+        import re
+
+        match = re.fullmatch(r"(?:ref-)?(\d{3,9})", token) or re.fullmatch(
+            r"items/ref-(\d{3,9})", token
+        )
+        if match is None:
+            return None
+        number = match.group(1)
+        return (f"ref-{number}", (f"items/ref-{number}", f"ref {number}"))
+
+    @staticmethod
+    def _needle(query: str) -> history.SearchNeedle:
+        """The single required needle, asserting the one-reference invariant.
+
+        Mirrors ``TestForgeReferenceSearch._needle``: ~30 forge tests depend on a
+        reference query gating on exactly ONE needle, so a provider token must
+        satisfy the same invariant or the literal term has survived into the gate
+        alongside the provider's canonical spelling.
+        """
+        needles, _, _ = history.parse_search_query(query)
+        required = [n for n in needles if n.required]
+        assert len(required) == 1, f"{query!r} must gate on one reference: {required}"
+        return required[0]
+
+    @staticmethod
+    def _corpus(tmp_path) -> ConversationLog:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("url_form", "assistant", "opened https://example.test/items/ref-987654321 today")
+        log.append("id_form", "assistant", "babysitting ref-987654321 to green")
+        log.append("prose_form", "assistant", "rebased ref 987654321 onto main")
+        log.append("digit_noise", "assistant", "the run id was 1987654321772 and it timed out")
+        return log
+
+    def test_a_provider_id_gates_on_the_item_not_the_literal(self):
+        """The named defect: one item, one result set, whichever spelling is typed."""
+        history_search.register_search_ref_resolver(self._resolver)
+
+        needle = self._needle("REF-987654321")
+
+        assert needle.text == "ref-987654321"
+        assert set(needle.alts) == {"items/ref-987654321", "ref 987654321"}
+        assert needle.digit_bounded is True
+
+    def test_every_provider_spelling_finds_every_spelling(self, tmp_path):
+        """A URL mention and a prose mention answer the same query."""
+        history_search.register_search_ref_resolver(self._resolver)
+        log = self._corpus(tmp_path)
+
+        for query in ("ref-987654321", "items/ref-987654321"):
+            keys = {s["key"] for s in log.search_sessions(query, 10)}
+            assert keys == {"url_form", "id_form", "prose_form"}, query
+
+    def test_an_uppercase_resolver_answer_still_matches(self, tmp_path):
+        """Casefold on OUR side, because getting it wrong fails SILENTLY.
+
+        A query is casefolded before parsing and needle matching requires folded
+        text, so a spelling that arrived capitalized would produce a needle that
+        can never match -- no error, no log, just zero results. Trusting the
+        plugin to fold is therefore not an option.
+        """
+
+        def shouty(token: str):
+            if token != "ref-987654321":
+                return None
+            return ("REF-987654321", ("ITEMS/REF-987654321", "REF 987654321"))
+
+        history_search.register_search_ref_resolver(shouty)
+        log = self._corpus(tmp_path)
+
+        needle = self._needle("ref-987654321")
+
+        assert needle.text == "ref-987654321"
+        assert needle.alts == ("items/ref-987654321", "ref 987654321")
+        assert {s["key"] for s in log.search_sessions("ref-987654321", 10)} == {
+            "url_form",
+            "id_form",
+            "prose_form",
+        }
+
+    def test_a_bare_number_keeps_plain_substring_recall(self, tmp_path):
+        """The loosen-only contract: a resolver cannot hide a numeric-content hit."""
+        history_search.register_search_ref_resolver(self._resolver)
+        log = self._corpus(tmp_path)
+
+        keys = {s["key"] for s in log.search_sessions("987654321", 10)}
+
+        assert "digit_noise" in keys, "plain digits still match"
+
+    def test_built_ins_win_and_the_resolver_is_never_asked(self):
+        """A resolver can only claim a token no built-in recognized."""
+        asked: list[str] = []
+
+        def greedy(token: str):
+            asked.append(token)
+            return ("ref-4411", ("items/ref-4411",))
+
+        history_search.register_search_ref_resolver(greedy)
+
+        for query in ("#4411", "pull/4411", "https://github.com/kirodotdev/KiroCrew/pull/4411"):
+            needle = self._needle(query)
+            assert needle.text == "#4411", query
+            assert "pull/4411" in needle.alts, query
+        assert asked == [], f"built-in shapes must short-circuit the resolver: {asked}"
+
+    def test_a_resolver_cannot_gate_a_bare_number(self):
+        """A bare number is the provider's blind spot: it is not consulted at all.
+
+        A provider's ids are prefixed, so a bare run of digits names nothing it
+        owns. Gating on it would trade a real search term for every session that
+        merely mentions that number.
+        """
+
+        def greedy(token: str):
+            return ("ref-42", ("items/ref-42",))
+
+        history_search.register_search_ref_resolver(greedy)
+
+        needles, _, _ = history.parse_search_query("42")
+
+        required = [n for n in needles if n.required]
+        assert [n.text for n in required] == ["42"], required
+        # Nor does it reach the ranking hint: the hint carries built-in spellings
+        # only, so a provider cannot influence a bare-number query in any way.
+        folded = {s for n in needles if not n.required for s in (n.text, *n.alts)}
+        assert not any("ref-42" in s for s in folded), folded
+
+    def test_contributed_spellings_are_capped(self):
+        """Each spelling costs one substring scan of every scanned session."""
+
+        def flood(token: str):
+            if token != "ref-777":
+                return None
+            return ("ref-777", tuple(f"spelling-{i}/777" for i in range(50)))
+
+        history_search.register_search_ref_resolver(flood)
+
+        needle = self._needle("ref-777")
+
+        assert len(needle.alts) == history_search._MAX_SEARCH_REF_SPELLINGS
+        # Bounds ONE answer, not a fan-in: the collector returns the first
+        # plugin to recognize the token, so only one provider's answer arrives.
+        assert history_search._MAX_SEARCH_REF_SPELLINGS == 8, "one answer's worth"
+
+    def test_an_endless_alts_iterable_is_consumed_only_to_the_cap(self):
+        """A resolver ignoring the ``Sequence`` contract can hand back no end of
+        spellings, and materializing them all would hang every search."""
+        produced: list[str] = []
+
+        def endless(token: str):
+            if token != "ref-777":
+                return None
+
+            def spellings():
+                while True:
+                    produced.append(f"spelling-{len(produced)}/777")
+                    yield produced[-1]
+
+            return ("ref-777", spellings())
+
+        history_search.register_search_ref_resolver(endless)
+
+        self._needle("ref-777")
+
+        assert len(produced) == history_search._MAX_SEARCH_REF_SPELLINGS, len(produced)
+
+    def test_an_answer_that_does_not_carry_the_typed_token_is_dropped(self):
+        """Containment: an answer naming some OTHER item cannot claim the token."""
+
+        def unrelated(token: str):
+            return ("ref-111", ("items/ref-111",)) if token == "ref-777" else None
+
+        history_search.register_search_ref_resolver(unrelated)
+
+        needles, _, _ = history.parse_search_query("ref-777")
+
+        required = [n for n in needles if n.required]
+        assert [n.text for n in required] == ["ref-777"], required
+        assert all(n.alts == () for n in required)
+
+    def test_a_raising_resolver_does_not_break_the_query(self):
+        """A plugin defect must not make the search box stop working."""
+
+        def broken(token: str):
+            raise RuntimeError("provider is on fire")
+
+        history_search.register_search_ref_resolver(broken)
+
+        needles, phrase, _ = history.parse_search_query("ref-987654321 deploy")
+
+        assert phrase == "ref-987654321 deploy"
+        assert {n.text for n in needles if n.required} == {"ref-987654321", "deploy"}
+
+    def test_a_resolver_whose_unpack_raises_does_not_break_the_query(self):
+        """The ANSWER itself may be lazy, so unpacking it can raise anything.
+
+        Only ``TypeError``/``ValueError`` were caught, so a two-item generator that
+        raises while being unpacked escaped ``parse_search_query`` into a 500 on
+        every search -- the collector does not shape-check ahead of this.
+        """
+
+        def lazy_unpack_boom(token: str):
+            def answer():
+                yield "ref-987654321"
+                raise RuntimeError("provider is on fire")
+
+            return answer()
+
+        history_search.register_search_ref_resolver(lazy_unpack_boom)
+
+        needles, phrase, _ = history.parse_search_query("ref-987654321 deploy")
+
+        assert phrase == "ref-987654321 deploy"
+        assert {n.text for n in needles if n.required} == {"ref-987654321", "deploy"}
+
+    def test_a_resolver_raising_while_its_alts_are_read_does_not_break_the_query(self):
+        """The hook promises a ``Sequence``, which cannot raise while being read.
+
+        A resolver ignoring that can, so the read sits inside a boundary; without
+        one the exception escapes the parse as a 500 on every search. The answer
+        is dropped WHOLE -- a half-read one is not an answer.
+        """
+
+        def boom_on_read(token: str):
+            class Hostile:
+                def __iter__(self):
+                    yield "items/ref-987654321"
+                    raise RuntimeError("provider is on fire")
+
+            return ("ref-987654321", Hostile()) if token == "ref-987654321" else None
+
+        history_search.register_search_ref_resolver(boom_on_read)
+
+        needles, phrase, _ = history.parse_search_query("ref-987654321 deploy")
+
+        assert phrase == "ref-987654321 deploy"
+        assert {n.text for n in needles if n.required} == {"ref-987654321", "deploy"}
+        gating = next(n for n in needles if n.required and n.text == "ref-987654321")
+        assert gating.alts == (), gating.alts
+
+    def test_a_later_registration_replaces_the_resolver(self):
+        """One slot, not a list: the latest registration is the one consulted."""
+
+        def broken(token: str):
+            raise RuntimeError("provider is on fire")
+
+        history_search.register_search_ref_resolver(broken)
+        history_search.register_search_ref_resolver(self._resolver)
+
+        needle = self._needle("ref-987654321")
+
+        assert needle.text == "ref-987654321"
+
+    def test_a_malformed_resolver_answer_is_ignored(self):
+        """Shape is validated, not trusted: a bad answer degrades to a literal."""
+
+        def malformed(token: str):
+            return ("", ["ok/1"]) if token == "ref-987654321" else None
+
+        history_search.register_search_ref_resolver(malformed)
+
+        needles, _, _ = history.parse_search_query("ref-987654321")
+
+        assert {n.text for n in needles if n.required} == {"ref-987654321"}
+        assert all(n.alts == () for n in needles if n.required)
+
+    def test_a_malformed_resolver_answer_is_logged_not_silent(self, caplog):
+        """The docstring promises every failure leaves a trace; silence hides a defect.
+
+        A silent drop is the failure this normalizer exists to prevent: the query
+        degrades to a literal and returns zero results with nothing to read.
+        """
+
+        def bad_canonical(token: str):
+            return (42, ["ok/1"]) if token == "ref-987654321" else None
+
+        history_search.register_search_ref_resolver(bad_canonical)
+        with caplog.at_level(logging.DEBUG, logger=history_search.logger.name):
+            history.parse_search_query("ref-987654321")
+
+        assert any(
+            "malformed" in r.message or "invalid" in r.message for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_a_non_iterable_alts_answer_is_logged_not_silent(self, caplog):
+        """The sibling shape rejection: `alts` a bare string is equally silent."""
+
+        def bad_alts(token: str):
+            return ("acme-987654321", "not-a-sequence") if token == "ref-987654321" else None
+
+        history_search.register_search_ref_resolver(bad_alts)
+        with caplog.at_level(logging.DEBUG, logger=history_search.logger.name):
+            history.parse_search_query("ref-987654321")
+
+        assert any(
+            "malformed" in r.message or "invalid" in r.message for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_a_malformed_alt_is_logged_not_silent(self, caplog):
+        """The per-alt shape rejection, the third case the docstring's claim covers.
+
+        One bad spelling costs only itself: the good spellings survive, so this is a
+        per-alt drop rather than the whole-answer drop a raising read produces.
+        """
+
+        def bad_alt(token: str):
+            if token != "ref-987654321":
+                return None
+            return ("acme-987654321", ["ref-987654321", 42, "  "])
+
+        history_search.register_search_ref_resolver(bad_alt)
+        with caplog.at_level(logging.DEBUG, logger=history_search.logger.name):
+            needles, _, _ = history.parse_search_query("ref-987654321")
+
+        assert any("an invalid alt" in r.message for r in caplog.records), [
+            r.message for r in caplog.records
+        ]
+        assert [n.alts for n in needles if n.required] == [("ref-987654321",)]
+
+    def test_republishing_the_same_resolver_consults_it_once(self):
+        """A registry republishes its collector on every provider registration."""
+        calls: list[str] = []
+
+        def counting(token: str):
+            calls.append(token)
+            return None
+
+        history_search.register_search_ref_resolver(counting)
+        history_search.register_search_ref_resolver(counting)
+
+        history.parse_search_query("deploy")
+
+        assert calls == ["deploy"], calls
+
+    def test_no_registration_leaves_the_parse_untouched(self):
+        """The seam is inert until something registers -- the regression guard."""
+        needles, phrase, floor = history.parse_search_query("ref-987654321 4411")
+
+        assert phrase == "ref-987654321 4411"
+        assert {n.text for n in needles if n.required} == {"ref-987654321", "4411"}
+        assert [n.text for n in needles if not n.required] == ["#4411"]
+        assert floor is False
+
+    def test_the_expansion_budget_is_shared_with_the_built_ins(self):
+        """A provider token charges the same ledger, so it cannot mint slots."""
+        history_search.register_search_ref_resolver(self._resolver)
+
+        needles, _, _ = history.parse_search_query("ref-111 ref-222 ref-333 ref-444")
+
+        required = [n for n in needles if n.required]
+        expanded = [n for n in required if n.text.startswith("ref-") and n.alts]
+        assert len(expanded) == history._SEARCH_MAX_FORGE_REFS, expanded
+        assert required[-1].text == "ref-444", "the over-budget token degrades to a literal"
+        assert required[-1].alts == ()
+
+    def test_repeating_one_item_charges_one_slot(self):
+        """Two spellings of one item are one item, whichever order they arrive."""
+        history_search.register_search_ref_resolver(self._resolver)
+
+        needles, _, _ = history.parse_search_query("ref-987654321 items/ref-987654321")
+
+        required = [n for n in needles if n.required]
+        assert len(required) == 1, required
+        assert required[0].text == "ref-987654321"
+
+
+class TestRecencyBoost:
+    """Bounded multiplicative recency weighting in search_sessions ranking."""
+
+    @staticmethod
+    def _set_age(tmp_path, key: str, days: float) -> None:
+        t = time.time() - days * 86400
+        os.utime(tmp_path / f"{key}.jsonl", (t, t))
+
+    def test_recent_session_outranks_stale_equal_match(self, tmp_path):
+        """At equal relevance the newer session must come first.
+
+        Regression: scoring was pure term frequency, so a year-old session
+        matching twice buried today's session matching once.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("stale", "user", "apollo deployment notes")
+        log.append("fresh", "user", "apollo deployment notes")
+        self._set_age(tmp_path, "stale", 365)
+        self._set_age(tmp_path, "fresh", 0)
+
+        results = log.search_sessions("apollo")
+
+        assert [s["key"] for s in results] == ["fresh", "stale"]
+
+    def test_stale_double_mention_loses_to_fresh_single_mention(self, tmp_path):
+        """The canonical complaint, verbatim: a year-old session matching TWICE
+        must not outrank today's session matching once. This is what sizes
+        _RECENCY_MAX_BOOST — a ceiling of 1.0 left exactly this case unfixed.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("stale", "user", "apollo apollo deployment notes here")
+        log.append("fresh", "user", "apollo filler deployment notes here")
+        self._set_age(tmp_path, "stale", 365)
+        self._set_age(tmp_path, "fresh", 0)
+
+        results = log.search_sessions("apollo")
+
+        assert [s["key"] for s in results] == ["fresh", "stale"]
+
+    def test_decisively_better_old_match_still_wins(self, tmp_path):
+        """The boost is bounded, so it reorders near-ties, not clear wins."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("stale", "user", "apollo apollo apollo apollo apollo notes")
+        log.append("fresh", "user", "apollo filler filler filler filler notes")
+        self._set_age(tmp_path, "stale", 365)
+        self._set_age(tmp_path, "fresh", 0)
+
+        results = log.search_sessions("apollo")
+
+        assert [s["key"] for s in results] == ["stale", "fresh"]
 
 
 class TestArchive:
@@ -1336,6 +2777,8 @@ class TestConsolidationOffset:
     def _make_consolidator(self, msg_count=_CONSOLIDATION_THRESHOLD):
         log = MagicMock()
         log._read_messages = MagicMock(return_value=[{}] * msg_count)
+        # A fresh span is eligible; maybe_consolidate's pre-check reads this.
+        log.consolidation_retry_state.return_value = (0, 0.0)
         return HistoryConsolidator(log=log, memory=MagicMock(), sessions=None)
 
     def test_offset_advances_on_success(self):
@@ -1404,6 +2847,9 @@ class TestConsolidationDoesNotBlockLoop:
             [{"role": "user", "content": "hi"}], 1, 0
         )
         log.get_metadata.return_value = {}
+        # A fresh span is eligible; _consolidate's inner gate reads this.
+        log.get_metadata_status.return_value = ({}, True)
+        log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
         memory.read_preferences.return_value = ""
@@ -1417,7 +2863,7 @@ class TestConsolidationDoesNotBlockLoop:
             vector_store=vector_store, migrated=True,
         )
 
-        def _fake_write(result, key):
+        def _fake_write(result, key, vector_store=None, **_):
             # Simulate the blocking embed call; record the executing thread.
             write_thread_id["id"] = threading.get_ident()
 
@@ -1451,6 +2897,9 @@ class TestConsolidationDoesNotBlockLoop:
             [{"role": "user", "content": "hi"}], 1, 0
         )
         log.get_metadata.return_value = {}
+        # A fresh span is eligible; _consolidate's inner gate reads this.
+        log.get_metadata_status.return_value = ({}, True)
+        log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
         memory.read_preferences.return_value = ""
@@ -1467,7 +2916,7 @@ class TestConsolidationDoesNotBlockLoop:
 
         original_save = c._save_lessons
 
-        def _instrumented_save(raw):
+        def _instrumented_save(raw, vector_store=None, lesson_store=None, **_):
             save_thread_id["id"] = threading.get_ident()
             original_save(raw)
 
@@ -1571,6 +3020,48 @@ class TestStopEventContextInjection:
 
         result = _build_stop_event_notes(log, "sess1")
         assert result == ""
+
+
+class TestCancelledTurnPreambleInstruction:
+    """The restore block must not invite a standalone cancellation ack.
+
+    The model reads the cancelled-turn preamble verbatim; an instruction that
+    permits acknowledging the cancellation makes it emit a synthetic
+    "Response was interrupted" message styled like a real response. The
+    wording must forbid any standalone acknowledgment, and the bracket
+    markers must stay byte-identical because context_blocks.py parses them.
+    """
+
+    def test_preamble_forbids_standalone_acknowledgment(self, tmp_path):
+        import json
+
+        from kiro_crew.context import build_cancelled_turn_preamble
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess1", "user", "please refactor the parser")
+        log.append("sess1", "assistant", "Starting on the parser")
+        log.append("sess1", "system", json.dumps({
+            "kind": "stop_event",
+            "id": "stop-abc",
+            "state": "stopped",
+            "outcome": "soft",
+        }))
+
+        result = build_cancelled_turn_preamble(log, "sess1")
+        # Markers parsed by context_blocks.py stay byte-identical.
+        assert result.startswith(
+            "[PREVIOUS TURN WAS CANCELLED BY THE USER \u2014 context restore]"
+        )
+        assert result.endswith("[END PREVIOUS TURN]")
+        # The instruction forbids a standalone acknowledgment and directs
+        # the model to the current request instead.
+        assert "Do not emit any standalone acknowledgment" in result
+        assert "respond only to the current user request" in result
+        # No wording that invites acknowledging the cancellation.
+        assert "Acknowledge it" not in result
+        # Restored context is still carried.
+        assert "please refactor the parser" in result
+        assert "Starting on the parser" in result
 
 
 class TestAutoSkillHelpers:
@@ -1706,7 +3197,7 @@ class TestProcessAutoSkillsIntegration:
         for i in range(10):
             conv_log.append("dashboard:chat-1", "assistant", f"step {i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "did 10 things",
                 "new_skill": {
@@ -1749,7 +3240,7 @@ class TestProcessAutoSkillsIntegration:
                 "dashboard:chat-2", "assistant", f"step {i}", tools=["Running: grep foo bar.txt"]
             )
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "did 6 things",
                 "new_skill": {
@@ -1803,7 +3294,7 @@ class TestProcessAutoSkillsIntegration:
 
         llm_called = False
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             nonlocal llm_called
             llm_called = True
             # The prompt built for this session should NOT include new_skill
@@ -1841,7 +3332,7 @@ class TestProcessAutoSkillsIntegration:
         for i in range(5):
             conv_log.append("dashboard:chat-4", "assistant", f"step {i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -1895,7 +3386,7 @@ class TestProcessAutoSkillsIntegration:
         for i in range(5):
             conv_log.append("dashboard:chat-5", "assistant", f"step {i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -1949,7 +3440,7 @@ class TestProcessAutoSkillsIntegration:
         conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/InternalCodeSearch")
         conv_log.append("dashboard:chat-schema", "assistant", "Here's the full list.")
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "explored grading services",
                 "new_skill": {
@@ -1994,7 +3485,7 @@ class TestProcessAutoSkillsIntegration:
                 "dashboard:chat-stage", "assistant", f"step {i}", tools=["Running: grep foo bar.txt"]
             )
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "did staged things",
                 "new_skill": {
@@ -2033,7 +3524,7 @@ class TestProcessAutoSkillsIntegration:
         for i in range(3):
             conv_log.append("dashboard:chat-scr", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_p):
+        async def fake_llm(_p, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -2071,7 +3562,7 @@ class TestProcessAutoSkillsIntegration:
         for i in range(3):
             conv_log.append("dashboard:chat-bad", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_p):
+        async def fake_llm(_p, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -2088,7 +3579,7 @@ class TestProcessAutoSkillsIntegration:
             await consolidator._consolidate("dashboard:chat-bad", include_history=True)
 
         detail = skills.get_pending_skill("dangerous-skill")
-        assert detail is not None  # skill still staged
+        assert detail is not None  # approval is enabled, so the prose still stages
         assert detail["scripts"] == []  # dangerous script dropped by validator
 
 
@@ -2126,7 +3617,7 @@ class TestAutoSkillSELAudit:
         for i in range(5):
             conv_log.append("dashboard:chat-refine", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 # LLM tries to refine a NON-auto skill (attack surface)
@@ -2186,7 +3677,7 @@ class TestAutoSkillSELAudit:
         for i in range(5):
             conv_log.append("dashboard:chat-bad-slug", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -2222,8 +3713,8 @@ class TestAutoSkillSELAudit:
 class TestAutoSkillSELAuditCompleteness:
     """Every no-write decision must emit a SEL audit event.
 
-    Regression tests for review-bot round 2 findings — each distinct rejection
-    branch in _process_auto_skills must surface via sel().log_tool_invocation.
+    Each distinct rejection branch in _process_auto_skills must surface via
+    sel().log_tool_invocation.
     """
 
     @pytest.mark.asyncio
@@ -2250,7 +3741,7 @@ class TestAutoSkillSELAuditCompleteness:
         for i in range(5):
             conv_log.append("dashboard:chat-empty", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "new_skill": {
@@ -2315,7 +3806,7 @@ class TestAutoSkillSELAuditCompleteness:
         for i in range(5):
             conv_log.append("dashboard:chat-refine-empty", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "refined_skill": {
@@ -2386,7 +3877,7 @@ class TestAutoSkillSELAuditCompleteness:
 
         huge = "x" * (AUTO_SKILL_MAX_PROCEDURE_CHARS + 1)
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "x",
                 "refined_skill": {
@@ -2417,7 +3908,7 @@ class TestAutoSkillSELAuditCompleteness:
 
 
 class TestConsolidationPromptJsonShape:
-    """Regression test for review-bot round 2 finding #6: the new_skill prompt
+    """The new_skill prompt
     JSON shape example must itself be a valid JSON fragment so the LLM
     doesn't see an unclosed string and emit malformed output.
 
@@ -2449,11 +3940,94 @@ class TestConsolidationPromptJsonShape:
             "opener — don't split the value inside a quoted string."
         )
 
+    @pytest.mark.asyncio
+    async def test_prompt_gates_on_recurrence_not_effort(self, tmp_path):
+        """The built prompt must demand recurrence and must not bias toward yes.
+
+        The observed failure this pins: the prompt would instruct the model to
+        "lean toward returning it" on any plausible procedure and judged only
+        triviality, so elaborate ONE-OFF sessions (a single bug's fix, a
+        one-time component audit, a probe answering a now-answered question)
+        were staged as skills and piled up unreviewable in the pending queue.
+        Asserts on the prompt the code actually builds, not on source text, so
+        the check survives refactors of how the string is assembled.
+        """
+        import asyncio as _asyncio
+        from unittest.mock import patch
+
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        c = HistoryConsolidator(
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            approval_required=True,
+            auto_min_tool_calls=2,
+        )
+        key = "dashboard:chat-recurrence"
+        for i in range(4):
+            conv_log.append(key, "assistant", f"step {i}", tools=["execute_bash"])
+
+        captured: dict = {}
+
+        async def fake_llm(prompt, *, memory_store: str = "", session_key: str = ""):
+            captured["prompt"] = prompt
+            return {"new_skill": None}
+
+        c._event_loop = _asyncio.get_running_loop()
+        with patch.object(c, "_call_llm", side_effect=fake_llm):
+            await c._run_skill_detection(key)
+
+        prompt = " ".join(captured.get("prompt", "").split())
+        assert prompt, "skill detection must have built and issued a prompt"
+
+        # The yes-bias that caused the over-generation must be gone.
+        for banned in ("lean toward returning it", "a miss is lost for good"):
+            assert banned not in prompt, (
+                f"the prompt must not bias the model toward proposing a skill: "
+                f"found {banned!r}"
+            )
+
+        # Recurrence must be the actual gate, stated as a test the model applies.
+        assert "recurrence test" in prompt.lower(), (
+            "the prompt must make the model apply an explicit recurrence test "
+            "before returning a candidate"
+        )
+        assert "DIFFERENT target" in prompt, (
+            "the recurrence test must require naming a DIFFERENT future target — "
+            "that is what separates a repeatable method from a one-off task"
+        )
+        assert "Effort is not evidence of recurrence" in prompt, (
+            "the prompt must say effort is not evidence of recurrence, or a long "
+            "difficult one-off session still reads as skill-worthy"
+        )
+
+        # The one-off shapes actually observed in the pending queue.
+        for shape in ("one-time audit", "migration", "now answered"):
+            assert shape in prompt, (
+                f"the prompt must name {shape!r} as a return-null shape — these "
+                f"are the elaborate one-offs that polluted the pending queue"
+            )
+
+        # Uncertainty must resolve to null, and the reason must be stated in
+        # terms of the real cost (human review attention), not a free lunch.
+        assert "Prefer null when uncertain" in prompt, (
+            "the prompt must resolve uncertainty to null rather than to a "
+            "speculative candidate"
+        )
+
 
 class TestSkillDetectionFullWindow:
     """Skill detection judges the full-session window, not the consolidated tail.
 
-    Regression for the tail-only recall gap: a reusable procedure that was
+    A reusable procedure that was
     already consolidated away (offset advanced past it) must still be seen by
     skill detection, because it reads the last-N of the FULL session rather
     than only the unconsolidated tail.
@@ -2617,7 +4191,7 @@ class TestConsolidateSession:
         for i in range(5):
             conv_log.append("dashboard:chat-expire", "assistant", f"s{i}", tools=["fs_read"])
 
-        async def fake_llm(_prompt):
+        async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
             return {
                 "history_entry": "did stuff",
                 "new_skill": {
@@ -2813,7 +4387,7 @@ class TestLRUCache:
         c["a"] = 1
         c["b"] = 2
         c["c"] = 3
-        # Touch 'a' so it is no longer the LRU victim.
+        # Touch 'a' so it is not the LRU victim.
         assert c.get("a") == 1
         c["d"] = 4
         # 'b' (now the LRU) is evicted instead of the touched 'a'.
@@ -2876,12 +4450,35 @@ class TestConversationLogCacheBounded:
         assert len(log._msg_cache) <= 4
 
     def test_meta_cache_evicts_beyond_bound(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path, cache_max=3)
+        # Bounds the metadata cache by assigning it directly rather than through a
+        # constructor parameter: the production default deliberately does not follow
+        # ``cache_max`` down, and a kwarg only tests pass is production API surface
+        # with no product consumer. The eviction invariant under test is unchanged.
+        from kiro_crew.history import _LRUCache
+
+        log = ConversationLog(base_dir=tmp_path)
+        log._meta_cache = _LRUCache(3)
         for i in range(10):
             key = f"sess{i}"
             log.append(key, "user", f"hi {i}")
             log.get_metadata(key)  # populate meta cache
         assert len(log._meta_cache) <= 3
+
+    def test_a_small_cache_max_cannot_shrink_the_metadata_cache(self, tmp_path):
+        """``cache_max`` must not drag the metadata cache down with it.
+
+        ``list_sessions`` reads ``_meta_cache`` in one cyclic pass over the whole
+        session directory, so a bound below the corpus size is evicted in exactly
+        the order it will next be read and the hit rate collapses to ~0 — every
+        call re-opens and re-parses the first line of most of the store. The
+        transcript cache still honors the knob.
+        """
+        log = ConversationLog(base_dir=tmp_path, cache_max=8)
+        assert log._msg_cache._maxsize == 8, "the transcript cache still honors cache_max"
+        assert log._meta_cache._maxsize == _METADATA_CACHE_MAX, (
+            "the metadata cache followed cache_max down; list_sessions will thrash "
+            "on any store larger than that knob"
+        )
 
     def test_cache_hit_returns_same_object(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path, cache_max=8)
@@ -2958,7 +4555,7 @@ class TestTailReads:
         log._msg_cache.clear()
         log.recent("t1", max_messages=3)
         # Tail path returned a partial view — the full cache must stay empty
-        # so load_transcript()/search still parse the whole file.
+        # so search still parses the whole file.
         assert "t1" not in log._msg_cache
 
     def test_tail_window_grows_when_insufficient(self, tmp_path):
@@ -3396,6 +4993,89 @@ class TestDeleteSessionSummarySidecar:
         assert log.delete_session("thread-nosum") is True
         assert not log._summary_cache_path("thread-nosum").exists()
 
+    def test_delete_session_skip_pinned_protects_pinned_sessions(self, tmp_path):
+        """skip_pinned=True returns None for pinned sessions under the REAL lock.
+
+        Regression test for the layering fix: the pin-check-and-delete invariant
+        now lives in ConversationLog.delete_session rather than in a handler closure.
+        This test exercises the real _locked codepath, NOT a mocked context manager,
+        so a regression that breaks lock reentrancy will actually fail.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned", "user", "important")
+        log.update_metadata("sess-pinned", {"pinned": True})
+        log.append("sess-unpinned", "user", "ephemeral")
+
+        # Pinned session: skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-pinned", skip_pinned=True) is None
+        assert log._path("sess-pinned").exists()
+
+        # Unpinned session: skip_pinned=True returns True, file is deleted
+        assert log.delete_session("sess-unpinned", skip_pinned=True) is True
+        assert not log._path("sess-unpinned").exists()
+
+    def test_delete_session_skip_pinned_skips_unreadable_metadata(self, tmp_path):
+        """skip_pinned=True returns None when get_metadata_status returns unreadable.
+
+        Simulates a Windows indexer/AV hold that makes the metadata transiently
+        unreadable. The session is skipped (not deleted blind) and can be retried.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-transient", "user", "might be locked")
+
+        # Patch get_metadata_status to simulate transient unreadability
+        original = log.get_metadata_status
+
+        def _unreadable(key):
+            if key == "sess-transient":
+                return {}, False  # readable=False
+            return original(key)
+
+        log.get_metadata_status = _unreadable
+
+        # skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-transient", skip_pinned=True) is None
+        assert log._path("sess-transient").exists()
+
+    def test_delete_session_skip_pinned_logs_on_exception(self, tmp_path, caplog):
+        """skip_pinned=True logs and returns None when get_metadata_status raises.
+
+        Corrupt metadata or permanent I/O failure should be diagnosable via logs.
+        """
+        import logging
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-corrupt", "user", "bad metadata")
+
+        # Patch to simulate corrupt metadata raising
+        def _corrupt_meta(key):
+            if key == "sess-corrupt":
+                raise ValueError("corrupt JSON")
+            return log.get_metadata(key), True
+
+        log.get_metadata_status = _corrupt_meta
+
+        with caplog.at_level(logging.WARNING):
+            result = log.delete_session("sess-corrupt", skip_pinned=True)
+
+        assert result is None
+        assert log._path("sess-corrupt").exists()
+        assert "unexpected error reading metadata" in caplog.text
+        assert "sess-corrupt" in caplog.text
+
+    def test_delete_session_skip_pinned_false_deletes_pinned(self, tmp_path):
+        """skip_pinned=False (default) deletes even pinned sessions.
+
+        Ensures the default behavior is unchanged for callers that don't use skip_pinned.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned-force", "user", "pinned but forced")
+        log.update_metadata("sess-pinned-force", {"pinned": True})
+
+        # Without skip_pinned, pinned sessions ARE deleted
+        assert log.delete_session("sess-pinned-force") is True
+        assert not log._path("sess-pinned-force").exists()
+
 
 @pytest.mark.asyncio
 async def test_dedupe_candidate_falls_back_to_lexical_without_judge_model(tmp_path):
@@ -3459,9 +5139,9 @@ async def test_dedupe_candidate_uses_judge_when_configured(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp_path):
-    """A candidate that SUPPLIED scripts must never auto-publish as prose-only,
-    even with approval disabled and every script rejected (GPT MEDIUM)."""
+async def test_all_invalid_scripts_are_rejected_when_approval_disabled(tmp_path):
+    """A candidate whose supplied scripts all fail validation is rejected
+    instead of being auto-published or queued against the user's opt-out."""
     from kiro_crew.memory import MemoryStore
     from kiro_crew.skills import SkillsLoader
 
@@ -3478,7 +5158,7 @@ async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp
     for i in range(6):
         conv_log.append("dashboard:chat-x", "assistant", f"step {i}", tools=["fs_read"])
 
-    async def fake_llm(_prompt):
+    async def fake_llm(_prompt, *, memory_store: str = "", session_key: str = ""):
         return {
             "history_entry": "did stuff",
             "new_skill": {
@@ -3493,16 +5173,17 @@ async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp
     with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
         await consolidator._consolidate("dashboard:chat-x", include_history=True)
 
-    # Not live (would be an auto-publish); staged for review instead.
+    # The unsafe candidate is neither auto-published nor queued for a review the
+    # user disabled.
     assert skills.list_auto_skills() == []
-    assert any(s["slug"] == "scripted-skill" for s in skills.list_pending_skills())
+    assert skills.list_pending_skills() == []
 
 
 class TestMetadataReadSurvivesATransientSharingViolation:
     """A read that FAILED must not be reported as a session with no metadata.
 
-    ``_read_metadata`` returns ``{}`` both for "this session has no metadata line"
-    and (previously) for "I could not open the file". Callers cannot tell those
+    ``_read_metadata`` returning ``{}`` both for "this session has no metadata
+    line" and for "I could not open the file" leaves callers unable to tell those
     apart and at least one acts destructively on the answer -- the open-tab
     restore treats ``{}`` as "never persisted" and silently drops the tab. On
     Windows a just-written file is transiently unopenable while an indexer or AV
@@ -3587,3 +5268,946 @@ class TestMetadataReadSurvivesATransientSharingViolation:
         assert any(
             "could not read metadata" in r.getMessage() for r in caplog.records
         ), f"no warning recorded; got {[r.getMessage() for r in caplog.records]}"
+
+
+class TestAppendIfAbsentOffLoop:
+    """The returned future IS the contract: callers holding the only durable
+    copy of something await it to turn "scheduled" into "on disk"."""
+
+    @pytest.mark.asyncio
+    async def test_returns_the_executor_future_when_a_loop_is_running(self) -> None:
+        log = MagicMock()
+        fut = history.append_if_absent_off_loop(log, "dashboard:s1", "assistant", "body")
+        assert fut is not None, "the scheduled write was not handed back to the caller"
+        await fut
+        log.append_if_absent.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_returned_future_carries_the_append_failure(self) -> None:
+        log = MagicMock()
+        log.append_if_absent.side_effect = OSError("history lock contention")
+        fut = history.append_if_absent_off_loop(log, "dashboard:s1", "assistant", "body")
+        assert fut is not None
+        with pytest.raises(OSError):
+            await fut
+
+    def test_returns_none_when_written_inline(self) -> None:
+        # No running loop: the append already happened, so there is nothing to
+        # await and None is the correct answer, not a lost future.
+        log = MagicMock()
+        assert history.append_if_absent_off_loop(
+            log, "dashboard:s1", "assistant", "body"
+        ) is None
+        log.append_if_absent.assert_called_once()
+
+
+class TestAppendMid:
+    """The append path can persist the window row's delivery identity.
+
+    A durable injector writes one logical message twice — the window copy through
+    ``_ChatSlot.append``, which mints ``meta.mid``, and the durable copy through
+    this path. Passing that minted id here stores it in the SAME ``meta.mid``
+    field shape the dashboard slot save writes, so the bounded-read identity walk
+    (``_append_unflushed_tail``) recognises the durable copy as the window row's
+    persisted form; a read cannot recover an identity the write never stored.
+    """
+
+    def test_append_persists_mid_in_the_save_paths_field_shape(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-feedfacefeedface")
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert row["meta"] == {"mid": "m-feedfacefeedface"}, (
+            "the id must land exactly where the slot save writes it (meta.mid); "
+            "any other spelling is invisible to the identity walk"
+        )
+
+    def test_id_less_legacy_append_still_round_trips_without_meta(self, tmp_path) -> None:
+        # Pre-id transcripts hold rows with no ``meta`` at all. An append that
+        # passes no id must keep producing that exact shape — readers keep an
+        # id-less fallback for those rows, and nothing migrates old sessions.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "legacy row")
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert "meta" not in row, "an id-less append must not grow a meta field"
+        assert log.recent("t1", 5) == [{"role": "assistant", "content": "legacy row"}]
+
+    def test_append_if_absent_writes_the_id_with_the_row(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is True
+        raw = (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()
+        row = json.loads(raw[1])
+        assert row["meta"] == {"mid": "m-0123456789abcdef"}
+
+    def test_append_if_absent_skips_only_its_own_persisted_copy(self, tmp_path) -> None:
+        # Same body AND same id: this very message is already on disk (the slot
+        # save or an earlier attempt of this write landed it) — skip, leaving
+        # the persisted row byte-identical (an id is never retrofitted).
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-0123456789abcdef")
+        before = (tmp_path / "t1.jsonl").read_text(encoding="utf-8")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is False
+        assert (tmp_path / "t1.jsonl").read_text(encoding="utf-8") == before
+
+    def test_append_if_absent_writes_a_new_occurrence_under_its_own_id(self, tmp_path) -> None:
+        # Same body under ANOTHER id is a different occurrence that repeats the
+        # text (an earlier injection's twin). Skipping on body alone would drop
+        # this occurrence's only durable copy — the window is lost on restart —
+        # so the write must land, carrying its own id.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-earlier0000000001")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-newer000000000002") is True
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+        ]
+        assert [r["meta"]["mid"] for r in rows] == [
+            "m-earlier0000000001",
+            "m-newer000000000002",
+        ]
+
+    def test_append_if_absent_treats_an_id_less_twin_as_another_occurrence(self, tmp_path) -> None:
+        # A body-equal row with NO id is a pre-id legacy row; with an identity
+        # in hand the caller cannot prove it is this message, and skipping
+        # would silently lose the new occurrence. The legacy row itself stays
+        # untouched (no migration).
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result")
+        assert log.append_if_absent("t1", "assistant", "result", mid="m-0123456789abcdef") is True
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "t1.jsonl").read_text(encoding="utf-8").splitlines()[1:]
+        ]
+        assert "meta" not in rows[0], "the legacy row must not be migrated"
+        assert rows[1]["meta"] == {"mid": "m-0123456789abcdef"}
+
+    def test_append_if_absent_without_mid_keeps_body_only_matching(self, tmp_path) -> None:
+        # An id-less caller keeps the body-equality regime: it holds no
+        # identity, so body equality is all it can check — unchanged for every
+        # existing caller that passes no mid.
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("t1", "assistant", "result", mid="m-0123456789abcdef")
+        before = (tmp_path / "t1.jsonl").read_text(encoding="utf-8")
+        assert log.append_if_absent("t1", "assistant", "result") is False
+        assert (tmp_path / "t1.jsonl").read_text(encoding="utf-8") == before
+
+    def test_append_if_absent_off_loop_threads_the_id_through(self) -> None:
+        # No running loop, so the wrapper takes the inline path; the contract
+        # under test is only that *mid* survives the hop to the log method.
+        # ``append_off_loop`` deliberately has no mid parameter: it has no
+        # dual-write caller, and a parameter nothing consumes is surface.
+        log = MagicMock()
+        history.append_if_absent_off_loop(log, "k", "assistant", "body", mid="m-2")
+        assert log.append_if_absent.call_args.kwargs["mid"] == "m-2"
+
+
+class TestConsolidationValueGuard:
+    """A consolidation item whose 'value' the LLM omitted must not reach the store."""
+
+    @staticmethod
+    def _consolidator(store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            vector_store=store,
+            migrated=True,
+        )
+
+    def _store(self, tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    def test_value_absent_item_does_not_clobber_existing_row(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        assert (
+            store.set_semantic("project.alpha.status", "curated text", 1.0, "user_explicit") is None
+        )
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.alpha.status", "confidence": 1.0}]}, "sess-1"
+        )
+
+        row = store.get_semantic("project.alpha.status")
+        assert row["value_json"] == json.dumps("curated text")
+
+    def test_explicit_none_value_item_does_not_clobber_existing_row(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        assert (
+            store.set_semantic("project.alpha.status", "curated text", 1.0, "user_explicit") is None
+        )
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.alpha.status", "value": None, "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.alpha.status")
+        assert row["value_json"] == json.dumps("curated text")
+
+    def test_value_absent_item_is_logged_and_counted(self, tmp_path, caplog) -> None:
+        """The skip must be observable: layer 1 returns before set_semantic, so no event fires."""
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._write_structured_memory(
+                {"semantic": [{"key": "project.alpha.status", "confidence": 1.0}]}, "sess-1"
+            )
+
+        assert any(
+            "skipped 'project.alpha.status'" in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), "the omitted-value item was dropped without a per-item warning"
+        assert any(
+            "0 written, 0 deleted, 1 skipped" in r.getMessage() for r in caplog.records
+        ), "the summary line did not report the skip"
+
+    def test_value_absent_item_creates_no_row(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.beta.status", "confidence": 1.0}]}, "sess-1"
+        )
+
+        assert store.get_semantic("project.beta.status") is None
+
+    def test_well_formed_item_still_overwrites(self, tmp_path) -> None:
+        """Negative control: the harness above can detect a clobber when one happens.
+
+        The seeded row is a lower-confidence *consolidation* row rather than a
+        ``user_explicit`` one, because consolidation is never allowed to overwrite
+        ``user_explicit`` (see ``TestConsolidationDoesNotImpersonateUser``) — seeding one
+        here would make this control pass for the wrong reason and stop detecting clobbers.
+        """
+        store = self._store(tmp_path)
+        assert (
+            store.set_semantic("project.alpha.status", "curated text", 0.85, "consolidation:sess-0")
+            is None
+        )
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.alpha.status", "value": "replaced", "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.alpha.status")
+        assert row["value_json"] == json.dumps("replaced")
+
+    def test_layer2_refusal_counted_apart_from_no_value_skip(self, tmp_path, caplog) -> None:
+        """An empty-string value clears layer 1 and is refused at layer 2, not 'no value'."""
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._write_structured_memory(
+                {"semantic": [{"key": "project.alpha.status", "value": "", "confidence": 1.0}]},
+                "sess-1",
+            )
+
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "0 written, 0 deleted, 0 skipped (no value), 1 refused" in m for m in msgs
+        ), "the layer-2 refusal was still folded into the no-value skip count"
+        assert any(
+            "refused 'project.alpha.status'" in m and "value_empty" in m for m in msgs
+        ), "the refusal did not name its reject cause"
+
+    def test_refusal_names_the_actual_cause_not_a_constant(self, tmp_path, caplog) -> None:
+        """A low-confidence refusal is not a missing value, so the label must follow the code."""
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._write_structured_memory(
+                {"semantic": [{"key": "project.alpha.status", "value": "v", "confidence": 0.1}]},
+                "sess-1",
+            )
+
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "refused 'project.alpha.status'" in m and "low_confidence" in m for m in msgs
+        ), "the cause was not read from the reject code"
+        assert not any("value_empty" in m for m in msgs), "a non-empty value reported value_empty"
+        assert any("0 skipped (no value), 1 refused" in m for m in msgs)
+
+
+class TestConsolidationDoesNotImpersonateUser:
+    """Consolidation writes under its own source, never under ``user_explicit``."""
+
+    @staticmethod
+    def _consolidator(store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            vector_store=store,
+            migrated=True,
+        )
+
+    def _store(self, tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    def test_confident_item_does_not_overwrite_a_user_explicit_row(self, tmp_path) -> None:
+        """A re-summarization at confidence 1.0 must lose the ``user_explicit`` conflict path."""
+        store = self._store(tmp_path)
+        assert (
+            store.set_semantic("project.alpha.status", "curated text", 1.0, "user_explicit") is None
+        )
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.alpha.status", "value": "shrunk", "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.alpha.status")
+        assert row["value_json"] == json.dumps("curated text")
+        assert row["source"] == "user_explicit"
+
+    def test_confident_item_still_creates_a_new_key_under_consolidation_source(
+        self, tmp_path
+    ) -> None:
+        """Demoting the source must not stop consolidation from writing its own keys."""
+        store = self._store(tmp_path)
+        c = self._consolidator(store)
+
+        c._write_structured_memory(
+            {"semantic": [{"key": "project.beta.status", "value": "fresh", "confidence": 1.0}]},
+            "sess-1",
+        )
+
+        row = store.get_semantic("project.beta.status")
+        assert row["value_json"] == json.dumps("fresh")
+        assert row["source"] == "consolidation:sess-1"
+
+    def test_v1_extracted_lesson_cannot_displace_user_lesson(self, tmp_path) -> None:
+        taught = "Zebra crossings need beacons"
+        inferred = "Submarine hatches demand orange lanterns for visibility"
+        store = self._store(tmp_path)
+        try:
+            assert store.algorithm_version == "v1"
+            store.embed_fn = lambda _text: [1.0, 0.0]
+            assert store.write_lesson(taught, source="user_explicit")
+            before = store.get_lessons()
+            events = store.get_events()
+
+            self._consolidator(store)._save_lessons([{"rule": inferred}])
+
+            assert store.get_lessons() == before
+            assert store.get_events() == events
+            [lesson] = store.get_lessons()
+            assert json.loads(lesson["value_json"])["rule"] == taught
+            assert lesson["source"] == "user_explicit"
+        finally:
+            store.close()
+
+
+class TestConsolidationEmbedBreaker:
+    """One consolidation pass must not pay a slow embedder once per item.
+
+    Every memory a pass writes embeds its text inline, so an embedder that is slow
+    for the first row is slow for all of them — and each failed embed stores the
+    same NULL-vector row the repair sweep would have filled anyway. The pass
+    therefore measures its own write time and, past the budget, defers the
+    remaining embeddings instead of re-paying the latency per item.
+    """
+
+    @staticmethod
+    def _consolidator(store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            vector_store=store,
+            migrated=True,
+        )
+
+    @staticmethod
+    def _store(tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    @staticmethod
+    def _episodes(count):
+        return [
+            {"text": f"episode {i}: the operator asked for a fresh status sweep", "importance": 0.5}
+            for i in range(count)
+        ]
+
+    @staticmethod
+    def _rows(store):
+        return store.db.execute(
+            "SELECT embedding FROM episodic_memories WHERE is_deleted = 0"
+        ).fetchall()
+
+    def test_slow_embedder_is_attempted_once_and_every_row_is_still_written(
+        self, tmp_path, caplog, monkeypatch
+    ) -> None:
+        """N items cost one embed attempt, not N."""
+        from kiro_crew import history_consolidation
+
+        store = self._store(tmp_path)
+        calls = []
+
+        def slow_embed(text):
+            calls.append(text)
+            time.sleep(0.05)
+            raise TimeoutError("timed out")
+
+        store.embed_fn = slow_embed
+        monkeypatch.setattr(history_consolidation, "_EMBED_BUDGET_SECS_PER_PASS", 0.01)
+        try:
+            with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+                self._consolidator(store)._write_structured_memory(
+                    {"episodic": self._episodes(5)}, "sess-1"
+                )
+
+            assert len(calls) == 1, (
+                f"the pass kept embedding after the first overrun ({len(calls)} attempts); "
+                "a degraded embedder is paid once per item again"
+            )
+            rows = self._rows(store)
+            assert len(rows) == 5, "deferring the embedding must not drop the memory itself"
+            assert all(row["embedding"] is None for row in rows)
+            deferrals = [
+                r
+                for r in caplog.records
+                if "embedding is deferred to the repair sweep" in r.getMessage()
+            ]
+            assert len(deferrals) == 1, (
+                "the deferral must be logged once per pass, not once per row; got "
+                f"{[r.getMessage() for r in deferrals]}"
+            )
+            assert deferrals[0].levelno == logging.WARNING
+        finally:
+            store.close()
+
+    def test_healthy_embedder_embeds_every_row(self, tmp_path) -> None:
+        """Control: an embedder that answers promptly never arms the latch."""
+        store = self._store(tmp_path)
+        calls = []
+
+        def fast_embed(text):
+            index = len(calls)
+            calls.append(text)
+            # Orthogonal per row: identical vectors would hit the similarity dedup
+            # and reject rows this control needs written.
+            vec = [0.0] * 8
+            vec[index % 8] = 1.0
+            return vec
+
+        store.embed_fn = fast_embed
+        try:
+            self._consolidator(store)._write_structured_memory(
+                {"episodic": self._episodes(5)}, "sess-1"
+            )
+
+            assert len(calls) == 5, "a healthy pass must still embed every row inline"
+            rows = self._rows(store)
+            assert len(rows) == 5
+            assert all(row["embedding"] is not None for row in rows)
+        finally:
+            store.close()
+
+    def test_both_tiers_share_one_budget_and_stop_after_the_first_overrun(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Every row a pass writes embeds inline, so both tiers latch together."""
+        from kiro_crew import history_consolidation
+
+        store = self._store(tmp_path)
+        calls = []
+
+        def slow_embed(text):
+            calls.append(text)
+            time.sleep(0.05)
+            raise TimeoutError("timed out")
+
+        store.embed_fn = slow_embed
+        monkeypatch.setattr(history_consolidation, "_EMBED_BUDGET_SECS_PER_PASS", 0.01)
+        keys = [f"project.p{i}.status" for i in range(4)]
+        try:
+            self._consolidator(store)._write_structured_memory(
+                {
+                    "semantic": [
+                        {"key": k, "value": f"green {i}", "confidence": 0.9}
+                        for i, k in enumerate(keys)
+                    ],
+                    "episodic": self._episodes(3),
+                },
+                "sess-1",
+            )
+
+            assert len(calls) == 1, (
+                "a tier kept embedding after the pass had already overrun "
+                f"({len(calls)} attempts across 4 semantic + 3 episodic rows)"
+            )
+            assert len(self._rows(store)) == 3, "deferral must not drop an episode"
+            rows = [store.get_semantic(k) for k in keys]
+            assert all(row is not None for row in rows), "deferral must not drop a fact"
+            assert all(row["embedding"] is None for row in rows)
+        finally:
+            store.close()
+
+    def test_a_deferred_episode_never_evicts_an_existing_memory(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A row admitted without dedup must not displace one it never compared.
+
+        Deferring leaves the vector NULL, which skips the similarity dedup. On a
+        legacy V1 store at its episodic cap the insert would then tombstone the
+        lowest-importance row to make room for a possible paraphrase. The refusal
+        is the cheaper loss: the transcript is still on disk, the evicted row is
+        not.
+        """
+        from kiro_crew import history_consolidation
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", episodic_max=2)
+        store.init()
+        assert store.algorithm_version == "v1"
+        kept = ["the canary stage runs before production", "the release owner signs the ledger"]
+        for text in kept:
+            assert store.write_episodic(text=text, importance=0.9, source="user_explicit")
+
+        calls = []
+
+        def slow_embed(text):
+            calls.append(text)
+            time.sleep(0.05)
+            raise TimeoutError("timed out")
+
+        store.embed_fn = slow_embed
+        monkeypatch.setattr(history_consolidation, "_EMBED_BUDGET_SECS_PER_PASS", 0.01)
+        try:
+            self._consolidator(store)._write_structured_memory(
+                {
+                    # One semantic write spends the budget, so every episode below
+                    # is written deferred rather than only the ones after the first.
+                    "semantic": [
+                        {"key": "project.alpha.status", "value": "green", "confidence": 0.9}
+                    ],
+                    "episodic": self._episodes(3),
+                },
+                "sess-1",
+            )
+
+            surviving = {
+                row["text"]
+                for row in store.db.execute(
+                    "SELECT text FROM episodic_memories WHERE is_deleted = 0"
+                ).fetchall()
+            }
+            assert surviving == set(kept), (
+                "a deferred episode displaced a memory it could not be compared "
+                f"against; store now holds {surviving}"
+            )
+            assert len(calls) == 1
+        finally:
+            store.close()
+
+    def test_a_deferred_semantic_row_is_left_for_the_repair_sweep(self, tmp_path) -> None:
+        """The deferred vector is work the standing sweep can still see and finish."""
+        store = self._store(tmp_path)
+        store.embed_fn = lambda _text: [1.0, 0.0, 0.0, 0.0]
+        try:
+            assert (
+                store.set_semantic(
+                    "project.alpha.status",
+                    "green",
+                    0.9,
+                    "consolidation:sess-1",
+                    defer_embedding=True,
+                )
+                is None
+            )
+
+            row = store.get_semantic("project.alpha.status")
+            assert row is not None and row["embedding"] is None
+            assert store.has_pending_embeddings(), (
+                "a deferred row the repair sweep cannot see is a vector lost forever"
+            )
+            # The returned count is episodic-only, so the repaired row itself is
+            # the evidence the semantic sub-sweep ran.
+            store.backfill_missing_embeddings(pace=False)
+            assert store.get_semantic("project.alpha.status")["embedding"] is not None
+        finally:
+            store.close()
+
+
+class TestConsolidationLessonScope:
+    """Consolidation forwards a model-supplied ``repo_scope`` into the lesson write.
+
+    ``write_lesson`` has accepted ``repo_scope`` all along, but ``_save_lessons``
+    never passed it, so consolidation-written lessons could not be
+    project-scoped -- and since the context gate drops out-of-scope lessons
+    before ranking, the scope lever was unreachable for every consolidation
+    write. These tests pin the forwarding on both write paths.
+    """
+
+    @staticmethod
+    def _consolidator(store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            vector_store=store,
+            migrated=True,
+        )
+
+    def _store(self, tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = lambda _text: [1.0, 0.0]
+        return store
+
+    @staticmethod
+    def _jsonl_consolidator(lesson_store):
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        return HistoryConsolidator(
+            log=MagicMock(),
+            memory=memory,
+            sessions=None,
+            lesson_store=lesson_store,
+            vector_store=None,
+            migrated=True,
+        )
+
+    def test_model_supplied_scope_is_written_with_repo_scope(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [
+                    {
+                        "rule": "Run the scoped gate before pushing here",
+                        "category": "tool",
+                        "repo_scope": "src/kiro_crew",
+                    }
+                ]
+            )
+
+            [lesson] = store.get_lessons()
+            value = json.loads(lesson["value_json"])
+            assert value["repo_scope"] == "src/kiro_crew"
+            assert lesson["source"] == "consolidation"
+        finally:
+            store.close()
+
+    def test_absent_scope_still_writes_a_global_lesson(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Prefer explicit timezones in timestamps"}]
+            )
+
+            [lesson] = store.get_lessons()
+            value = json.loads(lesson["value_json"])
+            # A global lesson stores NO scope key at all -- that absence is what
+            # keeps it applying everywhere (see write_lesson's lesson_value).
+            assert "repo_scope" not in value
+            assert lesson["source"] == "consolidation"
+        finally:
+            store.close()
+
+    def test_jsonl_fallback_forwards_scope_canonicalised(self, tmp_path) -> None:
+        """The no-vector-store path stores the scope too, canonicalised by save()."""
+        from kiro_crew.learn import LessonStore
+
+        lesson_store = LessonStore(base_dir=tmp_path)
+        c = self._jsonl_consolidator(lesson_store)
+
+        c._save_lessons(
+            [
+                # Trailing slash: save() canonicalises before storing.
+                {"rule": "Pin the vitest worker count here", "repo_scope": "src/kiro_crew/"},
+                {"rule": "A rule with no scope stays global"},
+            ]
+        )
+
+        by_rule = {le.rule: le for le in lesson_store.load_all()}
+        assert by_rule["Pin the vitest worker count here"].repo_scope == "src/kiro_crew"
+        assert by_rule["A rule with no scope stays global"].repo_scope is None
+
+    def test_whitespace_only_scope_is_global_not_refused(self, tmp_path) -> None:
+        """A whitespace-only scope is NO scope -- the lesson still lands, globally."""
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Trailing spaces mean nothing here", "repo_scope": "   "}]
+            )
+
+            [lesson] = store.get_lessons()
+            assert "repo_scope" not in json.loads(lesson["value_json"])
+        finally:
+            store.close()
+
+    def test_non_string_scope_refuses_the_lesson_not_widens_it(self, tmp_path) -> None:
+        """A present non-string scope must NOT slip past write_lesson's string-only
+        guard and store the lesson globally -- that is the fail-open a scoped
+        lesson must never take. The whole lesson is refused instead."""
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Scoped to a list, somehow", "repo_scope": ["src/kiro_crew"]}]
+            )
+
+            assert store.get_lessons() == []
+        finally:
+            store.close()
+
+    def test_inadmissible_scope_refused_on_jsonl_fallback_too(self, tmp_path) -> None:
+        """LessonStore.save never checks admissibility, so the consolidation seam
+        must -- an absolute path stored as a scope would render nowhere while
+        suppressing the store (see project_scope.scope_is_admissible)."""
+        from kiro_crew.learn import LessonStore
+
+        lesson_store = LessonStore(base_dir=tmp_path)
+        c = self._jsonl_consolidator(lesson_store)
+
+        c._save_lessons(
+            [{"rule": "Scoped to an absolute path", "repo_scope": "/etc/passwd"}]
+        )
+
+        assert lesson_store.load_all() == []
+
+    def test_non_string_scope_refused_on_jsonl_fallback_too(self, tmp_path) -> None:
+        """The silent-widening cell on the fallback path: a non-string scope must
+        refuse the lesson there too, not canonicalise to a global write."""
+        from kiro_crew.learn import LessonStore
+
+        lesson_store = LessonStore(base_dir=tmp_path)
+        c = self._jsonl_consolidator(lesson_store)
+
+        c._save_lessons(
+            [{"rule": "Scoped to a list, somehow", "repo_scope": ["src/kiro_crew"]}]
+        )
+
+        assert lesson_store.load_all() == []
+
+    def test_inadmissible_scope_refuses_the_lesson_on_vector_path(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Scoped to an absolute path", "repo_scope": "/etc/passwd"}]
+            )
+
+            assert store.get_lessons() == []
+        finally:
+            store.close()
+
+    def test_refused_lesson_keeps_its_well_formed_siblings(self, tmp_path) -> None:
+        """The per-item drop is a ``continue``, not an abort: one malformed scope
+        must not take the rest of the batch with it."""
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [
+                    {"rule": "Scoped to a list, somehow", "repo_scope": ["src/kiro_crew"]},
+                    {"rule": "A clean global lesson survives the batch"},
+                ]
+            )
+
+            [lesson] = store.get_lessons()
+            assert (
+                json.loads(lesson["value_json"])["rule"]
+                == "A clean global lesson survives the batch"
+            )
+        finally:
+            store.close()
+
+
+class TestConsolidationLessonApplies:
+    """Consolidation states the authored ``applies`` tier on both lesson write paths.
+
+    Every other write surface (``learn_add``, ``POST /api/lessons``) states the
+    tier; consolidation is the highest-volume writer, so without this its rows
+    all land unstated and are served as standing rules. The tier is untrusted
+    model output: the two literals round-trip, an omitted key lands unstated,
+    and a misspelling is logged and lands unstated rather than dropping the
+    correction.
+    """
+
+    _consolidator = staticmethod(TestConsolidationLessonScope._consolidator)
+    _jsonl_consolidator = staticmethod(TestConsolidationLessonScope._jsonl_consolidator)
+
+    def _store(self, tmp_path):
+        from kiro_crew.vector_memory import VectorMemoryStore
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = lambda _text: [1.0, 0.0]
+        return store
+
+    @staticmethod
+    def _by_rule(store) -> dict[str, dict]:
+        return {
+            json.loads(row["value_json"])["rule"]: json.loads(row["value_json"])
+            for row in store.get_lessons()
+        }
+
+    @pytest.mark.parametrize("tier", ["always", "on_topic"])
+    def test_tier_round_trips_on_vector_path(self, tmp_path, tier) -> None:
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Read the job log before classifying a red", "applies": tier}]
+            )
+
+            [lesson] = store.get_lessons()
+            assert json.loads(lesson["value_json"])["applies"] == tier
+            assert lesson["source"] == "consolidation"
+        finally:
+            store.close()
+
+    def test_omitted_tier_lands_unstated_on_vector_path(self, tmp_path) -> None:
+        store = self._store(tmp_path)
+        try:
+            self._consolidator(store)._save_lessons(
+                [{"rule": "Prefer explicit timezones in timestamps"}]
+            )
+
+            [lesson] = store.get_lessons()
+            # Unstated is ABSENT, not null: the row is byte-identical to one
+            # written before the field existed (see write_lesson's lesson_value).
+            assert "applies" not in json.loads(lesson["value_json"])
+        finally:
+            store.close()
+
+    def test_misspelled_tier_logs_and_lands_unstated_on_vector_path(self, tmp_path, caplog) -> None:
+        """A misspelling is a bug in the writer and must be audible, but the
+        correction itself is not lost: it lands unstated, never dropped."""
+        store = self._store(tmp_path)
+        # Orthogonal embeddings: the two rows must not be judged duplicates of
+        # each other, or the dedup pass (not the tier seam) decides which lands.
+        store.embed_fn = lambda text: [1.0, 0.0] if "Misspelled" in text else [0.0, 1.0]
+        try:
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+                self._consolidator(store)._save_lessons(
+                    [
+                        {"rule": "Misspelled tier still lands", "applies": "Directive"},
+                        {"rule": "Clean sibling keeps its tier", "applies": "on_topic"},
+                    ]
+                )
+
+            by_rule = self._by_rule(store)
+            assert "applies" not in by_rule["Misspelled tier still lands"]
+            assert by_rule["Clean sibling keeps its tier"]["applies"] == "on_topic"
+            assert any("unrecognized applies tier" in rec.getMessage() for rec in caplog.records)
+            # Only the closed-set reason is logged, never the untrusted value.
+            assert all("Directive" not in rec.getMessage() for rec in caplog.records)
+        finally:
+            store.close()
+
+    def test_tier_round_trips_on_jsonl_fallback(self, tmp_path) -> None:
+        from kiro_crew.learn import LessonStore
+
+        lesson_store = LessonStore(base_dir=tmp_path)
+        c = self._jsonl_consolidator(lesson_store)
+
+        c._save_lessons(
+            [
+                {"rule": "Never force-push a shared branch here", "applies": "always"},
+                {"rule": "The flaky shard was the arm64 runner", "applies": "on_topic"},
+                {"rule": "A rule with no tier stays unstated"},
+            ]
+        )
+
+        by_rule = {le.rule: le for le in lesson_store.load_all()}
+        assert by_rule["Never force-push a shared branch here"].applies == "always"
+        assert by_rule["The flaky shard was the arm64 runner"].applies == "on_topic"
+        assert by_rule["A rule with no tier stays unstated"].applies is None
+        # The unstated row carries NO applies key on disk (not ``null``), so the
+        # two stores agree on what absence means.
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "lessons.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        unstated = [r for r in rows if r["rule"] == "A rule with no tier stays unstated"]
+        assert unstated and "applies" not in unstated[0]
+
+    def test_misspelled_tier_logs_and_lands_unstated_on_jsonl_fallback(
+        self, tmp_path, caplog
+    ) -> None:
+        from kiro_crew.learn import LessonStore
+
+        lesson_store = LessonStore(base_dir=tmp_path)
+        c = self._jsonl_consolidator(lesson_store)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            c._save_lessons([{"rule": "Misspelled on the fallback path", "applies": "ALWAYS "}])
+        # Case and surrounding whitespace are canonicalised, not refused.
+        [lesson] = lesson_store.load_all()
+        assert lesson.applies == "always"
+        assert not any("unrecognized applies tier" in r.getMessage() for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            c._save_lessons([{"rule": "Truly misspelled on the fallback path", "applies": 7}])
+        by_rule = {le.rule: le for le in lesson_store.load_all()}
+        assert by_rule["Truly misspelled on the fallback path"].applies is None
+        assert any("unrecognized applies tier" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_extraction_prompt_asks_for_the_tier(self, tmp_path) -> None:
+        """The prompt the code actually builds names the field and the two
+        literals, tells the model to decide from what the user said, and to omit
+        the field when it cannot tell -- the same instruction ``learn_add`` carries."""
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        conv_log.append("dashboard:chat-tier", "user", "no, always run the gate first")
+        conv_log.append("dashboard:chat-tier", "assistant", "Understood, running it.")
+
+        captured: dict[str, str] = {}
+
+        async def fake_llm(prompt, *, memory_store: str = "", session_key: str = ""):
+            captured["prompt"] = prompt
+            return {"history_entry": "did stuff", "lessons": []}
+
+        with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
+            consolidator.consolidate_session("dashboard:chat-tier")
+            await asyncio.sleep(0.05)
+            for t in list(consolidator._tasks):
+                await t
+
+        prompt = " ".join(captured["prompt"].split())
+        assert '"applies": "always|on_topic"' in prompt
+        assert "YOU decide it from what the user actually said" in prompt
+        assert "Omit the field when you genuinely cannot tell" in prompt

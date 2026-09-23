@@ -8,7 +8,9 @@ and a refusal is loud.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import textwrap
 import types
 
 import pytest
@@ -307,7 +309,9 @@ class TestSpawnSkipsTheScanWhenPrevalidated:
         # guard exists AND that the flag threads into the queued params.
         import inspect
 
-        src = inspect.getsource(subagent.SubagentManager.spawn)
+        from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
+
+        src = inspect.getsource(SpawnAdmissionCoordinator.spawn_impl)
         assert "and not _agent_prevalidated" in src
         assert '"_agent_prevalidated": _agent_prevalidated,' in src
 
@@ -349,25 +353,72 @@ class TestManagerRefusesUnknownAgent:
     the SDK guard must not be able to reintroduce that escalation."""
 
     def test_validate_agent_refuses_named_unknown(self, monkeypatch):
-        import kiro_crew.agent_discovery as disc
         from kiro_crew import subagent
 
+        # Patched on SUBAGENT: the import is module-level there, so call-time
+        # lookup happens against subagent's binding, not agent_discovery's.
         monkeypatch.setattr(
-            disc,
+            subagent,
             "list_agents",
-            lambda: [
+            lambda project_dir=None: [
                 types.SimpleNamespace(name="kirocrew"),
                 types.SimpleNamespace(name="mochi--mochi-bg"),
             ],
         )
         # Empty request still means "use the default" — no error.
-        assert subagent._validate_agent("") == ("", "")
+        assert subagent._validate_agent("") == ("", "", "")
         # A known agent passes through unchanged.
-        assert subagent._validate_agent("mochi--mochi-bg") == ("mochi--mochi-bg", "")
+        assert subagent._validate_agent("mochi--mochi-bg") == ("mochi--mochi-bg", "", "")
         # A named-but-unknown agent is REFUSED (error), not silently defaulted.
-        name, err = subagent._validate_agent("does-not-exist")
+        name, err, code = subagent._validate_agent("does-not-exist")
         assert name == ""
         assert err and "not found" in err
+        assert code == subagent.AGENT_NOT_FOUND_CODE
+
+    def test_project_scope_is_read_from_cache_not_the_filesystem(self, monkeypatch):
+        """``spawn`` is synchronous and runs on the event loop, so validation must not
+        add filesystem work. The project scope therefore comes from the syscall-free
+        cache; widening the pre-existing user-level scan to a second directory would
+        stall the gateway on a slow or network checkout."""
+        import kiro_crew.agent_discovery as disc
+        from kiro_crew import subagent
+
+        monkeypatch.setattr(
+            subagent,
+            "list_agents",
+            lambda project_dir=None: [types.SimpleNamespace(name="kirocrew")],
+        )
+        # A warm cache makes a project agent dispatchable...
+        monkeypatch.setattr(
+            subagent, "cached_project_agent_names", lambda p: frozenset({"repobot"})
+        )
+        # ...and the SCANNING entry points must not be consulted at all.
+        monkeypatch.setattr(
+            disc,
+            "project_agent_names",
+            lambda p: pytest.fail("scanned the filesystem on the event loop"),
+        )
+        monkeypatch.setattr(
+            disc,
+            "project_agent_files",
+            lambda p, include_legacy=False: pytest.fail("globbed on the event loop"),
+        )
+        assert subagent._validate_agent("repobot", "/some/project") == ("repobot", "", "")
+
+    def test_cold_project_cache_refuses_rather_than_scanning(self, monkeypatch):
+        """Fail closed on a cold cache — refusing an unknown name is this function's
+        existing rule, and is safer than either stalling or running the default."""
+        from kiro_crew import subagent
+
+        monkeypatch.setattr(
+            subagent,
+            "list_agents",
+            lambda project_dir=None: [types.SimpleNamespace(name="kirocrew")],
+        )
+        monkeypatch.setattr(subagent, "cached_project_agent_names", lambda p: None)
+        name, err, _code = subagent._validate_agent("repobot", "/some/project")
+        assert name == ""
+        assert "repobot" in err
 
 
 class TestChildGateInheritsTheApp:
@@ -383,8 +434,20 @@ class TestChildGateInheritsTheApp:
     def test_child_gate_forwards_the_app(self):
         import inspect
 
-        from kiro_crew import subagent
+        from kiro_crew.subagent_manager.run import RunEventCoordinator
 
-        src = inspect.getsource(subagent.SubagentManager)
-        assert "on_tool_call(" in src
-        assert 'app=info.app or ""' in src
+        src = inspect.getsource(RunEventCoordinator._run_inner_impl)
+        tree = ast.parse(textwrap.dedent(src))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "on_tool_call"
+        ]
+        assert len(calls) == 1
+        app_arg = next(keyword.value for keyword in calls[0].keywords if keyword.arg == "app")
+        expected = ast.parse('info.app or ""', mode="eval").body
+        assert ast.dump(app_arg, include_attributes=False) == ast.dump(
+            expected, include_attributes=False
+        )

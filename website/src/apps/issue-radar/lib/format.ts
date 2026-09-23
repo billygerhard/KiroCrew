@@ -1,11 +1,12 @@
 // Pure, side-effect-free helpers + localStorage accessors + constants for
 // Issue Radar. No React, no component imports — safe to pull into any module.
-import { Clock, Hash, type LucideIcon } from 'lucide-react'
-import { fmtRelative, toDate } from '../../../i18n/format'
+import { AlertCircle, ArrowDownAZ, Clock, Hash, type LucideIcon } from 'lucide-react'
+import { activeLocale, fmtRelative, toDate } from '../../../i18n/format'
+import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, type LanguageEntry } from '../../../i18n/languages'
 import { i18nT } from '../../../i18n/t'
 import { loadColumnCollapsed, loadColumnWidth } from '../../../lib/columnWidth'
 import { DASHBOARD_TABS, SORT_KEYS } from './types'
-import type { ActiveRepo, DashboardTab, MainView, PrSortKey, PrStateFilter, SettingsTarget, SortDir, SortKey, StateFilter } from './types'
+import type { ActiveRepo, CrewSortKey, DashboardTab, MainView, PrSortKey, PrStateFilter, SettingsTarget, SortDir, SortKey, StateFilter } from './types'
 
 export const ACTIVE_KEY = 'kc:issue-radar:active-repo'
 export const LIST_WIDTH_KEY = 'kc:issue-radar:list-width'
@@ -127,24 +128,6 @@ export const DETAIL_POLL_CHOICES_MS = [15_000, 30_000, 60_000, 120_000] as const
  * from cache instead of re-fetching. */
 export const STALE_TIME_CHOICES_MS = [0, 30_000, 120_000, 600_000] as const
 
-/** How long an UNMOUNTED query's data is kept before react-query garbage-collects it.
- *
- * This is the dial that decides whether clicking between surfaces feels instant. Every
- * dashboard here mounts its own queries and unmounts them when you leave (the views are
- * SWAPPED, not hidden - see `views/registry.tsx`), so a surface's data is retained only
- * for `gcTime` after the last component reading it unmounts. The app-wide default is
- * react-query's 5 minutes, which is shorter than a normal triage session: leave the
- * Tagging dashboard for six minutes, come back, and its queue is gone from the cache and
- * refetched from scratch behind a "Loading the untagged queue" line.
- *
- * 30 minutes, because the cost of a retained entry is memory, not requests: freshness is
- * still governed by `staleTime` and the poll intervals, so a longer `gcTime` only means
- * "repaint from what we already had while any refetch happens", never "serve something
- * stale instead of fetching". Bounded rather than `Infinity` so a long-lived tab that has
- * visited many repos does not retain every one of their lists forever.
- */
-export const CACHE_RETENTION_MS = 30 * 60_000
-
 /** Defaults for the refresh preferences — the historical hardcoded behaviour, so
  * an existing user's app behaves identically until they change something. */
 export const REFRESH_DEFAULTS = {
@@ -203,6 +186,44 @@ export function coerceRefreshPrefs(raw: Partial<RefreshPrefs> | undefined): Refr
       : REFRESH_DEFAULTS.prefetchPulls,
   }
 }
+
+/** "Follow the dashboard language" — the default, persisted as the empty string
+ * so an unset field already means follow, with no migration for existing users. */
+export const AI_LANGUAGE_FOLLOW = ''
+
+/** The languages an AI-output directive may name.
+ *
+ * A FOURTH question, deliberately not one of the three lists in `i18n/languages`
+ * (resolvable / browser-detectable / pickable): "what language may the agent be
+ * told to write in". The pseudolocale is excluded because it is a rendering
+ * device, not a language — instructing a model to answer in `en-XA` would produce
+ * garbage rather than padded text.
+ */
+export const AI_LANGUAGE_CHOICES: readonly LanguageEntry[] =
+  SUPPORTED_LANGUAGES.filter(l => !l.devOnly)
+
+/** Coerce a persisted AI-language choice. Anything unrecognized — a hand-edited
+ * value, or a language this build no longer ships — falls back to follow, which
+ * is the only value that cannot be wrong. */
+export function coerceAiLanguage(value: unknown): string {
+  if (typeof value !== 'string') return AI_LANGUAGE_FOLLOW
+  return AI_LANGUAGE_CHOICES.some(l => l.code === value) ? value : AI_LANGUAGE_FOLLOW
+}
+
+/** The BCP-47 tag an agent prompt should name, or `''` for "say nothing".
+ *
+ * English resolves to `''` rather than to `'en'`: the prompts are written in
+ * English, so a directive would restate the language they are already in, and
+ * suppressing it keeps every prompt byte-identical to what an English user
+ * sends today. `''` is therefore both "not configured" and "no directive
+ * needed", which is what makes the follow case free.
+ */
+export function resolveAiLanguage(pref: string): string {
+  const tag = coerceAiLanguage(pref) || activeLocale()
+  if (tag === DEFAULT_LANGUAGE) return ''
+  return AI_LANGUAGE_CHOICES.some(l => l.code === tag) ? tag : ''
+}
+
 
 /** Compact "now / 5m ago / 3h ago / 2d ago" from an epoch-ms timestamp.
  * Used for the issue-list "Updated …" footer; returns '' for a falsy input
@@ -341,6 +362,18 @@ export const PR_SORT_FIELDS: { key: PrSortKey; label: string; icon: LucideIcon }
   { key: 'updated', get label() { return i18nT('apps.issueRadar.lib.format.last_update') }, icon: Clock },
 ]
 
+/** Sort options for the crew roster, in the order the rail lists them.
+ *
+ * `status` leads because it is the only one that answers "what needs me": its
+ * ascending direction is the urgency order the backend already ranks by (a crew
+ * waiting on a human above one that is merely working). Labels are getters for the
+ * same reason the two lists above use them — a locale switch must re-read them. */
+export const CREW_SORT_FIELDS: { key: CrewSortKey; label: string; icon: LucideIcon }[] = [
+  { key: 'status', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_status') }, icon: AlertCircle },
+  { key: 'name', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_name') }, icon: ArrowDownAZ },
+  { key: 'created', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_created') }, icon: Clock },
+]
+
 // ── Persisted UI state ────────────────────────────────────────────────────
 // The whole app view (which dashboard / issues / settings page is showing, the
 // selected issue, and the active filters + sort) is persisted here so leaving
@@ -380,6 +413,12 @@ export interface PersistedUiState {
   // per-repo home would make "how often does this poll" a property of the repo,
   // which is not what the setting means).
   refresh: RefreshPrefs
+  // ── AI output language ──
+  // Same reasoning as the refresh block: a per-browser view preference, not repo
+  // configuration. It is deliberately SEPARATE from `dashboard.language` so the
+  // interface and the agent's prose can differ — an English dashboard whose
+  // findings come back in Chinese is a supported combination, not a mismatch.
+  aiLanguage: string
 }
 
 /** Load the persisted UI state. Partial by design — any missing field falls
@@ -409,11 +448,55 @@ export function coerceDashboardTab(value: unknown): DashboardTab {
   return (DASHBOARD_TABS as readonly string[]).includes(value as string) ? (value as DashboardTab) : 'overview'
 }
 
-export function saveUiState(state: PersistedUiState) {
+/** What a caller may hand `saveUiState`: any subset of the document, and for
+ * `refresh` any subset of ITS members too. `refresh` is a document of its own, so a
+ * caller that changed one member must be able to say so without restating the rest --
+ * see `saveUiState` for why sending the whole object is a clobber one level down. */
+export type UiStatePatch =
+  Partial<Omit<PersistedUiState, 'refresh'>> & { refresh?: Partial<RefreshPrefs> }
+
+/** Merge the given fields into the persisted UI state, leaving every other field
+ * on disk untouched.
+ *
+ * This USED to take the whole `PersistedUiState` and overwrite the document, which
+ * made two dashboard tabs clobber each other: the provider's save effect fires on
+ * any view/filter/selection change, so a tab persisting one unrelated edit rewrote
+ * every other field from whatever it read at mount, reverting the other tab's work.
+ *
+ * Merging is only half the fix and does not work on its own -- a caller that still
+ * passes every field overwrites with the same stale values, because its payload wins
+ * the spread. The caller must send ONLY the fields it actually changed; the provider
+ * does that by diffing against the document it last wrote. Both halves are required,
+ * so keep them together if this is ever refactored.
+ *
+ * `refresh` is merged MEMBER-WISE for the same reason the document is: it holds five
+ * independent settings, so replacing the whole object reproduces the clobber one level
+ * down -- one tab toggling background polling and another changing an interval would
+ * each revert the other's member. Only the members the caller names are written.
+ *
+ * Unlike `patchUiState` this MAY carry `refresh`, because its one caller builds those
+ * values from `refreshPrefs`, which only ever comes out of `coerceRefreshPrefs` in
+ * `setRefreshPrefs`. `patchUiState` keeps the narrower type for the connect flow,
+ * where no such guarantee exists.
+ *
+ * @returns true when the document was written, false when the write was swallowed
+ * (quota exceeded / private mode). A caller that tracks what it last PERSISTED must
+ * not advance that record on false, or the fields in this patch would count as
+ * stored while the document on disk still holds the old ones. */
+export function saveUiState(patch: UiStatePatch): boolean {
   try {
-    localStorage.setItem(UI_STATE_KEY, JSON.stringify(state))
+    const stored = loadUiState()
+    const next: Record<string, unknown> = { ...stored, ...patch }
+    if (patch.refresh) {
+      // Spread the STORED members under the patch, so a member this caller did not
+      // name keeps whatever another tab last wrote for it.
+      next.refresh = { ...(stored.refresh ?? {}), ...patch.refresh }
+    }
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify(next))
+    return true
   } catch {
     /* quota exceeded / private mode — persistence is best-effort */
+    return false
   }
 }
 
@@ -434,11 +517,11 @@ export function patchUiState(
   // cannot introduce the bypass in the first place.
   patch: Partial<Omit<PersistedUiState, 'refresh'>>,
 ) {
-  try {
-    localStorage.setItem(UI_STATE_KEY, JSON.stringify({ ...loadUiState(), ...patch }))
-  } catch {
-    /* best-effort, same as saveUiState */
-  }
+  // The body is `saveUiState`'s -- the merge is the same operation, and this
+  // signature is the only difference worth keeping. `patch.refresh` is
+  // unrepresentable here, so the nested-merge branch there is simply never taken.
+  // The write result is passed through for the same reason it exists there.
+  return saveUiState(patch)
 }
 
 /** Pending "open the first issue" intent, set at connect time.

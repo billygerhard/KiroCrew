@@ -7,8 +7,16 @@ These exercise the acceptance criteria EB-1, EB-3, EB-4, EB-5, EB-7b from
 
 from __future__ import annotations
 
+import pytest
+
 from kiro_crew import mcp_core
 from kiro_crew.history import ConversationLog
+
+
+@pytest.fixture(autouse=True)
+def established_session(monkeypatch):
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:global-v1")
+
 
 # ── Pure helpers ──
 
@@ -41,6 +49,23 @@ class TestHelpers:
         # Empty/whitespace needle must not match-at-0 and wrap garbage.
         assert mcp_core._extract_history_snippet([{"role": "user", "content": "abc"}], "") == ""
         assert mcp_core._extract_history_snippet([{"role": "user", "content": "abc"}], "   ") == ""
+
+    def test_snippet_multi_word_query_falls_back_to_a_token(self):
+        # search_sessions matches a session when every TOKEN appears somewhere, so
+        # this extractor must locate a token too. Searching only the whole phrase
+        # returned "" and the handler suppresses snippet-less rows -- so exactly
+        # the multi-word queries token-wise matching enables came back bare.
+        msgs = [{"role": "user", "content": "the ack path shows contention under load"}]
+        snip = mcp_core._extract_history_snippet(msgs, "ack contention hypotheses")
+        assert snip, "a scattered multi-word match must still yield a snippet"
+        assert "<<<" in snip and ">>>" in snip, "the located token must be delimited"
+
+    def test_snippet_prefers_the_exact_phrase_over_a_token(self):
+        # Phrase first: when the words DO sit together, the snippet centres on the
+        # phrase rather than on whichever token happens to appear earliest.
+        msgs = [{"role": "user", "content": "ping alone, then the ping pong bench"}]
+        snip = mcp_core._extract_history_snippet(msgs, "ping pong")
+        assert "<<<ping pong>>>" in snip
 
     def test_snippet_full_casefold_match_is_delimited(self):
         # The selection (str.casefold().find) and the wrap must use the SAME full
@@ -130,6 +155,32 @@ class TestSearchChatHistoryHandler:
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
         assert "redis.timeout" in out
 
+    def test_get_chat_session_reads_recall_roles(self, tmp_path, monkeypatch):
+        """An inject-role breadcrumb is readable here, and a system-role one is not.
+
+        A ``/note`` breadcrumb is appended with ``role="inject"``, and reading a
+        past session is the clearest case of crossing the boundary those notes
+        exist to survive -- so a handler that filtered on a hardcoded
+        ``{"user", "assistant"}`` dropped exactly the messages it was asked for.
+        ``RECALL_ROLES`` already governs replay and compression; this asserts the
+        same constant governs the fetch.
+
+        The system-role half is the negative direction, and it is what makes the
+        test measure the CONSTANT rather than merely the absence of a filter:
+        ``ConversationLog.recent`` guards with ``if roles:``, so deleting the
+        argument is permissive and would satisfy the inject assertion on its own
+        while quietly admitting internal system rows into the transcript.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        cl = _seed_sessions(tmp_path)
+        cl.append("dashboard_chat-1", "inject", "note breadcrumb: rotate the staging key")
+        cl.append("dashboard_chat-1", "system", "internal marker, not for recall")
+
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+
+        assert "rotate the staging key" in out, "an inject breadcrumb must be readable here"
+        assert "internal marker, not for recall" not in out, "system is absent from RECALL_ROLES"
+
     def test_legacy_metadataless_session_still_surfaces(self, tmp_path, monkeypatch):
         # A legacy session file whose first line is a message (predates the
         # metadata line) yields {} from get_metadata. Search must NOT drop it:
@@ -209,7 +260,7 @@ class TestWorkspaceScope:
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
         # Resolve caller identity to the alpha-workspace session.
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget bug"})
         assert "dashboard_chat-alpha" in out  # EB-cc3: same workspace surfaces
         assert "dashboard_chat-beta" not in out  # other workspace hidden
@@ -217,22 +268,22 @@ class TestWorkspaceScope:
     def test_all_workspaces_opt_in(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner(
             "search_chat_history", {"query": "widget bug", "all_workspaces": True}
         )
         assert "dashboard_chat-alpha" in out
         assert "dashboard_chat-beta" in out  # opt-in surfaces both
 
-    def test_unresolvable_caller_scopes_to_default_not_all(self, tmp_path, monkeypatch):
-        # Fail-closed: an unresolvable caller (no workspace) must NOT fail open to
+    def test_caller_without_workspace_scopes_to_default_not_all(self, tmp_path, monkeypatch):
+        # An established caller without workspace metadata must NOT fail open to
         # every workspace. It scopes to the "default" bucket (unset workspace).
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed_two_workspaces(tmp_path)
         # Add an unset-workspace ("default" bucket) match.
         cl = ConversationLog(base_dir=tmp_path / "sessions")
         cl.append("dashboard_chat-default", "user", "the widget bug in default ws")
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:no-workspace")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget bug"})
         assert "dashboard_chat-default" in out  # default bucket included
         assert "dashboard_chat-alpha" not in out  # named workspaces excluded
@@ -273,14 +324,14 @@ class TestGetChatSessionWorkspaceGate:
     def test_same_workspace_allowed(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-alpha"})
         assert "secret alpha content" in out
 
     def test_cross_workspace_denied(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-beta"})
         assert "Access denied" in out
         assert "secret beta content" not in out
@@ -288,7 +339,7 @@ class TestGetChatSessionWorkspaceGate:
     def test_cross_workspace_all_workspaces_opt_in(self, tmp_path, monkeypatch):
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         self._seed(tmp_path)
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard_chat-self")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard_chat-self")
         out = mcp_core._call_tool_inner(
             "get_chat_session", {"session_key": "dashboard_chat-beta", "all_workspaces": True}
         )
@@ -374,7 +425,7 @@ class TestPostMergeHardening:
             cl.update_metadata(f"decoy-{i}", {"workspace": "alpha"})
         # one real default-bucket match
         cl.append("real", "user", "the widget bug we discussed")
-        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:no-workspace")
         out = mcp_core._call_tool_inner("search_chat_history", {"query": "widget", "limit": 5})
         assert "real" in out
         assert "decoy-" not in out

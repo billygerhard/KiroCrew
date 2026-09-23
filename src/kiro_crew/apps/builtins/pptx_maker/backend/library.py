@@ -43,7 +43,7 @@ TEMPLATE_SUFFIX = ".pptx"
 
 # Upload ceilings. A style is a single HTML document and a template is one
 # .pptx; these are an order of magnitude above any real one, and they exist so a
-# request body cannot be used to fill the disk.
+# request body cannot fill the disk.
 MAX_STYLE_BYTES = 4 * 1024 * 1024
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
 
@@ -279,9 +279,9 @@ def _save_state_or_undo_rename(
     Returns ``None`` on success, or the caller's error response.
 
     The rename has ALREADY committed by the time state is written, so a failing
-    write left the file under its new name while ``state.json`` still referred to
-    the old one — a pin or a template's metadata pointing at a name that no longer
-    exists, with the request reporting 500 as though nothing had happened. Undoing
+    write leaves the file under its new name while ``state.json`` still refers to
+    the old one — a pin or a template's metadata pointing at a name that does not
+    exist, with the request reporting 500 as though nothing had happened. Undoing
     the rename is the only outcome that keeps the two consistent: the operation
     fails cleanly and the user can retry.
 
@@ -472,9 +472,9 @@ def rename_style(name: str, new_name: str) -> tuple[int, dict]:
         return 404, {"error": "style not found", "code": "style_not_found"}
     # The MOVE and the state update are ONE critical section.
     #
-    # Splitting them let a concurrent delete of `new_name` interleave between the link
-    # and the state write: both verbs returned 200 while `state.json` referenced a file
-    # that no longer existed. The move is what makes the state stale, so the lock has
+    # Splitting them lets a concurrent delete of `new_name` interleave between the link
+    # and the state write: both verbs return 200 while `state.json` references a file
+    # that does not exist. The move is what makes the state stale, so the lock has
     # to span both — the same rule `delete_style` above already follows, and the same
     # lost-update shape as the template-metadata fix. `_load_state`/`_save_state` do
     # not acquire the lock themselves, so this cannot self-deadlock on a plain Lock.
@@ -582,23 +582,25 @@ def import_template(name: str, data: bytes, description: str = "") -> tuple[int,
     # megabytes, so a mid-write failure (disk full, the upload cut short) is a real
     # outcome — and a direct write leaves a PARTIAL file at the target, which then
     # answers `template_exists` on every retry. The user is stuck with a corrupt
-    # template they cannot replace. Same directory so the replace is a rename within
-    # one filesystem, hence atomic; this is what `atomic_write` does for the text
-    # sibling above, which only takes `str`.
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.part")
+    # template they cannot replace. `atomic_write` takes `bytes` as of the helper
+    # extension, so this is now the shared helper rather than a hand-rolled copy:
+    # it picks a unique `mkstemp` name in the target's own directory (so the
+    # replace is a rename within one filesystem, hence atomic) and carries the
+    # Windows `os.replace` sharing-violation retry this copy lacked. The final
+    # mode is unchanged: the replace already overwrote the 0o600 placeholder with
+    # the temp file's umask-default mode.
     try:
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
+        atomic_write(target, data)
     except OSError as exc:
         logger.warning("pptx-maker: template import failed: %s", exc)
-        for leftover in (tmp, target):
-            # `target` too: we created the zero-byte placeholder that claimed the name,
-            # so leaving it would answer `template_exists` on every retry against a file
-            # holding nothing.
-            try:
-                leftover.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover - best effort
-                logger.debug("pptx-maker: could not remove the partial template")
+        # `atomic_write` removes its own temp file. `target` is ours to clean:
+        # we created the zero-byte placeholder that claimed the name above, so
+        # leaving it would answer `template_exists` on every retry against a
+        # file holding nothing.
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - best effort
+            logger.debug("pptx-maker: could not remove the partial template")
         return 500, {"error": "could not save the template", "code": "template_write_failed"}
     # Analysis is best effort: an un-analyzed template still works, it just has
     # no theme colours / layout count to show, so a failure here must not undo
@@ -669,9 +671,9 @@ def rename_template(name: str, new_name: str) -> tuple[int, dict]:
     if not source.is_file():
         return 404, {"error": "template not found", "code": "template_not_found"}
     # The MOVE and the state update are ONE critical section — see `rename_style`.
-    # Splitting them let a concurrent delete of `new_name` interleave between the link
-    # and the state write, leaving `state.json` naming a file that no longer exists
-    # while both verbs answered 200.
+    # Splitting them lets a concurrent delete of `new_name` interleave between the link
+    # and the state write, leaving `state.json` naming a file that does not exist
+    # while both verbs answer 200.
     with _STATE_LOCK:
         # `os.link` + `unlink`, not `rename`. `Path.rename` REPLACES an existing target
         # on POSIX, so `exists()` then `rename` is check-then-act: two tabs renaming

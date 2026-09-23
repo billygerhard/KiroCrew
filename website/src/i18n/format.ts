@@ -18,9 +18,13 @@
  * two are used side by side without ceremony: formatting happens inside
  * `.map()` callbacks, in comparator functions passed to `.sort()`, and in plain
  * helper modules with no component around them — all positions a hook cannot
- * legally go. A language switch remounts the tree (`<App>` is keyed on the
- * active language in `main.tsx`), so a function that reads the language at call
- * time re-evaluates on switch without subscribing to anything.
+ * legally go. A language switch repaints the tree (`LanguageProvider` re-renders
+ * via `cloneElement` after the catalog swap — an update, not a remount), so a
+ * function that reads the language at call time re-evaluates on switch without
+ * subscribing to anything. The one shape that repaint cannot reach is a
+ * `React.memo` boundary, whose props-equality bailout swallows it —
+ * `MemoI18nSubscriptionRatchet.test.ts` pins the subscription every such
+ * boundary needs.
  *
  * ## Why `localeMatcher: 'lookup'`
  *
@@ -41,11 +45,12 @@
  * ## Known limitations, stated explicitly
  *
  *  1. **`Intl.DurationFormat` is NOT used**, because it does not exist on the
- *     runtime this ships to: `typeof Intl.DurationFormat === 'undefined'` on
- *     Node 20 (the CI and Electron baseline). `fmtUnit` uses `NumberFormat`
- *     with `style: 'unit'` instead, which is Baseline and covers every duration
- *     shape this app renders (a single value plus a unit). Revisit when the
- *     Electron floor reaches a Chromium with `DurationFormat`.
+ *     minimum supported runtime: `typeof Intl.DurationFormat === 'undefined'`
+ *     on Node 22 (the contributor floor; CI and Electron run Node 24, which
+ *     has it). `fmtUnit` uses `NumberFormat` with `style: 'unit'` instead,
+ *     which is Baseline and covers every duration shape this app renders (a
+ *     single value plus a unit). Revisit when the supported floor reaches a
+ *     runtime with `DurationFormat`.
  *  2. **Locale-formatted digits are not machine-readable.** `hi` groups as
  *     `12,34,567` (Indian grouping) and `bn` renders `১২,৩৪,৫৬৭` in Bengali
  *     digits by default — correct for display, catastrophic for a CSS length, a
@@ -191,7 +196,18 @@ export type FormatUnit =
 
 export function fmtUnit(value: number, unit: FormatUnit, options?: NumberOptions): string {
   if (!Number.isFinite(value)) return '—'
-  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options })
+  // A quantity is one atom: never let a line break fall between the number and
+  // its unit, or inside the digit grouping. CLDR does not guarantee this for us
+  // and is not even self-consistent about it — measured with `narrow`, en emits
+  // `5,289MB` (no separator at all), fr uses U+202F, ru uses U+00A0 for bytes but
+  // a plain U+0020 for hours, and de uses U+0020 for MB yet U+00A0 for GB. zh-CN
+  // uses a plain U+0020, which is a UAX #14 break opportunity, so `1,280 GB`
+  // could render with `GB` orphaned on its own line while the same value in
+  // English could not. Promoting every plain space in the formatted quantity to
+  // U+00A0 (class GL: breaks prohibited on both sides) makes the behaviour the
+  // same in all 12 locales. Only plain spaces are touched; U+202F and U+00A0 are
+  // already non-breaking.
+  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options }).replace(/ /g, '\u00A0')
 }
 
 /**
@@ -211,7 +227,7 @@ export function fmtUnit(value: number, unit: FormatUnit, options?: NumberOptions
  * put a stray gap in `6分钟 38秒`.
  *
  * `Intl.DurationFormat` would do all of this in one call and is deliberately
- * not used: it is `undefined` on the Node 20 / Electron baseline (see
+ * not used: it is `undefined` on the Node 22 contributor floor (see
  * limitation 1 in the file header).
  *
  * Every part passed is RENDERED, including zeros. That is deliberate: several
@@ -240,6 +256,35 @@ export function fmtDuration(
   return memo('durationList', locale, null, () =>
     new Intl.ListFormat(locale, { localeMatcher: 'lookup', type: 'unit', style: 'narrow' }),
   ).format(rendered)
+}
+
+/**
+ * A settled elapsed time — `4.2s`, `37s`, `6m 38s`.
+ *
+ * Three bands, because the useful precision changes with magnitude: a sub-10s
+ * step is interesting to a tenth, a sub-minute one is not, and past a minute the
+ * minutes place carries the meaning. Rounds to whole seconds BEFORE splitting so
+ * a value like 119.6s reads `2m 0s` and never the invalid `1m 60s` — flooring
+ * minutes first and rounding the remainder can push it to 60.
+ *
+ * The seconds place is kept above a minute rather than dropped, so a series
+ * steps `2m 1s` -> `2m 0s` -> `59s` instead of collapsing to a bare `2m`.
+ *
+ * Non-finite input renders the same em dash `fmtDuration` uses, so a caller can
+ * hand over an unmeasurable span without branching.
+ *
+ * `fmtTurnElapsed` (chat) and the remaining-time label in `ToolCallLine` predate
+ * this and implement the same three bands inline; they are deliberately left
+ * alone rather than migrated here, so this change stays on the surface it is
+ * about.
+ */
+export function fmtElapsed(ms: number): string {
+  if (!Number.isFinite(ms)) return '—'
+  const s = ms / 1000
+  if (s < 10) return fmtUnit(s, 'second', { maximumFractionDigits: 1, minimumFractionDigits: 1 })
+  if (s < 60) return fmtUnit(Math.round(s), 'second', { maximumFractionDigits: 0 })
+  const total = Math.round(s)
+  return fmtDuration([[Math.floor(total / 60), 'minute'], [total % 60, 'second']])
 }
 
 /**

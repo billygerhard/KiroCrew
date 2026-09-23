@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.ops_mission_control.backend.models import CorruptDocumentError
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
@@ -58,6 +59,14 @@ SCHEDULE_STRICT_KEY = "schedule-file.strict_gating"
 #: part: the class is "every input the off-shift refusal depends on", and identity is that
 #: input for EVERY rotation source, not just the committed-file one.
 PAGERDUTY_USER_KEY = "pagerduty.user_id"
+
+#: This operator's incident.io user id. Same class as the two above: the rotation source
+#: matches it against the users on the effective schedule, so it decides whether the shift
+#: being reported is this instance's own. incident.io has no self-identity endpoint — an API
+#: key resolves to the key, not to a person — so this cannot be derived at runtime and has to
+#: be stated by the operator, which makes fencing it the only thing standing between an
+#: agent-written config and a forged on-call claim.
+INCIDENTIO_USER_KEY = "incidentio.user_id"
 
 #: Whether this instance claims the ``primary`` tier — i.e. may prune the SHARED ledger.
 #:
@@ -119,12 +128,9 @@ OPERATOR_ONLY_KEYS: tuple[str, ...] = (
     SCHEDULE_LOGIN_KEY,
     SCHEDULE_STRICT_KEY,
     PAGERDUTY_USER_KEY,
+    INCIDENTIO_USER_KEY,
     PRIMARY_KEY,
 )
-
-#: Owner-only, matching the secret file. The value is not a credential, but it IS a control
-#: whose confidentiality and integrity both matter, so it gets the same lockdown.
-_POLICY_FILE_MODE = 0o600
 
 
 def policy_path() -> Path:
@@ -133,11 +139,96 @@ def policy_path() -> Path:
 
 
 def _read() -> dict[str, Any]:
+    """The stored ceiling, or ``{}`` when there is nothing readable.
+
+    A DISPLAY/GATE read: it must degrade to the caller's DEFAULT rather than
+    raise. Every caller left on this path has a RESTRICTIVE default -- an
+    unreadable ceiling reads as ``observe`` with no act-rules, the destination
+    and identity keys read as unset -- so degrading is the safe direction. The
+    one key whose default is permissive (``PRIMARY_KEY``, see
+    ``rotation.is_primary``) does NOT read through here: authority decisions
+    go through :func:`read_authority`, which refuses what this read degrades.
+    Found in review (GPT 5.6), two rounds: swallowing more here widened the
+    fail-open door, and scoping it out as pre-existing was rightly rejected --
+    a corrupt file granting prune authority is the corruption-enables-
+    destruction failure this change exists to remove.
+
+    An absent file is silent -- no ceiling has been stored yet, not a fault.
+    A degraded read is logged: the state is restrictive but it is also
+    silent, and nothing else would tell an operator their configuration has
+    stopped applying.
+    """
     try:
         raw = json.loads(policy_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
-    return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "ops-mission-control: keystone policy file unreadable; every key will "
+            "read as its restrictive default",
+            exc_info=True,
+        )
+        return {}
+    if not isinstance(raw, dict):
+        # The same degradation reached without a parse failure -- same silence
+        # problem, same log line.
+        logger.warning(
+            "ops-mission-control: keystone policy file root is not an object; "
+            "every key will read as its restrictive default"
+        )
+        return {}
+    return raw
+
+
+def _read_for_update() -> dict[str, Any]:
+    """The ceiling a read-modify-write is allowed to publish over.
+
+    ``_PolicyLock`` documents that every writer here is a read-modify-write and
+    that ``atomic_write`` REPLACES the whole file. So an empty base is not
+    "nothing to carry forward" -- it is "discard every other operator-only key",
+    and this file holds ALL of them: the autonomy ceiling, the outbound ledger
+    remote and Slack channel, the rotation identity, the primary-instance flag.
+    Only a MISSING file makes that base true.
+
+    Losing them is not a preference reset. Each key is fenced onto the keystone
+    floor precisely because the agent must not be able to set it, and every one
+    reverts to a value the agent CAN influence: ``mode`` and ``autonomy_rules``
+    fall back to a default the route re-derives, and the destination and identity
+    keys fall back to absent, which is how the off-shift refusal and the
+    ``not_primary`` gate get their inputs. Silently dropping the operator's
+    ceiling on one transient EACCES is the failure this file exists to prevent,
+    arriving by accident instead of by attack. The error propagates and the
+    write is abandoned instead.
+
+    Corruption propagates too, on the same reasoning as the sibling stores:
+    "cannot merge into" is not "safe to destroy", and for THIS file silent
+    replacement re-opens the exact bypass the keystone floor exists to prevent
+    -- a truncated document
+    rewritten from empty reverts every fenced key to a value the constrained
+    party can influence. Every corruption door raises the one named type,
+    :class:`CorruptDocumentError`: a parse failure, a byte stream that is not
+    UTF-8 (a ``ValueError`` but NOT a ``JSONDecodeError``, so unwrapped it
+    would slip past every corruption clause at the callers), and valid JSON
+    whose root is not an object (which parses without raising, so coercing it
+    to ``{}`` would destroy a document nobody could read). No per-entry check
+    beyond the root: values here are arbitrary JSON passed through verbatim,
+    so a parsed document survives a read-write cycle by construction.
+    """
+    try:
+        raw = json.loads(policy_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise CorruptDocumentError(exc.msg, exc.doc, exc.pos) from exc
+    except UnicodeDecodeError as exc:
+        raise CorruptDocumentError(
+            f"policy file is not valid UTF-8: {exc.reason}",
+            exc.object.decode("utf-8", "replace")[:120],
+            0,
+        ) from exc
+    if not isinstance(raw, dict):
+        raise CorruptDocumentError("policy file root is not a JSON object", str(raw)[:120], 0)
+    return raw
 
 
 #: Lock filename beside the policy file. Not the policy file itself: locking the file being
@@ -182,18 +273,22 @@ class _PolicyLock:
 
 def _write(data: dict[str, Any]) -> None:
     payload = json.dumps(data, indent=2, sort_keys=True)
-    atomic_write(policy_path(), payload, mode=_POLICY_FILE_MODE)
-    # Fail-loud lockdown, same as the secret store: ``atomic_write``'s mode covers POSIX,
-    # and this applies the owner-only DACL on Windows. A lockdown failure must not leave the
-    # ceiling world-readable, so unlink and re-raise rather than continue.
-    try:
-        platform_compat.restrict_to_owner(policy_path())
-    except OSError:
-        try:
-            policy_path().unlink()
-        except OSError:
-            logger.exception("failed to remove ops policy file after lockdown failure")
-        raise
+    # Fail-loud lockdown BEFORE any content lands, same as the secret store:
+    # ``restrict_to_owner=True`` applies the owner-only DACL to the temp file
+    # before the payload reaches it (a post-rename lockdown leaves the ceiling
+    # readable under the inherited DACL on Windows for the write window) and
+    # implies the owner-only POSIX mode. The default
+    # ``restrict_on_error="raise"`` refuses to publish a ceiling it cannot
+    # protect.
+    #
+    # No cleanup on failure: every failure inside ``atomic_write`` happens
+    # BEFORE the final path is touched, so an unprotectable file never exists
+    # at ``policy_path()`` at all. The unlink the old code ran on lockdown
+    # failure existed to remove a NEW file already PUBLISHED at a wide DACL;
+    # that state is unreachable now, and keeping the unlink would instead
+    # delete the PREVIOUS, healthy governance ceiling on one transient lockdown
+    # failure — silently resetting the operator's autonomy policy.
+    atomic_write(policy_path(), payload, restrict_to_owner=True)
 
 
 def read_mode(default: str) -> str:
@@ -224,11 +319,15 @@ def set_ceiling(*, mode: str | None = None, rules: list[Any] | None = None) -> N
     could fix because the interleaving comes from another request.
 
     ``None`` means "leave unchanged", so this is also the single-field writer.
+
+    Raises ``OSError`` when the existing ceiling could not be read; see
+    :func:`_read_for_update` for why that is not collapsed to an empty document
+    here.
     """
     if mode is None and rules is None:  # pragma: no cover — programming error, not input
         raise ValueError("set_ceiling requires at least one of mode/rules")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         if mode is not None:
             data[_MODE_KEY] = mode
         if rules is not None:
@@ -260,7 +359,7 @@ def get(key: str, default: Any = None) -> Any:
     from the agent-writable config: promoting a value found there onto the fenced floor would
     let the constrained party set its own ceiling — an agent shell writes ``config.json``,
     the next read lifts it to the keystone, and ``act`` is authoritative. See the module
-    docstring; the migration this used to call was removed for exactly that.
+    docstring; that is why there is no migration call here.
     """
     if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
         raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
@@ -268,12 +367,43 @@ def get(key: str, default: Any = None) -> Any:
     return data.get(key, default)
 
 
+def read_authority(key: str, default: Any = None) -> Any:
+    """Read one operator-only value for an AUTHORITY decision -- strict, never lenient.
+
+    :func:`get` degrades an unreadable or corrupt file to the caller's default, which is
+    safe exactly when the default is the restrictive answer -- true for every key here
+    except one. ``PRIMARY_KEY`` defaults to TRUE (``rotation.is_primary``), so the lenient
+    read turns a truncated policy file into GRANTED ledger-prune authority: the corrupt
+    file becomes the key that unlocks destroying shared knowledge, which is the exact
+    corruption-enables-destruction failure this strict reader exists to remove.
+
+    Reuses :func:`_read_for_update`'s read, deliberately: one strict reader, one set of
+    corruption doors (parse failure, non-UTF-8, non-object root), no second copy to
+    drift. Only a MISSING file reads as the default -- a fresh install is genuinely the
+    default state, while an unreadable or corrupt file is an UNKNOWN state, and an
+    authority check that cannot read its input must refuse rather than guess. Callers
+    whose failure posture is "deny" catch the raise and answer False.
+
+    Not folded into :func:`get` wholesale because the restrictive-default keys WANT the
+    lenient read: failing ``read_mode`` on a transient EACCES would wedge every
+    authorization gate on a condition that clears by itself, to protect keys whose
+    degraded answer is already the safe one.
+    """
+    if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
+        raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
+    return _read_for_update().get(key, default)
+
+
 def put(key: str, value: Any) -> None:
-    """Write one operator-only value. Dashboard-PUT only — see the module docstring."""
+    """Write one operator-only value. Dashboard-PUT only — see the module docstring.
+
+    Raises ``OSError`` when the existing ceiling could not be read, for the reason
+    :func:`_read_for_update` gives.
+    """
     if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
         raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         data[key] = value
         _write(data)
 

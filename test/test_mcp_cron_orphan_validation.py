@@ -15,8 +15,20 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from kiro_crew.cron import CronService
 from kiro_crew.mcp_cron import _call_tool_inner
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 def _jobs(tmp_path):
@@ -171,7 +183,7 @@ class TestCronServiceUpdateJobValidation:
         assert CronService(base_dir=tmp_path).list_jobs()[0].skip_dates == []
 
     def test_service_update_rejects_non_padded_skip_date(self, tmp_path):
-        # "2026-1-1" parses via strptime but renders back as "2026-01-01",
+        # A non-padded skip date parses via strptime but renders back padded,
         # so fire-time skip matching would silently never match. It must be
         # rejected at the persistence owner rather than stranded on disk.
         svc = CronService(base_dir=tmp_path)

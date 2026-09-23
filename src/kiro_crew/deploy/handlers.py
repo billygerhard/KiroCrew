@@ -15,6 +15,7 @@ registered tools, so they can never appear in heartbeat/cron tool safe-sets.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from kiro_crew.deploy import pricing as pricing_mod
 from kiro_crew.deploy import profiles as profiles_mod
 from kiro_crew.deploy.render import render_standalone
 from kiro_crew.deploy.scan import Finding, is_credential_finding, scan_content, summarize
+from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
@@ -104,10 +106,10 @@ def _sanitize_response(payload: Any) -> Any:
     """Recursively apply credential + exfiltration redaction to all str values in a response payload.
 
     Deploy handler error responses echo LLM-controlled values (local_dir,
-    site_id, profile) without BOTH redaction passes. This helper walks dict/list
-    structures and applies _redact_text to every str leaf. Applied at the three
-    chokepoint handlers (_handle_deploy, _handle_recall, _handle_destroy) so
-    ALL paths through _do_* are covered in one place.
+    site_id, profile), which need BOTH redaction passes. This helper walks
+    dict/list structures and applies _redact_text to every str leaf. Applied at
+    the three chokepoint handlers (_handle_deploy, _handle_recall,
+    _handle_destroy) so ALL paths through _do_* are covered in one place.
     """
     if isinstance(payload, str):
         return _redact_text(payload)
@@ -129,8 +131,7 @@ def _redact_profile_fields(profiles: list[dict[str, Any]]) -> list[dict[str, Any
         entry: dict[str, Any] = {}
         for k, v in p.items():
             if isinstance(v, str) and v:
-                v, _ = redact_credentials(v)
-                v, _ = redact_exfiltration_urls(v)
+                v = _redact_text(v)
             entry[k] = v
         out.append(entry)
     return out
@@ -209,10 +210,7 @@ def _safe_err(exc: BaseException) -> str:
     AWS CLI stderr can contain credential fragments (access key ids, session
     tokens, etc.) — never surface the raw exception in response payloads.
     """
-    msg = str(exc)
-    msg, _ = redact_credentials(msg)
-    msg, _ = redact_exfiltration_urls(msg)
-    return msg
+    return _redact_text(str(exc))
 
 
 # --- local_dir input validation (security-controls) ------------
@@ -226,9 +224,11 @@ _LOCAL_DIR_SPEC = FieldSpec(name="local_dir", type=str, max_len=4096, pattern=_L
 # profile/region are LLM-influenceable (chat-native skill) and flow into subprocess
 # argv (--profile/--region) on every aws call, so they get schema validation too.
 # Both allow empty (clears profile / falls back to default region); the pattern is
-# only enforced on non-empty values by validate_field.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
+# only enforced on non-empty values by validate_field. The profile charset
+# ('+' admitted for IAM Identity Center derived names, leading '-' excluded,
+# \Z anchor) is profiles.py's PROFILE_SPEC, aliased like REGION_SPEC
+# below rather than re-spelled here.
+_PROFILE_SPEC = profiles_mod.PROFILE_SPEC
 _REGION_SPEC = profiles_mod.REGION_SPEC
 
 # artifact_slug is LLM-influenceable (chat-native skill) and is used in a store
@@ -302,7 +302,7 @@ def _allowed_local_roots() -> list[Path]:
                 pass
     except Exception:
         pass
-    # Always allow the deploy staging dir (for artifact staging, F2/F3).
+    # Always allow the deploy staging dir, where artifacts are staged for publish.
     try:
         sr = _staging_root()
         roots.append(sr.resolve())
@@ -932,7 +932,7 @@ async def _do_deploy(params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
                          "scan": _redact_text(summarize(findings)) if findings else "clean",
                          "profile": profile, "region": region,
                          "content_digest": content_digest,
-                         "message": "This will publish to a PUBLIC URL on your own AWS. Confirm to proceed."}
+                         "message": "This publishes to your own AWS account. Confirm to proceed."}
 
         # When the caller supplies expected_content_digest on a
         # confirm=true request, re-compute the current digest and reject with
@@ -1306,8 +1306,6 @@ def _internal_denied(func):  # type: ignore[no-untyped-def]
     A new handler without this decorator (and not in the allowlist) will trip the
     registration-time assertion in register_routes.
     """
-    import functools
-
     @functools.wraps(func)
     async def _wrapper(request: web.Request) -> web.Response:
         if _is_internal_secret_request(request):
@@ -1331,17 +1329,59 @@ def _strip_confirm_for_internal(request: web.Request, params: dict[str, Any]) ->
     return params
 
 
-async def _json_body(request: web.Request) -> dict[str, Any]:
+async def _json_body(
+    request: web.Request,
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """Parse a JSON *object* body, following the ``read_bounded_json`` 400 contract.
+
+    Returns ``(body, None)`` on success, or ``(None, error_response)`` when the
+    caller should return early. Deploy has no app-specific reason to diverge from
+    the shared dashboard contract (``dashboard/handlers/_shared.py::read_bounded_json``),
+    so it answers a body-shape 400 for BOTH a malformed body and a valid-JSON body
+    that is not an object. Otherwise a bad-shape request collapses to ``{}`` and
+    surfaces as a downstream field error (e.g. ``400 invalid config: ...``) instead
+    of the body-shape mistake it actually is.
+
+    The catch spans the full client-input failure set: an unknown ``charset=`` codec
+    raises ``LookupError`` and undecodable bytes raise ``UnicodeDecodeError`` (a
+    ``ValueError``, not a ``json.JSONDecodeError``), so catching only the latter would
+    let those escape as a 500. Transport/disconnect errors are deliberately NOT caught
+    (no bare ``Exception``) so a client disconnect propagates rather than being reported
+    as a client mistake.
+    """
     try:
         body = await request.json()
-    except json.JSONDecodeError:
-        return {}
-    return body if isinstance(body, dict) else {}
+    except (LookupError, RecursionError, ValueError):
+        return None, web.json_response(
+            {"error": "invalid JSON body", "code": "invalid_json"}, status=400
+        )
+    if not isinstance(body, dict):
+        return None, web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
+        )
+    return body, None
 
 
 @_internal_denied
 async def _handle_get_config(_request: web.Request) -> web.Response:
-    return web.json_response(await asyncio.to_thread(_load_config))
+    """Deploy configuration, plus whether this installation may deploy at all.
+
+    ``cloudDeploymentEnabled`` is what lets the frontend hide the surface instead
+    of rendering a page whose every button 403s. Deliberately NOT gated itself: a
+    denied read here would leave the UI unable to explain why deployment is
+    unavailable.
+    """
+    # circular import: the dashboard handler layer imports the deploy module at
+    # registration time, so this is a downward import.
+    from kiro_crew.dashboard.handlers._shared import admits_cloud_deployment
+
+    cfg = await asyncio.to_thread(_load_config)
+    # In a worker thread: the admission path can initialize the SEL audit log,
+    # which is blocking file IO on a fresh gateway.
+    enabled = await asyncio.to_thread(admits_cloud_deployment, "aws")
+    if isinstance(cfg, dict):
+        cfg = {**cfg, "cloudDeploymentEnabled": enabled}
+    return web.json_response(cfg)
 
 
 @_internal_denied
@@ -1349,7 +1389,10 @@ async def _handle_put_config(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "config_update")
     if denied:
         return denied
-    body = await _json_body(request)
+    body, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert body is not None  # _json_body returns (dict, None) on success
     try:
         profile = validate_field(str(body.get("profile", "")), _PROFILE_SPEC)
         region = validate_field(str(body.get("region", "")), _REGION_SPEC)
@@ -1366,7 +1409,34 @@ async def _handle_deploy(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "deploy")
     if denied:
         return denied
-    params = _strip_confirm_for_internal(request, await _json_body(request))
+    # Publish-governance ceiling for THIS destination. The provider registry
+    # already hides the button when this denies, but a hidden button is not a
+    # control — the endpoint is reachable directly (and by the MCP preview path),
+    # so the decision is re-made here. Same chokepoint as artifact publish, so an
+    # operator has one place to close every publish destination.
+    #
+    # Off the loop: the decision reads the trust-root policy, every governance
+    # profile, and config.json from disk. On a slow or contended data home that
+    # walk would stall the gateway and its heartbeat for every caller, not just
+    # this request — the provider-registry call site is offloaded for the same
+    # reason.
+    reason = await asyncio.to_thread(
+        publish_denied_reason, request, DEPLOY_WEB_PROVIDER_ID
+    )
+    if reason:
+        _audit("deploy", "", "denied", error=reason)
+        return web.json_response(
+            {
+                "error": f"public web deploy is disabled by policy: {reason}",
+                "code": "publish_destination_disabled",
+            },
+            status=403,
+        )
+    params, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert params is not None  # _json_body returns (dict, None) on success
+    params = _strip_confirm_for_internal(request, params)
     status, payload = await _do_deploy(params)
     return web.json_response(_sanitize_response(payload), status=status)
 
@@ -1376,7 +1446,10 @@ async def _handle_recall(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "recall")
     if denied:
         return denied
-    params = await _json_body(request)
+    params, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert params is not None  # _json_body returns (dict, None) on success
     status, payload = await _do_recall(params)
     return web.json_response(_sanitize_response(payload), status=status)
 
@@ -1386,7 +1459,10 @@ async def _handle_destroy(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "destroy")
     if denied:
         return denied
-    params = await _json_body(request)
+    params, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert params is not None  # _json_body returns (dict, None) on success
     status, payload = await _do_destroy(params)
     return web.json_response(_sanitize_response(payload), status=status)
 
@@ -1436,7 +1512,10 @@ async def _handle_verify(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "verify")
     if denied:
         return denied
-    body = await _json_body(request)
+    body, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert body is not None  # _json_body returns (dict, None) on success
     try:
         profile, _region = await _resolve_profile(body)
     except _ProfileResolveError as e:
@@ -1496,8 +1575,14 @@ async def _handle_profiles_get(_request: web.Request) -> web.Response:
     return web.json_response({
         "profiles": _redact_profile_fields(reg["profiles"]),
         "default": _redact_text(str(reg["default"])),
+        # `discovered or []` deliberately does NOT carry the could-not-ask state:
+        # this endpoint feeds a profile picker, and both readers hide their
+        # section on an empty list, so a field for the difference would ship with
+        # no consumer. Narrowing `None` here is still required -- iterating it
+        # raised TypeError. The distinction an operator acts on lives on the
+        # aws-control profile routes, which answer 503 or 501 instead.
         "available": [_redact_text(str(n))
-                      for n in discovered if n not in registered],
+                      for n in (discovered or []) if n not in registered],
     })
 
 
@@ -1512,7 +1597,10 @@ async def _handle_profiles_post(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "profile_create")
     if denied:
         return denied
-    body = await _json_body(request)
+    body, body_err = await _json_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_body returns (dict, None) on success
     try:
         name = validate_field(str(body.get("name", "")), _PROFILE_SPEC)
         region = validate_field(str(body.get("region", "")) or DEFAULT_REGION, _REGION_SPEC)
@@ -1580,7 +1668,10 @@ async def _handle_profiles_put(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "profile_update")
     if denied:
         return denied
-    body = await _json_body(request)
+    body, err = await _json_body(request)
+    if err is not None:
+        return err
+    assert body is not None  # _json_body returns (dict, None) on success
     # match_info name is LLM/user-influenceable — validate like the POST path
     # before it reaches the registry lookup / error strings / audit call.
     try:
@@ -1709,7 +1800,7 @@ async def _expire_manifest_best_effort(art: Any) -> str:
         return "skipped"
 
     # Validate the profile through the registry — if the metadata records a
-    # profile that no longer exists (or was never registered), refuse to execute
+    # profile that does not exist (or was never registered), refuse to execute
     # aws CLI with unvalidated input.
     raw_profile = meta.deploy_target.profile
     raw_region = meta.deploy_target.region or engine.DEFAULT_REGION
@@ -2030,6 +2121,23 @@ async def _handle_pending_confirm(request: web.Request) -> web.Response:
     denied = _deny_restricted(request, "pending_confirm")
     if denied:
         return denied
+    # Publish-governance ceiling, re-made at confirm time: a pending entry
+    # created before the operator closed the destination must NOT still be
+    # confirmable. Checked BEFORE claim_pending so a denied confirm leaves the
+    # entry intact rather than consuming it. Off the loop for the same reason as
+    # the deploy handler — the decision reads policy, profiles and config from disk.
+    reason = await asyncio.to_thread(
+        publish_denied_reason, request, DEPLOY_WEB_PROVIDER_ID
+    )
+    if reason:
+        _audit("pending_confirm", request.match_info.get("id", ""), "denied", error=reason)
+        return web.json_response(
+            {
+                "error": f"public web deploy is disabled by policy: {reason}",
+                "code": "publish_destination_disabled",
+            },
+            status=403,
+        )
     entry_id = request.match_info["id"]
     from kiro_crew.deploy.pending import add_pending, claim_pending
     entry = await asyncio.to_thread(claim_pending, entry_id)
@@ -2181,8 +2289,13 @@ async def _handle_pending_confirm(request: web.Request) -> web.Response:
     # This handler is @_internal_denied, so the flag can only originate from a
     # cookie/token-authenticated human, never from the MCP caller.
     if entry.get("override_scan_required"):
-        body = await _json_body(request)
-        if body.get("override_scan") is True:
+        # Deliberate divergence from the _json_body 400 contract: the pending
+        # entry was already popped above, so answering a body-shape 400 here
+        # would drop it. A malformed or absent body therefore means "no
+        # override" — _do_deploy re-blocks on the same findings, which is the
+        # conservative outcome — rather than an error response.
+        body, _body_err = await _json_body(request)
+        if body is not None and body.get("override_scan") is True:
             params["override_scan"] = True
             _audit("pending_confirm", entry_id, "allowed",
                    error="human override_scan on non-credential findings")
@@ -2217,26 +2330,81 @@ async def _handle_pending_dismiss(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _cloud_gated(handler):
+    """Refuse a deploy PROVISIONING mutation when the platform withholds it.
+
+    Applied at REGISTRATION rather than inside each handler: several endpoints
+    reach AWS, and a per-handler check is a list the next endpoint can silently be
+    added without. Wrapping here means a new provisioning route is gated by being
+    listed below, next to the assertion that already forces every handler to
+    declare its MCP exposure.
+
+    WITHDRAWAL IS NEVER GATED. ``recall``, ``destroy`` and ``teardown`` tear down
+    infrastructure that already exists and take a public URL OFF the internet, so
+    gating them would strand exposure created while deployment was still permitted:
+    an operator who disables cloud deployment would be unable to remove a live site
+    through the supported API. A control that blocks provisioning must not also
+    block undoing it.
+
+    Read endpoints stay open for the same family of reasons — ``/api/deploy/config``
+    is what tells the frontend to hide the surface, and ``list`` / ``pricing`` /
+    ``iam-policy`` disclose no infrastructure while letting an operator see what a
+    already-permitted deployment left behind.
+
+    Runs the check in a worker thread: the admission path can initialize the SEL
+    audit log, which on a fresh gateway does blocking file IO (trust-dir
+    creation, key validation) and would otherwise stall the event loop for
+    every request.
+    """
+
+    @functools.wraps(handler)
+    async def _guarded(request: web.Request) -> web.StreamResponse:
+        # circular import: the dashboard handler layer imports the deploy module
+        # at registration time, so this is a downward import — same pattern as
+        # `_is_restricted_session` above.
+        from kiro_crew.dashboard.handlers._shared import admits_cloud_deployment
+
+        if not await asyncio.to_thread(admits_cloud_deployment, "aws"):
+            return web.json_response(
+                {
+                    "error": "cloud deployment is disabled for this installation",
+                    "code": "cloud_deployment_denied",
+                },
+                status=403,
+            )
+        return await handler(request)
+
+    # Explicit marker rather than relying on ``__wrapped__``: the pre-existing
+    # ``@_internal_denied`` decorator also wraps handlers, so a wrapper check
+    # cannot tell the two apart. ``test_provisioning_routes_are_gated_but_
+    # withdrawal_is_not`` reads this off the live route table.
+    _guarded._cloud_gated = True  # type: ignore[attr-defined]
+    return _guarded
+
+
 def register_routes(app: web.Application) -> None:
     """Mount deploy routes under /api/deploy/* (core module)."""
     r = app.router
     r.add_get("/api/deploy/config", _handle_get_config)
-    r.add_put("/api/deploy/config", _handle_put_config)
+    r.add_put("/api/deploy/config", _cloud_gated(_handle_put_config))
     r.add_get("/api/deploy/profiles", _handle_profiles_get)
-    r.add_post("/api/deploy/profiles", _handle_profiles_post)
-    r.add_put("/api/deploy/profiles/{name}", _handle_profiles_put)
-    r.add_delete("/api/deploy/profiles/{name}", _handle_profiles_delete)
+    r.add_post("/api/deploy/profiles", _cloud_gated(_handle_profiles_post))
+    r.add_put("/api/deploy/profiles/{name}", _cloud_gated(_handle_profiles_put))
+    r.add_delete("/api/deploy/profiles/{name}", _cloud_gated(_handle_profiles_delete))
     r.add_get("/api/deploy/iam-policy", _handle_iam_policy)
-    r.add_post("/api/deploy/verify", _handle_verify)
+    r.add_post("/api/deploy/verify", _cloud_gated(_handle_verify))
     r.add_get("/api/deploy/pricing", _handle_pricing)
-    r.add_post("/api/deploy/deploy", _handle_deploy)
+    r.add_post("/api/deploy/deploy", _cloud_gated(_handle_deploy))
+    # Withdrawal is deliberately UNGATED — see _cloud_gated. These take a live
+    # public URL off the internet, so blocking them would strand exposure created
+    # while deployment was still permitted.
     r.add_post("/api/deploy/recall", _handle_recall)
     r.add_post("/api/deploy/destroy", _handle_destroy)
     r.add_get("/api/deploy/list", _handle_list)
     r.add_post("/api/deploy/teardown/{slug}", _handle_teardown)
     # ── Pending confirmations ──
     r.add_get("/api/deploy/pending", _handle_pending_list)
-    r.add_post("/api/deploy/pending/{id}/confirm", _handle_pending_confirm)
+    r.add_post("/api/deploy/pending/{id}/confirm", _cloud_gated(_handle_pending_confirm))
     r.add_post("/api/deploy/pending/{id}/dismiss", _handle_pending_dismiss)
 
     # ── Registration-time assertion: every handler must be in the allowlist

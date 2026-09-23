@@ -27,8 +27,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import urlparse
 
+from kiro_crew.apps.builtins.crew_companion import hooks as hooks_mod
+from kiro_crew.apps.builtins.crew_companion.backend import routes as routes_mod
 from kiro_crew.apps.discovery import discover_builtin_apps
 from kiro_crew.apps.manifest import AppManifest
 
@@ -41,7 +42,6 @@ _APP_ASSETS_DIR = _REPO_ROOT / "website" / "public" / "app-assets"
 _ROUTE_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._~-]*$")
 _ASSET_FIELDS = ("iconUrl", "heroImage", "heroImageDark")
 _ASSET_PREFIX = "/app-assets/crew-companion/"
-_GATEWAY_DEFAULT_PORT = 5476
 
 
 def _raw() -> dict:
@@ -94,8 +94,15 @@ def test_route_is_single_top_level_segment() -> None:
 
 
 def test_permissions_api_scopes_own_backend() -> None:
+    """The backend is now IN-PROCESS, so its routes live under the gateway's own
+    ``/api/apps/<name>/`` prefix rather than behind the reverse proxy at
+    ``/apps/<name>/api``. This assertion changed with the architecture: the old
+    path does not exist any more, and asserting it would pin a shape that
+    required a second process.
+    """
     api = _raw().get("permissions", {}).get("api", [])
-    assert "/apps/crew-companion/api" in api
+    assert "/api/apps/crew-companion" in api
+    assert "/api/apps/crew-companion/*" in api
 
 
 def test_asset_urls_under_app_assets_and_files_exist() -> None:
@@ -138,14 +145,85 @@ def test_no_absolute_user_path_in_builtin_dir() -> None:
     assert not offenders, f"absolute /Users/ path(s) found in: {offenders}"
 
 
-def test_mcpservers_url_is_loopback_and_not_gateway_port() -> None:
+def test_declares_no_separate_process_backend() -> None:
+    """No loopback backend URL may appear in this manifest.
+
+    An ``mcpServers.crew-companion.url = http://127.0.0.1:7778/mcp`` field means a
+    SEPARATE macOS app the gateway proxies to, and that single field is what makes
+    a whole class of defects reachable: the ``.app_secret`` the proxy signs with, a
+    malformed-port crash that can stop gateway startup, and the hole where a
+    never-enabled app still has an authenticated route to its backend.
+
+    The backend runs in-process, so there must be no loopback backend URL to
+    resolve. Asserting the absence is what stops someone reintroducing it.
+    """
     servers = _raw().get("mcpServers", {})
-    assert servers, "manifest must declare an mcpServers backend"
-    for cfg in servers.values():
+    for name, cfg in servers.items():
         url = cfg.get("url", "")
-        parsed = urlparse(url)
-        host = parsed.hostname
-        assert host in ("127.0.0.1", "::1"), f"mcpServers host {host!r} is not loopback"
-        assert parsed.port != _GATEWAY_DEFAULT_PORT, (
-            f"mcpServers port must not be the gateway default {_GATEWAY_DEFAULT_PORT}"
+        assert not url, (
+            f"mcpServers[{name!r}] declares url={url!r}; the backend runs "
+            "in-process, so a loopback URL means a second process crept back in"
         )
+
+
+def test_does_not_launch_anything_on_enable() -> None:
+    """Enabling must not run a command that can fail.
+
+    ``handle_app_api_proxy`` rolls an enable BACK when a ``setup.onEnable`` script
+    fails, so a launch step such as ``open "$HOME/Applications/Crew
+    Companion.app"`` makes the tile impossible to switch on for anyone without
+    that app already present. The window follows the enabled state instead, so
+    there is nothing to fail and nothing to roll back.
+    """
+    raw = _raw()
+    assert "onEnable" not in raw.get("setup", {}), (
+        "setup.onEnable is what made this app impossible to enable"
+    )
+    assert "openCommand" not in raw, (
+        "openCommand points at a separate app that is no longer shipped"
+    )
+    platform = raw.get("platform", {})
+    assert "clientInstall" not in platform, (
+        "clientInstall describes installing a separate app on the user's machine"
+    )
+    assert platform.get("installMode") != "client", (
+        "installMode 'client' means 'the user installs this themselves'"
+    )
+
+
+def test_declares_an_in_process_backend_that_imports() -> None:
+    """The hooks and routes the gateway will call must exist and be importable.
+
+    A typo in either dotted path is otherwise a runtime failure at enable time,
+    on a code path that only runs on a machine where someone enabled the app.
+    """
+    backend = _raw().get("backend", {})
+    assert backend.get("routes") == "backend.routes:register_routes"
+    hooks = backend.get("hooks", {})
+    assert hooks.get("on_startup") == "hooks:on_startup"
+    assert hooks.get("on_shutdown") == "hooks:on_shutdown"
+
+    assert callable(hooks_mod.on_startup)
+    assert callable(hooks_mod.on_shutdown)
+    assert callable(routes_mod.register_routes)
+
+
+def test_declares_the_network_permission_its_routes_use() -> None:
+    """The manifest states what the app does, and its routes reach the internet.
+
+    The appearance routes import ``appearance_packs.transfer``, whose PetDex
+    fetch makes outbound HTTPS requests. The manifest said ``network: false``
+    while that was true, so the platform and the user were told the wrong
+    thing. Moving the fetch into core does not change who calls it.
+    """
+    assert _raw()["permissions"]["network"] is True
+
+
+def test_requires_the_desktop_app_declaratively() -> None:
+    """A flag the shell reads, not a shell command it runs.
+
+    The companion needs Kiro Crew's desktop app to have somewhere to draw its
+    window, and this is how that is stated — so the dashboard can gate the tile
+    instead of the enable failing on a machine with no shell.
+    """
+    assert _raw().get("platform", {}).get("requiresDesktopApp") is True

@@ -34,6 +34,7 @@ an afternoon and $50. Every one of these is overridable from config.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -82,6 +83,48 @@ STATUS_STOPPING = "stopping"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
 
+#: Filename of the last run's terminal record, written beside the archive's own
+#: ``run.meta.json``.
+#:
+#: A SIBLING file rather than a field inside ``run.meta.json`` on purpose. That document is
+#: owned by :mod:`..spine.archive` and written from inside ``driver.run()`` after preflight,
+#: so a run that ends before the archive writes has no metadata document to carry the field
+#: -- and an offline run, the case this record exists to explain, is exactly such a run. A
+#: record that is missing precisely when it is needed is not a record.
+TERMINAL_RECORD_NAME = "run.state.json"
+
+#: Statuses a persisted record is allowed to claim when it is read back at startup.
+#:
+#: The record is written only at a TERMINAL transition, so any other value in the file is
+#: stale or hand-edited. Restoring ``running`` from disk would make a fresh process report a
+#: live run with no thread behind it -- the same "UI spins forever" lie ``status()`` already
+#: guards against for a torn-down thread -- so a non-terminal record is ignored, not restored.
+_PERSISTABLE_STATUSES = frozenset({STATUS_DONE, STATUS_ERROR})
+
+
+class _CalibrationStopped(Exception):
+    """Internal signal that a Stop click landed between calibration phases.
+
+    Caught in :meth:`RunSupervisor._calibrate_loop` and recorded as a clean stop
+    rather than a failure — a stopped calibration has proven no ruler and writes
+    none, but it is not an error the operator needs to see reported.
+    """
+
+
+class AgentRunnerOffline(Exception):
+    """A run finished its cycles with no agent runner, so it attempted no work.
+
+    Carried as an exception, and raised nowhere, so the offline outcome can be recorded
+    through :meth:`RunSupervisor._fail` -- the ONE redaction site for anything that reaches
+    ``RunState.error`` and therefore the ``GET /run`` response. A second hand-rolled terminal
+    assignment beside it is exactly the drift
+    ``test_every_terminal_error_site_goes_through_the_helper`` exists to prevent.
+
+    PUBLIC name, unusually for a signal class, because ``_fail`` composes
+    ``f"{type(exc).__name__}: {detail}"`` -- the class name is rendered to the operator, so it
+    is part of the user-visible contract rather than an implementation detail.
+    """
+
 
 @dataclass
 class RunState:
@@ -105,6 +148,24 @@ class RunState:
     quiescence: dict[str, Any] = field(default_factory=dict)
     #: Terminal run counters, copied off the spine's ``Stats`` when the loop returns.
     stats: dict[str, Any] = field(default_factory=dict)
+    #: WHY this run has no agent runner, or ``""`` when one came online.
+    #:
+    #: Carried per-run rather than on the supervisor because it decides this run's TERMINAL
+    #: STATUS: an offline run's discovery early-returns an empty candidate list, so the loop
+    #: quiesces and ``driver.run()`` returns cleanly — a clean return with no reason set reads
+    #: as ``done``. Set from :meth:`RunSupervisor._build_runner` via :meth:`RunSupervisor.start`.
+    offline_reason: str = ""
+    #: Where THIS run's terminal record belongs, bound when the run started.
+    #:
+    #: Load-bearing, not a cache. :func:`_terminal_record_path` resolves
+    #: ``store.results_dir()``, which is scoped to the ACTIVE repository+branch workspace, and
+    #: the terminal write happens after the run has gone non-active -- at which point a
+    #: retarget is admitted again (``routes._ACTIVE_RUN_STATUSES`` holds only the in-flight
+    #: statuses). Resolving at write time could therefore file this run's outcome under a
+    #: DIFFERENT repository and leave its own workspace with no record at all. Bound at the
+    #: same instant as the driver's ``archive_root``, so the record and the archive can never
+    #: land in different workspaces. Raised by the GPT review of this branch.
+    record_path: Path | None = None
 
 
 #: Stands in for one activity string the redactor could not scan. A placeholder rather than a
@@ -113,37 +174,33 @@ _UNSCANNED = "[withheld: redaction unavailable]"
 
 
 def _credentials_are_unconfined() -> str:
-    """A REASON string when a provider-driven agent would run without credential masking.
+    """Return a refusal reason unless effective strict isolation or risk consent permits a run.
 
-    Empty string means "confined, safe to run". The app's subprocess path forces
-    ``sandboxed_spawn_argv(mode="strict")`` + ``strip_credential_env``; the provider path
-    inherits the gateway's ``sandbox`` setting instead, which DEFAULTS TO ``"off"``. Only
-    ``"auto"`` re-enables Kiro Crew's OS-level sandbox (namespace on Linux, sandbox-exec on
-    macOS) — the layer that hides ``~/.aws``/``~/.gnupg``/``gh`` credential stores from the
-    agent's auto-approved shell.
+    The provider inherits ``agent.sandbox``, clamped by the governance floor. Only
+    ``strict`` hides all required credential stores: ``cc`` leaves SSH and GitHub CLI
+    credentials visible, while ``auto`` and ``standard`` also expose AWS credentials.
+    Repository-controlled instructions must not reach those credentials unattended.
 
-    FAIL CLOSED on an unreadable config: a state we cannot verify is treated as unconfined,
-    because the alternative is running an agent over repository-controlled text with the
-    operator's credentials visible.
-
-    The operator can ACKNOWLEDGE the residual risk with ``acceptUnsandboxedAgentRisk``
-    (default OFF, compared with ``is True`` so only the explicit boolean opts in) — the same
-    one-time-consent shape as the watcher's ``watcherAcceptEgressRisk`` (D-118). That escape
-    hatch exists because ``sandbox`` defaults to ``"off"`` on every install (isolation is
-    deferred to kiro-cli's own agent sandbox, which this app cannot inspect), so a hard
-    refusal would silently take the loop offline for everyone rather than telling the operator
-    what to decide. Raised by the GPT review.
+    An unreadable config fails closed. The operator can acknowledge the residual risk
+    with ``acceptUnsandboxedAgentRisk`` (default OFF, only the explicit boolean ``True``
+    opts in). An empty result therefore means either strict isolation or explicit consent.
     """
     if _unsandboxed_agent_accepted():
         return ""
     try:
         from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.sandbox import effective_sandbox_mode
 
-        mode = str(getattr(KiroCrewConfig.load(), "sandbox", "") or "").strip().lower()
+        mode = effective_sandbox_mode(KiroCrewConfig.load().agent.sandbox)
     except Exception as exc:  # noqa: BLE001 — an unverifiable sandbox is an unconfined one
         return f"the gateway sandbox setting could not be read ({type(exc).__name__})"
-    if mode != "auto":
-        return f"the gateway sandbox is {mode or 'unset'!r}, not 'auto'"
+    if mode != "strict":
+        return (
+            f"the gateway sandbox is {mode or 'unset'!r} — the auto-improvement "
+            f"provider path requires a sandbox.min_level governance floor of 'strict' "
+            f"(credential-hiding profile) "
+            f"or the explicit acceptUnsandboxedAgentRisk opt-in"
+        )
     return ""
 
 
@@ -155,6 +212,40 @@ def _unsandboxed_agent_accepted() -> bool:
     """
     config = store.read_json(store.config_path(), {}) or {}
     return bool(config.get("acceptUnsandboxedAgentRisk") is True)
+
+
+def _terminal_record_path() -> Path:
+    """Where the ACTIVE workspace's last terminal record lives, beside the archive's metadata.
+
+    Resolved per call, never module-cached: ``store.results_dir()`` is scoped to the active
+    repository+branch, so a cached value would point a second target's record at the first
+    one's directory.
+
+    Who calls it matters. :meth:`RunSupervisor._hydrate_terminal_record` calls it live, and
+    should: it answers "what happened in the workspace I am looking at NOW". A RUN must not --
+    it binds the answer once, into ``RunState.record_path``, so a retarget cannot move its
+    outcome to another repository between the terminal transition and the write.
+    """
+    return store.results_dir() / TERMINAL_RECORD_NAME
+
+
+def _as_count(value: Any) -> int:
+    """A non-negative counter read back off disk, or ``0``.
+
+    Not :func:`_pos_int`: that helper substitutes its default for anything ``<= 0`` because
+    its callers are budget caps where zero is meaningless. Here zero is the MOST important
+    value -- ``cycle: 0`` is what an offline run records -- so it must survive the round trip.
+
+    ``OverflowError`` is in the tuple, not only ``TypeError``/``ValueError``: this reads
+    JSON off disk, ``json.loads`` turns ``1e309`` into ``float('inf')``, and ``int(inf)``
+    raises ``OverflowError`` -- which the usual two-name tuple does NOT catch. Measured.
+    Raised by the GPT review of this branch.
+    """
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return out if out > 0 else 0
 
 
 def _redact_activity(value: Any) -> Any:
@@ -219,6 +310,81 @@ class RunSupervisor:
         self._reserved = False
         self._driver: Any = None
         self._stop_requested = False
+        #: WHY the last :meth:`_build_runner` call produced no agent runner, or ``""``.
+        #: Written on EVERY call so it is self-clearing: a previous offline run cannot leak
+        #: its reason into a later run whose runner came online. Read by :meth:`start`, which
+        #: copies it onto that run's :class:`RunState`.
+        self._offline_reason = ""
+        self._hydrate_terminal_record()
+
+    def _hydrate_terminal_record(self) -> None:
+        """Seed ``_state`` from the last run's persisted terminal record.
+
+        Called ONCE, from ``__init__``, which is what keeps :meth:`status` honest about being
+        a cheap in-memory read (this module's header promises exactly that). Without it the
+        record would be written and never shown: a gateway restart after a failed run reports
+        ``idle``, which is the "nothing persisted, no trace after a restart" half of the
+        reported defect -- persisting a record nobody reads back fixes nothing.
+
+        Best-effort by construction. A missing, unreadable, malformed or non-terminal record
+        leaves the supervisor idle, which is the pre-existing behaviour, and this NEVER raises:
+        it runs inside the process-wide singleton every run route resolves through, so a
+        failure here would take out run reporting entirely rather than degrade it -- and
+        because ``get_supervisor()`` caches only on success, one raise would 500 EVERY
+        subsequent request, not just the first. That guarantee is STRUCTURAL: the whole body is
+        inside the ``try``, not just the read, so a coercion that turns out to be non-total
+        (``int(float('inf'))`` raising ``OverflowError`` was exactly that) degrades to idle
+        instead of wedging the app.
+
+        COST, stated plainly: this is the only I/O in the supervisor's construction, and
+        ``get_supervisor()`` builds the singleton lazily -- so the first request to reach it (a
+        ``GET /run`` handler, on the event loop) pays two small reads and the ``store``
+        directory ``mkdir``s. Once per process, on a document of a few hundred bytes. The
+        alternative -- reading on the idle path of :meth:`status` -- pays it on every poll and
+        makes that method's documented "cheap, in-memory" contract false.
+        """
+        try:
+            record = store.read_json(_terminal_record_path(), None)
+            if not isinstance(record, dict):
+                return
+            status = str(record.get("status") or "")
+            if status not in _PERSISTABLE_STATUSES:
+                return
+            numbers = (
+                record.get("cycle"),
+                record.get("kept"),
+                record.get("drafted"),
+                record.get("started_at"),
+                record.get("finished_at"),
+            )
+            if any(isinstance(n, float) and not math.isfinite(n) for n in numbers):
+                # A non-finite number means the document is corrupt, and coercing it is worse
+                # than declining it: `json.loads` turns `1e309` into `inf`, which passes
+                # `_pos_float`'s `> 0` guard untouched and would be re-serialized into the
+                # `GET /run` response as the literal `Infinity` -- not valid JSON, so the
+                # browser's `JSON.parse` rejects the WHOLE payload and the app shows nothing.
+                # Declining the record leaves the supervisor idle, which is what every other
+                # corrupt-record path already does. Raised by the GPT review of this branch.
+                logger.warning(
+                    "%s: ignoring the terminal run record -- it carries a non-finite number",
+                    store.APP_NAME,
+                )
+                return
+            self._state = RunState(
+                status=status,
+                run_id=str(record.get("run_id") or ""),
+                cycle=_as_count(record.get("cycle")),
+                kept=_as_count(record.get("kept")),
+                drafted=_as_count(record.get("drafted")),
+                error=str(record.get("error") or ""),
+                started_at=_pos_float(record.get("started_at"), 0.0),
+                finished_at=_pos_float(record.get("finished_at"), 0.0),
+                offline_reason=str(record.get("offline_reason") or ""),
+            )
+        except Exception:  # noqa: BLE001 -- see docstring: must not break every run route
+            logger.warning(
+                "%s: could not restore the terminal run record", store.APP_NAME, exc_info=True
+            )
 
     # ── progress sink (called from the worker thread) ─────────────────────────
 
@@ -260,8 +426,7 @@ class RunSupervisor:
     # ── construction (blocking; called from the route's worker thread) ────────
 
     def _build_runner(self, *, stop_check) -> Any:
-        """Pick the agent runner: the in-process provider when one is configured,
-        else the ``claude -p`` subprocess, else None (offline spine — no fabricated fixes).
+        """Build the app's member team on the gateway, or return None (offline).
 
         ``import kiro_crew.acp`` FIRST: there is a known circular import that only
         resolves when the acp package is imported before ``create_provider_factory()``
@@ -273,62 +438,62 @@ class RunSupervisor:
         from ..spine.agent_runner import SessionAgentRunner
 
         if SessionAgentRunner.available():
-            # CREDENTIAL CONFINEMENT PRECONDITION. The subprocess path spawns through
-            # `sandboxed_spawn_argv(mode="strict")` + `strip_credential_env`, which hides
-            # `~/.aws`, `~/.gnupg`, `gh`/`gcloud`/`kube` config and scrubs the token env. The
-            # PROVIDER path does not: it drives a Kiro Crew session, so isolation is whatever
-            # `cfg.sandbox` says — and that field DEFAULTS TO "off" ("defers isolation to
-            # kiro-cli's internal agent sandbox"). On a gateway where kiro-cli provides no
-            # sandbox, an injected repository instruction reaching the agent's auto-approved
-            # Bash (`python helper.py`) could read those credential stores and exfiltrate over
-            # an unrestricted network. Refuse rather than run unconfined: `None` means OFFLINE
-            # (no fabricated fixes), which is the same fail-closed answer this method already
-            # gives when the tool-restricted agent cannot be registered. Raised by the GPT
-            # review. The watcher path is gated separately and explicitly
-            # (`pr_watchers._watcher_egress_accepted`, D-118) because it genuinely needs `gh`
-            # network access; the loop's authoring agent does not.
+            # Unattended repository execution requires effective strict isolation or
+            # explicit risk consent before constructing the member team. Lesser profiles
+            # expose credentials. Watchers retain their separate egress acknowledgement.
             unconfined = _credentials_are_unconfined()
             if unconfined:
                 logger.warning(
                     "%s: refusing the provider-backed agent runner — %s, so an agent-run "
                     "command could read credential stores and exfiltrate. Running OFFLINE. "
-                    "Set the gateway's `sandbox` to 'auto' to re-enable the OS-level sandbox, "
+                    "Set the governance `sandbox.min_level` floor to 'strict', "
                     "or set `acceptUnsandboxedAgentRisk` to acknowledge the residual risk.",
                     store.APP_NAME,
                     unconfined,
                 )
+                self._offline_reason = (
+                    f"the provider-backed agent runner was refused because {unconfined}"
+                )
                 return None
-            runner = SessionAgentRunner(stop_check=stop_check, on_activity=self._on_agent_activity)
-            # Register the tool-restricted discovery agent so kiro-cli resolves it by name.
+            from .crew import build_runner
+
+            try:
+                runner = build_runner(stop_check=stop_check, on_activity=self._on_agent_activity)
+            except Exception as exc:
+                self._offline_reason = f"member team unavailable: {exc}"
+                logger.warning("%s: %s", store.APP_NAME, self._offline_reason)
+                return None
+            # Verify both app-owned role templates before dispatching any assignment.
             # FAIL CLOSED on the returned bool: an unknown agent name does not error, it
             # silently activates the DEFAULT agent — which carries the full kirocrew-core
-            # toolset including `spawn_sub_agents`. Ignoring this result meant an
-            # unwritable agent dir quietly widened an unattended agent's tool scope to
-            # everything, which is the opposite of what registering it is for. Raised by
-            # review of this branch.
+            # toolset including `spawn_sub_agents`. Ignoring this result lets an unwritable
+            # agent dir quietly widen an unattended agent's tool scope to everything, which
+            # is the opposite of what registering it is for.
             if not runner.ensure_agent_registered():
-                # OFFLINE, not the subprocess fallback. This used to fall through, which
-                # meant a configured provider whose agent registration failed silently
-                # downgraded to `claude -p` — bypassing the provider's own permission
-                # gate even though a provider EXISTED. Measured: with `available()` True
-                # and `ensure_agent_registered()` False, `_build_runner` returned
-                # `AgentRunner`. That is the substance of the review's long-standing
-                # "fallback bypasses the ACP gate" objection, and it is a real hole
-                # rather than the impossible case it looked like: the fallback is only
-                # defensible when there is NO provider to route through. Raised by the
-                # GPT review of this branch.
+                # OFFLINE, not the subprocess fallback. Falling through here lets a
+                # configured provider whose agent registration failed downgrade silently
+                # to `claude -p` — bypassing the provider's own permission gate even
+                # though a provider EXISTS. The hole is reachable, not theoretical:
+                # `available()` True with `ensure_agent_registered()` False is a state
+                # `_build_runner` sees here. The fallback is only defensible when there
+                # is NO provider to route through.
                 logger.warning(
                     "%s: could not register the tool-restricted agent — running OFFLINE "
                     "rather than falling back to the subprocess agent, because a provider "
                     "is configured and its permission gate must not be bypassed",
                     store.APP_NAME,
                 )
+                self._offline_reason = (
+                    "the tool-restricted member templates could not be registered, and falling "
+                    "back to the subprocess agent would bypass the configured provider's "
+                    "permission gate"
+                )
                 return None
+            self._offline_reason = ""
             return runner
-        # NO subprocess fallback. Review asked for this removal on every head, and after the
-        # two fall-through holes were closed the remaining objection turned out to be right on
-        # the facts: the fallback's stated purpose — "the only path that authors fixes when no
-        # in-process provider is configured" — describes a state that cannot occur.
+        # NO subprocess fallback. The fallback's stated purpose — "the only path that authors
+        # fixes when no in-process provider is configured" — describes a state that cannot
+        # occur.
         # `SessionAgentRunner.available()` is `cfg.create_provider_factory() is not None`, and
         # `create_provider_factory` has exactly two returns (`AcpProvider(...)` and `_acp`) and
         # NEVER returns None — verified by inspecting its source. So `available()` is False only
@@ -338,11 +503,16 @@ class RunSupervisor:
         # agent outside the provider's permission gate precisely when the platform is unhealthy.
         # Running OFFLINE (no fabricated fixes) is the honest outcome. Removing the selection
         # rather than the class keeps `AgentRunner` available for a future caller that can route
-        # it properly. Raised by the GPT review of this branch.
+        # it properly.
         logger.warning(
             "%s: no provider-backed agent runner available — running offline (the subprocess "
             "fallback is deliberately not used: it would bypass the provider permission gate)",
             store.APP_NAME,
+        )
+        self._offline_reason = (
+            "no provider-backed agent runner is available: SessionAgentRunner.available() is "
+            "False, which means the gateway config load or the provider-factory construction "
+            "raised rather than that no provider is configured"
         )
         return None
 
@@ -393,11 +563,24 @@ class RunSupervisor:
         clone_dir = str(config.get("clone") or "").strip()
         branch = str(config.get("branch") or "").strip() or "main"
         if clone_dir:
+            clone_path = Path(clone_dir)
+            # These preconditions precede checkout because checkout itself touches refs and
+            # the worktree. Preserve the established PermissionError contract for a live
+            # push URL instead of surfacing it later as a wrong-revision RuntimeError.
+            if not clone_setup._repository_is_safe(clone_path):
+                raise PermissionError(
+                    "refusing to start: repository metadata failed safety verification — "
+                    "re-run repository setup"
+                )
+            if not clone_setup._push_disabled(clone_path):
+                raise PermissionError(
+                    "refusing to start: the clone's push is not disabled — re-run repository setup"
+                )
             # Best-effort: log a failure but still start, EXCEPT when a diff scope was
             # requested — there, a failed checkout would compute the scope against the
             # wrong HEAD, and silently running unscoped is the outcome the operator was
             # trying to avoid by setting it.
-            ok, note = clone_setup.checkout_branch(Path(clone_dir), branch)
+            ok, note = clone_setup.checkout_branch(clone_path, branch)
             if not ok:
                 # RAISE on any failed checkout, not only when scopeDiffBase is set.
                 # `checkout_branch` already tries the remote-tracking ref AND a local ref
@@ -515,6 +698,12 @@ class RunSupervisor:
 
         driver = self._build_driver(config)
         run_id = f"run-{int(time.time())}"
+        # Bind this run's terminal-record path NOW, immediately after `_build_driver` bound the
+        # driver's `archive_root` to `store.results_dir()`. Both name the active workspace, so
+        # binding them at the same instant is what guarantees the record and the archive cannot
+        # end up in different repositories' subtrees. Resolved outside the lock because
+        # `store.results_dir()` touches the filesystem. See `RunState.record_path`.
+        record_path = _terminal_record_path()
 
         with self._lock:
             # Re-check under the lock: two concurrent POSTs could both pass the probe
@@ -527,8 +716,30 @@ class RunSupervisor:
                 status=STATUS_RUNNING,
                 run_id=run_id,
                 started_at=time.time(),
+                # Captured from the just-built driver's runner selection. Read here rather
+                # than in the worker thread so the run OWNS the reason from the moment it
+                # exists, and a later ``_build_runner`` call cannot change this run's answer.
+                offline_reason=self._offline_reason,
+                record_path=record_path,
             )
             self._state.activity.append({"t": time.time(), "note": f"run {run_id} starting"})
+            if self._offline_reason:
+                # Surfaced at the START, not only at the end. The feed is the operator's live
+                # view, and the ``logger.warning`` that names this reason goes to the
+                # process's stdout/stderr pipe -- which a supervised gateway does not capture
+                # into its log file -- so without this entry the reason exists nowhere the
+                # operator can reach. A run in this state cannot discover anything: the
+                # profile's discovery early-returns an empty candidate list on a ``None``
+                # runner, so every cycle is empty by construction.
+                self._state.activity.append(
+                    {
+                        "t": time.time(),
+                        "error": _redact_activity(
+                            f"agent runner OFFLINE -- this run cannot discover anything: "
+                            f"{self._offline_reason}"
+                        ),
+                    }
+                )
             thread = threading.Thread(
                 target=self._run_loop,
                 args=(driver,),
@@ -596,7 +807,7 @@ class RunSupervisor:
         UI reporting ``calibrating`` forever."""
         with self._lock:
             # The thread is RUNNING now, so `is_alive()` can carry the answer from here and the
-            # reservation is no longer needed. Released first so an early return or raise below
+            # reservation is not needed. Released first so an early return or raise below
             # cannot leave the supervisor permanently busy.
             self._reserved = False
         try:
@@ -639,11 +850,31 @@ class RunSupervisor:
                         )
 
                 profile = build_profile(config)
+                # Duck-wire the supervisor's stop flag onto the ruler so a Stop click
+                # can interrupt calibration between measurement reps, exactly as the
+                # driver does for the Phase-1 preflight path (`Driver._preflight`).
+                # `calibrate` builds NO driver, so without this the ruler never sees a
+                # stop and a Stop click during a long baseline flips the status to
+                # `stopping` while the suite runs to completion — the "stuck
+                # calibrating" symptom. The ruler treats it as optional.
+                try:
+                    profile.ruler.stop_check = self._stop_check  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — a frozen/slotted ruler just runs to completion
+                    pass
                 clone = Path(str(config.get("clone") or ""))
                 reps = _pos_int(config.get("calibrationReps"), 5)
 
+                # Between-phase cancellation. `baseline_samples` and `measure_canary`
+                # are each a multi-rep suite run, so honoring the stop only between
+                # baseline reps still leaves the canary to run in full; check the flag
+                # at every phase boundary and abort cleanly.
+                self._raise_if_stopped()
                 self._note(f"collecting {reps} baseline sample(s)")
                 samples = profile.ruler.baseline_samples(base_src=clone, reps=reps)
+                # A stop lands as a short/empty sample list from the ruler's own
+                # between-rep check; treat that as the stop it is, not as the genuine
+                # "harness produced nothing" error below.
+                self._raise_if_stopped()
                 if not samples:
                     raise RuntimeError("the ruler returned no baseline samples")
 
@@ -663,18 +894,19 @@ class RunSupervisor:
                 )
                 self._note(f"noise band = {band}")
 
+                self._raise_if_stopped()
                 self._note("running the canary (a known win must clear the band)")
                 canary = profile.ruler.measure_canary(base_src=clone)
                 observed = float(getattr(canary, "primary_delta", 0.0) or 0.0)
-                # Reuse the SPINE's predicate rather than re-deriving it. This used to be
-                # `abs(observed) > band`, which ignored both `canary.ok` and the ruler's improving
-                # DIRECTION — so `POST /calibrate` wrote `status="calibrated"` for two cases that
-                # prove the opposite. Measured against the spine's rule at band=10: a REGRESSION of
-                # +25 (minimize) passed, and a measurement with `ok=False` passed. A canary is the
+                # Reuse the SPINE's predicate rather than re-deriving it. A local
+                # `abs(observed) > band` ignores both `canary.ok` and the ruler's improving
+                # DIRECTION — so `POST /calibrate` writes `status="calibrated"` for two cases that
+                # prove the opposite: against the spine's rule at band=10, a REGRESSION of +25
+                # (minimize) clears, and so does a measurement with `ok=False`. A canary is the
                 # one measurement whose sign we know a priori, so direction-blindness here defeats
                 # the whole point of proving the ruler. `_canary_clears_band` already handles ok /
                 # None / direction and is what Phase-1 preflight uses; a second copy is exactly how
-                # these two drifted apart. Raised by the GPT review of this branch.
+                # the two drift apart.
                 from ..spine.preflight import _canary_clears_band
 
                 cleared = _canary_clears_band(
@@ -722,6 +954,11 @@ class RunSupervisor:
                     / "ruler"
                     / "ruler.json"
                 )
+                # Last boundary before the ruler write: a stop that landed during the
+                # canary must not persist a ruler. A stopped calibration has proven
+                # nothing, and a stale `calibrated` file would let a later run start on
+                # an unproven ruler.
+                self._raise_if_stopped()
                 ruler_path.parent.mkdir(parents=True, exist_ok=True)
                 store_mod.write_json_atomic(ruler_path, ruler_doc)
 
@@ -762,9 +999,37 @@ class RunSupervisor:
                         store.APP_NAME,
                         cleared,
                     )
+        except _CalibrationStopped:
+            # A Stop click, not a failure: record a clean terminal state. A stopped
+            # calibration wrote no ruler this run (the phase-boundary checks abort
+            # before the write), and — like the failure path below — it leaves any
+            # ruler an earlier calibration proved untouched: a stop is as often "this
+            # is taking too long" as "supersede this", so aborting must not destroy
+            # prior work the operator would have to re-pay a full suite run to rebuild.
+            self._mark_stopped()
         except BaseException as exc:  # noqa: BLE001 - a failure is state, not a crash
             logger.exception("%s: calibration failed", store.APP_NAME)
             self._fail(exc)
+
+    def _raise_if_stopped(self) -> None:
+        """Abort the current measurement phase if a stop has been requested.
+
+        Raised at each calibration phase boundary so a Stop click lands between
+        measurement phases rather than after the whole baseline-then-canary run
+        finishes on its own. The boundary before the ruler write is best-effort: a
+        stop in the window between it and the write still persists a fully proven
+        ruler, which is correct — that calibration actually completed.
+        """
+        if self._stop_check():
+            raise _CalibrationStopped
+
+    def _mark_stopped(self) -> None:
+        """Record a cooperative calibration stop as a clean terminal state (no error)."""
+        with self._lock:
+            self._state.status = STATUS_DONE
+            self._state.stage = ""
+            self._state.finished_at = time.time()
+            self._state.activity.append({"t": time.time(), "note": "calibration stopped"})
 
     def _fail(self, exc: BaseException) -> None:
         """Record a TERMINAL failure: status, redacted message, finish time, feed entry.
@@ -792,12 +1057,60 @@ class RunSupervisor:
         with self._lock:
             self._state.activity.append({"t": time.time(), "note": text})
 
+    def _persist_terminal_state(self) -> None:
+        """Write this run's terminal status/error/counters to disk. Call WITHOUT ``_lock``.
+
+        The half of the fix that outlives the process. :class:`RunState` is in-memory only, so
+        before this a run's terminal status and error died with the gateway: a restart reported
+        ``idle`` with no trace on disk that a run had ended at cycle 0, or why. Read back by
+        :meth:`_hydrate_terminal_record` in a later process.
+
+        The SNAPSHOT is taken under the lock and the WRITE happens outside it, because
+        ``store.write_json_atomic`` fsyncs and this module's contract is that ``_lock`` is held
+        for microseconds and never across blocking I/O -- every ``status()`` poll waits on it.
+
+        Deliberately does NOT carry ``activity``: that feed is a bounded in-memory ring of raw
+        model output, scanned by :func:`_redact_activity` on the way in for DISPLAY, and
+        persisting it would turn a display buffer into a durable copy of agent text. What
+        happened to the run is already in ``status`` and ``error``.
+
+        Best-effort. A failed write is logged and swallowed: the outcome is already correct in
+        memory, and losing the durable copy must not turn a reported failure into a second one.
+
+        The destination is the path the RUN bound at ``start()``, not one resolved here. By the
+        time this runs the terminal status is already set, so the run reads as non-active and a
+        repository retarget is admitted again -- resolving now could file this outcome under a
+        different repository and leave its own workspace with no record. See
+        ``RunState.record_path``; the live fallback covers only a state ``start()`` cannot
+        produce.
+        """
+        with self._lock:
+            st = self._state
+            path = st.record_path
+            record = {
+                "run_id": st.run_id,
+                "status": st.status,
+                "error": st.error,
+                "cycle": st.cycle,
+                "kept": st.kept,
+                "drafted": st.drafted,
+                "started_at": st.started_at,
+                "finished_at": st.finished_at,
+                "offline_reason": st.offline_reason,
+            }
+        try:
+            store.write_json_atomic(path or _terminal_record_path(), record)
+        except Exception:  # noqa: BLE001 -- a durability failure must not mask the outcome
+            logger.warning(
+                "%s: could not persist the terminal run record", store.APP_NAME, exc_info=True
+            )
+
     def _run_loop(self, driver: Any) -> None:
         """The worker thread body. Catches EVERYTHING: an escaping exception here would
         kill the thread silently and leave the UI reporting ``running`` forever."""
         with self._lock:
             # The thread is RUNNING now, so `is_alive()` can carry the answer from here and the
-            # reservation is no longer needed. Released first so an early return or raise below
+            # reservation is not needed. Released first so an early return or raise below
             # cannot leave the supervisor permanently busy.
             self._reserved = False
         try:
@@ -805,13 +1118,41 @@ class RunSupervisor:
             with self._lock:
                 self._state.stats = _stats_dict(stats)
                 self._state.kept = int(getattr(stats, "kept", 0) or 0)
-                self._state.status = STATUS_DONE
                 self._state.stage = ""
-                self._state.finished_at = time.time()
-                self._state.activity.append({"t": time.time(), "note": "run finished"})
+                offline = self._state.offline_reason
+                if not offline:
+                    self._state.status = STATUS_DONE
+                    self._state.finished_at = time.time()
+                    self._state.activity.append({"t": time.time(), "note": "run finished"})
+            if offline:
+                # A clean return is NOT success here. With no agent runner the profile's
+                # discovery early-returns an empty candidate list, so every cycle finds
+                # nothing, the budget's quiescence break fires after `quiesce_after` empty
+                # cycles, and `driver.run()` returns its stats normally. Reporting that as
+                # DONE made a run that could not even LOOK indistinguishable from one that
+                # looked and found nothing -- and DONE is what every downstream reader takes
+                # as "this worked".
+                #
+                # STATUS_ERROR (which is what `_fail` records) rather than a new `offline`
+                # status, deliberately. `error` is the ONLY terminal status the UI renders a
+                # message for -- `SetupPanel` falls through to the idle label for anything
+                # else -- so a novel status would still show the operator nothing, reproducing
+                # the very defect this fixes. It is also what the sibling subsystem already
+                # uses for an absent runner (`pr_watchers` records `runner unavailable: ...`
+                # as STATUS_ERROR), and nothing in this app auto-retries on a terminal status
+                # (the only `start()` caller is the POST /run handler, and the app declares no
+                # crons), so a hard failure cannot provoke a retry loop against a runner that
+                # is simply absent.
+                #
+                # Through `_fail` rather than assigning here: that helper is the single
+                # redaction site for anything reaching `RunState.error`, which `status()`
+                # serializes into `GET /run`.
+                self._fail(AgentRunnerOffline(f"the run did no work because {offline}"))
+            self._persist_terminal_state()
         except BaseException as exc:  # noqa: BLE001 — a run failure is state, not a crash
             logger.exception("%s: run failed", store.APP_NAME)
             self._fail(exc)
+            self._persist_terminal_state()
 
     def status(self) -> dict[str, Any]:
         """A JSON-ready snapshot. Cheap, lock-guarded, safe to poll on the event loop.
@@ -823,10 +1164,14 @@ class RunSupervisor:
             st = self._state
             alive = self._thread is not None and self._thread.is_alive()
             # A thread that died without setting a terminal status (only possible if the
-            # interpreter tore it down) must not be reported as still running.
+            # interpreter tore it down) must not be reported as still running. An OFFLINE run
+            # is not `done` on this path either: the thread never reached the terminal
+            # transition, but the run still had no agent runner, and reporting the same lie
+            # here would just move it one branch over.
             status = st.status
             if status in (STATUS_RUNNING, STATUS_STOPPING) and not alive:
-                status = STATUS_DONE if not st.error else STATUS_ERROR
+                clean = not st.error and not st.offline_reason
+                status = STATUS_DONE if clean else STATUS_ERROR
             return {
                 "status": status,
                 "run_id": st.run_id,

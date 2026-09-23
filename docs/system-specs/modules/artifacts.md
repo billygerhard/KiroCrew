@@ -8,16 +8,27 @@ history, and a stable handle the agent can iterate on across sessions.
 A typical flow:
 
 1. Agent emits an `<mcwidget>` in chat ("here's your CR queue")
-2. Agent (or user) calls `artifact_save` — the widget is persisted under
-   `~/.kiro/crew/artifacts/<slug>/current.html`
-3. Days later, in a fresh session, the user says "iterate on the cr-queue
-   artifact and add an age column"
-4. Agent calls `artifact_get("cr-queue")` to read the current HTML, modifies
-   it, then `artifact_update("cr-queue", content=…)` to publish a new version
+2. When the assistant segment finalizes, the backend auto-registers the widget
+   as an unpinned artifact under `~/.kiro/crew/artifacts/<slug>/current.html`
+3. Days later, in a fresh session, the user asks to iterate on that stable slug
+   and add an age column
+4. Agent calls `artifact_get("<slug>")` to read the current HTML, modifies it,
+   then calls `artifact_update("<slug>", content=…)` to publish a new version
 5. The previous version is preserved under `versions/v1.html` for rollback
 
 The dashboard provides a `/artifacts` library page for browse/search and a
 `/artifacts/<slug>` standalone view with a version dropdown.
+
+### Library scrolling
+
+Small galleries and single-column virtualized lists scroll with the page.
+A multi-column gallery with at least 30 entries fills the remaining page height
+when no discovery-capable provider is available. With an available discovery
+provider, the page keeps its scroll axis and the saved masonry uses a bounded
+60vh viewport. Chat documents and remote lists stay in normal page flow, so
+expanding a section cannot compress the toolbar or hide later provider rows.
+Provider capability selects the layout, not the result of a remote fetch.
+Loading, empty results, filtering, and read errors therefore keep the same mode.
 
 ## Storage Layout
 
@@ -36,15 +47,15 @@ The dashboard provides a `/artifacts` library page for browse/search and a
 
 | Field | Type | Notes |
 |---|---|---|
-| `slug` | string | URL-safe handle, derived from `name` if not given |
+| `slug` | string | URL-safe handle. Derived from `name` when not given, resolving a collision by suffixing (`-2`, `-3`, …); an explicitly-passed slug is refused — never renamed — when it is already taken or malformed |
 | `name` | string | Human-readable display name |
-| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
-| `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import` |
+| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
+| `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import`, `dashboard`, `slack`, `cli`, `task-runner`, `unknown` |
 | `pinned` | bool | "Starred" — user-curated keep flag (default `false`). Drives the Artifacts page **Starred** view. Metadata-only; toggling does NOT bump `version`. |
 | `auto_registered` | bool | `true` when the store created this record automatically from a chat-emitted `<mcwidget>` (see [Widget auto-registration](#widget-auto-registration)) rather than from an explicit save. Sweepable by the retention pass while unpinned; tolerant-loaded (pre-existing artifacts default `false`, so they are never swept). |
 | `description` | string | Optional, ≤ 2,000 chars |
 | `tags` | string[] | ≤ 16 tags, alphanumeric / `_`, `:`, `.`, `-` |
-| `version` | int | Latest version number; bumps on every content change |
+| `version` | int | Latest snapshot version; bumps when a content change is snapshotted |
 | `created_at` / `updated_at` | string | ISO 8601 UTC microseconds |
 
 ## Public API
@@ -57,7 +68,7 @@ from kiro_crew.artifacts import ArtifactStore, get_default_store
 store = get_default_store()
 art = store.create(name="CR Queue", content="<table>…</table>", tags=["ops"])
 art = store.get(art.slug)
-art = store.update(art.slug, content="<table>… age column …</table>")
+art = store.update(art.slug, content="<table>… age column …</table>", snapshot=True)
 versions = store.list_versions(art.slug)
 items = store.list(tag="ops")
 store.delete(art.slug)
@@ -70,6 +81,14 @@ store.merge_remote_comments(art.slug, "artifactory", remote_comments)
 The store is thread-safe. A module-level singleton is available via
 `get_default_store()`; pass an explicit `root` to `ArtifactStore(root=...)`
 for isolated test instances.
+
+`list()` returns newest first on a TOTAL order, `(updated_at, slug)` descending.
+The tie-break is load-bearing, not cosmetic: `updated_at` is microsecond ISO, so
+two artifacts written inside one microsecond carry the identical stamp, and
+sorting on it alone is a stable sort over equal keys that preserves directory
+scan order — which differs per platform and per filesystem, making the library
+UI, the MCP list tool and the auto-widget pruning sweep disagree about which
+artifact is newest on otherwise identical data.
 
 ### Kind inference
 
@@ -84,9 +103,10 @@ source_path, explicit)`:
    `.json` → `json`, `.txt` → `text`, any other extension → `text`.
 3. **Content sniff** — for inline content with no `source_path`: HTML-ish
    markup (`<div`, `<span`, `<style`, `<table`, `<mcwidget`, `<html`,
-   `<!doctype html`) → `widget`; a leading markdown heading (`#`…`######`) or
-   content with **no** `<` at all → `markdown`; otherwise the legacy `widget`
-   default (ambiguous blobs keep prior behavior).
+   `<!doctype html`) → `widget`; an empty body → `widget`; a leading markdown
+   heading (`#`…`######`) or non-empty content with **no** `<` at all →
+   `markdown`; otherwise the legacy `widget` default (ambiguous blobs keep prior
+   behavior).
 
 Only `widget` and `markdown` are inferred from inline content; the richer
 kinds need the extension signal. This is the safety prerequisite that lets
@@ -102,6 +122,7 @@ doc stored as `widget` renders as raw inner HTML).
 | `artifact_update` | Modify content/name/description/tags; bumps version on content change |
 | `artifact_list` | List artifacts (filter by `tag`, `kind`, name `q`) |
 | `artifact_versions` | List version numbers for a slug |
+| `artifact_revert` | Revert the live state to a prior version; writes that version's content as a fresh snapshot tagged `reverted`, so the activity timeline shows the rollback |
 | `artifact_delete` | Permanent delete (artifact + all versions) |
 | `artifact_folder_list` | List the folder tree (id, name, parent_id, path, item_count) |
 | `artifact_folder_create` | Create a folder; `parent` = id or path (mkdir -p) |
@@ -112,6 +133,7 @@ doc stored as `widget` renders as raw inner HTML).
 | `artifact_get_comments` | Read all comments on an artifact (local + provider-synced) |
 | `artifact_post_comment` | Post a comment; agent comments carry the structured `is_agent` flag (no emoji stamped into the body — dashboard renders a lucide `Bot` icon, CLI prefixes a plain-text `[agent]` marker) + SEL-audited; `scope='shared'` syncs to the provider |
 | `artifact_mark_review` | Advance a comment thread to REVIEW status (agent can mark_review but NEVER resolve) |
+| `artifact_reply_comment` | Reply to an existing comment thread; a reply to a provider-origin parent posts back to the provider |
 | `artifact_delete_comment` | Delete a fully-applied comment thread (root cascades to replies); provider-synced comments refused; SEL-audited with a `reason` |
 
 Schemas live in `validation.py` (`ARTIFACT_*_SCHEMA`) and are registered in
@@ -124,7 +146,7 @@ middleware live in one place.
 ```
 kirocrew artifact list [--tag T] [--kind K] [--q SUBSTR]
 kirocrew artifact show <slug> [--version N] [--meta]
-kirocrew artifact save --name N [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
+kirocrew artifact save --name N [--slug S] [--kind K] [--content C | --content-file F] [--tags A,B] [--description D]
 kirocrew artifact update <slug> [--content C | --content-file F] [--name N] [--description D] [--tags A,B]
 kirocrew artifact versions <slug>
 kirocrew artifact delete <slug>
@@ -139,9 +161,10 @@ The CLI proxies through the gateway HTTP API (matches `kirocrew learn`).
 | `GET` | `/api/artifacts` | `?tag&kind&q` filters + `?folder=` scoping (absent = all; empty = unfiled/root; id = that folder) + `?session=` scoping (same absent/empty distinction; validated like `origin_session_key`) + `?pinned=` (tri-state — unrecognized values don't scope); returns `{artifacts: […]}` |
 | `POST` | `/api/artifacts` | JSON body — creates, returns full artifact + content; optional `folder` key (id or human path, mkdir -p) |
 | `GET` | `/api/artifacts/{slug}` | Returns full artifact + content |
-| `PATCH` | `/api/artifacts/{slug}` | Partial update; `content` bumps version; optional `folder` key (metadata-only) |
+| `PATCH` | `/api/artifacts/{slug}` | Partial update; MCP-authenticated content updates snapshot by default, dashboard saves snapshot only with `snapshot: true`; optional `folder` key is metadata-only |
 | `DELETE` | `/api/artifacts/{slug}` | Permanent delete |
 | `PATCH` | `/api/artifacts/{slug}/pin` | Star/unstar — body `{pinned: bool}` (strictly boolean; non-booleans rejected). Metadata-only, no version bump |
+| `PATCH` | `/api/artifacts/{slug}/relocate` | Point a file-backed artifact at a validated `source_path`; dashboard HTTP surface only (the `artifact_move` MCP tool moves folders instead) |
 | `GET` | `/api/artifacts/session-docs` | Virtual, read-only list of non-code documents produced across chat sessions (the "All" firehose). `?session=<slot>` scopes to one session. Creates nothing; each entry carries `saved` (pinned) + `slug`. Registered before the `/{slug}` dynamic route |
 | `POST` | `/api/artifacts/materialize` | Turn a recorded chat document into a real, pinned file-backed artifact — body `{path}`. The path MUST be a document recorded in chat `file_changes` (authorization allowlist); the read goes through `hooks.safe_read_file_bytes` (is_sensitive_path + `O_NOFOLLOW` + `MAX_FILE_BYTES` cap). Idempotent by `source_path` |
 | `GET` | `/api/artifacts/{slug}/versions` | `{slug, versions: [int]}` |
@@ -151,6 +174,7 @@ The CLI proxies through the gateway HTTP API (matches `kirocrew learn`).
 | `PATCH` | `/api/artifact-folders/{id}` | Rename / reparent / reorder / icon / color |
 | `DELETE` | `/api/artifact-folders/{id}` | `?delete_contents=` picks keep (re-parent, default) vs cascade (delete subtree incl. artifacts) |
 | `PATCH` | `/api/artifacts/{slug}/folder` | Move an artifact into a folder (`{folder}` id/path or `{folder_id}` id-only) |
+| `POST` | `/api/artifacts/{slug}/publish/reprobe-notice` | Re-ask the destination whether a delivery notice still applies (`publish_sync.reprobe_notice`) and clear it once the copy is genuinely being served. READ-ONLY at the destination: it resolves through the drive's read path, never the create-capable one, so a re-check cannot provision infrastructure or rewrite a bucket policy |
 | `POST` | `/api/artifacts/{slug}/pull-latest` | Pull the tracked upstream (`?source=publication\|origin\|auto`) into a NEW local snapshot via `publish_sync.pull_upstream`; ungated ingress |
 | `GET` | `/api/artifacts/{slug}/upstream-status` | Cheap metadata-only drift check (`publish_sync.upstream_status`); best-effort, never blocks on the network |
 | `POST` | `/api/artifacts/{slug}/overwrite-remote` | Force-push local content over an upstream-ahead remote (`publish_sync.overwrite_upstream`); **egress — gated by `_publish_governance_denied` on the resolved `publication.provider`** |
@@ -164,17 +188,22 @@ The CLI proxies through the gateway HTTP API (matches `kirocrew learn`).
 | `POST` | `/api/remote-artifacts/{provider}/{external_id}/comments/{comment_id}/review` | Advance a provider thread to REVIEW (`mark_review`); **egress — gated by `_publish_governance_denied`** |
 | `DELETE` | `/api/remote-artifacts/{provider}/{external_id}/comments/{comment_id}` | Delete a provider comment (`delete_comment`); **egress — gated by `_publish_governance_denied`** |
 
-`external_id` (and `comment_id`) travel as percent-encoded path segments on
-these routes; aiohttp's `path_safe` matching (3.9.2+) preserves `%2F`, so a
-provider-native id containing `/` round-trips correctly (browse-listing ids are
-slash-free in practice). Clone/fork keep the id in the JSON body instead.
+Detail and comment operations carry `external_id` (and `comment_id`) in path
+segments, so the browse/detail ids used there must be slash-free; aiohttp decodes
+an encoded slash before route matching. Clone and fork keep `external_id` in the
+JSON body specifically so provider-native ids containing `/` round-trip safely.
 
 POST/PATCH/DELETE require an unrestricted session. The HTTP body envelope is
 capped at 2 MiB; the store enforces a per-content cap of 25 MiB
 (`artifacts.MAX_CONTENT_BYTES`), large enough for cloned/pulled rich artifacts
-(HTML reports, CSVs). The MCP save/update field cap
-(`validation.ARTIFACT_CONTENT_MAX`) imports that same constant so the tool and
-store paths never disagree.
+(HTML reports, CSVs). The number is owned by `constants.ARTIFACT_MAX_CONTENT_BYTES`;
+`artifacts.MAX_CONTENT_BYTES` and the MCP save/update field cap
+(`validation.ARTIFACT_CONTENT_MAX`) are both that name, so the tool and store
+paths never disagree. It lives in the `constants` leaf rather than in `artifacts`
+because `validation` importing `artifacts` closed the cycle `artifacts -> hooks
+-> webhooks -> validation -> artifacts`, which raised ImportError in any process
+whose first `kiro_crew` import reached `artifacts` before `validation`;
+`test_agent_import_hoist.py` pins that `validation` never imports `artifacts`.
 
 **Folders:** `Artifact.folder_id` (`""` = unfiled) is an opaque,
 rename-safe membership id, tolerant-loaded for legacy meta.json.
@@ -203,19 +232,70 @@ at parity with the dashboard — guarded in `test_remote_artifacts.py`.
 (`pull-latest` / `upstream-status` / `overwrite-remote`) wire `publish_sync`'s
 provider-agnostic orchestration (`pull_upstream` / `clone_from_remote` /
 `fork_from_remote` / `upstream_status` / `overwrite_upstream`) to HTTP. The
-surface is **inert in the public edition**: the provider registry is empty, so
-`get_provider()` raises `PublishUnavailableError` → browse / clone / fork all
-503, and the frontend gates the entire remote section + `UpstreamSyncBanner` on
-a non-empty `GET /api/artifacts/publish-providers` result (zero remote pixels /
-requests with no provider). A companion registers providers via the CPP publish
-seam. The picker includes a provider whenever `available() or installable()`
+surface's reach depends on what the registered destination declares. The public
+edition registers the personal cloud drive, which serves published bytes but
+declares no `CONTENT_PULL` and an all-off `DiscoveryModel`, so browse / clone /
+fork stay unavailable while publish works. It registers under its OWN key rather
+than `DEFAULT_PROVIDER`, so it is **opt-in**: the picker lists it and a caller can
+name it, but a publish that names no destination resolves the default key, which
+stays unregistered, and gets the same 503 as an edition with no provider at all.
+What holds the default back is not the transfer but a cross-store contract for
+whether a publication exists — see the withdrawal rules below and
+`personal_drive.PERSONAL_DRIVE_PROVIDER`; until that lands, the windows those rules
+guard are reachable only by someone who chose this destination deliberately.
+
+Because the drive pools **one** bucket and **one** distribution across every artifact,
+those artifacts share a serving domain, and what keeps them from sharing a browser origin
+is a response-headers policy carrying
+`Content-Security-Policy: sandbox allow-scripts allow-popups; frame-ancestors 'none'`.
+That policy is verified in two places, not one. At CREATE, a same-named policy is reused
+only when its CSP matches exactly with `Override` true — anything else fails closed, so a
+policy pre-created without the sandbox cannot be attached. At REUSE of an existing drive,
+**every transition that starts serving bytes publicly** verifies the distribution still has
+that policy attached to its default behaviour — a first publish and a private→public flip
+alike, because those reach the drive through two different resolvers and gating the
+guarantee on which one an artifact happened to travel through is not a guarantee. A
+confirmed mismatch refuses and names the policy to re-attach; an unreadable distribution
+config does **not** refuse, since an install whose IAM policy was narrowed would otherwise
+have a permissions gap reported to it as tampering.
+
+Three paths are deliberately **not** gated on it. Withdrawal and public→private are
+removals: refusing them because a header is missing would strand the copy that header was
+containing. Pushing a new version replaces bytes in place and hands out no new link, so if
+the header were already gone that artifact was already served without isolation before the
+push — refusing would un-expose nothing and would only strand its owner on the old bytes.
+
+A publication's handle is `<key>~<account id>~<profile name>`, and the **account** is what
+the withdrawal paths verify. An earlier shape pinned only the profile name, which was a real
+exposure rather than a nicety: a profile name is a local alias, so repointing it at another
+account and then deleting resolved the name to the new account, removed nothing, reported
+success, and cleared the record — leaving the original copy public with the only handle able
+to take it down erased. That needed no concurrency and no failure, just a config edit and an
+ordinary delete. Every mutation path resolves its credentials through one function, which
+compares the pinned account against what `sts:GetCallerIdentity` reports now and refuses on a
+mismatch — and refuses too when the live account cannot be read at all, because that call is
+gated by no IAM policy, so a failure means credentials did not resolve rather than a tier
+being narrow, and acting on an account that cannot be identified risks removing nothing while
+discarding the record. The account is read *before* the handle is minted, so a publish that
+cannot confirm it fails before uploading. A handle carrying no account field predates the
+binding and keeps the older behaviour rather than being refused; the middle field counts as
+an account only if it is twelve digits, so a pre-binding handle whose profile name contains
+the separator cannot have that name misread as an account.
+ The
+frontend gates the entire remote section + `UpstreamSyncBanner` on a non-empty
+`GET /api/artifacts/publish-providers` result (zero remote pixels / requests
+when no provider is registered at all). A companion registers its own provider
+via the CPP publish seam. The picker includes a provider whenever
+`available() or installable()`
 (`PublishProvider.installable()` defaults `False`; a companion provider whose
 `ensure_ready()` self-installs on first publish overrides it to `True`), and
 each row carries an `available` flag so the FE can hint install-on-first-use for
 a not-yet-installed but installable destination. Governance: `publish_sync` has NO internal gate and `push_version` is
 ungated, so the two egress-arming routes go through
 `_publish_governance_denied` (fail-closed `capabilities.publish ∩
-destinations:<provider>`) BEFORE dispatch — `overwrite-remote` on the resolved
+destinations:<provider>`, a module-local alias for the shared
+`publish_governance.publish_denied_reason` — the same decision the public-web
+deploy path uses, see `governance.md`) BEFORE dispatch — `overwrite-remote` on the resolved
 `publication.provider`, and `clone` on the routed provider (a clone sets
 `auto_sync=True`, arming every future snapshot push). The four remote comment
 WRITE routes (post / reply / review / delete) are outbound egress too, so each
@@ -243,6 +323,169 @@ provider's first page are reachable rather than silently truncated.
   sandboxed iframe (same security model as inline `<mcwidget>`), with a
   version dropdown
 
+### Publish panel (`PublishHub`) — reading a publish outcome
+
+`PublishHub` posts to the row's declared `endpoint` and must recognize **two**
+response shapes, because two different routes answer that POST:
+
+- `{url}` / `{public_url}` — the deploy shape (`POST /api/deploy/deploy`).
+- a serialized artifact carrying a `publication` block — what `POST
+  /api/artifacts/{slug}/publish` returns, which is where an app provider lands
+  when it hands the confirmed publish to the core route (the supported way to
+  reuse the core's single publish authorization + audit trail rather than
+  growing a second one). The link, when the destination exposes one, is
+  `publication.view_url`.
+
+`readPublishOutcome` is that reader, and it returns an *outcome*, not a url:
+
+- success is signalled by the return SHAPE, never inferred from a non-empty url
+  — a destination may publish successfully and expose no browsable link, and
+  conflating the two rendered a succeeded publish as the error branch with an
+  undefined message (a bare red icon and no text);
+- an `error` field wins over anything else in the same body;
+- `publication: null` (an unpublished artifact) is not success;
+- anything unrecognized is reported as a NAMED error (`unexpected_response`)
+  rather than an empty one.
+
+**HTTP 200 is not success on the artifact shape.** `publish_sync.publish()`
+treats the version push as best-effort: its re-publish branch runs
+`push_version(force=True)`, reads `refreshed.publication.last_error`, persists it
+and returns normally — so the route answers 200 with a publication whose remote
+content is stale. A non-empty (non-whitespace) `last_error` is therefore an error
+outcome carrying the provider's own already-redacted message; whitespace-only
+stays success, because the core writes `""` to clear the field. A publish that
+SUCCEEDED but whose link is not usable yet (e.g. CloudFront still rolling out)
+records that status on the separate `publication.notice` field, never
+`last_error` — so it does not render the publish as failed or withhold the URL.
+
+### Withdrawal is NOT best-effort
+
+`publish_sync.unpublish` deletes at the destination and only then clears the local
+`publication` block. A failure keeps the block and raises, because that block is the
+only handle to content that may still be served: clearing it strands the remote copy
+with nothing recording where it lives and no retry able to reach it. Both mouths fail
+the same way -- a provider that raises, and a destination reporting
+`reachable_for() == False`, which cannot attempt the withdrawal at all. Neither is
+allowed to drop the handle: both refuse the delete instead.
+
+Reachability is asked about the PUBLICATION, not the destination. `available()` answers
+whether a destination is configured at all, which is the right question for offering a
+new publish; a publication is bound to one specific account, recorded in its
+`external_id`. Asking the wide question on a withdrawal path reports a destination as
+reachable when this artifact's own account is gone, so the call is attempted, fails, and
+is classified as a rejection a retry could fix -- leaving an artifact that can be neither
+withdrawn nor deleted, only told to retry forever. Providers binding nothing per
+publication inherit the wide answer.
+
+Deleting the artifact notifies the destination, but it is NOT a way out of a kept
+publication: it refuses unless the withdrawal is confirmed, exactly as described below.
+`delete_for_artifact` runs from the delete handler BEFORE the local delete,
+using the publication the handler already read for its version capture. The ordering is
+chosen for its crash residue: die between the two steps in this order and the copy is
+withdrawn while the artifact remains, which the user simply deletes again; die between
+them in the reverse order and the local record is already gone while the content is still
+public, with nothing left to withdraw it by. Since `delete()` removes the artifact
+directory by slug under the store lock rather than writing back a value read earlier,
+placing a network round trip ahead of it does not widen any compare-and-swap window -- a
+save landing in that window is included in the delete the user asked for.
+
+The local delete proceeds on ONE rule: only when there is nothing left to withdraw, or
+the destination confirmed the withdrawal. Anything else refuses, loudly. A destination
+that answers and then rejects the removal blocks the delete with `502`, keeping the
+publication because that record is the only handle able to reach a copy that may still be
+served. A destination that cannot be reached at all -- a publication naming a destination
+this edition does not register, or one whose `reachable_for()` is False -- blocks it too:
+unreachable describes THIS PROCESS's access, not the object, so the copy may still be
+served to the whole internet, and deleting the record would erase the only thing that
+could ever take it down. The one case that would proceed is a CONFIRMED absent destination, signalled by a typed
+`DriveNotFound` -- never a substring match on an error message, because a throttled or
+unauthorized reply carries the same words while the object is still live. **No site
+raises that type today.** The personal drive resolves its destination by TAG, so a lookup
+miss says only that the lookup failed: a tag removed by hand or a transient answer from
+the tagging API both leave the bucket and distribution serving, and calling that proof
+would strand a copy on evidence no stronger than the substring match the type replaced.
+Proving absence needs a positive probe that asks the destination about the resource named
+in the publication, rather than asking a directory whether it can still find it. Until
+that exists nothing releases a handle except a confirmed withdrawal, so the branch is
+unreachable and the refusal set is correspondingly wider. That is the safe side of the
+trade: a record that will not clear is recoverable, and a public copy whose handle was
+erased is not. `delete_for_artifact` never raises either way -- it
+reports which of those happened and the handler decides, so provider resolution and the
+availability probe failing on an unregistered destination cost a log line rather than an
+exception.
+
+The folder cascade obeys the same rule rather than routing around it. `delete_contents`
+destroys artifacts through `ArtifactStore.delete`, which knows nothing about
+publications, so the cascade withdraws every published copy in the subtree FIRST and
+destroys nothing until they are all withdrawn; the first copy that will not come down
+refuses the whole cascade, leaving the artifacts, their handles and the folder in place.
+
+That preflight cannot be trusted on its own, because nothing holds a lock across it and
+the destruction that follows: the folder tree and the artifact store have independent
+locks, and taking both would invite an ordering deadlock. An artifact filed into the
+subtree after the preflight enumerated it therefore reaches the destruction still
+holding a publication nobody withdrew. So the refusal is asked of the delete itself
+rather than checked in the cascade loop: `ArtifactStore.delete` takes an opt-in
+`refuse_if_published` flag and re-reads the record inside the same lock as the removal,
+which is what makes it hold. A check in the loop would be a check-then-act over a
+snapshot, so a publish landing between the scan and that artifact's own delete would
+still be destroyed. The flag defaults to False, so the single-artifact path is
+unchanged: it is answered at the handler, which attempts the withdrawal and refuses on
+its outcome. The folder tree change is already committed by the time the cascade
+refuses and cannot be rolled back, so a kept artifact survives with a dangling folder
+id and degrades to Unfiled, which readers already tolerate; the response names it so a
+partly-refused cascade does not read as a completed one.
+
+`unpublish` is **not** a way out of a kept publication either, though it was designed as
+one. It obeys the same absence rule as the delete path: a destination that refuses the
+removal keeps the record and stays retryable; a destination that is merely unreachable is
+refused before the attempt, and its message must not offer deleting the artifact as the
+alternative, because that path refuses on the same destination. Only a confirmed-gone
+destination --
+typed `DriveNotFound` again, never message text -- releases the record, because there is
+nothing left to withdraw. That branch is currently unreachable for the reason given
+above: no site can prove absence yet. Its cost while unreachable is real and worth
+naming, because `reachable_for` resolves the PROFILE, not the drive: a drive deleted
+under a still-registered profile passes the reachability guard, fails inside the
+provider, and is now refused rather than released -- so that artifact's record cannot be
+cleared until a positive absence probe exists. Refusing is the deliberate choice over
+releasing on a tag miss, which could erase the handle to a copy that is still served.
+
+The cost is worth stating plainly: a published artifact whose destination refuses the
+withdrawal, or which this process can no longer reach, cannot be deleted until that is
+resolved -- and the unreachable half makes that population larger than a narrower reading
+would. A profile holding the publish permissions but not `s3:DeleteObject` is exactly that
+shape, and no shipped IAM tier grants it yet (see the publish-tier follow-up). The way out
+is deliberate rather than accidental: `unpublish` lets the owner state in the open that
+they accept the published copy may remain, and then the artifact deletes. The alternative
+was dropping the record and stranding a world-readable copy with nothing able to withdraw
+it -- failing loudly is recoverable, that is not.
+
+This asymmetry with the publish path above is deliberate. A stale publish leaves the
+wrong bytes at a URL the user already knows about; a stale withdrawal leaves content
+served that the user believes they took down, which is the worse failure and the one
+worth surfacing as an error the user can act on.
+
+The public-exposure warning and the blocking `PublicPublishAckModal` are gated
+on the selected destination's `public_reachable` descriptor field
+(`PublishProvider.public_reachable`, class attribute, default `True`, carried
+on each `GET /api/artifacts/publish-providers` row). A destination whose
+published link is served with no authentication gets both, on the clean path
+and on a scan override, exactly as before. A destination that declares `False`
+-- one that stores content privately behind a login -- gets neither: the
+confirm click publishes directly, because both surfaces say the content is
+going onto the open internet, and a gate that lies where the destination is
+private teaches the user to click past it where it is public. The publish flow
+always requests `visibility: PUBLIC`, so `False` asserts that even a
+publication the provider files as PUBLIC is served only to an authenticated
+reader; a provider whose PUBLIC publications are readable by anyone must leave
+it `True`. The default is
+`True` and the frontend treats an omitted field as `True`, so a provider must
+declare that it needs authentication; the failure mode of the wrong default is
+a public link with no warning. App-registered rows from
+`GET /api/publish-providers` are the public-web deploy surface and are always
+treated as reachable.
+
 ## Widget auto-registration
 
 **Every `<mcwidget>` the agent emits becomes an artifact automatically** — no
@@ -261,19 +504,23 @@ Artifacts tab list widgets at all (a widget's HTML is inline in the message and
 never written to disk, so the file-backed session-docs scan cannot see it).
 
 **Identity — a two-language contract.** The slug is derived from
-`(message_ts, widget_index)`:
+`(message_ts, body)` — the parent message's timestamp plus a fingerprint of the
+widget's body:
 
-- `src/kiro_crew/widget_slug.py` → `derive_widget_slug`
-- `website/src/lib/widgetSlug.ts` → `deriveWidgetSlug`
+- `src/kiro_crew/widget_slug.py` → `derive_widget_body_slug`
+- `website/src/lib/widgetSlug.ts` → `deriveWidgetBodySlug`
 
-Both MUST produce identical output (two FNV-1a passes, 32-bit prime, 16 hex
-chars); the frontend uses it to find the artifact the backend wrote, with no id
-exchanged. Likewise `widget_parse.parse_widgets` mirrors the frontend's
-`parseBlocks` widget detection, because a disagreement about *which* spans are
-widgets shifts `widget_index` and mis-keys every subsequent artifact. Parity is
-pinned by shared vectors/fixtures in `test/test_widget_slug.py`,
-`test/test_widget_parse.py`, and `website/src/test/widgetSlug.test.ts` — a change
-to one side fails all three.
+Both MUST produce identical output (seed `<ts>#w:<body>`, two FNV-1a passes,
+32-bit prime, 16 hex chars); the frontend uses it to find the artifact the
+backend wrote, with no id exchanged. Because the body is part of the key, a slug
+hit implies the same body: a disagreement about *which* spans are widgets can
+only cause a probe miss (the star shows unsaved), never a binding to the wrong
+artifact. `widget_parse.parse_widgets` mirrors the frontend's `parseBlocks`
+widget detection so both sides agree which spans are widgets and what their exact
+bodies are. Parity is pinned by shared body-slug vectors in
+`test/test_widget_slug.py` and `website/src/test/widgetSlug.test.ts`, and by
+shared parser fixtures in `test/test_widget_parse.py` and
+`website/src/test/widgetSlug.test.ts` — a change to one side fails the other.
 
 Registration is **idempotent and non-destructive**: an existing slug is left
 untouched (a replayed or rehydrated message never duplicates or clobbers content
@@ -313,17 +560,16 @@ pristine to every metadata signal above, and the sweep would otherwise delete th
 user's comments along with it.
 
 The edit test is `updated_at == created_at`, **not** `version == 1`: `update()`
-bumps `version` only when `snapshot=True`, so a plain content save — the common
-agent-iteration path — leaves the version at 1 while rewriting the body. Keying on
+bumps `version` only when `snapshot=True`, so a non-snapshot dashboard or direct
+store save can leave the version at 1 while rewriting the body. Keying on
 the version would let the sweep delete freshly-iterated widgets. Conversely
 `set_pinned` / `set_folder` deliberately don't touch `updated_at`, which is why
 they are separate signals.
 
-Ordering is newest-first, re-sorted on `(updated_at, slug)` inside the sweep:
-`list()`'s `updated_at`-only sort is not a total order, so widgets registered in
-the same microsecond would otherwise tie-break by directory scan order and make
-*which* one gets deleted nondeterministic. The candidate snapshot is taken
-unlocked, so eligibility is **re-checked and the directory removed in a single
+Ordering is newest-first on the same total `(updated_at, slug)` order used by
+`list()`. The sweep re-sorts defensively so its destructive boundary does not
+inherit an ordering assumption from the candidate source. The candidate snapshot
+is taken unlocked, so eligibility is **re-checked and the directory removed in a single
 lock acquisition** — otherwise a star landing mid-sweep would lose to a stale
 verdict and silently delete an artifact the user had just claimed. Note the sweep
 deliberately does NOT delegate to `delete()`: re-checking under the lock and then
@@ -348,15 +594,42 @@ inputs, distinguished by the leading **star** column:
   `PATCH /api/artifacts/{slug}/pin` (metadata-only, no version bump).
 - **Session documents** — a *virtual* firehose of non-code documents the agent
   produced across chats (from message `file_changes`), surfaced only in the
-  **All** view via `GET /api/artifacts/session-docs`. Nothing is written to disk
-  for these until the user stars one, which **materializes** it into a real,
+  **All** view via `GET /api/artifacts/session-docs`. Clicking a row opens a
+  **read-only preview** (`SessionDocPreview`) that fetches the file through the
+  redacting `GET /api/file-read` endpoint — a pure read that registers nothing.
+  A document recorded with a **relative path is refused client-side** (no
+  request is sent): `resolve=1` would resolve it against the gateway's
+  *current* project directory, not the project it was recorded under, so a
+  project switch would silently read a same-named file from the wrong project.
+  An unresolved **`~name` tilde form is refused the same way** — `expanduser`
+  leaves an unknown account name unchanged and the backend then anchors it to
+  the process CWD, the same wrong-project read; only the gateway user's own
+  `~`/`~/…` (deterministic, project-independent) counts as absolute. The
+  refusal renders as a **status, not an error** (nothing failed — the feature
+  is declining an unsafe read), and the preview header's save button is
+  **disabled in the refusal state**, mirroring the backend materialize
+  allowlist, which only trusts paths absolute after expansion.
+  Nothing is written to disk
+  for these until the user stars one (from the row or from the preview
+  header's labeled **Save to artifacts** button — named after the surface the
+  save lands on, not the Apps "Library"), which **materializes** it into
+  a real,
   pinned, file-backed artifact via `POST /api/artifacts/materialize`
-  ("Virtual All + materialize-on-save"). Search matches name/source (incl. the
+  ("Virtual All + materialize-on-save"); a clean save is acknowledged by a
+  transient status notice on the page (a colliding slug shows the collision
+  banner instead). Search matches name/source (incl. the
   originating session title); the file-type filter applies to both inputs.
 
 The page opens on the **All** view by default. The Starred/All selection is
 persisted per-browser (`localStorage['mc-artifacts-pinned-only']`), so a user
 who last chose **Starred** resumes there on their next visit.
+
+The firehose reads lightweight history projections: each JSONL file is streamed
+as bytes, lines without the serialized `"file_changes"` key are skipped without
+JSON parsing, and only `ts` plus `meta.file_changes` are retained in a bounded
+file-stamp cache. It never routes through the full parsed-message cache, so a
+dashboard refetch cannot pin or repeatedly decode the complete transcript
+corpus while looking for document paths.
 
 Materialization is authorization-gated: the requested path must appear in the
 recorded chat `file_changes` (never an arbitrary client path), and the read is
@@ -414,8 +687,8 @@ every write-side unit test still green — so test the round-trip
 | `description` | ≤ 2,000 chars |
 | `tags` | ≤ 16 tags; each ≤ 64 chars |
 | `content` | ≤ 25 MiB (`MAX_CONTENT_BYTES`) |
-| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `webapp` |
-| `source` | one of `chat` / `cron` / `subagent` / `manual` / `import` |
+| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `image` / `webapp` |
+| `source` | stored values: `chat` / `cron` / `subagent` / `manual` / `import` / `dashboard` / `slack` / `cli` / `task-runner` / `unknown`; the MCP save schema accepts the first five explicitly |
 | `MAX_VERSIONS` | 50 (oldest pruned beyond cap) |
 | `MAX_AUTO_WIDGET_ARTIFACTS` | 200 (oldest **unpinned auto-registered** widgets pruned beyond cap) |
 
@@ -424,10 +697,23 @@ every write-side unit test still green — so test the round-trip
 - **Path traversal** — slugs are regex-validated; the store resolves every
   path and refuses any that escape the artifact root.
 - **Sensitive paths** — every read and write goes through
-  `security.is_sensitive_path()`; the store refuses to instantiate at any
-  sensitive root.
-- **Relocate root confinement** — `PATCH /relocate` (and the `artifact_move`
-  MCP tool) point a file-backed artifact at a `source_path`; a later GET reads
+  the sensitive-path fence. The store's own file helpers (`_read_text` /
+  `_write_text` / `_read_bytes` / `_write_bytes`) canonicalise the path with
+  `os.path.realpath` and ask `security.is_sensitive_canonical_path()` (through
+  `_fence_refuses`), the shared entry point for a caller-canonicalised path: it
+  answers with `security.is_sensitive_path()` on the event loop and with
+  `security.is_sensitive_resolved_path()` off it, so a caller earns the
+  off-pool gate by offloading, never by declaring anything; `GET
+  /api/artifacts` runs `store.list()` on a worker for that reason. The two read
+  helpers then open through `pinned_fs.open_fenced_for_read` (bound as
+  `_open_pinned_for_read`): a link at the final name is refused, the inode must
+  be a regular file with one link, and the fence judges the kernel's path for
+  the opened inode whenever it differs from the path already judged. The root
+  check and the file-backed `source_path` pointers stay on
+  `security.is_sensitive_path()` unconditionally; the store refuses to
+  instantiate at any sensitive root.
+- **Relocate root confinement** — `PATCH /api/artifacts/{slug}/relocate`
+  points a file-backed artifact at a `source_path`; a later GET reads
   that file, so an unconfined relocate would be an agent-reachable
   arbitrary-local-file read primitive. The target is therefore confined to the
   user's home dir by default (an operator can widen to additional absolute roots
@@ -438,7 +724,7 @@ every write-side unit test still green — so test the round-trip
 - **Restricted sessions** — POST/PATCH/DELETE are denied when the dashboard
   classifies the session as restricted (`_is_restricted_session`).
 - **SEL audit** — every mutation emits a `log_tool_invocation` event from the
-  HTTP layer (`api/dashboard/handlers/artifacts.py`). Reads are not audited.
+  HTTP layer (`dashboard/handlers/artifacts.py`). Reads are not audited.
   `_audit` redacts caller-supplied text before it reaches the SEL writer (which
   signs bytes as-written and does NOT redact): the `error` string and every
   string leaf of `extra` metadata pass through `redact_via_context`, so an
@@ -453,18 +739,78 @@ every write-side unit test still green — so test the round-trip
   defaults for missing keys, so future schema additions don't break existing
   files.
 - **Frontend rendering** — artifact bodies are rendered in the same sandboxed
-  iframe that powers `<mcwidget>`. No `dangerouslySetInnerHTML` without
+  iframe that powers `<mcwidget>`, and that frame loads a **real document** from
+  `GET /sandbox-doc/{doc_id}/{tok}` rather than a browser-built `blob:` URL. A
+  blob URL is refused outright by some WebKit-based in-app browsers (which can
+  take the whole page down with it) and a sandboxed `srcdoc` frame blank-renders
+  on WebKit, so a plain document URL is the only form that loads everywhere. The
+  authed `POST /api/sandbox-doc` stashes the html the caller already holds and
+  returns the URL; the path credential is client-bound with a short TTL, and the
+  response pins `Content-Security-Policy: sandbox` so the document keeps an
+  opaque origin even when opened top-level. Flags match what the embedding frame
+  already grants, so nothing is newly permitted or denied. The same response's
+  `frame-ancestors` is **`'self'` plus the ancestors `'self'` cannot express**
+  (`origin.frame_ancestors_value`), and both halves are load-bearing. `'self'` is
+  resolved by the BROWSER against the frame's real URL, so it stays correct behind
+  a TLS-terminating tunnel that rewrites `Host` and may not forward
+  `X-Forwarded-Proto` — deriving the origin server-side instead names
+  `http://localhost:<port>` while the browser is on `https://<tunnel-host>` and
+  blanks every frame on that path. `'self'` alone is not enough because the
+  directive is matched against EVERY ancestor: the Instances embed nests a remote
+  dashboard inside the local one, so a widget sits three levels down (local
+  dashboard → embedded dashboard → widget) with a grandparent on a different
+  origin, and the browser refuses the embed while the `GET` still returns 200.
+  Those extra ancestors come from `server._extra_frame_ancestors` (the embedding
+  parent's port, from a validly-signed token claim) and each is re-validated
+  against a strict origin form, so a malformed or inexpressible source — a
+  bracketed IPv6 literal is not a valid CSP host-source — cannot reach the header.
+  See `dashboard/handlers/sandbox_doc.py`. No `dangerouslySetInnerHTML` without
   DOMPurify; no inline event handlers.
+- **The detail frame is sized to its document, and promoted to its own
+  compositing layer.** Both are corrections to shapes that only misbehave on iOS
+  WebKit, so both are invisible in a desktop dev loop and both are pinned by
+  tests in `website/src/test/ArtifactBody.iframeBlob.test.tsx`.
+  - The frame takes the height its document reports (`includeHeightReporter`, the
+    same `mc-widget-height` protocol the chat frame uses, in its own measured-height
+    key space) and carries **no minimum**. It previously stood in a fixed
+    `calc(100vh - 240px)` box with `minHeight: 480`, which on a phone put a short
+    artifact in a frame hundreds of pixels taller than itself and made the reader
+    scroll a pane inside a scrolling page. A floor reintroduced above the reported
+    height brings both back.
+  - `transform: translateZ(0)` is on the frame because iOS WebKit was measured
+    **skipping the document's first paint**: it loaded, its injected scripts ran,
+    it reported a correct layout height, and it sat in a correctly sized visible
+    frame while painting nothing. Four unrelated post-load invalidations each
+    made it appear (a 1px resize, a transform toggle, an opacity flip, a display
+    toggle), so promotion is the one remedy that needs no timing — anything
+    scheduled off the `load` event is a race on a slow connection. Content height
+    only ever *correlated* with the symptom because tall content happened to
+    trigger one of those invalidations.
+- **A frame showing something that is not ours offers a retry.** The document URL
+  is single-use, so a navigation the ENGINE starts on its own (memory pressure, a
+  back/forward cache eviction) re-requests a spent URL and lands the frame on a
+  404 page — which fires `load` like any other navigation and leaves a silent
+  empty box, while the failure notice stays hidden because the mint itself
+  succeeded. Every document this surface builds carries the height reporter, so
+  silence past a grace window is the signal to surface the existing retry (which
+  re-mints; re-pointing at the spent URL recovers nothing). Deliberately not an
+  automatic re-mint: a second `load` also happens when a link inside an artifact
+  navigates the frame, and silently pulling the reader back would fight them.
+  `/sandbox-doc/` is on the service worker's skip list for the same single-use
+  reason, and because an iframe navigation has `mode === 'navigate'`, so the
+  worker's offline fallback would otherwise serve the SPA shell INTO the widget
+  frame (`website/src/test/serviceWorkerSkipRules.test.ts` runs the real worker).
 
 ## Versioning
 
 Each `create()` writes the initial content to `current.html` and snapshots
-it as `versions/v1.html`. Each subsequent `update(slug, content=…)` that
-changes the content bumps the version number, writes the new content as
-both `current.html` and `versions/v{N}.html`. Older versions remain in
-`versions/` untouched until the prune cap is reached, so any prior version
-can be re-read via `get(slug, version=N)` or rolled back into `current.html`
-via a follow-up `update()`.
+it as `versions/v1.html`. `update(slug, content=…, snapshot=False)` updates the
+live state without adding a numbered version; `snapshot=True` also increments
+`version` and writes `versions/v{N}.html`. The MCP `artifact_update` path defaults
+to snapshots, while dashboard Save does not unless it sends `snapshot: true`.
+Older versions remain untouched until the prune cap is reached, so any retained
+version can be read via `get(slug, version=N)` or restored as a fresh snapshot by
+`artifact_revert`.
 
 `list_versions(slug)` returns the sorted set of stored version numbers.
 `get(slug, version=N)` reads a specific version. After pruning, lower-numbered
@@ -543,10 +889,10 @@ comment never disappears without a trace.
 
 ## Knowledge Library Auto-Ingest
 
-Content-bearing local artifacts (markdown/text documents) are automatically
+Content-bearing local artifacts (markdown/text documents) can be automatically
 ingested into the Knowledge Library so they become searchable, stay in sync as
-the artifact changes, and are removed when the artifact is deleted. On by
-default via `knowledge.auto_ingest_artifacts`; the eligible kinds are
+the artifact changes, and are removed when the artifact is deleted. Off by
+default, opt in with `knowledge.auto_ingest_artifacts`; the eligible kinds are
 `knowledge.auto_ingest_artifact_kinds` (default `["markdown", "text", "html",
 "json"]`). `widget` is excluded (widgets/dashboards are UI, not documents — and
 a remote widget round-trips back to `kind="widget"` on clone) and `svg` is
@@ -585,14 +931,91 @@ adding a parallel watcher (see `kiro_crew.knowledge.artifact_ingest`):
   content-affecting mutation (create, content-changing update, delete). A
   metadata-only rename fires a separate `rename` signal that refreshes the
   stored group label without re-ingesting (no chunk churn).
-- **First-enable backfill tied to source-row creation.** Because the feature is
-  on by default, the store may already hold artifacts created before the
-  listener existed. The one-time pass that ingests them is tied to the
-  *creation of the aggregate source row*: when `ensure_artifact_source` actually
-  inserts the row (its existence is the idempotency marker — no separate flag),
-  a background backfill runs once. On every later boot the row already exists,
-  so nothing re-runs. (Nothing writes the store while the gateway is down, and
-  there is no out-of-process writer, so no recurring reconcile is needed.)
+- **Every store take runs in a worker thread.** `on_change` schedules the
+  handler on the gateway loop, so `_handle` and `ingest_artifact` run on the
+  loop thread — where a contended knowledge connection would busy-wait every
+  task (the watchdog heartbeat included) for the connection's whole busy timeout
+  and, past 25s, get the gateway killed (see the on-loop guard in
+  [knowledge](knowledge.md)). Each store call on these paths is offloaded with
+  `asyncio.to_thread`: the `get_source_by_uri` lookups (delete/rename/upsert),
+  `ensure_artifact_source`, `refresh_artifact_name`, `ingest_artifact`'s
+  `_get_state` read and `release_stale_claim` write, the per-job
+  `get_job_status` read in `reconcile_artifacts`, and `remove_artifact` (a
+  `delete_items_batch` → graph rebuild). The one take still on the loop is
+  `ingest_artifact`'s post-ingest `get_job_status` read: it sits between the
+  commit and the fallback ownership write, so offloading it belongs with the
+  ownership-write change that keeps those two from being separated by a
+  cancellation point. The ordering the handler describes is preserved across
+  the hops — name refresh before ingest, the kind-change reconcile before the
+  ingest — and the deduped/ownership finalizers still run on the pipeline's own
+  worker hop, not the loop.
+- **Reconcile on every start, not a creation-gated backfill.** The feature is
+  opt-in, and while it is off the change-listener is not registered, so writes in
+  that window never reach the Library. Tying the catch-up pass to *creation of
+  the aggregate source row* cannot repair that: the row outlives the feature
+  being switched off, so on any install that ever had it on a later opt-in gets
+  `created=False` and the pass never runs — the gap is permanent and silent.
+  `ArtifactKnowledgeSync.start()` therefore runs `reconcile_artifacts`
+  **unconditionally**, comparing the artifact store against
+  `artifact_item_state`: ingest what is missing or changed, drop state for
+  artifacts that no longer exist. `created` is now reported for logging only.
+  - **Converged is free.** `ingest_artifact` already skips unchanged content, so
+    the steady state spends no extraction calls and logs at debug.
+  - **Removals are judged against every artifact, not the eligible kinds.**
+    Narrowing `auto_ingest_artifact_kinds` makes an artifact ineligible, not
+    absent; reaping on that basis would delete content the user never deleted.
+    A reap also requires two signals, not one: `get()` raising
+    `ArtifactNotFoundError` *and* the artifact's directory being gone. That error
+    is also what a missing `meta.json` raises, which a partially-restored
+    directory hits while its content is still present, and deletion removes the
+    whole directory — so demanding both costs a recoverable stale group instead
+    of unrecoverable deleted items.
+  - **An emptied artifact is dropped unbudgeted.** Its body is blank, so there is
+    nothing to extract and the drop costs no LLM calls. Keeping it behind the
+    budget would let obsolete text stay searchable for as many restarts as a
+    backlog of newer changes takes to drain. Only tracked artifacts are read, and
+    the pass stands down on `source_missing` for the same reason
+    `ingest_artifact` does.
+  - **Off-window metadata drift is repaired unbudgeted.** A tracked artifact
+    whose kind differs from the kind recorded at ingest (`artifact_item_state.kind`)
+    had its group produced by the previous kind's reader, so that group is
+    reaped exactly as the live `upsert` path does, and the ingest loop rebuilds
+    it if the new kind is eligible. The decision reads the *recorded* kind, not
+    the current allowlist: "the artifact changed" and "the user narrowed
+    `auto_ingest_artifact_kinds`" are indistinguishable from the current kind
+    alone, and reaping on the latter would delete content the user never
+    touched. A row predating the column carries `NULL`, so its ingested kind is
+    unknown; that is resolved by which repair is safe. An eligible artifact is
+    re-ingested once (in budget, no deletion), which repairs any undetectable
+    drift and backfills the column so it never repeats; an ineligible one is
+    left alone, because deletion is the only repair available there and drift
+    was never proven. Where the
+    removal happens depends on whether anything will rebuild the group: a drift
+    into an *ineligible* kind is reaped in the unbudgeted pre-pass (removal is
+    the whole repair), while a drift between two *eligible* kinds is replaced
+    inside the budgeted loop, so a backlog past the budget keeps its stale group
+    and defers rather than being deleted now and restored several starts later.
+    An eligible replacement clears only the recorded content hash, never the
+    group: that defeats the unchanged-content short-circuit (a byte-identical
+    body under a new kind would otherwise keep the previous reader's chunks)
+    while leaving `ingest_file` to do its normal atomic replace, so a failed
+    extraction keeps the old items and the artifact stays searchable.
+    Every tracked artifact's stored group label is also refreshed to its current
+    redacted name, so a rename during the off-window stops showing the old
+    label. Neither pass touches content hashes — a converged store still spends
+    nothing.
+- **A dead source pointer neither deletes nor rewrites an index.**
+  `ingest_artifact` returns early whenever `get()` reported `source_missing`
+  (live file moved / unreadable, so the content is a snapshot fallback). That
+  snapshot is not evidence about the live file in either direction: blank does
+  not mean the artifact was emptied, and non-blank does not mean it is current,
+  so acting on it would either destroy a valid index or replace newer indexed
+  text with older. Same rule as the reconcile reap — only provable state acts.
+  - **Ingests are bounded per run** by `RECONCILE_INGEST_BUDGET` (a module
+    constant, not a config key). `ArtifactStore.list` is newest-first, so a
+    backlog from a long off-window drains across successive starts with the most
+    recent artifacts first, instead of arriving as one unbounded burst of billed
+    extraction calls. Unchanged artifacts do not consume budget.
 - **Security.** Ingested text *and* the LLM-originated artifact name (used as
   the source/item title) are passed through `redact_credentials()` and
   `redact_exfiltration_urls()` before landing in the Knowledge store (per
@@ -646,8 +1069,40 @@ not enforce uniqueness.
 source_path dedup-bump paths), content-carrying PATCH (Save / Snapshot /
 MCP update / revert — metadata-only PATCHes do NOT emit), delete
 (`deleted: true`), relocate, and pull-latest (when the pull actually landed a
-new snapshot). Fire-and-forget; react-query's 30s staleness window remains
-the safety net.
+new snapshot). Fire-and-forget.
+
+**Live refresh — file-backed artifacts** — the funnel above only covers
+mutations that pass through a handler, so an agent (or any other tool) writing
+a file-backed artifact's `source_path` directly emitted nothing, and the open
+surface kept rendering pre-edit content. The frontend closes that gap with
+`useArtifactLiveReload(slug, source_path)`, mounted on `ArtifactDetailPage`
+(hence also `/popout/artifact/:slug`) and on the side-panel `ArtifactPanel`:
+
+- It subscribes to the existing `GET /api/file-watch` SSE for `source_path` as
+  a **change signal only** — the frame's `content` is discarded and the
+  artifact is refetched through `GET /api/artifacts/{slug}` instead, so
+  redaction, the live/snapshot fallback and the `live_dirty` recompute all keep
+  running on the one serving path. This also sidesteps the 512KB cap on what
+  the watch stream can *deliver* — the separate cap on what it can *detect*
+  still applies, see the known limits below.
+- 400ms debounce, then `invalidateQueries(['artifact', slug])` — an active
+  refetch, not a staleness mark, because the shared QueryClient runs
+  `staleTime: Infinity` and freshness is push-driven.
+- **Never refetches while an edit buffer is open** (`isArtifactEditing(slug)`),
+  matching the `artifact_update` WS handler: moving the editor's baseline under
+  a stale buffer makes the next Save silently overwrite the incoming update.
+  Nothing else is refreshed on that branch — an external write produces no
+  artifact event and no comment — and the detail page already refetches when
+  editing ends.
+- Inert for artifacts with no `source_path`, and inert after an SSE failure
+  (`useFileWatch` closes the stream rather than reconnecting), which degrades to
+  the previous manual-reload behavior.
+
+Known limits, both inherited from the endpoint: `api_file_watch` only emits when
+the redacted **first 512,000 bytes** change, so a rewrite touching only bytes
+past that cap produces no signal and no reload; and each mounted surface (every
+popout is its own window) opens its own EventSource against an HTTP/1.1 gateway,
+so nothing is watched unless the artifact is actually file-backed.
 
 **Panel (frontend)** — the comments sidebar and the chat panel are mutually
 exclusive flex siblings of the artifact body, icon-toggled from the toolbar
@@ -822,3 +1277,107 @@ Separately, the **reaper path** (the in-account reaper Lambda or
 and performs the same cleanup on a schedule. The reaper runs with the user's
 own credentials in-account and handles the case where the gateway is unreachable
 or the user did not explicitly destroy before TTL expiry.
+
+## Image Artifacts (`kind="image"`)
+
+An `image` artifact is a **raster picture**, not text. Its bytes live in a binary
+sidecar beside `meta.json` and are served by a dedicated endpoint; the textual
+`current.html` exists but stays **empty**, and `content` in every API response is
+`""`. Consumers must therefore never render an image artifact through the text or
+widget paths — `ArtifactBodyImage` handles it, bypassing both Monaco and the
+sandboxed iframe.
+
+SVG is deliberately **not** an image artifact: it is markup, stored as
+`kind="svg"` text and rendered through the sanitizing `SvgViewer`. Serving
+agent-authored SVG as an image would reintroduce a same-origin script vector.
+
+### Storage layout
+
+```
+~/.kiro/crew/artifacts/
+└── <slug>/
+    ├── meta.json        includes the `image` block below
+    ├── current.html     present but EMPTY (bytes are not text)
+    ├── asset.<ext>      the raster bytes (png|jpg|webp|gif|bmp)
+    └── versions/
+        └── v1.html      empty, mirroring current.html
+```
+
+The sidecar's extension is derived **from the allowlisted mime**, never from the
+stored `ext` field, on every read (see [Security](#security)). `delete` removes
+the whole artifact directory, so the sidecar needs no separate cleanup.
+
+### `image` metadata schema
+
+Tolerant-loaded: every field is optional so an older or hand-edited record still
+opens, and each consumer degrades gracefully.
+
+| Field | Type | Description |
+|---|---|---|
+| `mime` | string | One of `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`. Anything else is rejected on create **and** refused on read. |
+| `ext` | string | Sidecar extension as written. Informational only — reads re-derive it from `mime`. |
+| `size_bytes` | int | Byte length of the sidecar. |
+| `width` / `height` | int | Natural pixel size, sniffed from the file header with the stdlib only (no Pillow). `null` when unmeasurable — dimensions are a rendering nicety, not a gate. |
+| `sha256` | string | Hex digest of the bytes. |
+| `original_filename` | string | Basename of the source file; names the download. **LLM-derived** → redacted in `_serialize`. |
+| `alt` | string | Accessible description, from the markdown alt text. **LLM-derived** → redacted in `_serialize`. |
+
+### Asset endpoint
+
+`GET /api/artifacts/{slug}/asset` — returns the raw bytes with the sniffed
+`Content-Type`, so an `<img src=…>` can point straight at it and the artifact
+JSON never carries base64.
+
+- **Authenticated** like every other artifact route; unauthenticated requests get
+  403. No restricted-session gate applies (it is a read) and no `referenced`
+  breadcrumb is recorded (an asset fetch is a sub-resource of a detail view that
+  was already counted).
+- `Cache-Control: private, max-age=31536000, immutable` — `private` because the
+  bytes are behind token auth and a shared proxy must never serve a cached copy
+  to an unauthenticated requester.
+- 404 when the slug does not resolve, is not an image artifact, its sidecar is
+  missing, or its mime is not in the allowlist.
+- The read is offloaded with `asyncio.to_thread`: the sidecar may be up to
+  `MAX_CONTENT_BYTES` and a synchronous read would stall every other gateway
+  task, the liveness heartbeat included.
+
+### Auto-registration from chat (`kiro_crew.image_artifacts`)
+
+Finalized assistant messages are scanned for **local** markdown image references
+and each one is registered, copying the bytes immediately so temp-file cleanup
+cannot strip them.
+
+- **Identity.** Slugs are derived deterministically from `(message_ts, index)`
+  via `widget_slug.derive_widget_slug` on the Python side —
+  `image_artifacts._derive_image_slug` seeds it with `<ts>#image` so an image and
+  a widget in the same message never collide. This ordinal form is backend-only:
+  the frontend has no counterpart, because widget identity is keyed on the body
+  (see the widget Identity contract above), not on an ordinal. `index` counts
+  **every** image match in the message including skipped ones — so an image's
+  ordinal is stable regardless of which siblings were skipped. A replayed message
+  is therefore idempotent and never clobbers an artifact the user has since
+  edited.
+- **Destination parsing.** Balanced-paren walk, so `screenshot(1).png` survives;
+  `<...>` destinations are unwrapped so a path containing spaces survives;
+  backslashes are treated as escapes **only** before markdown-significant
+  characters, so a native Windows path (`C:\Users\me\shot.png`) survives; alt
+  text accepts escaped brackets (`![Revenue \[Q1\]](…)`) and is unescaped for
+  display.
+- **Skipped:** remote/`data:`/protocol-relative URLs (never fetched), relative
+  paths, unsupported extensions, sensitive paths, and restricted/incognito
+  sessions.
+- **Budgets (per message):** at most `MAX_IMAGES_PER_MESSAGE` (12) images and
+  `MAX_IMAGE_BYTES_PER_MESSAGE` (64 MiB) of copied bytes. Counted over
+  *eligible* images rather than successful writes, so a replay cannot walk past
+  the cap one batch at a time. Pruning runs after the loop, so without these a
+  single message could fill the disk.
+- **Retention.** Auto-registered images are `auto_registered=True` and unpinned,
+  so they ride the **same** count-based sweep as auto-registered widgets
+  (`prune_auto_widgets(keep=MAX_AUTO_WIDGET_ARTIFACTS)`) — the predicate is
+  kind-agnostic. Images and widgets therefore share one budget; pinning
+  ("Save permanently"), filing, tagging, or commenting exempts a record.
+- **Never raises.** A failure to register a chat image is a lost convenience, not
+  a reason to fail the turn that produced it; per-image failures are logged and
+  skipped individually. Dispatch uses `asyncio.to_thread` rather than the shared
+  subprocess pool, so a wedged teardown worker cannot hold registration until
+  after the source file is gone.

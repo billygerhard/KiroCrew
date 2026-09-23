@@ -24,8 +24,12 @@ const SelectTrigger = React.forwardRef<
     ref={ref}
     className={cn(
       'flex items-center justify-between w-full px-3 py-2 rounded-md text-sm border border-border bg-bg-elevated text-text',
-      'hover:border-border-strong transition-all cursor-pointer outline-none',
+      'hover:border-border-strong transition-all cursor-pointer outline-hidden',
+      // data-[disabled] fires only via the Radix `disabled` prop; an ancestor
+      // <fieldset disabled> disables the native button without Radix knowing,
+      // so the same look must also hang off the native :disabled state.
       'focus-visible:border-accent data-[disabled]:opacity-40 data-[disabled]:pointer-events-none',
+      'disabled:opacity-40 disabled:pointer-events-none',
       '[&>span]:truncate [&>span]:text-left [&>span]:min-w-0',
       className
     )}
@@ -87,7 +91,11 @@ const SelectContent = React.forwardRef<
       }}
       className={cn(
         'z-[9999] max-h-[240px] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        // Entry animation only. Radix suspends unmount until an exit animation
+        // finishes, and the still-mounted dismissable layer consumes the next
+        // pointer-down — so an exit animation makes a re-click on the trigger a
+        // no-op for the animation's whole duration.
+        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
         'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
         // Popper mode: the panel is EXACTLY the trigger's width. No `min-w`
         // here on purpose — a floor wider than the trigger makes the popup
@@ -116,7 +124,7 @@ const SelectItem = React.forwardRef<
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex cursor-pointer select-none items-center justify-between gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'relative flex cursor-pointer select-none items-center justify-between gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       // Themed selected state (user preference): accent wash + accent text
       // instead of stock shadcn's check-only look.

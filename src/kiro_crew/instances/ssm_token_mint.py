@@ -29,11 +29,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 
 from kiro_crew.cloud import ssm as cloud_ssm
+from kiro_crew.instances.constants import DEFAULT_SSM_MINT_TIMEOUT_SECS
+
+# The subcommand builder, the ttl/port bounds AND the error-tail scrubber are
+# SHARED with the SSH transport on purpose: both transports hand the same string
+# to the same remote shell and both build an error out of a stream that can be
+# holding a live token, so a second copy of any of them could only ever drift
+# into a weaker bound.
 from kiro_crew.instances.token_mint import (
+    _OUTPUT_TAIL_CHARS,
     TokenMintError,
+    _redacted_output_tail,
+    _token_subcommand,
+    _validate_port,
+    _validate_ttl,
     build_remote_command,
     parse_token_from_stdout,
 )
@@ -44,58 +55,88 @@ from kiro_crew.instances.validation import (
     validate_ssm_run_as,
     validate_ssm_target,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
 # How long to wait for the SSM send-command invocation to finish. Generous vs.
 # the SSH transport's 30s timeout: send-command has its own dispatch latency
-# (agent poll interval) on top of the remote command's own runtime.
-_DEFAULT_MINT_TIMEOUT_SECS = 90
-
-# Same ttl shape token_mint.py accepts (kept local rather than importing a
-# "private" helper cross-module — see module docstring).
-_TTL_RE = re.compile(r"^[1-9][0-9]{0,3}[hm]$")
-
-# How much of a failing remote's stdout/stderr to carry in an error message.
-_OUTPUT_TAIL_CHARS = 300
-
-
-def _validate_ttl(ttl: str) -> str:
-    if not _TTL_RE.match(ttl):
-        raise TokenMintError(
-            f"invalid ttl {ttl!r}: expected a positive integer with 'h' or 'm' "
-            "suffix (e.g. '20h', '30m')"
-        )
-    return ttl
+# (agent poll interval) on top of the remote command's own runtime. Canonical
+# default lives in instances.constants; an explicit user override of
+# ``instances.mint_timeout_secs`` wins for both transports.
+_DEFAULT_MINT_TIMEOUT_SECS = DEFAULT_SSM_MINT_TIMEOUT_SECS
 
 
 def _redacted_tail(text: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     """Credential/exfil-redact *text* and return its last *limit* chars.
 
-    Mirrors :func:`kiro_crew.instances.token_mint._redacted_output_tail`'s
-    intent (never let a token or credential-looking string reach a raised
-    exception's message) but is not called on an unbounded remote payload here:
-    :func:`cloud.ssm.run_command`'s ``CommandResult.stdout``/``stderr`` are
-    already SSM-invocation-output-sized (not a giant blind stream), so no
-    scan-window bounding is needed.
+    Delegates to :func:`kiro_crew.instances.token_mint._redacted_output_tail`,
+    because ``redact()`` alone is not the whole scrub this site needs: the shared
+    helper adds a ``?token=`` URL-param pass and a wider token-shape pass on top
+    of it, and both are load-bearing here. A partially-successful mint prints its
+    success URL and then exits non-zero, so the stream this tail is built from can
+    hold a live token -- and two shapes in it are invisible to ``redact()`` on its
+    own: a two-segment ``payload.signature`` token whose payload and signature do
+    not clear the bounds ``security``'s two-segment link-token pattern keys on,
+    and a ``?token=<value>`` URL whose value that pattern does not match at all.
+
+    The wider token-shape pass is borrowed at THIS site rather than pushed down
+    into ``redact()``. Over-matching here costs one masked word in an
+    operator-facing error string, whereas ``redact()``'s patterns also gate
+    request-blocking decisions, where the same widening flags ordinary dotted
+    filenames.
+
+    Scan bounding comes with the shared helper. SSM's ``GetCommandInvocation``
+    truncates ``StandardOutputContent`` to 24,000 chars and ``redact()`` over that
+    much text measures ~1.6ms, so the scan is not an event-loop stall at either
+    width; sharing the window simply leaves one fewer local bound to keep true.
+    The carried tail is ``_OUTPUT_TAIL_CHARS``, shared for the same reason.
     """
-    if not text:
-        return ""
-    safe = redact_exfiltration_urls(redact_credentials(text)[0])[0]
-    return safe.strip()[-limit:]
+    return _redacted_output_tail(text, limit)
 
 
-def _validate_port(port: int | None) -> int | None:
-    if port is None:
-        return None
-    try:
-        p = int(port)
-    except (TypeError, ValueError) as e:
-        raise TokenMintError(f"invalid port {port!r}: not an integer") from e
-    if not (1 <= p <= 65535):
-        raise TokenMintError(f"invalid port {p}: out of range 1-65535")
-    return p
+async def _send_over_ssm(
+    target: str,
+    remote_command: str,
+    profile: str,
+    region: str,
+    run_as: str,
+    timeout_secs: float,
+) -> cloud_ssm.CommandResult:
+    """Run *remote_command* on *target* through the send-command chokepoint.
+
+    Every SSM dispatch in the ``instances`` package goes through here -- both
+    mints below and ``diagnostics._probe_remote_dashboard_ssm`` -- so the two
+    budgets are spelled once. ``total_wait`` bounds what
+    :func:`cloud.ssm.run_command` spends sleeping between
+    ``get-command-invocation`` polls, and the outer ``wait_for`` is that same
+    budget plus a fixed 15s of headroom. One spelling because an outer bound
+    BELOW the inner one abandons an invocation the remote is still running and
+    reports a timeout it never had. Each caller keeps its OWN budget value
+    (mint's tunable, the probe's constant); what is shared is the relationship
+    between the pair, not the number.
+
+    The headroom is not a proof the outer bound fires second: ``run_command``
+    counts only its own sleeps, never the ``aws`` CLI round trip per poll, so a
+    slow host can still exhaust the outer budget first.
+
+    :func:`cloud.ssm.run_command` blocks synchronously while it polls, hence the
+    thread hop -- and because a thread is not interruptible, an outer timeout
+    abandons the result rather than stopping the poll loop. Raises whatever the
+    chokepoint raises, plus :class:`asyncio.TimeoutError` on the outer bound, so
+    each caller keeps its own failure shape.
+    """
+    return await asyncio.wait_for(
+        asyncio.to_thread(
+            cloud_ssm.run_command,
+            target,
+            remote_command,
+            profile,
+            region,
+            run_as=run_as,
+            total_wait=int(timeout_secs),
+        ),
+        timeout=timeout_secs + 15,
+    )
 
 
 async def mint_remote_token_ssm(
@@ -126,14 +167,9 @@ async def mint_remote_token_ssm(
     port = _validate_port(remote_port)
     embed_port = _validate_port(embed_parent_port)
 
-    subcommand = "token"
-    if ttl:
-        subcommand += f" --ttl {ttl}"
-    if port:
-        subcommand += f" --port {port}"
-    if embed_port:
-        subcommand += f" --embed-parent-port {embed_port}"
-    remote_command = build_remote_command(remote_bin, subcommand, marker_port=port)
+    remote_command = build_remote_command(
+        remote_bin, _token_subcommand(ttl, port, embed_port), marker_port=port
+    )
 
     # False positive (below): the message mentions "token" (this function's job)
     # but the interpolated values are the SSM target id and the ttl — never the
@@ -143,18 +179,7 @@ async def mint_remote_token_ssm(
     # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
     logger.info("Minting token on %s over SSM (ttl=%s)", target, ttl)
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                cloud_ssm.run_command,
-                target,
-                remote_command,
-                profile,
-                region,
-                run_as=run_as,
-                total_wait=int(timeout_secs),
-            ),
-            timeout=timeout_secs + 15,
-        )
+        result = await _send_over_ssm(target, remote_command, profile, region, run_as, timeout_secs)
     except asyncio.TimeoutError as e:
         raise TokenMintError(f"timed out minting token on {target} over SSM") from e
     except SsmValidationError as e:
@@ -209,18 +234,7 @@ async def run_remote_kirocrew_ssm(
     )
     logger.info("Running 'kirocrew %s' on %s over SSM", subcommand, target)
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                cloud_ssm.run_command,
-                target,
-                remote_command,
-                profile,
-                region,
-                run_as=run_as,
-                total_wait=int(timeout_secs),
-            ),
-            timeout=timeout_secs + 15,
-        )
+        result = await _send_over_ssm(target, remote_command, profile, region, run_as, timeout_secs)
     except asyncio.TimeoutError:
         return -1, f"timed out after {timeout_secs}s"
     except Exception as e:

@@ -1,19 +1,31 @@
-import { type ReactNode, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { lazy, Suspense, type ReactNode } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, BarChart3, Brain, CheckCircle, Zap } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BarChart3, Brain, Clock } from 'lucide-react'
 import { useAppSelector } from '../store'
 import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
-import { Card, CardTitle, StatCard } from '../components/ui'
+import type { WakaTimeStats } from '../api/client'
+import { Card, CardTitle, StatCard, Btn, ContentSkeleton } from '../components/ui'
 import { TunnelStatus } from '../components/TunnelStatus'
+import { TailnetMobileCard } from '../components/TailnetMobileCard'
 import ErrorBoundary from '../components/ErrorBoundary'
+import ErrorNotice from '../components/ErrorNotice'
+import { useGuardedLeave } from '../components/NavigationLeaveGuard'
 import { getOverviewStatCards } from './overviewStatCards'
-import { MemoryTab, UsageTab } from './overview'
+import { getOverviewPanel } from './overviewPanel'
+import { isOverviewBuiltinSuppressed } from './overviewBuiltins'
+import { KIRO_SIGN_IN_BACKEND, KIRO_SIGN_IN_PATH } from './developer/kiroSignInLink'
+import { UsageTab, WakaTimeTab } from './overview'
 import { useProvider } from '../providers'
-import type { NormalizedUsage } from '../providers'
+import { providerUsageQuery } from '../api/providerUsageQuery'
 
 import { i18nT } from '../i18n/t'
+import { fmtDuration } from '../i18n/format'
+
+// The record editor and recovery tools are needed only inside this drill-in.
+// Keep them out of the dashboard shell's initial bundle.
+const MemoryTab = lazy(() => import('./overview/MemoryTab'))
 /**
  * Settings > Overview — mission control.
  *
@@ -25,7 +37,7 @@ import { i18nT } from '../i18n/t'
  * on the Import tab.
  */
 
-const DRILL_VIEWS = ['memory', 'usage'] as const
+const DRILL_VIEWS = ['memory', 'usage', 'wakatime'] as const
 type DrillView = (typeof DRILL_VIEWS)[number]
 
 function fmtNum(n: number | undefined | null): string {
@@ -36,18 +48,19 @@ function fmtNum(n: number | undefined | null): string {
 }
 
 /** Back link + drill-in content, mirroring the Channels back affordance. */
-function DrillIn({ title, onBack, children }: { title: string; onBack: () => void; children: ReactNode }) {
+function DrillIn({ title, onBack, children, hideTitle = false }: { title: string; onBack: () => void; children: ReactNode; hideTitle?: boolean }) {
+  const leave = useGuardedLeave()
   return (
     <div>
-      <button
-        onClick={onBack}
+      <Btn
+        onClick={() => leave(onBack)}
         aria-label={i18nT('pages.overviewPage.back_to_overview')}
         className="flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 mb-2 hover:underline"
       >
-        <ArrowLeft size={14} />
+        <ArrowLeft className="lucide-inline" />
         {i18nT('pages.overviewPage.overview')}
-      </button>
-      <div className="text-xl font-bold tracking-tight text-text-strong mb-3">{title}</div>
+      </Btn>
+      {!hideTitle && <div className="text-xl font-bold tracking-tight text-text-strong mb-3">{title}</div>}
       {children}
     </div>
   )
@@ -56,11 +69,7 @@ function DrillIn({ title, onBack, children }: { title: string; onBack: () => voi
 /** Usage summary card — shares the query cache with the Usage drill-in. */
 function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
   const provider = useProvider()
-  const { data } = useQuery<NormalizedUsage>({
-    queryKey: ['provider-usage', provider.id],
-    queryFn: () => provider.fetchUsage(),
-    enabled: provider.capabilities.usageBilling,
-  })
+  const { data, isError, error } = useQuery(providerUsageQuery(provider))
   const b = data?.billing
   const today = data?.sessions.today
   return (
@@ -71,10 +80,13 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
           {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
         </button>
       </CardTitle>
+      {provider.capabilities.usageBilling && isError && (
+        <ErrorNotice title={data ? i18nT('pages.sessionsTab.could_not_refresh') : undefined} message={error?.message} askAgent testId="overview-usage-error" />
+      )}
       {!provider.capabilities.usageBilling ? (
         <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.usage_tracking_is_not_available_for')} {provider.displayName}.</div>
       ) : !data ? (
-        <div className="skeleton h-14 rounded" />
+        !isError && <div className="skeleton h-14 rounded" />
       ) : (
         <div className="flex flex-col gap-2">
           <div className="text-[13px] text-muted">
@@ -101,9 +113,46 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
   )
 }
 
+/** WakaTime summary card — shares the query cache with the WakaTime drill-in. */
+function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
+  const { data, isError, error } = useQuery<WakaTimeStats>({
+    queryKey: ['wakatime-stats', 'last_7_days'],
+    queryFn: () => api.wakatimeStats('last_7_days'),
+  })
+  const total = data?.stats?.total_seconds ?? 0
+  const fmtHm = (s: number) => {
+    // Round to whole minutes first, then split, so 7199s -> 2h 0m, not 1h 60m.
+    const totalMin = Math.round(Math.max(0, s) / 60)
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
+    return fmtDuration([[h, 'hour'], [m, 'minute']], { dropZero: true })
+  }
+  return (
+    <Card>
+      <CardTitle>
+        <Clock className="lucide-inline" /> {i18nT('pages.overviewPage.wakatime')}
+        <Btn onClick={onOpen} className="ml-auto border-none bg-transparent px-0 py-0 text-[12px] font-medium text-accent hover:bg-transparent hover:underline">
+          {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
+        </Btn>
+      </CardTitle>
+      {isError ? (
+        <ErrorNotice message={error?.message} askAgent testId="overview-wakatime-error" />
+      ) : !data ? (
+        <div className="skeleton h-14 rounded" />
+      ) : !data.configured ? (
+        <div className="text-[13px] text-muted">{i18nT('pages.overviewPage.wakatime_not_connected')}</div>
+      ) : (
+        <div className="text-[13px] text-muted">
+          {i18nT('pages.overviewPage.wakatime_last_7_days')} <span className="text-text font-mono">{fmtHm(total)}</span>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 /** Memory summary card — consolidation cadence + retention at a glance. */
 function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
-  const { data } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
+  const { data, isError, error } = useQuery<{ history_idle_hours?: number; history_max_days?: number; migrated?: boolean }>({
     queryKey: ['memory-settings'],
     queryFn: () => api.memorySettings(),
   })
@@ -115,7 +164,11 @@ function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
           {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
         </button>
       </CardTitle>
-      {!data ? (
+      {isError ? (
+        // askAgent on: a read of the persisted memory settings; the card holds no
+        // input. Without this branch a rejected fetch left the skeleton up forever.
+        <ErrorNotice message={error?.message} askAgent testId="overview-memory-error" />
+      ) : !data ? (
         <div className="skeleton h-14 rounded" />
       ) : (
         <div className="flex flex-col gap-1 text-[13px] text-muted">
@@ -147,14 +200,42 @@ export const STAT_LABEL_KEY: Record<StatId, string> = {
   lessons: 'pages.overviewPage.stat_lessons',
 }
 
+/**
+ * Signpost to the Kiro sign-in card's home, Developer > Agent Backend
+ * (`KIRO_SIGN_IN_PATH`), shown only while KAS is the selected backend: those
+ * users read token expiry on this page by habit, and the card now sits beside
+ * the switch that picks KAS. Everyone else sees nothing -- the identity does not
+ * concern the Kiro CLI or Claude backends, so a pointer would be noise for them.
+ * Renders no element (not an empty wrapper) when hidden, so the layout above the
+ * guided cards keeps no stray gap.
+ */
+function KiroSignInMovedPointer() {
+  const cfgQ = useQuery<{ agent?: { acp_backend?: string } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  if (cfgQ.data?.agent?.acp_backend !== KIRO_SIGN_IN_BACKEND) return null
+  return (
+    <div className="mb-6">
+      <Link
+        to={KIRO_SIGN_IN_PATH}
+        className="text-[12px] leading-snug text-accent hover:underline"
+        data-testid="kiro-sign-in-moved"
+      >
+        {i18nT('pages.overviewPage.kiro_sign_in_moved')}
+        {' '}
+        <ArrowRight size={12} className="lucide-inline" />
+      </Link>
+    </div>
+  )
+}
+
 export default function OverviewPage() {
   const status = useAppSelector(s => s.dashboard.status)
   const connected = useAppSelector(s => s.dashboard.connected)
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const uptime = useUptime()
   const [params, setParams] = useSearchParams()
-  const [restarting, setRestarting] = useState(false)
-  const [restartMsg, setRestartMsg] = useState<ReactNode>('')
 
   const rawView = params.get('view')
   const view: DrillView | null = DRILL_VIEWS.includes(rawView as DrillView) ? (rawView as DrillView) : null
@@ -165,25 +246,35 @@ export default function OverviewPage() {
     return next
   }, { replace: true })
 
-  const restart = async () => {
-    setRestarting(true)
-    await api.restartSessions()
-    setRestartMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overviewPage.sessions_restarted')}</>)
-    setRestarting(false)
-    setTimeout(() => setRestartMsg(''), 5000)
-  }
-
   if (view === 'memory') {
-    return <DrillIn title={i18nT('pages.overviewPage.memory')} onBack={() => setView(null)}><MemoryTab refreshTrigger={refreshTrigger} /></DrillIn>
+    const selectedStore = params.get('store') || ''
+    return <DrillIn title={i18nT('pages.overviewPage.memory')} hideTitle={!!selectedStore && selectedStore !== 'default'} onBack={() => setView(null)}>
+      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} onStoreNavigate={store => setParams(previous => {
+        const next = new URLSearchParams(previous)
+        if (store) next.set('store', store)
+        else next.delete('store')
+        return next
+      }, { replace: true })} /></Suspense>
+    </DrillIn>
   }
   if (view === 'usage') {
     return <DrillIn title={i18nT('pages.overviewPage.usage')} onBack={() => setView(null)}><UsageTab /></DrillIn>
   }
+  if (view === 'wakatime') {
+    return <DrillIn title={i18nT('pages.overviewPage.wakatime')} onBack={() => setView(null)}><WakaTimeTab /></DrillIn>
+  }
+
+  // Resolved once per render, and bound to a capitalized local so JSX treats it
+  // as a component rather than an intrinsic element.
+  const overviewPanel = getOverviewPanel()
+  const OverviewPanelComp = overviewPanel?.component
 
   return (
     <>
-      {/* Health hero */}
-      <div className="flex items-center justify-between gap-4 mb-5">
+      {/* Health hero. Status only — Overview edits no config, so it hosts no
+          apply/restart action. Restarting sessions to pick up config changes
+          lives with the surfaces that edit it (Capabilities header). */}
+      <div className="flex items-center gap-4 mb-5">
         <div>
           <div className="text-lg font-bold text-text-strong flex items-center gap-2">
             <span className={`w-2 h-2 rounded-full shrink-0 ${connected && status ? 'bg-ok' : 'bg-warn'}`} />
@@ -192,26 +283,6 @@ export default function OverviewPage() {
           <div className="text-[12.5px] text-muted mt-0.5">
             {i18nT('pages.overviewPage.up')} {uptime}{status?.version ? <> {i18nT('pages.overviewPage.v')}{status.version}</> : null}
           </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {restartMsg && <span className="text-ok text-[13px] animate-rise">{restartMsg}</span>}
-          <button
-            onClick={restart}
-            disabled={restarting}
-            title={i18nT('pages.overviewPage.apply_config_changes_by_restarting_all_sessions')}
-            className={`group relative inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold font-body cursor-pointer transition-all duration-300 overflow-hidden border-none ${
-              restarting
-                ? 'bg-accent/60 text-accent-fg/80 cursor-wait'
-                : 'bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)] hover:-translate-y-0.5 active:translate-y-0'
-            }`}
-          >
-            {restarting && <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer" />}
-            <span className={`transition-transform duration-300 ${restarting ? 'animate-spin' : 'group-hover:rotate-12'}`}><Zap className="lucide-inline" /></span>
-            {restarting
-              ? <span className="hidden sm:inline">{i18nT('pages.overviewPage.restarting')}</span>
-              : <><span className="hidden lg:inline">{i18nT('pages.overviewPage.apply_restart')}</span><span className="hidden sm:inline lg:hidden">{i18nT('pages.overviewPage.restart')}</span></>
-            }
-          </button>
         </div>
       </div>
 
@@ -243,11 +314,47 @@ export default function OverviewPage() {
         })}
       </div>
 
+      {/* Mobile access. Above the summary cards and full width, because it is a
+          guided sequence rather than a metric: it owns the one next action, and
+          in its terminal state it renders a QR the operator scans off the screen.
+          Isolated so a throwing card cannot take the Overview down with it.
+
+          Suppressible downstream: a distribution that disables tailnet outright
+          can remove this surface via `suppressOverviewBuiltin('tailnet-mobile')`
+          rather than patching this file on every sync. Gated OUTSIDE the
+          ErrorBoundary and the spacing wrapper so a suppressed build renders no
+          element at all — leaving the `mb-6` div behind would keep a 24px gap
+          where the card used to be. The core suppresses nothing. */}
+      <ErrorBoundary scope="overview-kiro-sign-in-moved" fallback={null}>
+        <KiroSignInMovedPointer />
+      </ErrorBoundary>
+      {!isOverviewBuiltinSuppressed('tailnet-mobile') && (
+        <ErrorBoundary scope="overview-tailnet-mobile" fallback={null}>
+          <div className="mb-6">
+            <TailnetMobileCard />
+          </div>
+        </ErrorBoundary>
+      )}
+
       {/* Deep-surface summary cards */}
       <div className="grid gap-3.5 grid-cols-2 max-[760px]:grid-cols-1">
         <UsageSummaryCard onOpen={() => setView('usage')} />
+        <WakaTimeSummaryCard onOpen={() => setView('wakatime')} />
         <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
+
+      {/* Extension slot: the single downstream-owned panel for the region below
+          the summary cards. One surface, one owner — a second registration
+          fails loud at the seam rather than negotiating layout here. Absent in
+          the stock build, and isolated so a throwing panel takes only itself
+          down, not the whole Overview. */}
+      {overviewPanel && OverviewPanelComp ? (
+        <ErrorBoundary scope={`overview-panel:${overviewPanel.id}`} fallback={null}>
+          <div className="mt-6">
+            <OverviewPanelComp />
+          </div>
+        </ErrorBoundary>
+      ) : null}
     </>
   )
 }

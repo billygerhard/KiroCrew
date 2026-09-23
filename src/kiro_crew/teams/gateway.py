@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from kiro_crew import extras
 from kiro_crew.messaging.driver import APPROVAL_AUTO, APPROVAL_INTERACTIVE
 from kiro_crew.teams.client import HAS_JWT, TeamsClient
 from kiro_crew.teams.transport import TeamsTransport
@@ -58,11 +59,12 @@ async def maybe_start_teams(orch: "GatewayOrchestrator") -> "TeamsClient | None"
         return None
 
     if not HAS_JWT:
-        msg = "PyJWT not installed (pip install 'kirocrew[teams]')"
+        hint = extras.install_hint("teams")
+        msg = f"PyJWT not installed ({hint})"
         logger.error(
             "Teams channel is enabled but PyJWT is missing; inbound JWT "
-            "validation is impossible. Install the extra: pip install "
-            "'kirocrew[teams]'. Skipping Teams."
+            "validation is impossible. Install it with: %s. Skipping Teams.",
+            hint,
         )
         if orch.dashboard_state is not None:
             orch.dashboard_state.teams_connect_error = msg
@@ -88,6 +90,10 @@ async def maybe_start_teams(orch: "GatewayOrchestrator") -> "TeamsClient | None"
             agent=None,
             conv_log=getattr(orch, "conv_log", None),
             approval_mode=_resolve_approval_mode(orch),
+            # The allow-list decides `/sessions`' owner: a dashboard session is the
+            # operator's whole transcript, so it is listable only when exactly one
+            # identity is configured (see teams/session_resume.py).
+            allowed_emails=allowed_emails,
         )
         client = TeamsClient(
             app_id=app_id,
@@ -97,17 +103,36 @@ async def maybe_start_teams(orch: "GatewayOrchestrator") -> "TeamsClient | None"
         transport = TeamsTransport(
             client, allowed_emails=allowed_emails, dispatch=dispatcher.handle_message
         )
+        # The dispatcher's config applier pushes a reloaded allow-list at the
+        # transport, so it needs the handle the construction cycle above stopped
+        # it from receiving as a constructor argument.
+        dispatcher.transport = transport
         # Inbound: pre-registered webhook route -> state.teams_on_activity ->
         # client.on_activity (JWT validate) -> transport.receive (scope gate +
         # authorize + normalize) -> dispatcher.handle_message (shared TurnDriver).
         client.set_message_handler(transport.receive)
+        # A promptless install/join activity carries a routable address and no turn.
+        # Learning it here is what makes a freshly-installed app a proactive target
+        # before the user first types; the transport re-applies the scope + allow-list
+        # gates, so this records nothing an ordinary message would not have.
+        client.on_route = transport.note_route
         dispatcher.client = client
 
         if orch.dashboard_state is not None:
             state = orch.dashboard_state
             # Late-bind the webhook handler now that the client exists.
             state.teams_on_activity = client.on_activity
+            # BEFORE registering: registration is what makes this transport
+            # reachable from the proactive send ladder, whose recipient check is
+            # synchronous and refuses an unread route store. Loading first means no
+            # send is judged against an empty store, so neither a revoked recipient
+            # slips through nor a deliverable send is refused. Does not block the
+            # loop -- ensure_loaded does its own to_thread.
+            await transport.warm_routes()
             state.register_channel_transport(transport)
+            # Binding a session from Teams changes what the dashboard must show, so the
+            # picker needs a way to push a slots refresh.
+            dispatcher._session_resume.dashboard_state = state
 
             def _on_state(connected: bool, error: str) -> None:
                 state.teams_connected = connected
@@ -115,9 +140,14 @@ async def maybe_start_teams(orch: "GatewayOrchestrator") -> "TeamsClient | None"
 
             client.on_state_change = _on_state
 
-        # Prime the outbound token to validate credentials; sets the status
-        # badge via on_state_change. Never raises (contained in connect()).
-        await client.connect()
+        # Through the TRANSPORT, not the client directly: the transport's connect
+        # primes the outbound token (validating the credentials and setting the
+        # status badge via on_state_change, never raising) AND starts the
+        # serviceUrl store warm-up. Calling the client's connect alone silently
+        # skips the warm-up, which is what `configured_targets` -- a sync accessor
+        # that cannot load the store itself -- depends on to report a Teams
+        # destination as reachable after a restart.
+        await transport.connect()
         logger.info("Teams channel started (self-hosted webhook path).")
         return client
     except Exception as exc:

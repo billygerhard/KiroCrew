@@ -39,7 +39,7 @@ vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
 vi.mock('../pages/chat/CollapsibleToolGroup', () => ({ default: () => null }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
 vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
-vi.mock('../pages/chat', () => ({ ChatFooter: () => null, AssistantMessage: () => null, McpInfoButton: () => null }))
+vi.mock('../pages/chat', () => ({ ChatFooter: () => null, AssistantMessage: () => null, McpInfoButton: () => null, UserMessage: () => null, CronAckBar: () => null, NotificationItem: () => null, PinnedPrompt: () => null }))
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ChatSettings', () => ({ loadChatConfig: () => ({ contentWidth: 'compact' }), CONTENT_WIDTH: { compact: { messages: '900px', input: '916px' }, comfortable: { messages: '84%', input: '85%' }, full: { messages: '92%', input: '93%' } } }))
 
@@ -76,7 +76,11 @@ Object.defineProperty(window, 'matchMedia', {
 globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
 
 import ChatPage from '../pages/ChatPage'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { i18nT } from '../i18n/t'
 import { api } from '../api/client'
+import { __resetErrorJournalForTests, recordError } from '../utils/errorReport'
 
 /** Slot keys `chatSlotDetail` was asked for — i.e. which sessions got fetched. */
 function detailCalls(): string[] {
@@ -115,17 +119,25 @@ function renderChatPage(opts: {
   slots?: ChatSlot[]
   /** Render the companion-panel variant on a HOST route (see the noUrlSync suite). */
   hostEmbed?: { noUrlSync?: boolean }
+  /** Transcript already in the store, plus the slot its paging cursor describes. */
+  messages?: RootState['chat']['messages']
+  slotCursorKey?: string | null
+  /** Has the slot list arrived? Defaults to `slots.length > 0`, the invariant a
+   *  real boot holds: the flag is set by the writer that delivers the list. Pass
+   *  false with a populated list only to model the pre-arrival window. */
+  slotsLoaded?: boolean
 }) {
-  const { route = '/chat', entries, mode, activeSlot = null, slots = [], hostEmbed } = opts
+  const { route = '/chat', entries, mode, activeSlot = null, slots = [], hostEmbed,
+          messages = [], slotCursorKey = null, slotsLoaded = slots.length > 0 } = opts
   const preload: PreloadState = {
     dashboard: {
-      status: { platform: 'darwin' }, connected: true, slots, approvalMode: 'normal',
+      status: { platform: 'darwin' }, connected: true, slots, slotsLoaded, approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
     },
     chat: {
-      activeSlot, messages: [], slotRunning: false, slotStopping: false, slotState: 'idle',
+      activeSlot, messages, slotCursorKey, slotRunning: false, slotStopping: false, slotState: 'idle',
       slotStatusDetail: {}, slotHasMore: false, slotOldestIndex: 0, loadingOlder: false,
       lastChunkSeq: undefined, history: [], historyHasMore: false, historyOffset: 0,
       pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
@@ -164,6 +176,7 @@ function renderChatPage(opts: {
 
 beforeEach(() => {
   localStorage.clear()
+  __resetErrorJournalForTests()
   currentUrl = ''
 })
 
@@ -185,6 +198,91 @@ const orchSlots = [
   slot('orch-1-100', 'Plan migration', 'orchestrator'),
   slot('orch-2-200', 'Review design', 'orchestrator'),
 ]
+
+/** A ?msg= deep link must survive the slot switch it arrives with. The effect
+ *  reads `state.chat.messages`, which still holds the OUTGOING chat until the
+ *  switch settles — so without a slot-identity gate the target is "not found"
+ *  in the wrong transcript, the one-shot ref is spent, and the jump is lost. */
+describe('ChatPage ?sid= + ?msg= deep link across a slot switch', () => {
+  const slots: ChatSlot[] = [
+    { key: 'chat-1-100', title: 'short chat', agent: 'a', mode: 'chat' } as ChatSlot,
+    { key: 'chat-2-200', title: 'long chat', agent: 'a', mode: 'chat' } as ChatSlot,
+  ]
+  /** A complete window for the chat being LEFT. The deep-link target belongs to
+   *  the requested chat, so it is legitimately absent from this array. */
+  const outgoing = [
+    { role: 'user', content: 'a', ts: '2026-01-01T00:00:00Z' },
+    { role: 'assistant', content: 'b', ts: '2026-01-01T00:00:01Z' },
+  ] as RootState['chat']['messages']
+  const DEEP_LINK = '/chat?sid=chat-2-200&msg=2025-06-01T00%3A00%3A00Z'
+
+  it('does not declare the target unavailable while the requested chat is still activating', async () => {
+    renderChatPage({ route: DEEP_LINK, activeSlot: 'chat-1-100', slots, messages: outgoing, slotCursorKey: 'chat-1-100' })
+    // The outgoing window is complete, so an ungated hand-off hits the dead-end
+    // branch and paints a false notice against a chat the link never named.
+    await new Promise(r => setTimeout(r, 250))
+    // Matched on "no longer", which BOTH unavailability notices still share: a
+    // matcher tied to wording only one of them carries would pass vacuously here.
+    expect(screen.queryByText(/no longer/i)).toBeNull()
+  })
+
+  it('acts on the deep link once the window belongs to the requested chat (control)', async () => {
+    // Target absent from a window whose extent is known, so the hand-off is
+    // correct to make here and the gate must not suppress it.
+    renderChatPage({ route: DEEP_LINK, activeSlot: 'chat-2-200', slots, messages: outgoing, slotCursorKey: 'chat-2-200' })
+    const notice = await screen.findByText(/no longer/i)
+    // Both strings share "no longer", so the pin word is what discriminates:
+    // this reader followed a link and may never have pinned anything.
+    expect(notice.textContent).not.toMatch(/pinned/i)
+  })
+
+  /** A same-tick twin: identical `ts`, different `mid`. The helper falls back to ts
+   *  when the requested mid is absent, which on a bounded page is a DIFFERENT row. */
+  const SAME_TICK = [
+    { role: 'user', content: 'a', ts: '2026-01-01T00:00:00Z' },
+    { role: 'assistant', content: 'twin', ts: '2025-06-01T00:00:00Z', meta: { mid: 'mid-other' } },
+  ] as RootState['chat']['messages']
+
+  it('hands off when the requested mid is off-page, rather than taking a same-ts twin', async () => {
+    // Accepting the twin highlights the wrong message with no signal at all, which is
+    // strictly worse than paging: the mid exists to discriminate exactly this pair.
+    renderChatPage({ route: `${DEEP_LINK}&mid=mid-offpage`, activeSlot: 'chat-2-200', slots, messages: SAME_TICK, slotCursorKey: 'chat-2-200' })
+    expect(await screen.findByText(/no longer/i)).toBeTruthy()
+  })
+
+  it('still resolves a legacy link carrying NO mid, by ts alone', async () => {
+    // Opposite direction: the ts fallback is what the helper documents for older links,
+    // so a guard that also rejected THEM would be worse than the defect it fixes.
+    renderChatPage({ route: DEEP_LINK, activeSlot: 'chat-2-200', slots, messages: SAME_TICK, slotCursorKey: 'chat-2-200' })
+    await new Promise(r => setTimeout(r, 250))
+    expect(screen.queryByText(/no longer/i)).toBeNull()
+  })
+})
+
+/** A transient paging error must not be reported with permanent-deletion copy. The
+ *  `earlier` origin already had a retry string; the `link` origin this PR introduces
+ *  fell through to the not-found writer, so a network blip told a reader following a
+ *  live link that the message was gone. Asserted on source text because the routing
+ *  ternary is shared with the pin path, whose own suite pins it the same way.
+ */
+describe('paging-failure notice by jump origin', () => {
+  const GONE = /no longer/i
+  const src = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+
+  it('routes the link origin to the retry copy, not to the not-found writer', () => {
+    expect(src).toContain("pendingPinnedJump.origin === 'earlier' || pendingPinnedJump.origin === 'link'")
+    // Positive control for the matcher: the retry string it selects is real copy.
+    expect(i18nT('components.chatPane.earlier_messages_load_failed')).toMatch(/try again/i)
+    expect(i18nT('components.chatPane.earlier_messages_load_failed')).not.toMatch(GONE)
+  })
+
+  it('keeps the not-found copy permanent-phrased, so the pair stays distinguishable', () => {
+    // Negative control: satisfying the test above by making the NOT-FOUND copy
+    // retryable would be a different regression, so it must still read permanent.
+    expect(i18nT('pages.chat.deepLink.message_unavailable')).toMatch(GONE)
+    expect(i18nT('pages.chat.pins.message_unavailable')).toMatch(GONE)
+  })
+})
 
 describe('ChatPage ?sid= URL parameter', () => {
   describe('URL sync on active slot', () => {
@@ -268,6 +366,97 @@ describe('ChatPage ?sid= URL parameter', () => {
       expect(screen.getByText(/session "nonexistent" not found/i)).toBeTruthy()
       vi.useRealTimers()
     })
+
+    /** The timer measures "the list lacks this key", so it must not start before
+     *  the list exists. Firing is one-way — it clears `initialSidRef` — so a list
+     *  arriving after the deadline finds nothing left to resolve, and the banner
+     *  denies a session that is live. Only a reopen recovers, which is what makes
+     *  this read to the user as an intermittent "not found" on a good link. */
+    it('does not declare a session missing while the slot list has not arrived', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+
+      await act(async () => { store.dispatch(sseSlots([slot('chat-9-900', 'Late Session')])) })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(store.getState().chat.activeSlot).toBe('chat-9-900')
+      vi.useRealTimers()
+    })
+
+    /** A slot list can be authoritative for what it carries without being the
+     *  final restored list. If a later frame proves the linked session is live,
+     *  the deadline's stale verdict must be withdrawn and the link resolved. */
+    it('withdraws not found when a later slot frame carries the key', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-9-900')
+      vi.useRealTimers()
+    })
+
+    /** A late list entry proves the key exists, but its transcript can still fail
+     *  to load. Recovery must replace the stale not-found verdict with the
+     *  existing open-session failure instead of clearing every visible error. */
+    it('keeps a visible error when the late session detail cannot load', async () => {
+      vi.useFakeTimers()
+      const report = recordError({
+        source: 'api',
+        message: 'detail load failed',
+        status: 503,
+        code: 'slot_detail_failed',
+        endpoint: '/api/chat/slots/chat-9-900',
+      })
+      vi.mocked(api.chatSlotDetail).mockRejectedValueOnce(new Error(report.message))
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(screen.getByText(
+        i18nT('store.chatSlice.session_open_error_named', { name: 'Late Session' }),
+      )).toBeTruthy()
+      expect(screen.getAllByRole('alert')).toHaveLength(1)
+      expect(store.getState().chat.switchSlotGone?.report).toMatchObject({
+        endpoint: '/api/chat/slots/chat-9-900',
+        status: 503,
+        code: 'slot_detail_failed',
+      })
+      vi.useRealTimers()
+    })
+
+    /** Control for the recovery above: repeated authoritative frames that omit
+     *  the key do not revoke the missing-session verdict. */
+    it('keeps not found while later slot frames still omit the key', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({ route: '/chat?sid=chat-9-900', slots: [], slotsLoaded: false })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { store.dispatch(sseSlots([...slots])) })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+      expect(store.getState().chat.activeSlot).not.toBe('chat-9-900')
+      vi.useRealTimers()
+    })
   })
 
   // Regression: loading on a chat URL (?sid= present) must not freeze switching.
@@ -275,6 +464,54 @@ describe('ChatPage ?sid= URL parameter', () => {
   // flight, the deep-link load would trip the POP bail so the first switch never
   // updated the URL until a reload; loading at /chat (no ?sid) hides that.
   describe('switch after deep-link load (Mesh chat-switch bug)', () => {
+
+    /** Revoking the stale verdict must not undo a session choice made after the
+     *  deadline. The late frame clears the lie but leaves the user where they went. */
+    it('does not override a user switch when the denied slot arrives later', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+      vi.useRealTimers()
+    })
+
+    it('does not override a user who switches away and back before the denied slot arrives', async () => {
+      vi.useFakeTimers()
+      const { store } = renderChatPage({
+        route: '/chat?sid=chat-9-900',
+        activeSlot: 'chat-1-100',
+        slots: [],
+        slotsLoaded: false,
+      })
+      await act(async () => { store.dispatch(sseSlots(slots)) })
+      await vi.advanceTimersByTimeAsync(5100)
+      expect(screen.getByText(/session "chat-9-900" not found/i)).toBeTruthy()
+
+      await act(async () => { await store.dispatch(switchSlot('chat-2-200')) })
+      await act(async () => { await store.dispatch(switchSlot('chat-1-100')) })
+      await act(async () => {
+        store.dispatch(sseSlots([...slots, slot('chat-9-900', 'Late Session')]))
+      })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(screen.queryByText(/session "chat-9-900" not found/i)).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe('chat-1-100')
+      vi.useRealTimers()
+    })
+
     it('updates URL when switching sessions after loading with ?sid= present', async () => {
       const { store } = renderChatPage({ route: '/chat/fix-login-bug?sid=chat-2-200', slots })
       await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))

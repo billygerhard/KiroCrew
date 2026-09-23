@@ -20,6 +20,7 @@ const PANE_SCREEN_RECORDING = 'x-apple.systempreferences:com.apple.preference.se
 const GRANTED = 'granted'
 const MISSING = 'missing'
 const DARWIN = 'macos'
+const WINDOWS = 'windows'
 
 /** Catalog KEY for each of the backend's permission tokens. The raw values are wire
  *  vocabulary (`missing`, `unsupported`, `unknown`) and read as jargon in a badge.
@@ -235,19 +236,46 @@ export function ComputerUsePanel() {
   }
 
   // Platform tag on the section header, shown in EVERY state (loading, error,
-  // supported, unsupported). Computer use has a macOS-only driver — the Windows
-  // and Linux backends are typed refusals — so the panel says so up front rather
-  // than only after the reason text on an unsupported host. On macOS it still
-  // reads correctly: it tells the operator this capability does not follow them
-  // to another OS.
-  const macOnlyBadge = <Badge variant="muted">{i18nT('pages.settings.computerUsePanel.macos_only')}</Badge>
+  // supported, unsupported), so it states the platform reality up front rather
+  // than only in the unsupported-host reason text.
+  //
+  // Both supported platforms drive the full tool set, but they differ in a way the
+  // operator has to know BEFORE enabling: on macOS an element-addressed action is
+  // delivered per-process, while Windows has no per-process input at all — so a
+  // keystroke there takes the operator's keyboard focus and a coordinate click moves
+  // their real cursor. The badge names that, because it is the operator's own
+  // machine and nothing else on this panel would tell them.
+  //
+  // Until `cfg` loads the platform is UNKNOWN, and no badge is shown for it. The
+  // macOS-only wording is not a conservative fallback, it is a false statement on two
+  // of the three platforms: a Windows operator who hits the error branch would be told
+  // the feature is macOS-only and stop, and a Linux one would read the same claim
+  // beside a reason that says otherwise. An absent badge withholds a fact; a wrong one
+  // ends the operator's attempt. `cfg` is also read in the pre-`cfg` states below,
+  // hence the optional chain.
+  const platformBadge = (() => {
+    if (!cfg?.supported) return undefined
+    if (cfg.platform === WINDOWS) {
+      return <Badge variant="muted">{i18nT('pages.settings.computerUsePanel.takes_focus_and_cursor')}</Badge>
+    }
+    if (cfg.platform === DARWIN) {
+      return <Badge variant="muted">{i18nT('pages.settings.computerUsePanel.macos_only')}</Badge>
+    }
+    return undefined
+  })()
 
   if (cfgQ.isError) {
     return (
-      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={macOnlyBadge}>
+      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={platformBadge}>
         <SettingsCard>
-          <div className="text-[13px] text-danger">
-            {i18nT('pages.settings.computerUsePanel.could_not_load_computer_use_settings')}{' '}
+          <div className="flex flex-wrap items-center gap-3">
+            <ErrorNotice
+              className="flex-1 min-w-[16rem]"
+              message={i18nT('pages.settings.computerUsePanel.could_not_load_computer_use_settings')}
+              askAgent
+            />
+            {/* Retry stays beside the notice: a refetch is the cheap first move,
+                the hand-off is for when it keeps failing. */}
             <Btn onClick={() => cfgQ.refetch()}>{i18nT('pages.settings.computerUsePanel.retry')}</Btn>
           </div>
         </SettingsCard>
@@ -257,7 +285,7 @@ export function ComputerUsePanel() {
 
   if (!cfg) {
     return (
-      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={macOnlyBadge}>
+      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={platformBadge}>
         <SettingsCard><FormSkeleton rows={['toggle', 'field', 'field']} /></SettingsCard>
       </SettingsSection>
     )
@@ -265,7 +293,7 @@ export function ComputerUsePanel() {
 
   if (!cfg.supported) {
     return (
-      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={macOnlyBadge}>
+      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={platformBadge}>
         <SettingsCard>
           <div className="text-[13px] text-muted">
             {cfg.reason || i18nT('pages.settings.computerUsePanel.computer_use_not_available', { platform: cfg.platform })}
@@ -277,20 +305,25 @@ export function ComputerUsePanel() {
 
   return (
     <>
+      {/* No hand-off: `draftNodes` / `draftWidth` are live numeric drafts. A
+          hand-off click blurs the field, which commits the draft and STARTS the
+          save — if that save then fails after the navigation has unmounted this
+          panel, the typed limit is gone with nothing on screen to say so. */}
       <ErrorNotice message={saveError} className="mb-4 animate-rise" />
 
       {/* A hand-edited keystone whose app lists could not be parsed. The page
           renders anyway — on purpose, because this is the only UI that can repair
           the file — but it must SAY so: the lists below come back empty in this
           state, and an empty allow-list otherwise reads as "no restriction
-          configured", which is the opposite of what the operator wrote. */}
-      {cfg.policy_error && (
-        <div className="mb-4 rounded-lg border border-warn/20 bg-warn/10 p-3 animate-rise">
-          <span className="text-[13px] text-text">{i18nT('pages.settings.computerUsePanel.the_app_lists_in_computer_use_json_could_not_be')}</span>
-        </div>
-      )}
+          configured", which is the opposite of what the operator wrote.
+          No hand-off: the `draftNodes` / `draftWidth` fields below share this
+          panel — the navigation would unmount a half-typed limit. */}
+      <ErrorNotice
+        message={cfg.policy_error ? i18nT('pages.settings.computerUsePanel.the_app_lists_in_computer_use_json_could_not_be') : null}
+        className="mb-4 animate-rise"
+      />
 
-      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={macOnlyBadge}>
+      <SettingsSection title={i18nT('pages.settings.computerUsePanel.computer_use')} badge={platformBadge}>
         <SettingsCard>
           <SettingsToggle
             label={i18nT('pages.settings.computerUsePanel.enable_computer_use')}
@@ -323,12 +356,20 @@ export function ComputerUsePanel() {
           {cfg.enabled && (
             <div className="pt-1 text-[13px] text-muted">{i18nT('pages.settings.computerUsePanel.computer_use_lets_the_agent_read_any_app_window')}</div>
           )}
+          {/* The paragraph above is written for the per-process case: "leave your
+              pointer alone" is true on macOS and not on Windows, where there is no
+              per-process input route at all. The badge names the two nouns; this says
+              what actually happens to the operator, which is the fact they need before
+              enabling and the one nothing else on this panel states. */}
+          {cfg.enabled && cfg.platform === WINDOWS && (
+            <div className="pt-1 text-[13px] text-muted">{i18nT('pages.settings.computerUsePanel.on_windows_keystrokes_take_your_keyboard_focus')}</div>
+          )}
         </SettingsCard>
       </SettingsSection>
 
       {cfg.platform === DARWIN && (
         <SettingsSection title={i18nT('pages.settings.computerUsePanel.permissions')}>
-          <SettingsCard>
+          <SettingsCard index={1}>
             <div className="flex items-center gap-1.5 pb-1 text-[13px] text-muted">
               <span>{i18nT('pages.settings.computerUsePanel.advisory_only')}</span>
               <InfoTip text={i18nT('pages.settings.computerUsePanel.not_detected_does_not_always_mean_unavailable_ma')} />
@@ -343,7 +384,7 @@ export function ComputerUsePanel() {
       )}
 
       <SettingsSection title={i18nT('pages.settings.computerUsePanel.limits')}>
-        <SettingsCard>
+        <SettingsCard index={2}>
           <div className="pb-2 text-[13px] text-muted">{i18nT('pages.settings.computerUsePanel.how_much_of_a_window_the_agent_reads_at_once_the')}</div>
           <SettingsInput
             label={i18nT('pages.settings.computerUsePanel.max_tree_nodes')}

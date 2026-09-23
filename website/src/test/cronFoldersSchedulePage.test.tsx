@@ -27,7 +27,10 @@ vi.mock('../api/client', () => ({
     cancelCron: vi.fn().mockResolvedValue({}),
     cronToChat: vi.fn().mockResolvedValue({}),
     kirocrewAgents: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    agentCatalog: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
+    // The page now SAYS when the default-agent read fails; an unmocked
+    // `api.defaultAgent` would surface that notice in every case here.
+    defaultAgent: vi.fn().mockResolvedValue({ default_agent: '' }),
     cronFolders: vi.fn().mockResolvedValue([]),
     createCronFolder: vi.fn().mockResolvedValue({ id: 'new-folder', name: 'Test', order: 1 }),
     updateCronFolder: vi.fn().mockResolvedValue({}),
@@ -118,7 +121,7 @@ describe('SchedulePage cron folders', () => {
     expect(screen.getByText('1 job')).toBeInTheDocument()
   })
 
-  it('renders move-to-folder button with aria-label in job action row', async () => {
+  it('exposes move-to-folder inside the row overflow menu', async () => {
     const { api } = await import('../api/client')
     vi.mocked(api).crons.mockResolvedValue({
       jobs: [mkJob('j1', 'Moveable Job')],
@@ -128,8 +131,14 @@ describe('SchedulePage cron folders', () => {
     renderWithProviders(<SchedulePage />)
     await waitFor(() => expect(screen.getByText('Moveable Job')).toBeInTheDocument())
 
-    const moveBtn = screen.getByLabelText('Move to folder')
-    expect(moveBtn).toBeInTheDocument()
+    // Move is no longer a row button — it lives behind the ⋯ menu, which is what
+    // keeps the actions column inside the table's width.
+    expect(screen.queryByLabelText('Move to folder')).not.toBeInTheDocument()
+
+    const overflow = screen.getByLabelText('Actions')
+    fireEvent.keyDown(overflow, { key: 'Enter' })
+
+    await waitFor(() => expect(screen.getByText('Move to folder')).toBeInTheDocument())
   })
 
   it('delete folder shows inline confirmation row', async () => {
@@ -151,7 +160,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm row should appear
-    await waitFor(() => expect(screen.getByText(/Delete "My Folder"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “My Folder”\? Jobs will be ungrouped\./)).toBeInTheDocument())
   })
 
   it('hides empty folders when filter is active (omitEmpty)', async () => {
@@ -253,7 +262,11 @@ describe('SchedulePage cron folders', () => {
     expect(input.className).toContain('focus-ring')
   })
 
-  it('move-to-folder button is positioned before delete button', async () => {
+  it('keeps the row action cell to three controls so the column fits', async () => {
+    // The width contract. Six controls per row (Strict, Run, View, Pause, Move,
+    // Delete) did not fit a 10-column table: the cell was clipped, and once
+    // cells stopped wrapping the whole column left the viewport. Only Run,
+    // Delete and the ⋯ menu may live in the row.
     const { api } = await import('../api/client')
     vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob('j1', 'Ordered Job')] })
     vi.mocked(api).cronFolders.mockResolvedValue([{ id: 'f1', name: 'Folder', order: 1 }])
@@ -261,17 +274,11 @@ describe('SchedulePage cron folders', () => {
     renderWithProviders(<SchedulePage />)
     await waitFor(() => expect(screen.getByText('Ordered Job')).toBeInTheDocument())
 
-    // Get the actions cell (last td in the row)
-    const moveBtn = screen.getByLabelText('Move to folder')
-    const actionCell = moveBtn.closest('td')!
-    const buttons = actionCell.querySelectorAll('button')
-    const btnArray = Array.from(buttons)
-    const moveIdx = btnArray.indexOf(moveBtn as HTMLButtonElement)
-    // Find the delete button (last danger button)
-    const deleteBtn = btnArray.find(b => b.textContent === 'Delete' && b.className.includes('danger'))
-    const deleteIdx = deleteBtn ? btnArray.indexOf(deleteBtn) : -1
-    // Move button should come before delete button
-    expect(moveIdx).toBeLessThan(deleteIdx)
+    const overflow = screen.getByLabelText('Actions')
+    const actionCell = overflow.closest('td')!
+    const labels = Array.from(actionCell.querySelectorAll('button'))
+      .map(b => b.textContent?.trim() || b.getAttribute('aria-label'))
+    expect(labels).toEqual(['Run', 'Delete', 'Actions'])
   })
 
   it('folder headers visible with zero jobs when cronFolders exist', async () => {
@@ -302,8 +309,10 @@ describe('SchedulePage cron folders', () => {
     // Jobs should render despite folders failure
     await waitFor(() => expect(screen.getByText('Resilient Job')).toBeInTheDocument())
     expect(screen.getByText('Also Visible')).toBeInTheDocument()
-    // No page-level error shown
-    expect(screen.queryByText('Folders API down')).not.toBeInTheDocument()
+    // The failure is SAID, not swallowed: a folder-level notice sits above the
+    // still-rendered list (targeted by testId — the page can show more than
+    // one notice) instead of the page-level load error replacing the jobs.
+    expect(await screen.findByTestId('schedule-folders-error')).toHaveTextContent('Folders API down')
   })
 
   it('auto-expands target folder when moving a job into a collapsed folder (#3)', async () => {
@@ -332,9 +341,12 @@ describe('SchedulePage cron folders', () => {
     expect(storedBefore).toBeTruthy()
     expect(JSON.parse(storedBefore!)).toContain('f1')
 
-    // Trigger the move via the move menu button + keyboard open (Radix needs this in jsdom)
-    const moveBtn = screen.getByLabelText('Move to folder')
-    fireEvent.keyDown(moveBtn, { key: 'Enter' })
+    // Trigger the move through the row's ⋯ menu, then its Move-to-folder
+    // submenu (Radix needs keyboard-open in jsdom for both levels).
+    const overflow = screen.getByLabelText('Actions')
+    fireEvent.keyDown(overflow, { key: 'Enter' })
+    const subTrigger = await screen.findByText('Move to folder')
+    fireEvent.keyDown(subTrigger, { key: 'ArrowRight' })
 
     // Wait for menu items to appear and click the folder option
     await waitFor(() => {
@@ -443,7 +455,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm row should appear (not immediately deleted)
-    await waitFor(() => expect(screen.getByText(/Delete "DeleteMe"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “DeleteMe”\? Jobs will be ungrouped\./)).toBeInTheDocument())
     expect(vi.mocked(api).deleteCronFolder).not.toHaveBeenCalled()
 
     // Confirm the delete
@@ -472,7 +484,7 @@ describe('SchedulePage cron folders', () => {
     fireEvent.click(screen.getByText('Delete folder'))
 
     // Confirm
-    await waitFor(() => expect(screen.getByText(/Delete "ErrFolder"\? Jobs will be ungrouped\./)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/Delete “ErrFolder”\? Jobs will be ungrouped\./)).toBeInTheDocument())
     const confirmDeleteBtn = screen.getAllByRole('button').find(b => b.textContent === 'Delete "ErrFolder"' && b.className.includes('danger'))
     fireEvent.click(confirmDeleteBtn!)
 
@@ -512,8 +524,11 @@ describe('SchedulePage cron folders', () => {
     renderWithProviders(<SchedulePage />)
     await waitFor(() => expect(screen.getByText('Some Job')).toBeInTheDocument())
 
-    // Open the move menu
-    const moveBtn = screen.getByLabelText('Move to folder')
+    // Exercised through the BATCH toolbar: that is `CronJobMoveMenu`'s remaining
+    // call site. The row's own move affordance is now a submenu inside the ⋯
+    // menu (see CronRowActions), which builds its items separately.
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select Some Job/ }))
+    const moveBtn = await screen.findByLabelText('Move to folder')
     fireEvent.keyDown(moveBtn, { key: 'Enter' })
 
     // Wait for menu to open
@@ -561,11 +576,12 @@ describe('SchedulePage cron folders', () => {
       fireEvent.click(targetItem!)
     })
 
-    // Error should render near the toolbar
+    // Error should render near the toolbar, through the shared ErrorNotice
+    // (role="alert"; the message no longer sits on a text-danger span of its own).
     await waitFor(() => {
-      const errorEl = screen.getByText(/could not be moved/)
-      expect(errorEl).toBeInTheDocument()
-      expect(errorEl.className).toContain('text-danger')
+      const errorEl = screen.getByTestId('schedule-batch-move-error')
+      expect(errorEl).toHaveAttribute('role', 'alert')
+      expect(errorEl).toHaveTextContent(/could not be moved/)
     })
   })
 })

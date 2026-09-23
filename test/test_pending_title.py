@@ -75,10 +75,6 @@ class TestFallbackTitle:
         assert not out[:-1].endswith(" ")
         assert long.startswith(out[:-1])
 
-    def test_strips_browse_marker(self):
-        msgs = [{"role": "user", "content": "[BROWSE] check something"}]
-        assert _fallback_title_from_messages(msgs) == "check something"
-
     def test_strips_image_attachment_and_keeps_user_text(self):
         attachment = f"![image](/Users/example/.kirocrew/uploads/{'b' * 240}.jpg)"
         msgs = [{"role": "user", "content": f"{attachment}\n\nsubagents seem to be failing"}]
@@ -222,7 +218,7 @@ class TestAutoTitleInFlightGuard:
             release_first = asyncio.Event()
             attempts = []
 
-            async def _generate(_state, messages):
+            async def _generate(_state, messages, *, session_key: str = ""):
                 attempts.append(list(messages))
                 if len(attempts) == 1:
                     first_started.set()
@@ -348,8 +344,8 @@ class TestSkipFallbackBranch:
 class TestAutoTitleRunsForEveryMemoryMode:
     """Titling is not gated on ``memory_mode``.
 
-    It used to bail on ``slot.blocks_reads`` (true only for ``temporary``),
-    which left temporary tabs showing "New Session…" for their whole life.
+    It must not bail on ``slot.blocks_reads`` (true only for ``temporary``),
+    which would otherwise leave temporary tabs showing "New Session…" for their whole life.
     Titling reads only the slot's own messages, so no memory-privacy rule
     applies; the manual generate-title endpoint never had the guard either.
     """
@@ -362,7 +358,7 @@ class TestAutoTitleRunsForEveryMemoryMode:
         state = _fake_state()
         attempts = []
 
-        async def _generate(_state, messages):
+        async def _generate(_state, messages, *, session_key: str = ""):
             attempts.append(list(messages))
             return generated
 

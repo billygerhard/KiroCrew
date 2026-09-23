@@ -16,6 +16,7 @@ Property-based tests (Hypothesis) and unit tests for:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -31,9 +32,14 @@ from kiro_crew.subagent_persistence import (
     create_agent_folder,
     prune_stale_tombstones,
     read_state,
+    remember_live_cleanup_identity,
     update_state,
     write_tombstone,
 )
+
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 # ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -45,10 +51,27 @@ def agent_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-@pytest.fixture(autouse=True)
-def _mock_memory_ok(monkeypatch):
-    """Prevent memory guard from refusing spawns on low-RAM build machines."""
-    monkeypatch.setattr("kiro_crew.subagent.check_memory_available", lambda **_kw: (True, 8.0))
+@contextlib.asynccontextmanager
+async def _owning(manager):
+    """Close the durable task-queue store a ``SubagentManager`` opens at construction.
+
+    ``SubagentManager.__init__`` opens ``tasks.db`` under the test's data home --
+    three descriptors (the database, its WAL, its shared-memory index) plus a
+    writer thread -- and a gateway holds its one manager for the process
+    lifetime, so nothing on the manager's surface closes them again. Left open
+    they survive the test: +3 descriptors per constructed manager, and the
+    hypothesis-driven startup sweep below constructs one per example. Closing
+    waits for the off-loop open first; a close BEFORE the attach would let the
+    late-arriving store reopen the very handles this releases.
+    """
+    try:
+        yield manager
+    finally:
+        await asyncio.wait_for(manager.wait_taskq_ready(), 5)
+        manager._shutting_down = True
+        store = manager._taskq
+        if store is not None:
+            store.close()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -364,6 +387,7 @@ class TestSubagentManagerCleanupIntegration:
         sessions.reset = AsyncMock()
         sessions.record_success = MagicMock()
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.get_approval_policy = MagicMock(return_value="auto")
 
         ctx = MagicMock()
@@ -373,10 +397,11 @@ class TestSubagentManagerCleanupIntegration:
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("cleanup test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("cleanup test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Retain-by-default: release is called WITHOUT cleanup — session
         # files are spawn_continue's resume material; the tombstone pruner
@@ -412,6 +437,7 @@ class TestSubagentManagerCleanupIntegration:
         sessions.reset = AsyncMock()
         sessions.record_success = MagicMock()
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.get_approval_policy = MagicMock(return_value="auto")
 
         ctx = MagicMock()
@@ -421,10 +447,11 @@ class TestSubagentManagerCleanupIntegration:
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("error test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("error test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Even on error, release retains session files (retain-by-default).
         sessions.release.assert_called()
@@ -459,6 +486,7 @@ class TestSubagentManagerCleanupIntegration:
         sessions.reset = AsyncMock()
         sessions.record_success = MagicMock()
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.get_approval_policy = MagicMock(return_value="auto")
 
         ctx = MagicMock()
@@ -469,10 +497,11 @@ class TestSubagentManagerCleanupIntegration:
         on_done = AsyncMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx, on_done=on_done)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("cleanup fail test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("cleanup fail test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Completion should still succeed (on_done called) despite release raising
         on_done.assert_awaited_once()
@@ -555,9 +584,15 @@ class TestTombstonePruningCleansSessionFiles:
         if d.exists():
             shutil.rmtree(d)
 
-        # Create subagent folder with session_id in state
+        # Create a plain subagent folder with explicit non-retention and session identity.
         create_agent_folder(agent_id, task="old task")
-        update_state(agent_id, session_id=session_id, provider="acp")
+        update_state(agent_id, session_id=session_id, provider="acp", keep=False)
+        remember_live_cleanup_identity(
+            agent_id,
+            session_id=session_id,
+            provider="acp",
+            keep=False,
+        )
 
         # Write an old tombstone (8 days ago)
         write_tombstone(agent_id, cause="timeout", recovery_action="delivered")
@@ -622,7 +657,7 @@ class TestStartupSweep:
     async def test_startup_sweep_processes_all_entries(self, tmp_path, agent_root, session_ids):
         """**Validates: Requirements 5.2, 5.4 (amended by retain-by-default)**
 
-        Orphan reconcile no longer deletes session files — an orphaned run's
+        Orphan reconcile does not delete session files — an orphaned run's
         transcript is spawn_continue resume material after a restart. The
         sweep must still tombstone every orphan; file deletion is owned by
         the tombstone pruner.
@@ -645,11 +680,12 @@ class TestStartupSweep:
         sessions = MagicMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
 
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
-        ):
-            await manager._reconcile_orphans()
+        async with _owning(manager):
+            with (
+                patch.object(manager, "_is_pid_alive", return_value=False),
+                patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
+            ):
+                await manager._reconcile_orphans()
 
         # Retain-by-default: session files are NOT deleted at reconcile time.
         mock_cleanup.assert_not_called()
@@ -666,7 +702,7 @@ class TestStartupSweep:
         """Reconcile processes every orphan; session files are retained.
 
         Validates: Requirements 5.4 (amended by retain-by-default: reconcile
-        no longer deletes session files, so per-entry cleanup failures can't
+        does not delete session files, so per-entry cleanup failures can't
         occur here — the invariant is that every orphan is still tombstoned).
         """
         from kiro_crew.subagent import SubagentManager
@@ -681,11 +717,12 @@ class TestStartupSweep:
         sessions = MagicMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
 
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
-        ):
-            await manager._reconcile_orphans()
+        async with _owning(manager):
+            with (
+                patch.object(manager, "_is_pid_alive", return_value=False),
+                patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
+            ):
+                await manager._reconcile_orphans()
 
         mock_cleanup.assert_not_called()
         assert (_adir("fail-orphan") / "tombstone.json").exists()

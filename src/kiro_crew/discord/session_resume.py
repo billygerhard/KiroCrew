@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
-import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from kiro_crew.history import INCOGNITO_MEMORY_MODES
 from kiro_crew.messaging.driver import sanitize_channel_replay_text
 from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.session_resume import ResumeReleaseError  # noqa: F401  (re-export)
+from kiro_crew.messaging.session_resume import (
+    PICKER_LIMIT,
+    InboundResolution,
+    ResumeCopy,
+    RoutingDecision,
+    SessionChoice,
+    SessionResumeController,
+    same_bucket_origin_keys,
+    session_title_of,
+)
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
     from kiro_crew.discord.client import DiscordClient, DiscordInteraction
@@ -22,54 +29,94 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_PICKER_LIMIT = 10
-#: Rows pulled from history before incognito/keying filters. Larger than
-#: _PICKER_LIMIT so filtered-out rows cannot starve the 10 button slots.
-_SEARCH_FETCH_LIMIT = 50
-_PICKER_TTL_SECS = 300
-_PICKER_REGISTRY_MAX = 100
 _REPLAY_MESSAGES = 5
 _REPLAY_TEXT_LIMIT = 1900
+#: Appended when a replayed message carried more than the preview shows, so the
+#: user can tell a shortened transcript entry from a complete one.
+_REPLAY_TRUNCATED = "\n… (truncated)"
+#: Budget held back per replayed message for the two-character role-icon prefix
+#: and the marker above, so a preview plus its scaffolding still fits the limit.
+_REPLAY_RESERVE = len(_REPLAY_TRUNCATED) + 2
+#: How Discord spells the two commands the shared refusals point at, and the noun for
+#: the place the user is in. The ONLY per-channel words in those messages.
+_DISCORD_COPY = ResumeCopy(
+    sessions_command="!sessions",
+    unlink_command="!unlink",
+    conversation_noun="Discord conversation",
+)
 
 
-@dataclass(frozen=True)
-class _SessionChoice:
-    key: str
-    title: str
+def _picker_owner(user_id: str, channel_id: str) -> str:
+    """The identity a Discord picker is scoped to.
+
+    One registry serves the whole gateway, so the channel has to be part of it: without
+    that, a press in one channel could resolve a list posted in another.
+    """
+    return f"{user_id}:{channel_id}"
 
 
-@dataclass
-class _SessionPicker:
-    user_id: str
-    channel_id: str
-    message_id: str
-    created_at: float
-    choices: tuple[_SessionChoice, ...]
+def _redact_discord_text(text: str) -> str:
+    """Redact credentials and exfiltration URLs, then defuse Discord mentions.
+
+    Mention defusing lengthens the text, so it runs before any budgeting: a
+    caller measuring the pre-defused string would under-count the payload.
+    """
+    clean, _ = redact_exfiltration_urls(text or "")
+    clean, _ = redact_credentials(clean)
+    return clean.replace("@", "@\u200b")
 
 
 def _safe_discord_text(text: str, max_chars: int) -> str:
-    """Redact full text, suppress Discord mentions, then truncate."""
-    clean, _ = redact_exfiltration_urls(text or "")
-    clean, _ = redact_credentials(clean)
-    clean = clean.replace("@", "@\u200b")
+    """Redact full text, suppress Discord mentions, then truncate.
+
+    For a short label (a session title, an error string). A Markdown BODY goes
+    through :func:`_replay_preview` instead, which shortens without cutting a
+    fenced code block in half.
+    """
+    clean = _redact_discord_text(text)
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 1] + "…"
 
 
-def _history_dashboard_key(raw_key: object) -> str | None:
-    """Restore the canonical dashboard session key from a JSONL file stem."""
-    key = str(raw_key or "")
-    if key.startswith("dashboard:"):
-        return key
-    if key.startswith("dashboard_"):
-        while key.startswith("dashboard_"):
-            key = key[len("dashboard_") :]
-        return f"dashboard:{key}" if key else None
-    return None
+async def _replay_preview(text: str, limit: int, *, reserve: int) -> str:
+    """A fence-safe preview of *text*, marked when it left content behind.
+
+    The replay is a bounded context preview, so a long transcript message is
+    still shortened — but a blind character slice can land inside a fenced code
+    block, and Discord then renders everything after it as literal backticks
+    instead of code. Taking the shared splitter's FIRST chunk shortens at a
+    boundary the fence grammar accepts: every chunk but the last is sealed, so
+    that chunk closes any block the cut opened and stands on its own.
+
+    The splitter is prefix-stable, so only a bounded prefix is needed to derive
+    its first sealed chunk. The bounded split still runs off the asyncio thread:
+    pathological delimiter input is finite but CPU-intensive, and transcript
+    replay must not pause unrelated Discord traffic while deriving a preview.
+
+    ``reserve`` is the caller's own scaffolding — the role icon, and the marker
+    below — held out of the splitter's budget so the assembled message still fits
+    ``limit``. A pathological opener can need more fence scaffolding than that
+    budget can hold. In that case the marker is safer than a blind API truncation
+    that would expose an unterminated fence.
+    """
+    redacted = _redact_discord_text(text)
+    probe = redacted[: max(1, limit) * 2]
+    probe_left_content = len(probe) < len(redacted)
+    chunks = await asyncio.to_thread(split_markdown_safe, probe, limit, reserve=reserve)
+    if not chunks:
+        return ""
+
+    first = chunks[0]
+    prefix_reserve = max(0, reserve - len(_REPLAY_TRUNCATED))
+    if len(chunks) == 1 and not probe_left_content:
+        return first if len(first) <= limit - prefix_reserve else _REPLAY_TRUNCATED
+    if len(first) > limit - reserve:
+        return _REPLAY_TRUNCATED
+    return first + _REPLAY_TRUNCATED
 
 
-def _picker_components(nonce: str, choices: tuple[_SessionChoice, ...]) -> list[dict]:
+def _picker_components(nonce: str, choices: tuple[SessionChoice, ...]) -> list[dict]:
     rows: list[dict] = []
     buttons: list[dict] = []
     for index, choice in enumerate(choices):
@@ -89,8 +136,100 @@ def _picker_components(nonce: str, choices: tuple[_SessionChoice, ...]) -> list[
     return rows
 
 
+class _DiscordResumeSurface:
+    owner_refusal = (
+        "🔒 `!sessions` requires exactly one configured " "`discord.allowed_user_ids` entry."
+    )
+    choice_owner_refusal = "🔒 Session resume is owner-only."
+    choice_expired = "⌛ This session picker expired. Run `!sessions` again."
+    choice_missing = "That session is no longer available. Run `!sessions` again."
+    choice_expectation_failed = (
+        "⚠️ Couldn't save which conversation this channel is linked to, "
+        "so the session was NOT resumed. Run `!sessions` to try again."
+    )
+    choice_claim_lost = (
+        "🧵 Another session just connected here. "
+        "Run `!unlink`, then `!sessions` to resume this one."
+    )
+    choice_binding_failed = "⚠️ Couldn't resume that session. Run `!sessions` to try again."
+
+    def __init__(self, client: "DiscordClient", channel_id: str) -> None:
+        self.client = client
+        self.channel_id = channel_id
+        self.expectation_id = channel_id
+
+    def display_safe(self, text: str, max_chars: int) -> str:
+        return _safe_discord_text(text, max_chars)
+
+    def no_choices(self, query: str) -> str:
+        normalized = " ".join(query.casefold().split())
+        if normalized:
+            label = _safe_discord_text(" ".join(query.split()), 100).replace("`", "ˋ")
+            return (
+                f"No sessions matched `{label}`. Try fewer words, "
+                f"or run `!sessions` to see up to {PICKER_LIMIT} recent sessions."
+            )
+        return "No recent sessions."
+
+    def picker_heading(self, query: str, total: int) -> str:
+        normalized = " ".join(query.casefold().split())
+        if normalized:
+            label = _safe_discord_text(" ".join(query.split()), 100).replace("`", "ˋ")
+            if total > PICKER_LIMIT:
+                summary = f"Showing {PICKER_LIMIT} of {total} matching sessions"
+            else:
+                summary = (
+                    f"Showing {total} matching session"
+                    f"{'s' if total != 1 else ''} (maximum {PICKER_LIMIT})"
+                )
+            return (
+                "🔎 **Session search**\n"
+                f"{summary} for `{label}`, ranked over titles and message content."
+            )
+        if total > PICKER_LIMIT:
+            summary = f"Showing {PICKER_LIMIT} of {total} most recent sessions."
+        else:
+            summary = (
+                f"Showing {total} most recent session"
+                f"{'s' if total != 1 else ''} (maximum {PICKER_LIMIT})."
+            )
+        return f"🧵 **Recent sessions**\n{summary}"
+
+    def choice_success(self, choice: SessionChoice) -> str:
+        return (
+            f"🔄 Resumed: {choice.title}\n"
+            "Continue here. Send `!unlink` to return to your Discord conversation."
+        )
+
+    async def post_picker(
+        self,
+        heading: str,
+        nonce: str,
+        choices: tuple[SessionChoice, ...],
+    ) -> str:
+        message_id = await self.client.send_message(
+            self.channel_id,
+            f"{heading}\n"
+            "Choose one to continue here. Use `!unlink` to return to your "
+            "Discord conversation.",
+            components=_picker_components(nonce, choices),
+        )
+        return message_id or ""
+
+    async def settle_picker(self, message_id: str, text: str) -> bool:
+        return await self.client.edit_message(
+            self.channel_id,
+            message_id,
+            text,
+            components=[],
+        )
+
+    async def say(self, text: str) -> None:
+        await self.client.send_message(self.channel_id, text)
+
+
 class DiscordSessionResume:
-    """Lists dashboard sessions and binds one bidirectionally to Discord."""
+    """Lists dashboard + same-DM native sessions and binds one to Discord."""
 
     def __init__(
         self,
@@ -101,26 +240,39 @@ class DiscordSessionResume:
         self.sessions = sessions
         self.conv_log = conv_log
         self.owner_id = next(iter(allowed_user_ids)) if len(allowed_user_ids) == 1 else ""
-        self.pickers: dict[str, _SessionPicker] = {}
-        # Set by the gateway after construction (same pattern as ``client`` on
-        # the dispatcher). Binding a session from Discord changes what the
-        # dashboard must display -- without a push, an already-open dashboard
-        # shows no "driven from" chip until unrelated activity happens to
-        # refresh slots, which is exactly the window the chip exists to cover.
-        self.dashboard_state: object | None = None
-        self._bind_lock = asyncio.Lock()
+        self._controller = SessionResumeController(
+            sessions,
+            conv_log,
+            channel_type="discord",
+            copy=_DISCORD_COPY,
+            title_display=_safe_discord_text,
+        )
+        self.pickers = self._controller.pickers
+        self._binder = self._controller.binder
+        self._expectations = self._binder.expectations
+        self._bind_lock = self._binder.lock
+
+    @property
+    def dashboard_state(self) -> object | None:
+        return self._controller.dashboard_state
+
+    @dashboard_state.setter
+    def dashboard_state(self, state: object | None) -> None:
+        self._controller.dashboard_state = state
 
     def _push_slots(self) -> None:
-        """Nudge the dashboard so the two-way chip appears/disappears at once."""
-        state = self.dashboard_state
-        if state is None:
-            return
-        try:
-            push = getattr(state, "push_slots_update", None)
-            if callable(push):
-                push()
-        except Exception:
-            logger.debug("discord: slots push after binding change failed", exc_info=True)
+        self._controller.push_slots()
+
+    def reconfigure(self, allowed_user_ids: set[str]) -> None:
+        """Re-derive ``owner_id`` from a reloaded ``discord.allowed_user_ids``.
+
+        The copy of the allow-list that decides who may list dashboard sessions,
+        so it moves with the dispatcher's roster on the same reload: an operator
+        who adds a second identity loses ``!sessions`` immediately, not at the
+        next restart. Same one-identity rule as construction -- none or several
+        leaves ``owner_id`` empty and ``is_owner`` refuses everyone.
+        """
+        self.owner_id = next(iter(allowed_user_ids)) if len(allowed_user_ids) == 1 else ""
 
     def is_owner(self, user_id: str) -> bool:
         return bool(self.owner_id) and user_id == self.owner_id
@@ -129,39 +281,32 @@ class DiscordSessionResume:
     def link_for(channel_id: str) -> ChannelLink:
         return ChannelLink(channel_type="discord", channel_id=channel_id)
 
-    def resumed_session(self, channel_id: str) -> str | None:
-        """Resolve exactly one inbound-enabled binding, failing closed on duplicates."""
-        matches = self.sessions.find_mirror_sessions(
-            self.link_for(channel_id),
-            inbound_only=True,
-        )
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            logger.error(
-                "discord resume: ambiguous inbound bindings for channel %s; routing denied",
-                channel_id,
-            )
-        return None
+    def resolve_inbound(self, channel_id: str) -> InboundResolution:
+        """Resolve this channel's inbound owner, keeping "none" and "many" apart."""
+        return self._binder.resolve_inbound(self.link_for(channel_id))
 
-    def leave_resumed_session(self, channel_id: str) -> str | None:
-        key = self.resumed_session(channel_id)
-        if key is not None:
-            # Free the LOCATION, not just the resume binding: the dashboard's
-            # mirror-link endpoint performs no occupancy check, so an outbound
-            # mirror can be laid onto a conversation a resumed session already
-            # holds. This early path bypasses the dispatcher's own sweep —
-            # clearing only *key* here would leave that mirror occupying the
-            # location and reproduce the "already attached" refusal after an
-            # apparently successful unlink.
-            cleared = self.sessions.clear_mirror_links_at(self.link_for(channel_id))
-            logger.info(
-                "discord: released resumed session %s (cleared bindings: %s)",
-                key,
-                ", ".join(cleared) or "none",
-            )
+    def resumed_session(self, channel_id: str) -> str | None:
+        """Exactly one inbound-enabled binding, failing closed on duplicates."""
+        return self._binder.resumed_session(self.link_for(channel_id))
+
+    async def leave_resumed_session(self, channel_id: str) -> str | None:
+        """Drop this channel's resumed binding; raise ResumeReleaseError if not durable."""
+        released = await self._binder.release(channel_id, self.link_for(channel_id), self._title_of)
+        if released is not None:
             self._push_slots()
-        return key
+        return released
+
+    async def route(self, channel_id: str) -> RoutingDecision:
+        """Decide where one inbound message runs, or why it does not run at all."""
+        return await self._binder.route(channel_id, self.link_for(channel_id), self._title_of)
+
+    async def settle(self, channel_id: str, decision: RoutingDecision) -> None:
+        """Apply a delivered refusal, with version and live-owner guards."""
+        await self._binder.settle(channel_id, self.link_for(channel_id), decision)
+
+    async def _title_of(self, session_key: str) -> str:
+        """The stored title for *session_key*, read off-loop, with a stable fallback."""
+        return await asyncio.to_thread(session_title_of, self.conv_log, session_key, "discord")
 
     async def show_picker(
         self,
@@ -169,338 +314,47 @@ class DiscordSessionResume:
         user_id: str,
         channel_id: str,
         query: str = "",
+        native_key: str = "",
     ) -> None:
-        if not self.is_owner(user_id):
-            sel().log_api_access(
-                caller=user_id,
-                operation="discord.sessions_data_access",
-                outcome="denied",
-                source="discord",
-            )
-            await client.send_message(
-                channel_id,
-                "🔒 `!sessions` requires exactly one configured "
-                "`discord.allowed_user_ids` entry.",
-            )
-            return
-
-        if self.conv_log is None:
-            await client.send_message(channel_id, "⚠️ Recent sessions are unavailable.")
-            return
-
-        normalized_query = " ".join(query.casefold().split())
-
-        try:
-            if normalized_query:
-                # Reuse the SAME search the dashboard uses
-                # (KiroCrewHistory.search_sessions): it matches message CONTENT
-                # with a title boost and length-normalised ranking, so a phrase
-                # the user remembers from the CONVERSATION finds the session.
-                # A title-only filter here would miss exactly that case -- a
-                # natural-language phrase rather than a title -- and would be a
-                # second search implementation free to drift from the
-                # dashboard's ranking. Fetch more than the picker shows
-                # so incognito filtering cannot starve the button slots.
-                rows = await asyncio.to_thread(
-                    self.conv_log.search_sessions, query, _SEARCH_FETCH_LIMIT
-                )
-                if not rows and len(normalized_query.split()) > 1:
-                    # search_sessions matches the query as ONE phrase
-                    # (``needle = query.casefold()``), so out-of-order words miss:
-                    # "specific link" does not match "Link to a Specific Session".
-                    # Fall back to an all-words TITLE match so a remembered-but-
-                    # reordered title still resolves. Deliberately last-resort and
-                    # only on zero hits, so the shared search stays authoritative
-                    # and we are not running two rankers in parallel. The proper
-                    # home for multi-word support is search_sessions itself, which
-                    # would fix the dashboard too -- tracked as a follow-up.
-                    listed = await asyncio.to_thread(self.conv_log.list_sessions)
-                    words = normalized_query.split()
-                    rows = [
-                        row
-                        for row in listed
-                        if isinstance(row, dict)
-                        and all(
-                            word in " ".join(str(row.get("title") or "").casefold().split())
-                            for word in words
-                        )
-                    ]
-            else:
-                rows = await asyncio.to_thread(self.conv_log.list_sessions)
-        except Exception as exc:
-            safe_error = _safe_discord_text(str(exc), 200)
-            sel().log_api_access(
-                caller=user_id,
-                operation="discord.sessions_data_access",
-                outcome="error",
-                source="discord",
-                resources="0 sessions read",
-                error=safe_error,
-            )
-            logger.exception("discord sessions: history listing failed")
-            await client.send_message(channel_id, "⚠️ Recent sessions are unavailable.")
-            return
-
-        eligible: list[_SessionChoice] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("memory_mode", "persistent")).lower() in INCOGNITO_MEMORY_MODES:
-                continue
-            key = _history_dashboard_key(row.get("key"))
-            if key is None:
-                continue
-            raw_title = str(row.get("title") or key.removeprefix("dashboard:"))
-            title = _safe_discord_text(" ".join(raw_title.split()), 76) or "Untitled session"
-            eligible.append(_SessionChoice(key=key, title=title))
-
-        # Order is already meaningful: search_sessions returns best-scored first,
-        # list_sessions returns newest first. Do not re-sort.
-        total_choices = len(eligible)
-        choices = eligible[:_PICKER_LIMIT]
-
-        sel().log_api_access(
+        await self._controller.show_picker(
+            _DiscordResumeSurface(client, channel_id),
             caller=user_id,
-            operation="discord.sessions_data_access",
-            outcome="allowed",
-            source="discord",
-            resources=f"{len(choices)} sessions read",
+            picker_owner=_picker_owner(user_id, channel_id),
+            is_owner=self.is_owner(user_id),
+            query=query,
+            native_key=native_key,
         )
-        if not choices:
-            if normalized_query:
-                query_label = _safe_discord_text(" ".join(query.split()), 100).replace("`", "ˋ")
-                await client.send_message(
-                    channel_id,
-                    f"No dashboard sessions matched `{query_label}`. Try fewer words, "
-                    f"or run `!sessions` to see up to {_PICKER_LIMIT} recent sessions.",
-                )
-            else:
-                await client.send_message(channel_id, "No recent dashboard sessions.")
-            return
-
-        self._purge_pickers()
-        for nonce, picker in list(self.pickers.items()):
-            if picker.user_id == user_id and picker.channel_id == channel_id:
-                self.pickers.pop(nonce, None)
-
-        nonce = secrets.token_hex(8)
-        frozen = tuple(choices)
-        if normalized_query:
-            query_label = _safe_discord_text(" ".join(query.split()), 100).replace("`", "ˋ")
-            if total_choices > _PICKER_LIMIT:
-                summary = f"Showing {_PICKER_LIMIT} of {total_choices} matching sessions"
-            else:
-                summary = (
-                    f"Showing {total_choices} matching session"
-                    f"{'s' if total_choices != 1 else ''} (maximum {_PICKER_LIMIT})"
-                )
-            heading = (
-                "🔎 **Dashboard session search**\n"
-                f"{summary} for `{query_label}`, ranked over titles and message content."
-            )
-        else:
-            if total_choices > _PICKER_LIMIT:
-                summary = f"Showing {_PICKER_LIMIT} of {total_choices} most recent dashboard sessions."
-            else:
-                summary = (
-                    f"Showing {total_choices} most recent dashboard session"
-                    f"{'s' if total_choices != 1 else ''} (maximum {_PICKER_LIMIT})."
-                )
-            heading = f"🧵 **Recent dashboard sessions**\n{summary}"
-        message_id = await client.send_message(
-            channel_id,
-            f"{heading}\n"
-            "Choose one to continue here. Use `!unlink` to return to your "
-            "Discord conversation.",
-            components=_picker_components(nonce, frozen),
-        )
-        if message_id:
-            self.pickers[nonce] = _SessionPicker(
-                user_id=user_id,
-                channel_id=channel_id,
-                message_id=message_id,
-                created_at=time.monotonic(),
-                choices=frozen,
-            )
-
-    def _binding_conflict(
-        self,
-        key: str,
-        title: str,
-        target: ChannelLink,
-    ) -> str | None:
-        """Return a refusal message when *key* must not be bound to *target*.
-
-        Evaluated twice per resume: once for fast feedback, and again
-        immediately before the write. The second call is load-bearing.
-        ``_bind_lock`` only serialises Discord's own picker, while a dashboard
-        mirror link (``chat_mirror``) or another channel's ``!link`` takes no
-        such lock -- either can bind this session, or this conversation, during
-        the awaited header edit. Without the re-check those newer bindings are
-        silently overwritten and the conflict rules below are bypassed.
-        """
-        existing = self.sessions.get_mirror_link(key)
-        if existing is not None and existing != target:
-            return (
-                f"🧵 This session is already active on "
-                f"{existing.channel_type.title()}. Unlink it there first."
-            )
-
-        inbound = self.sessions.find_mirror_sessions(target, inbound_only=True)
-        if key in inbound:
-            return f"🧵 Already active here: {title}"
-
-        occupants = [
-            candidate
-            for candidate in self.sessions.find_mirror_sessions(target)
-            if candidate != key
-        ]
-        if occupants:
-            # `!unlink` clears every binding at this location by value —
-            # resumed sessions and outbound dashboard mirrors alike — so one
-            # instruction is always followable from inside the conversation.
-            return (
-                "⚠️ This Discord conversation is already attached to another "
-                "session. Run `!unlink` first."
-            )
-        return None
 
     async def choose(
         self,
         client: "DiscordClient",
         interaction: "DiscordInteraction",
         custom_id: str,
+        native_key: str = "",
     ) -> None:
-        if not self.is_owner(interaction.user_id):
-            sel().log_api_access(
-                caller=interaction.user_id,
-                operation="discord.session_resume_choice",
-                outcome="denied",
-                source="discord",
-            )
-            await client.edit_message(
-                interaction.channel_id,
-                interaction.message_id,
-                "🔒 Session resume is owner-only.",
-                components=[],
-            )
-            return
-
-        choice = self._take_choice(interaction, custom_id)
-        if choice is None:
-            await client.edit_message(
-                interaction.channel_id,
-                interaction.message_id,
-                "⌛ This session picker expired. Run `!sessions` again.",
-                components=[],
-            )
-            return
-
-        if self.conv_log is None or not await asyncio.to_thread(
-            self.conv_log.has_log,
-            choice.key,
-        ):
-            await client.edit_message(
-                interaction.channel_id,
-                interaction.message_id,
-                "That session is no longer available. Run `!sessions` again.",
-                components=[],
-            )
-            return
-
-        target = self.link_for(interaction.channel_id)
-        async with self._bind_lock:
-            conflict = self._binding_conflict(choice.key, choice.title, target)
-            if conflict is not None:
-                await client.edit_message(
-                    interaction.channel_id,
-                    interaction.message_id,
-                    conflict,
-                    components=[],
-                )
-                return
-
-            header_ok = await client.edit_message(
-                interaction.channel_id,
-                interaction.message_id,
-                f"🔄 Resumed: {choice.title}\n"
-                "Continue here. Send `!unlink` to return to your Discord conversation.",
-                components=[],
-            )
-            if not header_ok:
-                return
-
-            # The edit above awaited a Discord round-trip. Re-check before
-            # writing: a dashboard mirror or another channel's !link may have
-            # claimed this session or this conversation in that window.
-            conflict = self._binding_conflict(choice.key, choice.title, target)
-            if conflict is not None:
-                await client.edit_message(
-                    interaction.channel_id,
-                    interaction.message_id,
-                    conflict,
-                    components=[],
-                )
-                return
-
-            try:
-                self.sessions.set_mirror_link(
-                    choice.key,
-                    target,
-                    accepts_inbound=True,
-                )
-                self._push_slots()
-            except Exception:
-                logger.exception("discord resume: failed to persist binding")
-                await client.edit_message(
-                    interaction.channel_id,
-                    interaction.message_id,
-                    "⚠️ Couldn't resume that session. Run `!sessions` to try again.",
-                    components=[],
-                )
-                return
-
-        sel().log_api_access(
+        nonce, index = self._parse_choice(custom_id)
+        link = self.link_for(interaction.channel_id)
+        choice = await self._controller.choose(
+            _DiscordResumeSurface(client, interaction.channel_id),
             caller=interaction.user_id,
-            operation="discord.session_resume",
-            outcome="allowed",
-            source="discord",
-            resources=choice.key,
+            picker_owner=_picker_owner(interaction.user_id, interaction.channel_id),
+            is_owner=self.is_owner(interaction.user_id),
+            message_id=interaction.message_id,
+            nonce=nonce,
+            index=index,
+            link=link,
+            replace_outbound_keys=same_bucket_origin_keys(self.sessions, link, native_key),
         )
-        await self._replay(client, interaction.channel_id, choice.key)
+        if choice is not None:
+            await self._replay(client, interaction.channel_id, choice.key)
 
-    def _purge_pickers(self) -> None:
-        cutoff = time.monotonic() - _PICKER_TTL_SECS
-        for nonce, picker in list(self.pickers.items()):
-            if picker.created_at < cutoff:
-                self.pickers.pop(nonce, None)
-        if len(self.pickers) >= _PICKER_REGISTRY_MAX:
-            oldest = sorted(self.pickers, key=lambda key: self.pickers[key].created_at)
-            for nonce in oldest[: len(self.pickers) - _PICKER_REGISTRY_MAX + 1]:
-                self.pickers.pop(nonce, None)
-
-    def _take_choice(
-        self,
-        interaction: "DiscordInteraction",
-        custom_id: str,
-    ) -> _SessionChoice | None:
-        self._purge_pickers()
+    @staticmethod
+    def _parse_choice(custom_id: str) -> tuple[str, int]:
+        """Parse ``s:<nonce>:<index>`` without resolving the shared picker."""
         parts = custom_id.split(":")
         if len(parts) != 3 or parts[0] != "s" or not parts[2].isdigit():
-            return None
-        nonce, index = parts[1], int(parts[2])
-        picker = self.pickers.get(nonce)
-        if picker is None:
-            return None
-        if (
-            picker.user_id != interaction.user_id
-            or picker.channel_id != interaction.channel_id
-            or picker.message_id != interaction.message_id
-            or index >= len(picker.choices)
-        ):
-            return None
-        self.pickers.pop(nonce, None)
-        return picker.choices[index]
+            return "", -1
+        return parts[1], int(parts[2])
 
     async def _replay(
         self,
@@ -526,11 +380,17 @@ class DiscordSessionResume:
             raw_content = str(message.get("content") or "")
             if role == "assistant":
                 raw_content = sanitize_channel_replay_text(raw_content)
-            content = _safe_discord_text(raw_content, _REPLAY_TEXT_LIMIT)
+            content = await _replay_preview(
+                raw_content, _REPLAY_TEXT_LIMIT, reserve=_REPLAY_RESERVE
+            )
             if role not in {"user", "assistant"} or not content:
                 continue
             icon = "🧑" if role == "user" else "🤖"
             try:
-                await client.send_message(channel_id, f"{icon} {content}")
+                # The icon gets its OWN line: on the body's first line it would
+                # sit in front of a fence opener, which must start the line, so a
+                # replayed code block would render as literal backticks however
+                # carefully the body was split.
+                await client.send_message(channel_id, f"{icon}\n{content}")
             except Exception:
                 logger.debug("discord resume: context replay failed", exc_info=True)

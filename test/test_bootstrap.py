@@ -8,7 +8,9 @@ stub the import and the pip spawn — no real installs, no network.
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
+from configparser import ConfigParser
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,22 @@ import pytest
 from kiro_crew import _bootstrap
 
 # ── Helpers ──
+
+
+def _venv_maps(monkeypatch):
+    """Answer the install path's foreign-venv guard with "it maps".
+
+    ``dep_sync.sync_or_reinstall`` refuses a venv serving a DIFFERENT checkout
+    before it picks a branch, and it answers that by RUNNING the target
+    interpreter — which these tests stub. Without this the guard's refusal would
+    stand in for the outcome each test is actually asserting, and two of them
+    would pass for the wrong reason. The guard itself is covered in
+    test/test_dep_sync.py.
+    """
+    from kiro_crew import dep_sync
+
+    monkeypatch.setattr(dep_sync, "installed_package_origin", lambda target: "<stub>")
+    monkeypatch.setattr(dep_sync, "venv_not_mapped_to", lambda origin, repo: None)
 
 
 def _fail_then_succeed(calls: list[str], sentinel):
@@ -99,14 +117,38 @@ def test_self_heal_refuses_outside_source_checkout(monkeypatch):
     assert _bootstrap._self_heal("defusedxml") is False
 
 
-def test_self_heal_skips_windows(monkeypatch, tmp_path):
-    """A running console launcher cannot be replaced on Windows -> no heal."""
+def test_self_heal_runs_on_windows_through_the_dependency_only_path(monkeypatch, tmp_path):
+    """Windows heals through the dependency-only path.
+
+    The blanket skip was there because pip cannot replace the running
+    ``kirocrew.exe`` — but a dependency install never touches that wrapper, and a
+    missing dependency is the only thing that brings us here. Skipping left the
+    platform whose users hit this most with nothing but a printed one-liner.
+    """
+    from kiro_crew import dep_sync
+
     monkeypatch.setattr(_bootstrap.sys, "platform", "win32")
     monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: tmp_path)
+    _venv_maps(monkeypatch)
     monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: pytest.fail("pip must not run")
+        dep_sync, "locked_console_scripts", lambda target: [r"C:\v\Scripts\kirocrew.exe"]
     )
-    assert _bootstrap._self_heal("defusedxml") is False
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: pytest.fail("the reinstall must not run")
+    )
+    seen: dict = {}
+
+    def _fake_sync(repo, target_py, emit=None, timeout=None):
+        seen["repo"] = repo
+        seen["timeout"] = timeout
+        return 0
+
+    monkeypatch.setattr(dep_sync, "sync", _fake_sync)
+    assert _bootstrap._self_heal("defusedxml") is True
+    assert seen["repo"] == tmp_path
+    # The substitute is bounded too — an unbounded dependency install would hang
+    # the console entry point with no way out.
+    assert seen["timeout"] == _bootstrap._PIP_TIMEOUT_SECS
 
 
 def test_retry_invalidates_import_caches(monkeypatch):
@@ -132,16 +174,31 @@ def test_retry_invalidates_import_caches(monkeypatch):
 
 
 def test_self_heal_runs_fixed_pip_argv(monkeypatch, tmp_path):
-    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")  # POSIX heal path
+    """A full reinstall heals dependencies and satisfies its artifact contract."""
+    from kiro_crew import dep_sync
+
+    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")
     monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: tmp_path)
+    _venv_maps(monkeypatch)
+    monkeypatch.setattr(dep_sync, "locked_console_scripts", lambda target: [])
+    script = tmp_path / "venv" / "bin" / "kirocrew"
+    monkeypatch.setattr(dep_sync, "console_script_path", lambda target: script)
     seen: dict = {}
 
-    def _fake_run(argv, timeout):
-        seen["argv"] = argv
-        seen["timeout"] = timeout
+    def _fake_run(argv, **kwargs):
+        if argv[1:3] == ["-m", "pip"]:
+            seen["argv"] = argv
+            seen["timeout"] = kwargs.get("timeout")
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\n")
+            script.chmod(0o755)
+        elif argv[1:] == ["-I", "-X", "utf8", "-c", "import kiro_crew"]:
+            seen["import_checked"] = True
 
         class _P:
             returncode = 0
+            stdout = b""
+            stderr = b""
 
         return _P()
 
@@ -149,17 +206,50 @@ def test_self_heal_runs_fixed_pip_argv(monkeypatch, tmp_path):
     assert _bootstrap._self_heal("defusedxml") is True
     assert seen["argv"][1:] == ["-m", "pip", "install", "-e", str(tmp_path), "--quiet"]
     assert seen["timeout"] == _bootstrap._PIP_TIMEOUT_SECS
+    assert seen["import_checked"] is True
 
 
 def test_self_heal_reports_pip_failure(monkeypatch, tmp_path):
+    from kiro_crew import dep_sync
+
     monkeypatch.setattr(_bootstrap.sys, "platform", "linux")  # POSIX heal path
     monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: tmp_path)
+    _venv_maps(monkeypatch)
+    monkeypatch.setattr(dep_sync, "locked_console_scripts", lambda target: [])
 
-    def _fake_run(argv, timeout):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+    def _fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     assert _bootstrap._self_heal("defusedxml") is False
+
+
+def test_self_heal_output_stays_ascii(monkeypatch, tmp_path, capsys):
+    """Every line this module prints must survive a cp1252 pipe.
+
+    The heal now relays pip's output and filesystem paths, neither of which is
+    ASCII by nature, and it prints before ensure_utf8_console() has run.
+    """
+    from kiro_crew import dep_sync
+
+    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")
+    monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: tmp_path)
+    _venv_maps(monkeypatch)
+    monkeypatch.setattr(dep_sync, "locked_console_scripts", lambda target: [])
+
+    def _fake_run(argv, **kwargs):
+        class _P:
+            returncode = 1
+            stdout = b""
+            stderr = "pip a\u00e9choue \u2014 pas de distribution".encode()
+
+        return _P()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert _bootstrap._self_heal("defusedxml") is False
+    err = capsys.readouterr().err
+    assert err  # the failure was reported, not swallowed
+    err.encode("ascii")  # raises UnicodeEncodeError if anything slipped through
 
 
 # ── _source_checkout_root ──
@@ -171,3 +261,35 @@ def test_source_checkout_root_detects_this_repo():
     assert root is not None
     assert (root / "setup.cfg").is_file()
     assert Path(_bootstrap.__file__).is_relative_to(root)
+
+
+# ── console_scripts targets ──
+
+
+def test_every_console_script_target_resolves():
+    """Every ``console_scripts`` target must name a module that exists.
+
+    Packaging metadata is not imported by the suite, so a target left behind by
+    a deleted module passes every other gate and fails only in a user's shell:
+    pip still writes the shim onto PATH, and running it raises
+    ModuleNotFoundError. ``find_spec`` is used rather than a real import so the
+    check stays free of import side effects.
+    """
+    root = _bootstrap._source_checkout_root()
+    assert root is not None
+    cfg = ConfigParser()
+    cfg.read(root / "setup.cfg", encoding="utf-8")
+    entries = [
+        line.strip()
+        for line in cfg["options.entry_points"]["console_scripts"].splitlines()
+        if line.strip()
+    ]
+    assert entries, "setup.cfg declares no console scripts"
+    for entry in entries:
+        script, _, target = entry.partition("=")
+        module = target.strip().partition(":")[0]
+        try:
+            spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:
+            spec = None
+        assert spec is not None, f"console script {script.strip()!r} names missing module {module!r}"

@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest'
 
 import {
   changeDiffCommand,
+  changeUrlFor,
   changeViewCommand,
   commitUrlFor,
   isGitlab,
@@ -21,6 +22,7 @@ import {
   providerTerms,
   recordIdentityJson,
   repoWebUrl,
+  sameRepoRef,
   userUrlFor,
 } from '../apps/issue-radar/lib/links'
 
@@ -181,5 +183,131 @@ describe('recordIdentityJson', () => {
     // an MR would overwrite the issue's findings.
     expect(JSON.parse(`{${recordIdentityJson(GL, 'pull')}}`).kind).toBe('pull')
     expect(JSON.parse(`{${recordIdentityJson(GL)}}`).kind).toBe('issue')
+  })
+})
+
+/** Azure DevOps: `owner` carries `{organization}/{project}`, the repository sits
+ * behind a literal `_git`, and work items belong to the PROJECT rather than the
+ * repository. None of that is expressible as "the not-GitHub branch", which is
+ * why the builders dispatch on a per-provider table — these assertions are what
+ * pin that the third provider gets its OWN shapes rather than inheriting GitHub's
+ * or GitLab's.
+ */
+const AZ = {
+  owner: 'contoso/Payments',
+  repo: 'ledger',
+  provider: 'azure' as const,
+  host: 'dev.azure.com',
+}
+
+describe('Azure DevOps link shapes', () => {
+  it('puts the literal _git between the project and the repository', () => {
+    // Without `_git` the path is a project page, not the repo — a 404 at best.
+    expect(repoWebUrl(AZ)).toBe('https://dev.azure.com/contoso/Payments/_git/ledger')
+  })
+
+  it('addresses a pull request as pullrequest under the repo path', () => {
+    expect(changeUrlFor(AZ, 7))
+      .toBe('https://dev.azure.com/contoso/Payments/_git/ledger/pullrequest/7')
+  })
+
+  it('addresses work items off the PROJECT, with no repository in the path', () => {
+    // A work item is project-scoped, so appending to the repo URL (which ends in
+    // `_git/ledger`) would build a page that does not exist.
+    expect(issueUrlFor(AZ, 42))
+      .toBe('https://dev.azure.com/contoso/Payments/_workitems/edit/42')
+    expect(issuesUrlFor(AZ)).toBe('https://dev.azure.com/contoso/Payments/_workitems')
+  })
+
+  it('does not borrow GitLab’s /-/ nesting', () => {
+    expect(commitUrlFor(AZ, 'abc1234'))
+      .toBe('https://dev.azure.com/contoso/Payments/_git/ledger/commit/abc1234')
+    expect(commitUrlFor(AZ, 'abc1234')).not.toContain('/-/')
+  })
+
+  it('administers access at the project level', () => {
+    expect(membersUrlFor(AZ)).toBe('https://dev.azure.com/contoso/Payments/_settings/permissions')
+  })
+
+  it('is not GitLab, even though it shares GitLab’s ! sigil', () => {
+    // `isGitlab` survives as a helper but must not be the dispatch mechanism.
+    expect(isGitlab(AZ)).toBe(false)
+    expect(providerTerms(AZ).sigil).toBe('!')
+  })
+
+  it('names Azure DevOps and its own CLI', () => {
+    expect(providerTerms(AZ).providerName).toBe('Azure DevOps')
+    expect(providerTerms(AZ).cli).toBe('az')
+    // Azure DevOps calls them pull requests, not merge requests.
+    expect(providerTerms(AZ).changeRequestPluralTitle).toBe('Pull Requests')
+  })
+
+  it('builds az invocations that carry org AND project, and refuse inference', () => {
+    // `az` has no `--repo owner/repo`: the organization is a URL and the project a
+    // separate flag. `--detect false` matters because the agent may be standing in
+    // an unrelated checkout, and `az` would otherwise read THAT project silently.
+    const view = changeViewCommand(AZ, 7)
+    expect(view).toContain('az repos pr show --id 7')
+    expect(view).toContain('--org https://dev.azure.com/contoso')
+    expect(view).toContain('--project Payments')
+    expect(view).toContain('--detect false')
+    expect(view).not.toContain('--repo ')
+
+    const item = issueViewCommand(AZ, 42)
+    expect(item).toContain('az boards work-item show --id 42')
+    expect(item).toContain('--expand all')
+  })
+
+  it('records the azure provider so findings land in its own ledger', () => {
+    expect(JSON.parse(`{${recordIdentityJson(AZ, 'pull')}}`)).toEqual({
+      owner: 'contoso/Payments', repo: 'ledger',
+      provider: 'azure', host: 'dev.azure.com', kind: 'pull',
+    })
+  })
+})
+
+/**
+ * The single "is this the same repository" predicate.
+ *
+ * It replaced four hand-written copies of the same four-way comparison, one of
+ * which compared the slug alone. Defined as scope-key equality so "same
+ * repository" and "same cache entry" cannot drift apart, which is also what makes
+ * the legacy case below fall out for free rather than needing its own branch.
+ */
+describe('sameRepoRef', () => {
+  it('is true for the same repository on the same forge', () => {
+    expect(sameRepoRef(GH, { ...GH })).toBe(true)
+    expect(sameRepoRef(GL, { ...GL })).toBe(true)
+  })
+
+  it('is false for the same slug on a different provider', () => {
+    // The collision the predicate exists for: `acme/widget` is a different
+    // repository on GitHub and on GitLab, and treating them as one is what let a
+    // stored pointer resolve to the wrong record.
+    expect(sameRepoRef(GH, { ...GH, provider: 'gitlab' })).toBe(false)
+  })
+
+  it('is false for the same slug and provider on a different host', () => {
+    // A self-managed instance is not gitlab.com: `group/sub/proj` there names a
+    // project that may not exist on the public site at all.
+    expect(sameRepoRef(GL, SELF)).toBe(false)
+    expect(sameRepoRef(SELF, { ...SELF, host: 'gitlab.com' })).toBe(false)
+  })
+
+  it('matches a legacy forge-less record with its public-GitHub counterpart', () => {
+    // Absent means public GitHub, so a value persisted before GitLab support still
+    // matches its connected record — which is what lets the host page HEAL such a
+    // pointer instead of falling back away from it.
+    expect(sameRepoRef(LEGACY, GH)).toBe(true)
+    expect(sameRepoRef(GH, LEGACY)).toBe(true)
+  })
+
+  it('does not match a legacy forge-less record against a non-GitHub one', () => {
+    expect(sameRepoRef(LEGACY, { ...LEGACY, provider: 'gitlab' as const })).toBe(false)
+  })
+
+  it('is false on a different slug, whatever the forge', () => {
+    expect(sameRepoRef(GH, { ...GH, repo: 'other' })).toBe(false)
+    expect(sameRepoRef(GH, { ...GH, owner: 'other' })).toBe(false)
   })
 })

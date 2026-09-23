@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
 import logging
 import secrets
@@ -25,7 +26,7 @@ from urllib.parse import quote
 
 import aiohttp
 
-from kiro_crew.platform_compat import restrict_to_owner
+from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,11 @@ ITEM_VOICE = 3
 ITEM_FILE = 4
 ITEM_VIDEO = 5
 
+#: Item types the inbound path downloads from the CDN. Ordered as a frozenset so
+#: membership is the only question asked — the per-type envelope shape lives in
+#: ``weixin/attachments.py``, not here.
+INBOUND_MEDIA_ITEM_TYPES = frozenset({ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO})
+
 MSG_TYPE_USER = 1
 MSG_TYPE_BOT = 2
 MSG_STATE_FINISH = 2
@@ -82,7 +88,16 @@ def _json_dumps(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _random_wechat_uin() -> str:
+@functools.lru_cache(maxsize=1)
+def _wechat_uin() -> str:
+    """One random UIN per process, generated on first use and then reused.
+
+    iLink binds a bot session to the ``X-WECHAT-UIN`` it saw at authorization.
+    Generating a fresh value per request made the first ``getupdates``
+    long-poll after a QR login return ``-14`` (:data:`SESSION_EXPIRED_ERRCODE`),
+    which parked the poll loop for 10 minutes and made the channel look like it
+    had never connected.
+    """
     value = struct.unpack(">I", secrets.token_bytes(4))[0]
     return base64.b64encode(str(value).encode("utf-8")).decode("ascii")
 
@@ -96,7 +111,7 @@ def _headers(token: Optional[str], body: str) -> Dict[str, str]:
         "Content-Type": "application/json",
         "AuthorizationType": "ilink_bot_token",
         "Content-Length": str(len(body.encode("utf-8"))),
-        "X-WECHAT-UIN": _random_wechat_uin(),
+        "X-WECHAT-UIN": _wechat_uin(),
         "iLink-App-Id": ILINK_APP_ID,
         "iLink-App-ClientVersion": str(ILINK_APP_CLIENT_VERSION),
     }
@@ -112,11 +127,12 @@ def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-# NOTE: media (image/voice/file/video) is NOT supported yet — only the text item
-# of an inbound message is read, and replies are text-only. The iLink media path
-# needs an AES-128-ECB envelope over the WeChat CDN (the cipher mode is dictated
-# by the remote protocol, not chosen by us); those helpers land with the media
-# feature rather than sitting here unreachable.
+# NOTE: OUTBOUND media (image/voice/file/video) is NOT supported yet -- replies
+# are text-only. INBOUND media IS supported: ``weixin/media.py`` downloads the
+# CDN object and AES-128-ECB decrypts it (the cipher mode is dictated by the
+# remote protocol, not chosen by us) and ``weixin/attachments.py`` feeds it to
+# the shared ingest pipeline. The upload half (``getuploadurl`` + encrypted CDN
+# PUT) lands with outbound media rather than sitting here unreachable.
 
 
 # --- Credential + ephemeral state persistence ---------------------------------
@@ -129,21 +145,31 @@ def _account_dir(home: str) -> Path:
 def save_weixin_account(home: str, *, account_id: str, token: str, base_url: str, user_id: str = "") -> None:
     """Persist account credentials owner-only.
 
-    The file holds the bot credential, so it is locked down with
-    :func:`platform_compat.restrict_to_owner` — a bare ``chmod(0o600)`` is a no-op
-    against Windows ACLs.
+    The file holds the bot credential, so ``atomic_write(restrict_to_owner=True)``
+    applies :func:`platform_compat.restrict_to_owner` to the temp file BEFORE any
+    content byte reaches it — a bare ``chmod(0o600)`` is a no-op against Windows
+    ACLs, and locking down only after the write left the token readable under the
+    directory's inherited DACL for the whole write window.
+    ``restrict_on_error="warn"`` keeps this site's existing policy: a lockdown
+    failure must not cost the credential write, but it must be visible. That
+    policy covers the lockdown only — the linked-parent refusal implied by
+    ``restrict_to_owner=True`` raises unconditionally, which is the right
+    behavior for a credential writer: a pre-planted link under
+    ``<home>/weixin/accounts`` (a directory this code creates) is hostile.
     """
     path = _account_dir(home) / f"{account_id}.json"
-    _atomic_json_write(path, {
+    payload = {
         "token": token,
         "base_url": base_url,
         "user_id": user_id,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    try:
-        restrict_to_owner(str(path))
-    except OSError:
-        logger.warning("weixin: could not restrict account file permissions", exc_info=True)
+    }
+    atomic_write(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        restrict_to_owner=True,
+        restrict_on_error="warn",
+    )
 
 
 def load_weixin_account(home: str, account_id: str) -> Optional[Dict[str, Any]]:
@@ -262,6 +288,7 @@ class WeixinClient:
         self.base_url = base_url.rstrip("/")
         self.account_id = account_id
         self._session: Any = None  # aiohttp.ClientSession, created in connect()
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
 
     async def connect(self) -> None:
         if self._session is None or self._session.closed:

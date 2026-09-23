@@ -1,11 +1,11 @@
 # Signing Infrastructure
 
 This directory contains the macOS code signing and notarization scaffolding
-for the KiroCrew desktop app, using an enterprise code-signing service.
+for the Kiro Crew desktop app, using an enterprise code-signing service.
 
 ## Why identifiers are committed here
 
-KiroCrew is distributed as a signed desktop application under a shared Apple
+Kiro Crew is distributed as a signed desktop application under a shared Apple
 Developer identity. The bundle identifier and team ID are required by Apple's
 code signing infrastructure and are not secrets — they're embedded in every
 signed `.app` bundle users download.
@@ -23,6 +23,57 @@ trigger macOS Gatekeeper warnings).
   for all Electron helper processes and frameworks.
 - `sign.sh` — CI script that packages, uploads, submits to the signing
   service, polls, downloads, and verifies the signed artifact.
+- `notarize.sh` — submits a file to the Apple notary service and polls
+  `notarytool info` for the verdict, retrying transient request failures
+  (NSURLErrorDomain timeouts, 5xx) with exponential backoff inside a 30m hard
+  budget; every backoff sleep and every `notarytool` invocation is bounded by
+  the budget left, so a request that hangs instead of erroring cannot run past
+  it. Replaces `notarytool submit --wait`, whose in-process poll made a
+  single timed-out status request fail the job even after Apple had Accepted
+  the submission. Fail-closed: `Invalid`/`Rejected` pulls the itemized Apple
+  log and exits non-zero; the Gatekeeper `spctl` gates in the workflow are
+  unchanged. Used for both the app zip and the DMG.
+- `build-dmg.sh` — replaces the unsigned app inside electron-builder's branded
+  DMG layout template with the signed/stapled app, then shrinks and recompresses
+  the image before the DMG signing and notarization stages.
+
+  The mounted-volume phase races Spotlight and XProtect, which start reading
+  the freshly-copied app and can hold the volume against ejection ("Resource
+  busy") — the same transient class electron-builder retries on. The script
+  layers its defenses: `-nobrowse` keeps the volume out of Finder, and the
+  eject gets bounded retries with a synced force fallback (see
+  `hdiutil-detach.sh`). hdiutil calls run without `-quiet`, because
+  that flag suppresses stderr too and previously reduced failures of this
+  script to bare exit codes.
+- `hdiutil-detach.sh` — the detach retry loop `build-dmg.sh` sources. It
+  addresses the device node (`/dev/diskN`, read from `hdiutil attach -plist`)
+  rather than the mount path, and after every failed attempt asks `hdiutil info`
+  whether the device is still attached instead of trusting the exit status.
+  `hdiutil detach` unmounts and then ejects, and reports "Resource busy" when
+  only the eject is held — at which point the mount path is already gone, so a
+  path-addressed retry can only ever answer "No such file or directory". A
+  device that is no longer attached counts as detached however that came about;
+  a device that survives `-force` is still a hard failure. `test/test_hdiutil_detach.py`
+  drills the loop against a scripted fake `hdiutil`.
+
+  The branded background is a **volume-bound alias recorded inside `.DS_Store`**,
+  which is why the image is reused rather than rebuilt from a folder: recreating
+  it drops the layout. The script fingerprints the template's `.DS_Store` before
+  the swap and requires the final image to carry the same bytes, which is
+  stronger than checking the files exist — a broken alias leaves every file in
+  place. It still cannot prove Finder *resolves* the alias, since that also
+  depends on the volume identity the alias binds to, and nothing on a CI runner
+  re-renders the window.
+
+  **So two things are worth doing rather than assuming green CI covers them.**
+  First, watch the next real signing run: the unsigned-DMG S3 round trip, the
+  sector-resize arithmetic and the app swap all execute for the first time
+  there, not in PR CI. Second, know the fallback — if the alias ever stops
+  surviving, run `dmgbuild` against the **stapled** app inside the notarize job.
+  That writes a fresh, correct `.DS_Store` and removes the template round trip,
+  the resize arithmetic and the survival question in one move; the only reason
+  it is not the default is that it re-derives the layout on every release
+  instead of preserving the one the build already produced.
 
 ## Prerequisites
 
@@ -54,16 +105,26 @@ publisher role remain trusted. The publisher role holds `kms:Sign`, so its
 compromise can produce a valid manifest and is explicitly out of scope; the
 signature does not create a separate trust boundary from that role.
 
-### Repository bootstrap state
+The same key, algorithm and canonical form sign the feature-videos release
+manifest (`scripts/feature-videos/`, schema
+`kirocrew-feature-videos-manifest-v1`). That tool loads `cli-manifest.py` by path
+and uses its canonical JSON, key-id derivation, runners and `kms_sign_digest`
+rather than carrying copies, so there is one signer to audit. The two schemas
+keep the two verifiers apart; the key grant is one grant, and a principal that
+may sign videos may sign a CLI manifest.
 
-The repository intentionally carries `UNCONFIGURED` in both
-`cli-manifest-public.pem` and the two `CLI_MANIFEST_*` constants in `cli.sh`.
-This is fail-closed: the installer exits before network I/O, and a trusted
-publisher configuration with only one of the role/key settings fails before any
-upload. Forks with neither setting still skip publication.
+### Trust-root configuration
+
+The upstream repository carries a configured public key in
+`cli-manifest-public.pem` and matching `CLI_MANIFEST_*` constants in `cli.sh`.
+The installer still handles an `UNCONFIGURED` trust root fail-closed by exiting
+before network I/O. The publication workflow likewise fails before upload when
+only one of the role/key settings is configured; forks with neither setting skip
+publication.
 
 No private key should be generated, exported, committed, pasted into CI, or
-handled by an agent. Operational enablement is a human/infrastructure step:
+handled by an agent. Initial enablement for a new distribution is a
+human/infrastructure step:
 
 1. Create a non-exportable asymmetric KMS key in `us-west-2` with key usage
    `SIGN_VERIFY` and key spec `RSA_3072` or `RSA_4096`.
@@ -88,13 +149,32 @@ handled by an agent. Operational enablement is a human/infrastructure step:
    is enforced mechanically: `publish-installer.yml` refuses to publish while
    `cli.sh` still pins `CLI_MANIFEST_KEY_ID="UNCONFIGURED"`, and — once a key
    is pinned — refuses unless every LIVE channel feed verifies against that
-   key (`cli-manifest.py verify`, the same checks the installer runs), so
-   neither the pin commit nor any later merge can replace the live installer
-   with one that refuses the feeds it is pointed at.
+   key (`cli-manifest.py verify`), so neither the pin commit nor any later
+   merge can replace the live installer with one that refuses the feeds it is
+   pointed at. That gate is a SEPARATE implementation of the installer's
+   contract, so the direction between them is what is guaranteed rather than
+   equality: whatever the gate accepts, `cli.sh` must also accept. The gate is
+   deliberately stricter in three places (a 16 KiB payload cap against the
+   installer's 64 KiB, a 2048-character cap per field, and refusing a
+   `min_version` above the shipped version), each of which costs a publisher
+   one loud failure instead of shipping a feed nobody can install. It may never
+   be laxer, and `test_cli_manifest_signature.py` drives one shared fixture set
+   (valid, wrong-channel, wrong-host, tampered, legacy) through the gate AND
+   through a real `cli.sh` run so the two cannot drift apart silently.
 
 Pinned versions released before enablement have no immutable signed manifest and
-therefore fail closed under the new installer unless an authorized backfill signs
-the already-published digest. Do not replace the KMS key in place: schema v1 pins
+therefore fail closed under the new installer. The project's disposition is a
+documented cutoff rather than a backfill: `0.1.0` and `0.1.1` are the only
+published releases without a manifest, the minimum pinnable release is `0.1.2`,
+and the user-facing statement of that is `docs/guides/install.md` ("Pinning an
+exact version"). A backfill would sign an already-published digest with the
+operational key, minting an attestation for bytes that no signing pipeline
+produced. Reversing that decision is a release operation, not a code change: the
+only code-side facts are the floor stated in that section and the pinned
+examples that cite it. Do not replace the KMS key in place: schema v1 pins
 one key. For rotation, first ship an installer revision that trusts both old and
 new public keys, then switch the publisher, and retire the old key only after the
-overlap window.
+overlap window. The same key also verifies the gateway's feature-video manifest
+(`src/kiro_crew/platform/feed_trust.py`), so the overlap window has a third
+party in it: the feature-video publisher re-signs every hosted manifest a
+shipped release still reads back before the old key is retired.

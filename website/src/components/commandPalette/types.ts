@@ -77,6 +77,19 @@ export interface Result {
    * otherwise.
    */
   enter?: EnterAction
+  /**
+   * An explicit address to put on the clipboard, for a row whose best address is
+   * not the one its {@link EnterAction} names.
+   *
+   * Copy is normally DERIVED from `enter` — see `copyTarget.ts`: a row that can be
+   * opened can be addressed, so populating `enter` is what gives a provider copy
+   * for free. This field is the exception, and a deployed webapp artifact is what
+   * it exists for: Enter opens that artifact's page on THIS dashboard, while the
+   * address worth handing to someone else is the public URL it is served from, and
+   * only the provider holding that record knows it. Validated through `safeHttpUrl`
+   * before it reaches the clipboard.
+   */
+  copyUrl?: string
   /** Primary activation (Enter). Context-aware per the §2 Enter matrix. */
   onActivate: () => void
   /** ⌘Enter / Ctrl+Enter activation (always-new-session semantics). */
@@ -104,6 +117,18 @@ export interface ResourceProvider {
   icon: ReactNode
   /** Run the search for a query. May return a Promise or a value. */
   search(query: string): Promise<Result[]> | Result[]
+  /**
+   * Shortest non-empty query this provider can actually answer. A provider
+   * whose backend (or short-circuit) returns nothing below N declares N here,
+   * so the palette can render a "keep typing" empty state instead of the
+   * misleading generic "No matches" for a query the provider never searched.
+   * Absent means no minimum. An EMPTY query is exempt by contract (it is the
+   * recents / scoped-listing view, not a search). Declared values must be
+   * >= 2: a minimum of 1 is indistinguishable from "no minimum" (the empty
+   * query is already exempt), and the copy key interpolates the number
+   * without plural forms, so 1 would also render "1 characters".
+   */
+  minQueryChars?: number
 }
 
 
@@ -152,12 +177,6 @@ export type EnterAction =
   | { kind: 'navigate'; route: string }
   /** Actions tab. Enter invokes the free action callback. No distinct modifier action. */
   | { kind: 'invoke'; run: () => void }
-
-/**
- * Discriminant strings of {@link EnterAction}, for exhaustiveness checks and
- * test fixtures.
- */
-export type EnterActionKind = EnterAction['kind']
 
 /**
  * Central Enter dispatcher signature (§2). `CommandPalette.tsx`

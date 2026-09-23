@@ -8,6 +8,15 @@ export interface Segment<T extends string = string> {
   icon?: React.ReactNode
   count?: number
   tooltip?: string
+  /**
+   * Render the segment but refuse selection — for an option the surface knows
+   * about and cannot serve yet. Showing it greyed says "planned"; omitting it
+   * says "does not exist", and silently accepting the click says "broken".
+   * A disabled segment carries `aria-disabled` rather than the `disabled`
+   * attribute so it stays reachable by keyboard and its tooltip stays readable,
+   * which is where the reason for the greying lives.
+   */
+  disabled?: boolean
 }
 
 interface SegmentedControlProps<T extends string = string> {
@@ -25,11 +34,27 @@ interface SegmentedControlProps<T extends string = string> {
    * beneath the rows that follow it.
    */
   collapse?: boolean
+  /**
+   * Pin the control to its icon-only form — every segment keeps its icon, only
+   * the selected one keeps its label. For a row that must fit a phone while its
+   * parent hugs its content, where the measured collapse above cannot help
+   * (that measurement reads this control's own width and always answers
+   * "plenty of room"). Wins over `collapse`, since it is a decision the caller
+   * has already made.
+   */
+  compact?: boolean
+  /**
+   * Hide EVERY segment's label, the selected one included — the control is a
+   * row of icon buttons. Each label moves to the segment's `aria-label` and
+   * `title`, so the name survives for readers and hover. For a pair whose
+   * icons are self-evident (grid/list) where even the selected label is noise.
+   */
+  iconOnly?: boolean
 }
 
 type Mode = 'full' | 'compact' | 'dropdown'
 
-export default function SegmentedControl<T extends string = string>({ segments, value, onChange, layoutId = 'segment', collapse = true }: SegmentedControlProps<T>) {
+export default function SegmentedControl<T extends string = string>({ segments, value, onChange, layoutId = 'segment', collapse = true, compact = false, iconOnly = false }: SegmentedControlProps<T>) {
   const containerRef = useRef<HTMLDivElement>(null)
   // The label below animates its WIDTH while clipping overflow, so until it
   // settles the text is genuinely cut off. Anything measuring layout in that
@@ -38,7 +63,7 @@ export default function SegmentedControl<T extends string = string>({ segments, 
   // are not truncated once the spring lands. framer-motion does not consult the
   // preference on its own, which is why the honouring is explicit here.
   const reduceMotion = useReducedMotion()
-  const [mode, setMode] = useState<Mode>('full')
+  const [mode, setMode] = useState<Mode>(compact ? 'compact' : 'full')
   const [dropdownOpen, setDropdownOpen] = useState(false)
 
   useEffect(() => {
@@ -51,6 +76,7 @@ export default function SegmentedControl<T extends string = string>({ segments, 
   }, [dropdownOpen])
 
   const measure = useCallback(() => {
+    if (compact) { setMode('compact'); return }
     if (!collapse) { setMode('full'); return }
     const el = containerRef.current?.parentElement
     if (!el) return
@@ -61,15 +87,15 @@ export default function SegmentedControl<T extends string = string>({ segments, 
     if (w >= fullWidth) setMode('full')
     else if (w >= compactWidth) setMode('compact')
     else setMode('dropdown')
-  }, [segments.length, collapse])
+  }, [segments.length, collapse, compact])
 
   useEffect(() => {
     measure()
-    if (!collapse) return
+    if (!collapse || compact) return
     const ro = new ResizeObserver(measure)
     if (containerRef.current?.parentElement) ro.observe(containerRef.current.parentElement)
     return () => ro.disconnect()
-  }, [measure, collapse])
+  }, [measure, collapse, compact])
 
   const active = segments.find(s => s.key === value)
 
@@ -96,9 +122,16 @@ export default function SegmentedControl<T extends string = string>({ segments, 
               {segments.map(s => (
                 <button
                   key={s.key}
-                  onClick={() => { onChange(s.key); setDropdownOpen(false) }}
-                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-[12px] font-medium cursor-pointer border-none bg-transparent text-left hover:bg-bg-hover ${
-                    s.key === value ? 'text-accent' : 'text-muted'
+                  aria-disabled={s.disabled === true || undefined}
+                  onClick={() => {
+                    if (s.disabled === true) return
+                    onChange(s.key)
+                    setDropdownOpen(false)
+                  }}
+                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-[12px] font-medium border-none bg-transparent text-left ${
+                    s.disabled === true
+                      ? 'text-muted/40 cursor-not-allowed'
+                      : `cursor-pointer hover:bg-bg-hover ${s.key === value ? 'text-accent' : 'text-muted'}`
                   }`}
                 >
                   {s.icon}
@@ -115,23 +148,57 @@ export default function SegmentedControl<T extends string = string>({ segments, 
 
   return (
     <>
-      <div ref={containerRef} className="inline-flex rounded-lg bg-bg-elevated border border-border p-0.5 gap-0.5">
+      <div ref={containerRef} role="group" className="inline-flex rounded-lg bg-bg-elevated border border-border p-0.5 gap-0.5">
         {segments.map(s => {
           const isActive = s.key === value
+          const isDisabled = s.disabled === true
+          // Compact hides an unselected segment's label, leaving an icon-only
+          // button; `iconOnly` hides every label. Name it explicitly rather
+          // than leaning on `title` as the accessible-name fallback: the
+          // tooltip never appears on touch, which is the form factor compact
+          // exists for.
+          const labelShown = !iconOnly && (mode === 'full' || isActive)
+          // #9684: the active-pill indicator (below) is `absolute inset-0`, so
+          // its CSS box always equals the button's live box. The label reveal
+          // animates its own `width` from 0 to auto, growing the button box
+          // every frame of the transition. Two things used to make the pill
+          // mis-size during that reveal, and BOTH had to change (measured: each
+          // alone leaves ~6px of overshoot, together 0):
+          //   1. the button carried `layout`, so framer re-measured and
+          //      re-projected the whole button box every frame -- the pill,
+          //      pinned to it, was dragged onto the intermediate box. Dropped
+          //      here; the button still grows smoothly because the label's
+          //      width is itself a spring, and the pill's travel BETWEEN
+          //      segments is the indicator's own `layoutId`, not the button's.
+          //   2. the indicator animated its SIZE via the shared-layout spring,
+          //      so on selection it sprang from the old box to a NEW box read
+          //      while the label was still at width 0. `layout="position"` below
+          //      keeps the cross-segment position spring but takes the size from
+          //      CSS `inset-0`, so the pill matches the button box on every
+          //      frame, settled or mid-reveal.
           return (
             <motion.button
               key={s.key}
-              layout
-              onClick={() => onChange(s.key)}
+              aria-label={labelShown ? undefined : s.label}
+              aria-disabled={isDisabled || undefined}
+              onClick={() => {
+                if (isDisabled) return
+                onChange(s.key)
+              }}
               title={s.tooltip || s.label}
-              whileTap={isActive ? { scale: 0.95 } : undefined}
+              whileTap={isActive && !isDisabled ? { scale: 0.95 } : undefined}
               transition={{ duration: 0.15 }}
-              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[12px] font-medium cursor-pointer border-none transition-colors z-[1] ${
-                isActive ? 'text-accent' : 'text-muted hover:text-text hover:bg-bg-hover'
+              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[12px] font-medium border-none transition-colors z-[1] ${
+                isDisabled
+                  ? 'text-muted/40 cursor-not-allowed'
+                  : isActive
+                    ? 'text-accent cursor-pointer'
+                    : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'
               }`}
             >
-              {isActive && (
+              {isActive && !isDisabled && (
                 <motion.div
+                  layout="position"
                   layoutId={`${layoutId}-indicator`}
                   className="absolute inset-0 bg-card rounded-md shadow-sm border border-border"
                   transition={reduceMotion
@@ -141,7 +208,7 @@ export default function SegmentedControl<T extends string = string>({ segments, 
               )}
               {s.icon && <span className="relative z-[1]">{s.icon}</span>}
               <AnimatePresence>
-                {(mode === 'full' || isActive) && (
+                {labelShown && (
                   <motion.span
                     key={`label-${s.key}`}
                     initial={reduceMotion ? false : { width: 0 }}

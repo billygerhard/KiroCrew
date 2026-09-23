@@ -6,6 +6,7 @@ via the dashboard UI (Artifact Deploy page) by a cookie-authenticated human.
 Storage: ``~/.kiro/crew/deploy/pending-deploys.json`` — same atomic-write
 pattern as profiles.py registry.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -18,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.paths import config_dir
 from kiro_crew.platform_compat import file_lock
 
@@ -55,7 +57,21 @@ def _save_raw(entries: list[dict[str, Any]]) -> None:
         tmp.flush()
         os.fsync(tmp.fileno())
         tmp.close()
-        os.replace(tmp.name, str(p))
+        # `replace_with_retry`, not a bare `os.replace`: on Windows the rename
+        # raises `PermissionError` while any other handle is open on either
+        # path -- an indexer, an AV scanner, or a concurrent reader of this
+        # store -- and that transient is the only thing standing between a
+        # fully-durable write (fsync'd temp, above) and the entry landing.
+        # Every writer here funnels through this one call, so a faulted rename
+        # aborts whichever of add/claim/remove was in flight: a preview that
+        # cannot record its pending confirmation, a human confirm whose atomic
+        # claim cannot be persisted, or a dismiss that does not take.
+        #
+        # The retry only helps where it is allowed to sleep, and it is: the
+        # dashboard drives every one of these through `asyncio.to_thread`
+        # (`deploy/handlers.py`), so the helper's off-the-event-loop gate leaves
+        # it enabled on that path.
+        replace_with_retry(tmp.name, p)
     except BaseException:
         tmp.close()
         with contextlib.suppress(OSError):
@@ -90,7 +106,12 @@ def add_pending(params: dict[str, Any]) -> dict[str, Any]:
     # required=True: a deploy store that cannot obtain cross-process exclusion
     # must fail loudly rather than risk a double-deploy / lost write. flock_compat
     # is a Windows no-op, so this uses platform_compat's real msvcrt lock.
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable (msvcrt.locking needs it) but NON-TRUNCATING — a
+    # truncating "w" open of a lock file whose first byte another holder already
+    # locked raises a sharing violation on Windows instead of waiting. Full
+    # rationale: work_ledger._open_lock.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             entries = _prune_expired(_load_raw())
             entries.append(entry)
@@ -107,19 +128,14 @@ def list_pending() -> list[dict[str, Any]]:
     return entries
 
 
-def get_pending(entry_id: str) -> dict[str, Any] | None:
-    """Get a single pending entry by id, or None if expired/missing."""
-    for e in _prune_expired(_load_raw()):
-        if e.get("id") == entry_id:
-            return e
-    return None
-
-
 def remove_pending(entry_id: str) -> bool:
     """Remove an entry (confirm or dismiss). Returns True if found."""
     lock_path = _store_path().with_suffix(".lock")
     _store_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable but non-truncating; see add_pending above and
+    # work_ledger._open_lock for the Windows sharing-violation rationale.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             entries = _prune_expired(_load_raw())
             before = len(entries)
@@ -137,7 +153,10 @@ def claim_pending(entry_id: str) -> dict[str, Any] | None:
     """
     lock_path = _store_path().with_suffix(".lock")
     _store_path().parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as fd:
+    # touch + "r+": writable but non-truncating; see add_pending above and
+    # work_ledger._open_lock for the Windows sharing-violation rationale.
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with file_lock(fd.fileno(), exclusive=True, required=True):
             entries = _prune_expired(_load_raw())
             claimed = None

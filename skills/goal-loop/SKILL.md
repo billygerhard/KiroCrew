@@ -1,14 +1,7 @@
 ---
 name: goal-loop
-description: |
-  Bootstrap a goal-driven self-improving AutoNudge loop. Give it a goal + anchor
-  directory; it generates LOOP.md + GOAL.md + kanban board, then you write the
-  Definition of Done and arm the loop. The running agent manages the board
-  autonomously: finds issues, adds cards, resolves them, handoffs to Review,
-  repeats until DoD met → autonudge_stop. Use when user says "goal-driven loop",
-  "set up a goal loop", "autonomous fix loop", or "run until done". Depends on
-  the self-nudge-loop skill (reuses its scaffold.sh) — load that first for the
-  loop-mechanics reference.
+description: Bootstrap a goal-driven self-improving AutoNudge loop from a goal plus an anchor directory, then run the board autonomously until the Definition of Done is met.
+triggers: goal-driven loop, set up a goal loop, autonomous fix loop, run until done
 ---
 
 # goal-loop
@@ -26,7 +19,7 @@ After running this skill's `scaffold.sh`, the anchor directory contains:
 ├── GOAL.md        ← your goal statement + issue-discovery rules (this skill)
 ├── LOOP.md        ← DoD placeholder + REST arming recipe (from self-nudge-loop)
 ├── README.md      ← directory map (from self-nudge-loop)
-└── board/         ← kanban-md board, 6 columns (from self-nudge-loop)
+└── board/         ← kanban-md board, 6 columns (only when kanban-md is installed)
 ```
 
 The loop agent re-reads `GOAL.md` + `LOOP.md` every cycle. That's the
@@ -72,22 +65,29 @@ go install github.com/antopolskiy/kanban-md/cmd/kanban-md@latest
 Verify:
 
 ```bash
-kanban-md --version   # expect 0.33.0 or newer
+command -v kanban-md
 ```
 
-If `kanban-md` is not on PATH, the scaffold still generates `board/` as a
-plain markdown directory you can hand-edit, but the loop's auto-claim /
-auto-move steps will fail and the agent will block every cycle. Install the
-CLI before arming the loop for unattended runs.
+The loop needs the `pick`, `create`, `move`, and `handoff` verbs; check for those
+rather than a version number.
 
-**KiroCrew `autonudge_stop` MCP tool** — shipped with KiroCrew ≥ the
-autonudge CR. Used by the agent to self-halt when DoD is met. No extra
-install.
+If `kanban-md` is not on PATH, the scaffold skips `board/` creation and
+prints a warning. Install the CLI before arming a goal loop; this skill requires
+the board for automatic claim and handoff.
+
+The current scaffold also requires a `readlink` implementation that supports
+`-f` (GNU coreutils). Stock macOS `readlink` does not provide that flag.
+
+**Kiro Crew `autonudge_stop` MCP tool** — included with Kiro Crew. Used
+by the agent to self-halt when DoD is met; no extra install is required.
 
 ## Run it
 
+From a repo checkout (this skill and its `scaffold.sh` are repo-checkout-only, so
+the path below exists only where `KIROCREW_PROJECT_DIR` names such a checkout):
+
 ```bash
-cd $(dirname $(readlink -f ~/.kiro/crew/skills/goal-loop/SKILL.md))
+cd ~/.kiro/crew/skills/goal-loop
 ./scaffold.sh \
   --project my-goal-name \
   --anchor-dir /abs/path/to/goal/anchor \
@@ -100,7 +100,10 @@ Then:
 2. Open `<anchor>/GOAL.md` — confirm issue-discovery sources (defaults: tree
    grep, kanban backlog). Add/remove.
 3. `ls <anchor>/STOP` must say "No such file".
-4. Arm via UI 🎯 "Set a goal" or REST (see `LOOP.md §"Start the loop (REST)"`).
+4. Arm the loop: `monitor_start(message, interval_secs, max_cycles, max_runtime_secs)` from a live
+   session, the UI 🎯 "Set a goal", or `POST /api/autonudge`. Revise a running
+   loop in place with `PATCH /api/autonudge/{loop_id}` (or `monitor_update`),
+   which keeps its cycle count; `DELETE /api/autonudge/{loop_id}` stops it.
 
 ## The goal-loop cycle (what the agent does)
 
@@ -112,14 +115,21 @@ The nudge written by this skill instructs the agent to, every cycle:
 3. **Discover issues** — run the discovery sources from GOAL.md. For each
    finding not already on the board, `kanban-md create`. Then pick.
 4. **Execute one atomic step** on the claimed card (≤5 tool calls).
-5. **Record** — edit card body with `<UTC> cycle-<n>: <verb> <outcome>`.
-   Move to Review when ready for human approval.
+5. **Record** — edit card body with `<UTC> cycle-<n>: <verb> <outcome>`, and call
+   `session_ledger_record` with the phase, `next` as a concrete intent, and any
+   approach tried and rejected. The ledger survives context compaction; a card's
+   Cycle Log does not. On resume, read `session_ledger_read` before re-deriving
+   state from the board. Move the card to Review when it is ready for human
+   approval.
 6. **DM the user** — one-line progress tick via `send_message`.
 
 ## Operating invariants
 
 Inherited verbatim from `self-nudge-loop/LOOP.md §"Operating invariants"`.
 See that file. The short list:
+
+- If the armed nudge has gone stale, revise it with `monitor_update` rather than
+  re-arming, which loses the cycle count
 
 - Never `git push`
 - Never read credential files as text
@@ -129,15 +139,20 @@ See that file. The short list:
 
 ## Persistence rule (CRITICAL)
 
-**The loop stops in exactly two cases, nothing else:**
+**The agent self-stops in exactly three cases:**
 
-1. **Goal achieved** — all DoD criteria in `LOOP.md` check green → call
+1. **User stop** — the configured `STOP` sentinel exists → call
+   `autonudge_stop(reason="sentinel")`.
+2. **Goal achieved** — all DoD criteria in `LOOP.md` check green → call
    `autonudge_stop(reason="DoD met")`.
-2. **Unrecoverable infrastructure error** — the host/tooling itself is
+3. **Unrecoverable infrastructure error** — the host/tooling itself is
    broken in a way the agent cannot route around: disk full, network
    partition, auth provider down for >3 cycles, kanban-md binary missing
    from PATH mid-loop, kernel OOM, etc. Log one-line diagnosis to the
    Cycle Log and call `autonudge_stop(reason="infra: <what>")`.
+
+The service may also deactivate the loop on its finite cycle/runtime bounds or
+an approval stall. Those are bounded stops, not evidence that the goal succeeded.
 
 **Everything else is a problem to solve, not a reason to halt.** Examples
 of things that are NOT stop conditions:
@@ -155,10 +170,10 @@ of things that are NOT stop conditions:
 - It's late in the cycle budget → keep working; the service enforces
   `max_cycles`, not you
 
-The only time the agent writes a STOP sentinel or calls `autonudge_stop`
-itself is for the two cases above. When in doubt: keep going, find another
-angle, create a new card, and tick. The loop exists precisely so the agent
-can grind through problems humans would give up on.
+The agent never creates the user's STOP sentinel itself. It calls
+`autonudge_stop` only for the three cases above; service-enforced bounds remain
+independent. When in doubt: keep going, find another angle, create a new card,
+and tick.
 
 ## Extension points (future)
 

@@ -1,6 +1,6 @@
-"""Regression: gateway boot self-heals a stray auth-staging path (#561).
+"""Regression: gateway boot self-heals a stray auth-staging path.
 
-A stray file or dangling symlink at ``<home>/.kiro/crew-auth-staging`` used to
+A stray file or dangling symlink at ``<home>/.kiro/crew-auth-staging`` would
 make ``mkdir(exist_ok=True)`` raise ``FileExistsError`` and crash boot. It must
 now be removed (unlinked, so no sensitive contents survive to a readable
 sibling) and a fresh private directory created.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import requires_symlinks
 from kiro_crew.kiro_prerequisite import _AUTH_STAGING_RELATIVE, _ensure_auth_staging_parent
 
 
@@ -27,6 +28,7 @@ def test_stray_file_is_removed(tmp_path: Path) -> None:
     assert not any(".broken-" in p.name for p in staging.parent.iterdir())
 
 
+@requires_symlinks
 def test_dangling_symlink_is_removed(tmp_path: Path) -> None:
     staging = tmp_path / _AUTH_STAGING_RELATIVE
     staging.parent.mkdir(parents=True, exist_ok=True)

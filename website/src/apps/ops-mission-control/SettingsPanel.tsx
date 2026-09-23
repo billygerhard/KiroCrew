@@ -60,19 +60,85 @@ import { Badge, Btn, Card, CardTitle, Input, SendBtn, Toggle } from '../../compo
 import { i18nT } from '../../i18n/t'
 import { fmtUnit } from '../../i18n/format'
 import SegmentedControl from '../../components/SegmentedControl'
+import ErrorNotice from '../../components/ErrorNotice'
 import SimpleSelect from '../../components/SimpleSelect'
 import {
   opsApi,
+  OpsApiError,
   type AutonomyRule,
   type CompanionInfo,
   type LedgerSyncStatus,
   type NotifyOutStatus,
   type OperatingMode,
   type ProviderInfo,
+  type RotationIdentities,
   type RotationRoster,
   type SlackOutStatus,
   type SweepWindows,
 } from './api'
+import { useImeGuard } from '../../hooks/useImeGuard'
+
+/**
+ * Operator-facing message for a failed settings write.
+ *
+ * The error contract puts a machine `code` on every error body so callers can
+ * speak task vocabulary instead of the raw reason — which for the keystone's
+ * OSError-backed 503 is `str(exc)` ("[Errno 13] Permission denied") and for the
+ * validation 400s names the snake_case settings key. `subject` picks the
+ * sentence's subject (an identity field vs a settings change); both refusal
+ * strings name the settings store as the refuser, so a persistently failing
+ * retry has a diagnosis. Uncoded failures keep their backend reason verbatim.
+ */
+function settingsRefusalMessage(error: unknown, subject: 'identity' | 'change'): string {
+  if (error instanceof OpsApiError) {
+    if (error.code === 'policy_store_unwritable') {
+      return subject === 'identity'
+        ? i18nT('apps.opsMissionControl.settingsPanel.identity_save_refused')
+        : i18nT('apps.opsMissionControl.settingsPanel.change_save_refused')
+    }
+    if (error.code === 'value_too_long') {
+      return i18nT('apps.opsMissionControl.settingsPanel.value_too_long_refused')
+    }
+  }
+  return (error as Error).message
+}
+
+/**
+ * Fenced rotation identities by provider id — the keystone-backed field a
+ * rotation-capable provider row renders. Keys only: the labels are resolved
+ * through `i18nT` at render so a locale switch re-translates them. Field name
+ * and settings key coincide by construction (`RotationIdentities` mirrors the
+ * keystone keys), so one name serves both.
+ */
+const FENCED_IDENTITY_FIELDS: Record<
+  string,
+  { labelKey: string; helpKey: string; settingsKey: keyof RotationIdentities }
+> = {
+  pagerduty: {
+    labelKey: 'apps.opsMissionControl.settingsPanel.your_pagerduty_user_id',
+    helpKey: 'apps.opsMissionControl.settingsPanel.pagerduty_user_id_help',
+    settingsKey: 'pagerduty_user_id',
+  },
+  incidentio: {
+    labelKey: 'apps.opsMissionControl.settingsPanel.your_incident_io_user_id',
+    helpKey: 'apps.opsMissionControl.settingsPanel.incidentio_user_id_help',
+    settingsKey: 'incidentio_user_id',
+  },
+}
+
+function fencedIdentityFor(
+  providerId: string,
+  identities: RotationIdentities | undefined,
+): { label: string; settingsKey: string; value: string; help: string } | undefined {
+  const field = FENCED_IDENTITY_FIELDS[providerId]
+  if (!field) return undefined
+  return {
+    label: i18nT(field.labelKey),
+    settingsKey: field.settingsKey,
+    value: identities?.[field.settingsKey] ?? '',
+    help: i18nT(field.helpKey),
+  }
+}
 
 /** Module-level frozen empty so the render-time fallback is referentially stable. */
 const EMPTY_COMPANIONS: readonly CompanionInfo[] = Object.freeze([])
@@ -98,6 +164,7 @@ function ProviderRow({
    */
   fencedIdentity?: { label: string; settingsKey: string; value: string; help: string }
 }) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
@@ -166,7 +233,9 @@ function ProviderRow({
   // deliberately ignores.
   const hasEnableFlag = provider.config_fields.includes('enabled')
   const fieldsVisible = enabled || !hasEnableFlag
-  const writeError = configMutation.isError || secretMutation.isError
+  // A failed credential revoke used to leave the button re-enabled with no message at
+  // all; it is a write like the other two and reports beside them.
+  const indent = hasEnableFlag ? 'ml-11' : ''
 
   return (
     <div className="border-t border-border py-3">
@@ -206,9 +275,7 @@ function ProviderRow({
               value={identityDraft ?? fencedIdentity.value}
               placeholder="—"
               onChange={(e) => setIdentityDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commitIdentity()
-              }}
+              {...ime.bindEnter({ onEnter: commitIdentity })}
             />
             <SendBtn
               disabled={
@@ -221,6 +288,19 @@ function ProviderRow({
               {i18nT('apps.opsMissionControl.settingsPanel.save')}
             </SendBtn>
           </label>
+          {identityMutation.isError ? (
+            <>
+              {/* No hand-off: the unsaved provider identity typed into
+                  `omc-${provider.id}-fenced-identity` (`identityDraft`) is still in the
+                  input — it is cleared only on success, so the refusal must not offer an
+                  agent hand-off over a value the keystone never accepted. A refused
+                  keystone write comes back as a coded 503 precisely so the operator is
+                  not left guessing whether the identity landed. */}
+              <ErrorNotice
+                message={settingsRefusalMessage(identityMutation.error, 'identity')}
+              />
+            </>
+          ) : null}
           <p className="text-[12px] text-muted">{fencedIdentity.help}</p>
         </div>
       ) : null}
@@ -324,10 +404,17 @@ function ProviderRow({
           one write most likely to be rejected — the toggle itself, on an adapter with no
           `enabled` field — failed with no visible message at all. A rejected write must
           always be able to say so. */}
-      {writeError ? (
-        <p className={`text-[12px] text-danger ${hasEnableFlag ? 'pl-11' : ''}`}>
-          {((configMutation.error ?? secretMutation.error) as Error)?.message}
-        </p>
+      {/* No hand-off: the provider config fields and the typed-but-unsaved secret
+          drafts in this row live in component state until Save. One notice per write,
+          not a coalesced chain, so a persistent earlier failure cannot mask a later one. */}
+      {configMutation.isError ? (
+        <ErrorNotice className={indent} message={(configMutation.error as Error).message} />
+      ) : null}
+      {secretMutation.isError ? (
+        <ErrorNotice className={indent} message={(secretMutation.error as Error).message} />
+      ) : null}
+      {revokeMutation.isError ? (
+        <ErrorNotice className={indent} message={(revokeMutation.error as Error).message} />
       ) : null}
     </div>
   )
@@ -631,6 +718,7 @@ function SharedMemoryCard({
   onSave: (updates: Record<string, unknown>) => void
   saving: boolean
 }) {
+  const ime = useImeGuard()
   // Local drafts, seeded from the server and re-seeded while untouched — the same shape
   // as the Slack channel field, so a background /state refresh cannot clobber typing.
   const serverRemote = status?.remote ?? ''
@@ -749,9 +837,7 @@ function SharedMemoryCard({
               setRemoteTouched(true)
               setRemote(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') saveRemote()
-            }}
+            {...ime.bindEnter({ onEnter: saveRemote })}
           />
           {/* An explicit Save, not a commit on blur. Tabbing out of a half-pasted URL
               would repoint the whole team's repo, and the backend's branch/length
@@ -773,9 +859,7 @@ function SharedMemoryCard({
               setBranchTouched(true)
               setBranch(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') saveBranch()
-            }}
+            {...ime.bindEnter({ onEnter: saveBranch })}
           />
           <SendBtn disabled={!branchDirty || saving} onClick={saveBranch}>
             {i18nT('apps.opsMissionControl.settingsPanel.save')}
@@ -876,6 +960,7 @@ function OnCallScheduleCard({
   roster?: RotationRoster
   syncReady: boolean
 }) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   // From the ROSTER, not from provider config. The login moved onto the keystone floor
   // (`policy_store.OPERATOR_ONLY_KEYS`) because it is an input to the authorization decision —
@@ -968,9 +1053,7 @@ shifts:
                 setTouched(true)
                 setLogin(e.target.value)
               }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commit()
-              }}
+              {...ime.bindEnter({ onEnter: commit })}
             />
             <SendBtn disabled={!dirty || loginMutation.isPending} onClick={commit}>
               {i18nT('apps.opsMissionControl.settingsPanel.save')}
@@ -982,10 +1065,9 @@ shifts:
               ghCli: 'gh',
             })}
           </p>
+          {/* No hand-off: the GitHub login typed into `omc-schedule-login` is unsaved. */}
           {loginMutation.isError ? (
-            <p className="text-[12px] text-danger">
-              {(loginMutation.error as Error).message}
-            </p>
+            <ErrorNotice message={settingsRefusalMessage(loginMutation.error, 'identity')} />
           ) : null}
         </div>
       ) : null}
@@ -1029,12 +1111,8 @@ shifts:
               </span>
             </p>
           ) : null}
-          {roster.error ? (
-            <p className="text-[13px] text-danger flex items-start gap-1.5">
-              <AlertTriangle className="lucide-inline" />
-              <span>{roster.error}</span>
-            </p>
-          ) : null}
+          {/* No hand-off: shares the card with the unsaved `omc-schedule-login` input. */}
+          {roster.error ? <ErrorNotice message={roster.error} /> : null}
 
           {/* Strict gating moved onto the keystone floor alongside the login, for the same
               reason: turning it off restores fail-open gating, so an unreadable schedule
@@ -1102,6 +1180,7 @@ function HeartbeatCard({
   onSave: (updates: Record<string, unknown>) => void
   saving: boolean
 }) {
+  const ime = useImeGuard()
   // Drafts in MINUTES, because the backend's seconds are a storage unit and nobody tunes a
   // 12-hour window by typing 43200. Re-seeded from the server while untouched, the same
   // shape as every other field here, so a background /state refresh cannot clobber typing.
@@ -1175,11 +1254,7 @@ function HeartbeatCard({
               setStaleTouched(true)
               setStale(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                save('stale_after_secs', staleSecs, () => setStaleTouched(false))
-              }
-            }}
+            {...ime.bindEnter({ onEnter: () => save('stale_after_secs', staleSecs, () => setStaleTouched(false)) })}
           />
           <span className="text-muted shrink-0">{i18nT('apps.opsMissionControl.settingsPanel.min')}</span>
           <SendBtn
@@ -1201,13 +1276,11 @@ function HeartbeatCard({
               setNeedsHumanTouched(true)
               setNeedsHuman(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                save('needs_human_stale_after_secs', needsHumanSecs, () =>
-                  setNeedsHumanTouched(false),
-                )
-              }
-            }}
+            {...ime.bindEnter({
+              onEnter: () => save('needs_human_stale_after_secs', needsHumanSecs, () =>
+                setNeedsHumanTouched(false),
+              ),
+            })}
           />
           <span className="text-muted shrink-0">{i18nT('apps.opsMissionControl.settingsPanel.min')}</span>
           <SendBtn
@@ -1378,7 +1451,9 @@ function ActRulesCard({
         </div>
       )}
 
-      {error ? <p className="text-[12px] text-danger mt-2">{error}</p> : null}
+      {/* No hand-off: the new rule's signal source and resource pattern (`omc-rule-glob`)
+          are unsaved until Grant. */}
+      <ErrorNotice className="mt-2" message={error} />
     </Card>
   )
 }
@@ -1394,6 +1469,9 @@ export default function SettingsPanel() {
   const rotationQuery = useQuery({
     queryKey: ['ops-mission-control', 'rotation'],
     queryFn: () => opsApi.rotation(),
+    // settingsMutation sends a replace-all PUT from this cache; finite staleTime
+    // lets focus-refetch fire here (global default is Infinity).
+    staleTime: 30_000,
   })
 
   // Slack status rides on /state (it depends on live gateway state, not config
@@ -1462,10 +1540,13 @@ export default function SettingsPanel() {
         {/* An un-actionable empty-state line lived here and was a dead end: it named the gap
             without offering any way to close it. The rules card below IS the way, so the
             statement moved there, next to the form that answers it. */}
+        {/* No hand-off: this page also holds the provider rows' identity, login and
+            secret drafts, which the navigation would discard. */}
         {settingsMutation.isError ? (
-          <p className="text-[12px] text-danger mt-2">
-            {(settingsMutation.error as Error).message}
-          </p>
+          <ErrorNotice
+            className="mt-2"
+            message={settingsRefusalMessage(settingsMutation.error, 'change')}
+          />
         ) : null}
       </Card>
 
@@ -1496,16 +1577,7 @@ export default function SettingsPanel() {
             <ProviderRow
               key={p.id}
               provider={p}
-              fencedIdentity={
-                p.id === 'pagerduty'
-                  ? {
-                    label: i18nT('apps.opsMissionControl.settingsPanel.your_pagerduty_user_id'),
-                    settingsKey: 'pagerduty_user_id',
-                    value: rotationQuery.data?.identities?.pagerduty_user_id ?? '',
-                    help: i18nT('apps.opsMissionControl.settingsPanel.pagerduty_user_id_help'),
-                  }
-                  : undefined
-              }
+              fencedIdentity={fencedIdentityFor(p.id, rotationQuery.data?.identities)}
             />
           ))
         )}

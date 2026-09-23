@@ -7,7 +7,7 @@ up to a full "experience pack" (fonts, sandboxed overlays, audio, persona). A
 color theme is the degenerate case of a pack — the whole spectrum lives behind
 **one Theme dropdown** in Settings → Display: install many, select one.
 
-Themes are a **standalone subsystem built on `useTheme`**, not KiroCrew apps. This document is the **source of truth** for the end-to-end subsystem.
+Themes are a **standalone subsystem built on `useTheme`**, not Kiro Crew apps. This document is the **source of truth** for the end-to-end subsystem.
 The frontend pack-author contract (the CSS-var surface and the
 `overrides.css` selector allowlist) lives in
 [`website/docs/theming-contract.md`](../../../website/docs/theming-contract.md);
@@ -18,8 +18,8 @@ where the two overlap, this spec governs.
 `theme.json` MUST declare `"formatVersion": 1` (required integer major,
 mirroring the platform layer's pinned-`CONTRACT_VERSION` precedent). Validation
 rejects a missing/non-integer value, and rejects an unknown major with an
-explicit *"this pack requires a newer version of KiroCrew"* message — never the
-opaque generic-validation errors — so an older KiroCrew degrades honestly when
+explicit *"this pack requires a newer version of Kiro Crew"* message — never the
+opaque generic-validation errors — so an older Kiro Crew degrades honestly when
 handed a newer pack. Semantics changes within a major stay backward-tolerant;
 breaking manifest changes bump the major.
 
@@ -28,27 +28,79 @@ a pack may ship. Validation is tier-scaled to payload trust.
 
 | Tier | `level` | Surface unlocked |
 |---|---|---|
-| **L0 Color** | 0 | the 43 theme CSS variables (dark + light) only |
-| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css` |
+| **L0 Color** | 0 | the 56 theme CSS variables (dark + light) only |
+| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css`, `loader/*.png\|webp\|gif\|svg` |
 | **L2 Experience** | 2 | + `overlays/` + `topbar/` sandboxed HTML, `audio/`, `persona.md` |
 
+Level-1 and Level-2 manifests may also declare `loaderIcons`: 4–8 distinct
+names from the bundled stock-symbol allowlist (`cloud`, `flower`, `heart`,
+`moon`, `sparkles`, `star`, `sun`, `zap`). The backend validates and surfaces
+the names in the theme asset descriptor; the frontend maps them to bundled
+Lucide components and reuses the existing carousel. No component code, SVG, or
+asset path crosses the manifest boundary. Missing declarations preserve the
+Kiro ghost poses, and trusted compiled themes retain the broader
+`registerThemeBranding()` component seam.
+
+Installed packs may also supply the loader **art**, not just select symbols:
+`loader/*.png` `.webp` `.gif` `.svg` (1–8 images, Level 1) are the pack's own
+loader art: one image renders on its own, 2–8 are cycled by the stock carousel.
+Animated WebP/APNG/GIF and animated SVG self-animate inside the `<img>`, so a
+pack can ship a single fully-authored loop. Each is served through the ordinary
+asset route with a strict Content-Type + `nosniff` under `_THEME_ASSET_CSP`
+(`default-src 'none'; sandbox`) and referenced only as an `<img>` — SVG is safe
+the same way `logo.svg` is (an `<img>`-loaded SVG runs in the browser's secure
+static/animated mode: no scripts, no external loads, animation still plays), so
+it needs no HTML-serving route of its own. The frontend
+`resolveLoader` precedence is: compiled `loader` → pack images (one on its own,
+2–8 cycled) → `loaderIcons` (manifest, then compiled) → the default poses.
+
 Constants (`dashboard/theme_validate.py`): `_THEME_MAX_LEVEL=2`,
-`_THEME_MAX_FONTS=3`, `_THEME_MAX_OVERLAYS=5`, `_THEME_PERSONA_MAX_CHARS=2000`,
+`_THEME_MAX_FONTS=6`, `_THEME_MAX_OVERLAYS=5`, `_THEME_PERSONA_MAX_CHARS=2000`,
 plus per-file byte caps (`_THEME_FILE_CAPS`) and per-level entry-count + total
 uncompressed byte ceilings.
 
+### Fonts are role-tagged
+
+Each entry in `theme.json`'s `fonts` list carries a `role` of `sans` or `mono`
+(absent ⇒ `sans`, so pre-role packs keep their meaning). A role fills a CSS token
+— `--theme-font-sans` / `--theme-font-mono` — that the Font Family preference
+reads through, which is what routes a pack's proportional face to the Sans option
+and its monospace face to Mono while System stays on the OS face. `--mono` reads
+the mono token as well, so code surfaces follow a pack's monospace face.
+
+The indirection is load-bearing: the preference applies `--font-body` as an inline
+style on `<html>`, and an inline declaration outranks every selector, so a pack
+declaring `--font-body` on its own `[data-theme=…]` block would never win.
+`_THEME_MAX_FONTS` covers both roles at once, so shipping a mono face does not
+cost a sans weight. Declaring any font token — or `font` / `font-family` on a
+whole-UI surface — in `overrides.css` is rejected **at install**
+(`_overrides_font_violation`, which decodes CSS escapes and matches the `font`
+shorthand as well as the longhand) and dropped by the runtime scoper, keeping the
+manifest the single route and the preference honest for every pack.
+
+The font layer is gated behind `_validate_theme_dir(..., installing=True)` rather
+than applied on every call, because that function also runs when the theme-detail
+route re-reads an installed pack — and that route answers 500 on a validation
+failure, which the dashboard fetches for every theme at boot. Enforcing it there
+would drop a pre-rule pack out of the theme map entirely, colours included. The
+runtime scoper still removes the pin, so the preference is protected either way.
+
 ## Install Pipeline
 
-1. **Source** — a local directory (moved/copied) or an https `github.com` repo
+1. **Source** — a local directory (read in place, then copied into staging) or an https `github.com` repo
    shallow-cloned server-side (`_clone_github`, `--depth 1`, 30s timeout, host
-   allowlist).
+   allowlist). The clone spawns through the sandbox chokepoint, which fails
+   **closed** where no OS sandbox backend exists: that refusal answers `503`
+   with `code: "theme_install_sandbox_unavailable"`, never an unsandboxed
+   retry — the URL is user-influenced and `git clone` executes remote content.
+   A **local** source spawns nothing, so it stays available on such a host.
 2. **Stage** — the source is copied into a private staging snapshot
    (`.install-staging-<token>`) via a per-file, symlink-rejecting,
    byte-bounded loop (`_copy_installed_theme`). The source dir remains
    attacker-writable throughout, so nothing read from it is trusted twice:
    the copy enforces a hard cumulative byte ceiling, and everything after
    this step operates on the snapshot only.
-3. **Validate** — `_validate_theme_dir(stage)` runs on the immutable staging
+3. **Validate** — `_validate_theme_dir(stage, installing=True)` runs on the immutable staging
    snapshot and returns `(record | None, error)`: tier-gated category
    allowlist, filename allowlist, per-file/total size caps, symlink rejection,
    path-traversal rejection (`_safe_slug`), CSS/HTML denylists, audio
@@ -71,7 +123,7 @@ Registered in `dashboard/server.py`. The validation/parsing core lives in
 |---|---|---|
 | `POST` | `/api/themes/install` | Install from local dir or GitHub (overwrite on re-install) |
 | `DELETE` | `/api/themes/{slug}` | Remove an installed theme |
-| `GET` | `/api/themes` | List all themes (built-in + custom + installed) |
+| `GET` | `/api/themes` | List custom + installed themes (the frontend adds built-ins) |
 | `GET` | `/api/themes/{slug}` | Theme detail + resolved `level` |
 | `GET` | `/api/theme/{slug}/assets/{path}` | Serve a pack asset (nosniff + content-type allowlist) |
 | `GET` | `/api/theme/{slug}/overlay/{id}` | Serve overlay HTML (locked CSP) |
@@ -89,9 +141,21 @@ predate this subsystem and remain the color-theme surface.)
 - **Locked CSP** — overlay/topbar responses carry a fixed
   `Content-Security-Policy` including a `sandbox` directive; asset responses
   carry `X-Content-Type-Options: nosniff` and a content-type allowlist.
+- **Descriptor-pinned containment** — pack install and serving resolve the
+  opened file descriptor before trusting bytes: `/proc/self/fd` on Linux,
+  `fcntl.F_GETPATH` on macOS, and `GetFinalPathNameByHandleW` on Windows. The
+  resolved path must remain inside the pack root; an unavailable or failed
+  resolution rejects the read rather than falling back to a pathname-only
+  check. On macOS, a case-only spelling mismatch is accepted by the shared
+  reader only after a no-follow walk proves identity with the held descriptor;
+  containment compares kernel spellings of the file and pinned root, never a
+  globally case-folded prefix. This lets legitimate APFS aliases reach the
+  install destination guard, which still refuses a source inside its own
+  destination before promotion and preserves source and sibling contents.
 - **postMessage allowlist** — the parent (`ThemeExperienceLayer.tsx`) accepts
-  only `theme:resize`, `theme:sound`, `theme:visibility`, and `theme:state`
-  messages from a pack iframe; all others are dropped.
+  only `theme:resize`, `theme:sound`, and `theme:visibility` messages from a
+  pack iframe; all others are dropped. `theme:state` travels in the opposite
+  direction, from the parent to each live theme iframe.
 - **CSS containment** — install-time denylist (no `@import`, external `url()`,
   dangerous functions/bindings, forbidden selectors, `z-index` >
   `_THEME_OVERLAY_MAX_ZINDEX`) via a string-aware top-level rule tokenizer, plus
@@ -170,6 +234,7 @@ predate this subsystem and remain the color-theme surface.)
 | Loader | `website/src/hooks/useTheme.tsx` | Applies CSS vars; `applyThemeOverrides` → `_scopeOverridesCss` + `_rewriteOverridesUrls`; `injectThemeFonts`; pre-apply self-repair; `themeSwitching` state |
 | Experience layer | `website/src/components/ThemeExperienceLayer.tsx` | Mounts sandboxed overlay/topbar iframes + audio; enforces the postMessage allowlist |
 | Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Single Theme dropdown + install-from-local/GitHub + remove + "Applying…" status indicator |
+| Utility bridge | `website/src/tailwind-theme.css` | Tailwind v4 `@theme` mapping each utility (`bg-accent`, `text-muted/40`, `rounded-md`, `shadow-sm`, `font-mono`) onto the runtime CSS variable of the same stem, plus the `dark:` variant keyed on `[data-theme="dark"]`. A pack changes what a utility renders by writing the variable; it never touches this file. |
 
 ### One theme, one picker row (registered vs installed)
 

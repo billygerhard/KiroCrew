@@ -1,4 +1,5 @@
 import { appPageLabel } from './components/appstore/appManifest'
+import { installedIcon } from './components/appstore/useHeroArt'
 
 /**
  * Where an installed app lives in the dashboard — one definition, shared by every
@@ -13,6 +14,14 @@ import { appPageLabel } from './components/appstore/appManifest'
  * its glyph for a 16px row while the palette does not.
  */
 
+/** A UI page an app publishes in `manifest.ui.pages`. */
+export interface AppNavPage {
+  route: string
+  icon?: string
+  iconUrl?: string
+  label?: string
+}
+
 /**
  * The subset of `GET /api/apps` this module reads. Pinned locally (rather than
  * imported from a consumer) so a field this derivation depends on cannot quietly
@@ -24,11 +33,25 @@ export interface AppNavRecord {
   enabled?: boolean
   origin?: string
   orphaned?: boolean
+  /** Git URL the install recorded — the repo an external app's art resolves against. */
+  sourceUrl?: string
   manifest?: {
     iconUrl?: string
+    iconUrlDark?: string
+    /**
+     * What an EXTERNAL app actually declares. The manifest contract gives a
+     * fetched app `iconPath` (repo-relative) and reserves `iconUrl` for a
+     * builtin's absolute client-local path, so reading only `iconUrl` here left
+     * every external app's rail and command-palette icon as the generic box —
+     * the one surface that renders on every load.
+     */
+    iconPath?: string
+    iconPathDark?: string
+    /** The repo a manifest declares for its own art paths, when it declares one. */
+    repo?: string
     ui?: {
       entry?: string
-      pages?: Array<{ route: string; icon?: string; iconUrl?: string; label?: string }>
+      pages?: AppNavPage[]
     }
   }
 }
@@ -55,10 +78,26 @@ export interface AppNavTarget {
   builtin: boolean
   /** Custom top-level icon (an absolute `/app-assets/...` path), when the manifest has one. */
   iconUrl: string
+  /** Dark-appearance variant of `iconUrl`, when the manifest ships one. */
+  iconUrlDark: string
   /** Lucide glyph name from the app's first UI page, for the builtin icon lookup. */
   iconName: string
   /** Page-relative icon file (installed apps), resolved against `/apps/<name>/ui/`. */
   pageIconUrl: string
+}
+
+/**
+ * The UI page a navigable app opens at, or `null` when it has none.
+ *
+ * The guard and the read are ONE expression on purpose. Asking
+ * `manifest?.ui?.pages?.length` in one place and then asserting
+ * `manifest!.ui!.pages![0]` in another is the shape that produced #3689: the
+ * assertion outlives the guard it was written against. Returning the page makes
+ * "navigable" and "here is the page" the same answer, so they cannot disagree.
+ */
+function firstUiPage(app: AppNavRecord): AppNavPage | null {
+  const pages = app.manifest?.ui?.pages
+  return pages && pages.length > 0 ? pages[0] : null
 }
 
 /**
@@ -68,7 +107,7 @@ export interface AppNavTarget {
  * offer to open them.
  */
 export function isAppNavigable(app: AppNavRecord): boolean {
-  return !!app.enabled && (app.manifest?.ui?.pages?.length ?? 0) > 0
+  return !!app.enabled && !!firstUiPage(app)
 }
 
 /**
@@ -84,8 +123,8 @@ export function isAppNavigable(app: AppNavRecord): boolean {
  *     registered at the page's own route.
  */
 export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
-  if (!isAppNavigable(app)) return null
-  const page = app.manifest!.ui!.pages![0]
+  const page = app.enabled ? firstUiPage(app) : null
+  if (!page) return null
   const isBuiltin = app.origin === 'builtin'
   const orphaned = !!app.orphaned
   const appHostRouted = !isBuiltin || !!app.manifest?.ui?.entry
@@ -98,10 +137,29 @@ export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
     name: app.name,
     route,
     id: appHostRouted ? `app-${app.name}` : app.name,
-    label: appPageLabel(app.name, page.label, app.displayName),
+    label: appPageLabel(app.name, page.label, app.displayName, app.origin),
     orphaned,
     builtin: isBuiltin,
-    iconUrl: app.manifest?.iconUrl || '',
+    // Routed through the shared resolver rather than taken raw: an installed
+    // `app.json` is untrusted content, and both consumers of this target (the
+    // left rail and the command palette) render for EVERY enabled app on every
+    // dashboard load — so a manifest naming an external host would leak the
+    // viewer to it without them opening anything. A built-in's absolute
+    // `/app-assets/…` still passes through unchanged.
+    //
+    // `installedArt` first: everything here IS installed, and its art sits in
+    // the app's own install directory, so serving it from `/apps/{name}/art/…`
+    // keeps the rail off the blob proxy entirely. That matters most on this
+    // surface — it is the one that renders on every load, so a proxy 403 during
+    // a cold start would blank every external app's rail icon at once.
+    // `iconPath` before `iconUrl`, matching the order the detail page and the
+    // backend both use: a fetched app declares the repo-relative one, and reading
+    // only `iconUrl` is why an external app kept the generic box here even after
+    // its detail page showed the real icon.
+    iconUrl: installedIcon(app.manifest?.iconPath, app.manifest?.iconUrl, app.name),
+    iconUrlDark: installedIcon(
+      app.manifest?.iconPathDark, app.manifest?.iconUrlDark, app.name,
+    ),
     iconName: page.icon || '',
     pageIconUrl: page.iconUrl || '',
   }

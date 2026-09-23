@@ -129,10 +129,16 @@ class TestUnresolvableScopeRefuses:
             "GIT_COMMITTER_EMAIL": "t@t",
         }
         root.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, env=env)
+        # ``cwd=root`` on every spawn: a test's git must never inherit pytest's working
+        # directory (the checkout) as the child's cwd.
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(root)], check=True, env=env, cwd=str(root)
+        )
         (root / "f.txt").write_text("x\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env)
-        subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env, cwd=str(root))
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env, cwd=str(root)
+        )
         return root
 
     def test_an_unresolvable_scope_base_refuses_to_build_the_profile(self, tmp_path) -> None:
@@ -141,10 +147,10 @@ class TestUnresolvableScopeRefuses:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 
         clone = self._repo(tmp_path / "clone")
-        # Matches on the CONSEQUENCE, not the cause: the guard deliberately no longer
-        # distinguishes "does not resolve" from "resolves but cannot be diffed" (both widen
-        # the fence identically), so asserting the old cause-specific wording would pin a
-        # distinction the code dropped on purpose.
+        # Matches on the CONSEQUENCE, not the cause: the guard deliberately does not
+        # distinguish "does not resolve" from "resolves but cannot be diffed" (both widen
+        # the fence identically), so asserting cause-specific wording would pin a
+        # distinction the code does not make.
         with pytest.raises(ValueError, match="could not be resolved to a file set"):
             gp.GitHubRepoProfile(
                 clone_path=clone,

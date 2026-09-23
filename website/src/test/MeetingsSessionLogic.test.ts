@@ -8,22 +8,31 @@ import { describe, it, expect } from 'vitest'
 
 import {
   ALLOWED_TRANSITIONS,
+  canOpenTranscription,
   canTransition,
   isDuplicateSegment,
+  mergeTranscriptSegments,
+  metaPollInterval,
   newSegmentText,
+  reconcileTranscriptPage,
   resolveEnabledAgents,
 } from '../apps/meetings/hooks/useMeetingSession'
+import {
+  CAPTION_FINALS_LIMIT,
+  CAPTION_WINDOW_CHARS,
+  captionWindow,
+} from '../apps/meetings/hooks/useMeetingTranscription'
 import type { AgentDef, MeetingsConfig } from '../apps/meetings/api'
-import { readFileSync } from 'node:fs'
+import { readSource } from './readSource'
 import EN_CATALOG from '../i18n/locales/en.json'
 
 // Plain repo-relative paths, the convention in PapyrusCloseProject.test.tsx:
 // vitest runs with `website/` as cwd.
-const TranscriptionSource = readFileSync(
-  'src/apps/meetings/hooks/useMeetingTranscription.ts', 'utf-8',
+const TranscriptionSource = readSource(
+  'src/apps/meetings/hooks/useMeetingTranscription.ts',
 )
-const SessionSource = readFileSync('src/apps/meetings/hooks/useMeetingSession.ts', 'utf-8')
-const SettingsSource = readFileSync('src/apps/meetings/SettingsView.tsx', 'utf-8')
+const SessionSource = readSource('src/apps/meetings/hooks/useMeetingSession.ts')
+const SettingsSource = readSource('src/apps/meetings/SettingsView.tsx')
 
 const AGENTS: AgentDef[] = [
   { id: 'note-taker', name: 'Note Taker', widget_type: 'markdown', enabled_by_default: true },
@@ -102,6 +111,33 @@ describe('resolveEnabledAgents', () => {
   it('treats a missing enabled_by_default as enabled', () => {
     const agents: AgentDef[] = [{ id: 'x', name: 'X', widget_type: 'markdown' }]
     expect(resolveEnabledAgents('', undefined, agents)).toEqual(['x'])
+  })
+})
+
+describe('mergeTranscriptSegments', () => {
+  const segment = (id: string) => ({
+    id,
+    timestamp: '2026-08-10T10:00:00Z',
+    source: 'speech' as const,
+    text: id,
+  })
+
+  it('appends cursor pages while deduplicating immediate dispatch responses', () => {
+    expect(
+      mergeTranscriptSegments(
+        [segment('first'), segment('immediate')],
+        [segment('immediate'), segment('polled')],
+      ).map(item => item.id),
+    ).toEqual(['first', 'immediate', 'polled'])
+  })
+
+  it('restores durable order after concurrent dispatch responses resolve out of order', () => {
+    expect(
+      reconcileTranscriptPage(
+        [segment('first'), segment('third'), segment('second')],
+        [segment('second'), segment('third')],
+      ).map(item => item.id),
+    ).toEqual(['first', 'second', 'third'])
   })
 })
 
@@ -224,6 +260,15 @@ describe('final-segment dispatch is retried, never swallowed', () => {
       /const dispatchWithRetry[\s\S]*?\n  \},\n?\s*\[[^\]]*\],?\n?\s*\)/,
     )
     expect(helper![0]).toContain('onErrorRef.current?.(')
+  })
+
+  it('treats transcript capacity as permanent and blocks later retries', () => {
+    const helper = TranscriptionSource.match(
+      /const dispatchWithRetry[\s\S]*?\n  \},\n?\s*\[[^\]]*\],?\n?\s*\)/,
+    )
+    expect(helper![0]).toContain("error.code === 'transcript_too_large'")
+    expect(helper![0]).toContain('dispatchBlockedRef.current = true')
+    expect(helper![0]).toContain("onErrorRef.current?.('transcript_full')")
   })
 
   it('the reported code has a distinct catalog key', () => {
@@ -396,10 +441,7 @@ describe('task sidebar inputs track the server value', () => {
   // update. Keying on the server value remounts the input when the server's copy
   // changes, which is what makes the refresh visible.
 
-  const sidebar = readFileSync(
-    'src/apps/meetings/components/TaskSidebar.tsx',
-    'utf-8',
-  )
+  const sidebar = readSource('src/apps/meetings/components/TaskSidebar.tsx')
 
   it('keys the description input on the server value', () => {
     expect(sidebar).toContain('key={`desc:${task.description}`}')
@@ -426,7 +468,7 @@ describe('settings saves cannot revert each other', () => {
   // The backend PUT is a full, validated replace, so each patch carries the whole
   // config. Built from the render-time snapshot, two rapid changes each sent a base
   // missing the other's change and the later response reverted it.
-  const settings = readFileSync('src/apps/meetings/SettingsView.tsx', 'utf-8')
+  const settings = readSource('src/apps/meetings/SettingsView.tsx')
 
   it('derives the payload from the CACHE, not the render snapshot', () => {
     // `onSuccess` writes the server's response into the cache, so reading it at send
@@ -468,7 +510,7 @@ describe('a nested settings patch is derived from the latest config', () => {
   // from the config — `meeting_agents` mapped from the existing array, `calendar`
   // spread to keep its other key — was still computed at call time from the render
   // snapshot, so two rapid toggles each queued a value missing the other's change.
-  const settings = readFileSync('src/apps/meetings/SettingsView.tsx', 'utf-8')
+  const settings = readSource('src/apps/meetings/SettingsView.tsx')
 
   it('patch accepts an updater resolved against the latest config', () => {
     expect(settings).toMatch(/\(latest: MeetingsConfig\) => Partial<MeetingsConfig>/)
@@ -525,5 +567,210 @@ describe('starting before the config loads does not persist an empty roster', ()
     const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
     expect(startCall, 'no startMutation found').not.toBeNull()
     expect(startCall![0]).not.toMatch(/enabledIds\.length/)
+  })
+})
+
+describe('the live caption shows the newest speech, not the meeting opening', () => {
+  // The durable transcript owns the complete history. The bounded local array is
+  // handed to a caption element that clips its overflow — and
+  // `text-overflow: ellipsis` shows a string's HEAD. The visible caption was
+  // therefore the meeting's first sentence, frozen for its whole duration.
+
+  const SEGMENTS = Array.from(
+    { length: 40 },
+    (_, i) => `segment ${i} with several spoken words in it`,
+  )
+
+  it('drops the oldest segments once the window is full', () => {
+    const out = captionWindow(SEGMENTS)
+    expect(out).toContain('segment 39')
+    // The defect, stated as an assertion: the opening of the meeting must be gone.
+    expect(out).not.toContain('segment 0 ')
+  })
+
+  it('bounds what the caption element is asked to render', () => {
+    expect(captionWindow(SEGMENTS).length).toBeLessThanOrEqual(CAPTION_WINDOW_CHARS)
+  })
+
+  it('leaves a transcript that already fits completely alone', () => {
+    // The common case must not be trimmed at all.
+    expect(captionWindow(['hello there', 'how are you'])).toBe('hello there how are you')
+  })
+
+  it('joins Chinese and Japanese finals and partials without inserted spaces', () => {
+    expect(captionWindow(['继续', '继续'], '，请处理。')).toBe('继续继续，请处理。')
+    expect(captionWindow(['今日は', '晴れ'], 'です。')).toBe('今日は晴れです。')
+    expect(captionWindow(['请打开', 'Settings'], '然后继续。')).toBe('请打开Settings然后继续。')
+  })
+
+  it('keeps a CJK segment that fits exactly instead of charging a nonexistent separator', () => {
+    const final = '中'.repeat(CAPTION_WINDOW_CHARS - 2)
+    expect(captionWindow([final], '继续')).toBe(final + '继续')
+    // An actual English joining space still counts toward the budget.
+    expect(captionWindow(['a'.repeat(CAPTION_WINDOW_CHARS - 4)], 'next')).toBe('next')
+  })
+
+  it('attaches a punctuation partial without dropping a final that fits the caption budget', () => {
+    expect(captionWindow(['hello'], ', world')).toBe('hello, world')
+    const final = 'a'.repeat(CAPTION_WINDOW_CHARS - 1)
+    expect(captionWindow([final], '.')).toBe(final + '.')
+  })
+
+  it('keeps the recent CJK prefix of an oversized mixed-language segment', () => {
+    const newest = '中'.repeat(CAPTION_WINDOW_CHARS) + ' hello world'
+    const out = captionWindow([newest])
+    expect(out).toBe(newest.slice(-CAPTION_WINDOW_CHARS))
+    expect(out.length).toBe(CAPTION_WINDOW_CHARS)
+  })
+
+  it('keeps the in-flight partial at the end', () => {
+    expect(captionWindow(['committed words'], 'and the partial')).toBe(
+      'committed words and the partial',
+    )
+    expect(captionWindow([], 'partial only')).toBe('partial only')
+    expect(captionWindow([])).toBe('')
+  })
+
+  it('keeps the tail, not the head, when one segment alone overflows', () => {
+    const long = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ')
+    expect(long.length).toBeGreaterThan(CAPTION_WINDOW_CHARS)
+    const out = captionWindow([long])
+    expect(out.length).toBeLessThanOrEqual(CAPTION_WINDOW_CHARS)
+    // A suffix of the segment: the newest words survive, the oldest are cut.
+    expect(long.endsWith(out)).toBe(true)
+    // And cut at a word boundary, so the caption never opens mid-token.
+    expect(out.startsWith('word')).toBe(true)
+  })
+
+  it('routes both caption call sites through the bounded window', () => {
+    // Exporting the helper is not enough. A call site left on the raw
+    // accumulation would restore the bug while every assertion above still
+    // passed, so the guard is on the source itself.
+    expect(TranscriptionSource).not.toContain("finalsRef.current.join(' ')")
+    expect(TranscriptionSource).toContain('captionWindow(finalsRef.current, lastPartial)')
+    expect(TranscriptionSource).toContain('captionWindow(finalsRef.current)')
+  })
+
+  it('bounds the browser-only final segment buffer', () => {
+    expect(CAPTION_FINALS_LIMIT).toBeGreaterThan(1)
+    expect(TranscriptionSource).toContain('finalsRef.current.splice(')
+  })
+})
+
+describe('the meeting is polled while a start is still initializing agents', () => {
+  // `POST /start` awaits one dispatch per agent before it answers, so it can take
+  // tens of seconds, while the server persists `active` up front. Without a poll in
+  // that window the UI held a stale `idle`: Start disabled, no Live badge, and no
+  // microphone — the mic is bound to `status` — so recording appeared not to start
+  // until the user reloaded by hand.
+
+  it('polls on a short cadence while the start is in flight', () => {
+    expect(metaPollInterval({ status: 'idle', startInFlight: true })).toBe(1000)
+    // `undefined` is the same situation: meta has not arrived, nothing says active.
+    expect(metaPollInterval({ status: undefined, startInFlight: true })).toBe(1000)
+  })
+
+  it('does not poll an idle meeting that nobody is starting', () => {
+    expect(metaPollInterval({ status: 'idle', startInFlight: false })).toBe(false)
+    expect(metaPollInterval({ status: 'ended', startInFlight: false })).toBe(false)
+  })
+
+  it('hands back to the configured cadence as soon as a status is known', () => {
+    // The start rule is checked last, so a landed poll ends the fast window even
+    // while the mutation is still pending — that is what makes it self-limiting.
+    expect(metaPollInterval({ status: 'active', startInFlight: true, activeMs: 5000 })).toBe(5000)
+    expect(metaPollInterval({ status: 'paused', startInFlight: true, idleMs: 30_000 })).toBe(30_000)
+    expect(metaPollInterval({ status: 'reviewing', startInFlight: true, idleMs: 30_000 })).toBe(30_000)
+  })
+
+  it('falls back to the shipped defaults when the config has not loaded', () => {
+    expect(metaPollInterval({ status: 'active', startInFlight: false })).toBe(5000)
+    expect(metaPollInterval({ status: 'reviewing', startInFlight: false })).toBe(30_000)
+  })
+
+  it('respects a configured cadence over the defaults', () => {
+    expect(metaPollInterval({ status: 'active', startInFlight: false, activeMs: 250 })).toBe(250)
+    expect(metaPollInterval({ status: 'paused', startInFlight: false, idleMs: 60_000 })).toBe(60_000)
+  })
+
+  it('opens the window before the request and closes it however the start ends', () => {
+    // Guards the wiring, not the rule: a window opened in `onSuccess` would miss the
+    // wait entirely, and one closed there would poll a failed start forever.
+    const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
+    expect(startCall, 'no startMutation found').not.toBeNull()
+    const mutateBlock = startCall![0].slice(
+      startCall![0].indexOf('onMutate:'),
+      startCall![0].indexOf('onSettled:'),
+    )
+    expect(mutateBlock).toContain('setStartInFlight(true)')
+    expect(startCall![0]).toContain('onSettled: () => setStartInFlight(false)')
+  })
+
+  it('feeds the query from the shared rule rather than an inline copy', () => {
+    expect(SessionSource).toContain('refetchInterval: query =>')
+    expect(SessionSource).toContain('metaPollInterval({')
+  })
+})
+
+describe('the microphone waits for transcript ingress, not just for `active`', () => {
+  // `POST /start` persists `active` up front and then initializes agents with
+  // transcript ingress SUSPENDED — every dispatch in that window 409s. The fast
+  // start poll observes `active` within ~1s of Start, so binding the microphone
+  // to `status` alone opened it tens of seconds before ingress: early finals
+  // exhausted the short dispatch retry schedule and were permanently lost from
+  // the notes and tasks. The gate follows the server's own admission flag,
+  // `live.accepting_dispatches`, reported on every meta poll — client-side
+  // inference from the start mutation's outcome cannot be trusted in either
+  // direction (an error can hide a server-side success; a success response can
+  // be lost in transit).
+
+  it('keeps the mic closed while the poll sees `active` but ingress is not open', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: false, transcriptFull: false,
+    })).toBe(false)
+  })
+
+  it('opens the mic once the poll reports ingress open on an active meeting', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: true, transcriptFull: false,
+    })).toBe(true)
+  })
+
+  it('never opens the mic for a meeting that is not active, ingress or not', () => {
+    for (const status of ['idle', 'paused', 'reviewing', 'ended'] as const) {
+      expect(canOpenTranscription({ status, ingressReady: true, transcriptFull: false })).toBe(false)
+      expect(canOpenTranscription({ status, ingressReady: false, transcriptFull: false })).toBe(false)
+    }
+  })
+
+  it('a full transcript keeps the mic closed regardless of readiness', () => {
+    expect(canOpenTranscription({
+      status: 'active', ingressReady: true, transcriptFull: true,
+    })).toBe(false)
+  })
+
+  it('the status binding actually consults the readiness rule', () => {
+    // Guards the wiring: the effect must gate BOTH the open and the close branch on
+    // the shared rule, so a poll reporting ingress open flips the mic on without a
+    // status change and a fast poll observing `active` early cannot race one on.
+    const binding = SessionSource.match(/const mayOpen = canOpenTranscription\(\{[\s\S]*?\n  \}, \[status, ingressReady, transcriptFull, transcriptionActive\]\)/)
+    expect(binding, 'status binding no longer gates on canOpenTranscription').not.toBeNull()
+    expect(binding![0]).toContain('if (mayOpen && !transcriptionRef.current.active)')
+    expect(binding![0]).toContain('if (!mayOpen && transcriptionRef.current.active)')
+  })
+
+  it('readiness comes from the POLLED server flag, and unknown reads as not-ready', () => {
+    // Guards the two properties that make the whole failure class unreachable:
+    // (1) the gate's input is the server's own admission flag off the poll — not
+    // client-side inference from the start mutation's lifecycle, which round-trips
+    // through outcomes that can misrepresent the server (lost success, ambiguous
+    // error); (2) strict `=== true`, so a null `live` (meeting `active` on disk
+    // with no session installed) keeps the mic closed rather than dispatching
+    // into guaranteed 409s.
+    expect(SessionSource).toContain('live?.accepting_dispatches === true')
+    // And the mutation callbacks do not manipulate any mic gate.
+    const startCall = SessionSource.match(/const startMutation[\s\S]*?\n  \}\)/)
+    expect(startCall, 'no startMutation found').not.toBeNull()
+    expect(startCall![0]).not.toContain('Ingress')
   })
 })

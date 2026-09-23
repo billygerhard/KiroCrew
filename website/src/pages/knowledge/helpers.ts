@@ -1,6 +1,7 @@
 import { useState } from 'react'
-import { fmtDateFields } from '../../i18n/format'
+import { fmtDateFields, fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { copyToClipboard } from '../../utils/clipboard'
 
 export function typeBadgeVariant(t: string): 'ok' | 'warn' | 'err' | 'aim' {
   if (['design_doc', 'code_doc'].includes(t)) return 'aim'
@@ -23,14 +24,17 @@ export function formatRelativeDate(iso: string): string {
   return i18nT('pages.knowledge.helpers.months_ago', { n: Math.floor(days / 30) })
 }
 
-export function copyText(text: string) {
-  navigator.clipboard.writeText(text)
-}
-
+/** Copy-with-confirmation for the knowledge views.
+ *
+ *  Routed through the shared helper, not `navigator.clipboard` directly: that
+ *  API needs a secure context, so on a plain-HTTP dashboard it does not exist
+ *  and a bare call throws before anything is copied. The confirmation is gated
+ *  on the helper's boolean — a tick over an unchanged clipboard is worse than
+ *  none, because the user finds out only when they paste. */
 export function useCopy() {
   const [copied, setCopied] = useState(false)
-  const copy = (text: string) => {
-    navigator.clipboard.writeText(text)
+  const copy = async (text: string) => {
+    if (!(await copyToClipboard(text))) return
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -45,7 +49,27 @@ export const STATUSES = ['active', 'archived']
 // Status the list view opens on. This is the default view, NOT user narrowing,
 // so the onboarding empty state treats this value as "no filter applied".
 export const DEFAULT_STATUS_FILTER = 'active'
-export const SUPPORTED_FORMATS = 'Markdown, Plain text, Code files (.py, .ts, .java, .go, .rs, etc.), HTML, JSON, YAML, CSV, DOCX'
+// Fallback shown/used only until GET /api/knowledge/config resolves. The
+// backend's `FileReader.SUPPORTED` (src/kiro_crew/knowledge/readers.py) is the
+// single source of truth for what upload ingests; this mirror exists so the
+// file picker and the copy are not empty during the config round-trip.
+// test/test_knowledge_formats_parity.py holds this list identical to
+// `sorted(FileReader.SUPPORTED - {''})`, so it cannot silently drift.
+export const FALLBACK_SUPPORTED_FORMATS = [
+  '.c', '.cpp', '.cs', '.csv', '.docx', '.go', '.h', '.htm', '.html', '.java',
+  '.js', '.json', '.jsonl', '.kt', '.kts', '.log', '.md', '.ndjson', '.org',
+  '.pdf', '.ps1', '.psd1', '.psm1', '.py', '.rb', '.rs', '.scala', '.sh',
+  '.swift', '.ts', '.txt', '.yaml', '.yml',
+]
+
+/**
+ * Render an extension list (from `/api/knowledge/config`, or the fallback
+ * above) as a localized display string for the "Supported formats" copy. The
+ * extensions themselves are DNT tokens; only the list separators localize.
+ */
+export function formatSupportedFormats(exts: readonly string[]): string {
+  return fmtList(exts, { type: 'conjunction' })
+}
 
 /**
  * Onboarding copy for the Knowledge Library help dialog and empty state.
@@ -64,14 +88,17 @@ export const ONBOARDING = {
   get description() {
     return i18nT('pages.knowledge.helpers.your_centralized_knowledge_base_with_entity_extr')
   },
-  get steps() {
+  // A method rather than a getter because the caller supplies the formats
+  // display string (derived from /api/knowledge/config). Like the getters, it
+  // resolves i18nT per CALL, so a language switch still re-renders correctly.
+  steps(formatsDisplay: string) {
     return [
       i18nT('pages.knowledge.helpers.drop_files_here_or_click_upload_to_ingest_docume'),
       i18nT('pages.knowledge.helpers.documents_are_chunked_entities_extracted_and_rel'),
       i18nT('pages.knowledge.helpers.search_across_all_knowledge_filter_by_type_or_ex'),
-      // The format list itself is a set of DNT product names and file
-      // extensions, interpolated so only the sentence around it is translated.
-      i18nT('pages.knowledge.helpers.supported_formats', { formats: SUPPORTED_FORMATS }),
+      // The format list itself is a set of DNT file extensions, interpolated
+      // so only the sentence around it is translated.
+      i18nT('pages.knowledge.helpers.supported_formats', { formats: formatsDisplay }),
     ]
   },
 }

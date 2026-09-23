@@ -9,7 +9,8 @@ Three layers of defense:
    stderr goes to /dev/null or a truncated pipe.
 3. ``asyncio`` loop exception handler — catches "Task exception was never
    retrieved" and task-internal exceptions that asyncio would otherwise swallow
-   at DEBUG level.  Writes to crash.log AND the normal logger at ERROR.
+   at DEBUG level. Writes real failures to crash.log and the normal logger at
+   ERROR; known connection-teardown noise is warning-only.
 
 Call ``install(loop)`` once at gateway startup.  Safe to call multiple times
 (idempotent via module-level flag).
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _INSTALLED = False
 _CRASH_LOG: Path | None = None
+_PROACTOR_CONNECTION_LOST_CALLBACK = "_ProactorBasePipeTransport._call_connection_lost"
 
 
 def _crash_log_path() -> Path:
@@ -45,7 +47,13 @@ def _write_crash(header: str, exc_info: tuple | None = None) -> None:
     """Append a crash record to crash.log (best-effort, never raises)."""
     try:
         path = _CRASH_LOG or _crash_log_path()
-        with open(path, "a") as f:
+        # utf-8 explicitly, never the host locale: on a cp1252 Windows console
+        # host any non-ASCII byte -- in the exception message, or in a source
+        # line echoed by traceback.print_exception -- raises UnicodeEncodeError
+        # mid-record, and the except below swallows it, so the record is lost or
+        # truncated exactly where the cause would be named. backslashreplace
+        # keeps even an unencodable surrogate from ending the last-resort writer.
+        with open(path, "a", encoding="utf-8", errors="backslashreplace") as f:
             f.write(f"\n{'=' * 72}\n")
             f.write(f"{header}\n")
             f.write(f"Time: {datetime.now(timezone.utc).isoformat()}\n")
@@ -80,6 +88,22 @@ def _excepthook(exc_type, exc_value, exc_tb) -> None:
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
+def _is_transport_shutdown_noise(context: dict) -> bool:
+    """Return whether asyncio reported the expected Windows pipe-close race.
+
+    A Proactor transport can learn that its peer reset the connection, schedule
+    ``connection_lost``, and then receive the same reset again from ``shutdown``.
+    The connection is already gone at that point; the callback error does not
+    represent a failed task or a dying gateway.
+    """
+    exception = context.get("exception")
+    message = str(context.get("message", ""))
+    return (
+        isinstance(exception, ConnectionResetError)
+        and _PROACTOR_CONNECTION_LOST_CALLBACK in message
+    )
+
+
 def _asyncio_exception_handler(loop, context) -> None:  # noqa: no-blocking-call-on-event-loop
     """Catches exceptions swallowed by asyncio (task-never-retrieved, etc.).
 
@@ -90,6 +114,15 @@ def _asyncio_exception_handler(loop, context) -> None:  # noqa: no-blocking-call
     """
     exception = context.get("exception")
     message = context.get("message", "Unhandled asyncio exception")
+
+    if _is_transport_shutdown_noise(context):
+        logger.warning(
+            "asyncio unhandled (noise): %s — %s: %s",
+            message,
+            type(exception).__name__,
+            exception,
+        )
+        return
 
     # Log to the normal logger at ERROR (default asyncio only logs at DEBUG)
     if exception:
@@ -104,8 +137,13 @@ def _asyncio_exception_handler(loop, context) -> None:  # noqa: no-blocking-call
         exc_tuple = (type(exception), exception, exception.__traceback__)
         _write_crash(header, exc_tuple)
     else:
-        logger.error("asyncio unhandled: %s (no exception object)", message)
-        _write_crash(f"ASYNCIO UNHANDLED (no exc): {message}")
+        if message.startswith("Unclosed"):
+            # GC noise from aiohttp sessions dropped without close() — harmless,
+            # not worth a crash.log entry.
+            logger.warning("asyncio unhandled (noise): %s", message)
+        else:
+            logger.error("asyncio unhandled: %s (no exception object)", message)
+            _write_crash(f"ASYNCIO UNHANDLED (no exc): {message}")
 
 
 def install(loop=None) -> None:

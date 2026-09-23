@@ -28,6 +28,9 @@ import {
   ScanSearch,
   ScrollText,
   Contact,
+  ShoppingBag,
+  Activity,
+  FolderPlus,
 } from 'lucide-react'
 import type { ReactElement } from 'react'
 import { reportSeamCollision } from './seamCollision'
@@ -51,6 +54,9 @@ const BUILTIN_ICON_REGISTRY: Record<string, ReactElement> = {
   ScanSearch: <ScanSearch size={16} />,
   ScrollText: <ScrollText size={16} />,
   Contact: <Contact size={16} />,
+  ShoppingBag: <ShoppingBag size={16} />,
+  Activity: <Activity size={16} />,
+  FolderPlus: <FolderPlus size={16} />,
 }
 
 /**

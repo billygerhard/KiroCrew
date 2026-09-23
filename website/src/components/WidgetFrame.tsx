@@ -1,16 +1,18 @@
-import { safeSetItem } from '../utils/safeStorage'
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
-import { Maximize2, Minimize2, ExternalLink, Download, Star } from 'lucide-react'
-import { IconButton, IconButtonGroup } from './ui'
+import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight, clampFrameHeight } from '../utils/widgetHeights'
+import { Maximize2, Minimize2, ExternalLink, Download, Star, RotateCw, Eye } from 'lucide-react'
+import { Btn, IconButton, IconButtonGroup } from './ui'
 import { useTheme } from '../hooks/useTheme'
-import { sanitizeCssValue } from '../lib/cssSanitize'
-import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
+import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
 import { effectiveWidgetSlug } from '../lib/widgetSlug'
+import { analyzeWidgetComplexity } from '../lib/widgetComplexity'
 import { api, ApiError } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { i18nT } from '../i18n/t'
-const MIN_HEIGHT = 80
+import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
+import { useNearViewport } from '../hooks/useNearViewport'
 
 // Upper bound on the text a single widget action may pre-fill into the
 // composer. A malicious LLM-emitted <script> can postMessage
@@ -79,80 +81,6 @@ export function staggeredBuildWait(baseWait: number, slot: number): number {
 let jumpBuildSlot = 0
 let jumpBuildResetAt = 0
 
-// Height cache is theme-independent: every entry in THEME_VAR_NAMES is a
-// color var, never a size. If a length/size var is ever added to the list,
-// include it in the cache key so heights don't get reused across themes.
-// Persisted to localStorage so widgets don't jump on page reload.
-const CACHE_KEY = 'mc-widget-heights'
-const heightCache: Map<string, number> = (() => {
-  try {
-    const stored = localStorage.getItem(CACHE_KEY)
-    return stored ? new Map(JSON.parse(stored)) : new Map()
-  } catch { return new Map() }
-})()
-
-// Fallback height for a widget we've never measured. The first reveal of any
-// widget must reserve SOME height before its iframe builds and reports the real
-// one; if that reserve is wrong the row visibly corrects once (skeleton →
-// iframe). Using the median of heights we've already cached (this session or a
-// prior one, via localStorage) makes a brand-new widget reserve a typical
-// height, so the one-time correction is small. A truly first-ever widget (empty
-// cache) falls back to the fixed default. NOTE: this is why the correction only
-// showed on a cache-cold browser (fresh Firefox/Safari) and went away after one
-// view or a refresh — localStorage warms the cache.
-const DEFAULT_WIDGET_HEIGHT = 200
-function defaultWidgetHeight(): number {
-  if (heightCache.size === 0) return DEFAULT_WIDGET_HEIGHT
-  const vals = [...heightCache.values()].sort((a, b) => a - b)
-  return vals[Math.floor(vals.length / 2)]
-}
-
-function persistHeightCache() {
-  try {
-    // Keep only last 200 entries to bound storage
-    const entries = [...heightCache.entries()].slice(-200)
-    safeSetItem(CACHE_KEY, JSON.stringify(entries))
-  } catch (e) {
-    // Best-effort persistence (quota / private-mode / serialize failures).
-    // Surface it in dev so a persistent failure isn't completely invisible;
-    // there's no recovery to attempt, the next update retries the write.
-    // eslint-disable-next-line no-console -- intentional dev-only diagnostic
-    if (import.meta.env.DEV) console.warn('widget height cache persist failed', e)
-  }
-}
-
-// localStorage.setItem is synchronous and JSON.stringify'ing up to 200 entries
-// is not free; writing it on every height update stalls the main thread. Batch
-// writes so a burst of resizes (a widget settling, or several widgets mounting
-// at once) persists at most once per window.
-const HEIGHT_PERSIST_DEBOUNCE_MS = 1000
-let persistTimer: ReturnType<typeof setTimeout> | null = null
-function schedulePersistHeightCache() {
-  if (persistTimer) return
-  persistTimer = setTimeout(() => {
-    persistTimer = null
-    persistHeightCache()
-  }, HEIGHT_PERSIST_DEBOUNCE_MS)
-}
-
-function contentHash(html: string): string {
-  let h = 0
-  for (let i = 0; i < html.length; i++) {
-    h = ((h << 5) - h + html.charCodeAt(i)) | 0
-  }
-  return String(h)
-}
-
-function readThemeVars(): Record<string, string> {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return {}
-  const computed = getComputedStyle(document.documentElement)
-  const out: Record<string, string> = {}
-  for (const name of THEME_VAR_NAMES) {
-    const v = sanitizeCssValue(computed.getPropertyValue(name))
-    if (v) out[name] = v
-  }
-  return out
-}
 
 /** Probe result for a widget's backing artifact.
  *
@@ -190,24 +118,21 @@ interface WidgetFrameProps {
   /** Explicit slug attribute on `<mcwidget slug="...">`. When the agent
    * re-emits a previously-saved artifact it MUST include this attribute so
    * the impression binds to the same artifact. For brand-new emissions the
-   * agent may omit it and we derive a stable slug from `messageTs +
-   * widgetIndex` instead. */
+   * agent may omit it and we derive a stable slug from `messageTs + html`
+   * instead. */
   slug?: string
   /** Parent message timestamp. Threaded through from AssistantMessage so
    * widgets without an explicit slug get a stable, location-anchored
    * identity that survives refreshes and prevents save-then-refresh
    * duplicate creation. */
   messageTs?: string
-  /** 0-based ordinal of this widget within the parent message. Two
-   * `<mcwidget>` tags in the same message disambiguate by this index. */
-  widgetIndex?: number
   /** Chat slot this widget was rendered in. Used to attribute a
    * fallback-created artifact to its session and to refresh the in-session
    * Artifacts tab after a star/unstar. Absent for embedded/detached renders. */
   slotKey?: string
 }
 
-export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, widgetIndex, slotKey }: WidgetFrameProps) {
+export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, slotKey }: WidgetFrameProps) {
   // Re-read theme CSS vars whenever the resolved theme, active color theme,
   // or themeVersion counter changes. themeVersion is the trigger for
   // in-place custom-theme edits via the theme editor: the slug stays the
@@ -226,27 +151,8 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // build in the same frame. `visible` is one-way false→true; the chat
   // virtualizer unmounts the whole row to actually free the iframe.
   const [visible, setVisible] = useState(false)
-  const [near, setNear] = useState(false)
 
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    // SSR / environments without IO: render eagerly.
-    if (typeof IntersectionObserver === 'undefined') { setNear(true); return }
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setNear(true)
-          io.disconnect()
-        }
-      },
-      // Mark as near a bit before it scrolls into view so a scroll pause has a
-      // head start on building.
-      { rootMargin: '400px 0px' },
-    )
-    io.observe(el)
-    return () => io.disconnect()
-  }, [])
+  const near = useNearViewport(containerRef)
 
   useEffect(() => {
     if (visible || !near) return
@@ -268,8 +174,14 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
     const id = setTimeout(() => setVisible(true), wait)
     return () => clearTimeout(id)
   }, [near, visible])
-  const key = useMemo(() => contentHash(html), [html])
-  const [height, setHeight] = useState(() => heightCache.get(key) ?? defaultWidgetHeight())
+  // Measured heights live in `utils/widgetHeights` — ONE map, one debounce timer,
+  // one persist. Two modules each holding their own map and each persisting a
+  // whole-map overwrite of the same storage key would erase each other's fresh
+  // entries, whichever flushed last. This frame lays out at its container's
+  // width, so it takes the default key space; a caller measuring at a different
+  // width takes its own.
+  const key = useMemo(() => widgetHeightKey(html), [html])
+  const [height, setHeight] = useState(() => clampFrameHeight(getWidgetHeight(key) ?? estimateWidgetHeight()))
   // Mirror of `height` so the message handler (wired once per `key`) can
   // compare against the live value, plus a timer used to defer shrinks.
   const heightRef = useRef(height)
@@ -278,33 +190,60 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
+
+  // Analyze widget complexity to decide rendering path. Cached per html content.
+  const complexity = useMemo(() => analyzeWidgetComplexity(html), [html])
+
   const srcdoc = useMemo(
-    () => visible ? buildSrcdoc({ html, themeVars, mode: theme, includeHeightReporter: true }) : '',
-    [html, themeVars, theme, visible],
+    () => visible ? buildSrcdoc({
+      html,
+      themeVars,
+      mode: theme,
+      includeHeightReporter: true,
+      // Heavy widgets get an in-iframe indicator so a perceptible Tailwind
+      // compile reads as progress rather than a broken render. The label is
+      // passed in because the iframe cannot reach the parent's i18n catalog.
+      showLoadingOverlay: complexity.needsProgressIndicator,
+      loadingLabel: i18nT('components.widgetFrame.rendering'),
+    }) : '',
+    [html, themeVars, theme, visible, complexity.needsProgressIndicator],
   )
 
   // Blob URL — only created when visible
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  // See hooks/useSandboxDoc.ts: the frame loads a gateway-served document
+  // rather than a `blob:` URL, and the previous document survives both an
+  // in-flight and a failed re-mint.
+  const { url: blobUrl, failed: mintFailed, pending: mintPending, retry: retryMint } = useSandboxDoc(
+    visible ? srcdoc : null,
+  )
   // Fade the iframe in once its document loads, so the reveal is a soft fade
   // instead of an abrupt blink-then-appear. Reset to false whenever a new blob
   // is built (first reveal, theme change, content rebuild) so each fresh render
   // fades in too.
+  // Gated on the FIRST load only, and deliberately never reset when the document
+  // is rebuilt. Re-hiding on every new srcdoc leaves the frame blank until the
+  // next `load` fires; with the document now minted over the network (rather than
+  // a local blob:) that gap is a real round trip, long enough on a phone reaching
+  // the gateway through a tunnel to read as the widget vanishing after it had
+  // already rendered — and permanent if a further rebuild lands first. Same
+  // reasoning as ArtifactBody's `everLoaded`; keep the two in step.
   const [iframeLoaded, setIframeLoaded] = useState(false)
-
-  useEffect(() => {
-    if (!visible || !srcdoc) return
-    setIframeLoaded(false)
-    const blob = new Blob([srcdoc], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    setBlobUrl(url)
-    return () => URL.revokeObjectURL(url)
-  }, [srcdoc, visible])
+  // A mint can succeed (blobUrl in hand) while the frame never fires `load` —
+  // an engine that navigates but never rasterizes. Without a watch the frame
+  // stays at opacity 0 forever with no notice. `silent` arms the same recovery
+  // affordance mintFailed uses; the reveal below also un-hides the frame so a
+  // slow-but-eventual document is never trapped invisible. Same affordance
+  // ArtifactBody carries; keep the four in step.
+  const { silent: loadSilent, onLoaded: onFrameLoaded } = useSilentLoadWatch(blobUrl)
 
   useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return
       if (e.data?.type === 'mc-widget-height' && typeof e.data.height === 'number') {
-        const h = Math.max(e.data.height, MIN_HEIGHT)
+        // Bounded at both ends by the shared clamp. Chat frames have always been
+        // self-sizing off this same report with no bound at all, so a
+        // viewport-coupled document could grow one without limit here.
+        const h = clampFrameHeight(e.data.height)
         // No-op when the clamped height is unchanged. An animated widget can
         // post the same height every frame; without this guard each report
         // re-ran applyHeight → persistHeightCache (synchronous localStorage
@@ -316,8 +255,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
         const applyHeight = (next: number) => {
           heightRef.current = next
           setHeight(next)
-          heightCache.set(key, next)
-          schedulePersistHeightCache()
+          setWidgetHeight(key, next)
         }
         // A pending shrink is always superseded by the newest reading.
         if (shrinkTimerRef.current) { clearTimeout(shrinkTimerRef.current); shrinkTimerRef.current = null }
@@ -361,7 +299,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
       window.removeEventListener('message', handler)
       // The virtualizer can unmount this widget row (it leaves the window)
       // while a deferred shrink is still pending; clear it so it can't fire
-      // applyHeight → setHeight / heightCache.set / persist after unmount.
+      // applyHeight → setHeight / setWidgetHeight / persist after unmount.
       if (shrinkTimerRef.current) { clearTimeout(shrinkTimerRef.current); shrinkTimerRef.current = null }
     }
   }, [key])
@@ -422,17 +360,17 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // Determine the effective slug for this impression. Priority:
   //  1. Explicit `slug` attribute from the agent (used when re-emitting a
   //     known saved artifact — see artifacts skill).
-  //  2. Derived from `messageTs + widgetIndex` — stable across refreshes,
-  //     so saving once and refreshing doesn't create a duplicate.
+  //  2. Derived from `messageTs + html`, so a slug hit proves the stored body
+  //     equals this impression. Identical bodies in one message share a slug.
   // Returns null only when neither is available (streaming/detached
   // widgets, or test fixtures); in that case bookmark is disabled.
   const effectiveSlug = useMemo(
     () => effectiveWidgetSlug({
       explicitSlug: slug,
       messageTs,
-      widgetIndex,
+      body: html,
     }),
-    [slug, messageTs, widgetIndex],
+    [slug, messageTs, html],
   )
   // Probe this widget's artifact. Cached via React Query with a 5-min
   // staleTime so repeated impressions / tab refocuses don't each fire a
@@ -559,7 +497,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   return (
     <div
       ref={containerRef}
-      className={`group my-2 transition-colors ${expanded ? 'fixed inset-4 z-[100] rounded-xl border border-border bg-card overflow-hidden shadow-2xl' : ''}`}
+      className={`group my-2 transition-colors ${expanded ? 'fixed inset-4 z-[100] flex flex-col rounded-xl border border-border bg-card overflow-hidden shadow-2xl' : ''}`}
     >
       {!visible ? (
         /* Skeleton — mirrors the visible layout (same header bar + a reserved
@@ -620,18 +558,115 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
         </IconButtonGroup>
       </div>
 
-      {/* onLoad is a frame-load lifecycle handler (fade the iframe in), not a */}
-      {/* user interaction; the rule flags onLoad regardless. */}
-      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-      {blobUrl && <iframe
-        ref={iframeRef}
-        src={blobUrl}
-        onLoad={() => setIframeLoaded(true)}
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
-        className="w-full border-none bg-card transition-opacity duration-200 ease-out motion-reduce:transition-none"
-        style={{ height: expanded ? 'calc(100% - 36px)' : height, opacity: iframeLoaded ? 1 : 0 }}
-        title={title}
-      />}
+      {mintFailed && <div className="px-3 py-2 flex items-center gap-3 text-text">
+        <span>{i18nT('components.widgetFrame.could_not_render')}</span>
+        {/* Btn, not a raw `btn btn-sm` button: that class has no CSS behind it,
+            so the recovery control rendered as bare text. */}
+        <Btn
+          disabled={mintPending}
+          onClick={retryMint}
+        >
+          <RotateCw className="lucide-inline" />
+          {i18nT('components.widgetFrame.retry')}
+        </Btn>
+      </div>}
+
+      {/* Silent load: the mint succeeded but the frame never reported `load`
+          within the grace window, so it is showing an empty box. Distinct from
+          mintFailed (a known read failure) — this is a frame that did not
+          report, so the copy does not assert a failure and the action is
+          labeled by what it does (bring the widget back), matching
+          ArtifactBody's docSilent branch.
+
+          Guarded on `loadSilent && !mintFailed`, NOT on `!iframeLoaded`:
+          `loadSilent` is cleared by `onFrameLoaded` on every real load, so it is
+          already false whenever the current document loaded. `iframeLoaded`, by
+          contrast, is set once on the FIRST load and never reset (it gates the
+          fade-in), so a silent RE-mint after a good first render leaves it true
+          — and an `!iframeLoaded` guard would then suppress the very notice this
+          exists for. `mintFailed` still wins, so a known read failure shows the
+          retry row above rather than this cause-neutral one. */}
+      {loadSilent && !mintFailed && <div className="px-3 py-2 flex items-center gap-3 text-text">
+        <span role="status">{i18nT('components.artifactBody.no_longer_showing')}</span>
+        {/* Eye + "Show artifact", NOT a reload arrow + "Retry": a silent load is
+            a frame that did not report, not a known failure, so the recovery
+            must not assert an error the surface cannot verify. This matches
+            ArtifactBody's docSilent branch exactly — one recovery affordance
+            for the one silent-load situation across every consumer. */}
+        <Btn
+          disabled={mintPending}
+          onClick={retryMint}
+        >
+          <Eye className="lucide-inline" />
+          {i18nT('components.artifactBody.show_artifact')}
+        </Btn>
+      </div>}
+
+      {/* While the document URL is in flight the row must keep the height the
+          skeleton reserved. Rendering nothing here collapsed the row to its
+          header for a full round trip and then regrew it — the exact scroll
+          jump the skeleton above was built to prevent, now reachable on every
+          widget because the url arrives over the network instead of instantly. */}
+      {!blobUrl && !mintFailed && <div aria-hidden style={{ height: expanded ? '100%' : height }} />}
+
+      {blobUrl && <div className={expanded ? 'relative flex-1 min-h-0 bg-card' : 'relative'}>
+        {/* Parent-side progress indicator. REQUIRED in addition to the in-iframe
+            overlay: the iframe below renders at opacity 0 until its onLoad
+            fires, so anything inside it is invisible during exactly the window
+            where the user is most likely to think the widget is broken. Only
+            shown for widgets heavy enough for that window to be perceptible. */}
+        {!iframeLoaded && complexity.needsProgressIndicator && (
+          <div
+            // Pinned to the TOP, not centred. The height reporter grows this box
+            // to the widget's full height (measured: 200px -> 1781px), and a
+            // centred indicator drifts below the fold — mounted but invisible,
+            // which is the very failure this is meant to prevent.
+            className="absolute inset-0 z-10 flex items-start justify-center gap-2 rounded bg-card pt-6 text-[12px] text-muted"
+            style={{ height: expanded ? '100%' : height }}
+          >
+            <span
+              className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-border motion-reduce:animate-none"
+              style={{ borderTopColor: 'var(--accent)' }}
+              aria-hidden
+            />
+            {i18nT('components.widgetFrame.rendering')}
+          </div>
+        )}
+        {/* onLoad is a frame-load lifecycle handler (fade the iframe in), not a
+            user interaction; the rule flags onLoad regardless. */}
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+        <iframe
+          ref={iframeRef}
+          src={blobUrl}
+          onLoad={() => { setIframeLoaded(true); onFrameLoaded() }}
+          sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+          // NO clipboard-write delegation here, deliberately. These frames host
+          // agent-generated HTML whose scripts run on load, so a delegated
+          // permission would let one overwrite the user's clipboard with no Copy
+          // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+          // execCommand fallback that a real button press satisfies and a
+          // gesture-less on-load script does not.
+          className="w-full border-none bg-card transition-opacity duration-200 ease-out motion-reduce:transition-none"
+          style={{
+            height: expanded ? '100%' : height,
+            // Same compositing promotion the artifact frame carries, for the same
+            // reason: an engine can lay this document out, run its scripts and
+            // report a correct height while never rasterizing it, which presents
+            // as an empty box rather than an error. Promoting the frame to its
+            // own layer is the one remedy that needs no timing — the others have
+            // to be fired after load, which races a slow document. This frame was
+            // left out when the artifact frame was promoted, so the inline-widget
+            // surface still had the gap.
+            transform: 'translateZ(0)',
+            // Reveal on load OR when the silence window elapses: a frame that
+            // never fires `load` must not stay invisible forever. If the
+            // document does eventually paint the user sees it; if it never
+            // does, the notice below explains the blank.
+            opacity: iframeLoaded || loadSilent ? 1 : 0,
+          }}
+          title={title}
+        />
+      </div>}
 
       {expanded && (
         // Click-outside backdrop to collapse; keyboard users collapse via the

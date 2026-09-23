@@ -6,12 +6,12 @@
 // and data fetching live in context.tsx; the layout lives in Workspace.tsx.
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { queryClient } from '../../api/queryClient'
 import { issueRadarApi } from './api'
 import {
-  CACHE_RETENTION_MS, loadActiveRepo, markAutoSelectFirstIssue, patchUiState, saveActiveRepo,
+  loadActiveRepo, markAutoSelectFirstIssue, patchUiState, saveActiveRepo,
 } from './lib/format'
 import type { ActiveRepo } from './lib/types'
+import { sameRepoRef } from './lib/links'
 import { IssueRadarProvider } from './context'
 import Workspace from './Workspace'
 import RefSheet from './components/RefSheet'
@@ -19,21 +19,19 @@ import WelcomeCarousel from './WelcomeCarousel'
 import ConnectRepoModal from './ConnectRepoModal'
 
 import { i18nT } from '../../i18n/t'
-// Keep every Issue Radar query's data resident long enough to survive moving between
-// surfaces, set ONCE for the whole `['issue-radar', ...]` key space rather than repeated
-// across ~20 call sites (a per-site option is one a new query silently forgets).
+// Retention for the whole `['issue-radar', ...]` key space is no longer set here.
+// The host registers it for every builtin app from `BuiltinAppRoute`, against the
+// `[appId]` prefix, with the same 30 minutes this app introduced — see
+// `apps/appCacheRetention.ts`, which is now the only place that number lives --
+// this app's own CACHE_RETENTION_MS is deleted in the same change, because one
+// constant beats two literals kept in step by a test.
 //
-// The problem it fixes: each dashboard mounts its own queries and unmounts them on the way
-// out, because the views are SWAPPED not hidden (`views/registry.tsx`). Data for an
-// unmounted query lives only `gcTime` longer, and the app-wide default is react-query's 5
-// minutes, which is shorter than an ordinary triage session. Leave Tagging for six minutes
-// and its queue has been evicted, so returning shows a loading line and refetches
-// everything, once per tab click.
-//
-// Retention is not freshness: `staleTime` and the poll intervals still decide when a
-// refetch happens, so this only changes whether there is something to paint WHILE that
-// refetch runs. Module scope so it is applied before the first child query mounts.
-queryClient.setQueryDefaults(['issue-radar'], { gcTime: CACHE_RETENTION_MS })
+// Keeping a second registration here would not have been merely redundant:
+// `setQueryDefaults` is a Map keyed by the hashed key, so both write the SAME entry
+// and the last writer wins — and which one is last depends on module evaluation
+// order (the host registers while rendering the route; this line runs when this
+// lazy chunk evaluates, after). Identical values hid that today; a future change to
+// either number would have been silently decided by chunk timing.
 
 export default function IssueRadarPage() {
   const queryClient = useQueryClient()
@@ -98,9 +96,47 @@ export default function IssueRadarPage() {
     return <WelcomeCarousel onConnected={onConnected} />
   }
 
-  const resolved = active && repos.some((r) => r.owner === active.owner && r.repo === active.repo)
-    ? active
-    : { owner: repos[0].owner, repo: repos[0].repo }
+  // Resolve the active repository to the CONNECTED RECORD, on full identity.
+  //
+  // Two things used to go wrong here, and both produced a ref with no forge on it.
+  // The fallback arm built `{owner, repo}` from `repos[0]` and discarded that
+  // record's provider and host; and the membership test compared owner and repo
+  // alone, so a STORED slug-only pointer satisfied it and was handed back
+  // unenriched — `loadActiveRepo` accepts one deliberately, because a value
+  // persisted before GitLab support has no forge and rejecting it would drop the
+  // user's repository on upgrade. So the legacy pointer was never healed even
+  // though the record standing beside it carried the missing half.
+  //
+  // A forge-less ref is not merely incomplete, it reads as a DIFFERENT repository:
+  // `repoScopeKey` resolves an absent provider/host to public GitHub, so every
+  // surface keying a cache on `active` filed a GitLab or Azure repository's issues,
+  // labels and settings under GitHub's key, and every request that took the ref
+  // omitted the provider the backend needs to answer for the right forge.
+  //
+  // Returning the record itself fixes both arms at once: whatever identity the
+  // match was made on, what goes down is what the connect flow actually stored.
+  // The slug match is also gone — `sameRepoRef` compares the forge too, so on a
+  // mixed install a stored pointer can no longer resolve to the same slug on the
+  // wrong provider.
+  //
+  // Matching on identity ALONE is deliberate, and a slug fallback for the
+  // forge-less case was tried and reverted. A pointer with no provider/host is
+  // not a pointer of unknown forge: `repoScopeKey` resolves absent fields to
+  // public GitHub, so it NAMES github.com/owner/repo, which is why
+  // `sameRepoRef` pairs it with its GitHub record and why the predicate's own
+  // test refuses to pair it with a GitLab one. Resolving it to a same-slug
+  // record on another forge would therefore reassign the user's repository to a
+  // forge they never chose -- the exact "a slug is not an identity" error this
+  // fix exists to remove, reintroduced one layer up. When no GitHub record is
+  // connected the stored repository simply is not connected, so it falls back
+  // like any other missing one.
+  const connected = (active && repos.find((r) => sameRepoRef(r, active))) || repos[0]
+  const resolved: ActiveRepo = {
+    owner: connected.owner,
+    repo: connected.repo,
+    ...(connected.provider ? { provider: connected.provider } : {}),
+    ...(connected.host ? { host: connected.host } : {}),
+  }
 
   return (
     <IssueRadarProvider

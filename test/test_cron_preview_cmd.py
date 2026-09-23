@@ -3,12 +3,45 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import sys
 from pathlib import Path
+from typing import Iterator
 from unittest.mock import patch
 
 import pytest
 
+from conftest import forget_env_at_teardown
 from kiro_crew.cli_commands import _cron_preview
+
+
+@pytest.fixture(autouse=True)
+def _bytecode_stays_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep the bytecode of the script each test imports inside ``tmp_path``.
+
+    ``_cron_preview`` loads the script with ``spec.loader.exec_module``, and CPython
+    writes its ``.pyc`` under ``sys.pycache_prefix`` -- the suite-wide redirect the
+    rootdir conftest installs, ``<cache root>/kirocrew/pycache`` -- mirrored under the
+    script's ABSOLUTE path. That mirror is keyed on ``tmp_path``, a directory that is
+    new on every run, so each run minted a fresh
+    ``<cache>/<basetemp>/<test>0/s.cpython-312.pyc`` that no later run ever reads and
+    nothing ever reclaims: the host that found this carried 14,800 such files (5.3 GB)
+    under its per-user cache. The prefix is the seam the import system reads, so
+    pointing it at ``tmp_path`` for the test's duration puts the bytecode beside its
+    source, where pytest's own ``tmp_path`` retention removes it.
+
+    The teardown assertion is what turns a regression into a red test rather than a
+    directory on someone's disk: it checks the pyc for the script the test wrote
+    both RESOLVES under ``tmp_path`` and was actually WRITTEN there.
+    """
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "pycache"))
+    yield
+    script = tmp_path / "s.py"
+    if not script.exists() or sys.dont_write_bytecode:
+        return  # no script was imported, or this interpreter writes no bytecode anywhere
+    cached = Path(importlib.util.cache_from_source(str(script)))
+    assert cached.is_relative_to(tmp_path), f"bytecode for {script} would land at {cached}"
+    assert cached.is_file(), f"{script} was imported but its bytecode is not at {cached}"
 
 
 def _make_args(script: str, message: str = "test-msg", env: list | None = None) -> argparse.Namespace:
@@ -112,7 +145,11 @@ class TestCronPreviewValidation:
 
 
 class TestCronPreviewEnv:
-    def test_env_vars_set(self, tmp_path: Path, capsys):
+    def test_env_vars_set(self, tmp_path: Path, capsys, monkeypatch):
+        # `--env` is applied to the LIVE process environment (the script reads it
+        # through os.environ), and the preview does not undo it -- so without this
+        # the variable outlived the test and reached later ones on the worker.
+        forget_env_at_teardown(monkeypatch, "TEST_CRON_VAR")
         _write_script(
             tmp_path, "s.py",
             "import os\n"
@@ -182,3 +219,74 @@ class TestCronPreviewCallToolPath:
         out = capsys.readouterr().out
         assert "[notify suppressed]" in out
         assert "hello world" in out
+
+
+class TestCronPreviewNotifyParity:
+    """The preview ctx must accept everything production ScriptContext.notify accepts.
+
+    A monitor cron exists to speak up; `session="origin"` is the documented way to
+    reach the chat that created it. A preview that only validates the silent branch
+    validates nothing that matters, and a TypeError there reads exactly like a script
+    bug -- inviting the "fix" of dropping the kwarg, which silently breaks delivery.
+    """
+
+    def test_notify_accepts_documented_routing_kwarg(self, tmp_path: Path, capsys):
+        _write_script(
+            tmp_path,
+            "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.notify('stall suspected', session='origin')\n"
+            "    raise Report('done')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "[notify suppressed]" in out
+        assert "stall suspected" in out
+        # Routing surfaced, not swallowed: preview is how you confirm where it goes.
+        assert "origin" in out
+        assert "Error" not in out
+
+    def test_notify_signature_derived_from_production(self, tmp_path: Path, capsys):
+        """Expectations come from ScriptContext.notify itself, so future drift fails here."""
+        _write_script(
+            tmp_path,
+            "s.py",
+            "import inspect\n"
+            "from kiro_crew.cron_script import Report, ScriptContext\n"
+            "def run(ctx):\n"
+            "    prod = inspect.signature(ScriptContext.notify)\n"
+            "    stub = inspect.signature(ctx.notify)\n"
+            "    # Same first parameter name, so keyword calls work in both.\n"
+            "    assert list(stub.parameters)[0] == list(prod.parameters)[1]\n"
+            "    # Anything production can bind, the stub must bind too.\n"
+            "    call = {'session': 'origin', 'channel': 'C123'}\n"
+            "    prod.bind(object(), 'x', **call)\n"
+            "    stub.bind('x', **call)\n"
+            "    raise Report('parity ok')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "parity ok" in out
+        assert "Error" not in out
+
+    def test_notify_redacts_credentials_in_text_and_kwargs(self, tmp_path: Path, capsys):
+        """Production redacts before sending; preview must redact before printing."""
+        _write_script(
+            tmp_path,
+            "s.py",
+            "from kiro_crew.cron_script import Report\n"
+            "def run(ctx):\n"
+            "    ctx.notify('leak aws_secret_access_key=AKIAIOSFODNN7EXAMPLE',\n"
+            "               detail='aws_secret_access_key=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY')\n"
+            "    raise Report('done')\n",
+        )
+        with _patch_resolve(tmp_path):
+            _cron_preview(_make_args(f"{tmp_path / 's.py'}:run"))
+        out = capsys.readouterr().out
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        # The kwarg value is redacted too, not just the text.
+        assert "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY" not in out
+        assert "REDACTED" in out

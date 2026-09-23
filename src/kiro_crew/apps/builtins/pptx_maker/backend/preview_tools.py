@@ -41,11 +41,10 @@ from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
-#: The tool this module can provide, and the module that implements it.
+#: The tool this module can provide.
 PDFTOPPM = "pdftoppm"
 #: The tool it deliberately cannot — a system package, reported with a hint.
 SOFFICE = "soffice"
-_SHIM_MODULE = "kiro_crew.apps.builtins.pptx_maker.backend.pdftoppm_shim"
 
 #: Mode for the generated launcher: OWNER-ONLY rwx. It lives under the data home and
 #: is executed by the gateway's own engine children, so nothing else needs to read or
@@ -81,16 +80,13 @@ def _engine_python() -> Path | None:
     run under this interpreter. ``None`` means the engine is not provisioned yet,
     which the caller reports as "provision the engine first" rather than writing a
     launcher that could not work.
+
+    The platform's venv layout is resolved by ``paths.venv_python``, which is the
+    single authority: it knows both the POSIX ``bin/python`` and the Windows
+    ``Scripts\\python.exe`` layout, so no caller carries a private candidate list.
     """
-    candidates = [paths.engine_python()]
-    # The engine's venv layout is POSIX-shaped in `paths`; Windows venvs put the
-    # interpreter under Scripts/ instead.
-    if platform_compat.IS_WINDOWS:
-        candidates.insert(0, paths.engine_root() / "mcp-local" / ".venv" / "Scripts" / "python.exe")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
+    candidate = paths.engine_python()
+    return candidate if candidate.is_file() else None
 
 
 def _launcher_paths() -> list[Path]:
@@ -197,7 +193,10 @@ def install_pdftoppm() -> tuple[bool, str]:
             # chmod AFTER the write and before any caller can resolve it, so the
             # launcher is never observable without its exec bit.
             if not platform_compat.IS_WINDOWS:
-                platform_compat.chmod_safe(launcher, _LAUNCHER_MODE)
+                # 0o700 here is the EXEC bit, not secrecy: the body is generated
+                # launcher text with no payload, so nothing is exposed in the
+                # window before the chmod. The marker must sit on the call line.
+                platform_compat.chmod_safe(launcher, _LAUNCHER_MODE)  # lockdown-ok: exec bit
         except OSError as exc:
             return False, f"cannot write {launcher.name}: {exc}"
 

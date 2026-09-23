@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.wecom.client import WeComInbound
 from kiro_crew.wecom.commands import ConversationState, parse_command
 from kiro_crew.wecom.transport_dispatch import WeComDispatcher
@@ -74,12 +76,60 @@ class FakeSessions:
         self.failures: list = []
         self.channels: list = []
         self.last_agent = None
+        # Dashboard-mirror surface. WeCom binds its origin mirror on every turn
+        # now that aibot_send_msg gives a mirrored reply somewhere to land, so the
+        # fake owes the same API the real SessionMap exposes.
+        self.mirror_links: dict = {}
+        self.opted_out: dict = {}
+        self.cleared_mirror: list = []
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
+        self.reserved_generations: list[str] = []
+
+    @contextlib.contextmanager
+    def batched_save(self):
+        """One whole-map write per user action, as the real one does."""
+        yield
+
+    def mirror_opt_out(self, key) -> bool:
+        """Predicate, matching the real SessionMap -- not a plain mapping."""
+        return bool(self.opted_out.get(key))
+
+    def set_mirror_opt_out(self, key, value) -> None:
+        self.opted_out[key] = value
+
+    def set_mirror_link(self, key, location, *, reason="") -> None:
+        self.mirror_links[key] = location
+
+    def get_mirror_link(self, key):
+        return self.mirror_links.get(key)
+
+    def clear_mirror_link(self, key, *, reason="") -> bool:
+        """Returns whether a binding was actually cleared, like the real one --
+        ``release_conversation_location`` counts the return value."""
+        self.cleared_mirror.append(key)
+        return self.mirror_links.pop(key, None) is not None
+
+    def clear_mirror_links_at(self, location, *, reason="") -> list:
+        """Sweep every binding pointing at *location* (none, in these tests)."""
+        return []
+
+    def is_mirror_paused(self, key, *, origin=False) -> bool:
+        return False
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))
@@ -109,6 +159,12 @@ class FakeSessions:
     def is_busy(self, key) -> bool:
         return getattr(self, "_busy", False)
 
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
+
     def max_generation(self, bucket: str) -> int:
         return -1
 
@@ -129,7 +185,11 @@ class FakeCtx:
     def __init__(self) -> None:
         self.hooks = FakeHooks()
 
-    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source):
+    # Names only the kwargs it asserts on and takes ``**kw`` for the rest: the
+    # shared pipeline owns the call shape, so a fake that pins every kwarg
+    # breaks on any field the pipeline later forwards, without that field
+    # having anything to do with this channel. Mirrors the pipeline's own fake.
+    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source, **kw):
         assert runtime_source == "wecom"
         return (text, None)
 
@@ -138,10 +198,35 @@ class FakeClient:
     def __init__(self) -> None:
         self.frames: list[dict] = []
         self.replies: list[tuple[str, str]] = []
+        self.said: list[str] = []
+        #: (chat_id, content) of every confirmed push. A threshold notice goes out
+        #: this way rather than as a stream frame, so it cannot retarget the ACK
+        #: attribution of the answer's sealing frame (which shares the inbound
+        #: req_id).
+        self.pushed: list[tuple[str, str]] = []
 
-    async def send_stream(self, req_id, sid, content, *, finish) -> bool:
+    async def send_stream(self, req_id, sid, content, *, finish, await_ack=False) -> bool:
         self.frames.append({"sid": sid, "content": content, "finish": finish})
         return True
+
+    async def say(self, inbound, content) -> bool:
+        """Out-of-band ack. Recorded as a sealed one-frame bubble, like the real
+        client, so a test can tell an ack apart from the answer's own frames."""
+        self.said.append(content)
+        self.frames.append({"sid": "say", "content": content, "finish": True})
+        return True
+
+    async def send_proactive(self, chat_id, content) -> bool:
+        self.pushed.append((chat_id, content))
+        return True
+
+    def stream_is_dead(self, stream_id) -> bool:
+        # The renderer checks bubble liveness before every frame; bubbles stay
+        # live here, so dispatch tests exercise the ordinary path.
+        return False
+
+    def stream_had_rejection(self, stream_id) -> bool:
+        return False
 
     async def send_reply(self, url, content) -> None:
         self.replies.append((url, content))
@@ -152,7 +237,7 @@ class FakeConvLog:
         self.appended: list[tuple[str, str, str]] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text) -> None:
+    def append(self, key, role, text, agent=None, mid=None) -> None:
         self.appended.append((key, role, text))
 
     def set_title(self, key, title) -> None:
@@ -218,8 +303,8 @@ def _deny_wecom_profile(monkeypatch, tmp_path):
 class TestTurn:
     @pytest.mark.asyncio
     async def test_channels_deny_drops_inbound_message(self, tmp_path, monkeypatch) -> None:
-        # HIGH (GPT round-4 #2): a channels DENY must stop handle_message from
-        # driving a turn. Regression-locks the WeCom inbound chokepoint.
+        # A channels DENY must stop handle_message from driving a turn. This
+        # locks the WeCom inbound chokepoint.
         from kiro_crew.platform import governance_profiles as gp
 
         _deny_wecom_profile(monkeypatch, tmp_path)
@@ -289,8 +374,14 @@ class TestTurn:
 
         await d.handle_message(_inbound("hello"))
 
-        # Notice surfaced as a SEPARATE bubble (its own stream_id, finish=True).
-        assert any("对话上下文已较长" in f["content"] for f in client.frames)
+        # Notice surfaced as a separate message, delivered as a confirmed PUSH so
+        # it carries its own req_id: sent through `say` it would replace the
+        # answer's tracked stream on the shared inbound req_id, and a refusal ACK
+        # for the answer's sealing frame would then be recorded against the notice.
+        assert any("对话上下文已较长" in c for _chat, c in client.pushed)
+        assert not any(
+            "对话上下文已较长" in f["content"] for f in client.frames
+        ), "the notice went out on the answer's req_id"
         # ...but NOT persisted into the assistant turn (only the real answer is).
         assistant_texts = [t for (_, role, t) in conv.appended if role == "assistant"]
         assert assistant_texts == ["answer"]
@@ -310,8 +401,9 @@ class TestCommands:
 
         await d.handle_message(_inbound("/new"))
 
-        assert client.replies == [("https://r", "✅ 已开始新对话")]
+        assert client.said == ["✅ 已开始新对话"]
         assert d._conv.current_gen("Wei") == 1  # generation bumped
+        assert sessions.reserved_generations == [d._session_key("Wei")]
         assert sessions.successes == []  # no LLM turn
 
     @pytest.mark.asyncio
@@ -327,7 +419,70 @@ class TestCommands:
         assert provider.compacted is True
         assert sessions.acquired == [key]
         assert sessions.released == [key]
-        assert client.replies == [("https://r", "🗜️ 已压缩上下文。")]
+        assert client.said == ["🗜️ 已压缩上下文。"]
+
+    @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        key = d._session_key("Wei")
+        assert provider.compacted is False
+        assert sessions.released == [key]  # the acquired semaphore is handed back
+        assert any("自动压缩上下文" in s for s in client.said)
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = None
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is True
+
+    @pytest.mark.asyncio
+    async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
+        # No /compact to dispatch and no notice: the backend compacts on its
+        # own as context fills.
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=96.0)  # >= hard (95)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert provider.compacted is False
+        assert not any("已自动压缩" in c for _chat, c in client.pushed)
+
+    @pytest.mark.asyncio
+    async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
+        # The nudge advises /compact, which this backend refuses — it compacts
+        # on its own, so there is nothing for the user to act on.
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=85.0)  # >= soft (80), < hard (95)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert not any("对话上下文已较长" in c for _chat, c in client.pushed)
 
     @pytest.mark.asyncio
     async def test_compact_refused_while_turn_busy(self) -> None:
@@ -340,7 +495,7 @@ class TestCommands:
 
         assert provider.compacted is False
         assert sessions.released == []
-        assert client.replies == [("https://r", "⏳ 正在处理上一条消息，请稍后再试 /compact。")]
+        assert client.said == ["⏳ 正在处理上一条消息，请稍后再试 /compact。"]
 
     @pytest.mark.asyncio
     async def test_compact_without_active_session(self) -> None:
@@ -351,19 +506,57 @@ class TestCommands:
         await d.handle_message(_inbound("/compact"))
 
         assert sessions.released == []
-        assert client.replies == [("https://r", "ℹ️ 当前没有可压缩的对话。")]
+        assert client.said == ["ℹ️ 当前没有可压缩的对话。"]
 
     @pytest.mark.asyncio
-    async def test_link_rejected_on_wecom(self) -> None:
-        sessions = FakeSessions(FakeProvider([]))
+    @pytest.mark.asyncio
+    async def test_link_binds_the_dashboard_mirror(self) -> None:
+        # /link binds the dashboard mirror: aibot_send_msg makes the mirror
+        # deliverable, so the command is not refused as undeliverable.
         client = FakeClient()
+        sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), client)
-
         await d.handle_message(_inbound("/link"))
 
-        assert len(client.replies) == 1
-        assert "/link" in client.replies[0][1]  # explains it's unavailable here
-        assert sessions.successes == []  # no LLM turn
+        key = "wecom:kirocrew:direct:Wei"
+        assert sessions.mirror_links[key].channel_type == "wecom"
+        assert sessions.mirror_links[key].channel_id == "Wei"
+        assert sessions.opted_out[key] is False
+        assert any("已连接" in said for said in client.said)
+
+    @pytest.mark.asyncio
+    async def test_unlink_opts_out_so_the_next_turn_does_not_rebind(self) -> None:
+        # The opt-out is the load-bearing half: mirroring is re-asserted on every
+        # inbound turn, so a release alone would be undone by the next message.
+        client = FakeClient()
+        sessions = FakeSessions(FakeProvider([]))
+        d = _dispatcher(sessions, FakeCtx(), client)
+        await d.handle_message(_inbound("/unlink"))
+
+        key = "wecom:kirocrew:direct:Wei"
+        assert sessions.opted_out[key] is True
+        assert sessions.successes == []  # a command runs no LLM turn
+
+        # /link withdraws the opt-out, so the next turn rebinds again.
+        await d.handle_message(_inbound("/link"))
+        assert sessions.opted_out[key] is False
+        assert sessions.mirror_links[key].channel_id == "Wei"
+
+    @pytest.mark.asyncio
+    async def test_an_attachment_sent_mid_turn_is_refused_not_dropped(self) -> None:
+        # _session/steer carries TEXT ONLY, so folding this into the running turn
+        # would send the caption and lose the picture with no sign of it.
+        sessions = FakeSessions(FakeProvider([]), acquire=False)
+        sessions._busy = True
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+        inbound = _inbound("look at this")
+        inbound.attachments = [("att", "key")]
+
+        await d.handle_message(inbound)
+
+        assert inbound.attachments == [], "the refused attachment must be cleared"
+        assert any("附件" in said for said in client.said), "the user must be told"
 
     def test_parse_command(self) -> None:
         assert parse_command("/new") == "new"
@@ -373,6 +566,91 @@ class TestCommands:
         assert parse_command("/link") == "link"
         assert parse_command("/unlink") == "unlink"
         assert parse_command("hello") is None
+
+    def test_parse_command_after_a_group_mention(self) -> None:
+        """A group chat requires @-mentioning the bot, so the command arrives prefixed."""
+        assert parse_command("@Kiro /new") == "new"
+        assert parse_command("@Kiro /compact") == "compact"
+        assert parse_command("@Kiro 新对话") == "new"
+        assert parse_command("@Kiro 清空") == "new"
+        assert parse_command("@Kiro /link") == "link"
+        assert parse_command("@Kiro /unlink") == "unlink"
+
+    def test_mention_does_not_loosen_command_matching(self) -> None:
+        """Only ONE leading mention token in front of an EXACT command counts.
+
+        Everything here must keep reaching the model as ordinary text. The bot's
+        display name is not known to the parser, so the mention is recognized
+        structurally -- which is exactly why the rest of the match has to stay
+        exact rather than becoming a prefix or substring test.
+        """
+        for text in (
+            "@Kiro hello",  # mentioned prose
+            "@Kiro",  # bare mention, no remainder
+            "@Kiro please /new",  # command embedded in prose
+            "@Kiro /new extra",  # trailing argument
+            "@someone ordinary text",  # a mention of somebody else
+            "@a @b /new",  # only one mention token is consumed
+            "hello /new",  # command not at the start
+            "/new @Kiro",  # trailing mention
+            "/new@Kiro",  # Telegram's suffix syntax, not WeCom's
+            "@Kiro /bogus",  # unknown command stays unknown
+            "@Kiro/new",  # no separator -- not a mention token
+        ):
+            assert parse_command(text) is None, text
+
+    @pytest.mark.asyncio
+    async def test_group_mention_new_bumps_gen_and_acks(self) -> None:
+        """The reported shape: '@Kiro /new' must reset, not steer into the turn."""
+        sessions = FakeSessions(FakeProvider([]))
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("@Kiro /new"))
+
+        assert client.said == ["✅ 已开始新对话"]
+        assert d._conv.current_gen("Wei") == 1
+        assert sessions.successes == []  # no LLM turn
+
+    @pytest.mark.asyncio
+    async def test_group_mention_compact_reaches_compaction(self) -> None:
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("@Kiro /compact"))
+
+        assert provider.compacted is True
+        assert client.said == ["🗜️ 已压缩上下文。"]
+
+    @pytest.mark.asyncio
+    async def test_mentioned_prose_still_runs_a_turn_with_text_intact(self) -> None:
+        """Ordinary inbound text is never rewritten -- the model sees the mention."""
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="sure"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        sessions = FakeSessions(provider)
+        conv = FakeConvLog()
+        d = _dispatcher(sessions, FakeCtx(), FakeClient(), conv_log=conv)
+
+        await d.handle_message(_inbound("@Kiro explain this stack trace"))
+
+        key = d._session_key("Wei")
+        assert sessions.successes == [key]
+        assert (key, "user", "@Kiro explain this stack trace") in conv.appended
+        assert d._conv.current_gen("Wei") == 0  # not treated as /new
+
+    @pytest.mark.asyncio
+    async def test_mentioned_unknown_command_still_runs_a_turn(self) -> None:
+        provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
+        sessions = FakeSessions(provider)
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+
+        await d.handle_message(_inbound("@Kiro /bogus"))
+
+        assert sessions.successes == [d._session_key("Wei")]
+        assert d._conv.current_gen("Wei") == 0
 
     def test_conversation_state(self) -> None:
         s = ConversationState()
@@ -396,7 +674,7 @@ class TestWeComMidTurn:
         await d.handle_message(_inbound("and also this"))
 
         assert provider.steered == ["and also this"]
-        assert any("合并" in content for _url, content in client.replies)
+        assert any("合并" in content for content in client.said)
         assert sessions.successes == []  # no full turn ran while busy
 
     @pytest.mark.asyncio
@@ -426,7 +704,7 @@ class TestWeComMidTurn:
 
         await d._handle_busy(_inbound("later"), d._session_key("Wei"))
 
-        assert any("重发" in content for _url, content in client.replies)
+        assert any("重发" in content for content in client.said)
         assert sessions.successes == []
 
     @pytest.mark.asyncio
@@ -444,6 +722,6 @@ class TestWeComMidTurn:
         await d._handle_busy(_inbound("later"), d._session_key("Wei"))
 
         assert provider.steered == []
-        assert not any("合并" in content for _url, content in client.replies)
-        assert any("重发" in content for _url, content in client.replies)
+        assert not any("合并" in content for content in client.said)
+        assert any("重发" in content for content in client.said)
         assert sessions.successes == []

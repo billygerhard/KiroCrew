@@ -80,7 +80,9 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable
 
-from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew import platform_compat
+from kiro_crew.platform.context import redact_via_context
+from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 
 from ...spine import agent_discovery
 from ...spine import scope as scope_util
@@ -209,7 +211,7 @@ _ADDABLE_TEST_GLOBS = (
 # ── shared helpers ───────────────────────────────────────────────────────────
 
 
-#: Directory names that hold a pytest suite. Used to locate the RUN ROOT, which is
+#: Directory names that hold a pytest suite. They locate the RUN ROOT, which is
 #: not always the directory the spine hands us — see :func:`_repo_root`.
 _TEST_DIRS = ("tests", "test")
 
@@ -270,7 +272,7 @@ def _write_protected_targets() -> tuple[str, ...]:
       by ``os.path.isdir(target)`` — so a FILE path is silently skipped and the mask
       no-ops. (Files are masked through a separate ``SENSITIVE_FILES`` list the public helper
       does not expose.) Measured: passing the file paths left the child able to append to
-      ``~/.kiro/crew/.data-home-ready`` and exit 0; passing the parent blocked it.
+      ``~/.kiro/crew/config.json`` and exit 0; passing the parent blocked it.
     * Only EXISTING directories are returned — the launcher mounts over each target, and a
       mount over a missing path is a needless failure on a fresh install.
 
@@ -323,12 +325,12 @@ def _run(
     # Also MASK Kiro Crew's own write-protected files. `mode="strict"` hides 52 credential
     # paths so agent-authored code cannot READ secrets, but it does not make the rest of the
     # filesystem read-only — measured on this host: a strict-mode child appended to
-    # `~/.kiro/crew/.data-home-ready` and exited 0. Those paths are `security.
+    # `~/.kiro/crew/config.json` and exited 0. Those paths are `security.
     # write_protected_home_paths()`, enforced by the platform HOOK layer, which a sandboxed
     # subprocess never passes through — so the protection was inert for exactly the code that
     # most needs it. Bind-mounting an empty dir over each makes the write fail at the kernel
-    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json,
-    # .data-home-ready under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
+    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json
+    # under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
     # would corrupt the installation; broader hiding is not possible here because the
     # interpreter's own stdlib can live under `$HOME` (measured: hiding `~/.local/share`
     # broke `import platform` outright). Raised by the GPT review of this branch.
@@ -345,7 +347,12 @@ def _run(
     # test code. See `_CREDENTIAL_ENV_MARKERS`.
     scrubbed_env = strip_credential_env(scrubbed_env)
     try:
-        return subprocess.run(
+        # Kernel RLIMIT ceiling (NPROC/NOFILE/CPU/AS) on top of the sandbox: a
+        # runaway conftest or a fork bomb in the agent's own test cannot exhaust
+        # the host running the gateway. run_limited delivers the limits after
+        # exec via the spawn shim instead of in a fork child of this threaded
+        # process.
+        return run_limited(
             sandboxed,
             cwd=root,
             capture_output=True,
@@ -353,10 +360,6 @@ def _run(
             timeout=timeout,
             shell=False,
             env=scrubbed_env,
-            # Kernel RLIMIT ceiling (NPROC/NOFILE/CPU/AS) on top of the sandbox: a
-            # runaway conftest or a fork bomb in the agent's own test cannot exhaust
-            # the host running the gateway.
-            preexec_fn=resource_limit_preexec(),
         )
     finally:
         # A temp launcher/profile FILE, per sandboxed_spawn_argv's contract — unlink it,
@@ -381,6 +384,13 @@ _MEASURE_ENV_PASSTHROUGH = (
     "TERM",  # some suites probe it; absent TERM makes output differ between arms
     "SYSTEMROOT",  # Windows: CPython needs it to initialize
     "COMSPEC",  # Windows
+    # Memory-aware cap for xdist's ``-n auto`` (_XDIST_ARGV below adds it
+    # unconditionally when xdist is importable). Seeded at the agent spawn
+    # boundary (see resource_status.inject_xdist_auto_cap); without this
+    # passthrough the allowlist would strip it and the suite would size to the
+    # CPU count regardless of memory. Same value for both A/B arms, so arm
+    # fairness is preserved. Not credential-shaped.
+    "PYTEST_XDIST_AUTO_NUM_WORKERS",
 )
 
 
@@ -401,10 +411,14 @@ def _measure_env(tree: Path) -> dict[str, str]:
     # credentials to agent-authored test code. Raised by review of this branch.
     #
     # A few HOST variables are still required for a subprocess to run at all (PATH) or to
-    # behave like a normal user session (HOME, TMPDIR, locale). Those are copied through
-    # by NAME, so the set is auditable and cannot silently grow to include a credential.
+    # behave like a normal user session (HOME, TMPDIR, locale). Those are matched against
+    # the named allowlist above via the shared convention (exact on POSIX, case-folded on
+    # Windows — see platform_compat.env_key_allowed), so the set is auditable and cannot
+    # silently grow to include a credential.
     env: dict[str, str] = {
-        name: os.environ[name] for name in _MEASURE_ENV_PASSTHROUGH if name in os.environ
+        name: value
+        for name, value in os.environ.items()
+        if platform_compat.env_key_allowed(name, _MEASURE_ENV_PASSTHROUGH)
     }
     env["PYTHONHASHSEED"] = "0"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -454,7 +468,7 @@ def _xdist_argv() -> tuple[str, ...]:
 _XDIST_ARGV: tuple[str, ...] = _xdist_argv()
 
 #: Substrings that mean xdist itself failed to run, as opposed to tests failing.
-#: Used to retry the suite serially so the gate still gets a real verdict.
+#: They trigger a serial retry of the suite so the gate still gets a real verdict.
 _XDIST_FAILURE_MARKERS = (
     "unrecognized arguments: -n",
     "error: unrecognized arguments",
@@ -684,7 +698,7 @@ class SuiteRuler:
             "runner": self.benchmark_cmd or "python -m pytest -q",
             "timer": "time.perf_counter around the subprocess",
         }
-        #: Baseline medians captured during calibration, used to DERIVE the guardrail
+        #: Baseline medians captured during calibration; they DERIVE the guardrail
         #: tolerance the driver adopts (see :meth:`guardrail_tolerances`).
         self._baseline_median: float | None = None
         #: Duck-typed by the driver so a Stop click interrupts the calibration loop
@@ -958,7 +972,10 @@ class PytestBuildGate:
         tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""]
         return GateResult(
             passed=False,
-            detail=f"suite red (exit {proc.returncode}): {tail[0][:160]}",
+            # Redact BEFORE the bound: a candidate's test run can echo a credential,
+            # and the slice can cut it mid-match into a fragment no downstream
+            # redaction pass recognises.
+            detail=f"suite red (exit {proc.returncode}): {redact_via_context(tail[0])[:160]}",
             failing_tests=failing,
         )
 
@@ -1289,12 +1306,12 @@ class RepoEditAllowlist:
         # denylist — the BUG track's one carve-out, and only for additions. Modifying an
         # existing test always falls through to off_limits.
         #
-        # Gated on the track, which it previously was not: the class docstring promised "the
-        # perf track may not touch tests/** AT ALL" while the code granted the carve-out to
-        # both. That is the gaming the fence exists to stop — the RH guard compares collected
-        # test COUNTS, so adding one cheap test while an expensive one stops being collected
-        # keeps the count equal while measured suite time drops, and a purely artifactual
-        # "win" gets drafted as a real perf PR. Raised by the GPT review.
+        # Gated on the track: the class docstring promises "the perf track may not touch
+        # tests/** AT ALL", so granting the carve-out to both tracks is the gaming the
+        # fence exists to stop — the RH guard compares collected test COUNTS, so adding one
+        # cheap test while an expensive one stops being collected keeps the count equal
+        # while measured suite time drops, and a purely artifactual "win" gets drafted as a
+        # real perf PR.
         if added and self.track == TRACK_BUG and self._is_addable_test(path):
             return False
         if self._matches(path, self.off_limits):
@@ -1362,32 +1379,26 @@ class RepoIsolation:
         gated recording the clone in the first place, so the setup-time check and this
         run-time check cannot drift apart and disagree. Fails CLOSED: any git error,
         timeout, or unreadable url reads as "push is NOT disabled" and the driver
-        refuses to start.
+        refuses to start — except the launcher-crash class below, which raises instead
+        of returning ``False`` (the run still refuses to start).
 
         BOTH urls, not just the push url: a live FETCH url is a live push target
         (``git push "$(git remote get-url origin)" HEAD`` ignores the push url entirely
         and writes to the fetch url — see ``clone_setup._disable_push``). Checking only
-        the push url reported "disabled" for a clone that could still write to the remote;
-        `_ok` checks both, and this drifted from it. Raised by the GPT review of this branch.
+        the push url reports "disabled" for a clone that can still write to the remote;
+        `_ok` checks both, and this predicate must not drift from it.
+
+        One nonzero probe exit is NOT read as a live remote: when the probe's own
+        sandbox launcher crashed before git executed, this propagates
+        ``clone_setup.IsolationProbeError`` instead of returning ``False``. The run
+        still refuses to start either way — the exception exists so the surfaced
+        reason names the sandbox failure rather than the misleading
+        "push is not disabled".
         """
 
-        def _neutral(args: list[str]) -> bool:
-            try:
-                proc = _run(
-                    ["git", "-C", str(self.clone_path), *args],
-                    cwd=self.clone_path if self.clone_path.exists() else Path.cwd(),
-                    timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return False
-            if proc.returncode != 0:
-                return False
-            url = (proc.stdout or "").strip()
-            return (not url) or ("DISABLED" in url.upper()) or ("NO_PUSH" in url.upper())
+        from ...backend.clone_setup import _repository_is_isolated
 
-        return _neutral(["remote", "get-url", "--push", "origin"]) and _neutral(
-            ["remote", "get-url", "origin"]
-        )
+        return _repository_is_isolated(self.clone_path)
 
     def do_not_pollute_paths(self) -> list[Path]:
         """Host paths the spine snapshots around the (no-op) measurement boot.
@@ -1482,26 +1493,25 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: narrowed to the change set this branch introduced.
         self.scope_base = (scope_base or "").strip()
         self._scope = scope_util.scoped_relpaths(self.clone_path, self.scope_base)
-        # `scoped_relpaths` used to return None for THREE different situations — a blank ref, a
-        # git FAILURE (bad/unresolvable ref), and a valid-but-EMPTY diff (base == HEAD) — and
-        # the caller could not tell them apart. Treating all three as "no scope" means a
-        # misconfigured `scopeDiffBase` silently widens the edit fence from "what this branch
-        # changed" to the WHOLE REPOSITORY, the opposite of what setting a scope is for.
+        # `scoped_relpaths` separates THREE situations a bare None would conflate — a blank
+        # ref, a git FAILURE (bad/unresolvable ref), and a valid-but-EMPTY diff
+        # (base == HEAD). Treating all three as "no scope" means a misconfigured
+        # `scopeDiffBase` silently widens the edit fence from "what this branch changed" to
+        # the WHOLE REPOSITORY, the opposite of what setting a scope is for.
         #
-        # Two fixes, in two review rounds. First: an unresolvable ref REFUSES here rather than
-        # running unscoped. Then the remaining hole — `scopeDiffBase=HEAD` RESOLVES fine and
-        # yields an empty diff, so it still fell through to unscoped. `scoped_relpaths` now
-        # returns `set()` for a successful-but-empty diff (None only for blank/error), and the
-        # allowlist checks `scope is not None`, so an empty scope enforces "no file may be
-        # edited" — a run that keeps nothing beats a run that may edit anything.
+        # So an unresolvable ref REFUSES here rather than running unscoped, and
+        # `scopeDiffBase=HEAD` — which RESOLVES fine and yields an empty diff — must not
+        # fall through to unscoped either: `scoped_relpaths` returns `set()` for a
+        # successful-but-empty diff (None only for blank/error), and the allowlist checks
+        # `scope is not None`, so an empty scope enforces "no file may be edited" — a run
+        # that keeps nothing beats a run that may edit anything.
         # The condition is simply "a scope was configured but could not be computed". The
-        # REASON is deliberately not consulted: this guard was previously gated on
-        # a ref-resolvability check, which only covered a base that does not exist. A base
-        # that RESOLVES but whose diff fails left `_scope is None` and nothing refused —
-        # reproduced with two unrelated histories, where `rev-parse --verify` succeeds while
-        # `diff <ref>...HEAD` exits 128 "no merge base". Third variant of one bug on this
-        # branch (unresolvable ref, empty diff, git error), so the guard now keys on the
-        # CONSEQUENCE rather than enumerating causes. Raised by the GPT review.
+        # REASON is deliberately not consulted: a ref-resolvability check covers only a base
+        # that does not exist, while a base that RESOLVES but whose diff FAILS leaves
+        # `_scope is None` with nothing refusing — two unrelated histories make
+        # `rev-parse --verify` succeed while `diff <ref>...HEAD` exits 128 "no merge base".
+        # Keying on the CONSEQUENCE covers all three causes (unresolvable ref, empty diff,
+        # git error) instead of enumerating them.
         if self.scope_base and self._scope is None:
             raise ValueError(
                 f"scopeDiffBase {self.scope_base!r} could not be resolved to a file set in "

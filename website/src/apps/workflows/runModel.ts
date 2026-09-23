@@ -13,7 +13,10 @@ export interface WfEvent {
   seq: number
   ts: string
   type: string
-  data: Record<string, any>
+  /** Unvalidated wire payload: the backend sends a different set of fields per
+   *  `type`, and nothing here parses it, so every read is asserted at the point
+   *  the `type` check has already picked the shape. */
+  data: Record<string, unknown>
 }
 
 export interface AgentRow {
@@ -21,6 +24,18 @@ export interface AgentRow {
   label?: string
   last_tool?: string
   ok?: boolean
+  /**
+   * Wall-clock span between this agent's `agent_started` and `agent_finished`
+   * events, in ms. Derived from the `ts` both events already carry, so no
+   * backend change feeds it.
+   *
+   * Undefined for three distinct cases, all of which must render as "no time"
+   * rather than a zero: the agent is still running, its stream was truncated so
+   * one of the two events is missing, or either `ts` does not parse. A negative
+   * span is also dropped — the wire carries whatever clock the producer had, and
+   * a backwards duration is worse than none.
+   */
+  elapsed_ms?: number
 }
 
 export interface PhaseGroup {
@@ -32,6 +47,10 @@ export interface PhaseGroup {
 export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
   const phases: PhaseGroup[] = []
   const byId = new Map<string, AgentRow>()
+  // Start instants live here rather than on AgentRow: a consumer needs the span,
+  // not the bookkeeping, and keeping it local means a truncated stream cannot
+  // surface a half-measured row.
+  const startedAt = new Map<string, number>()
   let current = ''
   const ensure = (title: string): PhaseGroup => {
     let p = phases.find(x => x.title === title)
@@ -40,18 +59,29 @@ export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
   }
   for (const e of events) {
     if (e.type === 'phase_started') {
-      current = e.data.title || ''
+      current = (e.data.title as string | undefined) || ''
       ensure(current)
     } else if (e.type === 'agent_started') {
-      const row: AgentRow = { agent_id: e.data.agent_id, label: e.data.label }
-      byId.set(e.data.agent_id, row)
-      ensure(e.data.phase ?? current).agents.push(row)
+      // Asserted, not coerced: the backend sends a different field set per `type`
+      // and nothing here validates it, so these reads carry exactly the trust the
+      // `any` did. Narrowing at runtime would change what a malformed event
+      // renders, which a lint pass has no business deciding.
+      const row: AgentRow = { agent_id: e.data.agent_id as string, label: e.data.label as string | undefined }
+      byId.set(e.data.agent_id as string, row)
+      const started = Date.parse(e.ts)
+      if (Number.isFinite(started)) startedAt.set(e.data.agent_id as string, started)
+      ensure((e.data.phase as string | undefined) ?? current).agents.push(row)
     } else if (e.type === 'agent_progress') {
-      const row = byId.get(e.data.agent_id)
-      if (row) row.last_tool = e.data.last_tool
+      const row = byId.get(e.data.agent_id as string)
+      if (row) row.last_tool = e.data.last_tool as string | undefined
     } else if (e.type === 'agent_finished') {
-      const row = byId.get(e.data.agent_id)
+      const row = byId.get(e.data.agent_id as string)
       if (row) row.ok = !!e.data.ok
+      const started = startedAt.get(e.data.agent_id as string)
+      const finished = Date.parse(e.ts)
+      if (row && started !== undefined && Number.isFinite(finished) && finished >= started) {
+        row.elapsed_ms = finished - started
+      }
     }
   }
   return phases
@@ -73,18 +103,28 @@ export function runBelongsToSlot(sessionKey: string | undefined | null, slotKey:
   if (sessionKey === slotKey) return true
   if (sessionKey === `dashboard:${slotKey}`) return true
   // Tolerate a leading "dashboard:" / "dashboard_" prefix on either side.
-  const norm = (s: string) => s.replace(/^dashboard[:_]/, '')
-  return norm(sessionKey) === norm(slotKey)
+  return normalizeRunSessionKey(sessionKey) === normalizeRunSessionKey(slotKey)
+}
+
+/** Canonical form of a run's `session_key` — and of a slot key — for
+ *  cross-referencing the two without pairwise `runBelongsToSlot` scans: a map
+ *  of runs keyed by `normalizeRunSessionKey(session_key)` is looked up with
+ *  `normalizeRunSessionKey(slotKey)` and matches exactly the pairs
+ *  `runBelongsToSlot` accepts. Strips one leading "dashboard:" (the history
+ *  key the gateway tags chat-launched runs with) or "dashboard_" (persisted
+ *  key form) prefix. */
+export function normalizeRunSessionKey(s: string): string {
+  return s.replace(/^dashboard[:_]/, '')
 }
 
 /** Latest budget snapshot from the stream, if any. */
 export function latestBudget(events: WfEvent[]): { spent: number; total: number | null } | null {
   let out: { spent: number; total: number | null } | null = null
   for (const e of events) {
-    if (e.type === 'run_started') out = { spent: 0, total: e.data.budget_total ?? null }
+    if (e.type === 'run_started') out = { spent: 0, total: (e.data.budget_total as number | null | undefined) ?? null }
     else if (e.type === 'budget_update') {
       const prevTotal: number | null = out ? out.total : null
-      out = { spent: e.data.spent, total: prevTotal }
+      out = { spent: e.data.spent as number, total: prevTotal }
     }
   }
   return out

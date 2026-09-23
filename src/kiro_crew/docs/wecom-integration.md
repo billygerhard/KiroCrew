@@ -11,13 +11,13 @@ stream back live.
 Like Telegram, the connection is outbound-only: Kiro Crew opens a secure
 WebSocket to WeCom, so there's no callback URL or open port to manage.
 
-## The easy way: just ask Kiro Crew
+## The easy way: use Settings
 
-You don't have to edit anything by hand. In any Kiro Crew session — the
-dashboard, Slack, or the CLI — say something like *"set up the WeCom channel."*
-Kiro Crew tells you where to create the WeCom AI bot, then writes your Bot ID and
-Secret into `~/.kiro/crew/.env` and `config.json` and restarts the gateway for
-you. You just paste the two values when it asks.
+Open **Settings → Messaging Channels → WeCom**. Paste the Bot ID and Secret and add the
+allowed userids there; the panel validates the credentials, stores them in
+`~/.kiro/crew/.env`, and writes the non-secret channel settings to `config.json`.
+Restart when the panel asks. Because both values are credentials, do not paste
+them into a chat message.
 
 Prefer to wire it up yourself? The manual steps are below.
 
@@ -52,11 +52,12 @@ Message the bot in WeCom and it answers. If it stays quiet, look for
 is allowed.
 
 Those two values — **Bot ID** and **Secret** — are all Kiro Crew needs. There's
-no corp ID, agent ID, callback URL, or AES key to wire up. Good to know: the
-WeCom bot replies to messages you send it — it can't start a conversation on its
-own, and it has no buttons (so `OPTIONS` arrive as plain text).
+no corp ID, agent ID, callback URL, or AES key to wire up. Good to know about
+today's WeCom channel: it renders no tappable buttons, so a list of choices
+arrives as a numbered list you answer by typing. Tappable cards do exist in the
+AI-bot API; they are not wired up yet.
 
-## Who can reach it
+## Access control
 
 > **Kiro Crew runs on your machine, with your files and credentials.** So it only
 > talks to the owner and the userids you name.
@@ -64,19 +65,60 @@ own, and it has no buttons (so `OPTIONS` arrive as plain text).
 - Authorized senders: the **owner** (`KIROCREW_OWNER_ID`) plus anyone listed in
   `allowed_users`. With no owner and an empty list, nobody gets in.
 - Whole-company access: set `"allow_all_users": true` (or flip **Allow all
-  organization members** in Settings → WeCom) to skip listing each userid.
+  organization members** in Settings → Messaging Channels → WeCom) to skip listing each userid.
   This is an explicit opt-in — an empty list never means "everyone" — and it
   works because a WeCom AI bot is only reachable inside your own org tenant.
   Messages without a userid are still dropped.
-- The WeCom AI bot carries direct messages only — one conversation per userid.
+- **Direct messages only — one conversation per userid.** A message sent to the
+  bot in a WeCom **group** is refused and recorded in the audit log, even from an
+  allowed sender. Your session is keyed to your userid, so answering in a group
+  would replay that private conversation's history and tool output to everyone in
+  the room. Group support needs its own per-group sessions and group allow-list.
 - Anyone else is quietly dropped and recorded in the audit log.
+
+## Sending files and screenshots
+
+Send an image, a file, or a voice note and the agent sees it. Images and files are
+downloaded and decrypted from WeCom's CDN; a voice note uses WeCom's own
+transcript, so nothing extra has to be installed. A screenshot with a caption
+works too — the caption comes through with the picture, and a picture with no
+caption at all is still delivered rather than ignored. A caption that happens to
+look like a command is treated as text: attach a photo captioned `/new` and you get
+an answer about the photo, not a reset conversation and a lost picture. Send the
+command in its own message to run it.
+
+Per-item ceilings follow WeCom's own: 10 MB per image, 20 MB per file (including an
+audio file you attach, which is transcribed locally), 10 items per message. A voice
+note has no size ceiling here because its bytes are never fetched — WeCom sends the
+transcript. Anything refused is reported rather than silently dropped. Sending a
+file *to* you is not wired up yet, so if the agent produces an image you'll get its
+path rather than the picture.
 
 ## Commands
 
 - `/new` (or `新对话`, `清空`) — start a fresh conversation
-- `/compact` — free up room when the context fills
+- `/compact` (or `压缩`) — free up room when the context fills
+- `/stop` (or `/cancel`, `停止`) — stop the reply that's running
+- `/link` / `/unlink` — mirror the dashboard's replies for this conversation here
+- `/help` (or `帮助`) — show the command list
 
-## Settings & reference
+While a reply is running, prefix a message to control it:
+
+- `/steer <message>` — fold it into the running reply now
+- `/queue <message>` — not supported here; you'll be asked to resend instead
+
+**Approving tools.** WeCom has no approve/deny buttons, so a tool the agent wants to
+run is declined unless auto-approve is already on. Turn it on from the dashboard (or
+Slack) — it is one grant for the whole machine, it expires on its own, and tools your
+policy denies stay blocked either way. There is deliberately no WeCom command for it:
+one switch with one answer beats a per-channel copy.
+
+Send commands in your direct chat with the bot. A leading `@mention` is tolerated
+and stripped before the command is matched, so `@Kiro /new` also works — but see
+"Who can reach it": messages sent in a WeCom group are refused, so commands only
+take effect in a direct chat.
+
+## Settings reference
 
 Everything lives in the `wecom` section of `config.json`:
 
@@ -84,11 +126,23 @@ Everything lives in the `wecom` section of `config.json`:
 |---|---|---|
 | `enabled` | `false` | Turns the channel on |
 | `allowed_users` | `[]` | `{ "userid", "name" }` entries allowed to chat (empty = owner only) |
+| `allow_all_users` | `false` | Allow every organization member to DM the bot |
 | `soft_threshold_pct` | `80` | Context % where the bot suggests `/compact` |
 | `hard_threshold_pct` | `95` | Context % hard cutoff |
 | `ws_url` | `wss://openws.work.weixin.qq.com` | WeCom AI-bot endpoint |
+| `session_folder` | `""` | Folder that WeCom sessions are filed under |
 
 Credentials go in `~/.kiro/crew/.env`: `WECOM_BOT_ID` and `WECOM_SECRET`.
+
+### Delivery destinations
+
+Dashboard delivery uses `target_id` values `user:<userid>`. Named users are shown as unavailable until they message the bot after the gateway starts; with `allow_all_users`, only those warmed direct-message peers are listed. Each destination is revalidated against the current authorization policy before delivery.
+
+**This channel is not an owner-DM target.** Because the peer list is learned from
+inbound traffic, "the owner" cannot be resolved to a known person here — a
+`send_message` aimed at this channel would risk delivering to whoever last
+messaged the bot, so the channel is excluded from that routing entirely. Named
+dashboard destinations above still work; only the unqualified owner DM does not.
 
 **If something's off:** no reply usually means the sender's userid isn't allowed
 or `enabled` is `false`; a missing `channel started` line means a credential is
@@ -97,6 +151,7 @@ the WeCom console — re-add it and restart.
 
 ## Related docs
 
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
 - [Slack Integration](slack-integration.md)
 - [Telegram Integration](telegram-integration.md)
 - [Getting Started](getting-started.md)

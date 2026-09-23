@@ -42,6 +42,13 @@ export interface NormalizedUsage {
     thisWeek: UsagePeriod
     thisMonth: UsagePeriod
     avgMsgsPerSession: number
+    /**
+     * Transcripts the path validator refused while scanning the sessions dir
+     * (#6733). On a Windows roaming-profile (UNC) home every transcript is
+     * refused, so a `total` of 0 with a positive count here is the silent
+     * failure the usage page must not render as a confident zero.
+     */
+    refusedTranscripts: number
     dailyHistory: { date: string; sessions: number; messages: number; toolCalls: number }[]
   }
   billing: {
@@ -98,7 +105,6 @@ export interface ProviderLabels {
   sessionProcess: string
   agentTemplateField: string
   processCountLabel: string
-  warmPoolDescription: string
   configFile: string
   pluginRegistryName: string
   hooksSection: string
@@ -109,6 +115,20 @@ export interface ModelInfo {
   description: string
   contextWindow?: number
   supportsExtendedContext?: boolean
+  /**
+   * Relative credit cost of a turn on this model, with Auto as the 1.0
+   * baseline — kiro's `rate_multiplier` from `chat --list-models`, passed
+   * straight through by `GET /api/models`.
+   *
+   * Deliberately OPTIONAL and never defaulted: a missing value means "the
+   * backend did not tell us", which happens on a cold start (the auto-only
+   * fallback list) and for rows served from the 24h localStorage cache written
+   * before this field existed. Substituting 1.0 there would state a price we
+   * were not told — and kiro does re-price (Luna moved 0.6x -> 0.1x in
+   * 2026-07), so a guess can be wrong by 6x. Consumers render nothing when it
+   * is absent.
+   */
+  rateMultiplier?: number
 }
 
 export interface PermissionMode {
@@ -145,7 +165,10 @@ export interface ProviderAdapter {
   uninstallPlugin(pkg: string, type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; error?: string }>
   updatePlugins(type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; output?: string; error?: string }>
 
-  fetchAvailableModels(): Promise<ModelInfo[]>
+  /** The model catalog. An optional `backend` re-keys it to a per-chat backend
+   *  pick (the composer's picker asks "what does THIS harness serve?"); omitted,
+   *  it answers for the configured global backend. */
+  fetchAvailableModels(backend?: string): Promise<ModelInfo[]>
   getContextWindow(model: string): number
   getDefaultModel(): string
   getPermissionModes(): PermissionMode[]

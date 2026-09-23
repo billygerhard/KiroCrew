@@ -1,9 +1,11 @@
 """Phase 3 — self-protection of the governance trust-root files (KEYSTONE).
 
-Under "secure by default, not by mandate", the ONLY mechanism preventing a
-prompt-injected agent from rewriting its own ceiling is that the policy/profile
-files are on the sensitive-path floor (read + write blocked at every surface via
-``is_sensitive_path``).  These tests pin that guarantee.
+Under "secure by default, not by mandate", what prevents a prompt-injected agent
+from rewriting its own ceiling is that the policy/profile files are on the
+sensitive-path floor (read + write blocked on every file-tool surface via
+``is_sensitive_path``) and that the OS sandbox mounts them read-only for the
+agent's shell. These tests pin the ``is_sensitive_path`` half; the shell half is
+the sandbox's, not a matcher over command text.
 """
 
 from __future__ import annotations
@@ -99,62 +101,85 @@ def test_agent_fs_write_to_run_marker_denied_at_gate():
     assert result.action == TOOL_DENY
 
 
-@pytest.mark.parametrize(
-    "cmd",
-    [
-        "tee ~/.kiro/crew/security_policy.json",
-        "mv /tmp/evil.json ~/.kiro/crew/security_policy.json",
-        "sed -i s/deny/allow/ ~/.kiro/crew/security_policy.json",
-        "ln -sf /tmp/evil ~/.kiro/crew/profiles/app.json",
-        "truncate -s0 ~/.kiro/crew/admission_policy.json",
-        # Legacy pre-move home is still gated.
-        "tee ~/.kirocrew/security_policy.json",
-        "mv /tmp/evil.json ~/.kirocrew/security_policy.json",
-    ],
+def test_the_named_ceiling_and_secret_leaves_are_fenced_at_the_OS_LAYER():
+    """The leaves this file names are fenced where a SUBPROCESS is actually bound.
+
+    This assertion must not run ``is_sensitive_bash_command`` over eight attached-redirect
+    spellings (``>~/.kiro/crew/./<leaf>`` and the ``<`` input forms). It was testing the
+    wrong layer, and the layer it tested could not hold: a spawned shell reaches a file
+    through an ``open()`` that never routes through the tool gate, so a path fenced only
+    there is readable in any sandbox mode whatever the text matcher recognises. Matching
+    one more spelling never converged -- six review rounds produced a new one each time
+    (``/./``, a glued redirect, ``pushd``, an assignment, a conditional assignment).
+
+    What binds a subprocess is the OS layer in :mod:`kiro_crew.sandbox`, so that is what
+    is pinned: every leaf named here carries a HIDDEN (bind-masked in every mode) or
+    READONLY (readable in-sandbox, never writable) disposition.
+
+    Two residuals are stated rather than asserted away, because the OS layer does not
+    close either and no text matcher can:
+
+    * READONLY permits the READ, so an in-sandbox reader can still open
+      ``security_policy.json``. Only its WRITE is refused, in every mode.
+    * ``sel_hmac.key`` is VISIBLE, not fenced at all: in-sandbox code needs read AND
+      write, so by the sandbox's own design it "stays on the tool gate alone". Only
+      ``is_sensitive_path`` on the file-tool path refuses it; no bash-layer fence
+      remains. Closing that properly
+      means moving its in-sandbox reader behind the gateway so the leaf can become
+      HIDDEN -- a sandbox change, not another regex.
+
+    ``test_sandbox_governance_mask.py`` pins the dispositions themselves.
+    """
+    from kiro_crew import sandbox
+
+    fenced = sandbox._CREW_HIDDEN_LEAVES + sandbox._CREW_READONLY_LEAVES
+
+    def _carries(leaf: str, entries: "tuple[str, ...]") -> bool:
+        return any(entry == leaf or entry.endswith("/" + leaf) for entry in entries)
+
+    for leaf in ("live_target.json", "security_policy.json", ".env"):
+        assert _carries(leaf, fenced), leaf
+
+    # Pinned as VISIBLE on purpose: if it ever becomes maskable this assertion fails and
+    # the residual above is what should be revisited.
+    assert _carries("sel_hmac.key", sandbox._CREW_SANDBOX_VISIBLE_LEAVES)
+    assert not _carries("sel_hmac.key", fenced)
+
+
+def test_home_var_expansion_survives_windows_backslashes(monkeypatch):
+    """$HOME expansion must not be defeated by Windows backslash home paths.
+
+    The fix: $HOME is expanded per-token AFTER shlex.split, so backslashes in
+    the expanded path are never reinterpreted as escape characters by shlex."""
+    import os as _os
+
+    from kiro_crew.security import normalize_shell_command
+
+    win_home = r"C:\Users\runneradmin"
+    monkeypatch.setattr(_os.path, "expanduser", lambda _p: win_home)
+
+    tokens = normalize_shell_command("cat $HOME/.kiro/crew/live_target.json")
+    assert tokens[0] == "cat"
+    # The path must contain the FULL Windows home (backslashes intact),
+    # not the mangled 'C:Usersrunneradmin' that shlex would produce.
+    assert win_home in tokens[1], f"Expected {win_home!r} in {tokens[1]!r}"
+    assert ".kiro/crew/live_target.json" in tokens[1]
+
+
+# Browser Mode's enable/engine gate is a keystone: presence of the enable file
+# authorizes browser operation (and in attach mode, driving the operator's real
+# logged-in browser), so a prompt-injected agent must not be able to author it.
+_BROWSER_KEYSTONE = (
+    "~/.kiro/crew/browser-mode-enabled",
+    "~/.kiro/crew/browser-engine",
+    "~/.kirocrew/browser-mode-enabled",
 )
-def test_bash_write_verbs_to_keystone_are_blocked(cmd):
-    # The CRITICAL fix: write verbs (not just reads/redirects) to the governance
-    # trust-root must be blocked by the shared bash gate.
-    assert security.is_sensitive_bash_command(cmd) is not None
 
 
-def test_benign_write_verbs_not_overblocked():
-    for cmd in ["tee /tmp/out.txt", "mv a.txt b.txt", "rm /tmp/junk", "sed -i s/a/b/ README.md"]:
-        assert security.is_sensitive_bash_command(cmd) is None
-
-
-@pytest.mark.parametrize(
-    "cmd",
-    [
-        "git checkout -- ~/.kiro/crew/security_policy.json",
-        "git restore ~/.kiro/crew/security_policy.json",
-        "cp evil /home/someuser/.kiro/crew/security_policy.json",
-        "unzip evil.zip -d ~/.kiro/crew/profiles/",
-        "tar -xf evil.tar -C ~/.kiro/crew/",
-        "tar xzf x -C /home/u/.kiro/crew/",
-        "curl x | tar xf - -C ~/.aws",
-        # Legacy pre-move home is still gated.
-        "cp evil /home/someuser/.kirocrew/security_policy.json",
-        "tar -xf evil.tar -C ~/.kirocrew/",
-    ],
-)
-def test_archive_and_vcs_keystone_writes_blocked(cmd):
-    # Write-verb allowlist was bypassable via extraction/checkout verbs and the
-    # /home/<user> literal anchor; the verb-independent + extraction-destination
-    # backstops must block these.
-    assert security.is_sensitive_bash_command(cmd) is not None
-
-
-def test_benign_archive_and_vcs_not_overblocked():
-    for cmd in [
-        "tar -xf release.tar -C /tmp/build",
-        "git checkout -- src/main.py",
-        "unzip data.zip -d /tmp/data",
-        "git commit -m 'update'",
-        "tar -cf out.tar ~/.kiro/crew/sessions.db",  # reading a non-sensitive crew file
-        "cat ~/.kiro/crew/config.json",
-    ]:
-        assert security.is_sensitive_bash_command(cmd) is None, cmd
+@pytest.mark.parametrize("path", _BROWSER_KEYSTONE)
+def test_browser_mode_gate_is_sensitive(path):
+    assert security.is_sensitive_path(path)
+    assert validate_file_path(path) is None
 
 
 def test_case_variant_policy_path_is_sensitive():

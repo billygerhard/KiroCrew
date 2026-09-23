@@ -11,8 +11,12 @@ nobody. An unconfigured transport (empty allow-list under ``allowlist``)
 authorizes nobody.
 
 SCAFFOLD NOTES / TODO:
-  * Inbound media (image/voice/file/video) is not yet decrypted+cached -- only
-    the text item is extracted. Port ``_download_and_decrypt_media`` next.
+  * Inbound media (image/voice/file) IS decrypted and ingested -- see
+    ``weixin/media.py`` (CDN + AES-128-ECB) and ``weixin/attachments.py``
+    (shared ingest adapter). Inbound VIDEO is rejected with a visible note
+    BEFORE any download (``messaging/attachments.py`` classifies and refuses it
+    ahead of the fetch), so it costs no CDN round trip; outbound media is still
+    unimplemented (``getuploadurl`` + encrypted CDN PUT).
   * Outbound chunking uses a naive splitter; swap for ``renderer`` once the
     Markdown block splitter lands.
   * Group delivery is intentionally unsupported for now (iLink bot identities
@@ -28,6 +32,8 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from kiro_crew.config.sections import _coerce_opaque_str_ids
+from kiro_crew.messaging.tables import TABLE_POLICY_NATIVE
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -36,6 +42,7 @@ from kiro_crew.messaging.transport import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.weixin.client import (
+    INBOUND_MEDIA_ITEM_TYPES,
     ITEM_TEXT,
     MESSAGE_DEDUP_TTL_SECONDS,
     RATE_LIMIT_ERRCODE,
@@ -50,21 +57,30 @@ logger = logging.getLogger(__name__)
 
 DispatchFn = Callable[[InboundMessage], Awaitable[None]]
 
-# iLink renders Markdown natively; DM-only; no threads. Both file directions
-# are False because this transport has NO media path: send_message carries text
-# only (files_outbound=False), and inbound media (image/voice/file/video) is
-# not decrypted or cached (files_inbound=False; see the module docstring).
-# Flip each in the same change that lands that direction's media support --
-# declaring a capability the transport cannot perform makes the contract lie
-# to every future capability-aware caller.
+#: The DM policies :meth:`WeixinTransport.authorize` implements. A reloaded value
+#: outside this set is REFUSED rather than adopted, so a typo in ``config.json``
+#: cannot land a policy the authorize ladder would fall through on.
+WEIXIN_DM_POLICIES = frozenset(("open", "allowlist", "disabled"))
+
+# iLink renders Markdown natively; DM-only; no threads. ``files_inbound=True``
+# because inbound image/voice/file items are downloaded from the WeChat CDN and
+# AES-128-ECB decrypted (weixin/media.py) then handed to the shared attachment
+# pipeline (weixin/attachments.py). ``files_outbound`` stays False: send_message
+# carries text only — the upload half (getuploadurl + encrypted CDN PUT) is not
+# implemented, and declaring a capability the transport cannot perform makes the
+# contract lie to every future capability-aware caller.
 WEIXIN_CAPABILITIES = TransportCapabilities(
     streaming=False,
     edit=False,
     reactions=False,
-    files_inbound=False,
+    files_inbound=True,
     files_outbound=False,
     rich_blocks=False,
     threads=False,
+    # iLink clients render Markdown natively, tables included -- which is why
+    # weixin/renderer.py preserves them instead of flattening.
+    table_mode=TABLE_POLICY_NATIVE,
+    native_tables=True,
     max_message_chars=WEIXIN_CHUNK_LIMIT,
     max_buttons=0,
     supports_proactive_send=True,
@@ -112,6 +128,62 @@ class WeixinTransport(MessagingTransport):
     def client(self) -> WeixinClient:
         return self._client
 
+    # -- Live config -----------------------------------------------------------
+    def reconfigure(self, section: Any) -> None:
+        """Adopt a reloaded ``weixin`` config section's authorization fields.
+
+        Called by the dispatcher's config applier so a roster or policy edit from
+        the dashboard, the CLI or ``$EDITOR`` takes effect on the next inbound
+        message instead of the next restart. The allow-list is rebuilt through
+        :func:`_coerce_opaque_str_ids` -- iLink ids are opaque (``wxid_…``,
+        ``<hex>@im.bot``), so the digit-only coercion would silently empty the
+        list and, under the deny-by-default policy, lock every sender out.
+
+        Fails closed on shape: a policy outside the three known values, or a
+        roster that is not a list, keeps the PREVIOUS value and logs at WARNING.
+        Both fields are authorization boundaries, so each change is SEL-audited
+        by count and by policy NAME -- never by id.
+        """
+        raw_ids = getattr(section, "allowed_user_ids", None)
+        if not isinstance(raw_ids, (list, tuple)):
+            logger.warning(
+                "weixin: allowed_user_ids is not a list in the reloaded config; keeping the "
+                "previous allow-list (%d id(s))",
+                len(self._allowed),
+            )
+        else:
+            new_allowed = frozenset(_coerce_opaque_str_ids(list(raw_ids)))
+            if new_allowed != self._allowed:
+                added = len(new_allowed - self._allowed)
+                removed = len(self._allowed - new_allowed)
+                self._allowed = new_allowed
+                logger.info("weixin: allow-list reloaded (+%d/-%d id(s))", added, removed)
+                sel().log_api_access(
+                    caller="config",
+                    operation="weixin_transport.reconfigure",
+                    outcome="allow_list_changed",
+                    source="weixin",
+                    resources=f"added={added} removed={removed} size={len(new_allowed)}",
+                )
+        policy = getattr(section, "dm_policy", None)
+        if policy not in WEIXIN_DM_POLICIES:
+            logger.warning(
+                "weixin: dm_policy %r in the reloaded config is not one of %s; keeping %r",
+                policy,
+                "/".join(sorted(WEIXIN_DM_POLICIES)),
+                self._dm_policy,
+            )
+        elif policy != self._dm_policy:
+            previous, self._dm_policy = self._dm_policy, policy
+            logger.warning("weixin: dm_policy reloaded: %s -> %s", previous, policy)
+            sel().log_api_access(
+                caller="config",
+                operation="weixin_transport.reconfigure",
+                outcome="dm_policy_changed",
+                source="weixin",
+                resources=f"from={previous} to={policy}",
+            )
+
     # -- Tier-1 core -----------------------------------------------------------
     async def send_message(
         self, conversation_id: str, content: str, thread_id: str | None = None
@@ -151,6 +223,30 @@ class WeixinTransport(MessagingTransport):
         if kind != "user" or not separator or value not in identities:
             return None
         return await self.resolve_conversation(value), None
+
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Re-decide a proactive send under the live ``dm_policy``. Fails closed.
+
+        The iLink conversation id IS the peer's user id, so this asks the same
+        question :meth:`authorize` asks and answers it the same way -- including
+        denying an unrecognized policy rather than falling through to ``open``.
+
+        Deliberately consults ``_allowed`` ALONE, unlike
+        ``resolve_configured_target``, which also accepts ``_known_users``. That
+        set is learned from inbound traffic, so honouring it here would let a peer
+        who spoke once keep receiving proactive messages after being taken off the
+        roster -- which is the exact revocation this check exists to enforce.
+        """
+        if not conversation_id:
+            return False
+        if self._dm_policy == "open":
+            return True
+        if self._dm_policy == "allowlist":
+            return conversation_id in self._allowed
+        return False
 
     # -- Lifecycle -------------------------------------------------------------
     async def connect(self) -> None:
@@ -235,8 +331,8 @@ class WeixinTransport(MessagingTransport):
                     continue
                 if errcode is not None:
                     # Unknown protocol error: still back off. Without this an
-                    # unrecognized code would spin the same way the two known
-                    # codes used to.
+                    # unrecognized code would spin instead of backing off the way
+                    # the two known codes do.
                     failures += 1
                     delay = 2 if failures < 3 else 30
                     logger.warning(
@@ -249,7 +345,14 @@ class WeixinTransport(MessagingTransport):
                     continue
                 self._sync_buf = resp.get("get_updates_buf", self._sync_buf)
                 for msg in resp.get("msgs") or []:
-                    await self.receive(msg)
+                    task = asyncio.current_task()
+                    if task is not None:
+                        self._client._handler_tasks.add(task)
+                    try:
+                        await self.receive(msg)
+                    finally:
+                        if task is not None:
+                            self._client._handler_tasks.discard(task)
                 failures = 0
             except asyncio.CancelledError:
                 # Propagate: cancellation is shutdown, and swallowing it here
@@ -317,13 +420,22 @@ class WeixinTransport(MessagingTransport):
         if msg_id and self._dedup(msg_id):
             return
 
-        # Text only for now — media (voice/file/image/video) is not supported yet.
+        # Text rides in an ITEM_TEXT item; every other item type is a CDN media
+        # reference handed to the attachment pipeline. A media-only message has
+        # no text, so emptiness alone must NOT drop it — that was the bug where a
+        # screenshot vanished with no reply and no log line.
         text = ""
+        media_items: list[Any] = []
         for item in raw_envelope.get("item_list") or []:
+            if not isinstance(item, dict):
+                continue
             if item.get("type") == ITEM_TEXT:
-                text = (item.get("text_item") or {}).get("text", "")
-                break
-        if not text:
+                if not text:
+                    text = (item.get("text_item") or {}).get("text", "")
+                continue
+            if item.get("type") in INBOUND_MEDIA_ITEM_TYPES:
+                media_items.append(item)
+        if not text and not media_items:
             return
 
         msg = InboundMessage(
@@ -331,6 +443,7 @@ class WeixinTransport(MessagingTransport):
             user_id=from_user,
             conversation_id=from_user,  # DM: peer id is the conversation
             text=text,
+            attachments=media_items,
         )
         # Authorize FIRST: an unallowlisted stranger must not be able to mutate
         # any server-side state, so the reply-context write happens only after

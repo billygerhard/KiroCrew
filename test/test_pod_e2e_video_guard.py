@@ -1,4 +1,4 @@
-"""Guards for the pod-e2e ``--video`` hang (issue #645).
+"""Guards for the pod-e2e ``--video`` hang.
 
 A spec that passed in 16s must never be lost to an unbounded browser teardown,
 so these tests pin the three mechanisms that make that impossible:
@@ -25,6 +25,8 @@ import types
 from pathlib import Path
 
 import pytest
+
+from conftest import _find_posix_test_shell
 
 _SKILL = (
     Path(__file__).resolve().parent.parent
@@ -193,9 +195,12 @@ def test_normal_recording_is_transcoded(driver, tmp_path, monkeypatch):
 # --- orphan cleanup ---------------------------------------------------------
 
 
-@pytest.mark.skipif(not Path("/proc").is_dir(), reason="/proc walk is Linux-only")
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/proc").is_dir(),
+    reason="/proc walk is Linux-only",
+)
 def test_descendant_pids_finds_a_grandchild(driver):
-    """A wedged run used to leave the driver + ~19 chromium processes behind."""
+    """A wedged run leaves the driver + ~19 chromium processes behind."""
     child = subprocess.Popen(
         [sys.executable, "-c", "import subprocess,sys,time;"
          "subprocess.Popen([sys.executable,'-c','import time;time.sleep(20)']);"
@@ -369,33 +374,10 @@ def test_spec_recorded_pass_keeps_the_run_green(driver, tmp_path):
 
 
 def _usable_bash() -> str | None:
-    """Return a bash that can actually execute a script, else None.
-
-    `shutil.which("bash")` is not enough: on GitHub's Windows runners it finds
-    the WSL launcher stub, which exits 1 with a UTF-16 "no installed
-    distributions" message instead of running anything. Probe it.
-    """
-    candidates = ["bash", r"C:\Program Files\Git\bin\bash.exe"]
-    for cand in candidates:
-        exe = shutil.which(cand)
-        if exe is None and Path(cand).exists():
-            exe = cand
-        if exe is None:
-            continue
-        try:
-            probe = subprocess.run(
-                [exe, "-c", "echo ok"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-            )
-        except OSError:                         # pragma: no cover - env guard
-            continue
-        if probe.returncode == 0 and "ok" in (probe.stdout or ""):
-            return exe
-    return None
+    """Return Bash specifically, never a generic ``/bin/sh`` or WSL stub."""
+    if os.name == "nt":
+        return _find_posix_test_shell()
+    return shutil.which("bash")
 
 
 @pytest.mark.skipif(
@@ -566,8 +548,8 @@ def test_teardown_bail_row_matches_the_summary_grep(driver, tmp_path):
 def test_missing_playwright_interpreter_fails_the_run():
     """A run that captured ZERO screenshots must not report a green summary.
 
-    The FE phase used to `warn` when KIROCREW_PW_PY was unset, so the summary
-    said "N passed, 0 failed" with no evidence on disk — which is how "capture
+        A `warn` when KIROCREW_PW_PY is unset produces a summary that says
+        "N passed, 0 failed" with no evidence on disk — which is how "capture
     is in flight" becomes a believable but false statement. It must `fail`.
     """
     lines = _runner_text().splitlines()

@@ -1,14 +1,18 @@
 import { memo, useMemo, useRef, useState, useCallback, useEffect } from 'react'
+import { useIsMobile } from '../hooks/useIsMobile'
 import {
   MessageSquare, X, RefreshCw, Send, Bot, CheckCircle2, Eye, CornerDownRight,
   AlertTriangle, ChevronRight, Sparkles, Plus, RotateCcw, Link2, Pencil,
 } from 'lucide-react'
 import type { ArtifactComment } from '../types'
+import Clickable from './Clickable'
+import ErrorNotice from './ErrorNotice'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** Short relative-ish timestamp for a comment row. */
 function fmtTs(ts: string): string {
   if (!ts) return ''
@@ -82,14 +86,16 @@ export function ReplyBox({ onSubmit, onCancel }: { onSubmit: (text: string) => v
         rows={2}
         placeholder={i18nT('components.commentsSidebar.reply')}
         onChange={e => setText(e.target.value)}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
-          if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && text.trim()) {
-            e.preventDefault(); onSubmit(text.trim())
+          // The emptiness test stays OUTSIDE the claim: on a blank box this Enter is not
+          // a submit at all, and taking it would cost the newline it means there.
+          if (e.key === 'Enter' && !e.shiftKey && text.trim()) {
+            if (ime.claimEnter(e)) onSubmit(text.trim())
           }
           if (e.key === 'Escape') { e.preventDefault(); onCancel() }
         }}
-        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
       />
       <div className="flex items-center justify-end gap-1.5 mt-1">
         <button
@@ -125,14 +131,14 @@ export function EditBox({ initial, onSubmit, onCancel }: { initial: string; onSu
         rows={2}
         placeholder={i18nT('components.commentsSidebar.edit_comment')}
         onChange={e => setText(e.target.value)}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
-          if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && text.trim()) {
-            e.preventDefault(); e.stopPropagation(); onSubmit(text.trim())
+          if (e.key === 'Enter' && !e.shiftKey && text.trim()) {
+            if (ime.claimEnter(e)) { e.stopPropagation(); onSubmit(text.trim()) }
           }
           if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onCancel() }
         }}
-        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
       />
       <div className="flex items-center justify-end gap-1.5 mt-1">
         <button
@@ -194,50 +200,61 @@ export function CommentRow({
   // so Edit is hidden there. Gated further on onEdit being wired by the parent.
   const canEdit = !isProvider
   const isEditing = !!editing && !!onEditSubmit
+  const bodyClass = `rounded-lg border px-3 py-2.5 shadow-sm transition-colors ${onBodyClick ? 'cursor-pointer' : ''} ${
+    active
+      ? 'border-accent bg-accent-subtle ring-1 ring-accent/50'
+      : 'border-border bg-card hover:border-border-strong'
+  }`
+  const body = (
+    <>
+      {/* anchor preview (roots only) */}
+      {!isReply && quote && (
+        <div
+          className="text-[11px] text-muted font-mono mb-1.5 truncate border-l-2 border-accent/40 pl-1.5"
+          title={quote}
+        >{quote.slice(0, 80)}{quote.length > 80 ? '…' : ''}</div>
+      )}
+      {/* header: avatar + author + time + lightweight source */}
+      <div className="flex items-center gap-1.5 mb-1">
+        <span
+          className="flex items-center justify-center w-5 h-5 rounded-full bg-bg-elevated text-[10px] font-semibold text-muted shrink-0"
+          aria-hidden="true"
+        >{initials(comment)}</span>
+        <span className="text-[12px] font-semibold text-text-strong truncate">{authorName(comment)}</span>
+        <span className="text-[10px] text-muted shrink-0">{fmtTs(comment.created_at)}</span>
+        {comment.is_agent && <Bot size={11} className="text-accent shrink-0" aria-label={i18nT('components.commentsSidebar.ai_agent')} />}
+        {comment.scope === 'shared' && <Link2 size={11} className="text-muted shrink-0" aria-label={i18nT('components.commentsSidebar.shared_comment')} />}
+        {syncWarn && <AlertTriangle size={11} className="text-warn shrink-0" aria-label={syncWarn} />}
+      </div>
+      {/* body (or inline editor when editing) */}
+      {isEditing ? (
+        <EditBox
+          initial={comment.body}
+          onSubmit={onEditSubmit as (text: string) => void}
+          onCancel={onEditCancel || (() => {})}
+        />
+      ) : (
+        <div className="text-[13px] text-text whitespace-pre-wrap break-words">{comment.body}</div>
+      )}
+    </>
+  )
   return (
     <div className={`${isReply ? 'ml-3.5 pl-2 border-l-2 border-border' : ''} group${comment.anchor_orphaned ? ' opacity-60' : ''}`}>
-      <div
-        onClick={onBodyClick ? () => onBodyClick(comment) : undefined}
-        role={onBodyClick ? 'button' : undefined}
-        tabIndex={onBodyClick ? 0 : undefined}
-        onKeyDown={onBodyClick ? (e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onBodyClick(comment) } }) : undefined}
-        title={onBodyClick ? i18nT('components.commentsSidebar.scroll_to_the_highlighted_text') : undefined}
-        className={`rounded-lg border px-3 py-2.5 shadow-sm transition-colors ${onBodyClick ? 'cursor-pointer' : ''} ${
-          active
-            ? 'border-accent bg-accent-subtle ring-1 ring-accent/50'
-            : 'border-border bg-card hover:border-border-strong'
-        }`}
-      >
-        {/* anchor preview (roots only) */}
-        {!isReply && quote && (
-          <div
-            className="text-[11px] text-muted font-mono mb-1.5 truncate border-l-2 border-accent/40 pl-1.5"
-            title={quote}
-          >{quote.slice(0, 80)}{quote.length > 80 ? '…' : ''}</div>
-        )}
-        {/* header: avatar + author + time + lightweight source */}
-        <div className="flex items-center gap-1.5 mb-1">
-          <span
-            className="flex items-center justify-center w-5 h-5 rounded-full bg-bg-elevated text-[10px] font-semibold text-muted shrink-0"
-            aria-hidden="true"
-          >{initials(comment)}</span>
-          <span className="text-[12px] font-semibold text-text-strong truncate">{authorName(comment)}</span>
-          <span className="text-[10px] text-muted shrink-0">{fmtTs(comment.created_at)}</span>
-          {comment.is_agent && <Bot size={11} className="text-accent shrink-0" aria-label={i18nT('components.commentsSidebar.ai_agent')} />}
-          {comment.scope === 'shared' && <Link2 size={11} className="text-muted shrink-0" aria-label={i18nT('components.commentsSidebar.shared_comment')} />}
-          {syncWarn && <AlertTriangle size={11} className="text-warn shrink-0" aria-label={syncWarn} />}
-        </div>
-        {/* body (or inline editor when editing) */}
-        {isEditing ? (
-          <EditBox
-            initial={comment.body}
-            onSubmit={onEditSubmit as (text: string) => void}
-            onCancel={onEditCancel || (() => {})}
-          />
-        ) : (
-          <div className="text-[13px] text-text whitespace-pre-wrap break-words">{comment.body}</div>
-        )}
-      </div>
+      {/* The row body is a control only when the parent wires onBodyClick (scroll
+          the artifact to the anchored text). Two wrappers over one body, rather
+          than conditional role/tabIndex on one div: without a handler the same
+          markup is inert, so it must not be announced as a button nor take
+          focus. Clickable also owns the Enter/Space guard that keeps the inline
+          editor's own keys from activating the row. */}
+      {onBodyClick ? (
+        <Clickable
+          onClick={() => onBodyClick(comment)}
+          title={i18nT('components.commentsSidebar.scroll_to_the_highlighted_text')}
+          className={bodyClass}
+        >{body}</Clickable>
+      ) : (
+        <div className={bodyClass}>{body}</div>
+      )}
       {/* actions — always visible, comfortable touch targets */}
       <div className="flex items-center gap-1 mt-1.5 px-0.5" style={isEditing ? { display: 'none' } : undefined}>
         <button
@@ -299,6 +316,11 @@ export interface CommentsSidebarProps {
   loading?: boolean
   /** Remote-sync failure surfaced from the GET response. */
   remoteSyncError?: string | null
+  /** The comments read itself failed (useQuery error), so the list may be stale or empty. */
+  loadError?: string | null
+  /** The most recent comment write (post / reply / resolve / edit / delete) was rejected. */
+  mutationError?: string | null
+  onDismissMutationError?: () => void
   /** Doc-level add (no anchor). Anchored adds happen via the inline popover. */
   onAdd: (text: string) => void
   onReply: (parentId: string, text: string) => void
@@ -308,6 +330,13 @@ export interface CommentsSidebarProps {
   onRefresh: () => void
   /** Optional "ask agent to address comments" — secondary, opens a chat. */
   onAskAgent?: () => void
+  /** Optional batch-submit bar for the footer, so a host with a chat to send to
+   *  can offer "send every pending comment as one message" from the sidebar
+   *  itself. Rendered as handed over: the bar is `ArtifactPanel`'s `SubmitBar`,
+   *  and the HOST renders it because this sidebar is one of that panel's own
+   *  children — importing it here would close an import cycle. Hosts without a
+   *  send path omit it and the footer is unchanged. */
+  submitBar?: React.ReactNode
   onClose: () => void
   /** Hide Resolve/Review/Delete (e.g. a fully read-only view). */
   restrictActions?: boolean
@@ -346,6 +375,7 @@ export interface CommentsSidebarProps {
 }
 
 const SIDEBAR_DEFAULT_CLASS = 'w-[340px] shrink-0 flex flex-col rounded-xl border border-border bg-card overflow-hidden'
+const SIDEBAR_NARROW_CLASS = 'w-full flex flex-col rounded-xl border border-border bg-card overflow-hidden'
 const SIDEBAR_DEFAULT_STYLE: React.CSSProperties = { height: 'calc(100vh - 240px)', minHeight: 480 }
 
 /** Collapsible right-hand comment sidebar. Threaded one level deep, with
@@ -354,9 +384,11 @@ const SIDEBAR_DEFAULT_STYLE: React.CSSProperties = { height: 'calc(100vh - 240px
  *  widget, where text-selection anchoring isn't available inside the
  *  sandboxed iframe — comments degrade to whole-artifact). */
 export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSidebarProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const isMobile = useIsMobile()
   const {
-    comments, loading, remoteSyncError, onAdd, onReply, onResolve,
-    onMarkReview, onDelete, onRefresh, onAskAgent, onClose, restrictActions, hideResolve, hideDelete,
+    comments, loading, remoteSyncError, loadError, mutationError, onDismissMutationError, onAdd, onReply, onResolve,
+    onMarkReview, onDelete, onRefresh, onAskAgent, submitBar, onClose, restrictActions, hideResolve, hideDelete,
     onCommentClick, onReopen, activeCommentId, flashCommentId,
     containerClassName, containerStyle, onEditComment,
   } = props
@@ -440,7 +472,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const visibleRoots = showResolved ? roots : roots.filter(r => r.status !== 'resolved')
 
   return (
-    <aside className={containerClassName ?? SIDEBAR_DEFAULT_CLASS} style={containerStyle ?? SIDEBAR_DEFAULT_STYLE}>
+    // A caller-supplied class still wins. Absent one, the default 340px leaves
+    // the artifact body 34px at 390px, so the panel takes the width instead.
+    <aside className={containerClassName ?? (isMobile ? SIDEBAR_NARROW_CLASS : SIDEBAR_DEFAULT_CLASS)} style={containerStyle ?? SIDEBAR_DEFAULT_STYLE}>
       {/* header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-bg-elevated shrink-0">
         <MessageSquare size={14} className="text-accent" />
@@ -464,11 +498,35 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
         </div>
       </div>
 
-      {/* remote sync error */}
+      {/* No hand-off on any of these: the sidebar's comment composer draft
+          (the textarea at the bottom, plus any in-place edit) is unsaved. */}
       {remoteSyncError && (
-        <div className="px-3 py-2 border-b border-warn/30 bg-warn-subtle text-[11px] text-warn flex items-start gap-1.5 shrink-0">
-          <AlertTriangle size={12} className="shrink-0 mt-0.5" />
-          <span>{i18nT('components.commentsSidebar.remote_comment_sync_unavailable')} {remoteSyncError}</span>
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-sync-error"
+            title={i18nT('components.commentsSidebar.remote_comment_sync_unavailable')}
+            message={remoteSyncError}
+          />
+        </div>
+      )}
+      {loadError && (
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-load-error"
+            message={loadError}
+          />
+        </div>
+      )}
+      {mutationError && (
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-mutation-error"
+            message={mutationError}
+            onDismiss={onDismissMutationError}
+          />
         </div>
       )}
 
@@ -540,8 +598,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
         )}
       </div>
 
-      {/* footer: doc-level add + optional ask-agent */}
+      {/* footer: optional batch submit + doc-level add + optional ask-agent */}
       <div className="border-t border-border p-2 shrink-0 space-y-2">
+        {submitBar}
         {adding ? (
           <div>
             <textarea
@@ -550,14 +609,14 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
               rows={2}
               placeholder={i18nT('components.commentsSidebar.add_a_comment_on_the_whole_artifact')}
               onChange={e => setAddText(e.target.value)}
-              {...ime.composition}
+              {...ime.bindComposition()}
               onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && addText.trim()) {
-                  e.preventDefault(); submitAdd()
+                if (e.key === 'Enter' && !e.shiftKey && addText.trim()) {
+                  if (ime.claimEnter(e)) submitAdd()
                 }
                 if (e.key === 'Escape') { e.preventDefault(); setAdding(false); setAddText('') }
               }}
-              className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+              className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
             />
             <div className="flex items-center justify-end gap-1.5 mt-1">
               <button
@@ -592,5 +651,3 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
     </aside>
   )
 })
-
-export default CommentsSidebar

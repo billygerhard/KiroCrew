@@ -1,4 +1,5 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { useIsMobile } from '../hooks/useIsMobile'
 import React, { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { motion } from 'framer-motion'
 import { X } from 'lucide-react'
@@ -32,7 +33,7 @@ interface DetailPanelProps {
   reserveWidth?: number
   storageKey?: string
   children: React.ReactNode
-  /** Drop the default px-5 py-4 children padding. Used by panels that fill the viewport themselves (e.g. Monaco diff). */
+  /** Drop the default px-5 py-4 children padding. Used by panels that fill the viewport themselves (e.g. the diff). */
   noPadding?: boolean
   /** Override the header's default border-color/bg (e.g. to match an embedded editor). When provided, replaces the default `border-border bg-bg` styling. */
   headerClassName?: string
@@ -49,6 +50,12 @@ interface DetailPanelProps {
    *  When set, `title`, `headerActions`, and `secondaryHeaderActions` are
    *  ignored. */
   customHeader?: React.ReactNode
+  /** Override the standalone panel's frame chrome. Default is the docked
+   *  search panel's bare `border-l border-border bg-bg` slab; a page that
+   *  wants the chat SidePanel's card frame (`mb-2 border-l border-t border-b
+   *  rounded-l-xl`) passes that recipe here. Layout classes (flex column,
+   *  h-full, overflow) stay fixed. */
+  frameClassName?: string
 }
 
 /**
@@ -82,7 +89,8 @@ const maxPanelWidth = (rowWidth: number, reserveWidth?: number) => {
 const clampPanelWidth = (w: number, minWidth: number, rowWidth: number, reserveWidth?: number) =>
   Math.max(minWidth, Math.min(w, maxPanelWidth(rowWidth, reserveWidth)))
 
-export default function DetailPanel({ title, icon, onClose, footer, headerActions, secondaryHeaderActions, initialWidth = 380, minWidth = 300, reserveWidth, storageKey, children, noPadding = false, headerClassName, embedded = false, customHeader }: DetailPanelProps) {
+export default function DetailPanel({ title, icon, onClose, footer, headerActions, secondaryHeaderActions, initialWidth = 380, minWidth = 300, reserveWidth, storageKey, children, noPadding = false, headerClassName, embedded = false, customHeader, frameClassName }: DetailPanelProps) {
+  const isMobile = useIsMobile()
   // Outer wrapper ref, used to measure the panel's flex row (its parent) so the
   // width cap tracks the actual available room rather than the whole viewport.
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -215,7 +223,17 @@ export default function DetailPanel({ title, icon, onClose, footer, headerAction
 
   // Embedded: fill the parent (SidePanel tab body) — no resize handle, no left
   // border, no width animation. Only the header + content contribute.
-  if (embedded) {
+  // While narrow, take the same full-width path `embedded` callers already use.
+  // The alternative -- keeping the pixel width and lowering the floor -- cannot
+  // work: `minWidth` is applied AFTER every cap in `clampPanelWidth`, so no
+  // caller can configure its way below it.
+  //
+  // This alone is NOT sufficient, and that is the point of the caller-side
+  // change that ships with it: dropping the pixel width means a caller that
+  // wraps this panel in its OWN content-sized box (an animated `width: 'auto'`
+  // with `shrink-0`) gets a box that hugs its content, and the panel comes out
+  // NARROWER than the floor it replaced. Measured at a 390px row: 42px.
+  if (embedded || isMobile) {
     return (
       <div className="h-full w-full min-w-0 bg-bg flex flex-col overflow-hidden relative">
         {body}
@@ -232,7 +250,7 @@ export default function DetailPanel({ title, icon, onClose, footer, headerAction
       transition={{ width: { type: 'spring', bounce: 0, duration: 0.3 }, opacity: { duration: 0.12 } }}
       className="shrink-0 overflow-hidden h-full"
     >
-      <div className="shrink-0 border-l border-border bg-bg flex flex-col h-full overflow-hidden relative" style={{ width, minWidth }}>
+      <div className={`shrink-0 ${frameClassName ?? 'border-l border-border bg-bg'} flex flex-col h-full overflow-hidden relative`} style={{ width, minWidth }}>
         {body}
       </div>
     </motion.div>

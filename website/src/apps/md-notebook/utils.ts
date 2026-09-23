@@ -5,9 +5,17 @@
  * module and no test runner could import it; the editor behaviour (indent
  * measurement, list continuation, caret placement) was therefore unverifiable.
  */
-import { INDENT_COL_PX, LIST_INDENT, TAB_STOP } from './constants'
+import {
+  DEFAULT_AUTO_SYNC_MINS,
+  INDENT_COL_PX,
+  LIST_INDENT,
+  MAX_AUTO_SYNC_MINS,
+  MIN_AUTO_SYNC_MINS,
+  TAB_STOP,
+} from './constants'
 import type { Note, Shortcut, TreeNode } from './types'
 import { fmtDateFields } from '../../i18n/format'
+import { WINDOWS_ABS_PATH_RE, urlTransform } from '../../utils/urlTransform'
 
 /**
  * Leading indent + marker of a list item: bullet, task or ordered.
@@ -34,12 +42,163 @@ export function indentPx(ws: string): number {
   return col * INDENT_COL_PX
 }
 
+/** Horizontal alignment a table column asks for, null when it says nothing. */
+export type TableAlign = 'left' | 'center' | 'right' | null
+
+/** A table recognised in the source, and the last line it occupies. */
+export interface ParsedTable {
+  header: string[]
+  align: TableAlign[]
+  rows: string[][]
+  end: number
+}
+
+/** A delimiter-row cell: hyphens, with a colon on either side for alignment. */
+const SEP_CELL_RE = /^:?-+:?$/
+
+/** True when the line has a pipe that is not backslash-escaped. */
+function hasPipe(line: string): boolean {
+  return line.replace(/\\\|/g, '').includes('|')
+}
+
+/**
+ * Split one table row into trimmed cells.
+ *
+ * `\|` is a literal pipe inside a cell, so it must not split — that is how a
+ * note writes a pipe in prose or in `a \| b` code. The leading and trailing
+ * pipes are optional in GFM; when present they produce an empty edge cell that
+ * is delimiter rather than content, so those are dropped.
+ */
+export function splitTableRow(line: string): string[] {
+  const cells: string[] = []
+  let cur = ''
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '\\' && line[i + 1] === '|') {
+      cur += '|'
+      i++
+    } else if (line[i] === '|') {
+      cells.push(cur)
+      cur = ''
+    } else {
+      cur += line[i]
+    }
+  }
+  cells.push(cur)
+  if (cells.length > 1 && cells[0].trim() === '') cells.shift()
+  if (cells.length > 1 && cells[cells.length - 1].trim() === '') cells.pop()
+  return cells.map(c => c.trim())
+}
+
+/**
+ * Per-column alignment when `line` is a delimiter row for `cols` columns, else
+ * null. The cell count has to match the header exactly: that is what separates
+ * a table from a paragraph that happens to contain pipes.
+ */
+export function tableAlignments(line: string, cols: number): TableAlign[] | null {
+  if (!hasPipe(line)) return null
+  const cells = splitTableRow(line)
+  if (cells.length !== cols || !cells.every(c => SEP_CELL_RE.test(c))) return null
+  return cells.map(c => {
+    const left = c.startsWith(':')
+    const right = c.endsWith(':')
+    if (left && right) return 'center'
+    if (right) return 'right'
+    return left ? 'left' : null
+  })
+}
+
+/**
+ * Read the table starting at `start`, or null when there is none there.
+ *
+ * A table is a header line followed by a matching delimiter row, then rows for
+ * as long as they keep carrying pipes. Requiring a pipe in the delimiter row
+ * too keeps a bare `---` under a line of prose an horizontal rule, which is
+ * what it has always rendered as.
+ */
+export function parseTable(lines: readonly string[], start: number): ParsedTable | null {
+  const headerLine = lines[start]
+  if (headerLine === undefined || !hasPipe(headerLine)) return null
+  const sep = lines[start + 1]
+  if (sep === undefined) return null
+  const header = splitTableRow(headerLine)
+  const align = tableAlignments(sep, header.length)
+  if (!align) return null
+
+  const rows: string[][] = []
+  let end = start + 1
+  for (let i = start + 2; i < lines.length; i++) {
+    if (lines[i].trim() === '' || !hasPipe(lines[i])) break
+    const cells = splitTableRow(lines[i])
+    // A body row is padded to the header's width and its overflow dropped, so
+    // every rendered row has exactly as many cells as there are columns.
+    rows.push(Array.from({ length: header.length }, (_, c) => cells[c] ?? ''))
+    end = i
+  }
+  return { header, align, rows, end }
+}
+
 /**
  * Indent (or with `out`, outdent) the list item containing the caret.
  * Returns the rewritten text and new caret position, or null when the caret
  * is not on a list item — callers then leave the keystroke alone so Tab can
  * still move focus out of the editor.
  */
+/**
+ * Resolve a markdown image source to a URL the browser can load, or null when
+ * the source must degrade to plain text.
+ *
+ * A note is ordinary text out of a git-backed vault, so its image sources are
+ * untrusted input and the two cases are kept apart deliberately:
+ *
+ * - a remote source is handed to `urlTransform()`, which returns '' for a
+ *   scheme it refuses. `javascript:` and `data:` land there, so a crafted note
+ *   cannot smuggle script or an inline payload past this point;
+ * - a local source is served through the dashboard's `/api/file-raw`, the same
+ *   endpoint the chat renderer uses for local images. Nothing about the path is
+ *   trusted here on purpose: that endpoint validates it, refuses sensitive
+ *   paths and symlinks, and answers only for bytes whose magic number really is
+ *   an image, so path traversal in a note is the endpoint's answer to give.
+ *
+ * A relative source resolves against `noteDir`, the directory of the note being
+ * read, which is how `assets/diagram.png` sitting beside the note is found. It
+ * stays unresolved without that directory rather than guessing a root.
+ */
+export function resolveNoteImageSrc(src: string, noteDir?: string): string | null {
+  const raw = src.trim()
+  if (!raw) return null
+  // A Windows drive letter is a local path, not a URL scheme. The predicate is
+  // imported rather than spelled again here: urlTransform.ts owns the single
+  // copy so this decision and the chat renderer's cannot drift apart, and its
+  // deliberate exclusion of backslash UNC (an outbound SMB probe) holds for a
+  // note's images too.
+  const winAbs = WINDOWS_ABS_PATH_RE.test(raw)
+  const isLocal =
+    raw.startsWith('/') ||
+    raw.startsWith('~') ||
+    raw.startsWith('.') ||
+    winAbs ||
+    !/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(raw)
+  if (!isLocal) {
+    const remote = urlTransform(raw)
+    return remote || null
+  }
+  const rooted = raw.startsWith('/') || raw.startsWith('~') || winAbs
+  if (!rooted && !noteDir) return null
+  const path = rooted ? raw : `${noteDir}/${raw.replace(/^\.\//, '')}`
+  return `/api/file-raw?path=${encodeURIComponent(path)}`
+}
+
+/** Directory of a note inside its vault, absolute, for resolving its images. */
+export function noteDirPath(
+  vault: { localPath: string; subfolder?: string } | null | undefined,
+  notePath: string | null | undefined,
+): string | undefined {
+  if (!vault || !notePath) return undefined
+  const root = vaultContentPath(vault)
+  const slash = notePath.lastIndexOf('/')
+  return slash === -1 ? root : `${root}/${notePath.slice(0, slash)}`
+}
+
 export function shiftListItem(
   text: string,
   pos: number,
@@ -244,4 +403,70 @@ export function savePref(key: string, value: unknown): void {
   } catch {
     /* storage unavailable — preferences simply do not persist */
   }
+}
+
+/** Forget a stored preference, ignoring quota or privacy-mode failures. */
+export function clearPref(key: string): void {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    /* storage unavailable — there was nothing persisted to forget */
+  }
+}
+
+/**
+ * An auto-sync interval coerced into a cadence that can actually be scheduled.
+ *
+ * Two steps, in this order, because they answer different questions. `Math.round(n)
+ * || DEFAULT` first: 0, NaN and '' all mean the user expressed no interval at all
+ * (an emptied number input reports ''), so they land on the default rather than on
+ * MIN — a one-minute push loop is not what clearing the field asks for. Only then
+ * is a real number clamped into the allowed range.
+ *
+ * Applied when a value is READ as well as when it is written. An unclamped 0
+ * reaching the auto-sync timer schedules `setInterval(…, 0)`, which syncs in a
+ * tight loop and pushes to the remote continuously.
+ */
+export function clampAutoSyncMins(n: number): number {
+  return Math.min(
+    MAX_AUTO_SYNC_MINS,
+    Math.max(MIN_AUTO_SYNC_MINS, Math.round(n) || DEFAULT_AUTO_SYNC_MINS),
+  )
+}
+
+/**
+ * A closed ` ```mermaid ` fence starting at `start`, or null.
+ *
+ * Strict on the opening line (` ```mermaid ` alone) so other info-strings keep
+ * their generic code-block rendering, but the closing scan accepts any line
+ * starting with ` ``` ` — the same rule the generic fence toggle applies — so
+ * both parsers always agree on where a block ends. An UNCLOSED mermaid fence
+ * returns null on purpose: the generic path already renders run-away fences as
+ * code until EOF, and a half-typed diagram flashing through the renderer on
+ * every keystroke would be noise.
+ */
+export function parseMermaidBlock(
+  lines: string[],
+  start: number,
+): { code: string; end: number } | null {
+  if (!/^```mermaid\s*$/.test(lines[start])) return null
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('```')) {
+      return { code: lines.slice(start + 1, i).join('\n'), end: i }
+    }
+  }
+  return null
+}
+
+/**
+ * Language named on a fence's opening line (` ```python ` -> `python`), or
+ * undefined for a bare fence. Only the first whitespace-delimited token after
+ * the backticks counts, matching how highlight.js and every other markdown
+ * renderer read a fence info string; anything after it (e.g. a title) is not
+ * this app's concern yet. Undefined — not '' — is the signal a caller checks
+ * to keep an unlabelled fence out of highlightAuto().
+ */
+export function fenceLang(openLine: string): string | undefined {
+  const info = openLine.slice(3).trim().split(/\s+/)[0]
+  return info || undefined
 }

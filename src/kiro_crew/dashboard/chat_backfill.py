@@ -25,7 +25,8 @@ import logging
 from typing import Any, NamedTuple
 from urllib.parse import quote
 
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import slot_history_key
+from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.urls import dashboard_origin
 
 logger = logging.getLogger(__name__)
@@ -55,13 +56,9 @@ def backfill_content(row: dict[str, Any]) -> str:
 def _is_conversational(row: object) -> bool:
     """True when *row* is a human-readable message worth replaying.
 
-    Excludes compaction notices, which are ``role == "assistant"`` rows carrying
-    ``meta["kind"] == "compaction"``. Replaying one would read as a real answer
-    and, worse, would count as a turn.
-
-    ``meta`` is checked with ``isinstance`` rather than the ``or {}`` idiom used
-    at ``state.py`` -- ``append``'s ``meta: dict | None`` is not enforced at
-    runtime, so a truthy non-dict would raise ``AttributeError`` on ``.get``.
+    Excludes system notices (``is_system_notice``): assistant-role status rows
+    such as compaction notices and session-reload confirmations. Replaying one
+    would read as a real answer and, worse, would count as a turn.
     """
     if not isinstance(row, dict):
         return False
@@ -71,7 +68,7 @@ def _is_conversational(row: object) -> bool:
     if not backfill_content(row):
         return False
     meta = row.get("meta")
-    if role == "assistant" and isinstance(meta, dict) and meta.get("kind") == "compaction":
+    if is_system_notice(role, meta):
         return False
     return True
 
@@ -111,11 +108,13 @@ def _transcript_prefix(state: Any, slot: Any, disk_older: int) -> list[dict[str,
     if log is None:
         return []
     try:
-        # effective_session_key, never _history_key_for: the latter prepends
+        # slot_history_key, never _history_key_for: the latter prepends
         # "dashboard:" unconditionally, so a channel-born slot would resolve to
         # the nonexistent "dashboard:slack:<ts>" and read an empty file -- a
-        # silent zero-turn result rather than an error.
-        rows = log.read_messages_chained(effective_session_key(slot))
+        # silent zero-turn result rather than an error. It also resolves an
+        # UNBOUND channel slot (no mapped session key) onto the channel
+        # transcript instead of a phantom "dashboard:slack_<ts>" file.
+        rows = log.read_messages_chained(slot_history_key(slot))
     except Exception:
         logger.debug("backfill: could not read transcript for the first turn", exc_info=True)
         return []
@@ -179,6 +178,11 @@ def select_backfill_messages(
     rows = [row for row in slot.messages if _is_conversational(row)]
     prefix: list[dict[str, Any]] = []
     if include_first_turn:
+        # Deliberately the all-rows counter: it slices the DISK read below
+        # (``_transcript_prefix`` takes ``chained[:disk_older]``), so the count
+        # whose units are on-disk lines is the correct one. The durable-only
+        # ``_disk_older_durable_count`` measures positions over durable rows,
+        # a different unit.
         disk_older = getattr(slot, "_disk_older_count", 0) or 0
         if disk_older > 0:
             prefix = _transcript_prefix(state, slot, disk_older)

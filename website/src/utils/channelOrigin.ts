@@ -60,6 +60,26 @@ export function isLegacySlackSlotKey(slotKey?: string): boolean {
 }
 
 /**
+ * Whether a slot's `surface` (falling back to `mode`) is one `ChatPage`
+ * actually renders — the unified chat view shows the default surface plus
+ * `orchestrator` slots together; everything else (e.g. `dashboard`) belongs to
+ * a different page entirely. (`crew` was in this set until Crew Mode retired;
+ * a slot persisted under it is restored server-side as the default surface,
+ * so it never reaches this predicate.)
+ *
+ * Single source of truth for that set: `ChatPage.tsx`'s `filteredSlots` and
+ * `ChatSidebar.tsx`'s resume-from-history handler both need the identical
+ * answer to "can the chat page show this slot", and having two independent
+ * copies is exactly how #3624 happened — the sidebar offered every history
+ * row unconditionally, the page silently couldn't display some of them, and
+ * nothing that resumed one told the user it had bounced.
+ */
+export function isChatPageSurface(surfaceOrMode?: string): boolean {
+  const sk = surfaceOrMode ?? ''
+  return sk === '' || sk === 'orchestrator'
+}
+
+/**
  * Return the channel namespace a slot originated from, or `''` for an ordinary
  * dashboard session.
  *
@@ -105,4 +125,19 @@ export function slotChannelLabel(slotKey?: string): string {
   return Object.prototype.hasOwnProperty.call(CHANNEL_LABEL_KEY, ns)
     ? i18nT(CHANNEL_LABEL_KEY[ns])
     : CHANNEL_BRAND[ns]
+}
+
+/**
+ * The brand label for a CHANNEL TYPE (`"slack"`, `"discord"`), independent of any
+ * session key. `slotChannelLabel` answers the same question for a slot; this is
+ * for callers that already know the channel and need a label that does NOT vary
+ * with connection state — a row whose label changed between connected and
+ * disconnected would stop reading as one row with two states. Returns `''` for an
+ * unrecognised type so the caller can fall back to whatever the wire sent.
+ */
+export function channelBrandLabel(channelType?: string): string {
+  if (!channelType) return ''
+  return Object.prototype.hasOwnProperty.call(CHANNEL_BRAND, channelType)
+    ? CHANNEL_BRAND[channelType]
+    : ''
 }

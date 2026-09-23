@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import hooks as hooks_mod
 from kiro_crew.hooks import safe_read_file_bytes_nolink
 
@@ -36,6 +37,7 @@ class TestF1FdPinnedContainment:
         outside.write_text("leak")
         assert safe_read_file_bytes_nolink(str(outside), within_root=str(root)) is None
 
+    @requires_symlinks
     def test_rejects_nested_symlink_escape(self, tmp_path):
         # simulate the post-walk swap: a dir component inside root is a
         # symlink pointing outside — the opened fd's real path escapes root.
@@ -121,6 +123,16 @@ class TestWindowsFdPinnedContainment:
         # the unrelated path guards so this test remains portable.
         monkeypatch.setattr(hooks_mod, "validate_file_path", lambda raw: raw)
         monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda _path: False)
+        # The subject here is the fd-realpath CONTAINMENT decision, not the open. On a
+        # real Windows host the chokepoint's open goes through CreateFileW, which the
+        # kernel32 double above does not provide -- so route the open to a plain
+        # descriptor and let the containment branch be what this test measures.
+        real_open = os.open
+        monkeypatch.setattr(
+            hooks_mod.platform_compat,
+            "open_file_no_reparse",
+            lambda path, **_kwargs: real_open(os.fspath(path), os.O_RDONLY),
+        )
 
         assert safe_read_file_bytes_nolink(str(inside), within_root=str(root)) == b"ok"
 

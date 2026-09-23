@@ -2,22 +2,24 @@
  * ProjectList — the Papyrus landing view: create a paper, clone one, or open one.
  *
  * This is the view that carries the page-layout pattern (`PageHeader` +
- * `px-6 pb-8 overflow-y-auto flex-1 min-h-0` container + a `StatCard` row +
+ * `px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0` container + a `StatCard` row +
  * `Card`/`CardTitle` sections), because it is the page-shaped half of the app. The
  * editor is a full-bleed split pane by necessity — a paper and its PDF need the
  * whole viewport — and it carries its own toolbar instead.
  */
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, Download, FileCheck2, FilePlus2, GitBranch, Loader2, ScrollText, Trash2, X } from 'lucide-react'
+import { AlertTriangle, Download, FileCheck2, FilePlus2, GitBranch, Loader2, ScrollText, Trash2 } from 'lucide-react'
 import { Btn, Card, CardTitle, ContentSkeleton, EmptyState, Input, PageHeader, SendBtn, StatCard } from '../../components/ui'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
 import InfoTip from '../../components/InfoTip'
 import { fmtBytes, fmtDateTime } from '../../i18n/format'
 import { papyrusApi, type Project } from './api'
 import { pruneSlots } from './lib'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface ProjectListProps {
   onOpenProject: (name: string) => void
@@ -38,6 +40,8 @@ function formatModified(epochSeconds: number): string {
 }
 
 export default function ProjectList({ onOpenProject }: ProjectListProps) {
+  // One instance covers both inputs; the binding's focus/blur reset makes sharing safe.
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [newName, setNewName] = useState('')
   const [cloneUrl, setCloneUrl] = useState('')
@@ -148,7 +152,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
         title={i18nT('apps.papyrus.page.papyrus')}
         subtitle={i18nT('apps.papyrus.page.latex_papers_with_a_live_pdf_preview')}
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
           <StatCard
             label={i18nT('apps.papyrus.page.papers')}
@@ -223,23 +227,14 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
           </div>
         )}
 
-        {error && (
-          <div
-            className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise"
-            role="alert"
-          >
-            <AlertTriangle className="lucide-inline text-danger shrink-0 mt-0.5" />
-            <div className="flex-1 text-[13px] text-text break-words">{error}</div>
-            <button
-              type="button"
-              onClick={() => setError('')}
-              aria-label={i18nT('apps.papyrus.page.dismiss_error')}
-              className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors"
-            >
-              <X className="lucide-inline" />
-            </button>
-          </div>
-        )}
+        {/* The hand-off is offered only while the new-paper name and clone-URL
+            fields are empty: with either typed, the navigation would discard it. */}
+        <ErrorNotice
+          className="mb-4 animate-rise"
+          message={error}
+          onDismiss={() => setError('')}
+          askAgent={!newName && !cloneUrl}
+        />
 
         <Card>
           <CardTitle>
@@ -253,7 +248,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
               placeholder={i18nT('apps.papyrus.page.new_paper_name_placeholder')}
               value={newName}
               onChange={e => setNewName(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') submitCreate() }}
+              {...ime.bindEnter({ onEnter: submitCreate })}
             />
             <SendBtn onClick={submitCreate} disabled={!newName.trim() || createMutation.isPending}>
               {createMutation.isPending
@@ -269,7 +264,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
               placeholder={i18nT('apps.papyrus.page.clone_url_placeholder')}
               value={cloneUrl}
               onChange={e => setCloneUrl(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') submitClone() }}
+              {...ime.bindEnter({ onEnter: submitClone })}
             />
             <Btn onClick={submitClone} disabled={!cloneUrl.trim() || cloneMutation.isPending}>
               {cloneMutation.isPending

@@ -103,23 +103,23 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     })
 
     // The modal backdrop should be present and cover the content
-    const backdrop = screen.getByText('Create Theme').closest('[class*="fixed inset-0"]')
+    const dialog = screen.getByRole('dialog', { name: 'Create Theme' })
+    const backdrop = document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement
     expect(backdrop).toBeInTheDocument()
-    expect(backdrop).toHaveClass('z-[49]')
 
-    // The Sidebar Colors buttons should NOT be accessible to the user
-    // because the modal overlay (z-[49]) sits above the content area.
-    // The modal is rendered OUTSIDE the SettingsCard (not trapped in card-glow stacking context),
-    // and its z-index ensures it overlays the Sidebar Colors section below.
-    const modalOverlay = backdrop!
+    // The overlay used to be a hand-rolled `fixed inset-0 z-[49] bg-black/50`
+    // div. The shared Modal owns the backdrop now and puts the dialog on its
+    // own z-[100]/[101] layer, above the page rather than one step under the
+    // floating theme-experience toggle.
+    expect(document.querySelector('.bg-black\\/50')).toBeNull()
+    expect(backdrop.className).toContain('z-[100]')
+    expect((dialog.parentElement as HTMLElement).className).toContain('z-[101]')
 
-    // Verify DOM order: modal comes before Sidebar Colors in the tree,
-    // meaning the fixed overlay covers the section below it
-    const parent = modalOverlay.parentElement!
-    const children = Array.from(parent.children)
-    const modalIdx = children.indexOf(modalOverlay)
-    const sidebarIdx = children.findIndex(el => el.textContent?.includes('Sidebar Colors'))
-    expect(modalIdx).toBeLessThan(sidebarIdx)
+    // Modal portals to document.body, so the dialog is no longer a sibling of
+    // the Sidebar Colors section in the panel's own tree: it is a child of body,
+    // which is what places it above every section regardless of DOM order.
+    expect(dialog.closest('body')).toBe(document.body)
+    expect(screen.getByText('Sidebar Colors').closest('[role="dialog"]')).toBeNull()
   })
 
   it('renders ThemeEditorPanel modal outside of SettingsCard to avoid card-glow stacking context', async () => {
@@ -132,12 +132,9 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
       expect(screen.getByText('Create Theme')).toBeInTheDocument()
     })
 
-    // The modal container (fixed inset-0) should NOT be inside any .card-glow element
-    const modalContainer = screen.getByText('Create Theme').closest('[class*="fixed inset-0"]')
-    expect(modalContainer).toBeInTheDocument()
-
-    // Walk up the DOM tree — no ancestor should have card-glow class
-    let el = modalContainer!.parentElement
+    // Walk up the DOM tree from the portalled dialog — no ancestor should have
+    // card-glow class (a transform/filter ancestor would clip `fixed`).
+    let el: HTMLElement | null = screen.getByRole('dialog', { name: 'Create Theme' })
     while (el) {
       expect(el.className).not.toContain('card-glow')
       el = el.parentElement
@@ -154,10 +151,8 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
       expect(screen.getByText('Create Theme')).toBeInTheDocument()
     })
 
-    // Close via the X button
-    const headerBtns = screen.getByText('Create Theme').closest('.flex')!.querySelectorAll('button')
-    const xBtn = headerBtns[0] // The X button in the header
-    await user.click(xBtn)
+    // Close via Modal's own header close button
+    await user.click(screen.getByRole('button', { name: 'Close' }))
 
     // Modal should be gone
     await waitFor(() => {
@@ -167,6 +162,65 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     // Sidebar Colors section should still be visible and interactive
     expect(screen.getByText('Sidebar Colors')).toBeInTheDocument()
     expect(screen.getByText('Palette')).toBeInTheDocument()
+  })
+
+  it('dismisses the theme editor on Escape and on a backdrop click', async () => {
+    // Escape is the capability the hand-rolled overlay lacked; the backdrop
+    // click it already had must survive the conversion. Both are the ACCIDENTAL
+    // exits, so both are only available while the form is untouched.
+    const user = userEvent.setup()
+    renderWithProviders(<DisplayPanel />)
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    fireEvent.click(document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement)
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+  })
+
+  it('refuses Escape and backdrop dismissal once the theme draft has content', async () => {
+    // Escape is a path this conversion ADDS, and closeEditor discards the draft
+    // unconditionally — so on a part-filled form the accidental exits must not
+    // fire. Only the explicit ones (header close, the panel's Cancel) close it.
+    const user = userEvent.setup()
+    renderWithProviders(<DisplayPanel />)
+
+    await user.click(screen.getByText('+ New Theme'))
+    await screen.findByRole('dialog', { name: 'Create Theme' })
+    await user.type(screen.getByPlaceholderText('My Custom Theme'), 'Midnight')
+
+    // Settle past Modal's exit animation before asserting PRESENCE: the panel
+    // lingers in the DOM while AnimatePresence plays the exit, so a short wait
+    // would pass whether or not the dismissal was refused.
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await new Promise(r => setTimeout(r, 600))
+    expect(screen.getByRole('dialog', { name: 'Create Theme' })).toBeInTheDocument()
+
+    fireEvent.click(document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement)
+    await new Promise(r => setTimeout(r, 600))
+    expect(screen.getByRole('dialog', { name: 'Create Theme' })).toBeInTheDocument()
+    // The draft survived both, name included.
+    expect(screen.getByPlaceholderText('My Custom Theme')).toHaveValue('Midnight')
+
+    // The explicit exit still works on the same dirty form.
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByText('Create Theme')).not.toBeInTheDocument())
+  })
+
+  it('locks page scroll and puts initial focus inside the dialog while the editor is open', async () => {
+    // Both come from the shared Modal (scroll lock + focus trap) and neither
+    // existed on the hand-rolled overlay.
+    const user = userEvent.setup()
+    renderWithProviders(<DisplayPanel />)
+
+    await user.click(screen.getByText('+ New Theme'))
+    const dialog = await screen.findByRole('dialog', { name: 'Create Theme' })
+    expect(document.body.style.overflow).toBe('hidden')
+    expect(dialog.contains(document.activeElement)).toBe(true)
   })
 })
 
@@ -265,6 +319,46 @@ describe('DisplayPanel – theme install', () => {
   })
 })
 
+describe('DisplayPanel – font family setting', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('tells the user the code font tracks the theme, not this preference', () => {
+    // A theme pack's `mono` face reaches code blocks, inline code and diffs
+    // under EVERY option here, System included (website/docs/theming-contract.md
+    // § Fonts). Without this sentence a user who picks System and still sees the
+    // code font change reads the option as broken.
+    // Since OpenDyslexic shipped, the description also carves out that option:
+    // it applies its own OpenDyslexicMono to code surfaces, so the "follows the
+    // active theme" rule doesn't hold for it. The assertion pins both halves so
+    // a future edit can't silently drop either.
+    renderWithProviders(<DisplayPanel />)
+
+    expect(screen.getByText('Font Family')).toBeInTheDocument()
+    expect(
+      screen.getByText('UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.'),
+    ).toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – plain diffs setting lives on the Chat tab', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
+
+  // The toggle governs how a diff READS in the transcript, so it belongs beside
+  // File change chips in Chat → Messages, not in Display → View, which holds
+  // Language and Interface (app-shell scope). Its behaviour is covered by
+  // ChatPanel.plainDiff.test.tsx; this guards only against it reappearing here
+  // and shipping as two switches over one localStorage key.
+  it('does not render the toggle', () => {
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByRole('switch', { name: 'Plain diffs' })).toBeNull()
+  })
+})
+
 describe('DisplayPanel – zoom setting', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -305,5 +399,75 @@ describe('DisplayPanel – zoom setting', () => {
     // No zoom % value button renders in browser mode (other steppers keep theirs).
     expect(screen.queryByText(/^\d+%$/)).not.toBeInTheDocument()
     expect(screen.queryByText('Font Size')).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – dropped overrides notice', () => {
+  // The runtime scoper silently removes overrides.css rules the theming
+  // contract disallows; the ONLY other signal is a console warning no dashboard
+  // user has open. These pin the Settings-side surface: shown for the active
+  // pack with the rule names an author needs, absent otherwise.
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const REPORT = { slug: 'manrope', rules: ['body { --font-body }', '.session-card'] }
+
+  it('names the dropped rules when the active theme had rules removed', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: REPORT,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByText("Some of this theme's styles were ignored")).toBeInTheDocument()
+    // The rule names are the actionable part — a bare count tells an author
+    // nothing to edit.
+    expect(screen.getByText(/body \{ --font-body \}/)).toBeInTheDocument()
+    expect(screen.getByText(/\.session-card/)).toBeInTheDocument()
+    const link = screen.getByRole('link', { name: 'Theming guide' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', expect.stringContaining('noopener'))
+  })
+
+  it('renders nothing when no rules were dropped', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: null,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+
+  it('ignores a report that belongs to a theme other than the active one', () => {
+    // Belt-and-braces for the switch race: the provider clears the report on
+    // theme change, but a stale report must still never be attributed to the
+    // wrong pack in the UI.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-other',
+      overridesDropReport: REPORT,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  // The Font Family row is a SettingsButtonGroup that lists Sans / Mono /
+  // System, plus OpenDyslexic as a fourth built-in a11y option. The buttons
+  // render their label as accessible text; asserting on the button role is
+  // enough to prove the option is discoverable — actually clicking it would
+  // just re-verify the shared SettingsButtonGroup wiring, which has its own
+  // tests.
+  it('lists OpenDyslexic as a fourth font family option alongside Sans/Mono/System', () => {
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByRole('button', { name: 'Sans' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Mono' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'OpenDyslexic' })).toBeInTheDocument()
   })
 })

@@ -70,13 +70,17 @@ import os
 import re
 import shutil
 import subprocess
+from typing import Callable
 
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_handlers import deny_non_dashboard_caller
-from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import utf8_path_stdout, utf8_stdout
 from kiro_crew.validation import MAX_FOLLOWUP_BRANCH, is_valid_followup_branch
 
 logger = logging.getLogger(__name__)
@@ -93,11 +97,11 @@ _DIR_SLUG_STRIP_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # `core.hooksPath` sink. A NON-DIRECTORY, non-replaceable OS device: git finds no
 # `post-checkout` under it and there is no directory anyone could drop one into.
 #
-# Two earlier shapes were both wrong. An in-repo sentinel
+# Two other shapes are unsafe. An in-repo sentinel
 # (`.git/kirocrew-no-hooks`) is resolved relative to the repo, so whoever prepared
 # the checkout could create it and put `post-checkout` inside — the suppression
-# became the execution vector. A gateway-owned `mkdtemp` directory moved the path
-# out of the repo but left a same-uid, process-lifetime directory that a
+# becomes the execution vector. A gateway-owned `mkdtemp` directory moves the path
+# out of the repo but leaves a same-uid, process-lifetime directory that a
 # compromised agent could chmod and populate between calls. `os.devnull` has
 # no such window and needs no bookkeeping.
 _HOOKS_SINK = os.devnull
@@ -144,6 +148,13 @@ _SANDBOX_REFUSAL = (
 # established" from a genuine git error.
 _SANDBOX_LAUNCHER_PREFIX = "sandbox: "
 
+# The launcher prints this prefix for an ADVISORY it emits while still going on to
+# exec the child, so it must never be read as a refusal. Only one exists today: the
+# pre-exec hardlink scan degrades OPEN when it exhausts its per-root file budget,
+# because /tmp on a busy host exceeds any fixed budget from ordinary churn and
+# failing closed there would break every sandboxed spawn on such a host.
+_SANDBOX_LAUNCHER_WARNING_PREFIX = "sandbox: WARNING"
+
 # STRICT, not the "standard" default. `_checkout_filter` runs `git config
 # --includes`, and `include.path` is repo-controlled: a hostile checkout can point
 # it at `~/.aws/credentials` (or `~/.netrc`, `~/.git-credentials`) and have git
@@ -164,11 +175,11 @@ class SandboxUnavailable(RuntimeError):
 # but it removes the same-destination window between the "does dest exist" probe
 # and `worktree add`, which is what lets `_cleanup_partial` treat an unregistered
 # leftover directory as its own.
-_REPO_LOCKS: dict[str, asyncio.Lock] = {}
+_REPO_LOCKS: dict[str, LoopBoundLock] = {}
 _MAX_REPO_LOCKS = 64
 
 
-def _repo_lock(root: str) -> asyncio.Lock:
+def _repo_lock(root: str) -> LoopBoundLock:
     """Return (creating if needed) the serialization lock for ``root``."""
     lock = _REPO_LOCKS.get(root)
     if lock is None:
@@ -177,11 +188,16 @@ def _repo_lock(root: str) -> asyncio.Lock:
             # does not accumulate locks forever. Held locks are kept.
             for key in [k for k, v in _REPO_LOCKS.items() if not v.locked()]:
                 del _REPO_LOCKS[key]
-        lock = _REPO_LOCKS[root] = asyncio.Lock()
+        lock = _REPO_LOCKS[root] = LoopBoundLock()
     return lock
 
 
-def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    args: list[str],
+    cwd: str,
+    *,
+    stdout_decoder: Callable[[bytes | str | None], str] = utf8_stdout,
+) -> subprocess.CompletedProcess[str]:
     """Run git with an argv list (never a shell) inside ``cwd``, OS-sandboxed.
 
     Routed through the ``sandboxed_spawn_argv`` chokepoint, matching
@@ -203,8 +219,8 @@ def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
     (:func:`_checkout_filter`).
 
     The remaining protections are all here: an argv list with no shell, the
-    POSIX resource-limit ceiling (``resource_limit_preexec`` returns ``None`` on
-    Windows, where ``preexec_fn`` must be ``None``), a wall-clock timeout, and
+    POSIX resource-limit ceiling (:func:`run_limited` applies it after ``exec``
+    rather than in a forked child), a wall-clock timeout, and
     ``GIT_TERMINAL_PROMPT=0`` so a credential helper cannot block on an
     interactive prompt.
     """
@@ -216,20 +232,30 @@ def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
         raise SandboxUnavailable(str(exc)) from exc
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        proc = subprocess.run(
+        # Bytes mode, decoded by utf8_stdout: text mode's universal-newline
+        # translation rewrites every ``\r`` in git's stdout, and a ``\r`` in a
+        # ``rev-parse --absolute-git-dir`` answer is path CONTENT -- rewriting
+        # it would misdirect the classifier's lstat in
+        # :func:`_worktree_probe_failure_is_empty_scope` and clear a scope
+        # whose ``config.worktree`` exists (see kiro_crew.git_worktree_scope).
+        proc = run_limited(
             argv,
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
             check=False,
-            preexec_fn=resource_limit_preexec(),
         )
     finally:
         if cleanup:
             with contextlib.suppress(OSError):
                 os.unlink(cleanup)
+    proc = subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        stdout_decoder(proc.stdout),
+        utf8_stdout(proc.stderr),
+    )
     # The launcher can only discover SOME isolation failures in the child, after
     # `wrap_argv` has already returned: `unshare(NEWNS)` is permitted by the
     # backend probe but denied at exec time on hosts that restrict mount
@@ -237,9 +263,35 @@ def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
     # runs, so without this the non-zero exit is misread downstream as "not a git
     # repository" or "cannot list worktrees". Surface it as the same refusal a
     # missing backend gets, so the user is told the truth.
-    if proc.returncode != 0 and (proc.stderr or "").startswith(_SANDBOX_LAUNCHER_PREFIX):
-        raise SandboxUnavailable((proc.stderr or "").strip())
+    launcher_failure = _launcher_failure_line(proc.stderr or "")
+    if proc.returncode != 0 and launcher_failure:
+        raise SandboxUnavailable(launcher_failure)
     return proc
+
+
+def _launcher_failure_line(stderr: str) -> str:
+    """The sandbox launcher's FATAL line in *stderr*, or ``""`` when it did not fail.
+
+    Line-wise and WARNING-aware, and both properties are load-bearing.
+
+    The launcher degrades OPEN on a truncated pre-exec hardlink scan and prints
+    ``sandbox: WARNING — …`` before exec'ing the child anyway. Reading the whole
+    stderr with ``startswith`` classified that advisory as a refusal, so on any host
+    with more than the scan budget of files under /tmp — ordinary telemetry and cache
+    churn reaches it — every git command that legitimately exits non-zero was
+    reported as "this host has no OS sandbox backend". ``rev-parse --verify --quiet``
+    on a branch that does not exist is exactly that shape, which made a plain
+    "does this branch exist" probe answer "your host cannot sandbox git".
+
+    Scanning per line rather than only the head also catches the opposite order: a
+    real fatal line that an advisory happens to precede.
+    """
+    for line in stderr.splitlines():
+        if line.startswith(_SANDBOX_LAUNCHER_PREFIX) and not line.startswith(
+            _SANDBOX_LAUNCHER_WARNING_PREFIX
+        ):
+            return line.strip()
+    return ""
 
 
 def _dir_slug(branch: str) -> str:
@@ -335,34 +387,52 @@ def _worktree_branches(root: str) -> dict[str, str] | None:
     return trees
 
 
-def _worktree_config_active(root: str) -> bool:
-    """True when this repo has a *worktree-scoped* config file git will read.
+def _worktree_extension_on(root: str) -> bool:
+    """True when ``extensions.worktreeConfig`` is enabled for this repo.
 
-    ``extensions.worktreeConfig=true`` makes git load ``$GIT_DIR/config.worktree``
-    in addition to ``.git/config``. ``$GIT_DIR`` is **per worktree**: the common
-    dir for the main worktree, but ``$GIT_COMMON_DIR/worktrees/<id>`` for a linked
-    one — so ``--git-common-dir`` misses a linked worktree's own file entirely
-    (verified: a filter declared there executed during checkout while the common
-    dir had no ``config.worktree`` at all). ``--absolute-git-dir``
-    resolves the right directory in both cases.
+    Without the extension git ignores ``$GIT_DIR/config.worktree`` entirely, so
+    the ``--worktree`` config scope is never live and is not probed. With it on
+    the scope IS probed — unconditionally. Whether the file exists is decided
+    only AFTER a probe fails (:func:`_worktree_probe_failure_is_empty_scope`):
+    an existence pre-check would drop the scope on a stale fact and never look
+    at a file git goes on to read.
 
-    Both conditions matter: without the extension git ignores the file, and with
-    the extension but no file ``git config --worktree --list`` exits 128 ("unable
-    to read config file") — so probing unconditionally would refuse every repo
-    that merely enables the extension.
+    ``--local`` is load-bearing: git takes the extension from the REPO config
+    only (a global ``true`` does not enable it), while a merged read lets a
+    worktree-scoped ``extensions.worktreeConfig=false`` win the chain and hide
+    the very scope it lives in — the file stays live and a driver in it would
+    execute unseen. ``--bool`` folds every git-true spelling (yes/on/1/
+    valueless) to ``true``; ``--includes`` keeps ``include.path`` resolution on.
     """
-    ext = _run_git(["config", "--bool", "--get", "extensions.worktreeConfig"], root)
-    if ext.returncode != 0 or ext.stdout.strip() != "true":
-        return False
-    gitdir = _run_git(["rev-parse", "--absolute-git-dir"], root)
-    path = gitdir.stdout.strip() if gitdir.returncode == 0 else ""
-    if not path:
-        # Cannot locate GIT_DIR: assume the scope is live, so the probe below
-        # runs and any failure there fails closed.
-        return True
-    if not os.path.isabs(path):
-        path = os.path.join(root, path)
-    return os.path.isfile(os.path.join(path, "config.worktree"))
+    ext = _run_git(
+        ["config", "--local", "--includes", "--bool", "--get", "extensions.worktreeConfig"],
+        root,
+    )
+    return ext.returncode == 0 and ext.stdout.strip() == "true"
+
+
+def _worktree_probe_failure_is_empty_scope(root: str) -> bool:
+    """True when a failed ``--worktree`` probe hit the empty scope git creates lazily.
+
+    Called only AFTER ``git config --worktree ...`` exited non-zero. ``$GIT_DIR``
+    is **per worktree**: the common dir for the main worktree, but
+    ``$GIT_COMMON_DIR/worktrees/<id>`` for a linked one — so ``--git-common-dir``
+    misses a linked worktree's own file entirely (verified: a filter declared
+    there executed during checkout while the common dir had no
+    ``config.worktree`` at all). ``--absolute-git-dir`` resolves the right
+    directory in both cases. The classification itself is the shared decision in
+    :func:`kiro_crew.git_worktree_scope.worktree_probe_failure_is_empty_scope`.
+    """
+    # utf8_path_stdout, not the default display decode: this answer is handed
+    # to an ``os.lstat``, so a non-UTF-8 byte in the real path must survive as
+    # a PEP 383 surrogate that ``os.fsencode`` restores byte-exactly. The
+    # default ``errors="replace"`` would rewrite that byte to U+FFFD, the
+    # lstat would miss an existing ``config.worktree``, and this fail-closed
+    # guard would clear a scope git still reads.
+    gitdir = _run_git(["rev-parse", "--absolute-git-dir"], root, stdout_decoder=utf8_path_stdout)
+    return worktree_probe_failure_is_empty_scope(
+        gitdir.stdout if gitdir.returncode == 0 else "", root
+    )
 
 
 def _checkout_filter(root: str) -> str:
@@ -375,7 +445,7 @@ def _checkout_filter(root: str) -> str:
     a config file (never from ``.gitattributes``, and never from a remote — clone
     does not transfer config), so the repository-scoped sources are the two
     config scopes git reads from inside the repo: ``--local`` (``.git/config``)
-    and, when :func:`_worktree_config_active`, ``--worktree``
+    and, when :func:`_worktree_extension_on`, ``--worktree``
     (``$GIT_DIR/config.worktree``, per-worktree). Probing only ``--local`` was a real
     hole: ``git config --local --name-only --list`` does NOT report
     worktree-scoped keys, so a repo with ``extensions.worktreeConfig=true`` and
@@ -397,11 +467,18 @@ def _checkout_filter(root: str) -> str:
     repository supplies.
     """
     scopes = ["--local"]
-    if _worktree_config_active(root):
+    if _worktree_extension_on(root):
         scopes.append("--worktree")
     for scope in scopes:
         proc = _run_git(["config", scope, "--includes", "--name-only", "--list"], root)
         if proc.returncode != 0:
+            # Probe-first, classify after: git creates config.worktree lazily,
+            # so a --worktree probe that failed on a genuinely ABSENT file is
+            # the empty scope, not an unreadable one. Every other failure —
+            # this scope with the file present, or any --local failure —
+            # refuses: the repo cannot be proven filter-free.
+            if scope == "--worktree" and _worktree_probe_failure_is_empty_scope(root):
+                continue
             return _FILTER_PROBE_FAILED
         for key in proc.stdout.splitlines():
             key = key.strip()
@@ -421,10 +498,10 @@ def _claim_branch(root: str, branch: str, base_sha: str) -> bool:
 
     The empty old-value argument means "the ref must not exist", so git's ref
     lock decides the winner: exactly one of N concurrent requests for the same
-    branch gets a zero exit. That replaces the earlier check-then-create
-    (``_branch_head`` followed by ``worktree add -b``), where two requests could
-    both observe the branch as absent and the loser's cleanup would then delete
-    the winner's branch and working tree.
+    branch gets a zero exit. A check-then-create (``_branch_head`` followed by
+    ``worktree add -b``) cannot do this: two requests could both observe the
+    branch as absent, and the loser's cleanup would then delete the winner's
+    branch and working tree.
 
     A True return is also this request's PROOF OF CREATION: only the claimant may
     later delete the branch.
@@ -599,7 +676,10 @@ def _create_worktree_sync(root: str, branch: str) -> tuple[dict, int]:
         return ({"error": f"Directory already exists: {dest}"}, 409)
     except OSError as exc:
         _cleanup_partial(root, dest, branch, claimed=True, created=False, base_sha=base_sha)
-        return ({"error": f"Cannot create {dest}: {exc.strerror or exc}"}, 500)
+        # The OSError detail and destination path stay server-side; the client
+        # body (rendered verbatim in the UI) gets a generic message + code.
+        logger.warning("worktree create failed: %s", exc)
+        return ({"error": "cannot create worktree directory", "code": "worktree_mkdir_failed"}, 500)
 
     try:
         proc = _run_git(["worktree", "add", dest, branch], root)
@@ -647,8 +727,8 @@ def _match_allowed_root(candidate: str, roots: list[str]) -> str | None:
     Returns the value FROM ``roots`` (a server-held slot project), never the
     caller's string — every filesystem operation downstream then runs on a path
     the server chose, which is both the point of the barrier and why CodeQL's
-    "uncontrolled data used in path expression" no longer applies: the request
-    value is used for comparison only.
+    "uncontrolled data used in path expression" does not apply: the request value
+    is used for comparison only.
 
     ``candidate`` must be normalized by the caller. Comparison goes through
     ``os.path.normcase`` because Windows paths are case-insensitive and

@@ -18,6 +18,7 @@ interface StorageGroup {
 
 const PREFIX_PATTERNS: [RegExp, string][] = [
   [/^vc_heights_/, 'vc_heights_*'],
+  [/^vc_anchor_/, 'vc_anchor_'],
   [/^kirocrew:touched-files:/, 'kirocrew:touched-files:*'],
   [/^mc-cmt-read:/, 'mc-cmt-read:*'],
   [/^mimir-tasks:/, 'mimir-tasks:*'],
@@ -57,6 +58,7 @@ function groupEntries(entries: StorageEntry[]): StorageGroup[] {
   return [...map.values()].sort((a, b) => b.bytes - a.bytes)
 }
 
+/** Intl unit formatting, so the pseudolocale scan reads correct CLDR output as a Latin leak. */
 const formatBytes = (bytes: number): string => fmtBytes(bytes)
 
 /** Approximate quota (browsers vary; 5 MB is the common floor) */
@@ -106,7 +108,9 @@ export default function LocalStorageDebug() {
     let removed = 0
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const k = localStorage.key(i)
-      if (k && k.startsWith('vc_heights_')) { localStorage.removeItem(k); removed++ }
+      if (k && (k.startsWith('vc_heights_') || k.startsWith('vc_anchor_'))) {
+        localStorage.removeItem(k); removed++
+      }
     }
     refresh()
     return removed
@@ -115,12 +119,15 @@ export default function LocalStorageDebug() {
   return (
     <div className="space-y-4">
       {/* ── Usage Overview ── */}
-      <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2">{i18nT('pages.localStorageDebug.usage')}</h4>
+      {/* `first:mt-0`: these headings separate one section from the previous
+        * one, but the leading heading has only the pane above it, and the pane
+        * already owns the gap under the tab strip. */}
+      <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 first:mt-0">{i18nT('pages.localStorageDebug.usage')}</h4>
       <div className="card-glow border border-border bg-card rounded-lg p-5 mb-4 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <div>
             <span className="text-sm font-medium text-text">{entries.length} {i18nT('pages.localStorageDebug.keys')}</span>
-            <span className="text-muted text-sm ml-2">{formatBytes(totalBytes)} / ~{formatBytes(ESTIMATED_QUOTA)}</span>
+            <span data-i18n-opaque className="text-muted text-sm ml-2">{formatBytes(totalBytes)} / ~{formatBytes(ESTIMATED_QUOTA)}</span>
           </div>
           <div className="flex gap-2">
             <button onClick={refresh} className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs border border-border bg-card text-text hover:bg-bg-hover transition-all" title={i18nT('pages.localStorageDebug.refresh')}><RefreshCw size={13} /> {i18nT('pages.localStorageDebug.refresh')}</button>
@@ -158,7 +165,7 @@ export default function LocalStorageDebug() {
             <div key={g.prefix} className="flex items-center justify-between py-2 border-b border-border/50 last:border-0">
               <span className="font-mono text-xs text-text flex-1">{g.prefix}</span>
               <span className="w-14 text-right text-xs text-muted">{g.count}</span>
-              <span className="w-20 text-right text-xs text-muted">{formatBytes(g.bytes)}</span>
+              <span data-i18n-opaque className="w-20 text-right text-xs text-muted">{formatBytes(g.bytes)}</span>
               <span className="w-16 flex justify-end">
                 {g.prefix !== '(static keys)' && (
                   <button
@@ -184,7 +191,7 @@ export default function LocalStorageDebug() {
           aria-label={i18nT('pages.localStorageDebug.filter_keys_2')}
           value={filter}
           onChange={e => setFilter(e.target.value)}
-          className="w-full px-3 py-2 text-xs rounded-md border border-border bg-bg text-text placeholder:text-muted mb-3 focus:border-accent focus:outline-none"
+          className="w-full px-3 py-2 text-xs rounded-md border border-border bg-bg text-text placeholder:text-muted mb-3 focus-visible:border-accent focus:outline-hidden"
         />
 
         <div className="space-y-px">
@@ -204,7 +211,7 @@ export default function LocalStorageDebug() {
                 }}
               >
                 <span className="font-mono text-text truncate flex-1">{e.key}</span>
-                <span className="text-muted flex-shrink-0">{formatBytes(e.bytes)}</span>
+                <span data-i18n-opaque className="text-muted flex-shrink-0">{formatBytes(e.bytes)}</span>
                 <button
                   onClick={ev => { ev.stopPropagation(); deleteKey(e.key) }}
                   className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-danger-subtle text-danger transition-all"

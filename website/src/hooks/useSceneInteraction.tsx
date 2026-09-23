@@ -1,11 +1,14 @@
 import React, { useState, useCallback, useEffect, useRef, type RefObject } from 'react'
-import { Circle, Pause, MessageSquare, X, Check } from 'lucide-react'
+import { Circle, Pause, MessageSquare, X, Check, AlertTriangle } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../store'
 import { switchSlot } from '../store/chatSlice'
 import { api } from '../api/client'
+import { sendTurn } from '../chat-core/transport/sendTurn'
 import type { AgentSource } from './useAgentSync'
+import { useImeGuard } from './useImeGuard'
 import { KIRO_GHOST_PIXELS } from './sceneText'
+import ErrorNotice from '../components/ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 /** Minimal agent shape for hit-testing — all scene agent types satisfy this */
@@ -116,6 +119,7 @@ export function useSceneInteraction(
 ) {
   const navigate = useNavigate()
   const dispatch = useAppDispatch()
+  const ime = useImeGuard()
   const [tooltip, setTooltip] = useState<TooltipState | null>(null)
   const [threadView, setThreadView] = useState<ThreadViewState | null>(null)
   const sourcesRef = useRef<AgentSource[] | undefined>(sources)
@@ -146,7 +150,7 @@ export function useSceneInteraction(
 
   const openChat = useCallback((agent: SceneAgent) => {
     const slotKey = agent.id.replace(/^slot-/, '')
-    dispatch(switchSlot(slotKey))
+    dispatch(switchSlot({ key: slotKey, announceOnMissing: true }))
     navigate('/chat')
   }, [dispatch, navigate])
 
@@ -235,11 +239,33 @@ export function useSceneInteraction(
 
   const [draft, setDraft] = useState('')
   const [sendState, setSendState] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle')
+  // The server's own explanation for a refused send ('' when none — the
+  // transport-reject path has no body). Rendered as a visible status line
+  // under the composer so the scene surface keeps the reason the App path
+  // already surfaces.
+  const [sendFailReason, setSendFailReason] = useState('')
+  // A failed send is framed "Send failed: <reason>"; an UNCONFIRMED one is not a
+  // failure claim and renders its own copy unwrapped (the same distinction
+  // ChatPage draws with its warn-tone notice).
+  const [sendUnconfirmed, setSendUnconfirmed] = useState(false)
+  /** A send that FAILED (refused / never left) -- the state the Retry treatment is for. */
+  const sendFailedHard = sendState === 'failed' && !sendUnconfirmed
   const [approvalState, setApprovalState] = useState<'idle' | 'resolving' | 'failed'>('idle')
+  // Which agent the composer state (draft + sendState) belongs to RIGHT NOW,
+  // and a GENERATION for that binding. `sendToAgent` is deliberately
+  // dependency-free, so it reads both through refs: a send outcome that lands
+  // after the popover retargeted — or after the SAME agent's popover was
+  // closed and reopened, which the id alone cannot distinguish — must not
+  // write into the new composer. Every reset below bumps the epoch, so a
+  // stale outcome compares unequal even when the agent id matches again.
+  const composerTargetRef = useRef<string | null>(null)
+  const composerEpochRef = useRef(0)
 
   // Reset composer state when the popover target changes
   useEffect(() => {
-    setDraft(''); setSendState('idle'); setApprovalState('idle')
+    composerTargetRef.current = threadView?.agent.id ?? null
+    composerEpochRef.current += 1
+    setDraft(''); setSendState('idle'); setSendFailReason(''); setApprovalState('idle')
   }, [threadView?.agent.id])
 
   // Draggable popover: dragPos overrides the anchored position once the user
@@ -278,28 +304,111 @@ export function useSceneInteraction(
     if (!msg) return
     const slotKey = agent.id.replace(/^slot-/, '')
     setSendState('sending')
-    try {
-      const src = sourceFor(agent)
-      if (src?.running) {
-        // Mid-turn: steer the running turn (backend queues if steer unavailable)
-        await api.steerChat(msg, slotKey)
-      } else {
-        // Idle or waiting for input: start/continue the turn.
-        // sendChat streams SSE — fire it and swallow the stream; the scene's
-        // live slot state reflects the turn via the normal WS updates.
-        await api.sendChat(msg, slotKey).then(r => { r.body?.cancel().catch(() => {}) })
-      }
-      setDraft('')
-      setSendState('sent')
-      setTimeout(() => setSendState('idle'), 1500)
-      lastSentRef.current = { slotKey, content: msg, at: Date.now() }
-      // Optimistically append to the mini thread
-      setThreadView(tv => tv && tv.agent.id === agent.id
-        ? { ...tv, messages: [...tv.messages, { role: 'user', content: msg }].slice(-THREAD_VIEW_MESSAGES) }
-        : tv)
-    } catch {
+    // The composer THIS send belongs to: the target agent AND the epoch of
+    // its current open. The id alone cannot tell "still the same composer"
+    // from "closed and reopened on the same agent" — the reopen reset a fresh
+    // draft that a stale outcome must not erase or splice into.
+    const epochAtSend = composerEpochRef.current
+    const sameComposer = () =>
+      composerTargetRef.current === agent.id && composerEpochRef.current === epochAtSend
+    // Clear the sent payload NOW, not on acceptance: everything typed after
+    // this instant is NEWER work that neither outcome may erase. The success
+    // path deliberately does not touch the draft, and the failure path
+    // APPENDS the payload back into whatever is here by then.
+    setDraft('')
+    // A send the server refused has to say so on the composer it was typed
+    // into, and hand the payload back (#4198). Guarded on the SAME composer
+    // (target + epoch): a late failure must not flag a retargeted or reopened
+    // composer, or splice the old payload into its draft. The draft was
+    // cleared at send start, so anything in it now was typed mid-flight and
+    // is newer work: the restore APPENDS with whole-occurrence de-duplication
+    // rather than replacing — clobbering newer text to recover older is the
+    // regression class PR #4180 hit.
+    const reportFailedSend = (reason?: string, opts?: { unconfirmed?: boolean }) => {
+      if (!sameComposer()) return
       setSendState('failed')
+      setSendFailReason(reason || '')
+      setSendUnconfirmed(!!opts?.unconfirmed)
+      setDraft(prev => {
+        const keep = prev.replace(/\s+$/, '')
+        if (!keep.trim()) return msg
+        // EQUALITY only. The draft was cleared at send start, so anything
+        // here now is NEW text typed while the send was in flight — it can
+        // only equal the payload if the user deliberately retyped it, and
+        // any containment heuristic beyond that guesses about intent: it
+        // misread "do not deploy yet" as containing a retryable "deploy"
+        // (review finding on #4198). When in doubt, APPEND — a duplicated
+        // payload is visible and user-repairable, a dropped one is silent
+        // and unrecoverable.
+        if (keep === msg) return prev
+        // Single-line <input>: a newline separator would be silently stripped
+        // by the DOM, so the payload is appended after one space instead.
+        return [keep, msg].join(' ')
+      })
     }
+    // One transport call for both branches. Mid-turn the message is a STEER --
+    // "act on this now", injected into the running turn (the backend queues it
+    // if steer is unavailable) -- and idle it starts or continues the turn;
+    // `steer` is a flag of the same endpoint, not a different receipt shape.
+    // The chat-core transport owns the receipt contract (`?ws=1` JSON receipt,
+    // HTTP 4xx/5xx RESOLVE rather than reject, deadline) and never rejects, so
+    // every outcome is branched on below. Without a receipt read every refused
+    // send fell through to 'sent' -- the state asserting the opposite of what
+    // happened, for precisely the errors that matter.
+    const src = sourceFor(agent)
+    const receipt = await sendTurn({ message: msg, slot: slotKey, steer: !!src?.running })
+    switch (receipt.status) {
+      case 'refused':
+        // The server said no; nothing was sent, so the payload is safe to hand back.
+        reportFailedSend(receipt.reason)
+        return
+      case 'transport-error':
+        // The request never left (offline, DNS): restore-and-report is safe.
+        reportFailedSend()
+        return
+      case 'unknown':
+        // A 2xx whose body would not parse: the request was ACCEPTED and only
+        // its answer is mangled, so this send may well be running. It gets
+        // neither verdict: 'failed' would hand the payload back and invite a
+        // retry that duplicates a delivered turn, and the 'sent' tick plus the
+        // mini-thread echo below would assert a delivery nothing proves. The
+        // composer drops back to idle with whatever newer text it holds, the
+        // same silence the other send paths keep for this state.
+        if (sameComposer()) setSendState('idle')
+        return
+      case 'response-late':
+        // The deadline fired before ANY receipt: unlike `unknown`, nothing
+        // proves the gateway ever saw the request. The draft was cleared at send
+        // start, so silence here would discard the user's text with no evidence
+        // of delivery. Hand it back with the core's delivery-unconfirmed copy
+        // (check the transcript before sending again) -- a visible duplicate is
+        // user-repairable, a dropped message is not. Same policy as ChatPage.
+        reportFailedSend(i18nT('pages.chatPage.delivery_unconfirmed') as string, { unconfirmed: true })
+        return
+      case 'dispatched':
+      case 'queued':
+        break
+    }
+    lastSentRef.current = { slotKey, content: msg, at: Date.now() }
+    // Composer state belongs to the composer open NOW: after a mid-flight
+    // retarget — or a close-and-reopen of the same agent — the state is a
+    // NEW composer's, and an older send may not acknowledge into it. The
+    // draft is NOT cleared here: it was cleared at send start, so whatever
+    // it holds now was typed while this send was in flight and is newer
+    // work an acceptance must not erase.
+    if (sameComposer()) {
+      setSendState('sent')
+      // Reset only if the tick still shows: a later send (same agent or a
+      // retargeted popover) has moved the state to 'sending'/'failed' by the
+      // time this fires, and an unconditional reset would re-enable submit
+      // while that request is still in flight (review finding on #4198).
+      setTimeout(() => setSendState(s => (s === 'sent' ? 'idle' : s)), 1500)
+    }
+    // Optimistically append to the mini thread — only on acceptance: an
+    // echo of a message the server refused would assert it was delivered.
+    setThreadView(tv => tv && tv.agent.id === agent.id
+      ? { ...tv, messages: [...tv.messages, { role: 'user', content: msg }].slice(-THREAD_VIEW_MESSAGES) }
+      : tv)
   }, [])
 
   const resolvePendingApproval = useCallback(async (agent: SceneAgent, action: 'approve' | 'reject') => {
@@ -445,20 +554,54 @@ export function useSceneInteraction(
         <input
           value={draft}
           onChange={e => setDraft(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendToAgent(threadView.agent, draft) } }}
+          {...ime.bindComposition()}
+          onKeyDown={e => {
+            if (e.key !== 'Enter' || e.shiftKey) return
+            if (ime.claimEnter(e)) sendToAgent(threadView.agent, draft)
+          }}
           placeholder={sourceFor(threadView.agent)?.running ? i18nT('hooks.useSceneInteraction.steer_this_agent') : i18nT('hooks.useSceneInteraction.message_this_agent')}
           aria-label={i18nT('hooks.useSceneInteraction.message', { name: threadView.agent.name })}
           style={{ flex: 1, background: '#0d0d15', border: '1px solid #444', borderRadius: 4, color: '#ddd', fontSize: 11, padding: '4px 7px', outline: 'none' }}
         />
+        {/* The red Retry treatment is for a send that FAILED. An unconfirmed one
+            keeps the neutral Send button: the warn line below says to check the
+            transcript first, and a red "Retry" would invite the duplicate it
+            warns against. */}
         <button
           onClick={() => sendToAgent(threadView.agent, draft)}
           disabled={sendState === 'sending' || !draft.trim()}
-          aria-label={sendState === 'sending' ? i18nT('hooks.useSceneInteraction.sending_message') : sendState === 'sent' ? i18nT('hooks.useSceneInteraction.message_sent') : sendState === 'failed' ? i18nT('hooks.useSceneInteraction.retry_sending_message') : i18nT('hooks.useSceneInteraction.send_message')}
-          style={{ background: '#2a2a3a', border: '1px solid #555', borderRadius: 4, color: sendState === 'failed' ? '#f88' : '#ddd', fontSize: 10, padding: '2px 9px', cursor: 'pointer', opacity: draft.trim() ? 1 : 0.5 }}
+          aria-label={sendState === 'sending' ? i18nT('hooks.useSceneInteraction.sending_message') : sendState === 'sent' ? i18nT('hooks.useSceneInteraction.message_sent') : sendFailedHard ? i18nT('hooks.useSceneInteraction.retry_sending_message') : i18nT('hooks.useSceneInteraction.send_message')}
+          style={{ background: '#2a2a3a', border: '1px solid #555', borderRadius: 4, color: sendFailedHard ? '#f88' : '#ddd', fontSize: 10, padding: '2px 9px', cursor: 'pointer', opacity: draft.trim() ? 1 : 0.5 }}
         >
-          {sendState === 'sending' ? '…' : sendState === 'sent' ? <Check size={12} aria-hidden /> : sendState === 'failed' ? i18nT('hooks.useSceneInteraction.retry') : i18nT('hooks.useSceneInteraction.send')}
+          {sendState === 'sending' ? '…' : sendState === 'sent' ? <Check size={12} aria-hidden /> : sendFailedHard ? i18nT('hooks.useSceneInteraction.retry') : i18nT('hooks.useSceneInteraction.send')}
         </button>
       </div>
+      {/* Visible to everyone, not hover-only: a tooltip on the Retry button is
+          unreachable for keyboard, touch, and AT users (UX review on #4198).
+          Framed by the same core-owned entry the feature-request path uses — no
+          new string. */}
+      {/* No hand-off: the composer above holds the unsent draft this failure
+          handed back — navigating to the chat would discard it. */}
+      {sendFailedHard && sendFailReason ? (
+        <ErrorNotice
+          variant="inline"
+          message={i18nT('pages.chatPage.send_failed_with_error', { error: sendFailReason }) as string}
+          // The popover is fixed dark chrome in every theme, so the theme's
+          // `text-danger` (dark red on light themes) is not legible here; the
+          // popover's own dark-safe red wins over the component's token.
+          className="px-2 pb-1.5 !text-[#f88]"
+        />
+      ) : null}
+      {/* An UNCONFIRMED delivery is a warning, not an error (nothing failed for
+          certain), so it is not dressed as one: a warn-tone status line with a
+          warn glyph, never ErrorNotice's red. Explicit dark-safe colour: the
+          popover chrome is dark in every theme (see the ErrorNotice above). */}
+      {sendState === 'failed' && sendFailReason && sendUnconfirmed ? (
+        <div role="status" className="flex items-start gap-1.5 px-2 pb-1.5 text-[12px]" style={{ color: '#fb0' }}>
+          <AlertTriangle size={14} className="shrink-0 mt-px" aria-hidden="true" />
+          <span style={{ overflowWrap: 'anywhere' }}>{sendFailReason}</span>
+        </div>
+      ) : null}
     </div>
   ) : null
 

@@ -11,11 +11,11 @@ contained credential or exfiltration pattern").
 
 This corpus is the contract: every entry is a *real* provider URL shape
 (host + parameter set taken from the provider's own OAuth docs) and
-``_oauth_url_contains_credential`` must return False for all of them.
+``security.oauth_url_contains_credential`` must return False for all of them.
 
 **Adding a provider:** when KiroCrew gains/observes a new MCP OAuth provider,
 add a representative authorize URL here.  If any param it uses isn't yet in
-``_OAUTH_QUERY_PARAMS`` (kiro_crew/dashboard/chat_runner.py), add it there too
+``_OAUTH_QUERY_PARAMS`` (kiro_crew/security.py), add it there too
 — and confirm the value is benign (not a real secret) before exempting it.
 
 Values use realistic-but-fake identifiers; PKCE ``code_challenge`` is a real
@@ -26,6 +26,19 @@ from __future__ import annotations
 
 # Each item: (provider_label, authorization_url)
 LEGIT_OAUTH_URLS: list[tuple[str, str]] = [
+    # Asana V2 MCP OAuth authorization + PKCE.
+    # developers.asana.com/docs/integrating-with-asanas-mcp-server
+    (
+        "asana-mcp-v2",
+        "https://app.asana.com/-/oauth_authorize"
+        "?client_id=1234567890123456"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&response_type=code"
+        "&resource=https%3A%2F%2Fmcp.asana.com%2Fv2"
+        "&state=af0ifjsldkj"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256",
+    ),
     # GitHub OAuth apps + PKCE.
     # docs.github.com/.../authorizing-oauth-apps
     (
@@ -128,10 +141,273 @@ LEGIT_OAUTH_URLS: list[tuple[str, str]] = [
         "&state=somerandomstate"
         "&response_type=code&prompt=consent",
     ),
-    # Long-state OIDC (some providers pack return-path into state) — must pass
-    # purely because ``state`` is an exempt high-entropy param.
+    # Notion OAuth + long-state/PKCE. This exact endpoint is owned by the
+    # Connections registry and exercises the parameter-level entropy exemption.
     (
-        "oidc-long-state",
+        "notion-long-state",
+        "https://api.notion.com/v1/oauth/authorize"
+        "?client_id=client123&response_type=code"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),  # 128-char opaque state
+    ),
+    # Superhuman Mail MCP OAuth + PKCE. Endpoint taken from Superhuman's own
+    # RFC 8414 metadata (authorization_servers -> mcp.auth.mail.superhuman.com,
+    # authorization_endpoint /oauth2/authorize), which the Connections registry
+    # pins as the provider's issuer. kiro-cli generates the opaque state and
+    # S256 code_challenge, identical in shape to the other MCP-server providers
+    # in the builtin set.
+    (
+        "superhuman-mail-mcp",
+        "https://mcp.auth.mail.superhuman.com/oauth2/authorize"
+        "?client_id=sh_mcp_client_0123456789"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=email+offline_access"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),  # 96-char opaque state
+    ),
+    # Miro remote MCP server — authorization endpoint verified via RFC 8414
+    # metadata.
+    (
+        "miro-mcp",
+        "https://mcp.miro.com/authorize"
+        "?client_id=3458764514956732000"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&response_type=code"
+        "&state=af0ifjsldkj"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256",
+    ),
+    # Industry-baseline batch 1 (Connections registry, launch-gated). Every
+    # endpoint below is the ``authorization_endpoint`` from the issuer's RFC 8414
+    # document, reached via RFC 9728 discovery from the registry ``mcp_url`` by
+    # the L0 probe. Same kiro-cli-minted PKCE shape as above.
+    (
+        "sentry-mcp",
+        "https://mcp.sentry.dev/oauth/authorize"
+        "?client_id=sentry_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=org%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    (
+        "supabase-mcp",
+        "https://api.supabase.com/v1/oauth/authorize"
+        "?client_id=9c2b1f0e-4d3a-4b6c-8e7f-0a1b2c3d4e5f"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "airtable-mcp",
+        "https://airtable.com/oauth2/v1/authorize"
+        "?client_id=1f3a5c7e-9b1d-4f2a-8c6e-0d2f4a6c8e0b"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=schema.bases%3Aread%20data.records%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "paypal-mcp",
+        "https://mcp.paypal.com/authorize"
+        "?client_id=pp_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=openid%20email%20profile"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    (
+        "figma-mcp",
+        "https://www.figma.com/oauth/mcp"
+        "?client_id=figma_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=mcp%3Aconnect"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "canva-mcp",
+        "https://mcp.canva.com/authorize"
+        "?client_id=OC-AZ0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=profile%3Aread%20design%3Ameta%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "dropbox-mcp",
+        "https://www.dropbox.com/oauth2/authorize"
+        "?client_id=dbx_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=account_info.read%20files.metadata.read"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    # Industry-baseline batch 2 (Connections registry, launch-gated). Same
+    # provenance as batch 1: each endpoint is the issuer's advertised
+    # ``authorization_endpoint``, same kiro-cli-minted PKCE shape.
+    (
+        "miro-mcp",
+        "https://mcp.miro.com/authorize"
+        "?client_id=miro_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=boards%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "webflow-mcp",
+        "https://mcp.webflow.com/oauth/authorize"
+        "?client_id=wf_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "netlify-mcp",
+        "https://netlify-mcp.netlify.app/oauth-server/auth"
+        "?client_id=ntl_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=read"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    (
+        "amplitude-mcp",
+        "https://mcp.amplitude.com/authorize"
+        "?client_id=amp_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=mcp%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "mixpanel-mcp",
+        "https://mixpanel.com/oauth/authorize"
+        "?client_id=mp_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=projects%20analysis%20events%20insights%20data%3Aread"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "cloudflare-bindings-mcp",
+        "https://bindings.mcp.cloudflare.com/oauth/authorize"
+        "?client_id=cf_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    (
+        "huggingface-mcp",
+        "https://huggingface.co/oauth/authorize"
+        "?client_id=hf_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=read-mcp"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "zapier-mcp",
+        "https://mcp.zapier.com/oauth/authorize"
+        "?client_id=zap_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=openid%20profile%20email"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "square-mcp",
+        "https://mcp.squareup.com/authorize"
+        "?client_id=sq_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=MERCHANT_PROFILE_READ"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+    (
+        "postman-mcp",
+        "https://mcp.postman.com/authorize"
+        "?client_id=pm_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("a1B2c3D4" * 16),
+    ),
+    (
+        "neon-mcp",
+        "https://mcp.neon.tech/api/authorize"
+        "?client_id=neon_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=read"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+    ),
+    (
+        "prisma-mcp",
+        "https://auth.prisma.io/authorize"
+        "?client_id=prisma_mcp_0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=workspace%3Aadmin"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Kp7mQ2xR" * 12),
+    ),
+]
+
+# Consent URLs that the ACP banner-safety gate
+# (``security.oauth_url_contains_credential``) must pass ONLY once the operator
+# has allowlisted the endpoint in the keystone ``oauth_endpoints.json`` — they
+# are NOT in ``_OAUTH_AUTHORIZATION_ENDPOINTS`` and must stay rejected with
+# default config. Do NOT move an entry into ``LEGIT_OAUTH_URLS``: that list
+# asserts default-config behavior. Each item:
+# (provider_label, authorization_url, (host, path) the operator must allowlist).
+OPERATOR_EXTENSION_OAUTH_URLS: list[tuple[str, str, tuple[str, str]]] = [
+    # Generic long-state OIDC at an arbitrary identity provider — the exact
+    # shape that trips the >=200-char query heuristic at any endpoint outside
+    # the builtin set. Restored here under the operator-extension contract.
+    (
+        "oidc-generic-idp-long-state",
         "https://id.example-idp.com/authorize"
         "?client_id=client123&response_type=code"
         "&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcb"
@@ -139,5 +415,39 @@ LEGIT_OAUTH_URLS: list[tuple[str, str]] = [
         "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         "&code_challenge_method=S256"
         "&state=" + ("a1B2c3D4" * 16),  # 128-char opaque state
+        ("id.example-idp.com", "/authorize"),
+    ),
+    # Okta org-hosted authorization server — the canonical "my IdP is not in
+    # the launch set" case from the field.
+    (
+        "okta-org",
+        "https://acme.okta.com/oauth2/v1/authorize"
+        "?client_id=0oabcde12345FGHIJ697"
+        "&response_type=code"
+        "&scope=openid%20profile%20email%20offline_access"
+        "&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Zx9yW8vU" * 12),
+        ("acme.okta.com", "/oauth2/v1/authorize"),
+    ),
+    # Tenant-scoped Microsoft Entra authorize endpoint — a per-tenant path the
+    # builtin ``/common/…`` entry deliberately does not cover.
+    (
+        "entra-tenant",
+        "https://login.microsoftonline.com/11112222-aaaa-3333-bbbb-4444cccc5555"
+        "/oauth2/v2.0/authorize"
+        "?client_id=00001111-aaaa-2222-bbbb-3333cccc4444"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2Flocalhost%2Fmyapp%2F"
+        "&response_mode=query"
+        "&scope=openid%20offline_access%20https%3A%2F%2Fgraph.microsoft.com%2Fmail.read"
+        "&state=12345"
+        "&code_challenge=YTFjNjI1OWYzMzA3MTI4ZDY2Njg5M2RkNmVjNDE5YmEyZGRhOGYyM2IzNjdmZWFhMTQ1ODg3NDcxY2Nl"
+        "&code_challenge_method=S256",
+        (
+            "login.microsoftonline.com",
+            "/11112222-aaaa-3333-bbbb-4444cccc5555/oauth2/v2.0/authorize",
+        ),
     ),
 ]

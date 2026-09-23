@@ -9,11 +9,25 @@ export default function RestartButton() {
   const [isError, setIsError] = useState(false)
 
   const restart = async () => {
+    // The reassurance lives at the moment of the click, not only in a hover
+    // title: "Restart" reads as breaking something in progress, and a reader
+    // who will not press it never gets a saved template change into a running
+    // chat. The confirm says what stays (chats, history) and what stops (a
+    // reply in progress) before anything happens.
+    if (!window.confirm(i18nT('components.restartButton.confirm'))) return
     setRestarting(true)
     try {
-      await api.restartSessions()
-      setIsError(false)
-      setMsg(i18nT('components.restartButton.sessions_restarted_config_applied'))
+      const res = await api.restartSessions()
+      // The sessions DID restart, but a failed reconcile means they restarted
+      // against a config that may not match the sources — reporting "config
+      // applied" there would be the exact lie this button exists to avoid.
+      if (res && res.mcp_sync_ok === false) {
+        setIsError(true)
+        setMsg(i18nT('components.restartButton.sessions_restarted_but_mcp_sync_failed'))
+      } else {
+        setIsError(false)
+        setMsg(i18nT('components.restartButton.sessions_restarted_config_applied'))
+      }
     } catch (e: unknown) {
       setIsError(true)
       setMsg(e instanceof Error ? e.message : i18nT('components.restartButton.restart_failed'))
@@ -29,10 +43,11 @@ export default function RestartButton() {
       <button
         onClick={restart}
         disabled={restarting}
+        title={i18nT('components.restartButton.apply_restart_hint')}
         className={`group relative inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-[13px] font-semibold font-body cursor-pointer transition-all duration-300 overflow-hidden border-none ${
           restarting
             ? 'bg-accent/60 text-accent-fg/80 cursor-wait'
-            : 'bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)] hover:-translate-y-0.5 active:translate-y-0'
+            : 'bg-gradient-to-r from-accent to-accent-hover text-accent-fg shadow-[0_2px_8px_var(--accent-glow)] hover:shadow-[0_4px_20px_var(--accent-glow)]'
         }`}
       >
         {restarting && <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer" />}

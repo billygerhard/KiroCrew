@@ -1,24 +1,23 @@
 """skills.sh provider — public skill registry search and fetch.
 
 skills.sh exposes a public REST API (no auth for reads) that returns
-skill metadata including GitHub repo URLs. Installation fetches the
-SKILL.md from the repo directly.
+skill metadata including GitHub repo URLs. Installation reads the skill's
+files out of the registry's own download bundle (``fetch_skill_bundle``).
+
+The SSRF screen, the redirect allowlist and the bounded body read all live in
+``_http`` and are shared with every other provider; the names re-exported below
+are thin bindings of this provider's own allowlist and audit label onto that one
+implementation.
 """
 
 from __future__ import annotations
 
-import asyncio
-import ipaddress
-import json
 import logging
-import re
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from kiro_crew.security import canonicalize_ip
+from kiro_crew.skill_providers import _http
 from kiro_crew.skill_providers.base import SkillSearchResult
 
 logger = logging.getLogger(__name__)
@@ -26,20 +25,29 @@ logger = logging.getLogger(__name__)
 # skills.sh API base (no trailing slash)
 _API_BASE = "https://skills.sh/api"
 
-# Timeout for HTTP requests (seconds)
-_TIMEOUT = 5
+# Timeout for HTTP requests (seconds) — see ``_http.TIMEOUT_SECS``.
+_TIMEOUT = _http.TIMEOUT_SECS
 
 # User-Agent for our requests (good citizenship)
-_USER_AGENT = "KiroCrew/1.0 (skill-discovery)"
+_USER_AGENT = _http.USER_AGENT
 
-# Maximum response body size (1 MiB) — prevents disk exhaustion from
-# oversized responses. SKILL.md files are typically <50 KB.
-_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+# Maximum response body size (1 MiB). Rationale in ``_http.MAX_RESPONSE_BYTES``.
+_MAX_RESPONSE_BYTES = _http.MAX_RESPONSE_BYTES
 
-# Internal/private IP ranges that must never be fetched (SSRF mitigation).
-# NOTE: _API_BASE is hardcoded — if it becomes user-configurable, it must
-# be validated against this same check. Do NOT make api_base configurable
-# without adding SSRF validation on the base URL itself.
+# Per-chunk read size while draining a response body (64 KiB).
+_HTTP_READ_CHUNK_BYTES = _http.READ_CHUNK_BYTES
+
+
+def _s(v: Any) -> str:
+    """Coerce one provider-supplied value to str — non-strings become ''.
+
+    skills.sh rows are external input, and a non-string that survives into a
+    ``SkillSearchResult`` crashes a consumer far from here: a numeric ``id``
+    reaches ``_slugify``'s ``raw.strip()`` in the discover handler and 500s the
+    request. Coercing to '' is what lets one falsiness test at the call site
+    drop the row; this helper never drops anything itself.
+    """
+    return v if isinstance(v, str) else ""
 
 
 @dataclass
@@ -47,6 +55,14 @@ class SkillsShConfig:
     """Configuration for the skills.sh provider."""
 
     enabled: bool = True
+
+    # This module's SSRF host allowlist does not reach the base: `_is_allowed_host`
+    # gates redirect targets only, so an initial URL built from this field is
+    # checked by `_is_internal_url` alone. That rejects internal, private and
+    # loopback addresses, but it does not require HTTPS and does not hold the host
+    # to `_ALLOWED_HOSTS`. Any caller that lets a user set this must validate the
+    # base URL itself before constructing the provider. The platform `discovery`
+    # policy allowlist that `api_base` below feeds is a separate, policy-level gate.
     api_base: str = _API_BASE
 
 
@@ -55,6 +71,16 @@ class SkillsShProvider:
 
     def __init__(self, config: SkillsShConfig | None = None) -> None:
         self._config = config or SkillsShConfig()
+
+    @property
+    def api_base(self) -> str:
+        """The registry base URL this provider fetches from.
+
+        Public because the platform ``discovery`` policy allowlists a registry by
+        URL rather than by name: the name is a self-chosen label, while the base
+        URL is what determines where skill content comes from.
+        """
+        return self._config.api_base
 
     @property
     def name(self) -> str:
@@ -83,9 +109,7 @@ class SkillsShProvider:
         # {"skills": null} yields a non-list -> items[:limit] raises TypeError.
         # Either way ProviderRegistry.search would swallow it and silently zero
         # ALL skillsh results. Coerce anything that isn't a list to [] instead.
-        raw_items = data if isinstance(data, list) else (
-            data.get("skills") if isinstance(data, dict) else None
-        )
+        raw_items = data.get("skills") if isinstance(data, dict) else data
         items: list[Any] = raw_items if isinstance(raw_items, list) else []
         results: list[SkillSearchResult] = []
         for item in items[:limit]:
@@ -94,30 +118,19 @@ class SkillsShProvider:
             # skills.sh search response shape:
             # {"id": "owner/repo/skill-name", "skillId": "skill-name",
             #  "name": "skill-name", "installs": N, "source": "owner/repo"}
-            source = item.get("source", "") if isinstance(item.get("source"), str) else ""
+            source = _s(item.get("source"))
             repo_url = f"https://github.com/{source}" if source else ""
             try:
                 installs = int(item.get("installs", 0) or 0)
             except (TypeError, ValueError):
                 installs = 0
-            # Provider metadata is external input: a numeric id would reach
-            # _slugify().strip(), non-string tags reach the redactors — either
-            # 500s the discovery request. Coerce/drop instead of trusting.
-
-            def _s(v: Any) -> str:
-                return v if isinstance(v, str) else ""
-
-            skill_ident = (
-                _s(item.get("id")) or _s(item.get("skillId")) or _s(item.get("name"))
-            )
+            skill_ident = _s(item.get("id")) or _s(item.get("skillId")) or _s(item.get("name"))
             if not skill_ident:
                 continue  # entry without a usable string identifier — drop it
+            # A non-string tag reaches the discover handler's per-field
+            # redactor and 500s the whole response, so drop it here.
             raw_tags = item.get("tags", [])
-            tags = (
-                [t for t in raw_tags if isinstance(t, str)]
-                if isinstance(raw_tags, list)
-                else []
-            )
+            tags = [t for t in raw_tags if isinstance(t, str)] if isinstance(raw_tags, list) else []
             results.append(
                 SkillSearchResult(
                     id=skill_ident,
@@ -125,7 +138,10 @@ class SkillsShProvider:
                     description=_s(item.get("description")),
                     provider=self.name,
                     repo_url=repo_url,
-                    author=source.split("/")[0] if isinstance(source, str) and source else "",
+                    # `source` is the registry's "owner/repo" identifier, not a
+                    # filesystem path, so the separator is always "/". Take the
+                    # owner segment without building the whole list.
+                    author=source.partition("/")[0],
                     tags=tags,
                     installs=installs,
                 )
@@ -143,21 +159,15 @@ class SkillsShProvider:
         if bundle is None:
             return None
 
-        # Find SKILL.md first, fall back to AGENTS.md
-        skill_md = next((f for f in bundle if f[0] == "SKILL.md"), None)
-        if skill_md:
-            return skill_md[1]
-
-        agents_md = next((f for f in bundle if f[0] == "AGENTS.md"), None)
-        if agents_md:
-            return agents_md[1]
-
-        # Last resort: return the first .md file
+        # SKILL.md first, then AGENTS.md, then any .md. First match in bundle
+        # order wins at each tier, so a bundle carrying two SKILL.md entries
+        # resolves deterministically to the earlier one.
+        for wanted in ("SKILL.md", "AGENTS.md"):
+            named = next((f for f in bundle if f[0] == wanted), None)
+            if named:
+                return named[1]
         any_md = next((f for f in bundle if f[0].endswith(".md")), None)
-        if any_md:
-            return any_md[1]
-
-        return None
+        return any_md[1] if any_md else None
 
     async def fetch_skill_bundle(self, skill_id: str) -> list[tuple[str, str]] | None:
         """Fetch the full skill bundle (all files) from skills.sh.
@@ -217,188 +227,51 @@ class SkillsShProvider:
         return result if result else None
 
 
-def _github_raw_url(repo_url: str, file_path: str) -> str | None:
-    """Convert a GitHub repo URL to a raw content URL.
-
-    Handles:
-    - https://github.com/user/repo
-    - https://github.com/user/repo.git
-    - github.com/user/repo
-    """
-    # Defense-in-depth: file_path must not contain traversal sequences.
-    # Currently always called with literal "SKILL.md" but this guards
-    # against future misuse if the parameter becomes caller-controlled.
-    if ".." in file_path or file_path.startswith("/"):
-        return None
-    match = re.match(
-        r"(?:https?://)?github\.com/([^/]+)/([^/.\s]+?)(?:\.git)?/?$",
-        repo_url.strip(),
-    )
-    if not match:
-        return None
-    user, repo = match.group(1), match.group(2)
-    # Try the "main" default branch first (most common); caller can retry with
-    # the legacy default branch name if this 404s.
-    return f"https://raw.githubusercontent.com/{user}/{repo}/main/{file_path}"
-
-
 async def _fetch_json(url: str) -> Any | None:
-    """Fetch JSON from a URL. Returns None on any failure."""
-    try:
-        return await asyncio.get_running_loop().run_in_executor(None, _sync_fetch_json, url)
-    except Exception:
-        logger.debug("Failed to fetch JSON from %s", url, exc_info=True)
-        return None
+    """Fetch JSON from a URL. Returns None on any failure.
+
+    Calls the module-global ``_sync_fetch_json`` so a test may patch this
+    provider's fetch without reaching into ``_http``.
+    """
+    return await _http.run_off_loop(lambda: _sync_fetch_json(url))
 
 
 def _sync_fetch_json(url: str) -> Any | None:
-    """Synchronous JSON fetch (for run_in_executor)."""
-    # Pre-connect SSRF check on the initial URL
-    if _is_internal_url(url):
-        return None
-    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    try:
-        resp = _open_no_internal_redirect(req)
-        if resp is None:
-            return None
-        if resp.status != 200:
-            resp.close()
-            return None
-        data = _read_bounded(resp, _MAX_RESPONSE_BYTES)
-        resp.close()
-        if data is None:
-            return None
-        return json.loads(data.decode("utf-8"))
-    except (urllib.error.URLError, json.JSONDecodeError, OSError):
-        return None
-
-
-async def _fetch_text(url: str) -> str | None:
-    """Fetch text content from a URL. Returns None on any failure."""
-    try:
-        return await asyncio.get_running_loop().run_in_executor(None, _sync_fetch_text, url)
-    except Exception:
-        logger.debug("Failed to fetch text from %s", url, exc_info=True)
-        return None
-
-
-def _sync_fetch_text(url: str) -> str | None:
-    """Synchronous text fetch (for run_in_executor)."""
-    # Pre-connect SSRF check on the initial URL
-    if _is_internal_url(url):
-        return None
-    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    try:
-        resp = _open_no_internal_redirect(req)
-        if resp is None:
-            return None
-        if resp.status != 200:
-            resp.close()
-            return None
-        data = _read_bounded(resp, _MAX_RESPONSE_BYTES)
-        resp.close()
-        if data is None:
-            return None
-        return data.decode("utf-8")
-    except (urllib.error.URLError, OSError):
-        return None
+    """Synchronous JSON fetch (for the executor), bounded and SSRF-screened."""
+    return _http.sync_fetch_json(
+        url,
+        allowed_hosts=_ALLOWED_HOSTS,
+        internal_check=_is_internal_url,
+        headers={"User-Agent": _USER_AGENT},
+        max_bytes=_MAX_RESPONSE_BYTES,
+    )
 
 
 def _audit_ssrf_blocked(url: str, host: str, canonical_host: str) -> None:
-    """Emit a SEL audit event for a blocked SSRF-to-internal-IP attempt.
+    """Emit a SEL audit event for a blocked SSRF-to-internal-IP attempt here.
 
-    Best-effort: a security event log failure must never turn the SSRF *defense*
-    into a crash, so every error is swallowed. Imported lazily to avoid a
-    module-load cycle (sel -> ... -> skill_providers).
+    A separate function rather than a direct ``_http.audit_ssrf_blocked``
+    reference so this provider's audit label is fixed in one place and so a test
+    can observe the guard firing by patching this name.
     """
-    try:
-        from kiro_crew.sel import sel  # circular import: sel -> ... -> skill_providers
-
-        detail = host if host == canonical_host else f"{host} -> {canonical_host}"
-        sel().log_api_access(
-            caller="skillsh",
-            operation="ssrf_blocked",
-            outcome="blocked",
-            source="skill_provider",
-            resources=f"{detail} ({url[:120]})",
-        )
-    except Exception:  # noqa: BLE001 — auditing must never break the guard
-        logger.debug("SEL audit of blocked SSRF failed", exc_info=True)
+    _http.audit_ssrf_blocked("skillsh", url, host, canonical_host)
 
 
 def _is_internal_url(url: str) -> bool:
-    """Return True if the URL resolves to a private/internal/loopback address.
+    """This provider's binding of the shared internal-address screen.
 
-    Uses urllib.parse + ipaddress module for robust detection that covers:
-    - IPv4 private ranges (10.x, 172.16.x, 192.168.x, 127.x, 169.254.x)
-    - IPv6 loopback (::1), link-local (fe80::), ULA (fd00::)
-    - IPv6-mapped IPv4 (::ffff:127.0.0.1)
-    - Hex/octal/decimal/short-form IP encodings (0x7f000001, 0177.0.0.1,
-      2130706433, 127.1) — normalized via ``canonicalize_ip`` before parsing
-    - localhost hostname
-
-    Called BEFORE AND AFTER redirect resolution to prevent both pre-connect
-    and post-redirect SSRF.
+    Reads ``_audit_ssrf_blocked`` from the module globals at call time, so
+    patching that name observes the guard.
     """
-    try:
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname  # lowercased, brackets stripped for IPv6
-        if not host:
-            return True  # no host = suspicious, block
-
-        # Block "localhost" explicitly (covers DNS that resolves to 127.0.0.1)
-        if host == "localhost":
-            return True
-
-        # Normalize alternate IPv4 encodings the OS resolver / libc inet_aton
-        # accept but ipaddress.ip_address() rejects — hex (0x7f000001), octal
-        # (0177.0.0.1), 32-bit decimal (2130706433), and short forms (127.1).
-        # Without this, ip_address() raises ValueError on those, we fall through
-        # to the hostname branch, and a redirect to e.g. http://2852039166/ (==
-        # 169.254.169.254, the cloud instance metadata endpoint) is treated as
-        # "not internal" — an SSRF-to-metadata credential-read bypass.
-        # canonicalize_ip (security.py) is the same hardened resolver used by the
-        # bash-command metadata gate; it returns the dotted-quad for any encoding,
-        # or the input unchanged for a real hostname.
-        canonical_host = canonicalize_ip(host)
-
-        # Try to parse as an IP address directly (now covers hex/octal/decimal/
-        # short forms via canonicalize_ip, plus IPv6 and IPv4-mapped IPv6).
-        try:
-            ip = ipaddress.ip_address(canonical_host)
-            internal = (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_multicast
-                or ip.is_unspecified
-            )
-            if internal:
-                # A URL naming an internal IP literal is a genuine SSRF attempt
-                # (a legitimate skills.sh/github fetch never targets one). Emit a
-                # SEL audit event so blocked attempts are visible to audit tooling
-                # — especially the metadata-via-encoded-IP redirect vector this
-                # guard closes. canonical_host may differ from host (e.g.
-                # 0xa9fea9fe -> 169.254.169.254), so log both.
-                _audit_ssrf_blocked(url, host, canonical_host)
-            return internal
-        except ValueError:
-            pass  # not a literal IP — it's a hostname
-
-        # For hostnames: we cannot resolve DNS here (blocking call, and DNS
-        # rebinding would defeat it anyway). Non-IP hostnames pass THIS check;
-        # the redirect handler below additionally enforces _ALLOWED_HOSTS, so a
-        # redirect to an arbitrary DNS name that resolves to a private address
-        # is blocked by allowlist rather than by resolution.
-        return False
-    except Exception:
-        return True  # parse failure = suspicious, block
+    return _http.is_internal_url(url, audit=_audit_ssrf_blocked)
 
 
-# Hosts a fetch may start at or be redirected to. Everything this module
-# requests lives on skills.sh or GitHub raw content; GitHub serves raw file
-# redirects via its media/objects CDN hosts. A redirect to ANY other host —
+# Hosts a fetch may be REDIRECTED to; the initial URL is checked by
+# `_is_internal_url` alone (see `SkillsShConfig.api_base`). Every request this
+# module makes starts at the configured skills.sh API base, so the GitHub hosts
+# are here only as redirect targets of the download endpoint, which serves
+# bundle payloads from GitHub's raw, media and objects CDNs. A redirect to ANY
+# other host —
 # including an internal DNS name that would resolve to a private address
 # (DNS-rebinding style SSRF) — is refused. Keep this list tight: add hosts
 # only for a concrete, observed redirect target.
@@ -416,59 +289,17 @@ _ALLOWED_HOSTS = frozenset(
 
 
 def _is_allowed_host(url: str) -> bool:
-    """True iff *url* is HTTPS on an explicitly allowlisted host."""
-    try:
-        parsed = urllib.parse.urlparse(url)
-        return parsed.scheme == "https" and (parsed.hostname or "") in _ALLOWED_HOSTS
-    except Exception:
-        return False
+    """True iff *url* is HTTPS on a host this provider may be redirected to."""
+    return _http.is_allowed_host(url, _ALLOWED_HOSTS)
 
 
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Redirect handler that only follows redirects to allowlisted HTTPS hosts.
-
-    Prevents SSRF via 30x chains two ways: internal/private IP literals are
-    rejected (_is_internal_url), and — because a hostname can't be safely
-    resolved here (DNS rebinding) — any host outside _ALLOWED_HOSTS is
-    rejected outright. Checks run BEFORE following, so no TCP connection is
-    ever made to a disallowed target.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if _is_internal_url(newurl) or not _is_allowed_host(newurl):
-            raise urllib.error.URLError(
-                f"Blocked redirect to disallowed URL: {newurl[:80]}"
-            )
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def _open_no_internal_redirect(req: urllib.request.Request):
-    """Open a URL request using a redirect handler that blocks internal IPs.
-
-    Returns the response object, or None if blocked/failed.
-    """
-    opener = urllib.request.build_opener(_SafeRedirectHandler)
-    try:
-        return opener.open(req, timeout=_TIMEOUT)
-    except urllib.error.URLError:
-        return None
+def _open_no_internal_redirect(req):  # type: ignore[no-untyped-def]
+    """Open a request with redirects held to ``_ALLOWED_HOSTS``. None if blocked."""
+    return _http.open_guarded(
+        req, allowed_hosts=_ALLOWED_HOSTS, internal_check=_is_internal_url
+    )
 
 
 def _read_bounded(resp, max_bytes: int) -> bytes | None:
-    """Read response body up to max_bytes. Returns None if exceeded.
-
-    Prevents disk exhaustion from oversized responses. Reads in chunks
-    to avoid holding unbounded data in memory.
-    """
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        chunk = resp.read(65536)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            logger.warning("Response exceeded %d bytes, aborting read", max_bytes)
-            return None
-        chunks.append(chunk)
-    return b"".join(chunks)
+    """Read a response body up to *max_bytes*. None if exceeded."""
+    return _http.read_bounded(resp, max_bytes)

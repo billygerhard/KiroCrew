@@ -1,6 +1,8 @@
 import { api } from '../../api/client'
 import modelTokensRaw from '../../model_tokens.json'
 import { markModelsDegraded } from '../modelListHealth'
+import { isPricedMultiplier } from '../modelList'
+import { i18nT } from '../../i18n/t'
 import type {
   ProviderAdapter,
   ProviderCapabilities,
@@ -95,6 +97,22 @@ function readCachedModels(): ModelInfo[] | null {
  *  it. */
 for (const m of readCachedModels() ?? []) learnWindow(m.name, m.contextWindow ?? 0)
 
+/** Drop the last-good list. Called when `agent.acp_backend` changes: the cache
+ *  is keyed by nothing but time, so after a switch it still holds the PREVIOUS
+ *  backend's ids. If the new backend's first `/api/models` then fails (a cold
+ *  `--list-models` spawn past the gateway timeout is the common case), the
+ *  degraded path would serve that list and the picker would offer ids the new
+ *  backend rejects. Dropping it makes the degraded answer auto-only, which every
+ *  backend accepts, until the first live success rewrites the cache. */
+export function clearCachedModels(): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.removeItem(MODELS_CACHE_KEY)
+  } catch {
+    /* storage disabled — nothing to drop */
+  }
+}
+
 /** Persist a live model list with a timestamp. Best-effort — storage errors
  *  (quota, disabled, SSR) are swallowed so caching never breaks the picker. */
 function writeCachedModels(models: ModelInfo[]): void {
@@ -142,6 +160,10 @@ interface RawModel {
    *  predating either field still works (we fall back to the map). */
   context_window?: number
   context_window_tokens?: number
+  /** Relative credit cost of a turn on this model, Auto = 1.0. Optional: a
+   *  gateway/kiro-cli predating the field simply omits it, and we render no
+   *  badge rather than inventing a price (see ModelInfo.rateMultiplier). */
+  rate_multiplier?: number
 }
 
 /** The window a /api/models row reports, or 0 when it reports none. */
@@ -150,6 +172,13 @@ function rowWindow(m: RawModel): number {
     if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v
   }
   return 0
+}
+
+/** The credit multiplier a /api/models row reports, or undefined when it
+ *  reports none (or reports something that is not a price — see
+ *  isPricedMultiplier). */
+function rowMultiplier(m: RawModel): number | undefined {
+  return isPricedMultiplier(m.rate_multiplier) ? m.rate_multiplier : undefined
 }
 
 export class AcpAdapter implements ProviderAdapter {
@@ -182,7 +211,6 @@ export class AcpAdapter implements ProviderAdapter {
     sessionProcess: 'ACP subprocess',
     agentTemplateField: 'Agent Template',
     processCountLabel: 'acp_cli',
-    warmPoolDescription: 'Pre-spawn ACP CLI processes for instant session start.',
     configFile: 'kirocrew.json',
     pluginRegistryName: 'Packages',
     hooksSection: 'ACP Agent Hooks',
@@ -242,7 +270,24 @@ export class AcpAdapter implements ProviderAdapter {
 
   async fetchUsage(): Promise<NormalizedUsage> {
     const data = await api.kiroUsage()
-    const s = data.sessions
+    const s = data?.sessions
+    // A 2xx whose body is not the route's contract at all: no `sessions` half
+    // (a proxy or a stub answering `[]`, a gateway that never had the route).
+    // Reading `s.total_sessions` off that rejects with the engine's own
+    // "Cannot read properties of undefined", and the Overview card and the
+    // Usage tab render whatever this rejects with verbatim -- an English JS
+    // TypeError in place of a message, in every locale. Say what happened
+    // instead, in the catalog's words.
+    if (!s || typeof s !== 'object' || Array.isArray(s)) {
+      throw new Error(i18nT('api.client.unexpected_server_response'))
+    }
+    // The route answers 200 even when the transcript directory could not be
+    // read, because billing is a separate half of the payload. `error` is the
+    // server's own message for that failure, and the statistics beside it are
+    // a zero SHAPE rather than a measurement -- so reporting the reason is the
+    // only honest reading. Raising here puts it on the same channel a non-2xx
+    // takes, which the Usage tab already renders verbatim.
+    if (s?.error) throw new Error(String(s.error))
     const b = data.billing || {}
     return {
       sessions: {
@@ -251,6 +296,7 @@ export class AcpAdapter implements ProviderAdapter {
         thisWeek: { sessions: s.this_week.sessions, messages: s.this_week.messages, toolCalls: s.this_week.tool_calls },
         thisMonth: { sessions: s.this_month.sessions, messages: s.this_month.messages, toolCalls: s.this_month.tool_calls },
         avgMsgsPerSession: s.avg_msgs_per_session,
+        refusedTranscripts: s.refused_transcripts ?? 0,
         dailyHistory: (s.daily_history || []).map((d: RawDailyHistory) => ({
           date: d.date,
           sessions: d.sessions,
@@ -324,14 +370,21 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
+    // The disk cache (readCachedModels/writeCachedModels) is a SINGLE global slot
+    // keyed to the primary (configured) backend's catalog. A per-chat `backend`
+    // pick asks a DIFFERENT harness what it serves, so it must neither read that
+    // cache (it holds the wrong harness's ids) nor write it (it would clobber the
+    // primary catalog every other picker reads). Only the default call — the one
+    // whose ids the rest of the app treats as authoritative — touches the cache.
+    const primary = typeof backend !== 'string'
     try {
-      const models = await api.models()
+      const models = await api.models(backend)
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/non-array success: NOT a live list — keep polling, serve the
         // last-good live list if we have one, else auto-only.
         markModelsDegraded(this.id, true)
-        return readCachedModels() ?? this._defaultModels()
+        return (primary ? readCachedModels() : null) ?? this._defaultModels()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the
@@ -345,9 +398,10 @@ export class AcpAdapter implements ProviderAdapter {
           name: m.model_name,
           description: m.description || '',
           contextWindow: reported || MODEL_TOKENS[m.model_name] || DEFAULT_CONTEXT,
+          rateMultiplier: rowMultiplier(m),
         }
       })
-      writeCachedModels(result) // remember this good live list for next hiccup
+      if (primary) writeCachedModels(result) // remember this good live list for next hiccup
       markModelsDegraded(this.id, false) // live success → self-heal can stop polling
       return result
     } catch {
@@ -355,7 +409,7 @@ export class AcpAdapter implements ProviderAdapter {
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).
       markModelsDegraded(this.id, true)
-      return readCachedModels() ?? this._defaultModels()
+      return (primary ? readCachedModels() : null) ?? this._defaultModels()
     }
   }
 

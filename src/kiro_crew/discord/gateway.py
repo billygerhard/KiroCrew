@@ -14,13 +14,16 @@ The turn itself runs on the shared ``TurnDriver`` (credential/exfil redaction
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from kiro_crew.discord.client import DiscordClient
+from kiro_crew.discord.commands import application_command_payload
 from kiro_crew.discord.transport import DiscordTransport
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
 from kiro_crew.messaging.driver import APPROVAL_AUTO, APPROVAL_INTERACTIVE
+from kiro_crew.messaging.transport import InboundMessage
 
 if TYPE_CHECKING:
     from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -41,6 +44,57 @@ def _resolve_approval_mode(orch: "GatewayOrchestrator") -> str:
     return APPROVAL_AUTO if mode == APPROVAL_AUTO else APPROVAL_INTERACTIVE
 
 
+#: How long the background registration waits for the Gateway handshake. Longer
+#: than the caller's own readiness wait, because this task is off the boot path
+#: and its only cost for waiting is a later slash menu.
+_REGISTER_READY_TIMEOUT_SECS = 30.0
+
+
+def _publish_slash_commands(client: "DiscordClient") -> None:
+    """Publish the ``/`` command menu in the background, best-effort.
+
+    Fired as a task rather than awaited: registration is a REST round-trip whose
+    only product is discoverability, and the gateway boot path must not grow an
+    awaited network step (every user pays it on every launch, and a slow boot is
+    what the loop-stall watchdog turns into a crash loop). The ``!`` text commands
+    are the floor and work regardless, so a failure here costs the slash menu and
+    nothing else.
+
+    It needs READY to have populated ``application_id``; when the handshake did
+    not land, ``register_application_commands`` reports that and returns False.
+    """
+
+    async def _register() -> None:
+        try:
+            # Wait for READY here rather than relying on the caller having done
+            # it: the caller's wait sits inside its dashboard-state branch, so a
+            # `--no-dashboard` gateway reached this with no handshake yet and an
+            # empty application id, and the menu was skipped on exactly the
+            # install that has no other way to discover the commands. Waiting in
+            # the task keeps the boot path free of the await either way.
+            if not await client.wait_ready(timeout=_REGISTER_READY_TIMEOUT_SECS):
+                logger.warning(
+                    "Discord: gateway not READY within %.0fs, so the slash-command "
+                    "menu was not published; the ! text commands are unaffected",
+                    _REGISTER_READY_TIMEOUT_SECS,
+                )
+                return
+            await client.register_application_commands(application_command_payload())
+        except Exception:
+            logger.warning("Discord: publishing the slash-command menu failed", exc_info=True)
+
+    task = asyncio.create_task(_register())
+    # Hold a reference so the task is not garbage-collected mid-flight, and drop
+    # it on completion.
+    _PENDING_REGISTRATIONS.add(task)
+    task.add_done_callback(_PENDING_REGISTRATIONS.discard)
+
+
+#: In-flight command-registration tasks, held only to keep them from being
+#: collected before they finish.
+_PENDING_REGISTRATIONS: set[asyncio.Task[None]] = set()
+
+
 async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | None":
     """Start the Discord channel if enabled + credentialed; else no-op.
 
@@ -59,9 +113,9 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
         assert orch.sessions is not None and orch.ctx_builder is not None
 
         allowed_ids: set[str] = set(getattr(orch, "_discord_allowed_user_ids", []) or [])
-        allowed_threads: set[str] = set(
-            getattr(orch, "_discord_allowed_thread_ids", []) or []
-        )
+        allowed_threads: set[str] = set(getattr(orch, "_discord_allowed_thread_ids", []) or [])
+        allowed_channels: set[str] = set(getattr(orch, "_discord_allowed_channel_ids", []) or [])
+        auto_thread = bool(getattr(orch, "_discord_auto_thread", True))
         if not allowed_ids:
             logger.warning(
                 "Discord: allowed_user_ids is empty — the bot is reachable by "
@@ -83,19 +137,29 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
         client = DiscordClient(
             token=bot_token,
             on_interaction=dispatcher.on_interaction,
-            enable_guild_threads=bool(allowed_threads),
+            enable_guild_threads=bool(allowed_threads or allowed_channels),
         )
+
+        async def _dispatch(message: InboundMessage) -> None:
+            await dispatcher.handle_message(message)
+
         transport = DiscordTransport(
             client,
             allowed_user_ids=allowed_ids,
             allowed_thread_ids=allowed_threads,
-            dispatch=dispatcher.handle_message,
+            allowed_channel_ids=allowed_channels,
+            auto_thread=auto_thread,
+            on_thread_created=dispatcher.register_allowed_thread,
+            dispatch=_dispatch,
         )
         # Inbound: Gateway WS -> transport.receive (authorize + normalize)
         # -> dispatcher.handle_message (drive the turn on the shared TurnDriver).
         # set_message_handler avoids the client<->transport construction cycle.
         client.set_message_handler(transport.receive)
         dispatcher.client = client
+        # Handed to the dispatcher so its config applier can push a reloaded
+        # allow-list at the live transport instead of waiting for a restart.
+        dispatcher.transport = transport
 
         await transport.connect()  # starts the Gateway WebSocket loop
         if orch.dashboard_state is not None:
@@ -126,6 +190,7 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
                 state.discord_connect_error = (
                     client.fatal_error or "gateway not READY within 15s (check bot token/network)"
                 )
+        _publish_slash_commands(client)
         logger.info("Discord channel started (transport path, Gateway WebSocket).")
         return client
     except Exception as exc:

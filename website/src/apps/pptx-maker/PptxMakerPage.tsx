@@ -3,8 +3,9 @@
  *
  * A BUILTIN dashboard page (rendered by BuiltinAppRoute inside the main React
  * tree), so it talks to its in-gateway routes with same-origin fetch and the
- * dashboard's session cookie — not the app-sdk hooks, which need
- * `<AppApiProvider>` and only wrap standalone installed apps via AppHost.
+ * dashboard's session cookie — not the app-sdk data hooks, which need the SDK's
+ * scoped-API layer that a builtin page mounts for itself (`AppScopedApiProvider`).
+ * App identity is published for every builtin page by BuiltinAppRoute.
  *
  * Three views behind one segmented control:
  * - **Decks** — the deck list beside the tabbed deliverable viewer. This is where
@@ -43,6 +44,7 @@ import {
   StatCard,
 } from '../../components/ui'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
 import InfoTip from '../../components/InfoTip'
 import SegmentedControl from '../../components/SegmentedControl'
 import { SearchInput } from '../../components/ui'
@@ -65,15 +67,15 @@ type LibraryKind = 'styles' | 'templates'
  * if it ever goes missing (`dynamicKeys.test.ts`).
  */
 const CHAT_AGENT_LABEL_KEY = {
-  'pptx-maker--pptx-maker-spec': 'apps.pptxMaker.pptxMakerPage.mode_spec',
-  'pptx-maker--pptx-maker-vibe': 'apps.pptxMaker.pptxMakerPage.mode_vibe',
-  'pptx-maker--pptx-maker-style': 'apps.pptxMaker.pptxMakerPage.mode_style',
+  'pptx-maker-spec': 'apps.pptxMaker.pptxMakerPage.mode_spec',
+  'pptx-maker-vibe': 'apps.pptxMaker.pptxMakerPage.mode_vibe',
+  'pptx-maker-style': 'apps.pptxMaker.pptxMakerPage.mode_style',
 } as const
 
 const CHAT_AGENT_HINT_KEY = {
-  'pptx-maker--pptx-maker-spec': 'apps.pptxMaker.pptxMakerPage.mode_spec_hint',
-  'pptx-maker--pptx-maker-vibe': 'apps.pptxMaker.pptxMakerPage.mode_vibe_hint',
-  'pptx-maker--pptx-maker-style': 'apps.pptxMaker.pptxMakerPage.mode_style_hint',
+  'pptx-maker-spec': 'apps.pptxMaker.pptxMakerPage.mode_spec_hint',
+  'pptx-maker-vibe': 'apps.pptxMaker.pptxMakerPage.mode_vibe_hint',
+  'pptx-maker-style': 'apps.pptxMaker.pptxMakerPage.mode_style_hint',
 } as const
 
 /**
@@ -84,20 +86,23 @@ const CHAT_AGENT_HINT_KEY = {
  * check. Indexing a keyed map is the pattern that gate names.
  */
 /**
- * The DOUBLE HYPHEN is the registered filename, not a typo.
+ * The DECLARED agent name is the dispatchable identifier.
  *
- * `bridges._safe_link_name` writes each app agent into the kiro agents dir as
- * `{app}--{agent}.json`, and the value here goes straight to `kiro-cli --agent`,
- * which resolves it against that filename. The slash form (`pptx-maker/…`) matches
- * nothing there, and `--agent` FALLS BACK to the default agent rather than failing —
- * so every mode button silently opened a plain chat with none of this app's MCP tools
- * or prompt, and looked like it had worked. `test_pptx_maker_agents.py` derives these
- * three strings from `_safe_link_name` itself so they cannot drift.
+ * These values reach `api.createChatSlot(...)` and from there dispatch runs
+ * `config.loader.resolve_agent_bindings` -> `_materialized_kiro_agent`, whose
+ * snapshot is built by `_scan_materialized_agents` from each registered config's
+ * `name` field. `bridges._register_agents` writes the FILE as
+ * `{app}--{agent}.json`, but that double-hyphen stem is only the on-disk
+ * filename — it is not in the dispatchable set (the stem is used only when a
+ * config declares no name), so sending it makes resolution fall through to the
+ * default agent silently. Same for the slash namespace form.
+ * `test_pptx_maker_agents.py` pins these to the declared names in the app's
+ * shipped agent JSONs so the two cannot drift.
  */
 const CHAT_AGENTS = [
-  'pptx-maker--pptx-maker-spec',
-  'pptx-maker--pptx-maker-vibe',
-  'pptx-maker--pptx-maker-style',
+  'pptx-maker-spec',
+  'pptx-maker-vibe',
+  'pptx-maker-style',
 ] as const
 
 /** Banner shown until the presentation engine has been provisioned. */
@@ -243,10 +248,14 @@ function SettingsView() {
         </SendBtn>
         {draft !== null && <Btn onClick={() => setDraft(null)}>{i18nT('apps.pptxMaker.pptxMakerPage.reset')}</Btn>}
       </div>
+      {/* The hand-off is offered only while no directory is typed above: `draft`
+          is that unsaved value, and Save failing is exactly when it is still here. */}
       {saveMutation.isError && (
-        <div className="mt-3 text-[13px] text-danger">
-          {(saveMutation.error as Error).message}
-        </div>
+        <ErrorNotice
+          className="mt-3"
+          message={(saveMutation.error as Error).message}
+          askAgent={draft === null}
+        />
       )}
       {saveMutation.isSuccess && (
         <div className="mt-3 text-[13px] text-ok">
@@ -296,7 +305,9 @@ export default function PptxMakerPage() {
   // this app's agents rather than embedding a reduced chat here.
   const startChat = useMutation({
     mutationFn: async (agent: string) => {
-      const result = await api.createChatSlot(undefined, agent)
+      const result = await api.createChatSlot(
+        undefined, agent, undefined, undefined, 'persistent',
+      )
       return result as { key?: string }
     },
     onSuccess: (result) => {
@@ -325,7 +336,7 @@ export default function PptxMakerPage() {
           />
         }
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <EngineBanner />
         <DepsNote />
 
@@ -367,7 +378,7 @@ export default function PptxMakerPage() {
                       onClick={() => startChat.mutate(agent)}
                       disabled={startChat.isPending}
                     >
-                      {agent.endsWith('pptx-maker-style') ? (
+                      {agent === 'pptx-maker-style' ? (
                         <Sparkles className="lucide-inline" />
                       ) : (
                         <MessageSquarePlus className="lucide-inline" />
@@ -380,10 +391,9 @@ export default function PptxMakerPage() {
                   </div>
                 ))}
               </div>
+              {/* The decks view holds no draft (the search box is a filter). */}
               {startChat.isError && (
-                <div className="mt-3 text-[13px] text-danger">
-                  {(startChat.error as Error).message}
-                </div>
+                <ErrorNotice className="mt-3" message={(startChat.error as Error).message} askAgent />
               )}
             </Card>
 
@@ -418,8 +428,12 @@ export default function PptxMakerPage() {
                 />
               )}
               {filtered.length > 0 && (
-                <div className="flex gap-4 flex-1 min-h-0">
-                  <div className="w-60 shrink-0 overflow-y-auto border-r border-border pr-3">
+                <div className="flex flex-col sm:flex-row gap-4 flex-1 min-h-0">
+                  {/* Stacked while narrow: a 240px deck list beside the viewer left
+                      it 86px of a 390px viewport -- 44px once the surrounding Card
+                      padding is counted. The list is bounded when stacked, or its
+                      `shrink-0` natural height would push the viewer out. */}
+                  <div className="w-full sm:w-60 shrink-0 max-h-[40vh] sm:max-h-none overflow-y-auto border-b sm:border-b-0 sm:border-r border-border pb-3 sm:pb-0 sm:pr-3">
                     {filtered.map((deck) => (
                       <Clickable
                         key={deck.deckId}

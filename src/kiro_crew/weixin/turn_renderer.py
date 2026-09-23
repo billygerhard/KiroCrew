@@ -17,8 +17,12 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER
-from kiro_crew.messaging.renderer import Renderer
+from kiro_crew.messaging.renderer import (
+    Renderer,
+    count_redaction_tags,
+    redaction_notice,
+    render_options_as_text,
+)
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.weixin.client import TYPING_START, TYPING_STOP
 from kiro_crew.weixin.renderer import render_chunks
@@ -33,21 +37,7 @@ _CHUNK_DELAY_S = 0.3
 # Refresh the typing indicator on this cadence; iLink expires it on its own.
 _TYPING_REFRESH_S = 8.0
 
-# Trailing "[OPTIONS: a | b | c]" chip trailer (a dashboard convention iLink
-# can't render as tappable chips). Matched only at the very END of the message
-# via the canonical trailer parser, defined once in constants.py and shared with
-# the Slack/dashboard/Discord/Telegram/WeCom/Webex/Teams surfaces so the
-# ReDoS-hardened grammar can never drift. A hand-rolled MULTILINE|DOTALL variant
-# is unsafe here: `.*?` spans newlines, so a quoted "[OPTIONS:" earlier in a
-# reply could match a "]" far below it and silently delete everything between.
-_OPTIONS_RE = OPTIONS_RE_TRAILER
-
 _ERROR_TEXT = "⚠️ 出错了，请重试"
-
-
-def _strip_options(text: str) -> str:
-    """Drop the dashboard-only [OPTIONS: …] affordance — iLink has no buttons."""
-    return _OPTIONS_RE.sub("", text).strip()
 
 
 class WeixinRenderer(Renderer):
@@ -79,6 +69,8 @@ class WeixinRenderer(Renderer):
         self._typing = typing_cache
         self._session_key = session_key
         self._buf: list[str] = []
+        # Steer chip awaiting the text it heads (see on_steer_consumed).
+        self._pending_chip = ""
         self._started = False
         self._finalized = False
         self._typing_task: asyncio.Task[None] | None = None
@@ -91,7 +83,38 @@ class WeixinRenderer(Renderer):
         self._typing_task = asyncio.create_task(self._hold_typing())
 
     async def on_text_chunk(self, text: str) -> None:
+        self._materialize_chip()
         self._buf.append(text)
+
+    async def on_steer_consumed(self, summary: str = "") -> None:
+        """Record that kiro-cli folded a mid-turn steer, for an in-answer receipt.
+
+        The dispatcher already acked the steer out of band, but that ack is its own
+        message: the answer itself showed no sign of where the fold happened, so a
+        reader could not tell which half answered what. iLink cannot edit or rotate
+        a message, so the boundary is marked inline with a quote chip.
+
+        Materialized LAZILY, on the next text chunk. A steer folded at the very end
+        of a stream (the answer already covered it) would otherwise leave a chip
+        with nothing under it, and the out-of-band ack is receipt enough.
+        """
+        self._pending_chip = (summary or "").strip()
+
+    def _materialize_chip(self) -> None:
+        """Emit the pending steer chip, once, ahead of the text that follows it.
+
+        The summary is redacted in DISPLAY form, not merely inherited from the
+        driver's raw-stream scan. It lands in the message BODY, which the platform
+        markdown-parses, so a credential split by a code span or emphasis is whole
+        on screen while the byte-level scan saw it broken -- the same reassembly
+        hazard ``format_overflow`` redacts LLM-authored choice text for. A steer is
+        untrusted text arriving mid-turn, so it gets the same sink.
+        """
+        if not self._pending_chip:
+            return
+        prefix = "\n\n" if self._buf else ""
+        self._buf.append(f"{prefix}> ↪️ {self.redact_for_target(self._pending_chip)}\n\n")
+        self._pending_chip = ""
 
     async def on_thinking(self, text: str) -> None:
         # iLink surfaces one bubble per turn; reasoning would double the noise.
@@ -105,7 +128,12 @@ class WeixinRenderer(Renderer):
         return None
 
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+        tool_input: str = "",
     ) -> None:
         # iLink has no interactive buttons. The driver only dispatches
         # prompt_choice for INTERACTIVE + a decider, and this channel runs
@@ -128,6 +156,21 @@ class WeixinRenderer(Renderer):
         if not body:
             body = "…" if ok else _ERROR_TEXT
         await self._send(body)
+        cred_count, url_count = count_redaction_tags(body)
+        if cred_count or url_count:
+            # The answer above carries a redaction placeholder, so a follow-up
+            # notice tells the reader the text was rewritten. Counted over the
+            # DELIVERED body, and best-effort by the shared contract: ``_send``
+            # raises so the DISPATCHER can fail an undelivered turn, but the
+            # answer has already landed — the raise is contained here rather
+            # than allowed to convert a delivered turn into a failed one.
+            try:
+                await self._send(redaction_notice(cred_count, url_count))
+            except Exception:
+                logger.warning(
+                    "weixin: could not deliver the redaction notice (answer already sent)",
+                    exc_info=True,
+                )
 
     async def close(self) -> None:
         """Idempotent teardown: finalize the turn if it never reached on_done.
@@ -144,8 +187,8 @@ class WeixinRenderer(Renderer):
 
     # -- helpers ------------------------------------------------------------
     def text(self) -> str:
-        """The turn's visible answer (OPTIONS stripped). Also persisted to history."""
-        return _strip_options("".join(self._buf).strip())
+        """The turn's answer, with ``[OPTIONS:]`` as numbered text. Also persisted."""
+        return render_options_as_text("".join(self._buf).strip(), self.capabilities)
 
     async def _send(self, body: str) -> None:
         """Deliver the answer as one or more chat messages.
@@ -155,7 +198,15 @@ class WeixinRenderer(Renderer):
         must reach ``handle_message``'s except branch (which calls
         ``record_failure``). ``close()`` is the teardown path and suppresses it,
         since by then the turn is already being unwound.
+
+        The body is scrubbed render-aware HERE rather than in ``text()`` because
+        ``text()`` is also what the dispatcher persists: the redaction belongs on
+        the bytes that ship, not on the transcript. iLink renders the body as
+        markdown, so a credential split by emphasis (``AKIA**REST**``) or a link
+        survives the channel-neutral literal stream pass and is reassembled on
+        screen; this is the same send-boundary scrub every markdown channel does.
         """
+        body = self.redact_for_target(body)
         ctx_token = self._ctx.get(self._account_id, self._to)
         chunks = render_chunks(body, self.capabilities.max_message_chars)
         for i, part in enumerate(chunks):
@@ -213,9 +264,7 @@ class WeixinRenderer(Renderer):
                     self._typing.set(self._to, ticket)
             if not ticket:
                 return
-            await self._client.send_typing(
-                to_user_id=self._to, typing_ticket=ticket, status=status
-            )
+            await self._client.send_typing(to_user_id=self._to, typing_ticket=ticket, status=status)
         except Exception:
             # Typing is cosmetic — never let it break a turn.
             logger.debug("weixin: typing signal failed", exc_info=True)

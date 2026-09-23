@@ -1,8 +1,9 @@
 name: Fork Workflow-Change Guard
 
-# Blocks a FORK pull request that modifies CI/workflow files under `.github/**`
+# Flags a FORK pull request that modifies CI/workflow files under `.github/**`
 # — the vector a fork could use to fake basic-CI results (rewrite ci.yml to pass)
-# or tamper with CODEOWNERS/other automation.
+# or tamper with CODEOWNERS/other automation. This posts an ADVISORY check-run
+# signal; it is not itself a merge gate (see the enforcement note below).
 #
 # WHY DETERMINISTIC (no model): "does the diff touch .github/**" is a file-path
 # check — a grep on the authentic changed-file list is 100% reliable, instant,
@@ -14,10 +15,26 @@ name: Fork Workflow-Change Guard
 # NEVER checks out or executes fork code — it only reads the authentic
 # changed-file list from GitHub's compare API and posts a check-run.
 #
+# EXEMPT: ratchet BASELINE data files (`.github/coverage-baselines/*.txt` and
+# `.github/*-baseline.txt`) are not guarded. They are plain text consumed by
+# gates that run from the trusted base workflow; a fork editing one cannot run
+# code or forge a check-run -- it can only loosen its own ratchet, and that is
+# a visible line in the diff that CODEOWNERS review already covers. A fork PR
+# that adds a new file, or shrinks a baselined file, MUST edit these to pass
+# the coverage/lint gates, so guarding them blocked every such contribution
+# for nothing. Workflows, scripts, prompts, CODEOWNERS and everything else
+# under `.github/**` stay guarded.
+#
 # OVERRIDE: a maintainer who has reviewed a legitimate workflow change applies
 # the `allow-fork-workflow-change` label; the guard then re-evaluates green.
-# Complements a CODEOWNERS rule on `.github/workflows/**` (which forces review;
-# this enforces it as a required, blocking check).
+# ENFORCEMENT (what actually stops a malicious fork workflow change): this
+# guard is an advisory signal only — it is NOT listed in any branch/ruleset
+# `required_status_checks` and pr-readiness.yml does not consult it. The real
+# protection is two-fold: (1) fork workflow_run jobs require maintainer approval
+# before they run (repo "require approval for all external contributors"
+# setting), and (2) the catch-all `*` rule in CODEOWNERS forces code-owner
+# review, which covers `.github/**` by inheritance. Wiring this guard in as a
+# required, blocking check is a maintainer policy decision, not yet configured.
 
 on:
   workflow_run:
@@ -34,9 +51,7 @@ on:
     types: [labeled, unlabeled, synchronize]
 
 permissions:
-  checks: write
   contents: read
-  pull-requests: write
 
 concurrency:
   group: fork-workflow-guard-${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
@@ -47,6 +62,15 @@ jobs:
     name: Fork workflow-change guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # `checks: write` posts this guard's own check-run. The reads are all GETs:
+    # `pull-requests: read` for the open-PR list and the changed-file list,
+    # `issues: read` for the label list (labels are an issues endpoint). No
+    # write to the PR -- only strip-stale-override removes the override label.
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: read
+      issues: read
     # FORK ONLY, both event shapes. Same-repo PRs are unaffected.
     if: >-
       ( github.event_name == 'workflow_run'
@@ -70,9 +94,28 @@ jobs:
 
           # Resolve the PR by matching the open PR whose head SHA == head_sha
           # (workflow_run.pull_requests is empty for forks).
-          pr="$(gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
-            --jq "[.[] | select(.head.sha == \"$head_sha\")][0].number // empty" 2>/dev/null || true)"
-          if [ -z "$pr" ]; then echo "::error::could not resolve an open PR for $head_sha"; exit 1; fi
+          # An empty result here has TWO causes that need OPPOSITE handling, and
+          # collapsing them is what made this abort unfalsifiable: the same
+          # message and the same exit 1 were emitted whether the query failed or
+          # whether it succeeded and found nothing.
+          #   * query FAILED (5xx, rate limit, network) -> we know nothing about
+          #     this PR. Stay red and loud: skipping here would let a fork PR
+          #     that really does touch .github/** proceed with no verdict.
+          #   * query SUCCEEDED, no OPEN PR has this head -> the push was
+          #     superseded, or its PR closed, while CI was queued. There is
+          #     nothing to evaluate, and this abort is upstream of both
+          #     check-run POSTs, so nothing was published and no verdict is
+          #     withheld. Report it and exit 0.
+          # stderr is no longer discarded, so a failing query now says why.
+          if ! pr="$(gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+            --jq "[.[] | select(.head.sha == \"$head_sha\")][0].number // empty")"; then
+            echo "::error::could not query open PRs while resolving $head_sha - the query itself failed; see the error above"
+            exit 1
+          fi
+          if [ -z "$pr" ]; then
+            echo "::notice::no open PR has head $head_sha - superseded or closed while CI was queued; nothing to evaluate"
+            exit 0
+          fi
 
           # AUTHORITATIVE, COMPLETE changed-file list from the paginated PR-files
           # endpoint. NOT the compare API — its `.files` caps at 300, which would
@@ -96,7 +139,13 @@ jobs:
             fail_closed "too many files to verify (>= 3000)" \
               "This PR changes ${nfiles}+ files, at the API listing cap, so a hidden .github/** edit cannot be ruled out. Blocked; split the PR or a maintainer must review and apply the '$OVERRIDE_LABEL' label."
           fi
-          touched="$(printf '%s\n' "$files" | grep -E '^\.github/' || true)"
+          # Baseline data files are exempt (see EXEMPT in the header). The
+          # exemption is an exact-shape allowlist, not a directory prefix: only
+          # `.txt` leaves directly under coverage-baselines/, or a top-level
+          # `*-baseline.txt`, so a `.github/coverage-baselines/x/evil.yml` or a
+          # `.github/workflows/foo-baseline.txt` is still caught.
+          touched="$(printf '%s\n' "$files" | grep -E '^\.github/' \
+            | grep -vE '^\.github/(coverage-baselines/[^/]+\.txt|[^/]+-baseline\.txt)$' || true)"
 
           has_override=no
           if gh api "repos/$REPO/issues/$pr/labels" --paginate --jq '.[].name' 2>/dev/null \
@@ -113,7 +162,7 @@ jobs:
           else
             concl="failure"; title="fork PR modifies .github/** — blocked"
             changed_list="$(printf '%s ' $touched)"
-            summary="This fork PR changes CI/workflow files ($changed_list). A fork could use this to fake CI results, so it is blocked. A maintainer must review the change and apply the '$OVERRIDE_LABEL' label to proceed."
+            summary="This fork PR changes CI/workflow files ($changed_list). A fork could use this to fake CI results, so it is blocked. A maintainer must review the change and apply the '$OVERRIDE_LABEL' label to proceed. (Baseline data files under .github/coverage-baselines/ and .github/*-baseline.txt are exempt and never trigger this guard.)"
           fi
 
           gh api --method POST "repos/$REPO/check-runs" \

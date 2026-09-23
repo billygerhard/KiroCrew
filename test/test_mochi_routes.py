@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import json
 import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,6 +17,8 @@ from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _Ctx:
@@ -156,7 +159,7 @@ class TestWatchlistRoutes:
 
     @pytest.mark.asyncio
     async def test_remove_via_update(self, tmp_path):
-        # The panel Delete button posts {remove: [id]}; the route guard used to
+        # The panel Delete button posts {remove: [id]}; the route guard would
         # reject it (400 invalid_watchlist_op) even though the backend + MCP
         # schema support remove, so the row reappeared on the next refresh.
         async with _live_runtime(tmp_path):
@@ -562,7 +565,7 @@ class TestMovementReports:
             # the monitors, so without the cache the tool cannot answer at all.
             assert cached["activeId"] == 7
             entry = cached["displays"][0]
-            # The GEOMETRY has to survive. The projection used to keep only
+            # The GEOMETRY has to survive. A trimmed projection keeps only
             # {id, width, height}, which left the pet with no way to say WHICH screen
             # it was on — so it guessed, and told the user "display 1" while standing
             # on display 2.
@@ -684,7 +687,7 @@ class TestReset:
         """Stats reset runs off the loop (asyncio.to_thread) under the same lock
         as tick(), and the dirty flag + pending flush deadline are cleared, so a
         due flush in another worker thread cannot rewrite a stale snapshot back
-        over the wipe. (A lock-free off-thread unlink used to race a flush and
+        over the wipe. (A lock-free off-thread unlink would race a flush and
         'restore' pre-reset counters.)
         """
         async with _live_runtime(tmp_path) as rt:
@@ -897,7 +900,6 @@ class TestNoLockingCallRunsOnTheEventLoop:
 
     def test_every_locking_call_in_async_code_is_offloaded(self) -> None:
         import ast
-        from pathlib import Path
 
         locking = {
             "add_pin",
@@ -914,7 +916,7 @@ class TestNoLockingCallRunsOnTheEventLoop:
             "cancel_watch_item",
             "remove_watch_item",
         }
-        root = Path("src/kiro_crew/apps/builtins/mochi")
+        root = _REPO_ROOT / "src/kiro_crew/apps/builtins/mochi"
         offenders: list[str] = []
         scanned = 0
         for path in sorted(root.rglob("*.py")):
@@ -967,10 +969,9 @@ class TestTheOwnerLoopNeverBlocksOnDisk:
 
     def test_every_disk_bound_tick_is_offloaded(self) -> None:
         import ast
-        from pathlib import Path
 
         tree = ast.parse(
-            Path("src/kiro_crew/apps/builtins/mochi/hooks.py").read_text(encoding="utf-8")
+            (_REPO_ROOT / "src/kiro_crew/apps/builtins/mochi/hooks.py").read_text(encoding="utf-8")
         )
 
         def receiver(call: ast.Call) -> tuple[str, str] | None:
@@ -1018,10 +1019,9 @@ class TestSettingsAndDisplayWritesAreOffloaded:
 
     def test_no_bare_blocking_write_on_an_async_route(self) -> None:
         import re
-        from pathlib import Path
 
         lines = (
-            Path("src/kiro_crew/apps/builtins/mochi/backend/routes.py")
+            (_REPO_ROOT / "src/kiro_crew/apps/builtins/mochi/backend/routes.py")
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -1058,7 +1058,7 @@ class TestResetSerializesUnlinks:
         async with _live_runtime(tmp_path):
             # Wrap AFTER startup so only the reset's own acquisitions are counted.
             # `routes` is the namespace, not each source module: routes imports
-            # these at module scope, so patching the source no longer intercepts.
+            # these at module scope, so patching the source does not intercept.
             _spy(routes, "queue_mutation")
             _spy(routes, "watchlist_mutation")
             _spy(routes, "pins_mutation")
@@ -1178,7 +1178,7 @@ class TestMalformedWatchlistOpsRejected:
 class TestQueueFilenameHasOneDefinition:
     """The queue filename is defined ONCE, in the module that owns queue files.
 
-    `hooks` and `mcp_server` each used to define their own copy of the literal,
+    `hooks` and `mcp_server` could each define their own copy of the literal,
     and `routes` imported it from whichever was convenient per call site.
     Renaming the file in one module would have left the others reading a path
     nothing writes — a reset that clears nothing, with no error anywhere.
@@ -1194,7 +1194,6 @@ class TestQueueFilenameHasOneDefinition:
 
     def test_no_module_redefines_the_literal(self):
         """A future copy-paste must fail here rather than drift silently."""
-        from pathlib import Path
 
         from kiro_crew.apps.builtins.mochi import queue_file
 
@@ -1212,7 +1211,7 @@ class TestQueueFilenameHasOneDefinition:
 class TestMcpToolsRoute:
     """GET /api/apps/mochi/mcp-tools/{name} — the settings panel's discover action.
 
-    The panel used to call core's ``/api/mcp/servers/{name}``, which only has
+    The panel must not call core's ``/api/mcp/servers/{name}``, which only has
     PUT/DELETE registered, so every discover took a 405 and both the api helper
     and the click handler swallowed it.
     """

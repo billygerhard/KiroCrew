@@ -1,19 +1,22 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, ArrowLeft, Boxes, BookOpen } from 'lucide-react'
-import { useAppSelector } from '../../store'
-import { useContainerWidth } from '../../hooks/useContainerWidth'
+import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { setYoloDuration } from '../../store/dashboardSlice'
+import { SettingsSubNav } from '../../components/SettingsSubNav'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
-import { SettingsSection, SettingsCard } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
+import { MobileLoginCard } from './MobileLoginCard'
 
 import { i18nT } from '../../i18n/t'
-import { fmtList, fmtTimeNumeric } from '../../i18n/format'
+import { fmtDateFields, fmtDateTime, fmtDuration, fmtList, fmtTime, fmtTimeNumeric, fmtUnit, toDate, compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
+import { copyToClipboard } from '../../utils/clipboard'
 /* ── Security feature registry ──
  *
  * Qualitative layer descriptions ONLY. Every control whose posture is a COUNT
@@ -114,6 +117,13 @@ const CODE_BASE = POSTURE_CODE_BASE
  *  of its three render sites for the reason above: at module scope `i18nT()` would
  *  resolve once at boot. */
 const PINNED_TOOLTIP_KEY = 'pages.settings.securityPanel.pinned_by_policy'
+const FLOOR_TOOLTIP_KEY = 'pages.settings.securityPanel.enforced_by_floor'
+
+/** A rule is locked (forced-on, non-toggleable) when governance pins it or an
+ *  always-on floor enforces it. `lock_reason` picks the tooltip wording. */
+function isRuleLocked(rule: DeniedCommandRule): boolean {
+  return rule.pinned || rule.lock_reason === 'floor'
+}
 
 /** Icon per posture-control key. A control the server registers that has no entry
  *  here still renders — with a generic shield — so a new backend control is never
@@ -171,6 +181,19 @@ function StatusRow({ icon, label, value, variant, href }: { icon: React.ReactNod
     : content
 }
 
+/** A label:value micro-pill. Two-part on purpose: a bare "Added" pill states a
+ *  value with no subject, and the three chips only mean something read against
+ *  what they measure. Colour comes from theme variables via `Badge`, so the
+ *  chips follow a custom palette instead of pinning a hex. */
+function StatusChip({ label, value, variant }: { label: string; value: string; variant: 'ok' | 'warn' | 'muted' }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[11px] text-muted">
+      <span className="uppercase tracking-wider font-medium">{label}</span>
+      <Badge variant={variant} className="text-[11px] px-1.5 py-0">{value}</Badge>
+    </span>
+  )
+}
+
 /* ── Feature row ── */
 function FeatureRow({ feature }: { feature: SecurityFeature }) {
   return (
@@ -201,7 +224,7 @@ function categoryLabel(category: string): string {
 }
 
 /** A single built-in denied-command rule row (Card A). */
-function BuiltinDenyRow({ rule, dimmed, onToggle }: { rule: DeniedCommandRule; dimmed: boolean; onToggle: (next: boolean) => void }) {
+function BuiltinDenyRow({ rule, dimmed, onToggle, error, errorHandoff }: { rule: DeniedCommandRule; dimmed: boolean; onToggle: (next: boolean) => void; error?: string; errorHandoff?: boolean }) {
   const [open, setOpen] = useState(false)
   const Chevron = open ? ChevronDown : ChevronRight
   return (
@@ -217,11 +240,27 @@ function BuiltinDenyRow({ rule, dimmed, onToggle }: { rule: DeniedCommandRule; d
           <Chevron size={14} />
         </button>
         <span className="flex-1 min-w-0 text-[13px] text-text">{rule.description}</span>
-        {rule.pinned ? (
+        {rule.source === 'edition' && (
+          /* The seam's whole point is that a contributed rule is DISCOVERABLE
+             rather than an invisible refusal, so the row has to say where it came
+             from — otherwise an operator cannot tell it from a shipped rule and
+             cannot tell whom to ask about it.
+             The badge is a plain LABEL, not a control: the row already spends its
+             two-action budget (`max-two-buttons-per-row`) on the expand chevron
+             and the toggle, and an InfoTip trigger here would be a third button.
+             The explanation lives in the expand panel below instead, which makes
+             it readable rather than hover-only. */
+          <span className="shrink-0 rounded bg-bg-elevated border border-border px-1.5 py-0.5 text-[11px] font-mono text-muted">
+            {i18nT('pages.settings.securityPanel.edition_rule_badge')}
+          </span>
+        )}
+        {isRuleLocked(rule) ? (
           <span className="flex items-center gap-1.5 shrink-0">
             <Lock size={13} className="text-muted" />
-            <InfoTip text={i18nT(PINNED_TOOLTIP_KEY)} />
-            <Toggle checked disabled onChange={() => { /* pinned — forced on */ }} label={rule.description} />
+            {/* Two literal i18nT call sites (not one with a computed key) so the
+                static key checker keeps verifying both catalog keys. */}
+            <InfoTip text={rule.lock_reason === 'floor' ? i18nT(FLOOR_TOOLTIP_KEY) : i18nT(PINNED_TOOLTIP_KEY)} />
+            <Toggle checked disabled onChange={() => { /* locked — forced on */ }} label={rule.description} />
           </span>
         ) : (
           <span className={`shrink-0 ${dimmed ? 'opacity-50' : ''}`}>
@@ -229,8 +268,21 @@ function BuiltinDenyRow({ rule, dimmed, onToggle }: { rule: DeniedCommandRule; d
           </span>
         )}
       </div>
+      {/* The rejected write for THIS row, beside the switch that snapped back —
+          a banner at the top of a long rule list is off-screen from the toggle
+          that was pressed. `errorHandoff` is decided by the section, which knows
+          whether Card B's add-pattern draft (panel-shell state the navigation
+          would discard) is empty. No hand-off otherwise: the deny-pattern draft. */}
+      <ErrorNotice variant="inline" className="mt-1 ml-6" message={error} askAgent={!!errorHandoff} testId={error ? `denied-rule-error-${rule.id}` : undefined} />
       {open && (
-        <pre className="mt-1.5 ml-6 overflow-x-auto rounded-md bg-bg-elevated border border-border px-2.5 py-1.5 text-[12px] font-mono text-muted whitespace-pre-wrap break-all">{rule.pattern}</pre>
+        <>
+          {rule.source === 'edition' && (
+            <p className="mt-1.5 ml-6 text-[12px] text-muted">
+              {i18nT('pages.settings.securityPanel.edition_rule_tooltip')}
+            </p>
+          )}
+          <pre className="mt-1.5 ml-6 overflow-x-auto rounded-md bg-bg-elevated border border-border px-2.5 py-1.5 text-[12px] font-mono text-muted whitespace-pre-wrap break-all">{rule.pattern}</pre>
+        </>
       )}
     </div>
   )
@@ -254,6 +306,8 @@ function CategoryGroup({
   disableAll,
   onRuleToggle,
   collapsible = true,
+  rowError,
+  errorHandoff,
 }: {
   category: string
   rules: DeniedCommandRule[]
@@ -266,12 +320,15 @@ function CategoryGroup({
    *  chevron would be a control that visibly does nothing. Render a plain
    *  header instead of an inert button. */
   collapsible?: boolean
+  /** The one rejected rule write, if any, keyed to the row it belongs to. */
+  rowError?: { id: string; message: string } | null
+  errorHandoff?: boolean
 }) {
   const Chevron = open ? ChevronDown : ChevronRight
   const counted = allRules ?? rules
   const enabled = counted.filter(r => r.enabled).length
-  const pinned = counted.some(r => r.pinned)
-  // "off" when every non-pinned rule in the group is disabled.
+  const locked = counted.some(isRuleLocked)
+  // "off" when every non-locked rule in the group is disabled.
   const allOff = enabled === 0
   return (
     <div className="border-t border-border first:border-t-0">
@@ -289,9 +346,9 @@ function CategoryGroup({
           <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted group-hover:text-text transition-colors">
             {categoryLabel(category)}
           </span>
-          {pinned && <Lock size={12} className="shrink-0 text-muted" />}
+          {locked && <Lock size={12} className="shrink-0 text-muted" />}
           <span className="flex-1" />
-          {allOff && !pinned && (
+          {allOff && !locked && (
             <span className="text-[11px] text-warn">{i18nT('pages.settings.securityPanel.off')}</span>
           )}
           <Badge variant="muted" className="tabular-nums">{enabled}/{counted.length}</Badge>
@@ -301,9 +358,9 @@ function CategoryGroup({
           <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">
             {categoryLabel(category)}
           </span>
-          {pinned && <Lock size={12} className="shrink-0 text-muted" />}
+          {locked && <Lock size={12} className="shrink-0 text-muted" />}
           <span className="flex-1" />
-          {allOff && !pinned && (
+          {allOff && !locked && (
             <span className="text-[11px] text-warn">{i18nT('pages.settings.securityPanel.off')}</span>
           )}
           <Badge variant="muted" className="tabular-nums">{enabled}/{counted.length}</Badge>
@@ -315,8 +372,10 @@ function CategoryGroup({
             <BuiltinDenyRow
               key={rule.id}
               rule={rule}
-              dimmed={disableAll && !rule.pinned}
+              dimmed={disableAll && !isRuleLocked(rule)}
               onToggle={next => onRuleToggle(rule, next)}
+              error={rowError?.id === rule.id ? rowError.message : undefined}
+              errorHandoff={errorHandoff}
             />
           ))}
         </div>
@@ -326,30 +385,44 @@ function CategoryGroup({
 }
 
 /** A single user-authored denied-command row (Card B). */
-function CustomDenyRow({ rule, onToggle, onDelete }: { rule: DeniedUserRule; onToggle: (next: boolean) => void; onDelete: () => void }) {
+function CustomDenyRow({ rule, onToggle, onDelete, error, errorHandoff }: { rule: DeniedUserRule; onToggle: (next: boolean) => void; onDelete: () => void; error?: string; errorHandoff?: boolean }) {
   return (
-    <div className="flex items-center gap-2.5 py-2">
-      <code className="flex-1 min-w-0 overflow-x-auto text-[12px] font-mono text-text whitespace-pre-wrap break-all">{rule.pattern}</code>
-      <Toggle checked={rule.enabled} onChange={onToggle} label={rule.pattern} />
-      <button
-        type="button"
-        className="shrink-0 text-muted hover:text-danger transition-colors bg-transparent border-none cursor-pointer p-1"
-        onClick={onDelete}
-        aria-label={i18nT('pages.settings.securityPanel.delete_pattern', { name: rule.pattern })}
-      >
-        <Trash2 size={14} />
-      </button>
+    <div className="py-2">
+      <div className="flex items-center gap-2.5">
+        <div className="flex-1 min-w-0">
+          <code className="block overflow-x-auto text-[12px] font-mono text-text whitespace-pre-wrap break-all">{rule.pattern}</code>
+          {/* The note is what the agent is shown when this rule fires, so surface it
+              next to the pattern it explains rather than hiding it behind an edit
+              affordance that does not exist (rules are create-only). */}
+          {rule.note ? <p className="mt-0.5 text-[11px] text-muted whitespace-pre-wrap break-words">{rule.note}</p> : null}
+        </div>
+        <Toggle checked={rule.enabled} onChange={onToggle} label={rule.pattern} />
+        <button
+          type="button"
+          className="shrink-0 text-muted hover:text-danger transition-colors bg-transparent border-none cursor-pointer p-1"
+          onClick={onDelete}
+          aria-label={i18nT('pages.settings.securityPanel.delete_pattern', { name: rule.pattern })}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+      {/* The rejected toggle/delete for THIS row, beside the controls that
+          caused it. `errorHandoff` is the section's call on whether the
+          add-pattern draft below is empty (No hand-off otherwise: that draft). */}
+      <ErrorNotice variant="inline" className="mt-1" message={error} askAgent={!!errorHandoff} testId={error ? `denied-rule-error-${rule.id}` : undefined} />
     </div>
   )
 }
 
 /** Add-a-custom-pattern input with client-side RegExp validation (Card B).
  *
- *  `value` is CONTROLLED from the panel shell rather than held here, because the
- *  rules section unmounts when the reader picks another rail section — local
- *  state would silently discard a half-typed deny pattern. `error` stays local:
- *  it is derived from the value and costs nothing to recompute. */
-function AddDenyInput({ value, onChange, onAdd, busy }: { value: string; onChange: (next: string) => void; onAdd: (pattern: string) => void; busy: boolean }) {
+ *  `value` and `note` are CONTROLLED from the panel shell rather than held here,
+ *  because the rules section unmounts when the reader picks another rail section
+ *  — local state would silently discard a half-typed deny pattern or note.
+ *  `error` stays local: it is derived from the value and costs nothing to
+ *  recompute. */
+function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submitError }: { value: string; onChange: (next: string) => void; note: string; onNoteChange: (next: string) => void; onAdd: (pattern: string, note: string) => void; busy: boolean; submitError: string }) {
+  const ime = useImeGuard()
   const [error, setError] = useState('')
 
   const submit = () => {
@@ -362,8 +435,10 @@ function AddDenyInput({ value, onChange, onAdd, busy }: { value: string; onChang
       return
     }
     setError('')
-    onAdd(pattern)
-    onChange('')
+    // Deliberately does NOT clear the drafts. The server can still reject this
+    // (a note carrying the refusal prefix is a 400), and clearing here would
+    // discard text the operator has to retype. The parent clears on SUCCESS.
+    onAdd(pattern, note.trim())
   }
 
   return (
@@ -372,7 +447,7 @@ function AddDenyInput({ value, onChange, onAdd, busy }: { value: string; onChang
         <Input
           value={value}
           onChange={e => { onChange(e.target.value); if (error) setError('') }}
-          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); submit() } }}
+          {...ime.bindEnter({ onEnter: submit })}
           placeholder={i18nT('pages.settings.securityPanel.add_a_custom_deny_pattern_regex_e_g_rm_rf_tmp_mi')}
           aria-label={i18nT('pages.settings.securityPanel.custom_deny_pattern')}
         />
@@ -381,9 +456,34 @@ function AddDenyInput({ value, onChange, onAdd, busy }: { value: string; onChang
           {i18nT('pages.settings.securityPanel.add')}
         </Btn>
       </div>
-      {/* Invalid-regex feedback on the input the user is still typing — a form
-          hint, not a failure to diagnose, so no agent hand-off. */}
-      <ErrorNotice message={error} className="mt-1.5" />
+      {/* Optional. Whatever is typed here is what the agent reads instead of the
+          raw regex when the rule fires, so it is remediation ("use --maxdepth"),
+          not a label. Capped server-side at 200 chars; mirrored here so the
+          field stops accepting input rather than 400-ing on submit. */}
+      <div className="mt-1.5">
+        <Input
+          value={note}
+          onChange={e => onNoteChange(e.target.value)}
+          {...ime.bindEnter({ onEnter: submit })}
+          placeholder={i18nT('pages.settings.securityPanel.optional_why_shown_to_the_agent_when_this_rule_fir')}
+          aria-label={i18nT('pages.settings.securityPanel.custom_deny_note')}
+          maxLength={200}
+        />
+      </div>
+      {/* Two surfaces, because they have two sources. `error` is invalid-regex
+          feedback on the input the user is still typing — a form hint, not a
+          failure to diagnose, so it stays plain text. `submitError` carries a
+          SERVER rejection (e.g. a note carrying the refusal prefix): without it
+          the 400 is silent, the list does not change, and Add looks like it did
+          nothing. Local hint wins — it is about what is on screen. */}
+      {error ? (
+        <p className="text-[12px] text-danger mt-1.5 mb-0" data-testid="deny-pattern-hint">{error}</p>
+      ) : (
+        /* No hand-off: the pattern (`value`) and note (`note`) the user typed are
+           kept on a rejected add so they can be corrected — the navigation would
+           discard both. */
+        <ErrorNotice message={submitError} className="mt-1.5" />
+      )}
     </div>
   )
 }
@@ -423,9 +523,32 @@ export const SCOPE_LABEL_KEY: Record<string, string> = {
   // `telemetry.enabled` config field is local-only OTEL collection, and a row
   // reading just "Telemetry" would imply this ceiling governs that too.
   'capabilities.telemetry': 'pages.settings.securityPanel.gov_scope_telemetry',
+  // Named after the menu entry it withdraws ("Share as image"), not the scope's
+  // leaf: a user whose Share entry vanished reads THIS row to learn why, and
+  // "Social Share" would not connect to the feature they lost.
+  'capabilities.social_share': 'pages.settings.securityPanel.gov_scope_social_share',
 }
 
-/** Localised scope name. An unknown scope falls back to its title-cased leaf. */
+/** Localised scope name, falling back to a humanised leaf for an unknown scope.
+ *
+ *  The fallback exists for a scope this build has no catalog entry for, which in
+ *  practice means one a COMPANION EDITION registered through ``register_scope``:
+ *  the snapshot endpoint iterates ``SCOPE_CATALOG``, so such a row reaches this
+ *  panel, but shipping an i18n key for it is impossible — the core does not know
+ *  the scope exists.
+ *
+ *  Humanised rather than raw, because governed-scope leaves are snake_case by
+ *  convention (``capabilities.capability_install``,
+ *  ``capabilities.external_access``), and a title-cased raw leaf renders them as
+ *  `Capability_install` / `External_access` in the middle of an otherwise
+ *  copy-edited security panel. Underscores and hyphens become spaces and each word
+ *  is capitalised, so the row reads `Capability Install` / `External Access`.
+ *
+ *  Deliberately NOT localised: the leaf is an operator-authored identifier, not
+ *  product copy, so there is nothing to translate and no key to translate it under.
+ *  A known scope still resolves through ``SCOPE_LABEL_KEY`` and stays translated in
+ *  every locale.
+ */
 function scopeLabel(scope: string): string {
   // `hasOwnProperty`, not a truthiness test on the lookup: `scope` arrives from
   // `GET /api/governance-policy`, so a scope named `toString` or `constructor` would
@@ -433,7 +556,23 @@ function scopeLabel(scope: string): string {
   // i18next and then to JSX. Same hazard as `effortLabel` in `lib/effort.ts`.
   if (Object.prototype.hasOwnProperty.call(SCOPE_LABEL_KEY, scope)) return i18nT(SCOPE_LABEL_KEY[scope])
   const leaf = scope.includes('.') ? scope.slice(scope.indexOf('.') + 1) : scope
-  return leaf.charAt(0).toUpperCase() + leaf.slice(1)
+  return humaniseScopeLeaf(leaf)
+}
+
+/** Turn a snake_case / kebab-case scope leaf into Title Case words.
+ *
+ *  Exported for the test: the panel renders the result verbatim, so the mapping
+ *  from identifier to displayed text is worth pinning directly rather than only
+ *  through a mounted component.
+ */
+export function humaniseScopeLeaf(leaf: string): string {
+  return leaf
+    .split(/[_-]+/)
+    // Drop empties so a leading, trailing or doubled separator cannot produce a
+    // double space or a stray leading space in the rendered row.
+    .filter(Boolean)
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
 }
 
 /** Pluralize a count with its noun, e.g. 3 → "3 rules", 1 → "1 rule". */
@@ -550,6 +689,7 @@ const SCOPE_PLANE: Record<string, GovPlaneKey> = {
   'network.egress': 'io',
   channels: 'channels',
   approval_mode: 'modes',
+  approval_modes: 'modes',
   'sandbox.min_level': 'modes',
 }
 
@@ -622,15 +762,23 @@ type YoloDurationKey = (typeof YOLO_DURATION_KEYS)[number]
  *  (agent.dangerouslySkipPermissions) — that stays config-file-only. */
 function YoloDurationCard() {
   const qc = useQueryClient()
+  const dispatch = useAppDispatch()
   const status = useAppSelector(s => s.dashboard.status)
   const untilShutdownPermitted = status?.yolo_until_shutdown_permitted ?? true
-  const { data } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
+  const { data, isError: cfgError } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
   const configured = data?.agent?.yolo_duration
   const current: YoloDurationKey =
     YOLO_DURATION_KEYS.find(k => k === configured) ?? '6h'
   const save = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.yolo_duration', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    mutationFn: (v: YoloDurationKey) => api.patchConfig('agent.yolo_duration', v),
+    onSuccess: (_data, saved) => {
+      qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+      // The approval-mode picker reads the duration from `dashboard.status`,
+      // which only the HTTP status reply carries (the WebSocket push omits it).
+      // Record the save in the store, or the picker keeps naming the duration
+      // from page load until a reload while the gateway already grants this one.
+      dispatch(setYoloDuration(saved))
+    },
   })
 
   // Live "when does this end" line, so a no-expiry grant is never mistaken for
@@ -666,7 +814,9 @@ function YoloDurationCard() {
           <Clock size={12} className="shrink-0" />{activeNote}
         </div>
       )}
-      <div className="flex flex-col gap-1.5" role="radiogroup" aria-label={i18nT('pages.settings.securityPanel.yolo_duration_title')}>
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+          (settingsManual.ts) — the highlight hook queries the rendered label. */}
+      <div className="flex flex-col gap-1.5" role="radiogroup" aria-label={i18nT('pages.settings.securityPanel.yolo_duration_title')} data-setting-label={i18nT('pages.settings.securityPanel.yolo_duration_title')}>
         {YOLO_DURATION_KEYS.map(k => {
           const selected = current === k
           const disabled = k === 'until_shutdown' && !untilShutdownPermitted
@@ -695,105 +845,728 @@ function YoloDurationCard() {
         })}
       </div>
       <div className="text-[11px] text-muted mt-2">{i18nT('pages.settings.securityPanel.yolo_duration_next_activation_note')}</div>
+      {/* Picker-only card, nothing to lose on either: the read failure means the
+          highlighted option is the '6h' default rather than what is stored; the
+          save failure means the click did not persist. */}
+      {cfgError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.yolo_duration_load_failed')} askAgent />
+      )}
       {save.isError && (
-        <div className="text-[12px] text-danger mt-1.5">{i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')}</div>
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')} askAgent />
       )}
     </SettingsCard>
   )
 }
 
-/* ── Third-party app execution ── */
-
-/** The process-level admission gate for app code that is NOT a shipped builtin
- *  (`agent.apps_allow_third_party`, backend decision in `apps/execution.py`).
+/* ── Flagged-file delivery consent ──────────────────────────────────────────
  *
- *  Default OFF. While it is off, installing OR enabling a third-party app fails
- *  with a raw backend sentence naming this config key — and until this card
- *  existed the key was reachable only from `kirocrew config set`, so a user who
- *  never opens a terminal had no way to act on it. Every app shipped so far is
- *  a builtin (exempt), which is why the dead end went unnoticed.
+ * A VIEW over the grant the `/api/file-delivery/consent` endpoints already own.
+ * It introduces no consent scope of its own and writes nothing directly: the
+ * record sits on the sandbox-sealed keystone floor and the owner-gated handler
+ * is its only writer, so this card can ask for exactly the two transitions the
+ * endpoints already expose (record, withdraw) and earns the same refusal any
+ * other caller would if it is not the owner. Routing through the endpoints
+ * rather than writing settings is the point: duplicated authorization logic is
+ * how two copies drift until one of them is the permissive one.
  *
- *  This is deliberately a BLANKET switch, so the copy has to say so: it admits
- *  every third-party app, present and future, not the one the user was trying
- *  to install. */
-function ThirdPartyAppsCard() {
+ * WHY THE CACHED READ IS NOT THE AUTHORITY. An external dashboard app can reach
+ * the host QueryClient and rewrite any key (#8394), so a cached "confirmed" is
+ * not evidence that delivery is confirmed. Nothing is decided here — every
+ * delivery gate re-reads the store server-side — and after a write this card
+ * INVALIDATES rather than asserting the new state into the cache, so what it
+ * shows always came from a fresh owner-gated GET rather than from something it
+ * told itself.
+ *
+ * The rows and the excluded legs are both rendered FROM the response, never from
+ * a local list, so this card cannot offer a class the backend would refuse. The
+ * exclusion is STATED rather than omitted: an absent control reads as an
+ * oversight, while a named one reads as the decision it is.
+ */
+function FileDeliveryConsentCard() {
   const qc = useQueryClient()
-  const { data, isLoading, isError } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
-  // Mirror the backend exactly: `third_party_execution_allowed()` admits ONLY
-  // the literal JSON boolean `true`, so a hand-edited `"true"` or `1` in
-  // config.json is NOT a grant and must not render as one — hence the typed
-  // `unknown` plus an identity check rather than a truthiness test.
-  const allowed = data?.agent?.apps_allow_third_party === true
-  // An UNREADABLE value is not "off". If the read failed, the persisted setting
-  // may well be `true`, and collapsing that to `false` would be wrong twice
-  // over: the blanket-trust warning would be hidden while third-party code is
-  // still admitted, and the switch — sitting at OFF — would write `true` on
-  // click, so an ACTIVE grant could not be revoked from here at all. Treat
-  // not-yet-known and failed-to-read the same way: no actionable control, and
-  // say so instead of asserting a state we do not have.
-  const stateUnknown = isLoading || isError || data === undefined
-  const save = useMutation({
-    mutationFn: (next: boolean) => api.patchConfig('agent.apps_allow_third_party', next),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+  const { data, isLoading, isError } = useQuery<FileDeliveryConsentStatus>({
+    queryKey: ['file-delivery-consent'],
+    queryFn: api.fileDeliveryConsent,
   })
+  // The armed request (if any): after Allow delivery is clicked, the grant is
+  // NOT recorded here. The browser gets back only this nonce-free view naming
+  // the host command that finishes it, so an agent-driven browser cannot
+  // self-grant. Polled while armed so the "expires in" countdown and the flip to
+  // confirmed both surface without a manual refresh.
+  const armed = useQuery<ArmedFileDeliveryConsent>({
+    queryKey: ['file-delivery-consent-arm'],
+    queryFn: api.fileDeliveryConsentArmStatus,
+    refetchInterval: q => (q.state.data?.armed ? 5000 : false),
+  })
+  const invalidate = () => {
+    void qc.invalidateQueries({ queryKey: ['file-delivery-consent'] })
+    void qc.invalidateQueries({ queryKey: ['file-delivery-consent-arm'] })
+  }
+  // Arming replaces the previous request, so it is safe to re-arm; on success we
+  // refetch both the arm status (to show the command) and the grant (in case an
+  // approve already landed).
+  const arm = useMutation({
+    mutationFn: (destinationClass: string) => api.armFileDeliveryConsent(destinationClass),
+    onSuccess: invalidate,
+  })
+  const withdraw = useMutation({
+    mutationFn: (destinationClass: string) => api.revokeFileDeliveryConsent(destinationClass),
+    onSuccess: invalidate,
+  })
+
+  // An unreadable state renders NO state, and `isError` is the whole test for
+  // that -- NOT `data === undefined`. react-query RETAINS the last good `data`
+  // when a refetch rejects, so after a write that succeeded and a re-read that
+  // did not, `data` still describes the state from BEFORE the write: it would
+  // render "Not confirmed" for a grant that is now live. That is the reassuring
+  // direction of wrong, and the dangerous one, because it tells the owner there
+  // is nothing to withdraw. Everything displayed therefore comes from `view`,
+  // which is empty while the read is in error, so the two failure paths (first
+  // read failed, refetch failed) are identical on screen and the failure notice
+  // below is the only thing that renders.
+  const view = isError ? undefined : data
+  const armedView = armed.isError ? undefined : armed.data
+
+  // Copy affordance for the host command (item: parity with BrowserPanel /
+  // AboutPanel, which pair a host command with a Copy button because a mistype
+  // inside the step-up window silently fails approval). Acknowledge only on
+  // resolution; a false "Copied" is worse than none.
+  const [cmdCopied, setCmdCopied] = useState(false)
+  const [cmdCopyFailed, setCmdCopyFailed] = useState(false)
+  useEffect(() => {
+    if (!cmdCopied) return
+    const id = window.setTimeout(() => setCmdCopied(false), 1500)
+    return () => window.clearTimeout(id)
+  }, [cmdCopied])
+  // Whether a request has been armed at least once this mount, so an armed box
+  // that later disappears (expiry/consume) leaves a trace instead of a silent
+  // unmount that reads as a dead button.
+  const [wasArmed, setWasArmed] = useState(false)
+  const anyArmed = !!armedView?.armed
+  useEffect(() => {
+    if (anyArmed) {
+      setWasArmed(true)
+      return
+    }
+    if (wasArmed) {
+      // Host approval or expiry ends arm polling. Re-read the grant before
+      // rendering the terminal state, or a completed approval looks expired.
+      void qc.invalidateQueries({ queryKey: ['file-delivery-consent'] })
+    }
+  }, [anyArmed, qc, wasArmed])
+
+  const excluded = view?.never_grantable ?? []
+  const busy = isLoading || arm.isPending || withdraw.isPending
 
   return (
     <SettingsCard>
-      <div className="flex items-center justify-between py-1.5">
-        <div className="flex-1 min-w-0 mr-4">
-          <div className="flex items-center gap-1.5">
-            <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.third_party_apps_title')}</span>
-            <InfoTip text={i18nT('pages.settings.securityPanel.third_party_apps_tip')} />
+      <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.file_delivery_title')}</div>
+      <div className="text-[12px] text-muted mt-0.5 mb-2 leading-relaxed">{i18nT('pages.settings.securityPanel.file_delivery_desc')}</div>
+
+      {/* One row per GRANTABLE class, from the response. The backend returns
+          exactly one today; iterating means a second class needs no change here
+          and — the reason that matters — that this card can never render a
+          control for a class the backend did not name. */}
+      <div className="flex flex-col gap-1.5">
+        {(view?.grantable ?? []).map(destinationClass => {
+          const held = view?.grants?.[destinationClass] ?? null
+          const isArmedForThis = !!armedView?.armed && armedView.destination_class === destinationClass
+          return (
+            <div
+              key={destinationClass}
+              data-testid={`file-delivery-row-${destinationClass}`}
+              className="flex flex-col gap-1.5 border border-border rounded-md px-3 py-2"
+            >
+              <div className="flex items-start gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="text-[12px] text-text flex items-center gap-1.5 flex-wrap">
+                    {/* The label is the server's, falling back to the raw id: a
+                        class the backend added without a label still renders as
+                        itself rather than as an empty row. */}
+                    <span>{view?.labels?.[destinationClass] ?? destinationClass}</span>
+                    {held
+                      ? <Badge variant="ok">{i18nT('pages.settings.securityPanel.file_delivery_state_confirmed')}</Badge>
+                      : isArmedForThis
+                        ? <Badge variant="muted">{i18nT('pages.settings.securityPanel.file_delivery_state_armed')}</Badge>
+                        : <Badge variant="muted">{i18nT('pages.settings.securityPanel.file_delivery_state_not_confirmed')}</Badge>}
+                  </div>
+                  {/* Plain-language destination helper at the point of consent:
+                      the label alone ("this computer and your dashboard Files
+                      view") still leaves a first-time reader unsure WHAT that
+                      means, so name it in words they can picture. */}
+                  <div className="text-[11px] text-muted mt-0.5 leading-relaxed">
+                    {i18nT('pages.settings.securityPanel.file_delivery_destination_help')}
+                  </div>
+                  {held && (
+                    <div className="text-[11px] text-muted mt-0.5">
+                      {i18nT('pages.settings.securityPanel.file_delivery_since', { time: fmtDateTime(held.granted_at) })}
+                    </div>
+                  )}
+                </div>
+                {held
+                  ? (
+                    <Btn disabled={busy} onClick={() => withdraw.mutate(destinationClass)}>
+                      {i18nT('pages.settings.securityPanel.file_delivery_withdraw')}
+                    </Btn>
+                  )
+                  : isArmedForThis
+                    ? (
+                      // Armed: the next action is running the host command, not
+                      // clicking again. A disabled secondary CTA labelled
+                      // "Waiting..." stops the identical purple button from
+                      // reading as a dead no-op on a re-click (a re-arm is
+                      // invisible otherwise).
+                      <Btn disabled aria-disabled="true">
+                        {i18nT('pages.settings.securityPanel.file_delivery_waiting')}
+                      </Btn>
+                    )
+                    : (
+                      <Btn primary disabled={busy} onClick={() => arm.mutate(destinationClass)}>
+                        {i18nT('pages.settings.securityPanel.file_delivery_confirm')}
+                      </Btn>
+                    )}
+              </div>
+
+              {/* Resting state, before any click: the primary button reads
+                  "Allow delivery", which a blind reader takes as an immediate,
+                  irreversible grant. It is neither — the click only ARMS a
+                  reversible two-step request that delivers nothing until the
+                  host command runs. Say so at the point of consent. */}
+              {!held && !isArmedForThis && (
+                <div className="text-[11px] text-muted mt-0.5 leading-relaxed">
+                  {i18nT('pages.settings.securityPanel.file_delivery_confirm_help')}
+                </div>
+              )}
+
+              {/* Armed but not yet approved: the grant is deliberately NOT
+                  recorded by the click. Show the exact host command that
+                  finishes it, because that step-up is what stops an
+                  agent-driven browser from self-granting. */}
+              {!held && isArmedForThis && (
+                <div
+                  data-testid={`file-delivery-armed-${destinationClass}`}
+                  className="rounded-md border border-border bg-bg-hover px-2.5 py-2 mt-0.5"
+                >
+                  <div className="text-[11px] text-text leading-relaxed">
+                    {i18nT('pages.settings.securityPanel.file_delivery_armed_help')}
+                  </div>
+                  <div className="flex items-center gap-2 mt-1 flex-wrap">
+                    <code className="flex-1 min-w-0 truncate text-[11px] font-mono text-text bg-bg rounded px-2 py-1 select-all" title={armedView?.approve_command || 'kirocrew file-delivery approve'}>
+                      {armedView?.approve_command || 'kirocrew file-delivery approve'}
+                    </code>
+                    <Btn
+                      // Acknowledge only on RESOLUTION: copyToClipboard guards a
+                      // missing Clipboard API and falls back to execCommand, so a
+                      // plain-HTTP dashboard still copies; a false "Copied" would
+                      // let the owner paste stale text into a 10-minute window.
+                      onClick={() => {
+                        setCmdCopyFailed(false)
+                        copyToClipboard(armedView?.approve_command || 'kirocrew file-delivery approve').then(
+                          ok => { if (ok) setCmdCopied(true); else setCmdCopyFailed(true) },
+                          () => { setCmdCopied(false); setCmdCopyFailed(true) },
+                        )
+                      }}
+                      aria-label={i18nT('pages.settings.securityPanel.file_delivery_copy_command')}
+                    >
+                      {cmdCopied ? <Check size={12} /> : <Copy size={12} />}
+                      {cmdCopied
+                        ? i18nT('pages.settings.securityPanel.file_delivery_copied')
+                        : i18nT('pages.settings.securityPanel.file_delivery_copy')}
+                    </Btn>
+                  </div>
+                  {cmdCopyFailed && (
+                    <ErrorNotice
+                      variant="inline"
+                      className="mt-1.5"
+                      message={i18nT('pages.settings.securityPanel.file_delivery_copy_failed')}
+                      askAgent
+                      onDismiss={() => setCmdCopyFailed(false)}
+                    />
+                  )}
+                  {typeof armedView?.expires_in === 'number' && (
+                    <div className="text-[11px] text-muted mt-1">
+                      {i18nT('pages.settings.securityPanel.file_delivery_armed_expires', {
+                        // Human duration in LONG form ("about 10 minutes", not
+                        // "10 min"): the step-up deadline is safety-relevant, so
+                        // it must not read as an abbreviation. Rounded to the
+                        // nearest minute since the TTL is coarse.
+                        duration: fmtDuration(
+                          [[Math.max(1, Math.round(armedView.expires_in / 60)), 'minute']],
+                          { unitDisplay: 'long' },
+                        ),
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* A request armed earlier this session has vanished (expired or
+          consumed) and left no recorded grant: say so, rather than letting the
+          command box silently unmount — which reads as the step-up having
+          worked when it may simply have timed out. */}
+      {wasArmed && !anyArmed && (view?.grantable ?? []).every(c => !(view?.grants?.[c])) && (
+        <p className="text-[11px] text-muted mt-2 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.file_delivery_armed_expired')}
+        </p>
+      )}
+
+      {/* Mirrors the tailnet card's `pinned` shape: a Lock plus one read-only
+          sentence, because these legs are not merely unset — they can never be
+          granted, and the upload gate they route through does not read the
+          consent store at all. */}
+      {excluded.length > 0 && (
+        <p className="text-[12px] text-muted mt-2 leading-relaxed flex items-start gap-1">
+          <Lock size={12} className="shrink-0 mt-[3px]" aria-hidden="true" />
+          <span>{i18nT('pages.settings.securityPanel.file_delivery_never_grantable')}</span>
+        </p>
+      )}
+
+      {/* Read and write failures are reported separately: a failed read means the
+          state shown is unknown rather than unconfirmed, while a failed write
+          means the click did not persist. */}
+      {isError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_load_failed')} askAgent />
+      )}
+      {(arm.isError || withdraw.isError) && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_save_failed')} askAgent />
+      )}
+      {/* A failed arm-status read must SAY so rather than silently dropping the
+          command panel: without this, an armed request whose status GET fails
+          leaves the owner with no way to see how to finish approval, and no
+          explanation. Surfaced like the sibling read/write errors above. */}
+      {armed.isError && (
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.file_delivery_arm_status_failed')} askAgent />
+      )}
+    </SettingsCard>
+  )
+}
+
+/**
+ * Catalog KEY per tailnet `state`, and the badge tone that goes with it.
+ *
+ * Two flat `Record`s of plain literals rather than one record of objects, so the
+ * key-reference gate can still resolve `i18nT(TAILNET_STATE_KEY[state])`
+ * statically — a nested `MAP[state].key` is two hops and falls through to the
+ * unresolvable-site count. Module scope for the maps is fine because they hold
+ * KEYS, not copy: a module-scope `i18nT()` would freeze the boot language.
+ *
+ * `pinned` reuses the panel's existing policy wording instead of a second
+ * sentence about admin pins.
+ */
+const TAILNET_STATE_KEY: Record<TailnetStatusData['state'], string> = {
+  active: 'pages.settings.securityPanel.tailnet_state_active',
+  unresolved: 'pages.settings.securityPanel.tailnet_state_unresolved',
+  off: 'pages.settings.securityPanel.tailnet_state_off',
+  pinned: 'pages.settings.securityPanel.disabled_by_policy',
+}
+
+const TAILNET_STATE_VARIANT: Record<TailnetStatusData['state'], 'ok' | 'warn' | 'muted'> = {
+  active: 'ok',
+  unresolved: 'warn',
+  off: 'muted',
+  pinned: 'muted',
+}
+
+/* ── Tailnet origin section ─────────────────────────────────────────────────
+ *
+ * WHY THIS LIVES IN THE SECURITY PANEL, not in a Tailscale/network panel:
+ *
+ *  1. The setting IS an origin/Host allow-list control. Turning it on appends
+ *     this machine's MagicDNS name to the same allowed-origins set that the CSRF
+ *     Origin/Referer gate checks on every write and WebSocket upgrade — the
+ *     "CSRF Protection" layer listed a few sections down. It is a security
+ *     control that happens to be spelled as a Tailscale hostname, not a
+ *     networking preference.
+ *  2. It belongs beside the security-posture rows, which already report
+ *     session-pin state — and the pin caveat below is precisely about that row
+ *     stopping being enforceable behind `tailscale serve`.
+ *  3. The governance pin for `capabilities.tailnet_origin` shows up in THIS
+ *     panel's governance view with no extra wiring, because that view iterates
+ *     `SCOPE_CATALOG`. Putting the control anywhere else would split the switch
+ *     from the policy row that overrides it.
+ *
+ * The card renders off `state` and never recomputes it: the backend owns the
+ * state machine (`pinned` > `off` > `unresolved` > `active`) so the two layers
+ * cannot disagree about what "active" means.
+ */
+function TailnetOriginCard() {
+  const qc = useQueryClient()
+  const { data, isLoading, isError } = useQuery<TailnetStatusData>({
+    queryKey: ['tailnet-status'],
+    queryFn: api.tailnetStatus,
+    // The reported host is the STARTUP resolution, so it cannot change while the
+    // page is open. Only the config-backed `enabled`/pin can, and both of those
+    // invalidate this key on write.
+    staleTime: 300_000,
+  })
+  const save = useMutation({
+    // Write path is the generic config PATCH, not a tailnet-specific route: the
+    // switch persists `dashboard.tailscale.enabled`, and the status endpoint is
+    // read-only because what it reports (the resolved name) is fixed at startup.
+    mutationFn: (next: boolean) => api.patchConfig('dashboard.tailscale.enabled', next),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tailnet-status'] }),
+  })
+  const [copied, setCopied] = useState(false)
+  // Separate from `!copied`: idle and failed both read as not-copied, but only
+  // the failure needs a notice (same split as MobileLoginCard).
+  const [copyFailed, setCopyFailed] = useState(false)
+
+  useEffect(() => {
+    if (!copied) return
+    const id = window.setTimeout(() => setCopied(false), 1500)
+    return () => window.clearTimeout(id)
+  }, [copied])
+
+  // A FAILED read is not "off" — the same rule ThirdPartyAppsCard follows. If the
+  // read failed, the persisted setting may well be on, so collapsing it to off
+  // would both hide the pin caveat while the origin is still trusted and make
+  // the switch write `true` on click, leaving an active grant unrevokable here.
+  if (isError || (!isLoading && data === undefined)) {
+    return (
+      <SettingsCard>
+        <div className="flex items-center justify-between py-1.5">
+          <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.tailnet_title')}</span>
+          <span className="text-[12px] text-muted shrink-0">{i18nT('pages.settings.securityPanel.third_party_apps_state_unknown')}</span>
+        </div>
+        {/* Read failure on a switch-only card → hand-off on. */}
+        <ErrorNotice
+          variant="inline"
+          className="mt-1"
+          message={i18nT('pages.settings.securityPanel.tailnet_unavailable')}
+          askAgent
+        />
+      </SettingsCard>
+    )
+  }
+
+  const state = data?.state
+  // Read off `state`, never off `enabled`: a governed install can carry
+  // `enabled: true` in config while policy forces the capability off, and a
+  // switch sitting at ON there would claim an origin that was never allowed.
+  const effectiveOn = state === 'active' || state === 'unresolved'
+  const pinned = state === 'pinned'
+
+  return (
+    <SettingsCard>
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+          (settingsManual.ts) — the highlight hook queries the rendered label. */}
+      <div className="flex items-start justify-between py-1.5 gap-4" data-setting-label={i18nT('pages.settings.securityPanel.tailnet_title')}>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <Network size={14} className="lucide-inline text-muted shrink-0" />
+            <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.tailnet_title')}</span>
+            <InfoTip text={i18nT('pages.settings.securityPanel.tailnet_tip')} />
+            {state && <Badge variant={TAILNET_STATE_VARIANT[state]}>{i18nT(TAILNET_STATE_KEY[state])}</Badge>}
           </div>
-          <div className="text-[12px] text-muted mt-0.5 leading-relaxed">
-            {i18nT('pages.settings.securityPanel.third_party_apps_desc')}
+          <div className="text-[12px] text-muted mt-1 leading-relaxed">
+            {i18nT('pages.settings.securityPanel.tailnet_desc')}
           </div>
         </div>
-        <span className="shrink-0">
-          {/* On a FAILED read, render no switch at all rather than a disabled
-              one. `role="switch"` supports only aria-checked true/false — ARIA
-              has no "unknown" for it (`mixed` is checkbox-only) — so any switch
-              we render here would assert a state we could not read, and a
-              screen-reader user would simply hear "not checked". Disabling it
-              stops the write but does not retract the claim. A transient
-              loading read keeps the disabled switch: it resolves on its own. */}
-          {isError ? (
-            <span className="text-[12px] text-muted">
-              {i18nT('pages.settings.securityPanel.third_party_apps_state_unknown')}
-            </span>
-          ) : (
-            <Toggle
-              checked={allowed}
-              onChange={next => save.mutate(next)}
-              disabled={stateUnknown || save.isPending}
-              label={i18nT('pages.settings.securityPanel.third_party_apps_title')}
-            />
-          )}
+        <span className="shrink-0 flex items-center gap-1.5">
+          {pinned && <Lock size={13} className="lucide-inline text-muted" aria-hidden="true" />}
+          <Toggle
+            checked={effectiveOn}
+            onChange={next => save.mutate(next)}
+            disabled={isLoading || pinned || save.isPending}
+            label={i18nT('pages.settings.securityPanel.tailnet_title')}
+          />
         </span>
       </div>
 
-      {isError && (
-        <div className="text-[12px] text-warn mt-1 flex items-start gap-1.5 leading-relaxed">
-          <AlertTriangle size={13} className="shrink-0 mt-0.5" />
-          <span>{i18nT('pages.settings.securityPanel.third_party_apps_unavailable')}</span>
+      {/* Three status chips. Each is a FACT the endpoint reported, not a verdict:
+          whether a name went into the allow-list, when that happened, and
+          whether the per-device session pin can still bind. Rendered whenever
+          the feature is on, including `unresolved` — the negative values are the
+          whole point of that state. */}
+      {effectiveOn && (
+        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+          <StatusChip
+            label={i18nT('pages.settings.securityPanel.tailnet_chip_allowlist')}
+            value={state === 'active'
+              ? i18nT('pages.settings.securityPanel.tailnet_chip_allowlist_added')
+              : i18nT('pages.settings.securityPanel.tailnet_chip_allowlist_absent')}
+            variant={state === 'active' ? 'ok' : 'warn'}
+          />
+          <StatusChip
+            label={i18nT('pages.settings.securityPanel.tailnet_chip_resolved')}
+            value={data && data.resolved_at > 0
+              ? fmtTimeNumeric(data.resolved_at * 1000)
+              : i18nT('pages.settings.securityPanel.tailnet_chip_resolved_never')}
+            variant={data && data.resolved_at > 0 ? 'muted' : 'warn'}
+          />
+          {/* Constant by construction, not a read: no same-host tunnel can make
+              the pin bind, so this chip states a property of the deployment
+              shape rather than a value the server measured. */}
+          <StatusChip
+            label={i18nT('pages.settings.securityPanel.tailnet_chip_pin')}
+            value={i18nT('pages.settings.securityPanel.tailnet_chip_pin_unbound')}
+            variant="warn"
+          />
         </div>
       )}
 
-      {allowed && !stateUnknown && (
-        <div className="text-[12px] text-warn mt-1 flex items-start gap-1.5 leading-relaxed">
-          <AlertTriangle size={13} className="shrink-0 mt-0.5" />
-          <span>{i18nT('pages.settings.securityPanel.third_party_apps_on_warning')}</span>
+      {/* Copyable origin row. Present only in `active`, because that is the only
+          state in which an origin string exists AND is trusted. */}
+      {state === 'active' && data && (
+        <div className="mt-2.5 rounded-md border border-border bg-bg-elevated px-3 py-2">
+          <div className="text-[11px] text-muted uppercase tracking-wider font-medium">
+            {i18nT('pages.settings.securityPanel.tailnet_origin_label')}
+          </div>
+          <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <code className="flex-1 min-w-0 truncate text-[13px] font-mono text-text-strong select-all" title={data.origin}>
+              {data.origin}
+            </code>
+            <Btn
+              // Acknowledge only on RESOLUTION. Setting "Copied" synchronously
+              // claims a write that can still reject (clipboard permission, or
+              // no `navigator.clipboard` at all outside a secure context), and a
+              // false "Copied" is worse than no feedback: the user pastes stale
+              // content believing this one is on the clipboard.
+              onClick={() => {
+                setCopyFailed(false)
+                // The shared helper guards a missing Clipboard API and falls back
+                // to `execCommand`, resolving `false` (never rejecting) when both
+                // fail — so a plain-HTTP dashboard still copies where a direct
+                // `navigator.clipboard.writeText` would not exist at all.
+                copyToClipboard(data.origin).then(ok => {
+                  if (ok) setCopied(true); else setCopyFailed(true)
+                })
+              }}
+              aria-label={i18nT('pages.settings.securityPanel.tailnet_copy_origin')}
+            >
+              {copied ? <Check size={12} /> : <Copy size={12} />}
+              {copied
+                ? i18nT('pages.settings.securityPanel.tailnet_copied')
+                : i18nT('pages.settings.securityPanel.tailnet_copy')}
+            </Btn>
+            {/* An anchor, not a Btn: opening a URL is navigation, so it must be
+                middle-clickable and reachable by a screen reader as a link.
+                Btn's own classes are reused so the pair still reads as one
+                control group. */}
+            <a
+              href={data.origin}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-border bg-transparent text-[13px] text-muted no-underline font-body transition-all hover:text-text hover:border-border-strong hover:bg-bg-hover"
+            >
+              <ExternalLink size={12} />
+              {i18nT('pages.settings.securityPanel.tailnet_open')}
+            </a>
+          </div>
         </div>
       )}
 
-      <div className="text-[11px] text-muted mt-2 leading-relaxed">
-        {i18nT('pages.settings.securityPanel.third_party_apps_scope_note')}
-      </div>
+      {/* `unresolved`: on, but nothing was trusted. Says exactly that and no
+          more — the endpoint deliberately ships no daemon-state field, so there
+          is nothing here about whether tailscaled is running. */}
+      {state === 'unresolved' && (
+        <div className="text-[12px] text-warn mt-2 flex items-start gap-1.5 leading-relaxed">
+          <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+          <span>{i18nT('pages.settings.securityPanel.tailnet_unresolved_note')}</span>
+        </div>
+      )}
 
+      {/* The pin caveat is a real limitation of the shipped feature, not a
+          footnote: behind `tailscale serve` every request arrives from
+          127.0.0.1, so the per-device session pin has nothing to bind to and a
+          dashboard link becomes a transferable bearer credential for the whole
+          tailnet. Stated plainly, in the state where it actually applies. */}
+      {state === 'active' && (
+        <div className="text-[12px] text-warn mt-2 flex items-start gap-1.5 leading-relaxed">
+          <ShieldAlert size={13} className="shrink-0 mt-0.5" />
+          <span>
+            {i18nT('pages.settings.securityPanel.tailnet_pin_caveat')}{' '}
+            <a href={`${CODE_BASE}/issues/1762`} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+              {i18nT('pages.settings.securityPanel.tailnet_pin_caveat_link')}
+            </a>
+          </span>
+        </div>
+      )}
+
+      {pinned && (
+        <p className="text-[12px] text-muted mt-2 leading-relaxed">
+          {i18nT('privacyDisclosure.governanceOverrideNote')}
+        </p>
+      )}
+
+      {!pinned && (
+        <div className="text-[11px] text-muted mt-2 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.tailnet_restart_note')}
+        </div>
+      )}
+
+      {/* Switch-only card: nothing to lose on either notice. The origin is
+          `select-all` above, so a failed copy still has a manual path. */}
+      {copyFailed && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-1.5"
+          message={i18nT('pages.settings.securityPanel.tailnet_copy_failed')}
+          askAgent
+          onDismiss={() => setCopyFailed(false)}
+        />
+      )}
       {save.isError && (
-        <div className="text-[12px] text-danger mt-1.5">{i18nT('pages.settings.securityPanel.third_party_apps_save_failed')}</div>
+        <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.third_party_apps_save_failed')} askAgent />
       )}
     </SettingsCard>
+  )
+}
+
+/**
+ * Catalog KEY per central-distribution refresh outcome, and per posture error code.
+ *
+ * Flat `Record`s of full literal keys indexed inline at the `i18nT()` call, the same
+ * shape and for the same reason as `TAILNET_STATE_KEY` above: that is the form
+ * `scripts/check-i18n-keys.mjs` resolves statically, so a key rendered here is a key
+ * it can prove exists.
+ *
+ * Keyed by `string` rather than by the union, and read through an `in` guard, because
+ * these enums are produced by the backend: a value this build has no copy for must
+ * render NOTHING, never a raw backend token standing in for English.
+ */
+const DISTRIBUTION_REFRESH_KEY: Record<string, string> = {
+  applied: 'pages.settings.securityPanel.distribution_refresh_applied',
+  unchanged: 'pages.settings.securityPanel.distribution_refresh_unchanged',
+  rejected: 'pages.settings.securityPanel.distribution_refresh_rejected',
+  unreachable: 'pages.settings.securityPanel.distribution_refresh_unreachable',
+  not_configured: 'pages.settings.securityPanel.distribution_refresh_not_configured',
+}
+
+/** Badge tone for the two refresh outcomes an operator has to act on. Everything
+ *  else falls to the muted default below, deliberately: a green badge is a health
+ *  verdict, and this block reports facts. */
+const DISTRIBUTION_REFRESH_VARIANT: Record<string, 'err' | 'warn'> = {
+  rejected: 'err',
+  unreachable: 'warn',
+}
+
+/**
+ * A coarse interval or age, in the units an operator reads at a glance.
+ *
+ * Days/hours/minutes and no seconds: the poll interval has a 60-second floor and a
+ * cache age is judged against a staleness bound measured in hours, so seconds are
+ * noise on both. `dropZero` is what keeps three days from rendering as `3d 0h 0m`.
+ * Below a minute falls back to seconds, so a cache written moments ago does not read
+ * as `0m` — which on this row would look like a broken measurement.
+ */
+function fmtCoarseSecs(secs: number): string {
+  const s = Math.max(0, Math.floor(secs))
+  if (s < 60) return fmtUnit(s, 'second', { maximumFractionDigits: 0 })
+  return fmtDuration(
+    [
+      [Math.floor(s / 86400), 'day'],
+      [Math.floor((s % 86400) / 3600), 'hour'],
+      [Math.floor((s % 3600) / 60), 'minute'],
+    ],
+    { dropZero: true, maximumFractionDigits: 0 },
+  )
+}
+
+/**
+ * Where the ceiling itself comes from, when an admin publishes one centrally.
+ *
+ * READ-ONLY like the rest of this viewer, and for a stronger reason: the source is
+ * declared in the file-authored policy or in per-machine environment, so a control
+ * here could only ever lie about being able to change it.
+ *
+ * It reports facts and no verdict — the transport, whether the poll loop is alive in
+ * this process, how old the last-known-good copy is, what the most recent refresh did,
+ * and whether the declaration could be resolved at all. Deliberately no "healthy"
+ * badge, by the same rule the section rail follows: a summary that renders its own
+ * verdict keeps asserting it while the read behind it is failing.
+ *
+ * `pending` is the state the rest of the viewer cannot express. A host configured to
+ * fetch a central ceiling whose first fetch has not landed reports `has_policy: false`
+ * and `profile: null`, which is indistinguishable from an ungoverned machine
+ * everywhere else on this page.
+ */
+function PolicyDistributionBlock({ posture, pending }: { posture: GovernanceDistributionData; pending: boolean }) {
+  const interval = posture.refresh_interval_seconds ?? 0
+  const age = posture.cache_age_seconds
+  const status = posture.last_refresh_status ?? ''
+  const errorCode = posture.error_code ?? ''
+  return (
+    <div className="border-b border-border pb-2 mb-2">
+      <div className="flex items-center gap-1.5">
+        <Lock size={11} className="lucide-inline text-muted" />
+        <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">{i18nT('pages.settings.securityPanel.distribution_title')}</span>
+        <InfoTip text={i18nT('pages.settings.securityPanel.distribution_tip')} />
+      </div>
+      <div className="mt-1 flex items-center gap-2 flex-wrap">
+        {/* The SCHEME, never the URL — the producer withholds the endpoint because
+            this page is reachable by the agent's own browser tooling, and it is the
+            fleet's control plane. A scheme still answers what an operator asks here:
+            is the channel encrypted, or is this a local mount.
+            Rendered verbatim rather than through a key map, unlike the two enums
+            below: the transport registry is extensible, so a map would be incomplete
+            by construction and would silently blank out an edition's own scheme. It
+            is an identifier in a mono badge, not copy — there is nothing to
+            translate. */}
+        {posture.source_scheme && (
+          <Badge variant="muted"><Network size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.distribution_source', { scheme: posture.source_scheme })}</Badge>
+        )}
+        {posture.configured && (
+          <Badge variant="muted">
+            <Clock size={11} className="lucide-inline" />{' '}
+            {/* Three distinct facts, not one with two spellings: no interval means
+                boot-only fetching (still centrally governed), an interval with no live
+                loop means a pushed change will NOT bind until the next restart, and a
+                live loop is the state the feature promises. */}
+            {interval <= 0
+              ? i18nT('pages.settings.securityPanel.distribution_boot_only')
+              : posture.refresher_running
+                ? i18nT('pages.settings.securityPanel.distribution_polling', { interval: fmtCoarseSecs(interval) })
+                : i18nT('pages.settings.securityPanel.distribution_polling_stopped')}
+          </Badge>
+        )}
+        {posture.configured && (
+          <Badge variant={posture.cache_present ? 'muted' : 'warn'}>
+            <Package size={11} className="lucide-inline" />{' '}
+            {/* The cache is what keeps a host governed through an outage, so its
+                absence is the fact worth a warn tone: this machine has no fallback
+                if the source goes away. */}
+            {posture.cache_present && typeof age === 'number'
+              ? i18nT('pages.settings.securityPanel.distribution_cache_age', { age: fmtCoarseSecs(age) })
+              : i18nT('pages.settings.securityPanel.distribution_cache_none')}
+          </Badge>
+        )}
+        {status in DISTRIBUTION_REFRESH_KEY && (
+          <Badge variant={DISTRIBUTION_REFRESH_VARIANT[status] ?? 'muted'}>{i18nT(DISTRIBUTION_REFRESH_KEY[status])}</Badge>
+        )}
+        {errorCode === 'misconfigured' && (
+          <Badge variant="warn"><AlertTriangle size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.distribution_error_misconfigured')}</Badge>
+        )}
+      </div>
+      {/* The chips above are the job's status glyphs; the two outcomes that mean
+          the LAST REFRESH FAILED (a rejected or unreachable source) and a
+          declaration the pins cannot parse are failures of a background job —
+          the rule's `last_error` case — so they also render through
+          ErrorNotice. Read-only block, nothing to lose → hand-off on. Literal
+          keys per outcome, not a computed one, so the key gate can see them. */}
+      {(status === 'rejected' || status === 'unreachable' || errorCode === 'misconfigured') && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-1.5"
+          message={errorCode === 'misconfigured'
+            ? i18nT('pages.settings.securityPanel.distribution_error_misconfigured_detail')
+            : status === 'rejected'
+              ? i18nT('pages.settings.securityPanel.distribution_refresh_rejected_detail')
+              : i18nT('pages.settings.securityPanel.distribution_refresh_unreachable_detail')}
+          askAgent
+        />
+      )}
+      {pending && (
+        <div className="text-[12px] text-warn mt-1.5 flex items-start gap-1.5 leading-relaxed">
+          <AlertTriangle size={13} className="lucide-inline shrink-0 mt-0.5" />
+          <span>{i18nT('pages.settings.securityPanel.distribution_awaiting_policy')}</span>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -815,6 +1588,16 @@ function GovernancePolicyViewer() {
   // the backend returns via `unavailable`. Enforcement is server-side and
   // unaffected either way; this only governs what the viewer claims.
   const unavailable = isError || data?.unavailable
+
+  // Central distribution reports itself on BOTH the normal and the fail-safe
+  // snapshot, so it survives `unavailable` — a host whose governance resolution
+  // glitched still knows where its ceiling is fetched from, and that is exactly when
+  // an operator needs to be told. A misconfigured declaration reports
+  // `configured: false` (the fleet DID point this host somewhere, the pins just do not
+  // parse), so the block renders on either signal or the one state that most needs
+  // saying is the one that disappears.
+  const distribution = data?.distribution
+  const distributionConfigured = !!distribution && (distribution.configured || !!distribution.error_code)
 
   const byScope = useMemo(() => {
     const m = new Map<string, GovernanceScope>()
@@ -845,10 +1628,22 @@ function GovernancePolicyViewer() {
     })
   }, [data, byScope])
 
+  // Profiles naming capability scopes this build does not register — a
+  // companion edition's scopes (or a misspelled key), tolerated at load and
+  // inert here. Empty lists are filtered so a profile can never render a badge
+  // with nothing after it. Deliberately NOT memoized: compareText resolves the
+  // active language per call, and a useMemo whose deps exclude the language
+  // would keep the old sort order across a language switch.
+  const unknownScopeRows = Object.entries(data?.unknown_profile_scopes ?? {})
+    .filter(([, scopes]) => scopes.length > 0)
+    .sort(([a], [b]) => compareText(a, b))
+
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.governance_policy')}>
       <SettingsCard>
-        <div className="flex items-start gap-3 pb-1">
+        {/* data-setting-label: deep-link anchor for the manual registry entry
+            (settingsManual.ts) — the highlight hook queries the rendered label. */}
+        <div className="flex items-start gap-3 pb-1" data-setting-label={i18nT('pages.settings.securityPanel.governance_policy')}>
           <div className="mt-0.5 shrink-0 w-7 h-7 rounded-md bg-accent-subtle flex items-center justify-center text-accent">
             <Gavel size={14} className="lucide-inline" />
           </div>
@@ -860,14 +1655,41 @@ function GovernancePolicyViewer() {
           </div>
         </div>
 
+        {/* Rendered OUTSIDE the branch tree below, not inside one arm of it. Every
+            arm is a claim about the ceiling, and where the ceiling comes from
+            qualifies all three of them: the soft "temporarily unavailable" notice, the
+            reassuring "no enterprise policy" card, and the governed rows. Putting it
+            here is what keeps `unavailable` from swallowing a distribution state the
+            payload did report. */}
+        {distributionConfigured && distribution && (
+          // `pending` is gated on `!unavailable` because the fail-safe snapshot sets
+          // `has_policy: false` UNCONDITIONALLY — it is what the backend answers when it
+          // could not resolve the ceiling at all, not a report that there is none. Read
+          // as pending it would tell an operator no enterprise ceiling restricts the
+          // host surface on a machine whose ceiling is installed and enforcing, which is
+          // the same false reassurance the term below exists to remove, in the other
+          // direction.
+          <PolicyDistributionBlock posture={distribution} pending={!unavailable && !data?.has_policy} />
+        )}
+
         {isLoading ? (
           <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_governance_policy')}</div>
         ) : unavailable ? (
-          <div className="flex items-start gap-2.5 py-2 mt-1">
-            <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
-            <span className="text-[12px] text-muted leading-relaxed">{i18nT('pages.settings.securityPanel.governance_status_is_temporarily_unavailable_enf')}</span>
-          </div>
-        ) : !data?.has_policy && !data?.profile ? (
+          // A failed read or the backend's fail-safe snapshot. Read-only viewer,
+          // nothing to lose → hand-off on.
+          <ErrorNotice
+            className="mt-1"
+            message={i18nT('pages.settings.securityPanel.governance_status_is_temporarily_unavailable_enf')}
+            askAgent
+          />
+        ) : /* `!distributionConfigured` is a load-bearing term, not a tidy-up. A host
+              pointed at a central ceiling whose first fetch has not landed reports
+              `has_policy: false` and `profile: null`, so without it this arm renders a
+              reassuring "no enterprise policy in effect" — with a green shield — for a
+              machine that is supposed to have one and could not get it. It yields to
+              the scope rows instead, which say every scope is unrestricted, and the
+              distribution block above says why. */
+          !data?.has_policy && !data?.profile && unknownScopeRows.length === 0 && !distributionConfigured ? (
           <div className="flex items-start gap-2.5 py-3 mt-1 rounded-md bg-bg-elevated border border-border px-3">
             <ShieldCheck size={16} className="lucide-inline text-ok shrink-0 mt-0.5" />
             <div>
@@ -885,6 +1707,53 @@ function GovernancePolicyViewer() {
                 <Badge variant="muted"><ListChecks size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.profile')} {data.profile}</Badge>
               )}
             </div>
+            {(data?.fallback_profiles?.length ?? 0) > 0 && (
+              <div className="flex items-start gap-2.5 py-2.5 mt-1 mb-1 rounded-md bg-warn/10 border border-warn/30 px-3">
+                <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
+                <div className="text-[12px] text-text leading-relaxed">
+                  {/* Title on its OWN line, not joined to the body by a space:
+                      inline they render as one run-on sentence ("… in effect A
+                      profile named below could not be loaded"). */}
+                  <div className="font-semibold">{i18nT('pages.settings.securityPanel.profile_unusable_title')}</div>
+                  <div>
+                    {i18nT('pages.settings.securityPanel.profile_unusable_body')}
+                    {/* fmtList for the same reason the other_bound_surfaces block
+                        below gives: zh joins with 、 and no spaces, so a literal
+                        ', ' renders wrong in several of the twelve locales. */}
+                    {' '}{i18nT('pages.settings.securityPanel.profile_unusable_which', { profiles: fmtList(data!.fallback_profiles!, { type: 'unit' }) })}
+                  </div>
+                  {/* The cause list and the restart caveat are the rare edge of a
+                      rare state; demoted so the two sentences that matter are not
+                      buried in a paragraph wall at 12px. */}
+                  <div className="text-muted mt-1">{i18nT('pages.settings.securityPanel.profile_unusable_detail')}</div>
+                </div>
+              </div>
+            )}
+            {/* Profiles naming capability scopes this build does not register —
+                typically a companion edition's scopes, tolerated at load and
+                inert here. Rendered so a reader auditing a profile file can
+                account for every key it declares, not just the ones this build
+                enforces. Reachable even with no policy and no host profile: the
+                payload aggregates EVERY loaded profile (see client.ts), so the
+                no-policy branch above yields to this block when rows exist. */}
+            {unknownScopeRows.length > 0 && (
+              <div className="border-t border-border pt-2 mt-2">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">{i18nT('pages.settings.securityPanel.unknown_scopes_title')}</span>
+                  <InfoTip text={i18nT('pages.settings.securityPanel.unknown_scopes_tip')} />
+                </div>
+                <div className="mt-1 space-y-1">
+                  {unknownScopeRows.map(([stem, scopes]) => (
+                    <div key={stem} className="flex items-center gap-2 flex-wrap">
+                      <Badge variant="muted"><ListChecks size={11} className="lucide-inline" /> {stem}</Badge>
+                      {/* fmtList for the same reason as the profile_unusable
+                          block above: zh joins with 、 and no spaces. */}
+                      <span className="text-[11px] font-mono text-muted break-all">{fmtList(scopes, { type: 'unit' })}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {planeRows.map(({ plane, rows }) => rows.length === 0 ? null : (
               <div key={plane.key} className="border-t border-border first:border-t-0 pt-1.5 mt-1.5 first:mt-0 first:pt-0">
                 <div className="flex items-center gap-1.5 py-1">
@@ -921,6 +1790,43 @@ type ConfirmTarget =
   | { kind: 'builtin'; id: string; description: string }
   | { kind: 'disable-all' }
 
+/* ── Third-party trust confirm target ── */
+type TrustConfirmTarget =
+  // Turning the BLANKET third-party-app trust flag on. Same acknowledgement gate
+  // as a deny opt-out: both widen what un-reviewed code is allowed to do.
+  | { kind: 'trust-all' }
+  // Revoking one app's grant. Confirmed, unlike the other revoke-ish controls in
+  // this panel, because it is the one that STOPS something the user is using: the
+  // app is disabled and quits working. The consequence has to be on screen BEFORE
+  // the click, not reported after it.
+  | { kind: 'revoke-app'; name: string }
+
+/**
+ * The operator-facing reason a trust change failed, from an `ApiError`.
+ *
+ * The backend's prose is preferred over a generic "request failed" because the
+ * two 409s here are not retry-and-hope conditions: `trust_setting_overlay_owned`
+ * names the FILE and KEY the user has to edit (nothing the UI can do for them,
+ * since `config.local.json` is user-owned and never written by Kiro Crew), and
+ * `blanket_trust_sweep_incomplete` names the apps still executing after trust was
+ * withdrawn. Collapsing either into "something went wrong" hides the only
+ * actionable part.
+ */
+export function trustFailureMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    try {
+      const parsed = JSON.parse(err.body) as { error?: unknown }
+      if (typeof parsed.error === 'string' && parsed.error.trim()) return parsed.error
+    } catch {
+      // not JSON — fall through to the mapped message
+    }
+    return err.message
+  }
+  return err instanceof Error && err.message
+    ? err.message
+    : i18nT('pages.settings.securityPanel.trustedApps.unknown_error')
+}
+
 /* ── Live Security Posture section ── */
 
 /** The two single-valued modes plus the live posture registry.
@@ -952,6 +1858,12 @@ function PostureSection() {
 
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.live_security_posture')}>
+      <MobileLoginCard />
+      {/* data-setting-label: deep-link anchor for the manual registry entry
+        * (settingsManual.ts `security.live-security-posture`) — the section is
+        * raw markup the extractor cannot see, so without this the highlight
+        * would querySelector a label no element carries and silently no-op. */}
+      <div data-setting-label={i18nT('pages.settings.securityPanel.live_security_posture')}>
       <SettingsCard>
         {/* Non-expandable rows: single-valued modes, not counted sets. */}
         <StatusRow icon={<Lock size={14} />} label={i18nT('pages.settings.securityPanel.process_sandbox')} value={i18nT('pages.settings.securityPanel.standard')} variant="ok"
@@ -971,12 +1883,12 @@ function PostureSection() {
             {i18nT('pages.settings.securityPanel.click_any_control_to_see_exactly_what_it_covers')}
           </div>
           {postureError ? (
-            <div className="flex items-start gap-2.5 py-2">
-              <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
-              <span className="text-[12px] text-muted leading-relaxed">
-                {i18nT('pages.settings.securityPanel.security_posture_detail_is_temporarily_unavailab')}
-              </span>
-            </div>
+            // Read failure on a read-only status list → hand-off on.
+            <ErrorNotice
+              className="my-1"
+              message={i18nT('pages.settings.securityPanel.security_posture_detail_is_temporarily_unavailab')}
+              askAgent
+            />
           ) : postureLoading ? (
             <div className="text-[12px] text-muted py-2">{i18nT('pages.settings.securityPanel.loading_security_posture')}</div>
           ) : (
@@ -1032,6 +1944,7 @@ function PostureSection() {
           )}
         </div>
       </SettingsCard>
+      </div>
     </SettingsSection>
   )
 }
@@ -1043,9 +1956,18 @@ function PostureSection() {
  * rules across 10 categories) and there is no reason to build it while the
  * reader is looking at something else.
  */
-function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraftChange: (next: string) => void }) {
+function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftChange }: { draft: string; onDraftChange: (next: string) => void; noteDraft: string; onNoteDraftChange: (next: string) => void }) {
   const qc = useQueryClient()
-  const { data: dc } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
+  const { data: dc, isError: dcError } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
+  // One surface for the four rule writes below, keyed to the row (or the
+  // disable-all switch) whose write was rejected so it renders BESIDE that
+  // control — a long rule list puts a top-of-card banner off-screen from the
+  // toggle that snapped back. Each used to fail silently (the 409 reason on a
+  // pinned rule was invalidated away; the others had no onError at all).
+  const [ruleError, setRuleError] = useState<{ id: string; message: string } | null>(null)
+  // The disable-all switch is not a row, so its rejection has its own slot
+  // rather than a sentinel id in `ruleError`.
+  const [disableAllError, setDisableAllError] = useState('')
 
   const [confirm, setConfirm] = useState<ConfirmTarget | null>(null)
   const [ack, setAck] = useState(false)
@@ -1064,23 +1986,58 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
 
   const toggleBuiltin = useMutation({
     mutationFn: (v: { id: string; enabled: boolean }) => api.toggleBuiltinDeniedCommand(v.id, v.enabled),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
+    // A rejected toggle (409 on a pinned or floor-enforced rule — reachable
+    // from a stale cached bundle) must repaint the true locked state instead
+    // of leaving the optimistic-looking switch position on screen — AND say
+    // why, or the snap-back reads as a switch that never moved.
+    onError: (err: unknown, v) => {
+      setRuleError({ id: v.id, message: trustFailureMessage(err) })
+      qc.invalidateQueries({ queryKey: ['denied-commands'] })
+    },
   })
   const setDisableAll = useMutation({
     mutationFn: (value: boolean) => api.setDeniedCommandsDisableAll(value),
+    onMutate: () => { setRuleError(null); setDisableAllError('') },
     onSuccess: applySnapshot,
+    onError: (err: unknown) => setDisableAllError(trustFailureMessage(err)),
   })
   const addUser = useMutation({
-    mutationFn: (pattern: string) => api.addUserDeniedCommand(pattern),
-    onSuccess: applySnapshot,
+    mutationFn: ({ pattern, note }: { pattern: string; note: string }) =>
+      api.addUserDeniedCommand(pattern, note),
+    // Clear the drafts only once the write landed AND only if the form is still
+    // provably untouched since submit -- BOTH fields matching what was sent. This
+    // is deliberately all-or-nothing rather than per-field:
+    //   - a rejected add (a note carrying the refusal prefix is a 400) must leave
+    //     the operator's text in place to correct, not make them retype it;
+    //   - the inputs stay editable while the add is in flight, so an operator who
+    //     starts the next rule would otherwise have it erased on resolution;
+    //   - clearing per-field loses a note the operator DELIBERATELY reused for the
+    //     next rule while retyping only the pattern.
+    // The condition is closed, not a heuristic: the single state we clear in is
+    // "nothing new was typed", so no newer input can be discarded in any other.
+    // Compared trimmed, because submit() sends the trimmed values.
+    onSuccess: (snap: DeniedCommandsData, vars: { pattern: string; note: string }) => {
+      applySnapshot(snap)
+      const untouched = draft.trim() === vars.pattern && noteDraft.trim() === vars.note
+      if (untouched) {
+        onDraftChange('')
+        onNoteDraftChange('')
+      }
+    },
   })
   const toggleUser = useMutation({
     mutationFn: (v: { id: string; enabled: boolean }) => api.toggleUserDeniedCommand(v.id, v.enabled),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
+    onError: (err: unknown, v) => setRuleError({ id: v.id, message: trustFailureMessage(err) }),
   })
   const deleteUser = useMutation({
     mutationFn: (id: string) => api.deleteUserDeniedCommand(id),
+    onMutate: () => setRuleError(null),
     onSuccess: applySnapshot,
+    onError: (err: unknown, id) => setRuleError({ id, message: trustFailureMessage(err) }),
   })
 
   const grouped = useMemo(() => {
@@ -1093,29 +2050,37 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
 
   const query = filter.trim().toLowerCase()
   const filtering = query.length > 0
+  // Rule ids are hyphen-joined slugs (`aws-destructive-ec2-run-instances`), but
+  // the same id is naturally read -- and typed -- as `<category>.<slug>`. Accept
+  // that dotted spelling too so a copied id always finds its rule.
+  const idQuery = query.replace(/\./g, '-')
 
   /** Categories reduced to their matching rules. A category whose NAME matches
    *  keeps all of its rules, so searching "credential" reads as a category jump
-   *  rather than a partial list. */
+   *  rather than a partial list. Matching is additive across the category key,
+   *  its display label, and each rule's id, description and pattern. */
   const visibleGroups = useMemo(() => {
     if (!query) return grouped
     const out: Record<string, DeniedCommandRule[]> = {}
     for (const [category, rules] of Object.entries(grouped)) {
-      const hits = categoryLabel(category).toLowerCase().includes(query)
+      const hits = category.toLowerCase().includes(idQuery) || categoryLabel(category).toLowerCase().includes(query)
         ? rules
         : rules.filter(r =>
-          r.description.toLowerCase().includes(query)
+          r.id.toLowerCase().includes(idQuery)
+          || r.description.toLowerCase().includes(query)
           || r.pattern.toLowerCase().includes(query))
       if (hits.length > 0) out[category] = hits
     }
     return out
-  }, [grouped, query])
+  }, [grouped, query, idQuery])
 
   const visibleUserRules = useMemo(() => {
     const rules = dc?.user_added ?? []
     if (!query) return rules
-    return rules.filter(r => r.pattern.toLowerCase().includes(query))
-  }, [dc, query])
+    return rules.filter(r =>
+      r.id.toLowerCase().includes(idQuery)
+      || r.pattern.toLowerCase().includes(query))
+  }, [dc, query, idQuery])
 
   const matchedRules = Object.values(visibleGroups).reduce((n, rules) => n + rules.length, 0)
   const nothingMatches = filtering && matchedRules === 0 && visibleUserRules.length === 0
@@ -1133,7 +2098,6 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
     if (next) setConfirm({ kind: 'disable-all' })
     else setDisableAll.mutate(false)
   }
-
   const runConfirm = () => {
     if (!confirm) return
     if (confirm.kind === 'builtin') toggleBuiltin.mutate({ id: confirm.id, enabled: false })
@@ -1145,11 +2109,67 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
     ? i18nT('pages.settings.securityPanel.disabling_all_built_in_denies_removes_kirocrew_s')
     : i18nT('pages.settings.securityPanel.disabling_weakens_protection', { name: confirm.description })
 
+  // The one askAgent decision for every notice in this section: the add-pattern
+  // form's `draft` / `noteDraft` live in the panel shell and the hand-off
+  // navigation would discard them, so the button is offered only while both
+  // are empty.
+  const errorHandoff = !draft.trim() && !noteDraft.trim()
+
+  // Whether the row that owns `ruleError` is on screen right now. A write can be
+  // rejected after the user has typed a filter that drops the row, or folded its
+  // category — the row-level notice then has nowhere to render, so the section
+  // falls back to a top-level notice for exactly that case (and only that case,
+  // so a visible row never shows its failure twice).
+  const ruleErrorRowVisible = (() => {
+    if (!ruleError) return true
+    for (const [category, rules] of Object.entries(visibleGroups)) {
+      if (rules.some(r => r.id === ruleError.id)) return filtering || expandedCats.has(category)
+    }
+    return visibleUserRules.some(r => r.id === ruleError.id)
+  })()
+
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.denied_commands')}>
+      {/* askAgent is gated on the add form: `draft` / `noteDraft` (the custom
+          pattern and note, held by the panel shell) are unsaved input, so the
+          hand-off is offered only while both are empty. No hand-off otherwise:
+          the deny-pattern draft. A failed list read must not render as empty
+          groups. Rejected rule writes render beside their own row (see
+          `rowError` below), not here. */}
+      {dcError && (
+        <ErrorNotice
+          className="mb-3"
+          message={i18nT('pages.settings.securityPanel.denied_commands_load_failed')}
+          askAgent={errorHandoff}
+        />
+      )}
+      {/* Fallback for a rejected rule write whose row is filtered out or folded
+          away (see `ruleErrorRowVisible`): the failure still needs a surface. */}
+      {ruleError && !ruleErrorRowVisible && (
+        <ErrorNotice
+          className="mb-3"
+          message={ruleError.message}
+          onDismiss={() => setRuleError(null)}
+          askAgent={errorHandoff}
+          testId="denied-rule-error-hidden-row"
+        />
+      )}
+      {/* The tier's REACH, above BOTH cards: these rules read the command line
+        * a tool call carries and not the body of a program that line runs, so an
+        * operator reading either the built-in list or their own patterns as a
+        * fence over-trusts it. Card B is where a pattern is authored, so the note
+        * cannot live inside Card A. Same disclosure as the "What this tier cannot
+        * see" section of `src/kiro_crew/docs/blocked-commands.md`, which is where
+        * the closure mechanism (the OS-level sandbox) is explained. */}
+      <div className="text-[12px] text-muted mb-2 leading-relaxed" data-testid="denied-indirection-limit">
+        {i18nT('pages.settings.securityPanel.rules_read_the_command_line_not_the_program_body')}
+      </div>
+
       {/* Card A — Built-in denies */}
       <SettingsCard>
-        <div className="flex items-center justify-between py-1.5">
+        {/* data-setting-label: deep-link anchor for the manual registry entry
+            (settingsManual.ts) — the highlight hook queries the rendered label. */}
+        <div className="flex items-center justify-between py-1.5" data-setting-label={i18nT('pages.settings.securityPanel.denied_commands')}>
           <div className="flex-1 min-w-0 mr-4">
             <div className="flex items-center gap-1.5">
               <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.disable_all_built_in_denies')}</span>
@@ -1171,6 +2191,15 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
             <Toggle checked={disableAll} onChange={onDisableAllToggle} disabled={!dc} label={i18nT('pages.settings.securityPanel.disable_all_built_in_denies')} />
           </span>
         </div>
+        {/* The rejected disable-all write, beside its own switch. */}
+        <ErrorNotice
+          variant="inline"
+          className="mb-1"
+          message={disableAllError}
+          onDismiss={() => setDisableAllError('')}
+          askAgent={errorHandoff}
+          testId={disableAllError ? 'denied-disable-all-error' : undefined}
+        />
 
         <div className="text-[12px] text-muted mt-1 mb-2 leading-relaxed">
           {i18nT('pages.settings.securityPanel.disabling_a_rule_that_overlaps_an_always_on_cont')}
@@ -1243,6 +2272,8 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
                   disableAll={disableAll}
                   onRuleToggle={onBuiltinToggle}
                   collapsible={!filtering}
+                  rowError={ruleError}
+                  errorHandoff={errorHandoff}
                 />
               ))}
             </div>
@@ -1256,8 +2287,8 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
       </SettingsCard>
 
       {/* Card B — Your custom denies */}
-      <SettingsCard>
-        <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.your_custom_denies')}</div>
+      <SettingsCard index={1}>
+        <div className="text-[13px] font-semibold text-text" data-setting-label={i18nT('pages.settings.securityPanel.your_custom_denies')}>{i18nT('pages.settings.securityPanel.your_custom_denies')}</div>
         <div className="text-[12px] text-muted mt-0.5 mb-1 leading-relaxed">
           {i18nT('pages.settings.securityPanel.add_your_own_deny_patterns_python_compatible_reg')}
         </div>
@@ -1269,6 +2300,8 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
                 rule={rule}
                 onToggle={next => toggleUser.mutate({ id: rule.id, enabled: next })}
                 onDelete={() => deleteUser.mutate(rule.id)}
+                error={ruleError?.id === rule.id ? ruleError.message : undefined}
+                errorHandoff={errorHandoff}
               />
             ))}
           </div>
@@ -1280,19 +2313,23 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
             {i18nT('pages.settings.securityPanel.custom_patterns_hidden_by_filter')}
           </div>
         )}
-        <AddDenyInput value={draft} onChange={onDraftChange} onAdd={pattern => addUser.mutate(pattern)} busy={addUser.isPending} />
+        <AddDenyInput value={draft} onChange={onDraftChange} note={noteDraft} onNoteChange={onNoteDraftChange} onAdd={(pattern, note) => addUser.mutate({ pattern, note })} busy={addUser.isPending} submitError={addUser.isError ? trustFailureMessage(addUser.error) : ''} />
       </SettingsCard>
 
       {/* ── Confirm modal (disable a built-in rule / disable all) ── */}
       <Modal
         open={confirm !== null}
         onClose={() => setConfirm(null)}
-        title={confirm?.kind === 'disable-all' ? i18nT('pages.settings.securityPanel.disable_all_built_in_denies_2') : i18nT('pages.settings.securityPanel.disable_this_denied_command')}
+        title={confirm?.kind === 'disable-all'
+          ? i18nT('pages.settings.securityPanel.disable_all_built_in_denies_2')
+          : i18nT('pages.settings.securityPanel.disable_this_denied_command')}
         maxWidth={480}
         footer={
           <>
             <Btn onClick={() => setConfirm(null)}>{i18nT('pages.settings.securityPanel.cancel')}</Btn>
-            <Btn danger disabled={!ack} onClick={runConfirm}>{i18nT('pages.settings.securityPanel.disable')}</Btn>
+            <Btn danger disabled={!ack} onClick={runConfirm}>
+              {i18nT('pages.settings.securityPanel.disable')}
+            </Btn>
           </>
         }
       >
@@ -1300,13 +2337,307 @@ function DeniedCommandsSection({ draft, onDraftChange }: { draft: string; onDraf
           <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
           <div className="text-[13px] text-text leading-relaxed">{confirmBody}</div>
         </div>
-        {/* eslint-disable-next-line jsx-a11y/label-has-for -- the Checkbox control is nested inside the label */}
         <label className="flex items-center gap-2.5 mt-4 cursor-pointer">
           <Checkbox checked={ack} onChange={e => setAck(e.target.checked)} />
           <span className="text-[13px] text-text">{i18nT('pages.settings.securityPanel.i_understand_this_weakens_kirocrew_s_protection')}</span>
         </label>
       </Modal>
     </SettingsSection>
+  )
+}
+
+/* ── Third-party app execution ── */
+
+/** Per-app trust grants for third-party app code (`agent.apps_trusted`), plus the
+ *  blanket `agent.apps_allow_third_party` escape hatch.
+ *
+ *  Third-party app code does not run unless it is trusted. Two levers: the
+ *  per-app grants listed here, and the blanket allow-all flag. The allow-all row
+ *  is a `SettingsToggle` rather than a hand-rolled row so it carries
+ *  `data-setting-label` (the deep-link target the App Store links to) and is
+ *  picked up by scripts/gen-settings-registry.mjs. */
+function ThirdPartyAppsCard() {
+  const qc = useQueryClient()
+  // Separate query from denied-commands: a different endpoint, a different
+  // snapshot, and it must keep rendering when either of the two fails.
+  const { data: taRaw, isError: taError } = useQuery<TrustedAppsData>({
+    queryKey: ['trusted-apps'],
+    queryFn: api.listTrustedApps,
+  })
+  // Normalize at the fetch boundary. `ineffective` is newer than `apps`, so a
+  // newer dashboard talking to an older gateway (or any response shape that drops
+  // a list) would otherwise reach `ta.ineffective.length` and throw — taking down
+  // the WHOLE Security page, not just this card. The i18n render gate caught
+  // exactly that on /settings/security.
+  const ta = useMemo(
+    () =>
+      taRaw
+        ? {
+          ...taRaw,
+          apps: Array.isArray(taRaw.apps) ? taRaw.apps : [],
+          ineffective: Array.isArray(taRaw.ineffective) ? taRaw.ineffective : [],
+          allowAll: taRaw.allowAll === true,
+        }
+        : undefined,
+    [taRaw],
+  )
+  // A FAILED read, not a slow one: no actionable control, and say so.
+  const taUnavailable = taError === true
+
+  const [confirm, setConfirm] = useState<TrustConfirmTarget | null>(null)
+  const [ack, setAck] = useState(false)
+  // Name of the app whose revoke ALSO disabled it, so the panel can say so.
+  // Cleared on the next revoke, so the notice always refers to the last action.
+  const [revokeDisabledApp, setRevokeDisabledApp] = useState<string | null>(null)
+  // A trust mutation can FAIL in ways the operator has to see rather than infer
+  // from a toggle springing back: the setting may be owned by config.local.json
+  // (so writing config.json would change nothing), or the blanket-off sweep may
+  // have left apps running. Both arrive as a 409 with a `code`, and both mean
+  // "the thing you asked for did not happen" — silence here would reproduce, in
+  // the UI, exactly the false-success the backend fixed.
+  const [trustError, setTrustError] = useState<string | null>(null)
+
+  // The acknowledgment checkbox resets whenever the modal opens or closes.
+  useEffect(() => { setAck(false) }, [confirm])
+
+  const applyTrustSnapshot = (snap: TrustedAppsData) => {
+    // Field-by-field rather than the whole response: the revoke result carries an
+    // extra `disabled` flag that belongs to that one action, not to the snapshot.
+    qc.setQueryData(['trusted-apps'], {
+      apps: snap.apps,
+      ineffective: snap.ineffective,
+      allowAll: snap.allowAll,
+    })
+    // Trust changes gate whether an app's code may run, so the App Store's own
+    // enable/disable state can change underneath us — refetch it too.
+    qc.invalidateQueries({ queryKey: ['apps'] })
+  }
+  const setTrustAll = useMutation({
+    mutationFn: (value: boolean) => api.setTrustAllApps(value),
+    onSuccess: snap => {
+      setTrustError(null)
+      applyTrustSnapshot(snap)
+    },
+    onError: (err: unknown) => setTrustError(trustFailureMessage(err)),
+  })
+  const untrust = useMutation({
+    mutationFn: (name: string) => api.untrustApp(name),
+    onSuccess: (snap, name) => {
+      setTrustError(null)
+      applyTrustSnapshot(snap)
+      // Only surface the notice when the backend actually disabled something —
+      // revoking trust on an already-disabled app is a silent no-op there.
+      setRevokeDisabledApp(snap.disabled ? name : null)
+    },
+    onError: (err: unknown) => setTrustError(trustFailureMessage(err)),
+  })
+
+  // Granting blanket trust WEAKENS protection → acknowledgement gate. Revoking
+  // it tightens, so it applies immediately (same asymmetry as the deny rules).
+  const onTrustAllToggle = (next: boolean) => {
+    if (next) setConfirm({ kind: 'trust-all' })
+    else setTrustAll.mutate(false)
+  }
+
+  const runConfirm = () => {
+    if (!confirm) return
+    if (confirm.kind === 'trust-all') setTrustAll.mutate(true)
+    else untrust.mutate(confirm.name)
+    setConfirm(null)
+  }
+
+  const confirmBody = !confirm ? '' : confirm.kind === 'trust-all'
+    ? i18nT('pages.settings.securityPanel.trustedApps.allow_all_confirm_body')
+    : i18nT('pages.settings.securityPanel.trustedApps.revoke_confirm_body', { name: confirm.name })
+  // Revoking one grant TIGHTENS security — it withdraws permission and stops the
+  // app. It still needs a confirm (the app stops working, which the user must see
+  // coming) but not an "I understand this weakens protection" acknowledgement:
+  // demanding one for the safe direction trains people to tick the box without
+  // reading, which is exactly what makes it worthless on the dangerous direction.
+  const needsAck = confirm?.kind === 'trust-all'
+
+  return (
+    <>
+      <SettingsCard>
+        <div className="text-[12px] text-muted mb-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.trustedApps.description')}
+        </div>
+
+        {/* UNKNOWN is not OFF. If the snapshot has not resolved, the persisted
+            flag may well be on, and rendering the switch at OFF would be wrong
+            twice over: the blanket-trust warning below stays hidden while
+            third-party code is still admitted, and a click would write `true`
+            onto an ALREADY-true setting rather than revoking it. So on a failed
+            read render no switch at all — `role="switch"` has no "unknown"
+            (aria-checked `mixed` is checkbox-only), so any switch here would
+            assert a state we could not read. A still-loading read keeps the
+            disabled switch, since it resolves on its own. */}
+        {taUnavailable ? (
+          // Read failure on a switch-only card → hand-off on.
+          <ErrorNotice
+            variant="inline"
+            className="py-1.5"
+            message={i18nT('pages.settings.securityPanel.third_party_apps_unavailable')}
+            askAgent
+          />
+        ) : (
+          <SettingsToggle
+            label={i18nT('pages.settings.securityPanel.trustedApps.allow_all_label')}
+            description={i18nT('pages.settings.securityPanel.trustedApps.allow_all_description')}
+            checked={ta?.allowAll === true}
+            onChange={onTrustAllToggle}
+            disabled={!ta}
+          />
+        )}
+
+        {/* What switching it back off actually does. #1414 shipped this string
+            saying an already-running app stays up; that stopped being true once
+            the falling edge gained a teardown sweep, so the copy was corrected
+            and is rendered here rather than left orphaned in the catalogs. */}
+        <div className="text-[12px] text-muted py-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.third_party_apps_scope_note')}
+        </div>
+
+        {/* The blanket flag's real cost, in the words #1414 already shipped and
+            translated: it trusts every third-party app including future ones. */}
+        {ta?.allowAll === true && (
+          <div className="flex items-start gap-1.5 text-[12px] text-warn py-1.5 leading-relaxed">
+            <AlertTriangle size={13} className="shrink-0 mt-0.5" />
+            <span>{i18nT('pages.settings.securityPanel.third_party_apps_on_warning')}</span>
+          </div>
+        )}
+
+        {ta && (ta.apps.length === 0 ? (
+          <div className="text-[12px] text-muted py-2 leading-relaxed border-t border-border mt-1 pt-2">
+            {i18nT('pages.settings.securityPanel.trustedApps.empty')}
+          </div>
+        ) : (
+          <div className="divide-y divide-border border-t border-border mt-1">
+            {ta.apps.map(name => (
+              <div key={name} data-testid={`trusted-app-${name}`} className="flex items-center gap-2.5 py-2">
+                <Package size={14} className="lucide-inline shrink-0 text-muted" />
+                <code className="flex-1 min-w-0 text-[12px] font-mono text-text break-all">{name}</code>
+                <Badge variant="warn">{i18nT('pages.settings.securityPanel.trustedApps.trusted_badge')}</Badge>
+                {/* The consequence is stated BEFORE the click (hint here, full
+                    sentence in the confirm), because revoking stops an app the
+                    user is actively using — learning that afterwards is the
+                    failure a first-run reviewer flagged as a blocker. */}
+                <span className="text-[11px] text-muted hidden sm:inline">
+                  {i18nT('pages.settings.securityPanel.trustedApps.revoke_hint')}
+                </span>
+                <Btn
+                  danger
+                  disabled={untrust.isPending}
+                  onClick={() => setConfirm({ kind: 'revoke-app', name })}
+                >
+                  {i18nT('pages.settings.securityPanel.trustedApps.revoke')}
+                </Btn>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {/* Stored-but-unenforced entries. `ineffective` is the set the gate
+            IGNORES because the name fails the app-name charset (a hand-edited
+            config.json can hold `LD-App`, a trailing space, a fullwidth
+            homoglyph, `..`, `*`). Rendering them inside the list above claimed
+            trust that does not exist, and left the user with no explanation for
+            why their app was still blocked. Revoke is offered here too — the
+            endpoint deliberately does NOT validate the name being removed, so
+            junk that can never be granted can still be cleared out.
+
+            Explicit color-mix rather than a `bg-card/88` opacity modifier:
+            theme colors are raw `var(--x)` with no <alpha-value>, so a Tailwind
+            opacity suffix silently generates nothing. */}
+        {ta && ta.ineffective.length > 0 && (
+          <div
+            data-testid="trusted-apps-ineffective"
+            className="mt-2 rounded-md border border-border bg-[color-mix(in_srgb,var(--card)_88%,transparent)] px-3 py-2.5"
+          >
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <div className="text-[12px] font-semibold text-text">
+                  {i18nT('pages.settings.securityPanel.trustedApps.ineffective_label')}
+                </div>
+                <div className="text-[12px] text-muted leading-relaxed">
+                  {i18nT('pages.settings.securityPanel.trustedApps.ineffective_description')}
+                </div>
+              </div>
+            </div>
+            <div className="divide-y divide-border border-t border-border mt-2">
+              {ta.ineffective.map(name => (
+                <div key={name} data-testid={`ineffective-app-${name}`} className="flex items-center gap-2.5 py-2">
+                  <Package size={14} className="lucide-inline shrink-0 text-muted" />
+                  <code className="flex-1 min-w-0 text-[12px] font-mono text-muted line-through break-all">{name}</code>
+                  <Btn danger disabled={untrust.isPending} onClick={() => untrust.mutate(name)}>
+                    {i18nT('pages.settings.securityPanel.trustedApps.revoke')}
+                  </Btn>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* A refused trust change (409 codes via trustFailureMessage). The card
+            holds toggles and revoke buttons only — nothing to lose → hand-off on. */}
+        {trustError && (
+          <ErrorNotice
+            className="mt-2"
+            message={i18nT('pages.settings.securityPanel.trustedApps.change_failed', { detail: trustError })}
+            askAgent
+            onDismiss={() => setTrustError(null)}
+          />
+        )}
+        {revokeDisabledApp && (
+          <div className="flex items-start gap-2.5 mt-2 rounded-md bg-bg-elevated border border-border px-3 py-2">
+            <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
+            <span className="text-[12px] text-muted leading-relaxed">
+              {/* `name` is passed whether or not the catalog string interpolates
+                  it — an unused variable is ignored, a missing one would render
+                  the raw `{{name}}` placeholder to the user. */}
+              {i18nT('pages.settings.securityPanel.trustedApps.revoke_disables', { name: revokeDisabledApp })}
+            </span>
+          </div>
+        )}
+      </SettingsCard>
+
+      {/* ── Confirm modal (trust every app / revoke one grant) ── */}
+      <Modal
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        title={confirm?.kind === 'trust-all'
+          ? i18nT('pages.settings.securityPanel.trustedApps.allow_all_label')
+          : confirm
+            ? i18nT('pages.settings.securityPanel.trustedApps.revoke_confirm_title', { name: confirm.name })
+            : ''}
+        maxWidth={480}
+        footer={
+          <>
+            <Btn onClick={() => setConfirm(null)}>{i18nT('pages.settings.securityPanel.cancel')}</Btn>
+            {/* "Disable" is the wrong verb for granting blanket trust. Reuses the
+                existing one-word `trustDropdown.trust` string rather than minting an
+                eleventh catalog key for a word already translated in all locales. */}
+            <Btn danger disabled={needsAck && !ack} onClick={runConfirm}>
+              {confirm?.kind === 'trust-all'
+                ? i18nT('components.trustDropdown.trust')
+                : i18nT('pages.settings.securityPanel.trustedApps.revoke_confirm_ok')}
+            </Btn>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
+          <div className="text-[13px] text-text leading-relaxed">{confirmBody}</div>
+        </div>
+        {needsAck && (
+          <label className="flex items-center gap-2.5 mt-4 cursor-pointer">
+            <Checkbox checked={ack} onChange={e => setAck(e.target.checked)} />
+            <span className="text-[13px] text-text">{i18nT('pages.settings.securityPanel.trustedApps.allow_all_confirm_ack')}</span>
+          </label>
+        )}
+      </Modal>
+    </>
   )
 }
 
@@ -1356,7 +2687,7 @@ function DocsSection() {
  * The rail states which is which before any row is read, and the two large
  * tables (137 rules, ~20 governed scopes) get a pane instead of a fold.
  */
-type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'apps' | 'layers' | 'governance' | 'docs'
+type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'delivery' | 'layers' | 'governance' | 'docs'
 type SecuritySectionGroup = 'status' | 'yours' | 'enforced' | 'reference'
 
 interface SecuritySectionDef {
@@ -1380,7 +2711,9 @@ export const SECTION_LABEL_KEY: Record<SecuritySectionKey, string> = {
   posture: 'pages.settings.securityPanel.live_security_posture',
   approval: 'pages.settings.securityPanel.yolo_auto_approve',
   rules: 'pages.settings.securityPanel.denied_commands',
+  tailnet: 'pages.settings.securityPanel.tailnet_section',
   apps: 'pages.settings.securityPanel.third_party_apps_section',
+  delivery: 'pages.settings.securityPanel.file_delivery_section',
   layers: 'pages.settings.securityPanel.defense_in_depth_architecture',
   governance: 'pages.settings.securityPanel.governance_policy',
   docs: 'pages.settings.securityPanel.documentation',
@@ -1400,16 +2733,13 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'posture', icon: <ShieldCheck size={15} />, group: 'status' },
   { key: 'approval', icon: <Gauge size={15} />, group: 'yours' },
   { key: 'rules', icon: <Terminal size={15} />, group: 'yours' },
+  { key: 'tailnet', icon: <Network size={15} />, group: 'yours' },
   { key: 'apps', icon: <Boxes size={15} />, group: 'yours' },
+  { key: 'delivery', icon: <FileWarning size={15} />, group: 'yours' },
   { key: 'layers', icon: <Layers size={15} />, group: 'enforced' },
   { key: 'governance', icon: <Gavel size={15} />, group: 'enforced' },
   { key: 'docs', icon: <BookOpen size={15} />, group: 'reference' },
 ]
-
-/** Below this container width the rail and the detail pane stack: the rail
- *  becomes the whole view and choosing a section replaces it (with a back
- *  link), the same responsive contract ChannelsPanel uses. */
-const TWO_PANE_MIN_WIDTH = 760
 
 /** One rail row. `summary` is a live, FACTUAL value (a count, an on/off) — never
  *  a verdict: a rail that renders its own "OK" is a security claim made by the
@@ -1420,114 +2750,110 @@ const TWO_PANE_MIN_WIDTH = 760
  *  page, a badge next to the label truncated the longest names to
  *  "Denied Comman…" and "Defense-in-Dept…". Stacking is what lets the rail reuse
  *  each section's real heading instead of inventing shorter rail-only copy. */
-function SectionRow({ section, active, summary, onSelect, twoPane }: {
-  section: SecuritySectionDef
-  active: boolean
-  summary?: string
-  onSelect: () => void
-  twoPane: boolean
-}) {
-  const label = i18nT(SECTION_LABEL_KEY[section.key])
-  return (
-    <button
-      type="button"
-      role="option"
-      aria-selected={active}
-      onClick={onSelect}
-      // The longest label still ellipsizes in the most verbose locales, so the
-      // full string stays reachable on hover rather than being lost.
-      title={label}
-      className={`flex items-center gap-2.5 w-full px-2.5 py-2 rounded-md text-left cursor-pointer border-none transition-colors ${
-        active ? 'bg-accent-subtle text-accent' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover'
-      }`}
-    >
-      <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${active ? 'text-accent' : 'text-muted'}`}>
-        {section.icon}
-      </span>
-      <span className="flex-1 min-w-0">
-        {/* Wraps to two lines rather than truncating. The rail is a fixed 248px
-            and the longest label ("Defense-in-Depth Architecture") inflates to
-            52 characters under the pseudolocale, which truncated at 1.36x —
-            over the render gate's 1.35x budget, and a real problem in any
-            verbose locale, not just en-XA. Widening the rail would only move
-            the boundary; not truncating removes it. `title` stays for the
-            pathological case. */}
-        <span className="block text-[13px] font-medium line-clamp-2">{label}</span>
-        {summary && (
-          <span className="block text-[11px] text-muted tabular-nums truncate mt-px">{summary}</span>
-        )}
-      </span>
-      {!twoPane && <ChevronRight size={14} className="text-muted shrink-0" />}
-    </button>
-  )
+/**
+ * An auto-approve expiry sized for the RAIL: "11:40 AM" when it lands today,
+ * "Sat, 11:40 AM" once it crosses a day boundary.
+ *
+ * Two deliberate differences from the card's `fmtTimeNumeric`, both driven by
+ * the row being an 11px line that truncates:
+ *
+ * - Seconds are dropped. A grant that ends at 11:40:00 does not end more
+ *   precisely than "11:40" for any decision a reader makes here, so the extra
+ *   characters are noise competing with the label for a truncating line.
+ * - The weekday is added when the expiry is NOT today, because the offered
+ *   durations reach 24 hours. A bare "Until 10:00 AM" on a grant that ends
+ *   tomorrow morning reads as a time that has already passed — on this row
+ *   that means believing a live grant has expired, which is the one misread
+ *   worth spending characters to prevent.
+ */
+function fmtRailExpiry(expiry: Date, now: Date = new Date()): string {
+  const sameDay =
+    expiry.getFullYear() === now.getFullYear() &&
+    expiry.getMonth() === now.getMonth() &&
+    expiry.getDate() === now.getDate()
+  return sameDay
+    ? fmtTime(expiry)
+    : fmtDateFields(expiry, { weekday: 'short', hour: 'numeric', minute: '2-digit' })
 }
 
-export function SecurityPanel() {
-  const [params, setParams] = useSearchParams()
-  const [containerRef, width] = useContainerWidth<HTMLDivElement>()
-  // null width = first paint before measurement; assume wide to avoid flashing
-  // the narrow layout on desktop.
-  const twoPane = width === null || width >= TWO_PANE_MIN_WIDTH
-
+/** Security tab. `basePath` opts the section sub-nav into path navigation
+ *  (`${basePath}/security/<section>`); omitted, the historical ?sub= /
+ *  ?section= query behavior is unchanged. Passed by the Settings host. */
+export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
   // Held HERE, not in the rules pane: picking another rail section unmounts that
   // pane, and a half-typed deny pattern living in its local state would be
   // silently discarded. The 137-row rule table still unmounts — only the draft
   // string is lifted, so the reason the rail mounts lazily is preserved.
   const [denyDraft, setDenyDraft] = useState('')
-
-  const rawSection = params.get('section')
-  const selectedKey = SECURITY_SECTIONS.some(s => s.key === rawSection)
-    ? (rawSection as SecuritySectionKey)
-    : null
-  // Wide mode always shows a detail pane; default to the first section.
-  const effectiveKey = selectedKey ?? (twoPane ? SECURITY_SECTIONS[0].key : null)
-
-  const setSection = (key: SecuritySectionKey | null) => setParams(prev => {
-    const next = new URLSearchParams(prev)
-    if (key) next.set('section', key)
-    else next.delete('section')
-    return next
-  }, { replace: true })
-
-  // Canonicalize the wide-mode implicit selection into the URL, so shrinking
-  // below the breakpoint does not silently drop the shown pane back to the bare
-  // rail. Gated on a REAL measurement: the pre-measurement paint optimistically
-  // renders wide, and writing `section=posture` before the ResizeObserver
-  // reports would make a fresh narrow visit open a section instead of the rail.
-  useEffect(() => {
-    if (width !== null && twoPane && !selectedKey) setSection(SECURITY_SECTIONS[0].key)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, twoPane, selectedKey])
+  // Lifted for the same reason as denyDraft: the rules section unmounts on rail
+  // navigation, which would discard a half-typed note.
+  const [denyNoteDraft, setDenyNoteDraft] = useState('')
 
   // Rail summaries. Both reads are shared cache entries with the sections that
   // own them, so the rail adds no extra request.
+  // Deliberately NOT an error surface: on a failed read the summaries below
+  // return nothing (a blank rail line, never a fake value), and the failure
+  // itself is reported through ErrorNotice by the card that owns each read —
+  // YoloDurationCard for `cfgError`, TailnetOriginCard for `tailnetError`,
+  // DeniedCommandsSection for the denied-commands list. A second notice in a
+  // 192px rail would repeat the card's message without room to act on it.
   const status = useAppSelector(s => s.dashboard.status)
   const { data: dc } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
   const { data: cfg, isError: cfgError } = useQuery<KirocrewCfgShape>({ queryKey: ['kirocrewConfig'], queryFn: api.kirocrewConfig })
+  // Same key and staleTime the card uses, so the rail adds no second request.
+  const { data: tailnet, isError: tailnetError } = useQuery<TailnetStatusData>({
+    queryKey: ['tailnet-status'],
+    queryFn: api.tailnetStatus,
+    staleTime: 300_000,
+  })
+
+  // NO rail summary for the flagged-file-delivery row, deliberately, and this is a
+  // gate decision rather than a design preference. `SettingsSubNav` renders a
+  // label and a summary as two adjacent catalog keys, which the render-time i18n
+  // gate counts as one `fragment/multi-unit` finding per site
+  // (SettingsSubNav.tsx:241 and :264). The YOLO and third-party-apps rows already
+  // carry exactly that finding on this surface, and `[vs-base]` fails on ANY
+  // per-surface increase against a goal of zero -- so giving this row a summary
+  // adds four findings to a surface that is trying to reach none. The state is one
+  // click away in the card, which shows it prominently. The real remedy is the one
+  // the gate prints ("merge the adjacent catalog keys into one key with {{vars}}"),
+  // and it belongs to `SettingsSubNav` for every panel at once rather than to this
+  // row: doing it here alone would also break SECTION_LABEL_KEY's rule that a rail
+  // label REUSES its section's heading key.
 
   const summaryFor = (key: SecuritySectionKey): string | undefined => {
     switch (key) {
       case 'approval':
         // An active grant outranks the configured duration: it is the state that
-        // is currently weakening the install, so it is what the rail reports.
-        if (status?.yolo) return i18nT('pages.settings.securityPanel.yolo_auto_approve')
+        // is currently weakening the install, so it is what the rail reports —
+        // WHEN THE GRANT ENDS, not that it exists.
+        if (status?.yolo) {
+          if (status.yolo_until_shutdown) return i18nT('pages.settings.securityPanel.rail_until_restart')
+          // Parse before formatting, and fall back to the bare "active" string
+          // when the timestamp will not parse: "Until —" on a row asserting a
+          // live grant would announce a weakened install while withholding the
+          // one fact that makes the claim actionable.
+          const expiry = toDate(status.yolo_expires_at)
+          return expiry
+            ? i18nT('pages.settings.securityPanel.rail_until_time', { time: fmtRailExpiry(expiry) })
+            : i18nT('pages.settings.securityPanel.rail_active')
+        }
         // `== null`, NOT `=== undefined`: `dashboard.status` is typed
-        // `StatusData | null` and initialises to `null`, so an `undefined` check
-        // never fires and the rail would claim the safe "Interactive" on every
-        // fresh load — before any status payload has arrived, on an install where
-        // auto-approve may well be active. Same rule the apps case follows, where
-        // React Query genuinely yields `undefined`: an unread state is reported as
-        // no summary, never as the reassuring one.
+        // `StatusData | null` and initialises to `null`. An unread state is
+        // reported as no summary, never as the reassuring one.
         return status == null ? undefined : i18nT('pages.settings.securityPanel.interactive')
       case 'rules':
         return dc ? String(dc.builtins.filter(r => r.enabled).length) : undefined
+      case 'tailnet':
+        // An unread state gets no summary, never the reassuring one. The label
+        // is the server-owned `state`, so the rail cannot disagree with the
+        // card it navigates to.
+        if (tailnetError || tailnet === undefined) return undefined
+        return i18nT(TAILNET_STATE_KEY[tailnet.state])
       case 'apps':
         // An UNREADABLE value is not "off" — mirror the card's own handling and
         // render no summary rather than asserting a state we could not read.
         if (cfgError || cfg === undefined) return undefined
-        // Names what the gate DOES rather than "On"/"Off": a bare "On" is a
-        // connector word with nothing for a translator to work from, and the
-        // verb reads better against a blanket admission control.
         return cfg.agent?.apps_allow_third_party === true
           ? i18nT('pages.settings.securityPanel.state_allowed')
           : i18nT('pages.settings.securityPanel.state_blocked')
@@ -1538,98 +2864,76 @@ export function SecurityPanel() {
     }
   }
 
-  // Grouped as listbox > group > option. The group headers used to be
-  // `aria-hidden`, which handed screen-reader users seven flat options and threw
-  // away the yours-vs-enforced split the rail exists to convey; `role="group"`
-  // with the header as its accessible name is the ARIA-valid way to keep it,
-  // since a listbox may contain groups but not arbitrary children.
-  const groupedSections = SECURITY_SECTIONS.reduce<{ group: SecuritySectionGroup; items: SecuritySectionDef[] }[]>(
-    (acc, section) => {
-      const last = acc[acc.length - 1]
-      if (last && last.group === section.group) last.items.push(section)
-      else acc.push({ group: section.group, items: [section] })
-      return acc
-    },
-    [],
-  )
+  const items = SECURITY_SECTIONS.map(section => {
+    const summary = summaryFor(section.key)
+    return {
+      key: section.key,
+      label: i18nT(SECTION_LABEL_KEY[section.key]),
+      icon: section.icon,
+      group: i18nT(SECTION_GROUP_KEY[section.group]),
+      summary: summary ? (
+        <span className="block text-[11px] text-muted tabular-nums truncate mt-px">{summary}</span>
+      ) : undefined,
+    }
+  })
 
-  const rail = (
-    // No aria-label on the wrapper: the listbox inside already carries this name,
-    // and naming both makes a screen reader announce it twice.
-    <nav className={twoPane ? 'w-[248px] shrink-0' : 'w-full'}>
-      <div className="flex flex-col gap-0.5" role="listbox" aria-label={i18nT('pages.settings.securityPanel.security_sections')}>
-        {groupedSections.map(({ group, items }) => (
-          <div key={group} role="group" aria-label={i18nT(SECTION_GROUP_KEY[group])}>
-            <div className="text-[11px] text-muted uppercase tracking-wider font-medium px-2.5 pt-2.5 pb-1 select-none">
-              {i18nT(SECTION_GROUP_KEY[group])}
-            </div>
-            {items.map(section => (
-              <SectionRow
-                key={section.key}
-                section={section}
-                active={twoPane && section.key === effectiveKey}
-                summary={summaryFor(section.key)}
-                onSelect={() => setSection(section.key)}
-                twoPane={twoPane}
-              />
-            ))}
-          </div>
-        ))}
-      </div>
-    </nav>
-  )
-
-  return (
-    <div ref={containerRef}>
-      {/* ── Data Classification Warning ──
-       *  Outside the rail on purpose. It is an instruction about what to type
-       *  into the product, not a section of the security model, and a notice you
-       *  can navigate away from is a notice most readers never see. */}
-      <div className="mb-5 bg-bg-elevated border rounded-lg p-4 flex items-start gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
-        <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
-        <div>
-          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.data_classification_notice')}</div>
-          <div className="text-[12px] text-muted mt-1 leading-relaxed">
-            {i18nT('pages.settings.securityPanel.do_not_enter_highly_sensitive_or_restricted_data')}
-          </div>
-        </div>
-      </div>
-
-      {/* Both responsive modes render the same child slots in the same order
-          (rail?, back-link?, pane wrapper) so React reconciles the pane by
-          position and a width transition never remounts it — remounting would
-          discard an unsaved custom deny pattern mid-type. Only changing the
-          selected section remounts, which is intended. */}
-      <div className={twoPane ? 'flex gap-6 items-start' : 'flex flex-col'}>
-        {(twoPane || !effectiveKey) && rail}
-        {!twoPane && effectiveKey && (
-          <button
-            type="button"
-            onClick={() => setSection(null)}
-            className="flex items-center gap-1.5 self-start text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 mb-2 hover:underline"
-          >
-            <ArrowLeft size={14} />
-            {i18nT('pages.settings.securityPanel.security_sections')}
-          </button>
-        )}
-        <div className={twoPane ? 'flex-1 min-w-0' : 'w-full'}>
-          {effectiveKey === 'posture' && <PostureSection />}
-          {effectiveKey === 'approval' && (
-            <SettingsSection title={i18nT('pages.settings.securityPanel.yolo_auto_approve')}>
-              <YoloDurationCard />
-            </SettingsSection>
-          )}
-          {effectiveKey === 'rules' && <DeniedCommandsSection draft={denyDraft} onDraftChange={setDenyDraft} />}
-          {effectiveKey === 'apps' && (
-            <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
-              <ThirdPartyAppsCard />
-            </SettingsSection>
-          )}
-          {effectiveKey === 'layers' && <LayersSection />}
-          {effectiveKey === 'governance' && <GovernancePolicyViewer />}
-          {effectiveKey === 'docs' && <DocsSection />}
+  const banner = (
+    // ── Data Classification Warning ──
+    // In the SubNav banner slot on purpose: it is an instruction about what to
+    // type into the product, not a section of the security model, and a notice
+    // you can navigate away from is a notice most readers never see.
+    <div className="mb-5 bg-bg-elevated border rounded-lg p-4 flex items-start gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+      <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
+      <div>
+        <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.data_classification_notice')}</div>
+        <div className="text-[12px] text-muted mt-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.do_not_enter_highly_sensitive_or_restricted_data')}
         </div>
       </div>
     </div>
+  )
+
+  return (
+    <SettingsSubNav
+      items={items}
+      railWidth={248}
+      listLabel={i18nT('pages.settings.securityPanel.security_sections')}
+      backLabel={i18nT('settings.tabs.security.label')}
+      banner={banner}
+      basePath={basePath}
+    >
+      {active => {
+        const key = active as SecuritySectionKey | null
+        return (
+          <>
+            {key === 'posture' && <PostureSection />}
+            {key === 'approval' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.yolo_auto_approve')}>
+                <YoloDurationCard />
+              </SettingsSection>
+            )}
+            {key === 'rules' && <DeniedCommandsSection draft={denyDraft} onDraftChange={setDenyDraft} noteDraft={denyNoteDraft} onNoteDraftChange={setDenyNoteDraft} />}
+            {key === 'tailnet' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.tailnet_section')}>
+                <TailnetOriginCard />
+              </SettingsSection>
+            )}
+            {key === 'apps' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
+                <ThirdPartyAppsCard />
+              </SettingsSection>
+            )}
+            {key === 'delivery' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.file_delivery_section')}>
+                <FileDeliveryConsentCard />
+              </SettingsSection>
+            )}
+            {key === 'layers' && <LayersSection />}
+            {key === 'governance' && <GovernancePolicyViewer />}
+            {key === 'docs' && <DocsSection />}
+          </>
+        )
+      }}
+    </SettingsSubNav>
   )
 }

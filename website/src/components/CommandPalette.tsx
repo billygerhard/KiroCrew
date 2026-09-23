@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import { createPortal } from 'react-dom'
-import { Search, X, Pin, MessageSquare, Clock, Plus } from 'lucide-react'
+import { Search, X, Pin, MessageSquare, Clock, Plus, RotateCw } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 
 import { useAppSelector } from '../store'
@@ -23,8 +23,10 @@ import { useRecentsProvider } from './commandPalette/providers/recentsProvider'
 import { useSettingsProvider } from './commandPalette/providers/settingsProvider'
 import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
+import { useVisualViewport } from '../hooks/useVisualViewport'
 /**
  * Search Everywhere command palette.
  *
@@ -60,7 +62,9 @@ import { i18nT } from '../i18n/t'
  * shared hook, this component registers a *window*-phase capture listener:
  * window-capture fires before document-capture, so it can
  * `stopImmediatePropagation()` those two keys before the hook's document-level
- * listener sees them.
+ * listener sees them. Because that ordering also bypasses the hook's IME
+ * guard, both intercepted branches consult the hook's shared latch (its
+ * returned `claimKey`) before acting, declining keys the IME owns.
  *
  * Highlighting renders matched indices as React `<strong>` nodes split out of
  * the title — never `dangerouslySetInnerHTML` (`frontend-security` lint rule).
@@ -109,6 +113,7 @@ export default function CommandPalette({
   openShortcuts,
   openInSplit,
 }: CommandPaletteProps) {
+  const vv = useVisualViewport()
   // P0 providers. Each is memoized inside its hook, so identities are stable.
   const all = useAllAggregator()
   const sessions = useSessionsProvider({ openInSplit })
@@ -157,6 +162,12 @@ export default function CommandPalette({
   // Tab strip order (§1): All · Sessions · Knowledge · Skills ·
   // Prompts, with Artifacts + Apps + Pages + Actions riding along after the v1
   // corpus. Apps sits next to Pages because both are pure navigation targets.
+  //
+  // Folders are deliberately ABSENT. Reaching a session folder by name is a
+  // Command Bar feature, and it lives in that app (`apps/command-bar/`) the way
+  // session and artifact search reach their corpora there: one row you enter,
+  // then a list that narrows. Registering a second folder surface here would make
+  // the host own a copy of a feature the app already owns, and the two would drift.
   const tabs = useMemo<ResourceProvider[]>(
     () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
     [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
@@ -310,6 +321,7 @@ export default function CommandPalette({
           default: {
             // Exhaustiveness guard — every EnterAction kind must have a branch.
             const _exhaustive: never = action
+            // eslint-disable-next-line no-console -- unreachable while `EnterAction` is exhaustively handled; it only fires when a kind is ADDED without a branch, and the compile-time `never` above cannot report that at runtime. Silence would make Enter do nothing with no trace.
             console.warn('[CommandPalette] dispatchEnter: unhandled enter action', _exhaustive)
           }
         }
@@ -345,19 +357,23 @@ export default function CommandPalette({
     () =>
       activeProvider.id === 'recents'
         ? slots
-            .map(
-              (s) =>
-                `${s.key}:${s.running ? 1 : 0}${s.pending_approval ? 1 : 0}${
-                  s.pinned ? 1 : 0
-                }:${s.last_activity_ts ?? s.last_ts ?? ''}:${
-                  slotStatusDetail[s.key]?.kind ?? ''
-                }:${slotStatusDetail[s.key]?.text ?? ''}:${slotStatusDetail[s.key]?.ts ?? ''}`,
-            )
+            .map((s) => {
+              const detail = slotStatusDetail[s.key]
+              // The status string that can change under a stable `kind`: a tool
+              // phase's agent-written purpose, any other phase's label. Only a
+              // fingerprint input — the row itself renders via toolStatusLabel.
+              const detailText = detail?.kind === 'tool' ? detail.purpose ?? '' : detail?.label ?? ''
+              return `${s.key}:${s.running ? 1 : 0}${s.pending_approval ? 1 : 0}${
+                s.pinned ? 1 : 0
+              }:${s.last_activity_ts ?? s.last_ts ?? ''}:${
+                detail?.kind ?? ''
+              }:${detailText}:${detail?.ts ?? ''}`
+            })
             .join('|') + `#${unreadSlots.join(',')}#${simplifiedToolNames ? 1 : 0}`
         : '',
     [activeProvider.id, slots, unreadSlots, slotStatusDetail, simplifiedToolNames],
   )
-  const { data: results = [], isLoading: loading } = useQuery({
+  const { data: results = [], isLoading: loading, isError, refetch } = useQuery({
     queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint],
     queryFn: () => Promise.resolve(activeProvider.search(debouncedQuery)),
     enabled: open,
@@ -396,7 +412,7 @@ export default function CommandPalette({
     [dispatchEnter],
   )
 
-  const { selected, setSelected, selectedRef, itemRefs } = useListKeyboardNav({
+  const { selected, setSelected, selectedRef, itemRefs, claimKey } = useListKeyboardNav({
     open,
     count: results.length,
     wrap: true,
@@ -421,10 +437,21 @@ export default function CommandPalette({
   // way the palette needs: Tab (cycle category) and ⌥/Alt+Enter (preview).
   // window-capture runs before the hook's document-capture listener, so
   // stopImmediatePropagation here keeps the hook from also acting on them.
+  // Outranking the hook also outranks its IME guard, so each choose-class
+  // branch consults the hook's own latch first via `claimKey`: a Tab the IME
+  // owns (candidate-list navigation, or the committing keydown inside the
+  // post-composition window) must not adopt the scope hint and wipe the
+  // half-composed query. A declined key is already consumed per `claimKey`'s
+  // contract — stopPropagation keeps it from the hook's document listener,
+  // and preventDefault fires only where the browser would otherwise act.
+  // Backspace is not a choose-class key (the IME consumes its own Backspace
+  // mid-composition, and the composing text keeps `queryRef` non-empty, so
+  // the branch stays inert), and needs no guard.
   useEffect(() => {
     if (!open) return
     const onWinKey = (e: KeyboardEvent) => {
       if (e.key === 'Tab') {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         // Prefix + Tab adopts the hinted scope (clearing the query); Shift+Tab
@@ -441,6 +468,7 @@ export default function CommandPalette({
         e.stopImmediatePropagation()
         setScope(null)
       } else if (e.key === 'Enter' && e.altKey && !e.metaKey && !e.ctrlKey) {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         const r = resultsRef.current
@@ -451,32 +479,102 @@ export default function CommandPalette({
     }
     window.addEventListener('keydown', onWinKey, true)
     return () => window.removeEventListener('keydown', onWinKey, true)
-  }, [open, selectedRef])
+  }, [open, selectedRef, claimKey])
 
   if (!open) return null
 
-  const emptyState = loading ? (
+  const emptyState = isError ? (
+    // A provider's search REJECTED. This is distinct from an empty corpus: the
+    // ordinary "No matches" copy below would mislabel a backend failure as
+    // "nothing found", so a rejection gets its own message plus a retry that
+    // re-runs the query (React Query `refetch`). The All aggregator never lands
+    // here — it guards each provider and always RESOLVES with a blended list
+    // (see allAggregator.search) — so this branch only ever shows on a scoped
+    // tab (or the recents quick-switcher), leaving the All tab's swallow
+    // untouched.
+    <div className="px-3 py-6 text-center text-[12px] flex flex-col items-center gap-2">
+      {/* The palette holds only a transient search string, so the hand-off loses nothing. */}
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        testId="command-palette-search-error"
+        message={i18nT('components.commandPalette.search_failed')}
+      />
+      <button
+        type="button"
+        onClick={() => { void refetch() }}
+        className="inline-flex items-center gap-1 rounded-md border border-border bg-transparent px-2 py-1 text-[12px] text-text cursor-pointer hover:bg-bg-hover"
+      >
+        <RotateCw size={12} className="lucide-inline" />
+        {i18nT('components.commandPalette.retry')}
+      </button>
+    </div>
+  ) : loading ? (
     <div className="px-3 py-6 text-center text-[12px] text-muted">{i18nT('components.commandPalette.searching')}</div>
+  ) : scopeProvider?.minQueryChars != null &&
+    debouncedQuery.trim().length > 0 &&
+    debouncedQuery.trim().length < scopeProvider.minQueryChars ? (
+    // Sub-threshold query on a scoped tab whose provider declares a minimum
+    // (issue #1830): the provider never searched, so "No matches" would be a
+    // lie — say "keep typing" instead. Ordered AFTER isError/loading (a failure
+    // or in-flight fetch keeps its copy) and BEFORE the generic no-matches.
+    // Evaluated against debouncedQuery, NOT the live query: `results` are
+    // produced from debouncedQuery, so the raw query would disagree with the
+    // rendered data inside the debounce window at every threshold crossing
+    // (typing the 2nd char would flash "No matches" against the 1-char empty
+    // result — the exact lie this branch removes).
+    // The All tab never lands here: `scopeProvider` is undefined when
+    // unscoped, and the aggregator's client-side scopes can genuinely answer a
+    // one-character query. An empty query keeps the recents quick-switcher
+    // (the non-empty guard).
+    <div className="px-3 py-6 text-center text-[12px] text-muted">
+      {i18nT('components.commandPalette.min_query_chars', {
+        min: scopeProvider.minQueryChars,
+        scope: scopeProvider.label.toLowerCase(),
+      })}
+    </div>
   ) : (
     <div className="px-3 py-6 text-center text-[12px] text-muted">
       {query.trim()
-        ? 'No matches'
+        ? i18nT('components.commandPalette.no_matches')
         : scopeLabel
           ? i18nT('components.commandPalette.no_scope', { scope: scopeLabel.toLowerCase() })
-          : 'No recent sessions'}
+          : i18nT('components.commandPalette.no_recent_sessions')}
     </div>
   )
 
   return createPortal(
+    // The backdrop's onMouseDown is click-outside dismissal, a pointer-only
+    // convenience: Escape closes the palette through useListKeyboardNav, so the
+    // keyboard already has the same exit and needs no path to this element.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- backdrop dismissal on the dialog shell, with Escape as the keyboard equivalent
     <div
-      className="fixed inset-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      // Pinned to the VISUAL viewport, not `inset-0`. A keyboard shrinks the visual
+      // viewport on every browser; only Chromium also shrinks the layout one (via
+      // `interactive-widget`), so on iOS Safari an `inset-0` overlay keeps its full
+      // height and its lower half sits behind the keyboard, unreachable. iOS also
+      // scrolls the focused input into view, which moves the visual viewport's
+      // origin -- hence the top offset as well as the height.
+      className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-xs animate-rise"
+      style={{ top: vv.offsetTop, height: vv.height }}
       role="dialog"
       aria-modal="true"
       aria-label={i18nT('components.commandPalette.search_everywhere')}
       onMouseDown={onClose}
     >
+      {/* Containment only: the panel's onMouseDown performs no action, it just
+          keeps a press inside the panel from reaching the backdrop's dismiss.
+          Every control in here is a real input or button. */}
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- stopPropagation barrier, not an activatable control; there is no behaviour for a keyboard to be given */}
       <div
-        className="mt-[12vh] w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[70vh]"
+        className="w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col"
+        // Both numbers come from the VISUAL viewport in px, not a percentage
+        // and not a `vh`. A percentage MARGIN resolves against the containing
+        // block's WIDTH -- `mt-[8%]` measured 31px, not the 68px it reads like
+        // -- and `vh` measures the layout viewport, which a keyboard does not
+        // shrink on iOS. At rest these equal the previous 12vh / 70vh exactly,
+        // so the at-rest panel is unchanged.
+        style={{ marginTop: Math.round(vv.height * 0.12), maxHeight: Math.round(vv.height * 0.70) }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* Search input */}
@@ -518,7 +616,17 @@ export default function CommandPalette({
             }}
             placeholder={scopeLabel ? i18nT('components.commandPalette.search_scope', { scope: scopeLabel.toLowerCase() }) : i18nT('components.commandPalette.search_for_anything')}
             aria-label={i18nT('components.commandPalette.search_everywhere')}
-            className="flex-1 bg-transparent border-none outline-none text-[14px] text-text placeholder:text-muted"
+            // min-w-0 defeats the input's `min-width: auto` intrinsic floor (~20
+            // characters). Without it this flex item refuses to shrink, so on a
+            // narrow viewport the row overflows instead and the modal's
+            // overflow-hidden clips whatever trails the input — the Tab hint and,
+            // worse, the close button.
+            // focus-cue-ok: combobox — focus stays in this field for the palette's
+            // whole lifetime (options are tabIndex={-1}; arrows move the
+            // aria-selected highlight below), so the highlighted option is the
+            // visible cue and the palette frame itself only exists while this
+            // field owns focus.
+            className="flex-1 min-w-0 bg-transparent border-none outline-hidden text-[14px] text-text placeholder:text-muted"
           />
           {scopeHint && (
             <span className="shrink-0 flex items-center gap-1 text-[11px] text-muted">
@@ -537,7 +645,10 @@ export default function CommandPalette({
 
         {/* Result list */}
         <div className="overflow-y-auto py-1" role="listbox">
-          {results.length === 0
+          {/* An errored query takes precedence over any stale placeholder rows
+              React Query keeps from the previous key: a failed search must read
+              as failed, not silently show the last query's results. */}
+          {isError || results.length === 0
             ? emptyState
             : results.map((r, i) => {
                 // Section header whenever the group changes — the recents view

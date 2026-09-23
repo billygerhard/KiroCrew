@@ -1,6 +1,6 @@
-"""Stable command-args and effective-env hashing shared across the MCP gateway.
+"""Stable argv encoding and command/env hashing shared across the MCP gateway.
 
-Kept in its own dependency-free leaf module (only ``hashlib``) so every caller
+Kept in its own dependency-free leaf module (standard library only) so every caller
 imports it at module top level. The lightweight ``rewriter`` sits on
 ``config.loader``'s import path, while ``pool`` and ``stub`` are asyncio/socket
 -heavy submodules that must stay unloaded until the gateway is actually enabled
@@ -11,8 +11,75 @@ those heavy submodules into CLI/test/MCP startup.
 
 from __future__ import annotations
 
+import base64
 import hashlib
-from typing import Mapping
+import json
+from typing import Any, Collection, Mapping, Sequence
+
+#: One base64url JSON list carrying the stub's own flag tokens. Every raw value
+#: the rewriter emits -- executable path, work dir, socket, env sidecar, server
+#: and agent names, autoApprove identifiers -- rides inside it, because a CLI
+#: that launches the stub through cmd.exe expands ``%NAME%`` in any plain token,
+#: quoted or not, and there is no escape for it on that command line. The
+#: tokens keep their plain flag spelling inside the envelope, so the stub's
+#: parser and the daemon's reader see the same argv an older overlay spelled out
+#: directly, and hash it identically.
+STUB_FLAGS_FLAG = "--stub-flags-b64"
+
+
+def encode_target_args(args: list[str]) -> str:
+    """Carry argv boundaries in JSON, with a shell-inert base64url alphabet.
+
+    Arguments may contain delimiters or be empty. Encoding also keeps their
+    metacharacters out of cmd.exe's parse when a CLI launches the stub through
+    a shell. This is serialization, not encryption; arguments remain visible.
+    """
+    payload = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def decode_target_args(raw: str) -> list[str]:
+    """Reject malformed payloads without echoing potentially sensitive arguments."""
+    try:
+        payload = base64.b64decode(raw.encode("ascii"), altchars=b"-_", validate=True)
+        decoded = json.loads(payload.decode("utf-8"))
+    except ValueError:
+        raise ValueError("malformed target-args payload") from None
+    if not isinstance(decoded, list) or not all(isinstance(a, str) for a in decoded):
+        raise ValueError("target-args payload is not a JSON array of strings")
+    return decoded
+
+
+def expand_stub_flags(argv: Sequence[Any]) -> list[Any]:
+    """Splice every :data:`STUB_FLAGS_FLAG` envelope in ``argv`` back into its
+    plain flag tokens, in place; every other token passes through unchanged.
+
+    Both ``--stub-flags-b64=PAYLOAD`` and ``--stub-flags-b64 PAYLOAD`` are
+    read. A malformed or missing payload raises ``ValueError`` rather than
+    falling back to whatever plain tokens surround it: the envelope is the only
+    carrier of the values it holds, so a partial read would launch a stub
+    against different metadata than the rewriter hashed. One level only -- an
+    envelope inside an envelope is left as a plain token.
+    """
+    out: list[Any] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if isinstance(token, str) and (
+            token == STUB_FLAGS_FLAG or token.startswith(STUB_FLAGS_FLAG + "=")
+        ):
+            if "=" in token:
+                payload = token.partition("=")[2]
+            else:
+                i += 1
+                if i >= len(argv) or not isinstance(argv[i], str):
+                    raise ValueError("stub-flags envelope has no payload")
+                payload = argv[i]
+            out.extend(decode_target_args(payload))
+        else:
+            out.append(token)
+        i += 1
+    return out
 
 
 def hash_command(command: str, args: list[str]) -> str:
@@ -46,6 +113,15 @@ def hash_command(command: str, args: list[str]) -> str:
 #: pooled backend, and one must never be forwarded into it. Servers that need a
 #: per-session secret read it from disk (the platform credential helper / the
 #: provider's default credential chain, unchanged by pooling) or stay ``poolable: false``.
+#:
+#: An operator can lift the exclusion for a NAMED variable via
+#: ``mcp_gateway.pool_identity_env`` — see the ``identity_keys`` argument of
+#: :func:`non_secret_env`. That is not a hole in the reasoning above, it is the
+#: reasoning applied in reverse: naming a key makes it part of
+#: ``effective_env_hash``, so the hash becomes INJECTIVE over it, two sessions
+#: declaring different values no longer collide, and "no single correct value"
+#: stops being true for that key. Forwarding it is then safe by exactly the
+#: argument that already makes every other hashed key safe to forward.
 ENV_SCRUB_PREFIXES: tuple[str, ...] = ("AWS_SECRET", "AWS_SESSION", "OAUTH")
 
 
@@ -67,7 +143,9 @@ def is_secret_env_key(key: str) -> bool:
     return any(key.startswith(prefix) for prefix in ENV_SCRUB_PREFIXES)
 
 
-def non_secret_env(env_pairs: Mapping[str, str]) -> dict[str, str]:
+def non_secret_env(
+    env_pairs: Mapping[str, str], *, identity_keys: Collection[str] = ()
+) -> dict[str, str]:
     """Return ``env_pairs`` minus every :func:`is_secret_env_key` entry.
 
     This is the set folded into :func:`hash_effective_env`, and the OUTER bound
@@ -79,19 +157,41 @@ def non_secret_env(env_pairs: Mapping[str, str]) -> dict[str, str]:
     It is not sufficient on its own: the forwarding path in ``gatewayd`` also
     drops ``manager.is_credential_env_key`` matches, so a declared credential
     key that the daemon scrub removes is never re-introduced.
+
+    ``identity_keys`` names variables an operator has declared pool-identity-
+    relevant (``mcp_gateway.pool_identity_env``). A named key is KEPT even when
+    :func:`is_secret_env_key` matches it, which folds its value into the hash and
+    so restores the very property the exclusion gives up: two sessions declaring
+    different values get different ``effective_env_hash`` values and therefore
+    different backends. Matching is by exact name, not by prefix — the point is
+    for an operator to accept the rotation-splits-the-pool cost for ONE variable,
+    not to disable a whole prefix class.
+
+    Default ``()`` is byte-for-byte today's behaviour: an installation that names
+    nothing computes exactly the hash it computed before this argument existed,
+    so no existing PoolKey is invalidated.
     """
-    return {k: v for k, v in env_pairs.items() if not is_secret_env_key(k)}
+    keep = frozenset(identity_keys)
+    return {k: v for k, v in env_pairs.items() if k in keep or not is_secret_env_key(k)}
 
 
-def hash_effective_env(env_pairs: Mapping[str, str]) -> str:
+def hash_effective_env(env_pairs: Mapping[str, str], *, identity_keys: Collection[str] = ()) -> str:
     """Sorted ``K=V\\0``-delimited SHA-256 over the NON-SECRET env pairs.
 
     Feeds the ``effective_env_hash`` dimension of
     :class:`kiro_crew.mcp_gateway.pool.PoolKey`. Implemented on top of
     :func:`non_secret_env` so the hashed set and the forwardable set are the
-    same set by construction.
+    same set by construction — including for ``identity_keys``, which widens
+    both together and can therefore never widen one without the other.
+
+    WRITER AND READER MUST PASS THE SAME ``identity_keys``. The stub computes
+    this hash for its Register frame; ``gatewayd._declared_env_pairs`` recomputes
+    it at cold spawn and refuses to forward on a mismatch. That gate is what
+    makes the stub's copy of the list untrusted data rather than authority: a
+    stub that claims a different set than the daemon's configured one produces a
+    hash the daemon does not reproduce, so forwarding fails closed.
     """
-    filtered = non_secret_env(env_pairs)
+    filtered = non_secret_env(env_pairs, identity_keys=identity_keys)
     h = hashlib.sha256()
     for k in sorted(filtered):
         h.update(k.encode("utf-8"))

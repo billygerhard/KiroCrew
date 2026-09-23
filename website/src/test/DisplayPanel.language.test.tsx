@@ -6,9 +6,11 @@ vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-u
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent } from '@testing-library/react'
 import React from 'react'
-import i18next from 'i18next'
 
 import { renderWithProviders } from './helpers'
+// The app's own i18next, through `/all` so the Chinese catalog the zoom-description
+// case asserts on is registered — `../i18n` registers English only.
+import { i18next } from '../i18n/all'
 import { LANG_STORAGE_KEY } from '../i18n/detect'
 
 // DisplayPanel pulls in the zoom / theme / UI-mode / palette contexts; none of
@@ -107,12 +109,18 @@ describe('DisplayPanel — language picker Auto row', () => {
     expect(text).not.toContain('简体中文')
   })
 
-  it('offers Japanese as a display language', () => {
-    renderWithProviders(<DisplayPanel />)
+  // The endonym, not the English name: a user looking for Korean scans for
+  // 한국어. `languages.ts` is the only place these strings live, so a language
+  // registered there and missing from the picker fails here.
+  it.each([['Japanese', '日本語'], ['Korean', '한국어']])(
+    'offers %s as a display language',
+    (_language, endonym) => {
+      renderWithProviders(<DisplayPanel />)
 
-    fireEvent.click(screen.getByRole('combobox', { name: 'Language' }))
-    expect(screen.getByRole('option', { name: '日本語' })).toBeInTheDocument()
-  })
+      fireEvent.click(screen.getByRole('combobox', { name: 'Language' }))
+      expect(screen.getByRole('option', { name: endonym })).toBeInTheDocument()
+    },
+  )
 })
 
 describe('DisplayPanel — zoom level description', () => {

@@ -1,9 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
+// './all' for the zh-CN catalog: these cases switch language to exercise
+// resolution and persistence, and `changeLanguage` refuses in dev when the
+// target has no registered catalog.
+import './all'
 import { LanguageProvider, useLanguage } from './LanguageProvider'
 import { LANG_STORAGE_KEY } from './detect'
 import { api } from '../api/client'
@@ -133,11 +137,17 @@ describe('LanguageProvider', () => {
     await waitFor(() => expect(document.documentElement.lang).toBe('zh-CN'))
   })
 
-  it('normalizes a Japanese browser tag for the locale-specific font override', async () => {
-    vi.spyOn(navigator, 'languages', 'get').mockReturnValue(['ja-JP'])
-    wrap(<Probe />)
-    await waitFor(() => expect(document.documentElement.lang).toBe('ja'))
-  })
+  // A regional tag must land on the bare code, or the locale-specific font
+  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and
+  // Kana / Hangul fall through to the untagged OS cascade instead of their aliases.
+  it.each([['ja-JP', 'ja'], ['ko-KR', 'ko']])(
+    'normalizes the %s browser tag for the locale-specific font override',
+    async (tag, expected) => {
+      vi.spyOn(navigator, 'languages', 'get').mockReturnValue([tag])
+      wrap(<Probe />)
+      await waitFor(() => expect(document.documentElement.lang).toBe(expected))
+    },
+  )
 
   it('is inert but does not crash outside a provider', () => {
     // An isolated component test shouldn't have to mount the provider.
@@ -243,5 +253,40 @@ describe('LanguageProvider — an empty server value must not erase a local choi
     wrap(<Probe />, { language: '' })
     await waitFor(() => expect(screen.getByTestId('resolved')).toHaveTextContent('en'))
     expect(screen.getByTestId('choice')).toHaveTextContent('(auto)')
+  })
+})
+
+describe('LanguageProvider cross-tab boot ordering', () => {
+  it('keeps a cross-tab choice when an older boot response arrives later', async () => {
+    let resolveBoot!: (value: { language: string }) => void
+    const bootPromise = new Promise<{ language: string }>((resolve) => {
+      resolveBoot = resolve
+    })
+    vi.spyOn(api, 'themeBoot').mockReturnValue(bootPromise as never)
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <LanguageProvider><Probe /></LanguageProvider>
+      </QueryClientProvider>,
+    )
+
+    localStorage.setItem(LANG_STORAGE_KEY, 'zh-CN')
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: LANG_STORAGE_KEY,
+        newValue: 'zh-CN',
+        storageArea: localStorage,
+      }))
+    })
+    await waitFor(() => expect(screen.getByTestId('choice')).toHaveTextContent('zh-CN'))
+
+    resolveBoot({ language: 'en' })
+    await waitFor(() => {
+      expect(qc.getQueryData(['theme-boot'])).toEqual({ language: 'en' })
+    })
+
+    expect(screen.getByTestId('choice')).toHaveTextContent('zh-CN')
+    expect(localStorage.getItem(LANG_STORAGE_KEY)).toBe('zh-CN')
   })
 })

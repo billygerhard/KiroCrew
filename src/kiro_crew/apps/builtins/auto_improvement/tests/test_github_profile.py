@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from kiro_crew.apps.builtins.auto_improvement.profiles import build_profile
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 from kiro_crew.apps.builtins.auto_improvement.spine.contracts import TRACK_BUG, TRACK_PERF
@@ -178,6 +180,7 @@ class TestEditFence:
         assert fence.allows_changes([("A", "src/pkg/brand_new.py")])[0]
 
 
+@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
 class TestIsolation:
     """The push-disable predicate and the pollute path set."""
 
@@ -220,6 +223,14 @@ class TestIsolation:
             capture_output=True,
         )
         assert iso.push_disabled() is True
+
+        for key in ("remote.origin.url", "remote.origin.pushurl"):
+            subprocess.run(
+                ["git", "-C", str(clone), "config", "--add", key, "https://example.invalid/x"],
+                check=True,
+                capture_output=True,
+            )
+        assert iso.push_disabled() is False
 
     def test_do_not_pollute_excludes_the_app_data_dir(self, tmp_path: Path) -> None:
         """The app writes its own ledger under the snapshot root during the boot window;
@@ -280,6 +291,7 @@ class TestFactory:
         assert p.calibration.canary_id
 
 
+@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
 class TestRepoRootFallback:
     """The spine appends ``src`` unconditionally; every layout must still be runnable.
 
@@ -336,6 +348,7 @@ class TestRepoRootFallback:
         assert gp.PytestBugRunner().run_suite(src=tmp_path / "src") == (True, [])
 
 
+@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
 class TestSuiteMeasurement:
     """The ruler against a real (tiny) pytest suite — the one place we spawn pytest."""
 
@@ -471,6 +484,7 @@ class TestSuiteMeasurement:
         assert any("test_boom" in t for t in result.failing_tests)
 
 
+@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
 class TestBugRunnerPrimitives:
     """The RED/GREEN primitives. The three-way ``run_reproducing_test`` return is the
     load-bearing part: a test that cannot RUN must not count as a valid RED."""
@@ -660,11 +674,8 @@ class TestToolingArtifactsIgnored:
 class TestMeasureEnvDoesNotUndoTheSandboxScrub:
     """`_run` layers `_measure_env` ON TOP of the sandbox's credential-scrubbed
     environment, so anything `_measure_env` inherits is put back after the sandbox removed
-    it. It used to be `dict(os.environ)`.
-
-    Measured before fixing: an `AWS_SECRET_ACCESS_KEY` that the sandbox had scrubbed
-    reappeared in the child env once this dict was applied — handing the operator's
-    credentials to agent-authored test code. Raised by review of this branch.
+    it. A `dict(os.environ)` here therefore restores an `AWS_SECRET_ACCESS_KEY` the sandbox
+    scrubbed, handing the operator's credentials to agent-authored test code.
     """
 
     def test_measure_env_carries_no_credentials(self, tmp_path, monkeypatch) -> None:
@@ -715,6 +726,7 @@ class TestMeasureEnvDoesNotUndoTheSandboxScrub:
         assert sorted(out) == ["LANG", "PATH"]
 
 
+@pytest.mark.skipif(not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(), reason="requires unprivileged user namespaces (sandbox backend)")
 class TestGateChildEnvironmentMeasuredEndToEnd:
     """Runs a real child through the gate's own ``_run`` and reads its environment.
 
@@ -786,7 +798,7 @@ class TestGateRunsInStrictSandboxMode:
         # asserts nothing while still passing. (It did exactly that when the import was
         # function-local and was later hoisted.)
         monkeypatch.setattr(gp, "sandboxed_spawn_argv", _fake)
-        monkeypatch.setattr(prof.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(prof, "run_limited", lambda *a, **k: None)
         prof._run(["/bin/true"], cwd=tmp_path, timeout=5)
 
         assert seen["mode"] == "strict", "agent-authored tests must not see credential dirs"

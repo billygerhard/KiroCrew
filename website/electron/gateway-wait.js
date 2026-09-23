@@ -12,6 +12,28 @@
 // the launch log. The maxWaitMs timeout stays purely as the backstop for a
 // gateway that is alive but slow to bind its port.
 
+const DEFAULT_GATEWAY_WAIT_MS = 30_000;
+// Importing a freshly installed bundled Python tree can exceed the ordinary
+// connection deadline on Windows. Keep the splash responsive through that cold
+// start without weakening the fail-fast child-exit path above.
+const WINDOWS_LOCAL_GATEWAY_WAIT_MS = 120_000;
+
+/**
+ * Pick the readiness deadline for the connection being opened.
+ *
+ * Only the primary local gateway gets the extended Windows cold-start budget.
+ * Connection tabs still fail on the ordinary deadline, and every spawned child
+ * exit still wins immediately through `getFailure`.
+ *
+ * @param {{platform?: string, watchSpawn?: boolean}} [o]
+ * @returns {number}
+ */
+function gatewayWaitTimeoutMs({ platform = process.platform, watchSpawn = false } = {}) {
+  return platform === "win32" && watchSpawn
+    ? WINDOWS_LOCAL_GATEWAY_WAIT_MS
+    : DEFAULT_GATEWAY_WAIT_MS;
+}
+
 /**
  * Poll `checkBackend` until the gateway answers, the spawned child reports a
  * terminal failure, the window closes, or we hit maxWaitMs.
@@ -39,7 +61,7 @@ function waitForGateway({
   onStatus = () => {},
   now = Date.now,
   setTimeoutFn = setTimeout,
-  maxWaitMs = 30_000,
+  maxWaitMs = DEFAULT_GATEWAY_WAIT_MS,
   pollIntervalMs = 500,
 }) {
   const start = now();
@@ -79,11 +101,51 @@ function waitForGateway({
  * carries the Gatekeeper hint because an unsigned/quarantined nested executable
  * being killed on launch is the most common "works for me, not my friend" mode.
  *
- * @param {{code?: number|null, signal?: string|null, error?: string}|null} failure
+ * @param {{code?: number|null, signal?: string|null, error?: string, disabled?: boolean, port?: number, remoteHost?: string, remotePort?: string}|null} failure
  * @returns {string}
  */
 function describeGatewayFailure(failure) {
   if (!failure) return "The gateway failed to start.";
+  // Nothing was launched, so there is no exit code and no log to read: the port
+  // was silent and this app is set not to start a gateway here. Naming both
+  // halves matters because either one alone is a normal, working state.
+  //
+  // Deliberately does NOT send the user to Settings: the page holding that
+  // switch is served by a gateway, which is the thing not running. The error
+  // dialog carries a button instead -- except on a remote crew's port, where
+  // starting one here would shadow that crew, so this names the host to check
+  // and withholds the offer the dialog is also hiding.
+  if (failure.disabled) {
+    if (failure.remoteHost) {
+      // The crew binds its own port on its own machine; this app only holds the
+      // local end of the link. Naming the local port here would send the user to
+      // check a port nothing over there was ever expected to serve.
+      const target = failure.remotePort
+        ? `${failure.remoteHost}:${failure.remotePort}, reached through local port ${failure.port},`
+        : `${failure.remoteHost} on port ${failure.port},`;
+      // The last sentence is the only exit this state has. The dialog withholds
+      // its start-a-gateway button here (that spawn would bind the crew's own
+      // port and shadow it), and the settings page that owns the choice is
+      // served by a gateway -- so without naming this the user is left with a
+      // Retry that cannot succeed. Both steps are named: an explicit port
+      // outranks stored config, but the opt-out is still in force, so that
+      // launch stops at this same state on a port where the button comes back.
+      return `Nothing is answering at ${target} and Kiro Crew is set not to `
+        + `start a gateway on this machine. Start the gateway on `
+        + `${failure.remoteHost}, or re-establish the tunnel or port-forward that `
+        + "reaches it, and retry. To run one on this machine instead, relaunch "
+        + "with KIROCREW_PORT set to a port that has no remote host configured, "
+        + "then choose Start Local Gateway when prompted.";
+    }
+    return `No gateway is answering on port ${failure.port}, and Kiro Crew is set `
+      + "not to start one on this machine. Start the gateway you connect to (or "
+      + "the connection that reaches it) and retry, or start one here.";
+  }
+  // An incomplete bundle is not a launch failure — the installer is still writing
+  // the backend. That message already explains the state and names Retry, so pass
+  // it through bare; prefixing "could not be launched" would open with failure
+  // vocabulary under a title saying the install is still finishing.
+  if (failure.incompleteBundle && failure.error) return failure.error;
   if (failure.error) return `The gateway could not be launched: ${failure.error}`;
   if (failure.signal === "SIGKILL") {
     return "The gateway was killed on launch (SIGKILL). On macOS this usually "
@@ -125,4 +187,12 @@ function isPortInUse(text) {
   return /address already in use|already in use|EADDRINUSE/i.test(String(text));
 }
 
-module.exports = { waitForGateway, describeGatewayFailure, tailLines, isPortInUse };
+module.exports = {
+  DEFAULT_GATEWAY_WAIT_MS,
+  WINDOWS_LOCAL_GATEWAY_WAIT_MS,
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+};

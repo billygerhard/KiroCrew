@@ -6,19 +6,63 @@
  * these source lines" possible. Fenced code is the one multi-line block.
  */
 import type { CSSProperties, ReactNode } from 'react'
-import { ACCENT, ACCENT_BG, FONT_MONO, RAIL_X } from './constants'
+import {
+  ACCENT,
+  ACCENT_BG,
+  DOC_BODY_LINE_HEIGHT,
+  DOC_BODY_PX,
+  DOC_CODE_EM,
+  DOC_CODE_PX,
+  DOC_HEADING_EM,
+  DOC_HEADING_WEIGHTS,
+  FONT_MONO,
+  HEADING_FG,
+  HEADING_RAIL,
+  HEADING_RAIL_GAP,
+  HEADING_RAIL_INDENT,
+  HEADING_RULE_SOFT,
+  HEADING_RULE_STRONG,
+  RAIL_X,
+} from './constants'
 import Clickable from '../../components/Clickable'
 import { BlockEditor } from './BlockEditor'
-import { FM_RE, LIST_MARKER_RE, indentPx } from './utils'
+import { CodeFenceBlock } from './CodeFenceBlock'
+import { MermaidBlock } from './MermaidBlock'
+import { NoteImage } from './NoteImage'
+import {
+  FM_RE,
+  LIST_MARKER_RE,
+  fenceLang,
+  indentPx,
+  parseMermaidBlock,
+  parseTable,
+  resolveNoteImageSrc,
+} from './utils'
+import type { ParsedTable, TableAlign } from './utils'
 import type { EditRange } from './types'
 import { urlTransform } from '../../utils/urlTransform'
 
-/** Inline spans: code, bold, italic, wikilinks and links. */
+/**
+ * Inline spans: code, bold, italic, wikilinks, links and images.
+ *
+ * The image alternative sits last but still wins over the link one for
+ * `![alt](src)`: its match starts at the `!`, one character earlier than the
+ * link's `[`, and the engine takes the leftmost match before it ever considers
+ * alternative order. Appending it therefore leaves every existing group number
+ * untouched, which is why it is not spliced in beside the link branch.
+ */
 const INLINE_RE =
-  /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[\[([^\][|]+?)(?:\|([^\]]+?))?\]\])|(\[([^\]]+)\]\(([^)]+)\))/g
+  /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*]+\*)|(\[\[([^\][|]+?)(?:\|([^\]]+?))?\]\])|(\[([^\]]+)\]\(([^)]+)\))|(!\[([^\]]*)\]\(([^)]+)\))/g
 
-/** Render one line's inline markup to React nodes. */
-export function inline(text: string, key: number | string): ReactNode[] {
+/**
+ * Render one line's inline markup to React nodes.
+ *
+ * `noteDir` is the directory of the note being read; it is what turns a
+ * relative image source into a file the dashboard can serve. Optional because
+ * every other span renders without it, so a caller that has no note context
+ * (a test, a preview of loose text) still gets everything but relative images.
+ */
+export function inline(text: string, key: number | string, noteDir?: string): ReactNode[] {
   const nodes: ReactNode[] = []
   const re = new RegExp(INLINE_RE.source, 'g')
   let last = 0
@@ -36,7 +80,7 @@ export function inline(text: string, key: number | string): ReactNode[] {
             border: '1px solid var(--border)',
             borderRadius: '4px',
             padding: '0 4px',
-            fontSize: '0.9em',
+            fontSize: `${DOC_CODE_EM}em`,
             fontFamily: FONT_MONO,
           }}
         >
@@ -77,6 +121,15 @@ export function inline(text: string, key: number | string): ReactNode[] {
           <span key={k}>{m[8]}</span>
         ),
       )
+    } else if (m[10]) {
+      // An image whose source is refused (or relative with no note directory to
+      // resolve it against) degrades to its alt text rather than to a broken
+      // frame, matching what a refused link does just above. NoteImage owns
+      // that presentation for both failures, so a refused source and a file
+      // that vanished later cannot look different to the reader.
+      nodes.push(
+        <NoteImage key={k} src={resolveNoteImageSrc(m[12], noteDir)} alt={m[11]} rawSrc={m[12]} />,
+      )
     }
     last = m.index + m[0].length
     i++
@@ -85,7 +138,80 @@ export function inline(text: string, key: number | string): ReactNode[] {
   return nodes
 }
 
-const HEADING_SIZES = ['1.802em', '1.602em', '1.424em', '1.266em', '1.125em', '1em']
+/**
+ * The heading ramp itself lives in `constants.ts` (`DOC_HEADING_EM` /
+ * `DOC_HEADING_WEIGHTS`) because the inline note title has to match h1 and
+ * derives its px size from the same table. Read the rationale there before
+ * changing a value.
+ */
+const HEADING_SIZES = DOC_HEADING_EM.map(em => `${em}em`)
+
+const CELL_PAD = '5px 8px'
+const CELL_BORDER = '1px solid var(--border)'
+
+/**
+ * Render a parsed table.
+ *
+ * Cells wrap rather than being held on one line: a note's tables carry prose,
+ * and inside an 800px reading column nowrap would push almost every one of them
+ * into horizontal scrolling. The wrapper still scrolls, so a genuinely wide
+ * table stays reachable instead of overflowing the column.
+ */
+function tableNode(t: ParsedTable, key: number, noteDir?: string): ReactNode {
+  const cell = (align: TableAlign, first: boolean): CSSProperties => ({
+    padding: CELL_PAD,
+    textAlign: align ?? 'left',
+    verticalAlign: 'top',
+    ...(first ? null : { borderLeft: CELL_BORDER }),
+  })
+  return (
+    <div
+      style={{
+        overflowX: 'auto',
+        border: CELL_BORDER,
+        borderRadius: '6px',
+        margin: '6px 0',
+      }}
+    >
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <thead>
+          <tr>
+            {t.header.map((text, c) => (
+              <th
+                key={c}
+                style={{
+                  ...cell(t.align[c], c === 0),
+                  fontWeight: 600,
+                  background: 'var(--card)',
+                  borderBottom: CELL_BORDER,
+                }}
+              >
+                {inline(text, `${key}-h${c}`, noteDir)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {t.rows.map((row, r) => (
+            <tr key={r}>
+              {row.map((text, c) => (
+                <td
+                  key={c}
+                  style={{
+                    ...cell(t.align[c], c === 0),
+                    ...(r === 0 ? null : { borderTop: CELL_BORDER }),
+                  }}
+                >
+                  {inline(text, `${key}-${r}-${c}`, noteDir)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
 export interface PreviewProps {
   content: string
@@ -97,6 +223,11 @@ export interface PreviewProps {
   onSplitEdit: (before: string, after: string, caret: number) => void
   /** Mark the note dirty on the first edit keystroke, before commit. */
   onDirtyEdit?: () => void
+  /**
+   * Directory of the note being read, absolute. Resolves its relative image
+   * sources; without it those images fall back to their alt text.
+   */
+  noteDir?: string
 }
 
 export function Preview({
@@ -108,13 +239,26 @@ export function Preview({
   onCancelEdit,
   onSplitEdit,
   onDirtyEdit,
+  noteDir,
 }: PreviewProps) {
   const body = content.replace(FM_RE, '')
-  const lines = body.split('\n')
+  // `split('\n')` yields a trailing EMPTY segment whenever the body ends with a
+  // newline — the near-universal case for a file out of a git-backed vault — and
+  // for a body that is empty outright. That segment is not a line of content, so
+  // it is dropped here rather than at the append region alone: the render loop
+  // below keys blocks by index too, and leaving the phantom in would let the
+  // trailing append region and the phantom's own block both match `editRange`
+  // and mount two editors. Dropping it also puts `appendStart` AT the phantom's
+  // slot instead of one past it, which is what appended a spurious blank line
+  // (#3741). Exactly one segment goes, so a genuine trailing blank line stays.
+  const rawLines = body.split('\n')
+  const lines = rawLines[rawLines.length - 1] === '' ? rawLines.slice(0, -1) : rawLines
   const out: ReactNode[] = []
   let inCode = false
   let codeBuf: string[] = []
   let codeStart = 0
+  /** Last line swallowed by a multi-line block, so the loop skips past it. */
+  let skipTo = -1
 
   // Stop block-edit activation for interactive children (checkboxes, links).
   const shield = (e: React.MouseEvent) => e.stopPropagation()
@@ -197,30 +341,42 @@ export function Preview({
   }
 
   lines.forEach((line, idx) => {
+    // Lines already consumed by a multi-line block (a table's delimiter row
+    // and body, a mermaid fence) render as part of that block, not again on
+    // their own.
+    if (idx <= skipTo) return
+
     // Any line that is not a list item ends the list, so the rails stop there.
     // Checked up front because headings and code fences return early below.
     if (!LIST_MARKER_RE.test(line)) stack = []
 
     if (line.startsWith('```')) {
+      if (!inCode) {
+        // A closed ```mermaid fence renders as a diagram; clicking it opens
+        // the fenced SOURCE, and an unclosed one falls through to the generic
+        // code path below like any other run-away fence.
+        const mermaid = parseMermaidBlock(lines, idx)
+        if (mermaid) {
+          skipTo = mermaid.end
+          out.push(
+            blk(
+              idx,
+              mermaid.end,
+              <MermaidBlock code={mermaid.code} />,
+              { fontSize: `${DOC_CODE_PX}px`, fontFamily: FONT_MONO },
+              { split: false },
+            ),
+          )
+          return
+        }
+      }
       if (inCode) {
         out.push(
           blk(
             codeStart,
             idx,
-            <pre
-              style={{
-                background: 'var(--card)',
-                border: '1px solid var(--border)',
-                borderRadius: '6px',
-                padding: '10px',
-                fontSize: '12px',
-                overflowX: 'auto',
-                fontFamily: FONT_MONO,
-              }}
-            >
-              {codeBuf.join('\n')}
-            </pre>,
-            { fontSize: '12px', fontFamily: FONT_MONO },
+            <CodeFenceBlock code={codeBuf.join('\n')} lang={fenceLang(lines[codeStart])} />,
+            { fontSize: `${DOC_CODE_PX}px`, fontFamily: FONT_MONO },
             { split: false },
           ),
         )
@@ -233,6 +389,26 @@ export function Preview({
     }
     if (inCode) {
       codeBuf.push(line)
+      return
+    }
+
+    // A table is the second multi-line block: clicking it opens the whole
+    // source — header, delimiter and rows — because editing one row of pipes in
+    // isolation from the header it aligns with is not a useful gesture. Enter
+    // stays a literal newline there, so it adds a row instead of splitting the
+    // block, and the editor uses the mono face that keeps the pipes lined up.
+    const table = parseTable(lines, idx)
+    if (table) {
+      skipTo = table.end
+      out.push(
+        blk(
+          idx,
+          table.end,
+          tableNode(table, idx, noteDir),
+          { fontFamily: FONT_MONO },
+          { split: false },
+        ),
+      )
       return
     }
 
@@ -263,7 +439,7 @@ export function Preview({
                     : undefined
                 }
               >
-                {inline(task[3], idx)}
+                {inline(task[3], idx, noteDir)}
               </span>
             </div>,
           ),
@@ -278,15 +454,41 @@ export function Preview({
       const Tag = `h${n}` as 'h1'
       const style: CSSProperties = {
         fontSize: HEADING_SIZES[n - 1],
-        fontWeight: n <= 2 ? 700 : 600,
+        fontWeight: DOC_HEADING_WEIGHTS[n - 1],
         lineHeight: 1.25,
-        margin: n <= 2 ? '14px 0 6px' : '10px 0 4px',
+        color: HEADING_FG,
+        marginTop: n <= 2 ? '14px' : '10px',
+        marginRight: 0,
+        marginBottom: n <= 2 ? '6px' : '4px',
+        // The rail hangs in the column gutter so heading text stays flush with
+        // body text; h1/h2 rule underneath instead and need no offset.
+        marginLeft: n <= 2 ? 0 : `-${HEADING_RAIL_INDENT}px`,
+      }
+      // The accent is chrome, never the text colour — see HEADING_FG.
+      // Longhand rather than the `border-bottom` shorthand on purpose: a
+      // shorthand whose value contains color-mix() is dropped wholesale by a
+      // strict CSS parser (jsdom does exactly that), losing the whole rule
+      // rather than just its colour.
+      if (n <= 2) {
+        style.borderBottomWidth = n === 1 ? '2px' : '1px'
+        style.borderBottomStyle = 'solid'
+        style.borderBottomColor = n === 1 ? HEADING_RULE_STRONG : HEADING_RULE_SOFT
+        style.paddingBottom = n === 1 ? '4px' : '3px'
+      } else {
+        style.borderLeftWidth = '2px'
+        style.borderLeftStyle = 'solid'
+        style.borderLeftColor = HEADING_RAIL
+        style.paddingLeft = `${HEADING_RAIL_GAP}px`
       }
       out.push(
-        blk(idx, idx, <Tag style={style}>{inline(head[2], idx)}</Tag>, {
+        // The editor inherits the heading's typography AND colour so the text
+        // does not shift shade on click; the chrome is rendered-only, which is
+        // what distinguishes the two states.
+        blk(idx, idx, <Tag style={style}>{inline(head[2], idx, noteDir)}</Tag>, {
           fontSize: style.fontSize,
           fontWeight: style.fontWeight,
           lineHeight: style.lineHeight,
+          color: style.color,
         }),
       )
       return
@@ -299,7 +501,7 @@ export function Preview({
         withRails(
           enter(ind),
           idx,
-          blk(idx, idx, <div style={{ marginLeft: ind + 4 }}>{['• ', ...inline(li[2], idx)]}</div>),
+          blk(idx, idx, <div style={{ marginLeft: ind + 4 }}>{['• ', ...inline(li[2], idx, noteDir)]}</div>),
         ),
       )
       return
@@ -315,7 +517,7 @@ export function Preview({
           blk(
             idx,
             idx,
-            <div style={{ marginLeft: ind + 4 }}>{[`${ol[2]}. `, ...inline(ol[3], idx)]}</div>,
+            <div style={{ marginLeft: ind + 4 }}>{[`${ol[2]}. `, ...inline(ol[3], idx, noteDir)]}</div>,
           ),
         ),
       )
@@ -345,7 +547,7 @@ export function Preview({
               color: 'var(--muted)',
             }}
           >
-            {inline(line.slice(2), idx)}
+            {inline(line.slice(2), idx, noteDir)}
           </div>,
         ),
       )
@@ -356,7 +558,7 @@ export function Preview({
       blk(
         idx,
         idx,
-        line.trim() === '' ? <div style={{ height: '8px' }} /> : <div>{inline(line, idx)}</div>,
+        line.trim() === '' ? <div style={{ height: '8px' }} /> : <div>{inline(line, idx, noteDir)}</div>,
       ),
     )
   })
@@ -385,9 +587,12 @@ export function Preview({
 
   return (
     <div
+      // Carries the heading accent custom properties declared in `styles.ts`;
+      // without it the chrome resolves to nothing.
+      className="mdnb-note"
       style={{
-        fontSize: '13px',
-        lineHeight: 1.55,
+        fontSize: `${DOC_BODY_PX}px`,
+        lineHeight: DOC_BODY_LINE_HEIGHT,
         display: 'flex',
         flexDirection: 'column',
         minHeight: '100%',

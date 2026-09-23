@@ -51,6 +51,7 @@ from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     json_body,
 )
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact
 
 logger = logging.getLogger("kirocrew.app.meetings")
@@ -70,6 +71,17 @@ logger = logging.getLogger("kirocrew.app.meetings")
 #: registry would need. Held only across local file IO, never across an await.
 _TASKS_LOCK = threading.Lock()
 
+
+def task_mutation_transaction() -> "threading.Lock":
+    """Return the lock that serializes task writes with meeting deletion.
+
+    Hold it only from a worker thread. Meeting deletion takes the same lock so
+    an in-flight mutation either finishes before the directory is removed or
+    observes that the meeting does not exist.
+    """
+    return _TASKS_LOCK
+
+
 #: Serializes the whole prepare -> provider-create -> record sequence of a filing.
 #:
 #: `_TASKS_LOCK` cannot do this job: it is a `threading.Lock` held only across local
@@ -83,7 +95,13 @@ _TASKS_LOCK = threading.Lock()
 #: an await rather than concurrent worker threads. The terminal-`pushed` re-check
 #: inside it is the other half: the lock orders the two filings, and the re-read is
 #: what makes the SECOND one a no-op instead of a duplicate.
-_FILING_LOCK = asyncio.Lock()
+_FILING_LOCK = LoopBoundLock()
+
+
+def task_filing_transaction() -> LoopBoundLock:
+    """Return the lock spanning an external filing and its local record."""
+    return _FILING_LOCK
+
 
 _MAX_TASKS = 500
 _MAX_DESCRIPTION = 2000
@@ -146,7 +164,7 @@ def _normalize_task(raw: Any) -> dict[str, Any] | None:
         # which is exactly how a credential-shaped id would have crossed the
         # boundary while `description` beside it was scrubbed. Redact BEFORE the
         # truncation, so a marker cannot be sliced in half into something the
-        # scanner no longer recognises.
+        # scanner does not recognise.
         "id": redact(str(raw.get("id") or f"t{uuid.uuid4().hex[:8]}"))[:64],
         "description": description[:_MAX_DESCRIPTION],
         "assignee": redact(str(raw.get("assignee") or "").strip())[:200],
@@ -227,6 +245,10 @@ def _append_task(meeting_id: str, body: dict[str, Any], root: Any) -> dict[str, 
     ``_common.guarded``.
     """
     with _TASKS_LOCK:
+        if store.read_meeting_meta(meeting_id, root) is None:
+            raise store.MeetingsPathError(
+                "meeting not found", status=404, code="meeting_not_found"
+            )
         description = field_str(body, "description", required=True, max_len=_MAX_DESCRIPTION)
         tasks = read_normalized(meeting_id, root)
         if len(tasks) >= _MAX_TASKS:

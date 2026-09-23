@@ -12,7 +12,7 @@ of what would hurt most if broken:
    file every instance reads, "cannot tell" means the schedule is wrong, and arming would
    make the whole team pick up the same alarm. Only ``on_shift`` gates work; ``unknown``
    survives so the UI can say WHY.
-3. **A date-only ``to`` includes that day.** ``to: 2026-08-08`` means "through the 8th".
+3. **A date-only ``to`` includes that day.** It means "through that whole day".
    Reading it as midnight would silently drop the last day of every shift.
 4. **The file is untrusted input.** It arrives by ``git pull`` from a shared repo, so it
    must be size-capped and parsed with ``safe_load``.
@@ -29,8 +29,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers import schedule_file
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import ShiftStatus
+
+_needs_sandbox = pytest.mark.skipif(
+    not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 
 
 class _Env(unittest.TestCase):
@@ -95,7 +102,7 @@ class TestOnShiftResolution(_Env):
         self.assertTrue(schedule_file.resolve_now(self._at("2026-08-03T12:00")).on_shift)
 
     def test_date_only_end_includes_the_final_day(self) -> None:
-        """`to: 2026-08-08` means through the 8th, not midnight at its start.
+        """A date-only `to` means through that whole day, not midnight at its start.
 
         Read as 00:00 this drops the last day of every shift written date-only — the
         single most likely misreading of this file format.
@@ -284,6 +291,7 @@ class TestAdapterContract(_Env):
         self.assertEqual(schedule_file.ScheduleFileRotationSource().secret_fields, ())
 
 
+@_needs_sandbox
 class TestLoginResolution(_Env):
     def test_configured_login_wins_over_shelling_out(self) -> None:
         """An operator who set a login must not pay a `gh` spawn per rotation tick."""
@@ -293,7 +301,7 @@ class TestLoginResolution(_Env):
 
             def _counting_run(argv, *a, **kw):
                 # Match the whole argv, not argv[0]: sandboxed_spawn_argv PREPENDS a
-                # wrapper, so `gh` is no longer element 0 and an argv[0] check silently
+                # wrapper, so `gh` is not element 0 and an argv[0] check silently
                 # lets the real `gh` run (observed: it returned the developer's login).
                 if "api" in argv and "user" in argv:
                     gh_calls.append(argv)
@@ -304,7 +312,7 @@ class TestLoginResolution(_Env):
             with mock.patch.object(
                 schedule_file.policy_store, "get", return_value="configured-user"
             ) as cfg:
-                with mock.patch.object(schedule_file.subprocess, "run", side_effect=_counting_run):
+                with mock.patch.object(schedule_file, "run_limited", side_effect=_counting_run):
                     self.assertEqual(schedule_file._resolve_login_sync(), "configured-user")
             self.assertEqual(gh_calls, [], "a configured login must not shell out")
             self.assertTrue(cfg.called)
@@ -315,29 +323,29 @@ class TestLoginResolution(_Env):
         """The rotation-check cron runs on a schedule; an unbounded re-spawn per tick
         on a machine with no `gh` is pure waste.
 
-        Counts only OUR ``gh`` invocations. A bare ``subprocess.run`` call count is the
-        wrong assertion here: ``sandboxed_spawn_argv`` makes its own probe (``ssh -V``)
-        on the way in, so a broad patch counts the sandbox layer's spawns as if they
-        were ours and reports 2 for a single ``gh`` attempt.
+        Counts only OUR ``gh`` invocations, by patching the module's own
+        ``run_limited`` seam: ``sandboxed_spawn_argv`` makes its own probe
+        (``ssh -V``) on the way in, so a broad ``subprocess.run`` patch counts the
+        sandbox layer's spawns as if they were ours and reports 2 for a single
+        ``gh`` attempt.
         """
         self._login.stop()
         try:
             schedule_file.reset_login_cache()
 
             gh_calls = []
-            real_run = schedule_file.subprocess.run
 
             def _counting_run(argv, *a, **kw):
                 # Match the whole argv, not argv[0]: sandboxed_spawn_argv PREPENDS a
-                # wrapper, so `gh` is no longer element 0 and an argv[0] check silently
+                # wrapper, so `gh` is not element 0 and an argv[0] check silently
                 # lets the real `gh` run (observed: it returned the developer's login).
                 if "api" in argv and "user" in argv:
                     gh_calls.append(argv)
                     raise OSError("no gh")
-                return real_run(argv, *a, **kw)
+                raise AssertionError(f"unexpected spawn through run_limited: {argv!r}")
 
             with mock.patch.object(schedule_file.policy_store, "get", return_value=""):
-                with mock.patch.object(schedule_file.subprocess, "run", side_effect=_counting_run):
+                with mock.patch.object(schedule_file, "run_limited", side_effect=_counting_run):
                     self.assertEqual(schedule_file._resolve_login_sync(), "")
                     self.assertEqual(schedule_file._resolve_login_sync(), "")
             self.assertEqual(len(gh_calls), 1, "the miss is cached too")
@@ -345,10 +353,13 @@ class TestLoginResolution(_Env):
             self._login.start()
 
     def test_login_lookup_is_routed_through_the_spawn_chokepoint(self) -> None:
-        """test/test_spawn_audit.py requires it, and a rotation check is agent-reachable."""
+        """test/test_spawn_audit.py requires it, and a rotation check is agent-reachable.
+
+        Matched as a CALL (trailing paren) so a docstring mention cannot satisfy it.
+        """
         source = Path(schedule_file.__file__).read_text(encoding="utf-8")
-        self.assertIn("sandboxed_spawn_argv", source)
-        self.assertIn("resource_limit_preexec", source)
+        self.assertIn("sandboxed_spawn_argv(", source)
+        self.assertIn("run_limited(", source)
 
 
 if __name__ == "__main__":
@@ -604,9 +615,9 @@ class TestOffShiftCannotWrite(_Env):
     not pass through it.
     """
 
-    #: A window covering any plausible test clock. An earlier version of this fixture used
-    #: 2026-08-01..08 and silently tested the INDETERMINATE path instead, because the real
-    #: clock fell outside it — the guard correctly did not fire and it read as a failure.
+    #: A window covering any plausible test clock. A narrow one silently tests the
+    #: INDETERMINATE path instead, because the real clock falls outside it — the guard
+    #: correctly does not fire and it reads as a failure.
     WIDE = "timezone: UTC\nshifts:\n  - from: 2026-01-01\n    to: 2027-12-31\n    who: alice\n"
 
     def _grant_act(self, login: str) -> None:
@@ -777,11 +788,11 @@ class TestOffShiftCannotWrite(_Env):
     def test_the_off_shift_vote_does_not_consult_provider_enabled(self) -> None:
         """Instance 4 of the same class, pinned structurally.
 
-        `_definitely_off_shift` used to skip any source where `configured()` was false, and
+        Skipping any source where `configured()` is false would be fatal here:
         `configured()` reads `providers.<id>.enabled` from `config.json` for every adapter but
-        this one. One flag flip therefore made a source abstain, nothing answered, and the
-        refusal stopped firing. The vote now asks every non-fallback source and lets each
-        report its own inability to answer as `unknown`.
+        this one, so one flag flip makes a source abstain, nothing answers, and the refusal
+        stops firing. The vote asks every non-fallback source and lets each report its own
+        inability to answer as `unknown`.
         """
         import ast
         import inspect

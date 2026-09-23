@@ -1,7 +1,7 @@
 # Claim-push: event-driven caller identity for pooled MCP stubs
 
-Status: implemented. Supersedes the recaller poll as the primary
-identity-repair path; the poll remains as a fallback.
+The claim push is the primary identity-repair path; the recaller poll remains as a
+fallback, so both designs below are live behaviour.
 
 ## Problem
 
@@ -41,39 +41,50 @@ Pull (old): gateway rekey() ──write──> session_pid_<pid>.txt <──poll
 Push (new): gateway rekey() ─────────────────── claim frame ───────────────────────────────> gatewayd
 ```
 
-1. **Register carries `ancestor_pids`** (`stub.py`): the stub's parent PID
-   chain, nearest first. The chain matters because the PID the gateway
-   records for a runtime (`AcpClient._process.pid`) can sit several layers
-   above the stub's immediate parent — the live topology is
-   sandbox wrapper → kiro-cli → kiro-cli-chat → stub — and a single-level
-   index made every claim miss (found in pod QA: claims applied to 0
-   connections while the recaller fallback masked the failure).
-2. **gatewayd indexes each connection under EVERY ancestor PID**
-   (`_CONN_INDEX: pid → {_StubConn}`; `gatewayd.py`), so a claim naming any
-   level of the runtime's process tree hits. `_StubConn` is a mutable holder
-   for the connection's caller; the forward loop re-reads it per incoming
-   frame, so an update takes effect on the very next call.
+1. **Register carries `ancestor_pids` and, for gateway-injected entries,
+   `stub_session_token`** (`stub.py`). The ancestor chain is nearest first. It
+   matters because the PID recorded for a runtime can sit several layers above
+   the stub's immediate parent. The token names one ACP session on a runtime
+   that may host several; without it a shared-session sub-agent is
+   indistinguishable from its parent by process ancestry alone.
+2. **gatewayd indexes each connection under every usable ancestor PID**
+   (`_CONN_INDEX: pid → {_StubConn}`; `gatewayd.py`). It merges the stub's
+   register-time chain with the host chain derived from the kernel-attested peer
+   PID, so PID namespaces cannot make every claim miss. `_StubConn` stores the
+   caller, per-PID start tokens, and the optional session token; the forward
+   loop re-reads the caller per frame.
 3. **The gateway pushes a claim on rekey** (`claim.py`, hooked into
-   `AcpClient.rekey` and `SessionHandle.rekey`): a one-shot connection to the
-   gatewayd socket sends
-   `{"type": "claim", "pid": P, "caller": {...}}` and reads one ack frame.
+   `AcpClient.rekey` and `SessionHandle.rekey`): a one-shot connection sends
+   `{"type": "claim", "pid": P, "pid_start_id": T, "stub_session_token": U,
+   "caller": {...}}` and reads one ack. `pid_start_id` is the runtime's process
+   start token (`platform_compat.get_process_start_id`; `None` where
+   unavailable). The session token is omitted for legacy/tokenless runtimes.
    Fire-and-forget (`schedule_claim`), bounded at 5 s, no-ops cleanly when
    preconditions are missing.
-4. **gatewayd applies the claim** (`_apply_claim`): every indexed connection
-   under P gets the new caller, each change SEL-audited
-   (`mcp-gateway.caller-claim`). Idempotent re-claims (same key) are silent.
+4. **gatewayd applies the claim** (`_apply_claim`). It records the token binding
+   even when no stub has registered yet. Among connections indexed under P, a
+   token-bearing claim retargets only a connection with the same token or no
+   token; a connection positively naming another session is left alone. A
+   tokenless claim retains the legacy PID-wide behavior. Definite process-start
+   token mismatches are skipped and audited. Each caller change is SEL-audited
+   (`mcp-gateway.caller-claim`), and idempotent re-claims are silent.
 
 ## Trust model
 
 - The stub-initiated `recaller` stays **deny-by-default**: it may only move a
   key-less connection to a valid identity — a compromised stub must not pivot
   an existing identity.
-- The gateway-initiated `claim` may **replace** an existing identity. Trust
-  basis: the unix socket is uid-gated 0700 — the same gate that authenticates
-  `register` frames. Allowing replacement is what fixes re-claim staleness:
-  the caller always tracks the *current* owning session.
+- The gateway-initiated `claim` may **replace** an existing identity, but a
+  session token narrows replacement to that session's connections (plus legacy
+  tokenless connections). Trust is established by the local transport's
+  positive same-principal check: Linux `SO_PEERCRED`, macOS `LOCAL_PEERCRED`,
+  or the Windows named-pipe owning-process SID. POSIX mode bits and the Windows
+  owner-only DACL are defense in depth.
 - Malformed claims (non-int pid, pid ≤ 1, empty/missing session key) update
   nothing and are audited as denied.
+- A claim naming a **recycled PID** never lands on the pre-recycle
+  connection: the per-connection start-token check above is the guard. This
+  is a correctness/attribution boundary, not a principal boundary.
 
 ## Fallback
 
@@ -96,7 +107,7 @@ claim-path involvement.
 - `src/kiro_crew/mcp_gateway/claim.py` — frame builder + sender (stdlib-only)
 - `src/kiro_crew/mcp_gateway/gatewayd.py` — `_StubConn`, `_CONN_INDEX`,
   `_apply_claim`, claim first-frame dispatch, per-frame caller pickup
-- `src/kiro_crew/mcp_gateway/stub.py` — `parent_pid` on register; unbounded
+- `src/kiro_crew/mcp_gateway/stub.py` — `ancestor_pids` on register; unbounded
   backoff recaller
 - `src/kiro_crew/acp/client.py`, `src/kiro_crew/acp/session_provider.py` —
   `rekey()` claim hooks

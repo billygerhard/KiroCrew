@@ -4,12 +4,17 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { useMutation } from '@tanstack/react-query'
-import { MessageSquarePlus, Copy, Check } from 'lucide-react'
-import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd } from '../utils/terminalRegistry'
+import { MessageSquarePlus, Copy, Check, PlugZap, AppWindow } from 'lucide-react'
+import { ensureTerminalConnection, disposeTerminalConnection, getTerminalCwd, useTerminalConnStatus, useTerminalManualRetry, useTerminalDisplaced, retryTerminalConnection } from '../utils/terminalRegistry'
 import { getTerminalFont, resolveTerminalFontFamily, subscribeTerminalFont } from '../hooks/useTerminalFont'
+import { ansiPaletteFromVars } from '../utils/terminalPalette'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
+import { useTerminalTouchSelection, type TouchSelectStatus } from '../hooks/useTerminalTouchSelection'
 import TerminalCompletion from './TerminalCompletion'
 import TerminalKeyBar from './TerminalKeyBar'
+import ErrorNotice from './ErrorNotice'
+import { setTerminalCloseFailed } from '../hooks/useBottomTerminal'
+import { copyToClipboard } from '../utils/clipboard'
 
 import { i18nT } from '../i18n/t'
 /* ── Per-session xterm instance cache ──
@@ -21,11 +26,15 @@ const termCache = new Map<string, { term: Terminal; fit: FitAddon }>()
 /* ── Terminal theme from CSS custom properties ── */
 function getTermTheme() {
   const style = getComputedStyle(document.documentElement)
+  const read = (name: string) => style.getPropertyValue(name)
   return {
     background:          style.getPropertyValue('--bg').trim()            || '#1e1e2e',
     foreground:          style.getPropertyValue('--text').trim()          || '#cdd6f4',
     cursor:              style.getPropertyValue('--accent').trim()        || '#89b4fa',
     selectionBackground: style.getPropertyValue('--accent-subtle').trim() || '#313244',
+    // The 16 ANSI entries: without them xterm renders ANSI-coloured output with
+    // its own palette, which ignores the theme entirely.
+    ...ansiPaletteFromVars(read),
   }
 }
 
@@ -44,9 +53,42 @@ let _themeObserver: MutationObserver | null = null
 let _themeRaf = 0
 /** Coalesce multiple theme signals into one refresh, after the CSSOM settles. */
 function scheduleTermThemeRefresh() {
-  if (_themeRaf) return
+  // Replace the pending frame rather than deferring to it. A plain
+  // `if (_themeRaf) return` latch assumes every handle it stores is eventually
+  // cleared by its own callback, and requestAnimationFrame does not promise
+  // that: an implementation may hand back a live handle whose callback never
+  // runs (happy-dom returns a truthy `{}` when the window is closed or a
+  // timer-loop limit trips, and a browser drops queued frames for a page in the
+  // back/forward cache). One such handle latches the guard truthy forever and
+  // every later theme signal is dropped, so the terminal silently stops
+  // tracking the app theme for the life of the page.
+  //
+  // Cancel-and-reschedule coalesces exactly as well -- a burst of signals still
+  // yields one refresh, because each cancels the last -- while making a
+  // non-firing handle merely stale instead of permanently blocking.
+  if (_themeRaf) cancelAnimationFrame(_themeRaf)
   _themeRaf = requestAnimationFrame(() => { _themeRaf = 0; refreshTermThemes() })
 }
+/** Whether a batch of mutation records is one of the two theme signals.
+ *
+ * Split out of the observer callback so the CLASSIFICATION can be asserted directly.
+ * Driving it through a live MutationObserver in a test means asserting on happy-dom's
+ * record DELIVERY, which is bistable in this suite -- the same file passes under
+ * `--coverage` and fails without it -- so a test written that way reports on the
+ * environment rather than on this rule.
+ */
+export function isThemeSignal(records: MutationRecord[]): boolean {
+  for (const r of records) {
+    // (1) a built-in theme / mode swap flips <html data-theme>.
+    if (r.type === 'attributes') return true
+    // (2) a CUSTOM theme's vars only resolve once useTheme injects its <style>.
+    for (const n of r.addedNodes) {
+      if (n instanceof HTMLStyleElement && n.id.startsWith('mc-custom-theme-')) return true
+    }
+  }
+  return false
+}
+
 function ensureThemeObserver() {
   if (_themeObserver || typeof document === 'undefined') return
   // A terminal's xterm colours are a construction-time snapshot (canvas, not
@@ -58,18 +100,18 @@ function ensureThemeObserver() {
   //      observer misses it and the terminal stays on the boot-default palette.
   // The attribute filter catches (1); watching <head> childList catches (2).
   _themeObserver = new MutationObserver((records) => {
-    for (const r of records) {
-      if (r.type === 'attributes') { scheduleTermThemeRefresh(); return }
-      for (const n of r.addedNodes) {
-        if (n instanceof HTMLStyleElement && n.id.startsWith('mc-custom-theme-')) {
-          scheduleTermThemeRefresh()
-          return
-        }
-      }
-    }
+    if (isThemeSignal(records)) scheduleTermThemeRefresh()
   })
   _themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
   _themeObserver.observe(document.head, { childList: true })
+}
+
+/** Test-only: release the document-scoped observer and any queued frame. */
+export function __resetTerminalThemeSyncForTests(): void {
+  if (_themeRaf) cancelAnimationFrame(_themeRaf)
+  _themeRaf = 0
+  _themeObserver?.disconnect()
+  _themeObserver = null
 }
 
 /* ── Terminal font sync ──
@@ -91,7 +133,10 @@ function applyTerminalFontToAll(): void {
 
 let _fontRaf = 0
 function scheduleTerminalFontApply(): void {
-  if (_fontRaf) return
+  // Same latch hazard as scheduleTermThemeRefresh -- see the comment there for
+  // why a returned frame handle cannot be trusted to fire. Fixed identically so
+  // the two schedulers cannot drift apart.
+  if (_fontRaf) cancelAnimationFrame(_fontRaf)
   _fontRaf = requestAnimationFrame(() => { _fontRaf = 0; applyTerminalFontToAll() })
 }
 
@@ -147,13 +192,28 @@ export function disposeTerminalSession(sessionId: string): void {
  * backstopped by the server-side orphan reaper — but routing it through a
  * mutation gives it the standard write lifecycle instead of a bare fetch.
  * Local teardown stays synchronous in disposeTerminalSession().
+ *
+ * `keepalive` lets the request outlive the document that issued it: the
+ * terminal popout returns itself to the main window the moment its last tab
+ * closes, and without it that final DELETE would be aborted with the window.
+ * A rejection is recorded in the shared close-failed flag (every consumer
+ * reports it the same way), which the always-mounted panel root renders.
  */
 export function useDeleteTerminalSession() {
   return useMutation({
     mutationFn: async (sessionId: string) => {
-      const res = await fetch(`/api/terminal/sessions/${sessionId}`, { method: 'DELETE' })
+      const res = await fetch(`/api/terminal/sessions/${sessionId}`, { method: 'DELETE', keepalive: true })
+      // 404 means the server has no such session any more: the PTY was already
+      // reaped (idle sweep, gateway restart, a second close racing this one).
+      // The shell is stopped, which is the outcome the user asked for, so this
+      // is success, not a failure to report.
+      if (res.status === 404) return
       if (!res.ok) throw new Error(`Failed to delete terminal session (${res.status})`)
     },
+    // Mutation-level (not per-`mutate`) so it still fires after the caller has
+    // unmounted — closing the LAST tab hides the strip that would otherwise
+    // render the failure.
+    onError: () => setTerminalCloseFailed(true),
   })
 }
 
@@ -185,6 +245,18 @@ export function remeasureAndFit(term: Terminal, fit: FitAddon): void {
 }
 
 /* ── Terminal view for one session ── */
+/** Literal-key lookup for the touch range-selection hint (#6834) — one compact
+ *  string per gesture stage, serving both the visible hint chip and the sr-only
+ *  live region. Literal keys (no runtime-assembled catalog keys) keep the
+ *  dead-key scan meaningful, same discipline as the key bar's label lookups. */
+function touchSelectHint(status: TouchSelectStatus): string {
+  switch (status) {
+    case 'range_anchor': return i18nT('components.cliPanel.touch_select_anchor')
+    case 'range_selected': return i18nT('components.cliPanel.touch_select_done')
+    default: return ''
+  }
+}
+
 function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: string; cwd?: string; visible: boolean; onSendToChat?: (text: string) => void }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
@@ -200,10 +272,38 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
   // The soft keys exist for one reason — no physical keyboard.
   const touchDevice = useIsTouchDevice()
 
+  // Live socket state, so the view can surface a disconnected banner. The
+  // banner shows in two cases: the terminal 'disconnected' state (backoff
+  // ceiling reached), and while a USER-initiated reconnect is in flight — the
+  // latter as a "Reconnecting…" presentation so a failing manual retry is not
+  // silent. Ordinary automatic 'reconnecting' blips (tab hide/show) stay quiet
+  // to avoid flicker; only a manual retry sets manualRetry.
+  const connStatus = useTerminalConnStatus(sessionId)
+  const manualRetry = useTerminalManualRetry(sessionId)
+  // The manual "Reconnecting…" state: the user clicked Reconnect and the dial
+  // has not yet resolved. On failure the status flips back to 'disconnected'
+  // (manualRetry clears with it), returning the banner to its disconnected
+  // presentation; on success it flips to 'connected' and the banner is gone.
+  const reconnecting = manualRetry && connStatus === 'reconnecting'
+  const showBanner = connStatus === 'disconnected' || reconnecting
+  // Parked because another window of this dashboard took the terminal (the
+  // server said so explicitly). Not a failure: neutral icon and copy that
+  // names the cause, so the user does not blame the network and does not
+  // reflexively click Reconnect and bounce the other window.
+  const displaced = useTerminalDisplaced(sessionId) && connStatus === 'disconnected'
+
   if (!entryRef.current) {
     entryRef.current = getOrCreateTerm(sessionId)
   }
   const { term, fit } = entryRef.current
+
+  // Touch range-selection (#6834): long-press a line to set the first endpoint,
+  // then tap/long-press another to select the inclusive span. xterm's own
+  // drag-selection is mouse-only and never fires on touch, so on a phone this
+  // is the only way to grab an ARBITRARY range out of the middle of scrollback
+  // (the staged Select key only reaches the last line or the whole buffer).
+  // Inert on mouse devices, where xterm's drag-selection already works.
+  const touchSelect = useTerminalTouchSelection(term, touchDevice)
 
   // Re-measure + refit, gated on pane visibility (see remeasureAndFit). Stable
   // per cached term/fit, so the effects below don't re-subscribe.
@@ -262,7 +362,18 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
     fonts.ready.then(onReady)
     try {
       const px = term.options.fontSize ?? 13
-      fonts.load(`${px}px "JetBrains Mono"`).then(onReady, () => {})
+      // Preload the family the terminal is actually configured to render. The
+      // previous version hardcoded 'JetBrains Mono' — fine for the default
+      // stack but silently miss for anyone who picked a different Terminal
+      // Font Family (e.g. the bundled OpenDyslexicMono, or a custom Nerd Font):
+      // @font-face fonts fetch lazily on first DOM use, so xterm's canvas
+      // renderer would measure and draw against the generic monospace fallback
+      // until some other var(--mono) surface pulled the resolved family in.
+      // Using `term.options.fontFamily` (already the resolved stack from
+      // resolveTerminalFontFamily — comma-separated with a generic fallback)
+      // makes the load target follow the picker.
+      const configuredFontFamily = term.options.fontFamily ?? 'monospace'
+      fonts.load(`${px}px ${configuredFontFamily}`).then(onReady, () => {})
     } catch { /* invalid spec on some engines — `ready` handler covers it */ }
     return () => { cancelled = true }
   }, [term, doRefit]) // stable — term/doRefit come from the per-session cache
@@ -367,17 +478,16 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
     if (!sel?.text) return
     // Confirm only after the write actually lands; a denied/unavailable
     // clipboard shows "Copy failed" and keeps the selection so the user can
-    // fall back to the native copy shortcut.
-    const write = navigator.clipboard?.writeText(sel.text)
-    if (!write) { setCopied('failed'); return }
-    write.then(
-      () => {
-        setCopied('done')
-        // Keep the toolbar up briefly so the confirmation is visible.
-        setTimeout(dismissSelection, 900)
-      },
-      () => setCopied('failed'),
-    )
+    // fall back to the native copy shortcut. Routed through the shared
+    // helper, which falls back to execCommand('copy') on a plain-HTTP origin
+    // or a permission refusal — its fallback restores focus and the document
+    // selection afterwards, so it no longer costs this pane anything.
+    copyToClipboard(sel.text).then(ok => {
+      if (!ok) { setCopied('failed'); return }
+      setCopied('done')
+      // Keep the toolbar up briefly so the confirmation is visible.
+      setTimeout(dismissSelection, 900)
+    })
   }, [sel, dismissSelection])
 
   return (
@@ -390,14 +500,97 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
           only. The menu clamps itself inside its `offsetParent`; anchoring it to
           the outer wrapper would let it count the key bar's height as free space
           and drop over the soft keys — covering Tab on exactly the devices the
-          bar exists for. */}
-      <div className="relative w-full flex-1 min-h-0 overflow-hidden">
+          bar exists for.
+
+          The touch handlers (#6834) live on THIS div, not the outer wrapper, so
+          a touch maps to a terminal row using the terminal's own geometry. They
+          no-op on mouse devices (the hook's `enabled` gate), where xterm's own
+          drag-selection handles selection. Passive: they never preventDefault,
+          so ordinary scroll/tap still reach xterm — a long-press is recognised
+          by a still-finger timer, not by swallowing the gesture. */}
+      <div
+        className="relative w-full flex-1 min-h-0 overflow-hidden"
+        onTouchStart={touchSelect.onTouchStart}
+        onTouchMove={touchSelect.onTouchMove}
+        onTouchEnd={touchSelect.onTouchEnd}
+        onTouchCancel={touchSelect.onTouchEnd}
+      >
         <div ref={containerRef} className="w-full h-full overflow-hidden" />
         {/* Owns xterm's SINGLE `attachCustomKeyEventHandler` slot for this term
-            (it reserves Tab/Enter/arrows/Escape while its menu is open). A later
+            (it reserves Tab/arrows/Escape while its menu is open, and Enter only once
+            a row has been arrowed onto). A later
             feature that attaches its own handler here would silently replace it —
             extend the handler inside TerminalCompletion instead. */}
         <TerminalCompletion term={term} sessionId={sessionId} active={visible} />
+        {/* Touch range-selection discoverability (#6834). The gesture is
+            invisible on a canvas — nothing tells the user an endpoint is set —
+            so surface it two ways: a small transient hint chip anchored top-left
+            (visual), and an sr-only live region (screen reader), the same
+            announce-through-a-status-region pattern the key bar's Copy/Select
+            use. Only rendered on touch, and only while a gesture is mid-flight
+            or just completed. */}
+        {touchDevice && touchSelect.status && (
+          <div
+            // Sits top-left over the grid. When the disconnect banner is up it
+            // occupies the top strip (z-30) and would fully cover a top-2 chip —
+            // and copying the last output of a dead session is exactly when this
+            // gesture is used — so drop the chip below the banner then (UX
+            // review #8070).
+            className={`pointer-events-none absolute left-2 z-20 rounded-md border border-border bg-bg-elevated/95 px-2 py-0.5 text-[11px] text-text shadow-sm backdrop-blur ${showBanner ? 'top-10' : 'top-2'}`}
+            aria-hidden="true"
+          >
+            {touchSelectHint(touchSelect.status)}
+          </div>
+        )}
+        {touchDevice && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {touchSelect.status ? touchSelectHint(touchSelect.status) : ''}
+          </span>
+        )}
+        {showBanner && (
+          <div
+            className="absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-border bg-bg-elevated/95 px-3 py-1.5 text-[12px] text-text shadow-sm backdrop-blur"
+            role={displaced || reconnecting ? 'status' : undefined}
+            aria-live={displaced || reconnecting ? 'polite' : undefined}
+          >
+            {displaced || reconnecting ? (
+              <>
+                {/* Status, not failure: the terminal was handed to another
+                    window on purpose, or the user's own retry is in flight. */}
+                {displaced
+                  ? <AppWindow className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />
+                  : <PlugZap className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />}
+                <span className="min-w-0 flex-1 truncate">
+                  {reconnecting
+                    ? i18nT('components.cliPanel.reconnecting')
+                    : i18nT('components.cliPanel.displaced_message')}
+                </span>
+              </>
+            ) : (
+              /* The redial chain gave up: a FAILED outcome, so it renders through
+                 the shared error surface with the agent hand-off on. Nothing is
+                 lost by navigating away -- the PTY stays alive server-side and
+                 the cached xterm keeps its screen for the reconnect. */
+              <ErrorNotice
+                variant="inline"
+                askAgent
+                testId="cli-panel-disconnected"
+                className="min-w-0 flex-1"
+                message={i18nT('components.cliPanel.disconnected_message')}
+              />
+            )}
+            <button
+              type="button"
+              onClick={() => retryTerminalConnection(sessionId)}
+              disabled={reconnecting}
+              className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[12px] text-text hover:bg-bg-hover transition-colors disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent"
+            >
+              {displaced
+                ? i18nT('components.cliPanel.use_here')
+                : i18nT('components.cliPanel.reconnect')}
+            </button>
+          </div>
+        )}
       </div>
       {/* Below the terminal in flow, never over it: the shell prompt occupies the
           bottom row, so an overlay would hide the line being typed. The terminal
@@ -410,7 +603,7 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
         // eslint-disable-next-line jsx-a11y/no-static-element-interactions
         <div
           ref={toolbarRef}
-          className="absolute z-20 flex items-center gap-0.5 rounded-lg border border-border bg-bg-elevated p-0.5 shadow-lg transition-opacity"
+          className="absolute z-20 flex flex-wrap items-center gap-0.5 rounded-lg border border-border bg-bg-elevated p-0.5 shadow-lg transition-opacity"
           style={{
             left: pos?.left ?? 0,
             top: pos?.top ?? 0,
@@ -432,7 +625,7 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
               className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-text hover:bg-bg-hover transition-colors ${sending === 'busy' ? 'opacity-60' : ''}`}
               title={sending === 'failed' ? i18nT('components.cliPanel.redaction_failed_retry') : i18nT('components.cliPanel.send_selection_to_chat')}
             >
-              <MessageSquarePlus className={`h-3.5 w-3.5 ${sending === 'failed' ? 'text-red-500' : ''}`} />
+              <MessageSquarePlus className={`h-3.5 w-3.5 ${sending === 'failed' ? 'text-danger' : ''}`} />
               {sending === 'busy' ? i18nT('components.cliPanel.sending') : sending === 'failed' ? i18nT('components.cliPanel.failed_retry') : i18nT('components.cliPanel.send_to_chat')}
             </button>
           )}
@@ -442,9 +635,31 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
             className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] text-text hover:bg-bg-hover transition-colors"
             title={i18nT('components.cliPanel.copy_selection')}
           >
-            {copied === 'done' ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className={`h-3.5 w-3.5 ${copied === 'failed' ? 'text-red-500' : ''}`} />}
+            {copied === 'done' ? <Check className="h-3.5 w-3.5 text-ok" /> : <Copy className={`h-3.5 w-3.5 ${copied === 'failed' ? 'text-danger' : ''}`} />}
             {copied === 'done' ? i18nT('components.cliPanel.copied') : copied === 'failed' ? i18nT('components.cliPanel.copy_failed') : i18nT('components.cliPanel.copy')}
           </button>
+          {/* Failures take their own flex line (`basis-full`) beneath the two
+              actions, so the notice's hand-off link never joins them in one
+              button row. Neither holds a draft — the selection stays put for the
+              retry — so the hand-off is on. */}
+          {sending === 'failed' && (
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="cli-panel-send-error"
+              className="basis-full px-2 pb-1"
+              message={i18nT('components.cliPanel.redaction_failed_retry')}
+            />
+          )}
+          {copied === 'failed' && (
+            <ErrorNotice
+              variant="inline"
+              askAgent
+              testId="cli-panel-copy-error"
+              className="basis-full px-2 pb-1"
+              message={i18nT('components.cliPanel.copy_failed')}
+            />
+          )}
         </div>
       )}
     </div>

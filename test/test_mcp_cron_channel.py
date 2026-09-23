@@ -5,7 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from kiro_crew.mcp_cron import _call_tool
+import pytest
+
+from kiro_crew.mcp_cron import _call_tool_locally
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestCronAddChannel:
@@ -18,6 +30,7 @@ class TestCronAddChannel:
                 {
                     "id": "abc",
                     "name": "test",
+                    "timezone": "",
                     "schedule": type(
                         "S",
                         (),
@@ -26,7 +39,7 @@ class TestCronAddChannel:
                 },
             )()
             mock_svc.add_job.return_value = mock_job
-            result = _call_tool(
+            result = _call_tool_locally(
                 "cron_add",
                 {"name": "ops", "message": "check", "every": 300, "channel": "C0AP77JJSN6"},
             )
@@ -48,6 +61,7 @@ class TestCronAddChannel:
                 {
                     "id": "def",
                     "name": "test",
+                    "timezone": "",
                     "schedule": type(
                         "S",
                         (),
@@ -57,7 +71,9 @@ class TestCronAddChannel:
                 },
             )()
             mock_svc.add_job.return_value = mock_job
-            result = _call_tool("cron_add", {"name": "ops", "message": "check", "every": 300})
+            result = _call_tool_locally(
+                "cron_add", {"name": "ops", "message": "check", "every": 300}
+            )
             call_kwargs = mock_svc.add_job.call_args
             assert (
                 call_kwargs.kwargs.get("channel") is None or call_kwargs[1].get("channel") is None

@@ -12,6 +12,14 @@ vi.mock('../../api/client', () => ({
   ApiError: class ApiError extends Error {},
 }))
 
+// The modal reached through this card no longer offers a reveal delivery, so
+// its output does not depend on directLocal; the branding hook is stubbed only
+// so the component renders under test.
+const brandingEnv = vi.hoisted(() => ({ directLocal: true }))
+vi.mock('../../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
+}))
+
 function renderCard() {
   const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
   return render(
@@ -33,7 +41,10 @@ const RESULT = {
 }
 
 describe('ReportProblemCard', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    brandingEnv.directLocal = true
+  })
 
   it('opens the modal from the Report a Problem button', () => {
     renderCard()
@@ -41,7 +52,7 @@ describe('ReportProblemCard', () => {
     expect(screen.getByText(/what happened/i)).toBeInTheDocument()
   })
 
-  it('collects diagnostics and surfaces the three delivery actions', async () => {
+  it('collects diagnostics and surfaces the two delivery actions', async () => {
     ;(api.collectDiagnostics as ReturnType<typeof vi.fn>).mockResolvedValue(RESULT)
     renderCard()
 
@@ -53,15 +64,17 @@ describe('ReportProblemCard', () => {
     )
     expect(api.collectDiagnostics).toHaveBeenCalledWith({ note: '', include_logs: true })
 
-    // Finder + download + GitHub issue actions all present
-    expect(screen.getByRole('button', { name: /show in finder/i })).toBeInTheDocument()
+    // Download + GitHub issue actions present; no reveal button (the row keeps
+    // two buttons, and /api/reveal targets the gateway host, not the browser's
+    // machine — the saved path stands in for it).
     const issueLink = screen.getByRole('link', { name: /open github issue/i })
     expect(issueLink).toHaveAttribute('href', RESULT.github_issue_url)
     const dl = screen.getByRole('link', { name: /download zip/i })
     expect(dl).toHaveAttribute('href', RESULT.download_url)
-
-    fireEvent.click(screen.getByRole('button', { name: /show in finder/i }))
-    expect(api.revealPath).toHaveBeenCalledWith(RESULT.zip_path)
+    expect(
+      screen.queryByRole('button', { name: /finder|file explorer|file manager/i }),
+    ).not.toBeInTheDocument()
+    expect(api.revealPath).not.toHaveBeenCalled()
   })
 
   it('shows an error when collection fails', async () => {

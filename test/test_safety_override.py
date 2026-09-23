@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from conftest import drain_breadcrumb_writes
 from kiro_crew.safety_override import (
     ActivationResult,
     OverrideStatus,
@@ -182,6 +183,113 @@ class TestDeactivation:
         assert result.renewed is False
         assert result.reason == "not_active"
 
+    def test_deactivate_lapsed_grant_emits_sel(self, override: SafetyOverride) -> None:
+        """An explicit deactivate against a grant that already lapsed is an
+        operator DECISION and must reach the SEL sink — lazy expiry clearing
+        ``_active`` first must not swallow it."""
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack")
+        override._expires_at = time.monotonic() - 1
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            assert not override.is_active()  # trips lazy expiry
+        # Pin the discriminator: lazy expiry clears _active but NOT _expires_at,
+        # which is exactly why the deactivate guard must not key off _active.
+        assert override._active is False
+        assert override._expires_at > 0.0
+
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.deactivate("dashboard")
+        mock_sel_instance.log_api_access.assert_called_once()
+        kwargs = mock_sel_instance.log_api_access.call_args.kwargs
+        assert kwargs["operation"] == "safety_override:deactivate"
+        assert kwargs["outcome"] == "disabled"
+        assert "source:dashboard" in kwargs["resources"]
+        assert "was_active:False" in kwargs["resources"]
+        assert "was_permanent:False" in kwargs["resources"]
+        assert "remaining:0s" in kwargs["resources"]
+        assert "prior_source:slack" in kwargs["resources"]
+
+    def test_deactivate_live_grant_emits_sel_with_was_active(
+        self, override: SafetyOverride
+    ) -> None:
+        """A live-grant deactivate keeps its event, with was_active recording
+        that a real grant was revoked — the lapsed-grant event does not
+        replace or dilute the existing signal."""
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=600)
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.deactivate("slack")
+        mock_sel_instance.log_api_access.assert_called_once()
+        kwargs = mock_sel_instance.log_api_access.call_args.kwargs
+        assert kwargs["operation"] == "safety_override:deactivate"
+        assert kwargs["outcome"] == "disabled"
+        assert "was_active:True" in kwargs["resources"]
+
+    def test_deactivate_permanent_grant_records_permanence(
+        self, override: SafetyOverride
+    ) -> None:
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate_declared()
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.deactivate("dashboard")
+        kwargs = mock_sel_instance.log_api_access.call_args.kwargs
+        assert "was_active:True" in kwargs["resources"]
+        assert "was_permanent:True" in kwargs["resources"]
+        assert "remaining:-1s" in kwargs["resources"]
+
+    def test_second_deactivate_is_silent(self, override: SafetyOverride) -> None:
+        """After an explicit deactivate the 0.0 sentinel is restored, so a
+        repeat call has no grant to report and emits nothing."""
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack")
+            override.deactivate("slack")
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.deactivate("slack")
+        mock_sel_instance.log_api_access.assert_not_called()
+
+    def test_deactivate_lapsed_unpolled_grant_reports_inactive(
+        self, override: SafetyOverride
+    ) -> None:
+        """A TTL that lapsed WITHOUT an intervening is_active() poll leaves
+        _active stale at True; the event must still report was_active:False —
+        liveness is derived from the deadline, not the unreconciled flag."""
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack")
+        override._expires_at = time.monotonic() - 1
+        assert override._active is True  # lazy expiry has NOT run
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.deactivate("dashboard")
+        mock_sel_instance.log_api_access.assert_called_once()
+        kwargs = mock_sel_instance.log_api_access.call_args.kwargs
+        assert "was_active:False" in kwargs["resources"]
+        assert "remaining:0s" in kwargs["resources"]
+
+    def test_renew_after_deactivating_lapsed_grant_fails(
+        self, override: SafetyOverride
+    ) -> None:
+        """Deactivating a lapsed grant zeroes _expires_at, so the renew grace
+        window cannot resurrect an explicitly revoked grant."""
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack")
+            override._expires_at = time.monotonic() - 60  # lapsed, within 300s grace
+            assert not override.is_active()
+            override.deactivate("slack")
+            result = override.renew("slack")
+        assert result.renewed is False
+        assert result.reason == "not_active"
+
 
 # ─── Renewal ────────────────────────────────────────────────────────────────
 
@@ -241,6 +349,26 @@ class TestRenewal:
         assert "safety_override:renew" in operations
         outcomes = [c.kwargs["outcome"] for c in calls]
         assert "denied" in outcomes
+
+    def test_renew_extends_deadline_with_exactly_one_renewed_event(
+        self, override: SafetyOverride
+    ) -> None:
+        """Happy path: the deadline moves forward and ONE renewed event is logged."""
+        mock_sel_instance = MagicMock()
+        with patch("kiro_crew.safety_override.sel", return_value=mock_sel_instance):
+            override.activate("slack", ttl=60)
+            deadline_before = override._expires_at
+            result = override.renew("slack")
+        assert result.renewed is True
+        assert result.ttl > 0
+        assert override._expires_at > deadline_before
+        renew_events = [
+            c
+            for c in mock_sel_instance.log_api_access.call_args_list
+            if c.kwargs["operation"] == "safety_override:renew"
+        ]
+        assert len(renew_events) == 1
+        assert renew_events[0].kwargs["outcome"] == "renewed"
 
 
 # ─── Status ─────────────────────────────────────────────────────────────────
@@ -340,6 +468,184 @@ class TestSelFaultTolerance:
             # Should not raise
             override.deactivate("slack")
         assert not override.is_active()
+
+    def test_sel_crash_refuses_renew_and_leaves_deadline_unmoved(
+        self, override: SafetyOverride
+    ) -> None:
+        """SEL audit failure during renew() must refuse the extension — fail closed.
+
+        The sink (``log_api_access``) raises, not ``_log_sel``: patching
+        ``_log_sel`` would pass regardless of the ``critical`` flag, and the
+        flag is exactly what this test pins.
+        """
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=60)
+        deadline_before = override._expires_at
+        last_renewed_before = override._last_renewed_at
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock(
+                log_api_access=MagicMock(side_effect=RuntimeError("boom"))
+            )
+            result = override.renew("slack")
+        assert result.renewed is False
+        assert result.ttl == 0
+        assert result.reason == "audit_failed"
+        # The grant itself is untouched: still active, deadline unmoved.
+        assert override._expires_at == deadline_before
+        assert override._last_renewed_at == last_renewed_before
+        assert override.is_active()
+
+    def test_renew_does_not_resurrect_grant_deactivated_during_audit(
+        self, override: SafetyOverride
+    ) -> None:
+        """A deactivate() landing while the renew audit is being written wins.
+
+        The renew SEL event is written outside ``_lock``, so a concurrent
+        deactivate() can zero the grant in that window; the post-audit
+        re-verify must refuse the commit rather than resurrect the grant.
+        """
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=60)
+
+        sink = MagicMock()
+
+        def _deactivate_on_renew(**kwargs: object) -> None:
+            if (
+                kwargs.get("operation") == "safety_override:renew"
+                and kwargs.get("outcome") == "renewed"
+            ):
+                override.deactivate("dashboard")
+
+        sink.log_api_access.side_effect = _deactivate_on_renew
+        with patch("kiro_crew.safety_override.sel", return_value=sink):
+            result = override.renew("slack")
+
+        assert result.renewed is False
+        assert result.reason == "not_active"
+        # The deactivation stands: no resurrection, no deadline.
+        assert override._active is False
+        assert override._expires_at == 0.0
+        assert not override.is_active()
+
+    def test_renew_does_not_overwrite_activation_landed_during_audit(
+        self, override: SafetyOverride
+    ) -> None:
+        """A fresh activate() landing during the renew audit window wins.
+
+        The new activation audited its own grant and installed its own
+        deadline; a stale renewal committing afterwards would overwrite it
+        with a deadline computed for the OLD grant. The activation-count
+        snapshot must refuse the commit.
+        """
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=60)
+
+        sink = MagicMock()
+
+        def _activate_on_renew(**kwargs: object) -> None:
+            if (
+                kwargs.get("operation") == "safety_override:renew"
+                and kwargs.get("outcome") == "renewed"
+            ):
+                override.activate("dashboard", ttl=30)
+
+        sink.log_api_access.side_effect = _activate_on_renew
+        with patch("kiro_crew.safety_override.sel", return_value=sink):
+            result = override.renew("slack")
+
+        assert result.renewed is False
+        # The fresh activation's grant is intact: its deadline (~30s out) was
+        # not replaced by the stale renewal's much longer TTL, and the renewal
+        # left no bookkeeping behind.
+        assert override.is_active()
+        assert override._source == "dashboard"
+        assert override._expires_at - time.monotonic() <= 30 + 1
+        assert override._last_renewed_at == 0.0
+
+    def test_renew_refuses_when_permanent_activation_lands_during_audit(
+        self, override: SafetyOverride
+    ) -> None:
+        """A permanent grant installed during the audit window is left alone.
+
+        The renewal must neither report success (it committed nothing) nor
+        touch the permanent grant, and the already-persisted renewed event
+        must be followed by a corrective denied event so the SEL stays
+        truthful.
+        """
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=60)
+
+        sink = MagicMock()
+
+        def _go_permanent_on_renew(**kwargs: object) -> None:
+            if (
+                kwargs.get("operation") == "safety_override:renew"
+                and kwargs.get("outcome") == "renewed"
+            ):
+                override.activate_declared()
+
+        sink.log_api_access.side_effect = _go_permanent_on_renew
+        with patch("kiro_crew.safety_override.sel", return_value=sink):
+            result = override.renew("slack")
+
+        assert result.renewed is False
+        # The permanent grant is untouched and still permanent.
+        assert override.is_permanent is True
+        assert override._last_renewed_at == 0.0
+        # A corrective denied event follows the persisted renewed event.
+        renew_events = [
+            c
+            for c in sink.log_api_access.call_args_list
+            if c.kwargs["operation"] == "safety_override:renew"
+        ]
+        assert [c.kwargs["outcome"] for c in renew_events] == ["renewed", "denied"]
+        assert "superseded_by_activation" in renew_events[-1].kwargs["resources"]
+
+    def test_renew_begun_active_refuses_grace_commit_after_midaudit_off(
+        self, override: SafetyOverride
+    ) -> None:
+        """A renewal that began ACTIVE may not commit through the grace arm.
+
+        Mid-audit the grant lapses and the operator switches it off: the
+        expiry bookkeeping clears ``_active`` but keeps the past deadline, and
+        deactivate() on an already-lapsed grant is an early-return no-op, so
+        the grace arm alone cannot distinguish "expired" from "operator said
+        off". The renewal began on the active arm, so the commit must require
+        the grant to STILL be active — not slide into grace and restore
+        auto-approval over the operator's off.
+        """
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("slack", ttl=60)
+
+        sink = MagicMock()
+
+        def _lapse_and_off_on_renew(**kwargs: object) -> None:
+            if (
+                kwargs.get("operation") == "safety_override:renew"
+                and kwargs.get("outcome") == "renewed"
+            ):
+                # The deadline passes mid-audit and is_active() bookkeeping
+                # runs (e.g. from the operator's off flow reading status).
+                override._expires_at = time.monotonic() - 1  # lapsed, in grace
+                override._active = False
+                # The operator's explicit off: early-return no-op on a lapsed
+                # grant, deadline stays intact.
+                override.deactivate("dashboard")
+
+        sink.log_api_access.side_effect = _lapse_and_off_on_renew
+        with patch("kiro_crew.safety_override.sel", return_value=sink):
+            result = override.renew("slack")
+
+        assert result.renewed is False
+        assert result.reason == "not_active"
+        assert override._active is False
+        assert not override.is_active()
+        assert override._last_renewed_at == 0.0
 
     def test_sel_import_error_rolls_back_activate(self, override: SafetyOverride) -> None:
         """SEL import error during activate() must roll back — fail closed."""
@@ -854,6 +1160,35 @@ class TestRenamedConfigKey:
     def test_absent_defaults_to_off(self) -> None:
         assert self._load({}) is False
 
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "disabled", ""])
+    def test_falsy_looking_string_is_never_an_affirmative_grant(self, value: str) -> None:
+        """A bare ``bool(...)`` treats any non-empty string as True, so a
+        stringly-typed value from a templated/generated config -- someone's
+        hand-edit, a Docker-style generator that quotes every value -- can
+        silently turn "explicitly disabled" into the standing, unattended
+        tool-auto-approve grant this key controls. A non-bool value must never
+        be read as an affirmative grant, regardless of what it looks like."""
+        assert self._load({"dangerously_skip_permissions": value}) is False
+
+    @pytest.mark.parametrize("value", ["true", "1", 1, 1.0, None, [], {}])
+    def test_non_bool_value_of_any_shape_falls_through(self, value: object) -> None:
+        """Not just falsy-looking strings -- ANY non-bool value (including one
+        that looks like an affirmative grant, e.g. "true"/1) must be rejected,
+        not coerced. Falls through to check the next spelling."""
+        assert self._load({"dangerously_skip_permissions": value}) is False
+        assert self._load({"dangerously_skip_permissions": value, "yolo": True}) is True
+
+    def test_bad_primary_key_does_not_shadow_a_valid_legacy_spelling(self) -> None:
+        """A malformed dangerously_skip_permissions must not block a
+        well-formed yolo/dangerouslySkipPermissions from being honoured --
+        the original bug's fallback path (renamed key) must still work even
+        when the new key is present but garbage."""
+        assert self._load({"dangerously_skip_permissions": "true", "yolo": True}) is True
+        assert (
+            self._load({"dangerously_skip_permissions": "1", "dangerouslySkipPermissions": True})
+            is True
+        )
+
 
 # ─── Never-expiring grants must not be described as expiring ─────────────────
 
@@ -1006,7 +1341,11 @@ class TestStatusDoesNotBlockTheEventLoop:
         from kiro_crew.dashboard import handlers_system
 
         src = inspect.getsource(handlers_system.api_status)
-        assert "to_thread(_yolo_duration_fields)" in src, (
+        # Whitespace-insensitive: black may wrap the to_thread(...) call across
+        # lines, so collapse whitespace before matching rather than relying on a
+        # literal substring that a line-break would defeat.
+        compact = "".join(src.split())
+        assert "to_thread(_yolo_duration_fields)" in compact, (
             "the duration/permission fields must be resolved via asyncio.to_thread"
         )
 
@@ -1021,6 +1360,143 @@ class TestStatusDoesNotBlockTheEventLoop:
             "kiro_crew.dashboard.handlers_system.until_shutdown_permitted",
             side_effect=RuntimeError("governance down"),
         ):
-            label, permitted = _yolo_duration_fields()
+            label, permitted, disabled_modes = _yolo_duration_fields()
         assert label == "6h"
         assert permitted is True
+        # Fail-soft: the call returns cleanly. disabled_modes reflects the
+        # real governance layer (not patched here), so assert only its type.
+        assert isinstance(disabled_modes, list)
+
+
+# ─── Breadcrumb path resolution (host-isolation regression) ────────────────
+
+
+class TestBreadcrumbPathResolvedAtEnqueueTime:
+    """The breadcrumb publish must resolve ``config_dir()`` on the CALLING
+    thread, before the job is handed to the worker -- never inside the worker
+    itself.
+
+    ``_sync_breadcrumb`` runs synchronously on whatever thread committed the
+    state transition (an event-loop callback, or a test). The actual file I/O
+    is queued onto a long-lived daemon worker (``kirocrew-safety-breadcrumb``)
+    so that thread never blocks the caller. If the worker resolved
+    ``config_dir()`` itself -- lazily, at write time -- then a caller whose
+    ``KIROCREW_HOME`` override has since been reverted (a test's monkeypatch
+    torn down at fixture teardown, or a production reload that changes the
+    active home) would have its publish land wherever ``config_dir()``
+    resolves to BY THEN, not where it resolved when the grant was actually
+    committed.
+    """
+
+    def test_write_and_clear_receive_a_caller_resolved_path(
+        self, override: SafetyOverride, tmp_path, monkeypatch
+    ) -> None:
+        """Mutation guard: ``_write_breadcrumb``/``_clear_breadcrumb`` must be
+        handed the path, not resolve it themselves.
+
+        Pins ``config_dir()`` to *tmp_path* only while the transition commits,
+        then swaps it out for a path that does not exist BEFORE the worker gets
+        a chance to run, and confirms the write still lands under *tmp_path*.
+        If either helper called ``_breadcrumb_path()`` internally instead of
+        using the path handed to it, the swapped-out resolver would send the
+        write somewhere else (or make it fail outright), which this test would
+        catch by finding no breadcrumb under *tmp_path*.
+        """
+        import kiro_crew.safety_override as so_mod
+
+        real_config_dir = so_mod.config_dir
+        pinned_dir = tmp_path / "pinned-home"
+        pinned_dir.mkdir()
+        # A different directory the resolver is swapped to AFTER commit, so any
+        # write happening on the worker under the OLD (reverted) resolver would
+        # land here instead of under pinned_dir -- exactly the bug this test
+        # guards against.
+        diverted_dir = tmp_path / "diverted-home"
+        diverted_dir.mkdir()
+
+        monkeypatch.setattr(so_mod, "config_dir", lambda: pinned_dir)
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            result = override.activate("dashboard", ttl=60)
+        assert result.active is True
+
+        # Revert BEFORE the worker has necessarily run: the fix must have
+        # already captured the path on this (calling) thread inside
+        # activate()/_sync_breadcrumb(), synchronously, before this line.
+        monkeypatch.setattr(so_mod, "config_dir", lambda: diverted_dir)
+
+        drain_breadcrumb_writes()
+
+        pinned_breadcrumb = pinned_dir / so_mod._BREADCRUMB_FILE
+        diverted_breadcrumb = diverted_dir / so_mod._BREADCRUMB_FILE
+        assert pinned_breadcrumb.exists(), (
+            "breadcrumb must land under the home resolved at commit time"
+        )
+        assert not diverted_breadcrumb.exists(), (
+            "breadcrumb must NOT land under a home resolved after the "
+            "calling thread's context changed"
+        )
+        payload = json.loads(pinned_breadcrumb.read_text(encoding="utf-8"))
+        assert payload["source"] == "dashboard"
+
+        monkeypatch.setattr(so_mod, "config_dir", real_config_dir)
+
+    def test_deactivate_clears_the_breadcrumb_under_the_committing_home(
+        self, override: SafetyOverride, tmp_path, monkeypatch
+    ) -> None:
+        """Same guard on the clear path: deactivate() must remove the file
+        under the home that was active when it committed, not wherever
+        ``config_dir()`` resolves to once the worker actually runs.
+        """
+        import kiro_crew.safety_override as so_mod
+
+        real_config_dir = so_mod.config_dir
+        pinned_dir = tmp_path / "pinned-home"
+        pinned_dir.mkdir()
+
+        monkeypatch.setattr(so_mod, "config_dir", lambda: pinned_dir)
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.activate("dashboard", ttl=60)
+        drain_breadcrumb_writes()
+        pinned_breadcrumb = pinned_dir / so_mod._BREADCRUMB_FILE
+        assert pinned_breadcrumb.exists()
+
+        # Divert the resolver AFTER the commit (deactivate() resolves the path
+        # synchronously on this thread before it returns), then drain -- the
+        # worker's clear must still target the home resolved AT COMMIT TIME,
+        # not whatever config_dir() answers once it actually runs.
+        diverted_dir = tmp_path / "diverted-home"
+        diverted_dir.mkdir()
+        with patch("kiro_crew.safety_override.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            override.deactivate("dashboard")
+        monkeypatch.setattr(so_mod, "config_dir", lambda: diverted_dir)
+        drain_breadcrumb_writes()
+
+        assert not pinned_breadcrumb.exists(), "deactivate must clear the pinned breadcrumb"
+        assert not (diverted_dir / so_mod._BREADCRUMB_FILE).exists()
+
+        monkeypatch.setattr(so_mod, "config_dir", real_config_dir)
+
+    def test_drain_helper_raises_on_a_starved_worker(self, monkeypatch) -> None:
+        """Mutation guard for the drain helper itself: a worker that never
+        empties its queue must make ``drain_breadcrumb_writes`` raise rather
+        than return silently, or a test relying on it to prove isolation would
+        pass without having proven anything.
+
+        Reverts the patch itself (rather than relying on ``monkeypatch``'s own
+        teardown order) because this suite's ``test/conftest.py`` autouse
+        fixture calls the same helper at its OWN teardown, which -- as an autouse
+        fixture with no explicit dependency on ``monkeypatch`` -- is torn down
+        BEFORE ``monkeypatch`` reverts anything. Leaving the stub in place would
+        make that unrelated teardown call also raise.
+        """
+        import kiro_crew.safety_override as so_mod
+
+        monkeypatch.setattr(so_mod, "flush_breadcrumb_writes", lambda timeout=5.0: False)
+        try:
+            with pytest.raises(TimeoutError):
+                drain_breadcrumb_writes(timeout=0.01)
+        finally:
+            monkeypatch.undo()

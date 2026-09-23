@@ -13,6 +13,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew import platform_compat
+from kiro_crew.acp.session_handle import WatchdogSettings
+
 
 @pytest.fixture(autouse=True)
 def _isolate_config_dir(tmp_path, monkeypatch):
@@ -72,6 +75,61 @@ def _make_manager(pool_size: int = 2, pool_agent: str = "kirocrew", pool_ttl_sec
 # ---------------------------------------------------------------------------
 # _fill_warm_pool
 # ---------------------------------------------------------------------------
+
+
+class TestMemberContextAllocation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "key", ["cron:review", "subagent:review", "memory-consolidation:review:unique"]
+    )
+    async def test_member_context_captures_native_sources_before_start_without_pool(self, key):
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        execution = ExecutionContext(
+            "review", MemoryStoreRef("member-review", "review"), "member", "kirocrew"
+        )
+        mgr, factory = _make_manager()
+        provider = _make_provider()
+        factory.side_effect = None
+        factory.return_value = provider
+        mgr._drain_and_claim = AsyncMock()
+        mgr._ensure_cleanup_task = MagicMock()
+
+        async def start():
+            assert provider.memory_mode == "persistent"
+
+        provider.start.side_effect = start
+        with patch("kiro_crew.execution_context.read_session_execution", return_value=execution):
+            actual, is_new, _ = await mgr.get_or_create(key, agent="kirocrew")
+            assert actual is provider and is_new
+            mgr.release(key)
+            reused, is_new, _ = await mgr.get_or_create(key, agent="kirocrew")
+            assert reused is provider and not is_new
+            mgr.release(key)
+        mgr._drain_and_claim.assert_not_awaited()
+        factory.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary"])
+    async def test_restricted_task_uses_fresh_provider_instead_of_parent_runtime(self, mode):
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        execution = ExecutionContext(
+            "review", MemoryStoreRef("member-review", "review"), "member", "kirocrew", mode
+        )
+        mgr, _ = _make_manager()
+        expected = (_make_provider(), True, False)
+        mgr.get_or_create = AsyncMock(return_value=expected)
+        mgr._get_or_bootstrap_run_runtime = AsyncMock()
+        with patch("kiro_crew.execution_context.read_session_execution", return_value=execution):
+            result = await mgr.open_task_session(
+                "task:parent", "task:child", agent="review", cwd="/work"
+            )
+        assert result is expected
+        mgr.get_or_create.assert_awaited_once_with(
+            "task:child", agent="review", approval_policy="", cwd="/work"
+        )
+        mgr._get_or_bootstrap_run_runtime.assert_not_awaited()
 
 
 class TestFillWarmPool:
@@ -167,20 +225,28 @@ class TestLivenessDrainLoop:
         assert pooled is healthy
 
     @pytest.mark.asyncio
-    async def test_provider_without_is_alive_discarded(self):
-        """Provider missing is_alive attribute is treated as dead."""
-        mgr, _ = _make_manager(pool_agent="kirocrew")
+    async def test_unanswerable_liveness_probe_is_discarded_fail_closed(self):
+        """A provider whose liveness probe fails is discarded, not recycled.
 
-        no_alive = _make_provider()
-        del no_alive.is_process_alive
+        The TTL recycle reads the same process check, and an unusable answer
+        is treated as dead (WARNING, discard) so a broken provider never
+        reaches a session. Under the declared-ABC liveness contract a real
+        provider always answers ``is_process_alive`` (the ABC defaults it to
+        ``is_alive``), so the only remaining unanswerable case is a probe
+        that raises — which this models.
+        """
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=1)
+
+        broken = _make_provider()
+        broken.is_process_alive = MagicMock(side_effect=RuntimeError("probe failed"))
         healthy = _make_provider()
 
-        mgr._warm_pool.put_nowait((no_alive, time.monotonic()))
+        mgr._warm_pool.put_nowait((broken, time.monotonic() - 10))
         mgr._warm_pool.put_nowait((healthy, time.monotonic()))
 
         pooled = await mgr._drain_and_claim("kirocrew")
 
-        no_alive.shutdown.assert_awaited_once()
+        broken.shutdown.assert_awaited_once()
         assert pooled is healthy
 
 
@@ -338,9 +404,85 @@ class TestGetOrCreatePoolIntegration:
         )
 
         assert provider is pooled
-        pooled.client.rekey.assert_called_once_with("test-key", "ch-1")
+        # crew_agent="" — the caller supplied no canonical crew identity, and
+        # the claim must still rebind (a recycled runtime never carries a
+        # previous crew's watchdog windows). The watchdog snapshot is resolved
+        # off-loop by the claim site and handed in as data.
+        assert pooled.client.rekey.call_count == 1
+        args, kwargs = pooled.client.rekey.call_args
+        assert args == ("test-key", "ch-1")
+        assert kwargs["crew_agent"] == ""
+        assert isinstance(kwargs["watchdog"], WatchdogSettings)
         mgr._schedule_replenish.assert_called_once()
         factory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_claim_forwards_canonical_crew_identity_to_rekey(self):
+        """The claiming session's crew_agent kwarg reaches rekey so the pooled
+        handle's watchdog windows rebind to the claiming crew — the identity
+        travels with the session, not the pool key."""
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.providers.acp import AcpProvider
+
+        def declared_legacy_member():
+            cfg = KiroCrewConfig.load()
+            # This tests a legacy pooled runtime, not private V2 allocation.
+            cfg.agents["pr-reviewer"] = KiroCrewAgentConfig(
+                kiro_agent="kirocrew", memory_store="default"
+            )
+            cfg.save()
+            return cfg.agents
+
+        members = await asyncio.to_thread(declared_legacy_member)
+        mgr, factory = _make_manager(pool_agent="kirocrew")
+        mgr._cfg.agents = members
+        pooled = _make_provider()
+        pooled.__class__ = AcpProvider
+        pooled.client = MagicMock()
+        pooled.client.resumed = False
+        pooled.client._session_id = "fake-sid"
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
+
+        provider, _, _ = await mgr.get_or_create(
+            "test-key", agent="kirocrew", channel_id="ch-1", crew_agent="pr-reviewer"
+        )
+
+        assert provider is pooled
+        args, kwargs = pooled.client.rekey.call_args
+        assert args == ("test-key", "ch-1")
+        assert kwargs["crew_agent"] == "pr-reviewer"
+        assert isinstance(kwargs["watchdog"], WatchdogSettings)
+
+    def test_capability_preparation_refuses_an_undeclared_canonical_member(self):
+        from kiro_crew.session_capabilities import CapabilityStartupError, prepare_runtime
+
+        with pytest.raises(CapabilityStartupError, match="capability_member_missing"):
+            prepare_runtime("kirocrew", "undeclared-crew", None)
+
+    def test_corrupt_sidecar_refuses_declared_members_with_a_closed_code_only(self):
+        """Enrollment lives in the one shared sidecar, so an unreadable file
+        cannot prove a declared member is unenrolled: every declared member
+        refuses with the closed ``capability_state_unreadable`` code, never a
+        raw parser error, while a session that resolves to no crew never reads
+        the sidecar and still starts."""
+        from kiro_crew import agent_state
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.session_capabilities import CapabilityStartupError, prepare_runtime
+
+        cfg = KiroCrewConfig.load()
+        cfg.agents["legacy-member"] = KiroCrewAgentConfig(
+            kiro_agent="kirocrew", memory_store="default"
+        )
+        cfg.save()
+        path = agent_state._state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+
+        with pytest.raises(CapabilityStartupError, match="capability_state_unreadable"):
+            prepare_runtime("kirocrew", "legacy-member", None)
+        assert prepare_runtime("kirocrew", "", None).member == ""
+        assert path.read_text(encoding="utf-8") == "{"
 
     @pytest.mark.asyncio
     async def test_skips_pool_when_resume_sid_set(self):
@@ -464,6 +606,34 @@ class TestTTLExpiration:
         await mgr._drain_and_claim("kirocrew")
 
         mgr._schedule_replenish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_claim_ttl_discard_logs_info_dead_keeps_warning(self, caplog):
+        """The claim path follows the same severity rule as the health
+        sweep — a TTL recycle of a healthy provider is INFO, one that also died
+        before aging out keeps WARNING. Both are still discarded."""
+        import logging
+
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=60)
+        stale = _make_provider()
+        stale.is_process_alive = MagicMock(return_value=True)
+        stale_dead = _make_provider()
+        stale_dead.is_process_alive = MagicMock(return_value=False)
+        mgr._warm_pool.put_nowait((stale, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((stale_dead, time.monotonic() - 120))
+
+        with patch("kiro_crew.session._sync_kill_provider"):
+            with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+                result = await mgr._drain_and_claim("kirocrew")
+
+        assert result is None
+        ttl_records = [
+            r for r in caplog.records if str(r.msg).startswith("Warm pool: %.0fs old provider")
+        ]
+        # FIFO claim order: healthy-stale first (INFO), dead-stale second (WARNING).
+        assert [r.levelname for r in ttl_records] == ["INFO", "WARNING"]
+        stale.shutdown.assert_awaited_once()
+        stale_dead.shutdown.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +813,7 @@ class TestModelMatchesPoolDefault:
     async def test_unusable_model_is_withheld_not_raised_on_claim(self):
         """A stale slot model must behave the SAME warm as cold.
 
-        Design Review on #1596: the post-claim re-apply carries an INHERITED
+        The post-claim re-apply carries an INHERITED
         value, so letting AcpModelUnavailable escape here would kill the claimed
         provider — while an identical cold start quietly withholds. That makes
         the outcome depend on whether a pooled process happened to exist.
@@ -669,6 +839,40 @@ class TestModelMatchesPoolDefault:
 
         # Withheld, not sent — and the claim survives.
         pooled.client.set_model.assert_not_awaited()
+        assert provider is pooled
+
+    @pytest.mark.asyncio
+    async def test_namespaced_pin_resolves_on_claim_like_a_cold_start(self):
+        """A warm claim must run exactly what a cold start of the pin runs.
+
+        The pin carries a stale `<namespace>::` qualifier while the pooled
+        session advertises the bare id. The cold-start spawn resolves it via
+        resolve_pin_spelling and sends the advertised spelling; withholding it
+        here instead would make whether the pinned model runs depend on whether
+        a pooled process happened to exist — the exact failure class the
+        withhold test above guards from the other direction.
+        """
+        from kiro_crew.providers.acp import AcpProvider
+
+        mgr, factory = _make_manager(pool_agent="kirocrew")
+        pooled = _make_provider()
+        pooled.__class__ = AcpProvider
+        pooled.client = MagicMock()
+        pooled.client.set_model = AsyncMock()
+        pooled.client.resumed = False
+        pooled.client._session_id = "fake-sid"
+        pooled.available_models = MagicMock(return_value=[{"modelId": "z-ai/glm-5.3-flash"}])
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
+
+        with patch.object(type(mgr), "_resolve_agent_model", return_value="claude-sonnet-4.6"):
+            provider, _is_new, _resumed = await mgr.get_or_create(
+                "test-key", agent="kirocrew", model="openrouter::z-ai/glm-5.3-flash"
+            )
+
+        # Resolved to the ADVERTISED spelling and sent — not withheld, and not
+        # sent under the qualified spelling the backend never advertised.
+        pooled.client.set_model.assert_awaited_once_with("z-ai/glm-5.3-flash")
         assert provider is pooled
 
 
@@ -780,8 +984,8 @@ class TestPoolHealthLoop:
 
     @pytest.mark.asyncio
     async def test_keeps_healthy_provider(self):
-        """Healthy provider survives health sweep."""
-        mgr, _ = _make_manager(pool_agent="kirocrew")
+        """Healthy provider at target survives health sweep with no churn."""
+        mgr, _ = _make_manager(pool_size=1, pool_agent="kirocrew")
         healthy = _make_provider()
         mgr._warm_pool.put_nowait((healthy, time.monotonic()))
         mgr._schedule_replenish = MagicMock()
@@ -803,8 +1007,8 @@ class TestPoolHealthLoop:
         mgr._schedule_replenish.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_when_pool_empty(self):
-        """No crash when pool is empty during sweep."""
+    async def test_empty_pool_schedules_replenish(self):
+        """Empty pool self-heals: sweep schedules a refill instead of skipping."""
         mgr, _ = _make_manager(pool_agent="kirocrew")
         mgr._schedule_replenish = MagicMock()
 
@@ -819,6 +1023,43 @@ class TestPoolHealthLoop:
         with patch("asyncio.sleep", side_effect=_sleep_once):
             with pytest.raises(asyncio.CancelledError):
                 await mgr._pool_health_loop()
+
+        mgr._schedule_replenish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_under_target_pool_schedules_replenish(self):
+        """A short-but-healthy pool is a deficit: sweep schedules a refill."""
+        mgr, _ = _make_manager(pool_size=3, pool_agent="kirocrew")
+        healthy = _make_provider()
+        mgr._warm_pool.put_nowait((healthy, time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        assert mgr._warm_pool.qsize() == 1
+        healthy.shutdown.assert_not_awaited()
+        mgr._schedule_replenish.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_at_target_pool_does_not_replenish(self):
+        """A full healthy pool has no deficit: sweep schedules nothing."""
+        mgr, _ = _make_manager(pool_size=2, pool_agent="kirocrew")
+        for _ in range(2):
+            mgr._warm_pool.put_nowait((_make_provider(), time.monotonic()))
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
+
+        assert mgr._warm_pool.qsize() == 2
+        mgr._schedule_replenish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disabled_pool_sweep_is_noop(self):
+        """pool_size=0 keeps the sweep a no-op: no refill for a disabled pool."""
+        mgr, _ = _make_manager(pool_size=0)
+        mgr._schedule_replenish = MagicMock()
+
+        await mgr._sweep_warm_pool_once()
 
         mgr._schedule_replenish.assert_not_called()
 
@@ -947,6 +1188,7 @@ class TestReloadProviderFactoryRefillsPool:
         old_provider.shutdown.assert_awaited_once()
         # Pool started was reset and start_pool ran (non-blocking task created)
         assert mgr._pool_started is True  # re-set by start_pool
+        await mgr.close_all()
 
     @pytest.mark.asyncio
     async def test_reload_cancels_old_health_task(self):
@@ -969,6 +1211,7 @@ class TestReloadProviderFactoryRefillsPool:
             await mgr.reload_provider_factory()
 
         fake_task.cancel.assert_called_once()
+        await mgr.close_all()
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1293,7 @@ class TestRefreshDefaultsSparesLiveSessions:
 
         stale_pooled.shutdown.assert_awaited()
         assert mgr._warm_pool.empty()
+        await mgr.close_all()
 
     @pytest.mark.asyncio
     async def test_pool_is_restarted_after_the_drain(self):
@@ -1077,6 +1321,7 @@ class TestRefreshDefaultsSparesLiveSessions:
 
         stale_task.cancel.assert_called_once()
         assert mgr._pool_started is True, "start_pool never re-armed after the drain"
+        await mgr.close_all()
 
 
 # ---------------------------------------------------------------------------
@@ -1105,8 +1350,9 @@ class TestDefaultProjectDir:
     def test_returns_empty_when_sensitive(self, tmp_path):
         ws = tmp_path / "workspace"
         ws.mkdir()
-        with patch("kiro_crew.config.loader.workspace_dir_for", return_value=ws), patch(
-            "kiro_crew.security.is_sensitive_path", return_value=True
+        with (
+            patch("kiro_crew.config.loader.workspace_dir_for", return_value=ws),
+            patch("kiro_crew.security.is_sensitive_path", return_value=True),
         ):
             from kiro_crew.config.loader import default_project_dir
 
@@ -1221,6 +1467,7 @@ class TestPoolCwd:
 # Discard reaping — a discarded provider's OS process must actually die
 # ---------------------------------------------------------------------------
 
+
 class TestDiscardReaping:
     """A discard removes the provider from all pool bookkeeping, so the
     discard path is the last chance to signal the process. These tests pin
@@ -1296,7 +1543,22 @@ class TestDiscardReaping:
         wedged.shutdown = _never_returns
         self._expired_entry(mgr, wedged)
 
-        with patch("kiro_crew.session._sync_kill_provider") as mock_kill:
+        # Give the hard-kill offload a PRIVATE executor. Production dispatches it
+        # to `subprocess_executor()`, a process-wide 8-worker singleton shared by
+        # every test in this xdist worker, and a started run_in_executor future
+        # cannot be cancelled — so a sibling test holding those threads (a wedged
+        # PTY close, a real `taskkill` on Windows) makes this offload queue behind
+        # them. That queue wait is unbounded and is NOT covered by
+        # `_POOL_DISCARD_TIMEOUT`, so it could consume the 5s budget below and
+        # fail with a TimeoutError naming the wedged shutdown — the one thing this
+        # test had already bounded, to 0.05s. A dedicated executor keeps the
+        # assertion about escalation ordering instead of about the shared pool's
+        # spare capacity.
+        with (
+            ThreadPoolExecutor(max_workers=1) as private_executor,
+            patch("kiro_crew.session._sync_kill_provider") as mock_kill,
+            patch("kiro_crew.session.subprocess_executor", return_value=private_executor),
+        ):
             pooled = await asyncio.wait_for(mgr._drain_and_claim("kirocrew"), timeout=5)
 
         assert pooled is None
@@ -1315,6 +1577,45 @@ class TestDiscardReaping:
 
         survivor.shutdown.assert_awaited_once()
         mock_kill.assert_called_once_with(survivor)
+        assert mgr._warm_pool.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_sweep_ttl_discard_logs_info_dead_provider_stays_warning(self, caplog):
+        """A scheduled TTL recycle of a healthy provider is the pool
+        working as designed, so its discard line is INFO. Both anomalies keep
+        WARNING: a provider that died before aging out (TTL line, dead process)
+        and the dead-provider branch below. All three are still reaped."""
+        import logging
+
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=60)
+        stale = _make_provider()
+        stale.is_process_alive = MagicMock(return_value=True)
+        stale_dead = _make_provider()
+        stale_dead.is_process_alive = MagicMock(return_value=False)
+        dead = _make_provider()
+        dead.is_process_alive = MagicMock(return_value=False)
+        dead.exit_code = 9
+        mgr._warm_pool.put_nowait((stale, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((stale_dead, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((dead, time.monotonic()))
+
+        with patch("kiro_crew.session._sync_kill_provider"):
+            with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+                await mgr._sweep_warm_pool_once()
+
+        ttl_records = [
+            r for r in caplog.records if str(r.msg).startswith("Pool health: %.0fs old provider")
+        ]
+        dead_records = [
+            r for r in caplog.records if str(r.msg).startswith("Pool health: dead provider")
+        ]
+        # FIFO drain order: healthy-stale first (INFO), dead-stale second (WARNING).
+        assert [r.levelname for r in ttl_records] == ["INFO", "WARNING"]
+        assert [r.levelname for r in dead_records] == ["WARNING"]
+        # Severity-only: all three entries were still discarded and shut down.
+        stale.shutdown.assert_awaited_once()
+        stale_dead.shutdown.assert_awaited_once()
+        dead.shutdown.assert_awaited_once()
         assert mgr._warm_pool.qsize() == 0
 
     @pytest.mark.asyncio
@@ -1344,7 +1645,17 @@ class TestDiscardReaping:
         proc = subprocess.Popen(["sleep", "300"])
         try:
             provider = _make_provider()
-            provider._client = SimpleNamespace(_pid=proc.pid)
+            # Model a real ACP provider: the tracked PID lives at
+            # provider._client._pid AND the client records the pid's start
+            # identity, exactly as AcpClient does after start
+            # (client.py: self._start_time = get_process_start_id(self._pid)).
+            # _sync_kill_provider verifies that recorded id against the live one
+            # before signalling the root; a stand-in without it is refused as
+            # unverifiable and the survivor would leak, which is not the
+            # production shape this test exists to exercise.
+            provider._client = SimpleNamespace(
+                _pid=proc.pid, _start_time=platform_compat.get_process_start_id(proc.pid)
+            )
             # Bookkeeping lies: claims dead while the OS process is alive
             provider.is_process_alive = MagicMock(return_value=False)
             provider.shutdown = AsyncMock()  # "ran" but killed nothing
@@ -1372,8 +1683,14 @@ class TestDiscardReaping:
         proc = subprocess.Popen(["sleep", "300"])
         try:
             provider = _make_provider()
-            # Mimic an ACP provider: the tracked PID lives at provider._client._pid
-            provider._client = SimpleNamespace(_pid=proc.pid)
+            # Mimic an ACP provider: the tracked PID lives at
+            # provider._client._pid, and the client records that pid's start
+            # identity the way AcpClient does after start
+            # (client.py: self._start_time = get_process_start_id(self._pid)).
+            # _sync_kill_provider re-verifies it before signalling the root.
+            provider._client = SimpleNamespace(
+                _pid=proc.pid, _start_time=platform_compat.get_process_start_id(proc.pid)
+            )
             provider.is_process_alive = MagicMock(side_effect=lambda: proc.poll() is None)
             provider.shutdown = AsyncMock()  # graceful close that kills nothing
 
@@ -1411,14 +1728,16 @@ class TestDiscardReaping:
             done.set()
 
         provider = _make_provider()
-        with patch("kiro_crew.session.subprocess_executor", return_value=dead_executor), \
-                patch("kiro_crew.session._sync_kill_provider", side_effect=_record_thread):
+        with (
+            patch("kiro_crew.session.subprocess_executor", return_value=dead_executor),
+            patch("kiro_crew.session._sync_kill_provider", side_effect=_record_thread),
+        ):
             SessionManager._dispatch_hard_kill(provider)
 
         assert done.wait(timeout=5), "fallback kill was never dispatched"
-        assert called_on[0] is not threading.main_thread(), (
-            "fallback kill ran inline on the event-loop thread"
-        )
+        assert (
+            called_on[0] is not threading.main_thread()
+        ), "fallback kill ran inline on the event-loop thread"
 
     @pytest.mark.asyncio
     async def test_one_failing_hard_kill_does_not_abort_batch_discard(self):
@@ -1443,7 +1762,7 @@ class TestDiscardReaping:
         with patch("kiro_crew.session._sync_kill_provider", side_effect=_kill):
             await mgr._sweep_warm_pool_once()
 
-        assert first in attempted and second in attempted, (
-            "a failing hard kill aborted the batch and leaked later providers"
-        )
+        assert (
+            first in attempted and second in attempted
+        ), "a failing hard kill aborted the batch and leaked later providers"
         assert mgr._warm_pool.qsize() == 0

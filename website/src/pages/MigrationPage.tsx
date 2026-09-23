@@ -7,11 +7,12 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  AlertTriangle, Download, CheckCircle, RefreshCw, Trash2, ArrowRight, Database, X,
+  AlertTriangle, Download, CheckCircle, RefreshCw, Trash2, ArrowRight, Database,
 } from 'lucide-react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { PageHeader, Card, CardTitle, Btn, Badge, ContentSkeleton } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { appDisplayName } from '../components/appstore/appManifest'
@@ -36,7 +37,6 @@ type MigrationState = 'loading' | 'available' | 'not-in-registry' | 'already-ins
 export default function MigrationPage() {
   const { name } = useParams<{ name: string }>()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const [error, setError] = useState('')
   const [cleanedUp, setCleanedUp] = useState(false)
 
@@ -70,8 +70,9 @@ export default function MigrationPage() {
     mutationFn: () => api.migrateCleanup(name!),
     onSuccess: () => {
       setCleanedUp(true)
+      // Cache invalidation (['apps'] + ['registry']) is owned by the
+      // mc:apps-changed listener in App.tsx, for every dispatch site at once.
       window.dispatchEvent(new Event('mc:apps-changed'))
-      queryClient.invalidateQueries({ queryKey: ['apps'] })
     },
     onError: (e: unknown) => {
       setError((e instanceof Error && e.message) || i18nT('pages.migrationPage.cleanup_failed'))
@@ -85,14 +86,26 @@ export default function MigrationPage() {
   return (
     <>
       <PageHeader title={i18nT('pages.migrationPage.app_migration')} subtitle={i18nT('pages.migrationPage.migration_guide_for', { name: displayName })} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
 
+        {/* askAgent on: this page holds no draft — a failed load or cleanup
+            loses nothing on hand-off. The retry stays beside it for a load
+            failure; a cleanup failure is dismissable and the Clean up button
+            below is its retry. */}
         {displayError && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-center gap-3 animate-rise">
-            <span className="text-danger text-sm flex-1">{displayError}</span>
-            <button aria-label={queryError ? i18nT('pages.migrationPage.retry') : i18nT('pages.migrationPage.dismiss_error')} className="text-danger/60 hover:text-danger text-sm" onClick={() => { if (queryError) refetch(); else setError('') }}>
-              {queryError ? <RefreshCw size={14} /> : <X size={14} />}
-            </button>
+          <div className="mb-4 flex items-start gap-3 animate-rise">
+            <ErrorNotice
+              message={displayError}
+              askAgent
+              className="flex-1"
+              onDismiss={queryError ? undefined : () => setError('')}
+              testId="migration-page-error"
+            />
+            {queryError && (
+              <Btn onClick={() => refetch()}>
+                <RefreshCw size={14} /> {i18nT('pages.migrationPage.retry')}
+              </Btn>
+            )}
           </div>
         )}
 

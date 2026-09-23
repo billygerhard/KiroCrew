@@ -10,9 +10,12 @@ import math
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 import uuid
+import weakref
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -20,17 +23,30 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.apps.builtins.auto_research import subquestion_queue as _sq
+from kiro_crew.apps.builtins.auto_research.session_keys import (
+    AUTO_RESEARCH_APP,
+    is_campaign_id,
+    is_research_slot_key,
+    research_slot_key,
+)
 from kiro_crew.apps.builtins.auto_research.workflow_template import (
     RESEARCH_WORKFLOW_SOURCE,
     build_workflow_args,
 )
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.autonudge import (
+    AUTONUDGE_STOP_REASON,
+)
 from kiro_crew.autonudge import get_instance as _autonudge_instance
 from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.chat_utils import (
-    effective_session_key,
+    slot_history_key,
 )
+from kiro_crew.knowledge.ingestion import ImportChunkBudgetError
 from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.on_loop_db import OnLoopDBGuard
+from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
 
 try:
     from kiro_crew.artifacts import ArtifactNotFoundError, ArtifactStore
@@ -84,19 +100,19 @@ def _fence_untrusted(text: str) -> str:
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
 # test isolation. The name below is an opt-in override (None = live home) so
-# existing monkeypatch call sites keep working. See config.md "Data Home" and
-# issue #874; dashboard/handlers/usage.py is the reference implementation.
+# existing monkeypatch call sites keep working. See config.md "Data Home";
+# dashboard/handlers/usage.py is the reference implementation.
 RESEARCH_DIR: Path | None = None
 DB_PATH: Path | None = None
 
 
 def research_dir() -> Path:
-    """Research workspace dir, resolved against the live data home (issue #874)."""
+    """Research workspace dir, resolved against the live data home."""
     return RESEARCH_DIR if RESEARCH_DIR is not None else data_home() / "workspace" / "research"
 
 
 def db_path() -> Path:
-    """Campaigns sqlite DB path, resolved against the live data home (issue #874)."""
+    """Campaigns sqlite DB path, resolved against the live data home."""
     return (
         DB_PATH if DB_PATH is not None else data_home() / "apps" / "auto-research" / "campaigns.db"
     )
@@ -115,6 +131,7 @@ DEFAULT_MAX_SUBQUESTIONS_PER_ROUND = 3
 DEFAULT_DEPTH_DECAY = 0.5
 DEFAULT_RESERVE_FRACTION = 0.15
 POLL_INTERVAL = 5
+_TERMINAL_LOOP_REMOVAL_ATTEMPTS = 3
 _MAX_PARALLEL_WORKERS = 5  # hard cap on parallel sub-agents per cycle
 # Default seconds between cycles (until the next nudge fires). The watchdog's
 # inactivity timeout is idle_secs * 2; the first cycle gets a longer startup
@@ -124,7 +141,10 @@ _FIRST_CYCLE_GRACE_SECS = 600
 # Worker auto-approve is capped at 24h; past this the watchdog pauses the
 # campaign to NEEDS_INPUT and it must be resumed (re-authorized) to continue.
 _TRUST_TTL_SECS = 24 * 3600
-_CAMPAIGN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+
+# Cap on a stored model id. Longest ids in the wild (fully-qualified Bedrock
+# inference profiles) are ~60 chars; anything past this is not a model id.
+_MAX_MODEL_LEN = 128
 
 
 def _unresponsive_deadline(idle_secs: int) -> int:
@@ -167,7 +187,7 @@ _RESEARCH_NUDGE = (
 
 def _validate_campaign_id(campaign_id: str) -> bool:
     """Reject IDs that could cause path traversal."""
-    return bool(_CAMPAIGN_ID_RE.match(campaign_id))
+    return is_campaign_id(campaign_id)
 
 
 def _safe_campaign_dir(campaign_id: str) -> Path | None:
@@ -184,7 +204,24 @@ def _safe_campaign_dir(campaign_id: str) -> Path | None:
 # --- Database ---
 
 
+# The campaigns DB carries a 30s busy timeout, so one on-loop lock wait can
+# outlast the 25s loop-stall watchdog budget and kill the gateway. All six call
+# sites are offloaded behind this guard, which delegates to the shared
+# implementation in ``kiro_crew.on_loop_db``. Defaults are deliberate: this
+# surface IS fully offloaded, so it stays on the shared
+# ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch (which the e2e harness exports) and
+# keeps the dev-mode arm, where a raise means genuinely new drift.
+_ON_LOOP_DB_GUARD = OnLoopDBGuard(
+    label="auto_research campaigns DB",
+    remedy=(
+        "Offload the DB section (asyncio.to_thread / run_in_executor) like the "
+        "surrounding handlers do."
+    ),
+)
+
+
 def _get_db() -> sqlite3.Connection:
+    _ON_LOOP_DB_GUARD.check()
     dbp = db_path()
     dbp.parent.mkdir(parents=True, exist_ok=True)
     # Explicit 30s busy timeout (vs the 5s driver default). The research worker
@@ -276,6 +313,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "ALTER TABLE campaigns ADD COLUMN reserve_fraction REAL NOT NULL DEFAULT 0.15"
                 )
+            # Explicit per-campaign model pick ('' = inherit the research
+            # agent's / backend's default — never a hardcoded id).
+            if "model" not in cols:
+                conn.execute("ALTER TABLE campaigns ADD COLUMN model TEXT NOT NULL DEFAULT ''")
             conn.commit()
             _INITIALIZED_DBS.add(key)
         except Exception:
@@ -368,6 +409,28 @@ def _audit(operation: str, campaign_id: str, **extra: Any) -> None:
 # --- Validation ---
 
 
+def _campaign_model(config: dict) -> str:
+    """The campaign's explicit model pick from a create/fork config, normalized.
+
+    '' means "no explicit pick" — the worker slot inherits the research agent's
+    (and ultimately the backend's) default resolution. A concrete id is stored
+    verbatim (trimmed); over-length ids are rejected in ``validate_campaign``
+    rather than truncated, so a bad id gets a 400 that names the problem instead
+    of being stored as a different string.
+
+    Availability is NOT screened here: no advertised-model list exists outside a
+    live session. If the pick stops being served, the session layer's withhold
+    (``_pinned_model_verdict`` in chat_runner) KEEPS the pin, runs the worker on
+    the backend default, and posts a notice card — but that card lands in the
+    app-owned ``research-<cid>`` transcript, which the Research Lab page does not
+    render, so the fallback is not visible on this app's own surfaces.
+    """
+    raw = config.get("model")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
 def validate_campaign(config: dict) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
@@ -379,6 +442,25 @@ def validate_campaign(config: dict) -> dict:
     # RL v2: validate execution_mode against supported modes.
     if config.get("execution_mode", DEFAULT_EXECUTION_MODE) not in VALID_EXECUTION_MODES:
         errors.append("Execution mode must be 'agent' or 'workflow'")
+
+    raw_model = config.get("model")
+    if raw_model is not None and not isinstance(raw_model, str):
+        errors.append("Model must be a string")
+    elif isinstance(raw_model, str) and len(raw_model.strip()) > _MAX_MODEL_LEN:
+        # Reject rather than truncate: a sliced id is a *different* string that
+        # is never served, which would take the silent-fallback path instead of
+        # a 400 that names the problem.
+        errors.append(f"Model id too long (max {_MAX_MODEL_LEN} characters)")
+    elif (
+        _campaign_model(config)
+        and config.get("execution_mode", DEFAULT_EXECUTION_MODE) == "workflow"
+    ):
+        # The workflow engine resolves its own models per step; a campaign-level
+        # pin would be silently ignored, which
+        # docs/system-specs/common/model-selection.md forbids.
+        errors.append(
+            "Model selection requires agent mode — workflow mode runs on the default model"
+        )
 
     max_cycles = config.get("max_cycles", 30)
     if max_cycles > MAX_CYCLES_HARD_CAP:
@@ -479,9 +561,13 @@ def check_stagnation(campaign_id: str) -> bool:
         return False
     for f in files[-5:]:
         try:
-            if json.loads(f.read_text()).get("new_findings_count", 0) > 0:
+            # LLM-written cycle file: pin UTF-8 (Windows would otherwise decode
+            # with the ANSI code page) and absorb bad bytes, because a decode
+            # error here would abort the whole watchdog sweep.
+            raw = f.read_text(encoding="utf-8", errors="replace")
+            if json.loads(raw).get("new_findings_count", 0) > 0:
                 return False
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return False
     return True
 
@@ -497,6 +583,92 @@ def _campaign_dir(campaign_id: str) -> Path:
     return d
 
 
+def _read_text_or_missing(path: Path) -> str | None:
+    """Read *path*, or return ``None`` when it does not exist.
+
+    Blocking; call through ``asyncio.to_thread``. The existence check rides
+    with the read so the pair costs one worker hop and a file removed between
+    them reads as missing rather than raising. Any OTHER ``OSError`` still
+    propagates, so an unreadable file keeps its 500 rather than being
+    downgraded to "no findings yet".
+
+    UTF-8 is pinned because the file is agent-written prose (FINDINGS.md): on
+    Windows the default locale encoding is the ANSI code page, so an em dash or
+    a CJK character would raise. ``errors="replace"`` keeps a partially
+    corrupt report readable instead of turning an export into a 500.
+    """
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+
+
+def _read_json_or_missing(path: Path) -> Any:
+    """Parse a JSON file, or return ``None`` when it is missing or unusable.
+
+    Blocking; call through ``asyncio.to_thread``. Both callers already treated
+    a corrupt file as "no data", so the parse error is folded in here.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Write *text* to *path*. Blocking; call off-loop.
+
+    Deliberately does NOT create missing parents: both callers wrote into an
+    existing campaign directory before the off-loop move, so a concurrent
+    campaign deletion must keep winning (recreating the directory here would
+    resurrect a deleted campaign's data).
+
+    UTF-8 is pinned: the payload is LLM prose (FINDINGS.md,
+    findings_for_knowledge.md), so the Windows ANSI code page would raise
+    UnicodeEncodeError on the first em dash or CJK character and no report
+    would ever be produced.
+    """
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_new_cycle_files(pending: list[tuple[Path, str]]) -> bool:
+    """Write each cycle file that does not exist yet. Blocking; call off-loop.
+
+    The "already written by an earlier poll" check stays with the write it
+    guards, so idempotence costs no per-cycle stat on the event loop. Returns
+    whether anything was written.
+    """
+    wrote = False
+    for fpath, text in pending:
+        if fpath.exists():
+            continue
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(text, encoding="utf-8")
+        wrote = True
+    return wrote
+
+
+def _copy_parent_findings(src: Path, dst: Path) -> None:
+    """Seed a forked campaign with its parent's findings. Blocking; call off-loop."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Agent-written prose on both ends: pin UTF-8 so a fork does not lose the
+        # parent's context to a locale-encoding error, and absorb bad bytes.
+        content = src.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return
+    dst.write_text(content, encoding="utf-8")
+
+
+def _unlink_if_present(path: Path) -> bool:
+    """Remove *path*, reporting whether it was there. Blocking; call off-loop."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _questions_path(campaign_id: str) -> Path | None:
     """Path to the agent's pending clarification question (if any)."""
     d = _safe_campaign_dir(campaign_id)
@@ -509,8 +681,12 @@ def _pending_question(campaign_id: str) -> str | None:
     if not p or not p.exists():
         return None
     try:
-        return str(json.loads(p.read_text()).get("question", "")) or None
-    except (json.JSONDecodeError, OSError):
+        # The agent authors questions.json and its clarification text is very
+        # often non-ASCII, so UTF-8 must be explicit: a locale-encoding failure
+        # here 500s get_campaign and strands the campaign in NEEDS_INPUT.
+        raw = p.read_text(encoding="utf-8", errors="replace")
+        return str(json.loads(raw).get("question", "")) or None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 
@@ -522,7 +698,8 @@ def write_status(campaign_id: str, status: str, **extra: Any) -> None:
         json.dumps(
             {"status": status, "campaign_id": campaign_id, "ts": time.time(), **extra},
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
 
 
@@ -530,7 +707,8 @@ def write_guidance(campaign_id: str, text: str) -> None:
     if not _validate_campaign_id(campaign_id):
         return
     d = _campaign_dir(campaign_id)
-    (d / "guidance.txt").write_text(text)
+    # User-typed mid-campaign guidance — non-ASCII is the norm, not the edge case.
+    (d / "guidance.txt").write_text(text, encoding="utf-8")
 
 
 def get_findings(campaign_id: str) -> list[dict]:
@@ -543,8 +721,9 @@ def get_findings(campaign_id: str) -> list[dict]:
     results = []
     for f in _cycle_finding_files(findings_dir):
         try:
-            results.append(_redact_finding(json.loads(f.read_text())))
-        except (json.JSONDecodeError, OSError):
+            raw = f.read_text(encoding="utf-8", errors="replace")
+            results.append(_redact_finding(json.loads(raw)))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
     return results
 
@@ -564,11 +743,28 @@ def _list_cycle_files(campaign_id: str) -> list[Path]:
 
 
 def _read_finding_file(path: Path) -> dict:
-    """Read + redact a single cycle finding file; {} on parse/IO error."""
+    """Read + redact a single cycle finding file; {} on parse/IO/shape error.
+
+    The file is LLM-written, so valid-but-wrong-shape JSON (`[]`, a bare
+    string) is as reachable as malformed JSON. `_redact_finding` requires a
+    dict (`.items()`), so a non-object payload must be rejected here — letting
+    it raise would abort the watchdog iteration mid-cycle (e.g. the stall
+    verdict would never settle the campaign, leaving it RUNNING forever).
+
+    UTF-8 is pinned but bad bytes are NOT replaced, deliberately: this reader
+    feeds the stall verdict, so a genuinely corrupt file must keep reading as
+    absent ({}) rather than as mojibake. Before the explicit encoding a
+    perfectly valid UTF-8 finding hit that same {} branch on a Windows ANSI
+    console, so the watchdog saw zero new findings and failed a healthy
+    campaign as stalled.
+    """
     try:
-        return _redact_finding(json.loads(path.read_text()))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return _redact_finding(data)
 
 
 # --- CRUD ---
@@ -612,8 +808,8 @@ def create_campaign(config: dict) -> dict:
         "INSERT INTO campaigns (id,name,question,sub_questions,sources,scope_constraints,"
         "max_cycles,idle_secs,success_criteria,auto_approve,parent_id,parallel_workers,"
         "execution_mode,max_subquestions_per_round,depth_decay,reserve_fraction,"
-        "status,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "model,status,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             campaign_id,
             name,
@@ -631,6 +827,7 @@ def create_campaign(config: dict) -> dict:
             max_subq,
             depth_decay,
             reserve_fraction,
+            _campaign_model(config),
             CampaignStatus.READY,
             time.time(),
         ),
@@ -643,7 +840,9 @@ def create_campaign(config: dict) -> dict:
     if grill_tree and isinstance(grill_tree, list):
         d = _campaign_dir(campaign_id)
         d.mkdir(parents=True, exist_ok=True)
-        d.joinpath("grill_tree.json").write_text(json.dumps(grill_tree, indent=2))
+        d.joinpath("grill_tree.json").write_text(
+            json.dumps(grill_tree, indent=2), encoding="utf-8"
+        )
     write_status(campaign_id, CampaignStatus.READY)
     _audit("campaign_created", campaign_id)
     return {"id": campaign_id, "name": name, "status": CampaignStatus.READY}
@@ -729,9 +928,36 @@ def list_campaigns() -> list[dict]:
 
 
 def delete_campaign(campaign_id: str) -> dict:
-    """Delete a campaign's DB row and its research dir (findings + report)."""
+    """Delete a campaign's research dir (findings + report), then its DB row.
+
+    Directory cleanup runs BEFORE the DB delete, and the row is kept when
+    cleanup fails, so a caller who retries the same id gets a real retry of
+    the cleanup instead of ``{"error": "campaign not found"}`` against an
+    already-vanished row. Windows refuses to unlink a file another process
+    still holds open (POSIX allows it), so a live worker session's handle on
+    a findings file can make this tree removal fail HALFWAY; the previous
+    ``ignore_errors=True`` swallowed that and deleted the row anyway, leaving
+    orphaned findings with no id left to retry them under.
+    """
     if not _validate_campaign_id(campaign_id):
         return {"error": "invalid campaign_id"}
+    d = _safe_campaign_dir(campaign_id)
+    if d and d.exists():
+        failures: list[str] = []
+
+        def _on_error(_func: Any, path: Any, _exc: BaseException) -> None:
+            failures.append(str(path))
+
+        shutil.rmtree(d, onexc=_on_error)
+        if failures:
+            logger.warning(
+                "auto_research: campaign %s directory cleanup left %d path(s) "
+                "behind (a process may still hold them open); the database row "
+                "is kept so retrying this delete will try cleanup again",
+                campaign_id,
+                len(failures),
+            )
+            return {"error": "cleanup incomplete", "residual": True}
     db = _get_db()
     db.execute("BEGIN")
     rows = db.execute("DELETE FROM campaigns WHERE id = ?", (campaign_id,)).rowcount
@@ -739,10 +965,7 @@ def delete_campaign(campaign_id: str) -> dict:
     db.close()
     if rows == 0:
         return {"error": "campaign not found"}
-    d = _safe_campaign_dir(campaign_id)
-    if d and d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-    return {"id": campaign_id, "deleted": True}
+    return {"id": campaign_id, "deleted": True, "residual": False}
 
 
 # --- Watchdog ---
@@ -750,6 +973,197 @@ def delete_campaign(campaign_id: str) -> dict:
 _watchdog_task: asyncio.Task | None = None
 _SSE_QUEUE_MAXSIZE = 256
 _sse_queues: list[asyncio.Queue] = []
+_campaign_transition_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.WeakValueDictionary[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _campaign_transition_lock(campaign_id: str) -> asyncio.Lock:
+    """Serialize one campaign's user and watchdog status transitions per loop."""
+    event_loop = asyncio.get_running_loop()
+    locks = _campaign_transition_locks.setdefault(event_loop, weakref.WeakValueDictionary())
+    lock = locks.get(campaign_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[campaign_id] = lock
+    return lock
+
+
+async def _settle_before_cancellation(
+    task: "asyncio.Task[Any]",
+    *,
+    on_settled: "Callable[[asyncio.Task[Any]], None] | None" = None,
+) -> Any:
+    """Await *task* and guarantee it SETTLES before cancellation propagates
+    out of this coroutine.
+
+    ``asyncio.to_thread`` keeps running after its awaiting task is cancelled,
+    so a caller holding the campaign transition lock would release it while
+    the filesystem mutation is still in flight — letting a lock-serialized
+    DELETE interleave and have its directory resurrected by the worker's
+    ``mkdir``. Mirrors the shield-and-settle discipline of the terminal
+    settlement in the watchdog path.
+
+    When *on_settled* is provided, it is invoked with the now-settled *task*
+    on the cancellation path only — after the settle loop and before the
+    original cancellation is re-raised — so a caller can retrieve and report
+    the worker outcome without letting it replace the shutdown cancellation.
+    When it is None the helper just re-raises the cancellation as before.
+    """
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Repeated shutdown cancellation must not cancel the worker
+                # wait; the thread finishes regardless, so keep settling.
+                continue
+            except Exception:
+                # The worker failed; the cancellation below still wins.
+                break
+        if on_settled is not None:
+            on_settled(task)
+        raise cancelled
+
+
+def _guarded_txn(
+    cid: str,
+    new_status: str,
+    allowed_current: tuple[str, ...],
+    expected_started_at: float | None,
+    **kwargs: Any,
+) -> dict | None:
+    """The fence check + write of :func:`_guarded_transition`, WITHOUT the lock.
+
+    Runs off-loop. Callers must already hold the campaign's transition lock
+    (directly, or via :func:`_guarded_transition`).
+    """
+    db = _get_db()
+    try:
+        row = db.execute(
+            "SELECT status, started_at FROM campaigns WHERE id = ?", (cid,)
+        ).fetchone()
+        if row is None or row["status"] not in allowed_current:
+            return None
+        if expected_started_at is not None and row["started_at"] != expected_started_at:
+            return None  # stale generation: a replacement run took over
+    finally:
+        db.close()
+    return update_campaign_status(cid, new_status, **kwargs)
+
+
+def _sse_from_thread(loop: asyncio.AbstractEventLoop, event: dict) -> None:
+    """Deliver an SSE event from a worker thread (``_emit_sse`` is loop-affine)."""
+    loop.call_soon_threadsafe(_emit_sse, event)
+
+
+async def _guarded_transition(
+    cid: str,
+    new_status: str,
+    *,
+    allowed_current: tuple[str, ...],
+    expected_started_at: float | None = None,
+    on_commit: Any = None,
+    **kwargs: Any,
+) -> dict | None:
+    """Serialize a background status transition against user actions.
+
+    A background observer (watchdog / nudge / workflow poller) decides on a
+    transition from state it read BEFORE a thread hop, so a user Stop/Pause
+    that commits during the hop must win. This takes the same per-campaign
+    lock ``_handle_action`` holds, re-reads the current status, and writes
+    only while it is still one of ``allowed_current`` — refusing stale
+    observations instead of resurrecting or overwriting the newer state.
+
+    ``expected_started_at`` is the generation fence: ``started_at`` is minted
+    on every RUNNING transition, so a Pause→Resume that recreates RUNNING
+    yields a NEW generation and a status-only check would let the OLD run's
+    verdict (COMPLETE/STAGNANT/NEEDS_INPUT) terminate the replacement run
+    (ABA). Callers that observed a RUNNING row pass the ``started_at`` they
+    read; the write then also requires the persisted generation to match
+    (same equality contract as :func:`_campaign_run_has_status`).
+
+    Returns the update result, or ``None`` when the transition was refused.
+    The caller must NOT already hold the campaign's transition lock
+    (``asyncio.Lock`` is not reentrant) — a frame that holds it offloads
+    :func:`_guarded_txn` directly.
+
+    ``on_commit`` (optional) runs IN THE WORKER THREAD immediately after the
+    transition persists, before this coroutine resumes. Side effects that must
+    accompany a persisted transition (SSE via :func:`_sse_from_thread`, audit,
+    marker files) belong here: the awaiting frame can be CANCELLED at the
+    ``to_thread`` suspension point AFTER the commit already landed, and a
+    success-branch after ``await`` is silently skipped in that window (the
+    watchdog's shutdown cancel made a persisted COMPLETE lose its SSE).
+    """
+    async with _campaign_transition_lock(cid):
+
+        def _txn_and_notify() -> dict | None:
+            result = _guarded_txn(
+                cid, new_status, allowed_current, expected_started_at, **kwargs
+            )
+            if result and on_commit is not None:
+                on_commit(result)
+            return result
+
+        return await asyncio.to_thread(_txn_and_notify)
+
+
+async def _expire_trust(cid: str, observed_started_at: float | None) -> None:
+    """24h auto-approve expiry: park the campaign for re-authorization.
+
+    Transition FIRST, then write the synthetic question only if it persisted:
+    a refused transition (a user Stop committed during the hop) must not leave
+    a stale question file behind — it would drag a later Resume straight back
+    into NEEDS_INPUT with an expiry prompt that does not apply.
+    ``observed_started_at`` fences the write to the run generation whose age
+    was actually measured — a Pause→Resume replacement run must not be parked
+    by the previous run's expiry verdict.
+    """
+    event_loop = asyncio.get_running_loop()
+
+    def _on_parked(_result: dict) -> None:
+        # Runs in the txn thread right after the transition persists — survives
+        # a cancellation of the awaiting watchdog frame (see _guarded_transition).
+        qpath = _questions_path(cid)
+        if qpath:
+            try:
+                # The path lives in the agent-writable research dir: clear a
+                # link/junction or directory squatting on it before writing, and
+                # never let a write failure suppress the audit/SSE for a
+                # transition that already persisted.
+                if is_link_or_junction(qpath):
+                    unlink_link_or_junction(qpath)
+                elif qpath.is_dir():
+                    shutil.rmtree(qpath)
+                qpath.write_text(
+                    json.dumps(
+                        {
+                            "question": "Auto-approval expired after 24h. Resume to "
+                            "re-authorize and continue."
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                logger.warning(
+                    "auto_research: could not publish the expiry prompt for %s "
+                    "(campaign is parked NEEDS_INPUT; Resume still works)",
+                    cid,
+                    exc_info=True,
+                )
+        _audit("campaign_trust_expired", cid)
+        _sse_from_thread(event_loop, {"type": "needs_input", "campaign_id": cid})
+
+    await _guarded_transition(
+        cid,
+        CampaignStatus.NEEDS_INPUT,
+        allowed_current=(CampaignStatus.RUNNING,),
+        expected_started_at=observed_started_at,
+        on_commit=_on_parked,
+    )
 
 
 def _emit_sse(event: dict) -> None:
@@ -793,7 +1207,7 @@ async def _suspend_research_loops_while_disabled(state: Any) -> None:
     if svc is None:
         return
     for loop in svc.list_all():
-        if not loop.slot_key.startswith("research-"):
+        if not is_research_slot_key(loop.slot_key):
             continue
         if loop.active:
             try:
@@ -805,7 +1219,337 @@ async def _suspend_research_loops_while_disabled(state: Any) -> None:
             slot._trust = False
 
 
+_WORKER_DONE_FILENAME = "worker_done.json"
+# The marker is LLM-written: bound how much of it the gateway will ever read.
+# A legitimate marker is one short JSON object, so 64 KiB is already generous.
+_WORKER_DONE_MAX_BYTES = 64 * 1024
+
+
+def _read_worker_done(campaign_id: str) -> dict | None:
+    """Read the worker's explicit end-of-run marker, or None.
+
+    The worker writes ``worker_done.json`` in its campaign dir immediately
+    before ending its run via ``autonudge_stop`` (instructed in the brief).
+    This LLM-written marker is the compatibility fallback when the source-owned
+    ``autonudge_stop`` tombstone is unavailable. Unlike the mere absence of the
+    autonudge loop — which also happens when a deleted/closed worker session
+    makes the nudge fire path retire the loop (``_fire_dashboard_nudge``:
+    session unreachable → ``remove()``) — the marker file can only exist
+    because the worker chose to finish. Malformed content, a non-object
+    payload, or a missing/non-string/empty ``reason`` is treated as absent
+    (fail toward FAILED, the conservative verdict) — the brief instructs the
+    worker to write ``{"reason": "<one line>"}``, so anything else is not a
+    deliberate completion signal.
+
+    The path is LLM-writable, so the read itself is guarded: links (POSIX
+    symlink or Windows junction) and non-regular files are rejected outright —
+    a marker symlinked to ``/dev/zero`` must not become an unbounded read on
+    the gateway — and at most ``_WORKER_DONE_MAX_BYTES`` are ever read; an
+    over-cap file is treated as absent, never truncated-and-parsed.
+    """
+    d = _safe_campaign_dir(campaign_id)
+    if d is None:
+        return None
+    marker = d / _WORKER_DONE_FILENAME
+    try:
+        if is_link_or_junction(marker):
+            return None
+        st = marker.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _WORKER_DONE_MAX_BYTES:
+            return None
+        # Cap at open time too (the file can grow between stat and read):
+        # read one byte past the cap so an over-cap file is detected and
+        # rejected rather than silently truncated into valid-looking JSON.
+        with open(marker, "rb") as fh:
+            raw = fh.read(_WORKER_DONE_MAX_BYTES + 1)
+        if len(raw) > _WORKER_DONE_MAX_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return data
+
+
+def _clear_worker_done_marker(campaign_id: str) -> None:
+    """Remove a stale ``worker_done.json`` so a fresh run cannot inherit it.
+
+    The campaign dir is LLM-writable, so tolerate a rogue DIRECTORY at the
+    marker path too: ``unlink()`` would raise ``IsADirectoryError`` mid-resume
+    (status already RUNNING, worker never launched, HTTP 500). ``rmtree`` only
+    for a REAL directory — any link (POSIX symlink or Windows junction, per
+    ``platform_compat.is_link_or_junction``; a junction reports ``is_dir()``
+    True and ``is_symlink()`` False) is removed as a link so a link into a
+    foreign tree can never recursively delete its target's contents.
+    """
+    d = _safe_campaign_dir(campaign_id)
+    if d is None:
+        return
+    marker = d / _WORKER_DONE_FILENAME
+    if is_link_or_junction(marker):
+        unlink_link_or_junction(marker)
+    elif marker.is_dir():
+        shutil.rmtree(marker, ignore_errors=True)
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def _stalled_campaign_verdict(
+    campaign_id: str,
+    cycle_files: list[Path],
+    *,
+    stopped_reason: str = "",
+) -> tuple[CampaignStatus, str | None]:
+    """Classify an idle-deadline expiry — not every silence is a failure.
+
+    The watchdog only marks COMPLETE when a NEW cycle file arrives carrying
+    ``verification.passed=true`` (or the cycle cap is hit). A worker that ends
+    its run deliberately via ``autonudge_stop`` — goal met, nothing more to
+    write — produces no further findings, so silence up to the unresponsive
+    deadline is not evidence of a stall: stamping FAILED ("research stalled")
+    would contradict a finished report on disk. Distinguish the cases from durable
+    evidence:
+
+    - Latest finding has ``verification.passed=true`` → COMPLETE. Also heals a
+      completed campaign whose status was later reset to RUNNING (resume paths
+      allow terminal→RUNNING): with no new files the count never advances, so
+      the count>prev COMPLETE branch can never re-fire.
+    - A source-owned ``autonudge_stop`` tombstone, or as a fallback the
+      worker-written ``worker_done.json`` marker, plus a READABLE latest
+      finding → the worker ended the run on purpose → STOPPED. The tombstone
+      wins without reading the LLM-written marker. Same terminal affordances
+      as a user Stop (fork / export / add-to-knowledge), no red failure banner.
+      A stop signal alongside only unreadable findings is NOT a deliberate
+      finish — STOPPED's "findings are preserved" promise would be false — so
+      it falls through to FAILED. Mere ABSENCE of the autonudge loop is
+      deliberately NOT used as the signal: the nudge fire path also removes
+      loops for unreachable (deleted/closed) worker sessions, which is a
+      failure, not a finish.
+    - Otherwise → FAILED (genuine stall), unchanged.
+    """
+    if cycle_files:
+        latest = _read_finding_file(cycle_files[-1])
+        verified = latest.get("verification")
+        if isinstance(verified, dict) and verified.get("passed") is True:
+            return CampaignStatus.COMPLETE, None
+        deliberate_stop = stopped_reason == AUTONUDGE_STOP_REASON
+        if latest and (deliberate_stop or _read_worker_done(campaign_id) is not None):
+            return (
+                CampaignStatus.STOPPED,
+                "Worker ended the research loop — findings are preserved.",
+            )
+    return (
+        CampaignStatus.FAILED,
+        "No activity — research stalled. Resume to continue.",
+    )
+
+
+def _persist_new_cycle_bookkeeping(campaign_id: str, cycle_files: list[Path]) -> dict:
+    """Persist one observed cycle advance and run its recursive-exploration step."""
+    count = len(cycle_files)
+    latest = _read_finding_file(cycle_files[-1])
+    db = _get_db()
+    try:
+        db.execute("BEGIN")
+        db.execute(
+            "UPDATE campaigns SET total_cycles=? WHERE id=?",
+            (count, campaign_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+    # File and SQLite work in recursive exploration belongs on the same worker
+    # thread as the finding read and cycle-count persistence.
+    _advance_exploration(campaign_id)
+    return latest
+
+
+async def _record_new_cycle_from_watchdog(
+    campaign_id: str,
+    cycle_files: list[Path],
+    last_counts: dict[str, int],
+    last_ts: dict[str, float],
+) -> dict:
+    """Record a newly observed cycle without blocking the gateway event loop.
+
+    The SSE fires from the worker thread right after the bookkeeping persists
+    (same cancellation contract as ``_guarded_transition``'s ``on_commit``).
+    """
+    event_loop = asyncio.get_running_loop()
+
+    def _persist_and_notify() -> dict:
+        latest = _persist_new_cycle_bookkeeping(campaign_id, cycle_files)
+        _sse_from_thread(
+            event_loop,
+            {"type": "new_finding", "campaign_id": campaign_id, "finding": latest},
+        )
+        return latest
+
+    latest = await asyncio.to_thread(_persist_and_notify)
+    last_counts[campaign_id] = len(cycle_files)
+    last_ts[campaign_id] = time.time()
+    return latest
+
+
+def _campaign_run_has_status(
+    campaign_id: str,
+    observed_started_at: float | None,
+    expected_status: str,
+) -> bool:
+    """Return whether one run generation has the expected persisted status."""
+    if observed_started_at is None:
+        return False
+    db = _get_db()
+    try:
+        row = db.execute(
+            "SELECT status, started_at FROM campaigns WHERE id = ?",
+            (campaign_id,),
+        ).fetchone()
+    finally:
+        db.close()
+    return bool(
+        row is not None
+        and row["status"] == expected_status
+        and row["started_at"] == observed_started_at
+    )
+
+
+def _campaign_run_is_current(campaign_id: str, observed_started_at: float | None) -> bool:
+    """Return whether the watchdog observation still names the active run."""
+    return _campaign_run_has_status(
+        campaign_id,
+        observed_started_at,
+        CampaignStatus.RUNNING,
+    )
+
+
+async def _settle_campaign_from_watchdog(
+    campaign_id: str,
+    cycle_files: list[Path],
+    last_counts: dict[str, int],
+    last_ts: dict[str, float],
+    *,
+    observed_started_at: float | None,
+    stopped_reason: str = "",
+) -> None:
+    """Classify one terminal signal and cancellation-safely remove its loop."""
+
+    # Bind cleanup to the loop that produced this terminal observation. Status
+    # persistence makes Resume legal and may be slow; Resume can replace the
+    # slot-bound loop before settlement continues. Re-resolving by slot after
+    # that await would delete the replacement and leave RUNNING with no worker.
+    svc = _autonudge_instance()
+    terminating_loop = svc.get_by_slot(research_slot_key(campaign_id)) if svc else None
+    terminating_loop_id = terminating_loop.id if terminating_loop is not None else None
+
+    async def _settle() -> None:
+        async def _remove_terminating_loop() -> None:
+            try:
+                if svc is not None and terminating_loop_id is not None:
+                    for attempt in range(1, _TERMINAL_LOOP_REMOVAL_ATTEMPTS + 1):
+                        try:
+                            await svc.remove(terminating_loop_id)
+                        except OSError:
+                            if attempt == _TERMINAL_LOOP_REMOVAL_ATTEMPTS:
+                                raise
+                            logger.warning(
+                                "Auto Research: retrying durable loop removal for %s "
+                                "after store failure (%s/%s)",
+                                campaign_id,
+                                attempt,
+                                _TERMINAL_LOOP_REMOVAL_ATTEMPTS,
+                            )
+                        else:
+                            break
+            finally:
+                last_counts.pop(campaign_id, None)
+                last_ts.pop(campaign_id, None)
+
+        async with _campaign_transition_lock(campaign_id):
+            if not await asyncio.to_thread(
+                _campaign_run_is_current,
+                campaign_id,
+                observed_started_at,
+            ):
+                return
+            if len(cycle_files) > last_counts.get(campaign_id, 0):
+                # The worker may publish its final finding and stop tombstone in the
+                # same turn. Preserve the ordinary cycle bookkeeping before the
+                # terminal fast path consumes the loop record.
+                await _record_new_cycle_from_watchdog(
+                    campaign_id,
+                    cycle_files,
+                    last_counts,
+                    last_ts,
+                )
+            status, message = await asyncio.to_thread(
+                _stalled_campaign_verdict,
+                campaign_id,
+                cycle_files,
+                stopped_reason=stopped_reason,
+            )
+            # Persist a non-rearmable loop state before SQLite becomes terminal.
+            # If the later removal write fails, restart may retain this exact
+            # loop, but it cannot schedule another worker turn.
+            if (
+                svc is not None
+                and terminating_loop is not None
+                and terminating_loop.active
+            ):
+                await svc.update(terminating_loop.id, active=False)
+            try:
+                await asyncio.to_thread(
+                    update_campaign_status,
+                    campaign_id,
+                    status,
+                    error_message=message,
+                )
+            except Exception:
+                # SQLite commits before the status sidecar and audit write. If
+                # either later step fails, the campaign is already terminal and
+                # retaining its persisted loop would re-arm it after restart.
+                # Bind the recovery to this observed generation and verdict so a
+                # failure before the commit still keeps the non-terminal loop for
+                # a later retry.
+                terminal_committed = await asyncio.to_thread(
+                    _campaign_run_has_status,
+                    campaign_id,
+                    observed_started_at,
+                    status,
+                )
+                if terminal_committed:
+                    await _remove_terminating_loop()
+                raise
+            await _remove_terminating_loop()
+            _emit_sse({"type": status.value, "campaign_id": campaign_id})
+
+    def _report_terminal_settlement(settled: "asyncio.Task[Any]") -> None:
+        # Retrieve and report the worker failure without letting it replace the
+        # watchdog's shutdown cancellation.
+        try:
+            settled.result()
+        except asyncio.CancelledError:
+            logger.error("auto_research terminal settlement was cancelled")
+        except Exception:
+            # Preserve shutdown cancellation even when persistence fails. The
+            # campaign remains non-terminal and its active loop can retry after
+            # restart instead of leaving shutdown stuck in the watchdog loop.
+            logger.exception("auto_research terminal settlement failed during shutdown")
+
+    # Status persistence and loop removal are one terminal transition. A
+    # shutdown cancellation after SQLite commits must not leave an active
+    # persisted loop that start() can re-arm for a terminal campaign, so settle
+    # the cleanup task before the cancellation propagates.
+    settlement = asyncio.create_task(_settle())
+    await _settle_before_cancellation(settlement, on_settled=_report_terminal_settlement)
+
+
 async def _watchdog_loop(app: web.Application | None = None) -> None:
+    event_loop = asyncio.get_running_loop()  # for _sse_from_thread in on_commit hooks
     state = app.get("state") if app is not None else None
     last_counts: dict[str, int] = {}
     last_ts: dict[str, float] = {}
@@ -819,7 +1563,7 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
             # later starts work without a gateway restart, and disabling it stops
             # the work. is_app_enabled reads installed.json synchronously, so run
             # it off the event loop.
-            if not await asyncio.to_thread(is_app_enabled, "auto-research"):
+            if not await asyncio.to_thread(is_app_enabled, AUTO_RESEARCH_APP):
                 # Disabling the app must NOT leave a running campaign auto-approved.
                 # The per-campaign 24h trust expiry lives in the body below, which a
                 # disabled cycle skips, and the autonudge loops fire regardless of the
@@ -829,40 +1573,69 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                 # re-establishes trust and re-arms the loop in the per-campaign body.
                 await _suspend_research_loops_while_disabled(state)
                 continue
-            db = _get_db()
-            active = db.execute(
-                "SELECT id, idle_secs, max_cycles, started_at, auto_approve, execution_mode "
-                "FROM campaigns WHERE status = ?",
-                (CampaignStatus.RUNNING,),
-            ).fetchall()
-            db.close()
+
+            def _read_active_campaigns() -> list[sqlite3.Row]:
+                db = _get_db()
+                try:
+                    return db.execute(
+                        "SELECT id, idle_secs, max_cycles, started_at, auto_approve, execution_mode "
+                        "FROM campaigns WHERE status = ?",
+                        (CampaignStatus.RUNNING,),
+                    ).fetchall()
+                finally:
+                    db.close()
+
+            active = await asyncio.to_thread(_read_active_campaigns)
             for row in active:
                 cid = row["id"]
                 # Workflow-mode campaigns are driven by a Dynamic Workflow run;
                 # the adapter translates its events/result into the RL file+SSE
                 # model. The agent-mode body below does not apply to them.
                 if row["execution_mode"] == "workflow":
-                    await _poll_workflow_campaign(cid, state)
+                    await _poll_workflow_campaign(cid, state, row["started_at"])
                     continue
-                slot = state._slots.get(f"research-{cid}") if state is not None else None
-                # 24h auto-approve cap: expire trust and require re-authorization.
+                slot_key = research_slot_key(cid)
+                slot = state._slots.get(slot_key) if state is not None else None
+                svc = _autonudge_instance()
+                loop = svc.get_by_slot(slot_key) if svc is not None else None
                 started = row["started_at"]
+                run_newly_observed = (
+                    cid not in last_counts or last_ts.get(cid, 0.0) < (started or 0)
+                )
+                if loop is not None and not loop.active:
+                    stopped_reason = str(getattr(loop, "stopped_reason", "") or "")
+                    if stopped_reason == AUTONUDGE_STOP_REASON:
+                        if run_newly_observed:
+                            # A resume marks the campaign RUNNING before _launch_loop
+                            # removes the previous run's tombstone. Establish this
+                            # run's observation boundary before trusting stop evidence
+                            # so a watchdog poll in that window cannot settle the new
+                            # run. Keep the tombstone inactive while launch catches up.
+                            cycle_files = await asyncio.to_thread(_list_cycle_files, cid)
+                            last_counts[cid] = len(cycle_files)
+                            last_ts[cid] = time.time()
+                        # The directive runs inside the worker turn. Removing
+                        # its loop before that turn exits would cancel the
+                        # firing timer and destroy the response/bookkeeping.
+                        if slot is not None and slot.running:
+                            continue
+                        if run_newly_observed:
+                            continue
+                        cycle_files = await asyncio.to_thread(_list_cycle_files, cid)
+                        await _settle_campaign_from_watchdog(
+                            cid,
+                            cycle_files,
+                            last_counts,
+                            last_ts,
+                            observed_started_at=started,
+                            stopped_reason=stopped_reason,
+                        )
+                        continue
+                # 24h auto-approve cap: expire trust and require re-authorization.
                 if started and time.time() - started > _TRUST_TTL_SECS:
                     if slot is not None:
                         slot._trust = False
-                    qpath = _questions_path(cid)
-                    if qpath:
-                        qpath.write_text(
-                            json.dumps(
-                                {
-                                    "question": "Auto-approval expired after 24h. Resume to "
-                                    "re-authorize and continue."
-                                }
-                            )
-                        )
-                    update_campaign_status(cid, CampaignStatus.NEEDS_INPUT)
-                    _audit("campaign_trust_expired", cid)
-                    _emit_sse({"type": "needs_input", "campaign_id": cid})
+                    await _expire_trust(cid, started)
                     continue
                 # Re-establish worker trust each cycle (restart-durable; bounded above).
                 if slot is not None and not slot._trust:
@@ -870,70 +1643,90 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                     _audit("campaign_trust_reestablished", cid)
                 # Re-arm the autonudge loop if a prior app-disable deactivated it
                 # (see _suspend_research_loops_while_disabled at the enabled guard).
-                _svc = _autonudge_instance()
-                if _svc is not None:
-                    _loop = _svc.get_by_slot(f"research-{cid}")
-                    if _loop is not None and not _loop.active:
-                        await _svc.update(_loop.id, active=True)
+                if svc is not None and loop is not None and not loop.active:
+                    await svc.update(loop.id, active=True)
                 # Attended: pause for the user. Unattended: discard the stray
                 # question + keep running (code-enforced; see helper).
                 if _should_pause_for_question(cid, bool(row["auto_approve"])):
-                    update_campaign_status(cid, CampaignStatus.NEEDS_INPUT)
-                    _emit_sse({"type": "needs_input", "campaign_id": cid})
+                    await _guarded_transition(
+                        cid,
+                        CampaignStatus.NEEDS_INPUT,
+                        allowed_current=(CampaignStatus.RUNNING,),
+                        expected_started_at=started,
+                        on_commit=lambda _r, cid=cid: _sse_from_thread(
+                            event_loop, {"type": "needs_input", "campaign_id": cid}
+                        ),
+                    )
                     continue
                 # Lightweight: count files without reading them all. Only parse
                 # the latest finding when count advances (avoids re-reading 50+
                 # JSON files every 5s).
                 cycle_files = _list_cycle_files(cid)
                 count = len(cycle_files)
-                if cid not in last_counts or last_ts.get(cid, 0.0) < (started or 0):
+                if run_newly_observed:
                     last_counts[cid] = count
                     last_ts[cid] = time.time()
                     continue
                 prev = last_counts[cid]
                 if count > prev:
-                    last_counts[cid] = count
-                    last_ts[cid] = time.time()
-                    # Read only the newest finding (last file).
-                    latest = _read_finding_file(cycle_files[-1])
-                    _emit_sse({"type": "new_finding", "campaign_id": cid, "finding": latest})
-                    db2 = _get_db()
-                    db2.execute("BEGIN")
-                    db2.execute(
-                        "UPDATE campaigns SET total_cycles=? WHERE id=?",
-                        (count, cid),
+                    latest = await _record_new_cycle_from_watchdog(
+                        cid,
+                        cycle_files,
+                        last_counts,
+                        last_ts,
                     )
-                    db2.commit()
-                    db2.close()
-                    # RL v2: advance recursive exploration (ingest agent-proposed
-                    # emergent sub-questions + activate queued ones). Agent-mode
-                    # only and fully guarded — must never break the watchdog.
-                    _advance_exploration(cid)
                     verified = latest.get("verification")
                     if isinstance(verified, dict) and verified.get("passed") is True:
-                        update_campaign_status(cid, CampaignStatus.COMPLETE)
-                        _emit_sse({"type": "complete", "campaign_id": cid})
+                        await _guarded_transition(
+                            cid,
+                            CampaignStatus.COMPLETE,
+                            allowed_current=(CampaignStatus.RUNNING,),
+                            expected_started_at=started,
+                            on_commit=lambda _r, cid=cid: _sse_from_thread(
+                                event_loop, {"type": "complete", "campaign_id": cid}
+                            ),
+                        )
                     elif count >= row["max_cycles"]:
-                        update_campaign_status(cid, CampaignStatus.COMPLETE)
-                        _emit_sse({"type": "complete", "campaign_id": cid})
+                        await _guarded_transition(
+                            cid,
+                            CampaignStatus.COMPLETE,
+                            allowed_current=(CampaignStatus.RUNNING,),
+                            expected_started_at=started,
+                            on_commit=lambda _r, cid=cid: _sse_from_thread(
+                                event_loop, {"type": "complete", "campaign_id": cid}
+                            ),
+                        )
                     elif check_stagnation(cid):
-                        update_campaign_status(cid, CampaignStatus.STAGNANT)
-                        _emit_sse({"type": "stagnant", "campaign_id": cid})
+                        await _guarded_transition(
+                            cid,
+                            CampaignStatus.STAGNANT,
+                            allowed_current=(CampaignStatus.RUNNING,),
+                            expected_started_at=started,
+                            on_commit=lambda _r, cid=cid: _sse_from_thread(
+                                event_loop, {"type": "stagnant", "campaign_id": cid}
+                            ),
+                        )
                 elif cid in last_ts:
                     if slot is not None and slot.running:
                         # Agent is actively working this cycle (deep research can
                         # take minutes) — alive, not unresponsive. Refresh liveness.
                         last_ts[cid] = time.time()
                     elif time.time() - last_ts[cid] > _unresponsive_deadline(row["idle_secs"]):
-                        update_campaign_status(
+                        # Deadline expired — but classify before condemning: a
+                        # worker that deliberately ended its run (worker_done
+                        # marker; verified finding on disk) finished, it didn't
+                        # stall. See _stalled_campaign_verdict. Off the event
+                        # loop: it reads LLM-written files (finding + marker)
+                        # whose size is unbounded, and this watchdog shares the
+                        # gateway's single loop with every request and the
+                        # heartbeat (no-blocking-call-on-event-loop).
+                        await _settle_campaign_from_watchdog(
                             cid,
-                            CampaignStatus.FAILED,
-                            error_message="No activity — research stalled. Resume to continue.",
+                            cycle_files,
+                            last_counts,
+                            last_ts,
+                            observed_started_at=started,
                         )
-                        await _stop_loop(cid, remove=True)  # tear down so Resume re-arms cleanly
-                        last_counts.pop(cid, None)
-                        last_ts.pop(cid, None)
-                        _emit_sse({"type": "failed", "campaign_id": cid})
         except asyncio.CancelledError:
             break
         except Exception:
@@ -961,12 +1754,40 @@ def _require_auth(request: web.Request) -> web.Response | None:
 # --- Campaign worker loop (autonudge-backed) ---
 
 
-async def _launch_loop(request: web.Request, cid: str) -> None:
+async def _prepare_loop_launch(cid: str) -> None:
+    """Remove prior-run stop evidence before a campaign becomes RUNNING.
+
+    The watchdog queries RUNNING campaigns, so callers must await this helper
+    before publishing that state. Otherwise a slow marker cleanup can expose a
+    resumed campaign alongside its previous run's tombstone, letting the
+    watchdog settle the new run before its worker is armed.
+    """
+    # A fresh run must not inherit the previous run's deliberate-stop signals:
+    # stale marker/tombstone evidence would classify a genuine stall of THIS
+    # run as STOPPED. Consume the source-owned tombstone before the potentially
+    # slow marker cleanup so even direct _launch_loop callers preserve that
+    # ordering. The marker path is LLM-writable, so its cleanup runs off-loop
+    # and may rmtree an arbitrarily large rogue directory.
+    svc = _autonudge_instance()
+    if svc is not None:
+        previous = svc.get_by_slot(research_slot_key(cid))
+        if (
+            previous is not None
+            and not previous.active
+            and str(getattr(previous, "stopped_reason", "") or "") == AUTONUDGE_STOP_REASON
+        ):
+            await svc.remove(previous.id)
+    await asyncio.to_thread(_clear_worker_done_marker, cid)
+
+
+async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False) -> None:
     """Arm an autonudge loop that drives the research cycles for this campaign.
 
     Best-effort: if autonudge or dashboard state is unavailable, the status
     change still stands but no worker is launched (logged for visibility).
     """
+    if not prepared:
+        await _prepare_loop_launch(cid)
     state = request.app.get("state")
     svc = _autonudge_instance()
     if state is None or svc is None:
@@ -974,19 +1795,58 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
             "auto_research: cannot launch loop for %s (autonudge/state unavailable)", cid
         )
         return
-    db = _get_db()
-    row = db.execute(
-        "SELECT name, question, sub_questions, sources, scope_constraints, max_cycles, idle_secs, "
-        "success_criteria, auto_approve, parallel_workers FROM campaigns WHERE id = ?",
-        (cid,),
-    ).fetchone()
-    db.close()
+
+    def _read_launch_row_and_write_brief() -> sqlite3.Row | None:
+        """Row read + brief render in ONE write transaction.
+
+        ``BEGIN IMMEDIATE`` serializes this against ``_append_question``'s
+        transaction: a concurrent Add Question either commits before (this
+        brief includes it) or waits until after (its own in-transaction brief
+        write lands last, from the fresher row). Two separate hops here would
+        let a stale snapshot overwrite a just-committed question's brief.
+        """
+        with _brief_publish_lock(cid):
+            db = _get_db()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT name, question, sub_questions, sources, scope_constraints, max_cycles, idle_secs, "
+                    "success_criteria, auto_approve, parallel_workers, model FROM campaigns WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+                if row is None:
+                    db.execute("ROLLBACK")
+                    return None
+                db.commit()
+            finally:
+                db.close()
+            # Publish AFTER commit (a rollback must never leave a brief that
+            # describes phantom state); the publish lock spans commit+write so
+            # publish order matches commit order.
+            _write_brief(cid, row)
+            return row
+
+    row = await asyncio.to_thread(_read_launch_row_and_write_brief)
     if row is None:
         return
-    _write_brief(cid, row)
+    # Pin the campaign's explicit model pick on the worker slot ('' = inherit
+    # the research agent's / backend's default resolution — never a hardcoded
+    # id here). If a concrete pick is not served for this account, the session
+    # layer's withhold (_pinned_model_verdict) KEEPS the pin and runs the
+    # worker on the backend default — the notice it posts lands in the hidden
+    # research-<cid> transcript, not on the Research Lab page.
+    campaign_model = row["model"] or ""
+    slot_key = research_slot_key(cid)
     slot = state.get_or_create_slot(
-        name=f"research-{cid}", agent=_RESEARCH_AGENT, app="auto-research"
+        name=slot_key,
+        agent=_RESEARCH_AGENT,
+        app=AUTO_RESEARCH_APP,
+        model=campaign_model,
     )
+    # get_or_create_slot only applies kwargs on CREATE; on resume the slot
+    # already exists, so re-pin explicitly — the campaign row stays the single
+    # source of truth for the worker's model across gateway restarts.
+    slot.model = campaign_model
     # Give the app-owned worker slot a meaningful title (the campaign's human
     # name) instead of the "New Session…" placeholder. The slot is driven by
     # autonudge, whose injected messages carry role "nudge" (not "user"), so the
@@ -995,7 +1855,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
     # pattern: redact user-supplied text (defence-in-depth), lock _titled so
     # display_title returns it instead of the placeholder, persist so it survives
     # a gateway restart, and push a live SSE update to the sidebar/header.
-    raw_title = row["name"] or f"research-{cid}"
+    raw_title = row["name"] or slot_key
     if _HAS_SECURITY:
         raw_title, _ = redact_exfiltration_urls(raw_title)
         raw_title, _ = redact_credentials(raw_title)
@@ -1003,7 +1863,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
         # Fail closed: the campaign name is user-controlled, so if the security
         # redactors are unavailable we must NOT persist/broadcast it. Fall back
         # to the non-user-derived slot key, which carries no user content.
-        raw_title = f"research-{cid}"
+        raw_title = slot_key
     slot.title = raw_title
     slot._titled = True
     # Persist the title so it survives a gateway restart. set_title() does
@@ -1014,7 +1874,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
     if getattr(state, "conversation_log", None) is not None:
         try:
             await asyncio.to_thread(
-                state.conversation_log.set_title, effective_session_key(slot), slot.title
+                state.conversation_log.set_title, slot_history_key(slot), slot.title
             )
         except Exception:
             logger.warning("auto_research: failed to persist slot title for %s", cid, exc_info=True)
@@ -1037,7 +1897,27 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
         idle_secs=int(row["idle_secs"] or DEFAULT_IDLE_SECS),
         max_cycles=int(row["max_cycles"] or 0),
         stop_sentinel_path=str(_campaign_dir(cid) / "STOP"),
+        admission_check=lambda: state.get_slot(slot.key) is slot,
     )
+
+
+_brief_publish_locks: dict[str, threading.Lock] = {}
+_brief_publish_locks_guard = threading.Lock()
+
+
+def _brief_publish_lock(campaign_id: str) -> threading.Lock:
+    """Serialize one campaign's commit→brief-publish sequences (off-loop).
+
+    ``brief.md`` must be published only AFTER the row it renders committed
+    (a rollback must never leave a brief describing phantom state), and the
+    publish order must match the commit order (a stale snapshot must never
+    overwrite a newer brief). Holding this process-wide lock across
+    ``BEGIN IMMEDIATE`` → ``commit()`` → ``_write_brief`` gives both: the DB
+    write lock alone cannot, because it is released at commit, before the
+    file write.
+    """
+    with _brief_publish_locks_guard:
+        return _brief_publish_locks.setdefault(campaign_id, threading.Lock())
 
 
 def _write_brief(cid: str, row: Any) -> None:
@@ -1070,11 +1950,12 @@ def _write_brief(cid: str, row: Any) -> None:
         for s in subs:
             text = s.get("text", "") if isinstance(s, dict) else str(s)
             origin = s.get("origin", "grill") if isinstance(s, dict) else "grill"
-            tag = (
-                " _(emergent)_"
-                if origin == "emergent"
-                else " _(user guidance)_" if origin == "manual" else ""
-            )
+            if origin == "emergent":
+                tag = " _(emergent)_"
+            elif origin == "manual":
+                tag = " _(user guidance)_"
+            else:
+                tag = ""
             lines.append(f"- {text}{tag}")
     else:
         lines.append(
@@ -1129,6 +2010,12 @@ def _write_brief(cid: str, row: Any) -> None:
         "directive there (e.g. a FINALIZE MODE instruction to stop exploring and "
         "synthesize your final answer).",
         "",
+        "**Ending the run:** if you decide the research is finished (goal met or no "
+        "productive work remains), FIRST write `worker_done.json` in this dir as "
+        '`{"reason": "<one line>"}` — this is the durable signal that you ended the '
+        "run on purpose if the source stop record is unavailable — "
+        "and only THEN call `autonudge_stop`.",
+        "",
         "Adapt direction each cycle from prior findings; pursue the highest-value open "
         "lead toward the question.",
     ]
@@ -1144,7 +2031,7 @@ def _write_brief(cid: str, row: Any) -> None:
             "Wait for all completion events, then synthesize results into your cycle finding. "
             f"If fewer than {pw} sub-questions remain open, spawn only as many as needed.",
         ]
-    _campaign_dir(cid).joinpath("brief.md").write_text("\n".join(lines))
+    _campaign_dir(cid).joinpath("brief.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 # --- RL v2: recursive exploration (emergent sub-questions) ---
@@ -1195,8 +2082,10 @@ def _ingest_emergent_questions(campaign_id: str) -> list[dict]:
         ef.unlink(missing_ok=True)  # not agent mode (or gone) — discard
         return []
     try:
-        raw = json.loads(ef.read_text())
-    except (json.JSONDecodeError, OSError):
+        # LLM-authored sub-question text — non-ASCII is expected, so UTF-8 is
+        # explicit and bad bytes are absorbed rather than aborting the sweep.
+        raw = json.loads(ef.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         raw = []
     ef.unlink(missing_ok=True)  # consumed regardless of validity
     if not isinstance(raw, list) or not raw:
@@ -1257,51 +2146,66 @@ def _activate_emergent(campaign_id: str) -> list[dict]:
     queue = _sq.load_queue(d)
     if _sq.pending_count(queue) == 0:
         return []
-    db = _get_db()
-    row = db.execute(
-        "SELECT execution_mode, max_subquestions_per_round, sub_questions, total_cycles "
-        "FROM campaigns WHERE id = ?",
-        (campaign_id,),
-    ).fetchone()
-    if row is None or row["execution_mode"] != DEFAULT_EXECUTION_MODE:
+    with _brief_publish_lock(campaign_id):
+        db = _get_db()
+        # Write lock BEFORE the read: this is a read-modify-write on sub_questions
+        # (same shape as _append_question), so two concurrent writers must
+        # serialize instead of both reading the same base list.
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            "SELECT execution_mode, max_subquestions_per_round, sub_questions, total_cycles "
+            "FROM campaigns WHERE id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if row is None or row["execution_mode"] != DEFAULT_EXECUTION_MODE:
+            db.execute("ROLLBACK")
+            db.close()
+            return []
+        subs = json.loads(row["sub_questions"] or "[]")
+        initial = [
+            s for s in subs if isinstance(s, dict) and s.get("origin") in ("grill", "manual", None, "")
+        ]
+        initial_open = [s for s in initial if s.get("status") != "answered"]
+        if initial_open and int(row["total_cycles"] or 0) < len(initial):
+            db.execute("ROLLBACK")
+            db.close()
+            return []  # still working the initial questions — hold emergent ones
+        k = int(
+            row["max_subquestions_per_round"]
+            if row["max_subquestions_per_round"] is not None
+            else DEFAULT_MAX_SUBQUESTIONS_PER_ROUND
+        )
+        activated = _sq.dequeue_top_k(queue, k)
+        if not activated:
+            db.execute("ROLLBACK")
+            db.close()
+            return []
+        for a in activated:
+            subs.append({"text": a["text"], "origin": "emergent", "status": "open"})
+        db.execute(
+            "UPDATE campaigns SET sub_questions = ? WHERE id = ?",
+            (json.dumps(subs), campaign_id),
+        )
+        # Re-read inside the transaction; publish AFTER commit under the publish
+        # lock (mirrors _append_question / the launch path): the brief on disk
+        # always reflects a COMMITTED row, publish order matches commit order, and
+        # a rollback can never leave a brief describing phantom state.
+        full = db.execute(
+            "SELECT question, sub_questions, sources, scope_constraints, max_cycles, "
+            "idle_secs, success_criteria, auto_approve, parallel_workers "
+            "FROM campaigns WHERE id = ?",
+            (campaign_id,),
+        ).fetchone()
+        db.commit()
         db.close()
-        return []
-    subs = json.loads(row["sub_questions"] or "[]")
-    initial = [
-        s for s in subs if isinstance(s, dict) and s.get("origin") in ("grill", "manual", None, "")
-    ]
-    initial_open = [s for s in initial if s.get("status") != "answered"]
-    if initial_open and int(row["total_cycles"] or 0) < len(initial):
-        db.close()
-        return []  # still working the initial questions — hold emergent ones
-    k = int(
-        row["max_subquestions_per_round"]
-        if row["max_subquestions_per_round"] is not None
-        else DEFAULT_MAX_SUBQUESTIONS_PER_ROUND
-    )
-    activated = _sq.dequeue_top_k(queue, k)
-    if not activated:
-        db.close()
-        return []
-    for a in activated:
-        subs.append({"text": a["text"], "origin": "emergent", "status": "open"})
-    db.execute("BEGIN")
-    db.execute(
-        "UPDATE campaigns SET sub_questions = ? WHERE id = ?",
-        (json.dumps(subs), campaign_id),
-    )
-    db.commit()
-    _sq.mark_analyzed(queue, activated)  # dedup ledger: never re-admit/re-activate
-    _sq.save_queue(d, queue)
-    full = db.execute(
-        "SELECT question, sub_questions, sources, scope_constraints, max_cycles, "
-        "idle_secs, success_criteria, auto_approve, parallel_workers "
-        "FROM campaigns WHERE id = ?",
-        (campaign_id,),
-    ).fetchone()
-    db.close()
-    if full is not None:
-        _write_brief(campaign_id, full)  # surface the new emergent items next cycle
+        # Ledger BEFORE the brief publish (both inside the publish lock): the
+        # dedup ledger must record the activation even if the brief write then
+        # fails — otherwise the items stay pending and are re-activated
+        # (duplicated) on the next cycle.
+        _sq.mark_analyzed(queue, activated)  # dedup ledger: never re-admit/re-activate
+        _sq.save_queue(d, queue)
+        if full is not None:
+            _write_brief(campaign_id, full)  # surface the new emergent items next cycle
     _audit("campaign_emergent_activated", campaign_id)
     return activated
 
@@ -1339,7 +2243,7 @@ def _enter_finalize(campaign_id: str) -> bool:
     flag = d / _FINALIZE_FLAG
     if flag.exists():
         return False  # already signaled — leave the guidance in place
-    flag.write_text(str(time.time()))
+    flag.write_text(str(time.time()), encoding="utf-8")
     write_guidance(
         campaign_id,
         "FINALIZE MODE — you are near the cycle budget. STOP opening new "
@@ -1375,7 +2279,7 @@ async def _stop_loop(cid: str, *, remove: bool) -> None:
     svc = _autonudge_instance()
     if svc is None:
         return
-    loop = svc.get_by_slot(f"research-{cid}")
+    loop = svc.get_by_slot(research_slot_key(cid))
     if not loop:
         return
     if remove:
@@ -1405,7 +2309,8 @@ def _write_workflow_run_id(campaign_id: str, run_id: str) -> None:
     # old). Persisting the offset makes the resumed run append correctly.
     cycle_offset = len(_list_cycle_files(campaign_id))
     d.joinpath(_WORKFLOW_RUN_FILE).write_text(
-        json.dumps({"run_id": run_id, "ts": time.time(), "cycle_offset": cycle_offset})
+        json.dumps({"run_id": run_id, "ts": time.time(), "cycle_offset": cycle_offset}),
+        encoding="utf-8",
     )
 
 
@@ -1415,8 +2320,8 @@ def _read_workflow_cycle_offset(campaign_id: str) -> int:
     if not p or not p.exists():
         return 0
     try:
-        return int(json.loads(p.read_text()).get("cycle_offset", 0) or 0)
-    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return int(json.loads(p.read_text(encoding="utf-8")).get("cycle_offset", 0) or 0)
+    except (OSError, ValueError, TypeError):
         return 0
 
 
@@ -1426,8 +2331,8 @@ def _read_workflow_run_id(campaign_id: str) -> str | None:
     if not p or not p.exists():
         return None
     try:
-        return str(json.loads(p.read_text()).get("run_id") or "") or None
-    except (json.JSONDecodeError, OSError):
+        return str(json.loads(p.read_text(encoding="utf-8")).get("run_id") or "") or None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 
@@ -1446,24 +2351,32 @@ async def _launch_workflow(request: web.Request, cid: str) -> None:
         logger.warning(
             "auto_research: workflow_service unavailable; cannot launch workflow for %s", cid
         )
-        update_campaign_status(
+        await asyncio.to_thread(
+            update_campaign_status,
             cid,
             CampaignStatus.FAILED,
             error_message="Dynamic Workflow engine unavailable — cannot start workflow mode.",
         )
         _emit_sse({"type": "failed", "campaign_id": cid})
         return
-    db = _get_db()
-    row = db.execute("SELECT * FROM campaigns WHERE id = ?", (cid,)).fetchone()
-    db.close()
+
+    def _read_workflow_row() -> sqlite3.Row | None:
+        db = _get_db()
+        try:
+            return db.execute("SELECT * FROM campaigns WHERE id = ?", (cid,)).fetchone()
+        finally:
+            db.close()
+
+    row = await asyncio.to_thread(_read_workflow_row)
     if row is None:
         return
     args = build_workflow_args(dict(row))
     try:
-        res = await svc.start(RESEARCH_WORKFLOW_SOURCE, name="research-" + cid, args=args)
+        res = await svc.start(RESEARCH_WORKFLOW_SOURCE, name=research_slot_key(cid), args=args)
     except Exception:
         logger.exception("auto_research: workflow start failed for %s", cid)
-        update_campaign_status(
+        await asyncio.to_thread(
+            update_campaign_status,
             cid,
             CampaignStatus.FAILED,
             error_message="Workflow start failed — see gateway logs for details.",
@@ -1476,8 +2389,11 @@ async def _launch_workflow(request: web.Request, cid: str) -> None:
         _audit("campaign_workflow_started", cid)
     else:
         logger.warning("auto_research: workflow start returned no run_id for %s: %s", cid, res)
-        update_campaign_status(
-            cid, CampaignStatus.FAILED, error_message="Workflow start returned no run ID."
+        await asyncio.to_thread(
+            update_campaign_status,
+            cid,
+            CampaignStatus.FAILED,
+            error_message="Workflow start returned no run ID.",
         )
         _emit_sse({"type": "failed", "campaign_id": cid})
 
@@ -1494,14 +2410,18 @@ async def _stop_workflow(request: web.Request, cid: str) -> None:
             logger.exception("auto_research: workflow cancel failed for %s", cid)
 
 
-async def _poll_workflow_campaign(campaign_id: str, state: Any) -> None:
+async def _poll_workflow_campaign(
+    campaign_id: str, state: Any, observed_started_at: float | None
+) -> None:
     """Adapter: translate a Dynamic Workflow run's events/result into the RL
     file + SSE model the existing UI consumes. Each `investigate:` agent that
     finishes becomes a cycle finding; on terminal the run's report is written to
     FINDINGS.md and the campaign is marked COMPLETE/FAILED. Best-effort — never
-    raises into the watchdog.
+    raises into the watchdog. ``observed_started_at`` fences every terminal
+    write to the run generation this poll actually observed.
     """
     try:
+        event_loop = asyncio.get_running_loop()
 
         def _redact_llm(s: Any) -> str:
             text = str(s or "")
@@ -1528,94 +2448,169 @@ async def _poll_workflow_campaign(campaign_id: str, state: Any) -> None:
             # progress, mark it FAILED rather than let it sit zombie forever.
             d = _safe_campaign_dir(campaign_id)
             run_file = (d / _WORKFLOW_RUN_FILE) if d else None
-            if run_file and run_file.exists():
+            run_meta = (
+                await asyncio.to_thread(_read_json_or_missing, run_file) if run_file else None
+            )
+            if isinstance(run_meta, dict):
                 try:
-                    run_meta = json.loads(run_file.read_text())
                     started_ts = float(run_meta.get("ts", 0))
                     if started_ts and (time.time() - started_ts) > 3600:
-                        update_campaign_status(
+                        await _guarded_transition(
                             campaign_id,
                             CampaignStatus.FAILED,
+                            allowed_current=(CampaignStatus.RUNNING,),
+                            expected_started_at=observed_started_at,
+                            on_commit=lambda _r: _sse_from_thread(
+                                event_loop,
+                                {"type": "failed", "campaign_id": campaign_id},
+                            ),
                             error_message="Workflow run snapshot lost after 1h — run likely evicted or crashed.",
                         )
-                        _emit_sse({"type": "failed", "campaign_id": campaign_id})
-                except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                except (OSError, ValueError, TypeError):
                     pass
             return
-        d = _campaign_dir(campaign_id)
-        events = snap.get("events") or []
-        # Correlate agent_started (carries label/phase) -> agent_finished by id.
-        started: dict = {}
-        for e in events:
-            if e.get("type") == "agent_started":
-                data = e.get("data") or {}
-                started[data.get("agent_id")] = data
-        investigate: list = []
-        for e in events:
-            if e.get("type") == "agent_finished":
-                data = e.get("data") or {}
-                meta = started.get(data.get("agent_id"), {})
-                if str(meta.get("label", "")).startswith("investigate") and data.get("ok"):
-                    investigate.append((meta, data))
-        cycle_offset = _read_workflow_cycle_offset(campaign_id)
-        wrote = False
-        # Each investigation maps to one cycle file (intentional: the UI shows
-        # per-investigation progress, and total_cycles is a UI counter, not the
-        # DW round count. The DW script's max_rounds caps exploration rounds;
-        # per_round is already bounded by parallel_workers to limit fan-out).
-        for i in range(len(investigate)):
-            cycle_no = cycle_offset + i + 1
-            fpath = d.joinpath("findings", "cycle_%03d.json" % cycle_no)
-            if fpath.exists():
-                continue  # already written by an earlier poll (idempotent)
-            meta, fin = investigate[i]
-            label = str(meta.get("label", ""))
-            insight = label[len("investigate: ") :] if label.startswith("investigate: ") else label
-            finding = {
-                "cycle": cycle_no,
-                "summary": _redact_llm(fin.get("result_summary", "")),
-                "key_insight": _redact_llm(insight),
-                "sources_checked": [],
-                "sources_empty": [],
-                "new_findings_count": 1,
-                "evidence_strength": "moderate",
-            }
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(json.dumps(finding, indent=2))
-            wrote = True
-        if wrote:
-            count = len(_list_cycle_files(campaign_id))
-            db = _get_db()
-            db.execute("BEGIN")
-            db.execute("UPDATE campaigns SET total_cycles=? WHERE id=?", (count, campaign_id))
-            db.commit()
-            db.close()
-            _emit_sse(
-                {
-                    "type": "new_finding",
-                    "campaign_id": campaign_id,
-                    "finding": _read_finding_file(_list_cycle_files(campaign_id)[-1]),
+        # ALL snapshot processing runs under the campaign's transition lock:
+        # the slow snapshot read above happens outside it, so a user Pause →
+        # Resume may have replaced the run generation while we were reading.
+        # Re-verify the generation at lock entry and abort processing entirely
+        # when stale — a stale poll must not write cycle files, bookkeeping, or
+        # terminal state into the REPLACEMENT run. The lock also excludes
+        # _handle_action mid-processing, so check-then-write below is atomic
+        # with respect to user actions.
+        async with _campaign_transition_lock(campaign_id):
+            if not await asyncio.to_thread(
+                _campaign_run_is_current, campaign_id, observed_started_at
+            ):
+                return  # replacement run took over while we read the snapshot
+            d = _campaign_dir(campaign_id)
+            events = snap.get("events") or []
+            # Correlate agent_started (carries label/phase) -> agent_finished by id.
+            started: dict = {}
+            for e in events:
+                if e.get("type") == "agent_started":
+                    data = e.get("data") or {}
+                    started[data.get("agent_id")] = data
+            investigate: list = []
+            for e in events:
+                if e.get("type") == "agent_finished":
+                    data = e.get("data") or {}
+                    meta = started.get(data.get("agent_id"), {})
+                    if str(meta.get("label", "")).startswith("investigate") and data.get("ok"):
+                        investigate.append((meta, data))
+            cycle_offset = _read_workflow_cycle_offset(campaign_id)
+            wrote = False
+            # Each investigation maps to one cycle file (intentional: the UI shows
+            # per-investigation progress, and total_cycles is a UI counter, not the
+            # DW round count. The DW script's max_rounds caps exploration rounds;
+            # per_round is already bounded by parallel_workers to limit fan-out).
+            pending: list[tuple[Path, str]] = []
+            for i in range(len(investigate)):
+                cycle_no = cycle_offset + i + 1
+                fpath = d.joinpath("findings", "cycle_%03d.json" % cycle_no)
+                meta, fin = investigate[i]
+                label = str(meta.get("label", ""))
+                insight = label[len("investigate: ") :] if label.startswith("investigate: ") else label
+                finding = {
+                    "cycle": cycle_no,
+                    "summary": _redact_llm(fin.get("result_summary", "")),
+                    "key_insight": _redact_llm(insight),
+                    "sources_checked": [],
+                    "sources_empty": [],
+                    "new_findings_count": 1,
+                    "evidence_strength": "moderate",
                 }
-            )
-        status = snap.get("status")
-        if status == "finished":
-            result = snap.get("result") if isinstance(snap.get("result"), dict) else {}
-            report = str((result or {}).get("report") or "")
-            if not report:
-                fs = (result or {}).get("findings") or []
-                report = "\n\n".join(str(x) for x in fs) if isinstance(fs, list) else ""
-            d.joinpath("FINDINGS.md").write_text(_redact_llm(report) or "(no findings gathered)")
-            update_campaign_status(campaign_id, CampaignStatus.COMPLETE)
-            _emit_sse({"type": "complete", "campaign_id": campaign_id})
-        elif status in ("failed", "cancelled"):
-            update_campaign_status(
-                campaign_id,
-                CampaignStatus.FAILED,
-                error_message=_redact_llm(
-                    snap.get("error") or "workflow run ended without completing"
-                ),
-            )
-            _emit_sse({"type": "failed", "campaign_id": campaign_id})
+                pending.append((fpath, json.dumps(finding, indent=2)))
+            if pending:
+
+                def _write_and_persist_cycles() -> bool:
+                    """Write new cycle files AND persist the count in ONE worker.
+
+                    The bookkeeping rides in the same worker as the mutation so a
+                    task cancellation delivered at an await cannot land between
+                    them — the thread finishes both or neither, mirroring
+                    ``_txn_and_notify``'s commit-then-notify discipline. Blocking;
+                    call off-loop.
+                    """
+                    if not _write_new_cycle_files(pending):
+                        return False
+                    count = len(_list_cycle_files(campaign_id))
+                    db = _get_db()
+                    try:
+                        db.execute("BEGIN")
+                        # Predicated on the observed generation: even a poll that
+                        # somehow raced past the entry check cannot write counts
+                        # into a replacement run's row.
+                        db.execute(
+                            "UPDATE campaigns SET total_cycles=? "
+                            "WHERE id=? AND started_at IS ?",
+                            (count, campaign_id, observed_started_at),
+                        )
+                        db.commit()
+                    finally:
+                        db.close()
+                    return True
+
+                # One worker hop for the whole batch, bookkeeping included.
+                # Settled before cancellation can release the transition lock
+                # (see _settle_before_cancellation).
+                wrote = bool(
+                    await _settle_before_cancellation(
+                        asyncio.create_task(asyncio.to_thread(_write_and_persist_cycles))
+                    )
+                )
+            if wrote:
+                _emit_sse(
+                    {
+                        "type": "new_finding",
+                        "campaign_id": campaign_id,
+                        "finding": _read_finding_file(_list_cycle_files(campaign_id)[-1]),
+                    }
+                )
+            status = snap.get("status")
+            if status == "finished":
+                result = snap.get("result") if isinstance(snap.get("result"), dict) else {}
+                report = str((result or {}).get("report") or "")
+                if not report:
+                    fs = (result or {}).get("findings") or []
+                    report = "\n\n".join(str(x) for x in fs) if isinstance(fs, list) else ""
+                await asyncio.to_thread(
+                    _write_text,
+                    d.joinpath("FINDINGS.md"),
+                    _redact_llm(report) or "(no findings gathered)",
+                )
+
+                def _complete_and_notify() -> dict | None:
+                    r = _guarded_txn(
+                        campaign_id,
+                        CampaignStatus.COMPLETE,
+                        (CampaignStatus.RUNNING,),
+                        observed_started_at,
+                    )
+                    if r:
+                        _sse_from_thread(
+                            event_loop, {"type": "complete", "campaign_id": campaign_id}
+                        )
+                    return r
+
+                await asyncio.to_thread(_complete_and_notify)
+            elif status in ("failed", "cancelled"):
+                def _fail_and_notify() -> dict | None:
+                    r = _guarded_txn(
+                        campaign_id,
+                        CampaignStatus.FAILED,
+                        (CampaignStatus.RUNNING,),
+                        observed_started_at,
+                        error_message=_redact_llm(
+                            snap.get("error") or "workflow run ended without completing"
+                        ),
+                    )
+                    if r:
+                        _sse_from_thread(
+                            event_loop, {"type": "failed", "campaign_id": campaign_id}
+                        )
+                    return r
+
+                await asyncio.to_thread(_fail_and_notify)
     except Exception:
         logger.exception("auto_research: workflow poll failed for %s", campaign_id)
 
@@ -1659,7 +2654,7 @@ async def _handle_validate(request: web.Request) -> web.Response:
 #   { id, parent|null, kind: "root"|"clarifier"|"research", text,
 #     recommended (clarifier only), answer (clarifier only),
 #     origin: "grill"|"emergent" (research only), status }
-_MAX_GRILL_DEPTH = 4  # a node at this depth can no longer be expanded
+_MAX_GRILL_DEPTH = 4  # a node at this depth cannot be expanded
 _GRILL_CHILD_CAP = 5  # max children returned per expand
 
 
@@ -1718,14 +2713,34 @@ def _compact_tree(tree: list[dict]) -> str:
     return "\n".join(lines) if lines else "(empty — this is the first round)"
 
 
+def _grill_node_shaped(value: object) -> bool:
+    """Prefer predicate: an array carrying at least one node-shaped record.
+
+    Disambiguates the payload from stray bracketed PROSE that also parses as
+    an array (a "see item [1]:" marker, a trailing "[12]." citation) — those
+    decode to arrays of scalars and are never preferred."""
+    return isinstance(value, list) and any(
+        isinstance(item, dict) and "kind" in item and "text" in item for item in value
+    )
+
+
 def _parse_grill_nodes(raw: str) -> list[dict]:
-    """Extract child node dicts {kind, text, recommended?} from an LLM reply."""
-    start, end = raw.find("["), raw.rfind("]")
-    if start < 0 or end <= start:
-        return []
+    """Extract child node dicts {kind, text, recommended?} from an LLM reply.
+
+    Extraction delegates to the shared ``llm_helpers._extract_json_of_type``
+    scanner, so a stray bracket in surrounding prose cannot corrupt the span
+    the way an outermost ``find('[') .. rfind(']')`` slice would.
+    Returns [] on any parse failure, or when two DIFFERENT node-shaped arrays
+    make the choice ambiguous (the shared contract refuses to guess)."""
     try:
-        items = json.loads(raw[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
+        items = _extract_json_of_type(raw, list, prefer=_grill_node_shaped)
+    except RecursionError:
+        # The stdlib decoder recurses per nesting level, so a nesting bomb in
+        # the untrusted reply overflows long before any structural bound. This
+        # parser's callers are outside any exception envelope (the grill-expand
+        # handler would surface it as HTTP 500), so degrade to no-nodes here.
+        return []
+    if not isinstance(items, list):
         return []
     out = []
     for it in items:
@@ -1856,13 +2871,19 @@ async def _handle_get(request: web.Request) -> web.Response:
 
 
 def _read_report(campaign_id: str) -> str:
-    """Read the agent's cumulative FINDINGS.md report (empty if none yet)."""
+    """Read the agent's cumulative FINDINGS.md report (empty if none yet).
+
+    UTF-8 with byte replacement: the report is LLM prose, and
+    ``UnicodeDecodeError`` is a ``ValueError`` — NOT an ``OSError`` — so before
+    this it escaped the handler and turned GET /campaigns/{id}/report into a 500
+    for any report containing a non-ASCII character.
+    """
     d = _safe_campaign_dir(campaign_id)
     if not d:
         return ""
     p = d / "FINDINGS.md"
     try:
-        return p.read_text() if p.exists() else ""
+        return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
     except OSError:
         return ""
 
@@ -1900,12 +2921,18 @@ async def _handle_action(request: web.Request) -> web.Response:
 
     # Fork: creates a new child campaign from a completed parent.
     if action == "fork":
-        db = _get_db()
-        parent = db.execute(
-            "SELECT id, question, sources, status FROM campaigns WHERE id = ?",
-            (cid,),
-        ).fetchone()
-        db.close()
+
+        def _read_fork_parent() -> sqlite3.Row | None:
+            db = _get_db()
+            try:
+                return db.execute(
+                    "SELECT id, question, sources, status, model FROM campaigns WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+            finally:
+                db.close()
+
+        parent = await asyncio.to_thread(_read_fork_parent)
         if parent is None:
             return web.json_response({"error": "Not found"}, status=404)
         if parent["status"] not in (CampaignStatus.COMPLETE, CampaignStatus.STOPPED):
@@ -1924,6 +2951,7 @@ async def _handle_action(request: web.Request) -> web.Response:
             "success_criteria": body.get("success_criteria"),
             "auto_approve": body.get("auto_approve", False),
             "parent_id": cid,
+            "model": parent["model"] or "",  # fork continues on the parent's pick
             "grill_tree": body.get("grill_tree"),
         }
         loop = asyncio.get_running_loop()
@@ -1938,10 +2966,11 @@ async def _handle_action(request: web.Request) -> web.Response:
         fork_dir = _safe_campaign_dir(result["id"])
         if parent_dir is None or fork_dir is None:
             return web.json_response({"error": "Invalid campaign ID"}, status=400)
-        fork_dir.mkdir(parents=True, exist_ok=True)
-        parent_findings = parent_dir / "FINDINGS.md"
-        if parent_findings.exists():
-            (fork_dir / "parent_findings.md").write_text(parent_findings.read_text())
+        # One hop: the copy reads the parent's findings (unbounded LLM output)
+        # and writes them into the fork, neither of which belongs on the loop.
+        await asyncio.to_thread(
+            _copy_parent_findings, parent_dir / "FINDINGS.md", fork_dir / "parent_findings.md"
+        )
         _audit("campaign_forked", result["id"], parent=cid)
         return web.json_response(result, status=201)
 
@@ -1966,37 +2995,47 @@ async def _handle_action(request: web.Request) -> web.Response:
             CampaignStatus.NEEDS_INPUT,
         },
     }
-    db = _get_db()
-    srow = db.execute("SELECT status FROM campaigns WHERE id = ?", (cid,)).fetchone()
-    db.close()
-    if srow is None:
-        return web.json_response({"error": "Not found"}, status=404)
-    if srow["status"] not in allowed[action]:
-        return web.json_response(
-            {"error": f"Cannot {action} a campaign in '{srow['status']}' state"}, status=409
-        )
-    result = update_campaign_status(cid, status_map[action])
-    if "error" in result:
-        return web.json_response(result, status=404)
-    if action in ("start", "resume"):
-        mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _launch_workflow(request, cid)
-        else:
-            await _launch_loop(request, cid)
-    elif action == "pause":
-        mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _stop_workflow(request, cid)
-        else:
-            await _stop_loop(cid, remove=False)
-    elif action == "stop":
-        mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _stop_workflow(request, cid)
-        else:
-            await _stop_loop(cid, remove=True)
-    return web.json_response(result)
+    async with _campaign_transition_lock(cid):
+
+        def _read_status_row() -> sqlite3.Row | None:
+            db = _get_db()
+            try:
+                return db.execute("SELECT status FROM campaigns WHERE id = ?", (cid,)).fetchone()
+            finally:
+                db.close()
+
+        srow = await asyncio.to_thread(_read_status_row)
+        if srow is None:
+            return web.json_response({"error": "Not found"}, status=404)
+        if srow["status"] not in allowed[action]:
+            return web.json_response(
+                {"error": f"Cannot {action} a campaign in '{srow['status']}' state"}, status=409
+            )
+        mode = await asyncio.to_thread(_campaign_execution_mode, cid)
+        if action in ("start", "resume") and mode != "workflow":
+            # Publish RUNNING only after old stop evidence is gone. The watchdog
+            # selects RUNNING campaigns, so reversing this order exposes a partial
+            # resume while marker cleanup or tombstone persistence is still pending.
+            await _prepare_loop_launch(cid)
+        result = await asyncio.to_thread(update_campaign_status, cid, status_map[action])
+        if "error" in result:
+            return web.json_response(result, status=404)
+        if action in ("start", "resume"):
+            if mode == "workflow":
+                await _launch_workflow(request, cid)
+            else:
+                await _launch_loop(request, cid, prepared=True)
+        elif action == "pause":
+            if mode == "workflow":
+                await _stop_workflow(request, cid)
+            else:
+                await _stop_loop(cid, remove=False)
+        elif action == "stop":
+            if mode == "workflow":
+                await _stop_workflow(request, cid)
+            else:
+                await _stop_loop(cid, remove=True)
+        return web.json_response(result)
 
 
 async def _handle_delete(request: web.Request) -> web.Response:
@@ -2005,17 +3044,18 @@ async def _handle_delete(request: web.Request) -> web.Response:
     cid = request.match_info["id"]
     if not _validate_campaign_id(cid):
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
-    # Tear down any running worker (agent loop or workflow run) first.
-    mode = _campaign_execution_mode(cid)
-    if mode == "workflow":
-        await _stop_workflow(request, cid)
-    else:
-        await _stop_loop(cid, remove=True)
-    result = delete_campaign(cid)
-    if "error" in result:
-        return web.json_response(result, status=404)
-    _audit("campaign_deleted", cid)
-    return web.json_response(result)
+    async with _campaign_transition_lock(cid):
+        # Tear down any running worker (agent loop or workflow run) first.
+        mode = await asyncio.to_thread(_campaign_execution_mode, cid)
+        if mode == "workflow":
+            await _stop_workflow(request, cid)
+        else:
+            await _stop_loop(cid, remove=True)
+        result = await asyncio.to_thread(delete_campaign, cid)
+        if "error" in result:
+            return web.json_response(result, status=404)
+        _audit("campaign_deleted", cid)
+        return web.json_response(result)
 
 
 async def _handle_nudge(request: web.Request) -> web.Response:
@@ -2026,7 +3066,7 @@ async def _handle_nudge(request: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     # Workflow-mode campaigns are driven by a deterministic DW script; guidance
     # injected mid-run has no effect (the script doesn't read guidance.txt).
-    if _campaign_execution_mode(cid) == "workflow":
+    if await asyncio.to_thread(_campaign_execution_mode, cid) == "workflow":
         return web.json_response(
             {
                 "error": "Nudge/guidance not supported in workflow mode — the script "
@@ -2042,10 +3082,14 @@ async def _handle_nudge(request: web.Request) -> web.Response:
         return web.json_response({"error": "text required"}, status=400)
     write_guidance(cid, text)
     # If the agent paused awaiting input, clear the question and resume.
+    # Guarded: a Stop/Pause that committed while this handler ran must win —
+    # restoring RUNNING over it would resurrect a campaign with no worker.
     qp = _questions_path(cid)
-    if qp and qp.exists():
-        qp.unlink()
-        update_campaign_status(cid, CampaignStatus.RUNNING)
+    cleared = await asyncio.to_thread(_unlink_if_present, qp) if qp is not None else False
+    if cleared:
+        await _guarded_transition(
+            cid, CampaignStatus.RUNNING, allowed_current=(CampaignStatus.NEEDS_INPUT,)
+        )
     _audit("campaign_nudge", cid)
     return web.json_response({"ok": True})
 
@@ -2100,9 +3144,17 @@ async def _handle_report_status(request: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     if not _HAS_ARTIFACTS:
         return web.json_response({"slug": None})
-    db = _get_db()
-    row = db.execute("SELECT report_artifact_slug FROM campaigns WHERE id = ?", (cid,)).fetchone()
-    db.close()
+
+    def _read_slug_row() -> sqlite3.Row | None:
+        db = _get_db()
+        try:
+            return db.execute(
+                "SELECT report_artifact_slug FROM campaigns WHERE id = ?", (cid,)
+            ).fetchone()
+        finally:
+            db.close()
+
+    row = await asyncio.to_thread(_read_slug_row)
     if row is None:
         return web.json_response({"error": "Not found"}, status=404)
     slug = row["report_artifact_slug"]
@@ -2138,19 +3190,27 @@ async def _handle_to_artifact(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     findings_path = d / "FINDINGS.md"
-    if not findings_path.exists():
+    if not await asyncio.to_thread(findings_path.exists):
         return web.json_response({"error": "No findings yet"}, status=404)
-    db = _get_db()
-    row = db.execute(
-        "SELECT question, sub_questions, total_cycles, status, report_artifact_slug "
-        "FROM campaigns WHERE id = ?",
-        (cid,),
-    ).fetchone()
-    db.close()
+
+    def _read_export_row() -> sqlite3.Row | None:
+        db = _get_db()
+        try:
+            return db.execute(
+                "SELECT question, sub_questions, total_cycles, status, report_artifact_slug "
+                "FROM campaigns WHERE id = ?",
+                (cid,),
+            ).fetchone()
+        finally:
+            db.close()
+
+    row = await asyncio.to_thread(_read_export_row)
     if row is None:
         return web.json_response({"error": "Not found"}, status=404)
     question = row["question"]
-    findings_md = findings_path.read_text()
+    findings_md = await asyncio.to_thread(_read_text_or_missing, findings_path)
+    if findings_md is None:
+        return web.json_response({"error": "No findings yet", "code": "findings_missing"}, status=404)
     subs = json.loads(row["sub_questions"] or "[]")
 
     # Prefer an LLM-authored report (synthesized + nicely formatted). Cap the
@@ -2215,10 +3275,18 @@ async def _handle_to_artifact(request: web.Request) -> web.Response:
     # Persist the slug so the next export regenerates this same artifact and
     # the UI can show "View report" upfront.
     if art.slug != existing_slug:
-        db = _get_db()
-        db.execute("UPDATE campaigns SET report_artifact_slug = ? WHERE id = ?", (art.slug, cid))
-        db.commit()
-        db.close()
+
+        def _persist_slug() -> None:
+            db = _get_db()
+            try:
+                db.execute(
+                    "UPDATE campaigns SET report_artifact_slug = ? WHERE id = ?", (art.slug, cid)
+                )
+                db.commit()
+            finally:
+                db.close()
+
+        await asyncio.to_thread(_persist_slug)
     _audit("campaign_to_artifact", cid, slug=art.slug)
     return web.json_response(
         {"slug": art.slug, "name": name, "regenerated": regenerated},
@@ -2287,7 +3355,7 @@ async def _handle_knowledge_status(request: web.Request) -> web.Response:
     # (it has not, until the user adds it), so no filesystem side effects here.
     uri = str((d / "findings_for_knowledge.md").resolve())
     try:
-        existing = store.get_source_by_uri(uri)
+        existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     except Exception:
         logger.exception("knowledge-status lookup failed for %s", cid)
         return web.json_response({"in_library": False})
@@ -2307,7 +3375,7 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     findings_path = d / "FINDINGS.md"
-    if not findings_path.exists():
+    if not await asyncio.to_thread(findings_path.exists):
         return web.json_response({"error": "No findings yet"}, status=404)
     # Access knowledge store and pipeline from app state
     state = request.app.get("state")
@@ -2317,48 +3385,95 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     pipeline = request.app.get("knowledge_pipeline")
     if pipeline is None:
         return web.json_response({"error": "Knowledge pipeline unavailable"}, status=503)
+    raw_findings = await asyncio.to_thread(_read_text_or_missing, findings_path)
+    if raw_findings is None:
+        return web.json_response({"error": "No findings yet", "code": "findings_missing"}, status=404)
     # The Knowledge Library is an external surface (content surfaces to users and
     # agents via RAG/search), so redact credentials + exfil URLs before ingestion.
     # The agent may have encountered secrets mid-research; ingesting raw would
     # leak them. Write a sanitized copy and ingest THAT, never the raw file.
-    redacted = _redact_finding({"v": findings_path.read_text()})["v"]
+    redacted = _redact_finding({"v": raw_findings})["v"]
     sanitized_path = d / "findings_for_knowledge.md"
-    sanitized_path.write_text(redacted)
+    await asyncio.to_thread(_write_text, sanitized_path, redacted)
     uri = str(sanitized_path.resolve())
     # Dedup check
-    existing = store.get_source_by_uri(uri)
+    existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
         return web.json_response(
             {"error": "Already in Knowledge Library", "id": existing["id"]}, status=409
         )
     # Add source and trigger ingestion
-    db = _get_db()
-    row = db.execute("SELECT question FROM campaigns WHERE id = ?", (cid,)).fetchone()
-    db.close()
+
+    def _read_question_row() -> sqlite3.Row | None:
+        db = _get_db()
+        try:
+            return db.execute("SELECT question FROM campaigns WHERE id = ?", (cid,)).fetchone()
+        finally:
+            db.close()
+
+    row = await asyncio.to_thread(_read_question_row)
     # The Knowledge Library is an external surface (RAG/search), so even the
     # source name metadata must be redacted before ingestion — matching the
     # treatment _handle_to_artifact applies to its artifact name.
+    # Redact the question WHOLE, then bound: cutting first can split a
+    # credential at the 60-char boundary into fragments no redaction regex
+    # matches, leaking it into the Knowledge Library source name.
     name = (
-        f"Research: {_redact_finding({'v': row['question'][:60]})['v']}"
+        f"Research: {_redact_finding({'v': row['question']})['v'][:60]}"
         if row
         else f"Research: {cid}"
     )
-    sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
-    store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (sid,))
-    store.db.commit()
+
+    # The store hands out one connection per thread, so all statement work for
+    # this request runs off-loop in a single worker: a lock wait on the store's
+    # busy timeout must stall a thread, never the event loop. ``add_source`` rides
+    # in the same closure because the status UPDATE needs its ``sid`` on the same
+    # per-thread connection.
+    def _add_source_marked_syncing() -> str:
+        new_sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
+        store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (new_sid,))
+        store.db.commit()
+        return new_sid
+
+    sid = await asyncio.to_thread(_add_source_marked_syncing)
 
     async def _bg_ingest() -> None:
-        try:
-            await pipeline.ingest_file(uri, source_id=sid)
+        def _mark_synced() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (sid,))
             store.db.commit()
-        except Exception:
-            logger.exception("Research findings ingestion failed for %s", cid)
+
+        def _mark_error() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (sid,))
             store.db.commit()
 
+        def _mark_pending() -> None:
+            store.db.execute("UPDATE sources SET sync_status = 'pending' WHERE id = ?", (sid,))
+            store.db.commit()
+
+        try:
+            # A user's one-shot import: the click is deliberate, and this route has
+            # no budget of its own the way the watcher and artifact-sync sweeps do,
+            # so it counts against the explicit-import chunk ceiling.
+            await pipeline.ingest_file(uri, source_id=sid)
+            await asyncio.to_thread(_mark_synced)
+        except ImportChunkBudgetError as exc:
+            # Transient, so not 'error': sync_all skips an errored source, which
+            # would quiesce this one permanently over a window that clears in a
+            # minute. The findings file stays on disk, so a retry has content to
+            # re-read.
+            logger.warning("Findings ingestion deferred by import budget for %s: %s", cid, exc)
+            await asyncio.to_thread(_mark_pending)
+        except Exception:
+            logger.exception("Research findings ingestion failed for %s", cid)
+            await asyncio.to_thread(_mark_error)
+
     task = asyncio.create_task(_bg_ingest())
-    app_tasks = request.app.setdefault("_bg_tasks", set())
+    # Seeded by register_routes; the create branch serves an Application that
+    # skipped registration and is still mutable (a directly driven handler).
+    app_tasks = request.app.get("_bg_tasks")
+    if app_tasks is None:
+        app_tasks = set()
+        request.app["_bg_tasks"] = app_tasks
     app_tasks.add(task)
     task.add_done_callback(app_tasks.discard)
     _audit("campaign_to_knowledge", cid, source_id=sid)
@@ -2374,7 +3489,7 @@ async def _handle_add_question(request: web.Request) -> web.Response:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     # Workflow-mode campaigns plan sub-questions at launch (the DW script
     # decomposes them internally); adding questions mid-run has no effect.
-    if _campaign_execution_mode(cid) == "workflow":
+    if await asyncio.to_thread(_campaign_execution_mode, cid) == "workflow":
         return web.json_response(
             {
                 "error": "Adding questions mid-run not supported in workflow mode — "
@@ -2389,32 +3504,55 @@ async def _handle_add_question(request: web.Request) -> web.Response:
     text = (body.get("text") or "").strip()
     if not text:
         return web.json_response({"error": "text required"}, status=400)
-    db = _get_db()
-    row = db.execute(
-        "SELECT sub_questions, question, sources, scope_constraints, max_cycles, "
-        "idle_secs, success_criteria, auto_approve FROM campaigns WHERE id = ?",
-        (cid,),
-    ).fetchone()
-    if row is None:
-        db.close()
+
+    def _append_question() -> list | None:
+        """Read-modify-write under one write transaction, publish after commit.
+
+        ``BEGIN IMMEDIATE`` takes the write lock BEFORE the read, so two
+        concurrent appends serialize instead of both reading the same base
+        list and one overwriting the other's question. The publish lock spans
+        commit→``_write_brief`` so the brief on disk always reflects a
+        COMMITTED row and publish order matches commit order.
+        """
+        with _brief_publish_lock(cid):
+            db = _get_db()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT sub_questions, question, sources, scope_constraints, max_cycles, "
+                    "idle_secs, success_criteria, auto_approve FROM campaigns WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+                if row is None:
+                    db.execute("ROLLBACK")
+                    return None
+                subs = json.loads(row["sub_questions"] or "[]")
+                subs.append({"text": text, "origin": "manual", "status": "open"})
+                db.execute(
+                    "UPDATE campaigns SET sub_questions = ? WHERE id = ?",
+                    (json.dumps(subs), cid),
+                )
+                # Re-read the row so _write_brief sees the updated sub_questions.
+                # parallel_workers MUST be included — _write_brief defaults it to 1
+                # when absent, which would silently drop the parallel instruction
+                # from the brief.
+                fresh = db.execute(
+                    "SELECT question, sub_questions, sources, scope_constraints, max_cycles, "
+                    "idle_secs, success_criteria, auto_approve, parallel_workers "
+                    "FROM campaigns WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+                db.commit()
+            finally:
+                db.close()
+            # Publish AFTER commit (rollback can never leave a phantom brief):
+            # regenerate brief.md so the agent sees the new question next cycle.
+            _write_brief(cid, fresh)
+            return subs
+
+    subs = await asyncio.to_thread(_append_question)
+    if subs is None:
         return web.json_response({"error": "Not found"}, status=404)
-    subs = json.loads(row["sub_questions"] or "[]")
-    subs.append({"text": text, "origin": "manual", "status": "open"})
-    db.execute("BEGIN")
-    db.execute("UPDATE campaigns SET sub_questions = ? WHERE id = ?", (json.dumps(subs), cid))
-    db.commit()
-    # Re-read the row so _write_brief sees the updated sub_questions.
-    # parallel_workers MUST be included — _write_brief defaults it to 1 when
-    # absent, which would silently drop the parallel instruction from the brief.
-    row = db.execute(
-        "SELECT question, sub_questions, sources, scope_constraints, max_cycles, "
-        "idle_secs, success_criteria, auto_approve, parallel_workers "
-        "FROM campaigns WHERE id = ?",
-        (cid,),
-    ).fetchone()
-    db.close()
-    # Regenerate brief.md so the agent sees the new question next cycle.
-    _write_brief(cid, row)
     _audit("campaign_add_question", cid)
     _emit_sse({"type": "question_added", "campaign_id": cid})
     return web.json_response({"ok": True, "sub_questions": subs})
@@ -2467,12 +3605,9 @@ async def _handle_grill_tree(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     tree_path = d / "grill_tree.json"
-    if not tree_path.exists():
+    tree = await asyncio.to_thread(_read_json_or_missing, tree_path)
+    if tree is None:
         return web.json_response({"tree": []})
-    try:
-        tree = json.loads(tree_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        tree = []
     # Never trust LLM output: node text/recommended fields are model-generated,
     # so redact credentials + exfiltration URLs before serving to the dashboard
     # (same treatment as cycle findings via _redact_finding).
@@ -2489,6 +3624,9 @@ async def _handle_grill_tree(request: web.Request) -> web.Response:
 
 
 def register_routes(app: web.Application) -> None:
+    # Seeded while the app is still mutable; a handler-time ``setdefault`` would
+    # write to the frozen app. Shared with the knowledge routes, so setdefault.
+    app.setdefault("_bg_tasks", set())
     app.router.add_post("/api/apps/auto-research/validate", _handle_validate)
     app.router.add_post("/api/apps/auto-research/grill/expand", _handle_grill_expand)
     app.router.add_post("/api/apps/auto-research/campaigns", _handle_create)

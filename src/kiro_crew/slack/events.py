@@ -16,6 +16,7 @@ processing the same Slack event twice.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -31,6 +32,12 @@ from slack_sdk.socket_mode.websockets import SocketModeClient as WSSocketModeCli
 from slack_sdk.web.async_client import AsyncWebClient
 
 from kiro_crew import __version__
+from kiro_crew.agent_discovery import agent_spec_stems
+from kiro_crew.agent_spec_format import (
+    is_markdown_spec,
+    iter_agent_spec_files,
+    parse_agent_spec_text,
+)
 from kiro_crew.config.loader import (
     ACTIVATION_MENTION,
     ACTIVATION_OBSERVE,
@@ -40,21 +47,25 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import format_schedule
+from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers import get_update_info
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, parse_duration
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.mcp_discovery import list_servers
+from kiro_crew.messaging.commands import note_user_stop
+from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.platform.interfaces import InterceptDecision
-from kiro_crew.safety_override import safety_override
+from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
     should_record_observe_history,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session import unlink_queued_temp_paths
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.allowlist import prompt_track_channel, send_dashboard_link
 from kiro_crew.slack.blocks import (
@@ -64,7 +75,16 @@ from kiro_crew.slack.blocks import (
     dashboard_link_block,
     voice_config_modal,
 )
-from kiro_crew.slack.files import SLACK_AUDIO_MIMETYPES, process_slack_files
+from kiro_crew.slack.enterprise import trusted_bot_admission
+from kiro_crew.slack.files import (
+    VOICE_MEMO_DURATION_UNVERIFIED,
+    VOICE_MEMO_FAILED,
+    VOICE_MEMO_TOO_LONG,
+    VOICE_MEMO_UNAVAILABLE,
+    is_voice_memo,
+    process_slack_files,
+    voice_memo_notes,
+)
 from kiro_crew.slack.handler import (
     APPROVAL_AUTO,
     APPROVAL_INTERACTIVE,
@@ -80,6 +100,7 @@ from kiro_crew.slack.handler import (
     set_owner_id,
     set_tracking_channels,
     set_yolo_mode,
+    slack_cfg,
 )
 from kiro_crew.slack.interactions import dispatch as dispatch_interactive
 from kiro_crew.slack.sessions_view import (
@@ -88,12 +109,14 @@ from kiro_crew.slack.sessions_view import (
     _SESSION_KIND_TASKRUNNER,
     _SESSIONS_DEFAULT_LIMIT,
     _build_sessions_blocks,
-    _collect_recent_sessions,
+    _collect_recent_sessions_off_loop,
+    sessions_include_ended,
 )
 from kiro_crew.slack.transport_dispatch import handle_message_transport
 from kiro_crew.stats import Stats
+from kiro_crew.transcribe import audio_exceeds_secs, batch_duration_cap_secs
 from kiro_crew.transcribe import is_available as stt_available
-from kiro_crew.transcribe import transcribe_audio
+from kiro_crew.transcribe import load_stt_config, transcribe_audio
 
 if TYPE_CHECKING:
     from kiro_crew.slack.client import SlackClientOps
@@ -110,17 +133,18 @@ _skills_loader: SkillsLoader | None = None
 _bg_tasks: set[asyncio.Task[object]] = set()
 
 
-def _spawn_tracked(coro: Coroutine[object, object, object]) -> asyncio.Task[object]:
-    """Schedule *coro* as a task and retain a strong reference until it finishes.
-
-    ``asyncio.create_task``/``ensure_future`` alone is not enough: the event loop
-    keeps only a weak reference, so a fire-and-forget task can be garbage-collected
-    mid-execution (silently dropping the work). Tracking it in ``_bg_tasks`` and
-    discarding on completion keeps it alive for its whole lifetime.
-    """
+def _spawn_tracked(
+    coro: Coroutine[object, object, object],
+    *,
+    owner: "GatewayOrchestrator | None" = None,
+) -> asyncio.Task[object]:
+    """Schedule slash work under both retention and restart ownership."""
     task = asyncio.ensure_future(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_on_tracked_done)
+    if owner is not None:
+        owner._handler_tasks.add(task)
+        task.add_done_callback(owner._handler_tasks.discard)
     return task
 
 
@@ -144,7 +168,10 @@ def _on_tracked_done(task: asyncio.Task[object]) -> None:
 def _get_skills_loader() -> SkillsLoader:
     global _skills_loader  # noqa: PLW0603
     if _skills_loader is None:
-        _skills_loader = SkillsLoader()
+        # Listing only: the gateway startup already ran the builtin sync (in a
+        # worker thread). Re-syncing here would put its filesystem work on the
+        # event loop that renders the Slack Home tab.
+        _skills_loader = SkillsLoader(install_builtins=False)
     return _skills_loader
 
 
@@ -163,6 +190,30 @@ _MAX_SEEN = 5000
 
 # prevent GC of fire-and-forget tasks (Python event loop holds weak refs)
 _background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+
+#: How many Home Tab session collections may run at once. Every
+#: ``app_home_opened`` from an allowed user schedules its own publish, and the
+#: collector reads up to ``per_kind * 10`` transcripts on worker threads. Those
+#: threads are the process-wide default executor, shared with history appends,
+#: cron store writes and session storage, so an unbounded fan-out of tab opens
+#: makes unrelated ``asyncio.to_thread`` callers queue behind multi-MB reads.
+#: One at a time is what the collector had before it was offloaded, when running
+#: on the loop serialized it by accident; this keeps that bound on purpose.
+_HOME_TAB_COLLECT_CONCURRENCY = 1
+_home_tab_collect_sem: asyncio.Semaphore | None = None
+
+
+def _home_tab_collect_gate() -> asyncio.Semaphore:
+    """The collector gate, created on the loop that first needs it.
+
+    Built lazily rather than at import: a module-level ``asyncio.Semaphore``
+    binds to whatever loop happens to be current when the module loads, and the
+    gateway's loop is not running yet at that point.
+    """
+    global _home_tab_collect_sem
+    if _home_tab_collect_sem is None:
+        _home_tab_collect_sem = asyncio.Semaphore(_HOME_TAB_COLLECT_CONCURRENCY)
+    return _home_tab_collect_sem
 
 
 class SeenCache:
@@ -197,6 +248,43 @@ class SeenCache:
             self._d[key] = None
             if len(self._d) > self._maxlen:
                 self._d.popitem(last=False)
+
+
+class TrustedBotTurnLedger:
+    """Bounded per-thread count of consecutive trusted-bot-initiated turns.
+
+    The loop guard for mutually trusted gateways (slack.trusted_bot_ids):
+    without a bound, two gateways that trust each other admit each other's
+    replies as fresh turns indefinitely. Each admitted trusted-bot turn
+    increments its thread's count; a processed message from an allowed human
+    resets it; the admission gate in ``_route_message`` denies a trusted-bot
+    message once the count reaches ``slack.trusted_bot_turn_limit``.
+
+    LRU-bounded like ``SeenCache`` (single-event-loop access, no lock). An
+    evicted thread restarts at zero — acceptable, because eviction requires
+    *maxlen* other threads to have been active since, and the human reset
+    remains available at any time.
+    """
+
+    def __init__(self, maxlen: int = _MAX_SEEN):
+        self._d: OrderedDict[str, int] = OrderedDict()
+        self._maxlen = maxlen
+
+    def count(self, key: str) -> int:
+        return self._d.get(key, 0)
+
+    def increment(self, key: str) -> None:
+        self._d[key] = self._d.pop(key, 0) + 1
+        if len(self._d) > self._maxlen:
+            self._d.popitem(last=False)
+
+    def reset(self, key: str) -> None:
+        self._d.pop(key, None)
+
+
+#: Process-wide ledger: one gateway process serves one socket-mode connection,
+#: and _route_message runs on its single event loop.
+_trusted_bot_turns = TrustedBotTurnLedger()
 
 
 # ---------------------------------------------------------------------------
@@ -244,10 +332,22 @@ async def _handle_dashboard(
     assert orch.slack is not None
     url = await send_dashboard_link(orch.slack, caller_id, session_ttl)
     if url:
-        blks = dashboard_link_block(url, LINK_WINDOW_SECS // 60, session_ttl // 60)
+        # Same clamp the mint applies (``exp = now + min(LINK_WINDOW_SECS,
+        # session_ttl)``) and the same one the DM reports, so the ephemeral
+        # block cannot outlast the link it describes.
+        link_mins = min(LINK_WINDOW_SECS, session_ttl) // 60
+        blks = dashboard_link_block(url, link_mins, session_ttl // 60)
         await respond("🔗 Dashboard link sent to your DMs.", blocks=blks)
     else:
         await respond("❌ Failed to send dashboard link.")
+
+
+def _selector_agent_names() -> list[str]:
+    """The sorted agent stems the ``/agent`` selector offers; a thread-side read."""
+    agents_dir = kiro_agents_dir()
+    if not agents_dir.is_dir():
+        return []
+    return sorted(agent_spec_stems(agents_dir, operation="slack_agent_selector", source="slack"))
 
 
 async def _handle_agent(
@@ -269,20 +369,21 @@ async def _handle_agent(
     if args:
         name = args.strip().split()[0]
         if name.lower() in ("off", "default"):
-            _set_default_agent("")
+            await run_config_write(_set_default_agent, "")
             await respond("🔄 Reset to default agent.")
             return
-        resolved = _resolve_agent_name(name)
+        # Resolution reads a spec's content; off the loop, like the listing.
+        resolved = await asyncio.to_thread(_resolve_agent_name, name)
         if resolved:
-            _set_default_agent(resolved)
+            await run_config_write(_set_default_agent, resolved)
             await respond(f"🔄 Switched to agent: *{resolved}*")
             return
         await respond(f"❌ Unknown agent `{name}`. Pick one below:")
 
-    # Show selector dropdown
-    agents_dir = kiro_agents_dir()
-    jsons = sorted(agents_dir.glob("*.json")) if agents_dir.is_dir() else []
-    agent_names = sorted(f.stem for f in jsons)
+    # Show selector dropdown. The listing walks the agents directory and reads
+    # every markdown candidate to decide whether it is a spec, so it runs off
+    # the event loop: a large directory must not stall every other session.
+    agent_names = await asyncio.to_thread(_selector_agent_names)
     current = _get_default_agent() or ""
 
     options = [{"text": {"type": "plain_text", "text": n[:75]}, "value": n} for n in agent_names]
@@ -356,9 +457,21 @@ async def _handle_yolo(
         if so.is_active():
             await respond(f"🟢 YOLO mode is already *ON* ({describe_grant_lifetime()}).")
             return
-        result = so.activate("slack")
+        # Off-loop: activate() writes a SEL event and consults the
+        # ``approval_modes`` policy, so running it inline stalls the whole gateway
+        # on a slow home. The sibling slash path in handler.py already offloads it.
+        result = await asyncio.to_thread(so.activate, "slack")
         if not result.active:
-            await respond("❌ Failed to activate YOLO mode (audit system unavailable).")
+            # Arming can be REFUSED by policy, not just fail on audit. Reporting an
+            # audit fault for a policy denial sends the owner to the wrong place, so
+            # the two causes are told apart and they have two different places to
+            # look: the org's policy, or the audit system. Same split as the slash
+            # path in ``handler.py``, which must not drift from this one. The verdict
+            # is a memory read (pushed at ceiling install), so no thread.
+            if not yolo_policy_permits():
+                await respond("🔒 YOLO mode is disabled by your organization's policy.")
+            else:
+                await respond("❌ Failed to activate YOLO mode (audit system unavailable).")
             return
         sel().log_api_access(
             caller=caller_id,
@@ -390,7 +503,9 @@ async def _handle_yolo(
             orch.dashboard_state.push_slots_update()
         await respond("🔴 YOLO mode *OFF* — tools require approval.")
     elif arg == "renew":
-        renew_result = so.renew("slack")
+        # renew() audits fail-closed with a synchronous SEL write; keep that
+        # filesystem I/O off the event loop.
+        renew_result = await asyncio.to_thread(so.renew, "slack")
         if renew_result.renewed:
             sel().log_api_access(
                 caller=caller_id,
@@ -497,9 +612,9 @@ def _get_agent_names() -> list[str]:
     if not agents_dir.is_dir():
         return []
     names = []
-    for f in agents_dir.glob("*.json"):
+    for f in iter_agent_spec_files(agents_dir, ordered=False):
         try:
-            data = json.loads(safe_read_file(str(f)))
+            data = parse_agent_spec_text(safe_read_file(str(f)), f)
             name = data.get("name") if isinstance(data, dict) else None
         except PermissionError as exc:
             # Symlink or resolved path landed in a sensitive location — audit it.
@@ -519,8 +634,13 @@ def _get_agent_names() -> list[str]:
                     exc_info=True,
                 )
             name = None
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-            # UnicodeDecodeError (a ValueError subclass, NOT an OSError) is
+        except (ValueError, OSError):
+            if is_markdown_spec(f):
+                # A markdown file that does not parse as a spec is not a spec
+                # (a README, notes); only a broken JSON keeps its stem below.
+                continue
+            # ValueError covers bad JSON, bad frontmatter AND UnicodeDecodeError
+            # (a ValueError subclass, NOT an OSError), which is
             # raised by safe_read_file's utf-8 read on a non-UTF-8 *.json —
             # e.g. a macOS AppleDouble ._foo.json stub in ~/.kiro/agents.
             # Catching it here keeps a non-UTF-8 file from crashing the
@@ -543,12 +663,13 @@ async def _handle_channel_cmd(
     channels = [
         {
             "channel_id": cid,
-            "activation": orch._cfg.channel_config(cid).activation,
-            "agent": orch._cfg.channel_config(cid).agent,
+            "activation": slack_cfg(orch).channel_config(cid).activation,
+            "agent": slack_cfg(orch).channel_config(cid).agent,
         }
         for cid in current_ids
     ]
-    agent_names = _get_agent_names()
+    # Reads every spec's declared name; off the loop like the other listings.
+    agent_names = await asyncio.to_thread(_get_agent_names)
     modal = channels_modal(channels, agent_names=agent_names)
 
     trigger_id = getattr(orch, "_last_trigger_id", "")
@@ -570,7 +691,12 @@ register_slash_command("channels", _handle_channel_cmd, "manage tracked channels
 async def _handle_sessions(
     orch: GatewayOrchestrator, caller_id: str, args: str, respond: Callable
 ) -> None:
-    """List last 10 sessions as task_card blocks with resume buttons."""
+    """List last 10 sessions as task_card blocks with resume buttons.
+
+    *args* of ``all`` or ``ended`` includes rows the user has dismissed with
+    End; by default those are left out, so End takes a row off the list.
+    """
+
     # Deny-by-default authorization gate (defense-in-depth).
     #
     # Session JSONLs contain prior conversation contents — only owner /
@@ -600,9 +726,10 @@ async def _handle_sessions(
     # pattern: capture the exception, redact-then-truncate the message,
     # and emit an ``error=`` audit field.
     try:
-        rows = _collect_recent_sessions(
+        rows = await _collect_recent_sessions_off_loop(
             orch.sessions if orch is not None else None,
             limit=_SESSIONS_DEFAULT_LIMIT,
+            include_ended=sessions_include_ended(args or ""),
         )
     except Exception as exc:
         # Redact-then-truncate: redact() first so credential / exfil
@@ -740,6 +867,13 @@ async def _handle_restart(
         )
     except Exception:
         logger.debug("SEL flush before restart failed", exc_info=True)
+    # Same reason, same shape, for the OTHER async log sink: gateway.log runs
+    # through a QueueListener thread, so its queued tail -- the restart
+    # decision and everything logged during the teardown above -- dies with
+    # the os._exit below unless it is drained first.
+    from kiro_crew.cli import drain_log_queue_before_hard_exit
+
+    await drain_log_queue_before_hard_exit()
     os._exit(1)
 
 
@@ -751,11 +885,22 @@ register_slash_command("restart", _handle_restart, "restart the gateway (owner-o
 # ---------------------------------------------------------------------------
 
 
-def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
+async def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     """Wire up the Socket Mode client and attach the event listener.
 
     Does nothing when Slack is disabled (missing tokens or no allowed
     users).  Mutates ``orch._socket_client`` in place.
+
+    Awaited on the gateway loop, never offloaded whole: constructing
+    ``WSSocketModeClient`` requires a current event loop in the constructing
+    thread (its ``__init__`` ends in ``asyncio.ensure_future``), so running
+    this function in a worker thread crashes every Slack-enabled boot with
+    ``RuntimeError: There is no current event loop``.  The two blocking calls
+    it contains — the YOLO grant's profiles-dir walk and the enterprise
+    ``auth.test`` network call — are offloaded individually below instead,
+    which keeps the security-relevant early-return ordering (owner check,
+    then YOLO grant, then enterprise validation) intact.
+    ``test_slack_events_coverage.py::TestInitSocketMode`` pins both halves.
     """
     if not orch._slack_enabled:
         return
@@ -775,7 +920,8 @@ def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     set_open_channels(orch._open_channels)
     set_owner_id(orch._owner_id)
     if orch._cfg.agent.dangerously_skip_permissions:
-        set_yolo_mode(True)
+        # grant_declared_yolo walks the profiles dir — blocking, so off-loop.
+        await asyncio.to_thread(set_yolo_mode, True)
     set_orch_cfg(orch._cfg)
     if orch.dashboard_state:
         set_dashboard_state(orch.dashboard_state)
@@ -785,8 +931,10 @@ def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     extra_ids = orch._cfg.slack_enterprise_ids
     # Route through the active PlatformContext's Slack enterprise gate.  The
     # Default gate is open (opt-in allowlist), identical to today; the Amazon
-    # companion supplies a fail-closed workspace allowlist.
-    if not current_context().slack_gate.validate_enterprise(orch._bot_token, extra_ids=extra_ids):
+    # companion supplies a fail-closed workspace allowlist.  validate_enterprise
+    # does a synchronous auth.test network call — blocking, so off-loop.
+    _validate = current_context().slack_gate.validate_enterprise
+    if not await asyncio.to_thread(_validate, orch._bot_token, extra_ids=extra_ids):
         logger.error("Slack workspace failed enterprise validation — Slack disabled")
         orch._slack_enabled = False
         orch.slack = None
@@ -799,6 +947,19 @@ def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
     )
 
     async def _on_event(client: WSSocketModeClient, req: SocketModeRequest) -> None:
+        # Reserve before the ACK's first suspension. A paused update returns
+        # without acknowledging, so Slack retries the whole envelope on the new
+        # gateway instead of accepting a card/command that this process cannot
+        # durably finish. The Socket Mode SDK runs this listener in one task per
+        # envelope, so task-lifetime release covers ACK plus all inline routing.
+        if orch.sessions is not None and not await admit_inbound_callback(
+            orch.sessions,
+            channel_type="slack",
+            route=None,
+        ):
+            logger.info("slack envelope left unacknowledged during update restart")
+            return
+
         # Always ack immediately so Slack doesn't retry
         try:
             await client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
@@ -863,17 +1024,43 @@ def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
         if _subtype == "message_deleted":
             await _handle_message_deleted(orch, event)
             return
-        if _subtype and _subtype != "file_share":
-            return
-        if _bot_id:  # pragma: no cover — socket mode callback, tested via integration
+        # A bot-authored event is admitted ONLY on a positive match of its
+        # bot_id against the slack.trusted_bot_ids allowlist. The rule itself
+        # (deny by default, own id never trusted, unverified self id fails
+        # closed) lives in ONE place — trusted_bot_admission — which the
+        # transport applies too, so one owner keeps both drop sites in step.
+        #
+        # The admission is carried as from_trusted_bot so _route_message lets
+        # the bot_id stand in as sender_id and handle_message suppresses error
+        # replies (echo-loop guard). Successful-reply loops are bounded by the
+        # per-thread turn cap in _route_message (slack.trusted_bot_turn_limit);
+        # richer cross-bot coordination is the agent layer's job (envelope
+        # protocol).
+        #
+        # READ TIMING: this site passes the LIVE config, so an operator's
+        # allowlist edit takes effect on the next event without a restart. The
+        # transport deliberately freezes a snapshot instead; the predicate
+        # takes the set as an argument precisely so each site owns that choice.
+        #
+        # The trust decision runs BEFORE the generic subtype filter because a
+        # bot-authored message commonly carries subtype == "bot_message": the
+        # untrusted denial must be audited (not silently subtype-dropped), and
+        # a trusted bot's bot_message must pass the subtype gate below.
+        _from_trusted_bot, _deny_error = trusted_bot_admission(
+            _bot_id or "", orch._cfg.slack.trusted_bot_ids
+        )
+        if _deny_error:
             sel().log_api_access(
                 caller=_bot_id,
                 operation="slack.message",
                 outcome="denied",
                 source="slack",
-                error="untrusted_bot",
+                error=_deny_error,
             )
             return
+        if _subtype and _subtype != "file_share":
+            if not (_from_trusted_bot and _subtype == "bot_message"):
+                return
 
         # Enterprise Grid: envelope team_id is the *bot's* workspace;
         # event["team"] may be the *sender's* workspace in shared channels.
@@ -900,7 +1087,7 @@ def init_socket_mode(orch: GatewayOrchestrator, seen: SeenCache) -> None:
             event,
             seen,
             is_mention=(event_type == "app_mention"),
-            from_trusted_bot=False,
+            from_trusted_bot=_from_trusted_bot,
         )
 
     orch._socket_client.socket_mode_request_listeners.append(_on_event)  # type: ignore[arg-type]
@@ -954,7 +1141,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         blocks.append({"type": "header", "text": {"type": "plain_text", "text": "🔌 Capabilities"}})
         try:
             servers = list_servers()
-            skills = _get_skills_loader().list_skills()
+            skills = await asyncio.to_thread(lambda: _get_skills_loader().list_skills())
 
             # Slack caps a single section's text at 3000 chars. MCP servers and
             # skills each get their OWN section with an independent length cap
@@ -1084,17 +1271,21 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
                 sess_mgr = orch.sessions
                 # Read per-kind cap from config (default 5).
                 try:
-                    per_kind = orch._cfg.slack.home_tab_sessions_per_kind
+                    per_kind = slack_cfg(orch).slack.home_tab_sessions_per_kind
                     if not isinstance(per_kind, int) or per_kind < 1:
                         per_kind = _HOME_TAB_SESSIONS_PER_KIND
                 except (AttributeError, TypeError):
                     per_kind = _HOME_TAB_SESSIONS_PER_KIND
                 # Single directory scan for both kinds; partition + cap in memory.
-                all_rows = _collect_recent_sessions(
-                    sess_mgr,
-                    limit=per_kind * 10,
-                    kind=(_SESSION_KIND_DASHBOARD, _SESSION_KIND_TASKRUNNER),
-                )
+                # Gated so a burst of tab opens cannot put N of these scans in
+                # the shared executor at once; the rest of the publish, which is
+                # Slack API calls, stays unserialized.
+                async with _home_tab_collect_gate():
+                    all_rows = await _collect_recent_sessions_off_loop(
+                        sess_mgr,
+                        limit=per_kind * 10,
+                        kind=(_SESSION_KIND_DASHBOARD, _SESSION_KIND_TASKRUNNER),
+                    )
                 sel().log_api_access(
                     caller=user_id,
                     operation="slack.home_tab_sessions_data_access",
@@ -1180,30 +1371,36 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         vs = getattr(orch, "vector_memory", None)
         if vs is not None and callable(getattr(vs, "get_lessons", None)):
             try:
-                all_vs = vs.get_lessons()
+                all_vs = await asyncio.to_thread(vs.get_lessons)
             except Exception:
                 all_vs = None
                 logger.debug("Vector store lesson read failed, trying JSONL", exc_info=True)
             if isinstance(all_vs, list):
                 total_lessons = len(all_vs)
                 # get_lessons() returns ORDER BY updated_at DESC (most recent first).
+                # Deferred import: ``vector_memory`` pulls snowballstemmer plus
+                # the optional numpy/faiss imports, and this renderer is the
+                # module's only use of it, on an owner-command path.
+                from kiro_crew.vector_memory import _lesson_display_text
+
                 for entry in all_vs[:5]:
                     try:
                         parsed = json.loads(entry["value_json"])
-                        rule = (
-                            parsed.get("rule", str(parsed))
-                            if isinstance(parsed, dict)
-                            else str(parsed)
-                        )
-                        lesson_lines.append(
-                            f"• {redact_credentials(redact_exfiltration_urls(rule)[0])[0][:100]}"
-                        )
+                        # Rendered text for either storage shape, so a
+                        # mapping-shaped row keeps its NOT-clause instead of
+                        # showing rule-only (or a dict repr).  Credential
+                        # redaction runs on the FULL display text (rule +
+                        # negative combined) before truncation, so embedded
+                        # secrets in either field are replaced.
+                        rule = _lesson_display_text(parsed) or str(parsed)
+                        safe = redact_credentials(redact_exfiltration_urls(rule)[0])[0]
+                        lesson_lines.append(f"• {safe[:100]}")
                     except Exception:
                         logger.debug("Skipping malformed lesson entry", exc_info=True)
                 vs_ok = True
         # Fallback: legacy JSONL store.
         if not vs_ok and orch.ctx_builder is not None:
-            all_lessons = orch.ctx_builder.lessons.load_all()
+            all_lessons = await asyncio.to_thread(orch.ctx_builder.lessons.load_all)
             total_lessons = len(all_lessons)
             for le in all_lessons[-5:]:
                 lesson_lines.append(
@@ -1235,8 +1432,8 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         # ── Version ──
         version_text = f"📦 Kiro Crew v{__version__}"
         update_info = get_update_info()
-        remote_ver = update_info.get("remote_version")
-        if update_info.get("available") and remote_ver is not None:
+        remote_ver = update_info.get("latest_version")
+        if update_info.get("update_available") and remote_ver:
             version_text += f"  •  🆕 v{remote_ver} available — open Dashboard to update"
         version_text = redact_credentials(redact_exfiltration_urls(version_text)[0])[0]
         blocks.append({"type": "divider"})
@@ -1302,6 +1499,9 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
     response_url = payload.get("response_url", "")
     logger.info("Slash command: %s %s (caller=%s)", cmd, _safe_log(cmd_text), caller_id)
 
+    def _spawn(coro: Coroutine[object, object, object]) -> asyncio.Task[object]:
+        return _spawn_tracked(coro, owner=orch)
+
     async def _respond(text: str, blocks: list[dict] | None = None) -> None:
         if not response_url:
             return
@@ -1328,7 +1528,7 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
             resources=cmd_text,
             error="unauthorized sender",
         )
-        _spawn_tracked(_respond("⛔ You are not authorized to use this command."))
+        _spawn(_respond("⛔ You are not authorized to use this command."))
         return
 
     sel().log_api_access(
@@ -1340,7 +1540,7 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
     )
 
     if not (orch.slack and orch._owner_id):
-        _spawn_tracked(_respond("⚠️ Owner not configured."))
+        _spawn(_respond("⚠️ Owner not configured."))
         return
 
     # Parse sub-command and args
@@ -1354,13 +1554,13 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
         handler, _ = entry
         # Stash trigger_id so modal-opening handlers can use it
         orch._last_trigger_id = payload.get("trigger_id", "")  # type: ignore[attr-defined]
-        _spawn_tracked(handler(orch, caller_id, args, _respond))
+        _spawn(handler(orch, caller_id, args, _respond))
         return
 
     # Fallback: @user mention — multi-user access disabled for security
     user_match = re.search(r"<@([A-Z0-9]+)(?:\|([^>]+))?>", cmd_text)
     if user_match:
-        _spawn_tracked(
+        _spawn(
             _respond("⛔ Multi-user access is disabled. Only the owner can use Kiro Crew via Slack.")
         )
         return
@@ -1370,14 +1570,12 @@ async def _handle_slash(orch: GatewayOrchestrator, payload: dict) -> None:
     if channel_match:
         channel_id = channel_match.group(1)
         channel_name = channel_match.group(2) or "Secret"
-        _spawn_tracked(
-            prompt_track_channel(orch.slack, orch._owner_id, channel_id, channel_name)
-        )
-        _spawn_tracked(_respond(f"📨 Track request sent for #{channel_name or channel_id}."))
+        _spawn(prompt_track_channel(orch.slack, orch._owner_id, channel_id, channel_name))
+        _spawn(_respond(f"📨 Track request sent for #{channel_name or channel_id}."))
         return
 
     # Unknown sub-command → help
-    _spawn_tracked(_respond(_build_help_text(orch.slack_command)))
+    _spawn(_respond(_build_help_text(orch.slack_command)))
 
 
 # ---------------------------------------------------------------------------
@@ -1395,9 +1593,32 @@ def _maybe_prompt_owner(orch: GatewayOrchestrator, event: dict) -> None:
 # Audio transcription helper
 # ---------------------------------------------------------------------------
 
-# Single source of truth lives with the attachment adapter so the
-# transcriber and the ingestion path cannot disagree about what is audio.
-_AUDIO_MIMETYPES = SLACK_AUDIO_MIMETYPES
+# What counts as a voice memo lives with the attachment adapter
+# (``slack/files.py::is_voice_memo``) so the transcriber and the ingestion path
+# cannot disagree about what is audio.
+
+
+def _voice_memo_context(
+    text: str, memos: int, transcribed: int, *, available: bool
+) -> str:
+    """*text* plus one visible note per voice memo that produced no words.
+
+    A memo whose transcription is unavailable or failed would otherwise be dropped
+    in TOTAL silence: nothing appended to the prompt, so a voice-only message has
+    no text at all and the turn never starts. The sender's send succeeded, so
+    from their side that is indistinguishable from being ignored, and the agent
+    is never told anything arrived. The note keeps both true: the turn runs,
+    and it runs knowing a memo it cannot hear is what the user sent.
+
+    The wording is the neutral half's (``slack/files.py`` pins it), so the same
+    failure reads the same way whichever channel the memo came from.
+    """
+    missing = memos - transcribed
+    if missing <= 0:
+        return text
+    note = VOICE_MEMO_UNAVAILABLE if not available else VOICE_MEMO_FAILED
+    block = "\n\n".join(voice_memo_notes(missing, note))
+    return f"{text}\n\n{block}" if text else block
 
 
 async def _transcribe_with_reaction(
@@ -1431,11 +1652,16 @@ async def _transcribe_with_reaction(
 
 
 async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> list[str]:
-    """Download and transcribe audio files, return list of transcription strings."""
+    """Download and transcribe audio files, return list of transcription strings.
+
+    What speech-to-text could hear, plus one pinned refusal note
+    (:data:`VOICE_MEMO_TOO_LONG` / :data:`VOICE_MEMO_DURATION_UNVERIFIED`) per
+    memo refused before transcription. A memo that produced nothing is reported
+    by the caller, which knows how many arrived: see :func:`_voice_memo_context`.
+    """
     results: list[str] = []
     for f in files:
-        mimetype = f.get("mimetype", "")
-        if not any(mimetype.startswith(prefix) for prefix in _AUDIO_MIMETYPES):
+        if not is_voice_memo(f):
             continue
         url = f.get("url_private_download") or f.get("url_private", "")
         if not url:
@@ -1456,10 +1682,32 @@ async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> l
                 source="transcribe",
                 resources=f.get("name", "?"),
             )
-            transcript = await transcribe_audio(dest)
+            stt_config = await asyncio.to_thread(load_stt_config)
+            duration_cap = batch_duration_cap_secs(stt_config)
+            if duration_cap is not None:
+                exceeds = await audio_exceeds_secs(
+                    dest, duration_cap, timeout_secs=stt_config.timeout_secs
+                )
+                if exceeds is not False:
+                    note = VOICE_MEMO_DURATION_UNVERIFIED
+                    error = "audio_duration_unverified"
+                    if exceeds:
+                        note = VOICE_MEMO_TOO_LONG.format(minutes=duration_cap // 60)
+                        error = "audio_too_long"
+                    results.append(note)
+                    sel().log_api_access(
+                        caller="stt",
+                        operation="stt.transcribe",
+                        outcome="denied",
+                        source="transcribe",
+                        resources=f.get("name", "?"),
+                        error=error,
+                    )
+                    continue
+            transcript = await transcribe_audio(dest, stt_config)
             sel().log_api_access(
                 caller="stt",
-                operation="whisper.transcribe",
+                operation="stt.transcribe",
                 outcome="success" if transcript else "empty",
                 source="transcribe",
                 resources=f.get("name", "?"),
@@ -1473,7 +1721,7 @@ async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> l
             logger.exception("Failed to transcribe file %s", f.get("name", "?"))
             sel().log_api_access(
                 caller="stt",
-                operation="whisper.transcribe",
+                operation="stt.transcribe",
                 outcome="error",
                 source="transcribe",
                 resources=f.get("name", "?"),
@@ -1509,6 +1757,11 @@ async def _handle_message_deleted(orch: GatewayOrchestrator, event: dict) -> Non
             _filtered = [item for item in _pq if item[0] != deleted_ts]
             if len(_filtered) < len(_pq):
                 was_queued = True
+                # Dropped entries never reach _dispatch_queued's cleanup, so
+                # their temp files must be unlinked here or they leak.
+                for item in _pq:
+                    if item[0] == deleted_ts:
+                        unlink_queued_temp_paths(item[2])
                 if _filtered:
                     orch._pending_queue[_del_session_key] = _filtered
                 else:
@@ -1566,9 +1819,9 @@ async def _dispatch_queued(
     # path must keep taking it for its queued follow-ups (not silently fall back
     # to native). Review-mode channels stay on native (privacy gate), matching
     # the _route_message gate.
-    _activation = orch._cfg.channel_config(channel).activation
+    _activation = slack_cfg(orch).channel_config(channel).activation
     _use_transport = (
-        getattr(getattr(orch._cfg, "messaging", None), "use_transport", False) is True
+        getattr(getattr(slack_cfg(orch), "messaging", None), "use_transport", False) is True
         and _activation != ACTIVATION_REVIEW
     )
     try:
@@ -1596,6 +1849,13 @@ async def _dispatch_queued(
                 show_thinking=KiroCrewConfig.load().slack.show_thinking,
                 consolidator=orch.consolidator,
                 user_display_name=kwargs.get("user_display_name"),
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
+                # Echo-loop guard travels with the queued turn (parity with the
+                # immediate dispatch above).
+                from_trusted_bot=bool(kwargs.get("from_trusted_bot", False)),
             )
             return
         await handle_message(
@@ -1616,17 +1876,14 @@ async def _dispatch_queued(
             task_runner=orch.task_runner,
             channel_agent=kwargs.get("agent_override"),
             user_display_name=kwargs.get("user_display_name"),
+            from_trusted_bot=bool(kwargs.get("from_trusted_bot", False)),
         )
     finally:
         # The enqueue path deferred temp-image cleanup to here so the queued
         # turn's text could still resolve its image paths (see _route_message).
         # Unlink them now that the turn has consumed them — in finally so a
         # raising turn can't leak the temp files.
-        for _p in kwargs.get("image_temp_paths") or []:
-            try:
-                os.unlink(_p)
-            except OSError:
-                pass
+        unlink_queued_temp_paths(kwargs)
 
 
 # Maximum characters to recover from block extraction (DoS guard).
@@ -1882,33 +2139,76 @@ async def _route_message(
 
     # ── Workspace routing cache for org-wide installs ──
     # Slack Web API calls (chat.postMessage, chat.startStream, etc.) need
-    # team_id when the bot is org-wide installed; record the channel→team
-    # mapping so outbound posts on this channel route to the correct
-    # workspace and avoid ``team_access_not_granted``.
-    record_team = getattr(orch.slack, "record_channel_team", None)
-    if record_team and team_id:
-        record_team(channel, team_id)
+    # team_id when the bot is org-wide installed, and the value must be the
+    # workspace the CHANNEL lives in. ``event.team`` is the AUTHOR's
+    # workspace — a participant's, not the channel's, on a Slack Connect
+    # shared channel — so it must never seed this cache; resolve the home
+    # workspace from conversations_info instead (cached per process).
+    ensure_home_team = getattr(orch.slack, "ensure_channel_team", None)
+    if ensure_home_team is not None:
+        # The seam is duck-typed on purpose: orch.slack may be the real
+        # client, a test double, or a wrapper that implements this hook
+        # synchronously or as a coroutine. Accept either; only an awaitable
+        # is awaited.
+        outcome = ensure_home_team(channel)
+        if inspect.isawaitable(outcome):
+            await outcome
 
     # ── Access control: record authorization decision early for SEL audit ──
     # The ephemeral rejection is deferred until after activation checks so
     # users in observe/mention channels aren't spammed, but the SEL event
     # is always emitted to preserve the audit trail.
-    _user_authorized = is_allowed_user(sender_id)
+    # A trusted bot (from_trusted_bot=True) was already positively matched
+    # against the slack.trusted_bot_ids allowlist at the drop site; that
+    # allowlist IS its authorization — a bot_id is never in the owner-only
+    # user allowlist — so it is granted access equivalent to an allowed user.
+    # The audit records the decision basis so trusted-bot admissions stay
+    # traceable. TWO exceptions fail closed:
+    # 1. Review-mode channels: review mode delivers the draft via an
+    #    ephemeral to the sender, and chat.postEphemeral requires a human
+    #    user id — a bot_id target fails, so the turn would run with an
+    #    undeliverable reply. Matches the transport-path gate that also
+    #    excludes review mode.
+    # 2. Turn cap: a thread that has already run slack.trusted_bot_turn_limit
+    #    consecutive trusted-bot turns admits no more until an allowed human
+    #    posts in it. Without the cap, two mutually trusted gateways admit
+    #    each other's replies as fresh turns indefinitely (unbounded
+    #    successful-reply loop); the count is per thread and resets on a
+    #    processed human message, so legitimate mesh exchanges keep working
+    #    under human supervision.
+    _thread_key = f"{channel}:{thread_ts or msg_ts}"
+    _turn_capped = from_trusted_bot and _trusted_bot_turns.count(_thread_key) >= max(
+        1, slack_cfg(orch).slack.trusted_bot_turn_limit
+    )
+    _owner_authorized = is_allowed_user(sender_id)
+    _trusted_bot_admitted = (
+        from_trusted_bot
+        and not _turn_capped
+        and slack_cfg(orch).channel_config(channel).activation != ACTIVATION_REVIEW
+    )
+    _user_authorized = _owner_authorized or _trusted_bot_admitted
     if _user_authorized:
         sel().log_api_access(
             caller=sender_id,
             operation="slack.message",
             outcome="allowed",
             source="slack",
+            resources="" if _owner_authorized else "trusted_bot",
         )
     else:
         logger.warning("Ignoring message from unauthorized user %s", sender_id)
+        if not from_trusted_bot:
+            _deny_error = "unauthorized sender"
+        elif slack_cfg(orch).channel_config(channel).activation == ACTIVATION_REVIEW:
+            _deny_error = "trusted_bot_denied_in_review_channel"
+        else:
+            _deny_error = "trusted_bot_turn_limit_reached"
         sel().log_api_access(
             caller=sender_id,
             operation="slack.message",
             outcome="denied",
             source="slack",
-            error="unauthorized sender",
+            error=_deny_error,
         )
 
     # ── Message-interceptor seam (Default: PROCESS = inline, OSS-identical) ──
@@ -2004,7 +2304,7 @@ async def _route_message(
     # `app_mention` event for the same msg_ts.  We must skip the plain
     # `message` event *without* marking it as seen so the subsequent
     # `app_mention` event is still processed.
-    ch_cfg = orch._cfg.channel_config(channel)
+    ch_cfg = slack_cfg(orch).channel_config(channel)
     activation = ch_cfg.activation
 
     if activation == ACTIVATION_OFF:
@@ -2041,7 +2341,7 @@ async def _route_message(
     # EXEMPT only cancellation (``!stop``): a denied channel must still be able to
     # halt a runaway session it previously started. ``!restart`` is NOT
     # cancellation and stays gated. Default OSS build (no ``channels`` policy)
-    # permits, so this is byte-identical to today. handle_message keeps its own
+    # permits. handle_message keeps its own
     # gate as defense-in-depth for its other entry points (interaction
     # re-dispatch, synthetic sends).
     #
@@ -2175,32 +2475,45 @@ async def _route_message(
     # ── Transcribe audio files (voice memos) ──
     # Placed after dedup + auth to avoid expensive work on duplicate events
     # or unauthorized users.
-    _image_temp_paths: list[str] = []
+    _attachment_temp_paths: list[str] = []
     _had_voice_input = False
     if files and orch.slack and _user_authorized:
-        if stt_available():
-            transcripts = await _transcribe_with_reaction(
-                orch.slack,
-                channel,
-                msg_ts,
-                orch,
-                files,
-            )
-            if transcripts:
-                raw = "\n".join(transcripts)
-                raw, _ = redact_exfiltration_urls(raw)
-                raw, _ = redact_credentials(raw)
-                prefix = f"[Voice memo transcription]\n{raw}\n[End of transcription]"
-                text = f"{prefix}\n\n{text}" if text else prefix
-                _had_voice_input = True
+        memos = [f for f in files if is_voice_memo(f)]
+        if memos:
+            transcripts: list[str] = []
+            # Decided once per message, not per memo: an unusable transcriber
+            # cannot become usable between two attachments of one message.
+            #
+            # Off the loop, like every other caller of this: on the `local` provider it
+            # reaches the availability probe, which imports the recogniser binding and
+            # dlopens a native library (measured at 209 ms cold). Inline, the first
+            # inbound voice memo of a boot stalled the gateway's loop and its liveness
+            # heartbeat with it.
+            stt_ok = await asyncio.to_thread(stt_available)
+            if stt_ok:
+                transcripts = await _transcribe_with_reaction(
+                    orch.slack,
+                    channel,
+                    msg_ts,
+                    orch,
+                    files,
+                )
+                if transcripts:
+                    raw = "\n".join(transcripts)
+                    raw, _ = redact_exfiltration_urls(raw)
+                    raw, _ = redact_credentials(raw)
+                    prefix = f"[Voice memo transcription]\n{raw}\n[End of transcription]"
+                    text = f"{prefix}\n\n{text}" if text else prefix
+                    _had_voice_input = True
+            text = _voice_memo_context(text, len(memos), len(transcripts), available=stt_ok)
 
-        # ── Process non-audio files (images, text, etc.) ──
-        image_paths, text_blocks = await process_slack_files(orch, files)
-        _image_temp_paths = image_paths
+        # ── Process non-audio files (images, text, opaque files, etc.) ──
+        attachment_paths, text_blocks = await process_slack_files(orch, files)
+        _attachment_temp_paths = attachment_paths
 
-        # Inject image paths so AcpClient._send_prompt() inlines them as base64
-        if image_paths:
-            paths_text = "\n".join(image_paths)
+        # Image paths are inlined by ACP; opaque paths remain available to agent tools.
+        if attachment_paths:
+            paths_text = "\n".join(attachment_paths)
             text = f"{text}\n{paths_text}" if text else paths_text
 
         # Inject text file contents
@@ -2210,16 +2523,16 @@ async def _route_message(
 
     # Bail out if we still have no text after attempting transcription
     if not text:
-        # Clean up any downloaded image temp files
-        for p in _image_temp_paths:
+        # Clean up any downloaded attachment temp files
+        for p in _attachment_temp_paths:
             try:
                 os.unlink(p)
             except OSError:
                 pass
         return
 
-    def _cleanup_image_temps() -> None:
-        for p in _image_temp_paths:
+    def _cleanup_attachment_temps() -> None:
+        for p in _attachment_temp_paths:
             try:
                 os.unlink(p)
             except OSError:
@@ -2241,7 +2554,7 @@ async def _route_message(
         if end != -1:
             clean_text = text[end + 1 :].lstrip()
     if not clean_text:
-        _cleanup_image_temps()
+        _cleanup_attachment_temps()
         return
 
     # ── !stop: intercept BEFORE handle_message to bypass session semaphore ──
@@ -2271,11 +2584,22 @@ async def _route_message(
                 await orch.slack.post_message(channel, "Nothing running.", thread_ts or msg_ts)
             return
         session_key = thread_ts or msg_ts
+        # Recorded BEFORE the liveness checks: a turn between its abandoned
+        # attempt and its compaction replay has no session at this moment, and
+        # an interaction-originated turn has no registered task either; the
+        # replay reads this record to stay dropped (``note_user_stop``).
+        # Against the thread's OWNING session, not the bare thread key: a
+        # linked thread's turns -- and their replay -- run under the dashboard
+        # session that owns it, and that is the key the replay reads.
+        note_user_stop(orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key)
         has_session = orch.sessions.has_session(session_key)
         active_task = orch._session_tasks.pop(session_key, None)
         if has_session or active_task:
             orch.sessions.clear_queue(session_key)
-            orch._pending_queue.pop(session_key, None)
+            # Dropped pending (pre-session) entries never reach
+            # _dispatch_queued's cleanup, so unlink their temp files here.
+            for _item in orch._pending_queue.pop(session_key, None) or []:
+                unlink_queued_temp_paths(_item[2])
 
             # Post ephemeral "Stopping…" block with Kill Now button
             if orch.slack:
@@ -2340,6 +2664,22 @@ async def _route_message(
     # Per-channel agent override
     agent_override = ch_cfg.agent or None
 
+    # ── Trusted-bot turn ledger (loop guard bookkeeping) ──
+    # Counted HERE — after auth, activation, dedup, the empty-clean_text
+    # return, and the !stop/!restart interceptions — so only a message that
+    # will actually dispatch (or enqueue) a turn moves the count: a Slack
+    # retry, a message/app_mention duplicate pair, an activation-dropped
+    # message, a mention with no text after the <@…> strip, or an intercepted
+    # command must not burn the thread's budget. Every message reaching this
+    # point is authorized, so the non-trusted case is an allowed human:
+    # reset. An enqueued turn counts at enqueue time; the rare queued turn
+    # later cancelled via message_deleted leaves a one-turn over-count in the
+    # fail-closed direction, cleared by the next human message.
+    if from_trusted_bot:
+        _trusted_bot_turns.increment(_thread_key)
+    else:
+        _trusted_bot_turns.reset(_thread_key)
+
     logger.info(
         "Message from %s in %s (activation=%s): %s",
         sender_id,
@@ -2366,7 +2706,9 @@ async def _route_message(
             team_id=team_id,
             agent_override=agent_override,
             user_display_name=_sender_display,
-            image_temp_paths=list(_image_temp_paths),
+            # Historical key; carries every attachment temp path for cleanup.
+            image_temp_paths=list(_attachment_temp_paths),
+            from_trusted_bot=from_trusted_bot,
         )
         if not _queued:
             # Session object not created yet — stash on orch._pending_queue
@@ -2381,7 +2723,8 @@ async def _route_message(
                         team_id=team_id,
                         agent_override=agent_override,
                         user_display_name=_sender_display,
-                        image_temp_paths=list(_image_temp_paths),
+                        image_temp_paths=list(_attachment_temp_paths),
+                        from_trusted_bot=from_trusted_bot,
                     ),
                 )
             )
@@ -2393,11 +2736,9 @@ async def _route_message(
                 await orch.slack.add_reaction(channel, msg_ts, "hourglass_flowing_sand")
             except Exception:
                 logger.debug("Failed to add queue reaction", exc_info=True)
-        # NOTE: do NOT _cleanup_image_temps() here — clean_text references these
-        # temp-file paths and the queued turn hasn't run yet. They are carried in
-        # the queue kwargs and unlinked by _dispatch_queued after the turn runs
-        # (deleting them now dropped the images silently: p.is_file() was False
-        # by dispatch time, so _send_prompt skipped them with no error).
+        # NOTE: do NOT _cleanup_attachment_temps() here — clean_text references
+        # these paths. The historical image_temp_paths queue key transfers cleanup
+        # ownership to _dispatch_queued after the turn runs.
         return
     elif orch.sessions and orch.sessions.enqueue(
         session_key,
@@ -2409,7 +2750,8 @@ async def _route_message(
         team_id=team_id,
         agent_override=agent_override,
         user_display_name=_sender_display,
-        image_temp_paths=list(_image_temp_paths),
+        image_temp_paths=list(_attachment_temp_paths),
+        from_trusted_bot=from_trusted_bot,
     ):
         logger.info("Message %s queued for busy session %s", msg_ts, session_key)
         if orch.slack:
@@ -2418,8 +2760,7 @@ async def _route_message(
             except Exception:
                 logger.debug("Failed to add queue reaction", exc_info=True)
         # See the force=True branch above: cleanup is deferred to
-        # _dispatch_queued so the queued turn's clean_text can still resolve
-        # its image temp-file paths.
+        # _dispatch_queued so every queued attachment path remains valid.
         return
 
     # ── New transport path: route to the messaging abstraction ──
@@ -2438,7 +2779,7 @@ async def _route_message(
     # native handle_message; routing review-mode channels through native keeps
     # that guarantee intact rather than risking a partial re-implementation.
     _use_transport = (
-        getattr(getattr(orch._cfg, "messaging", None), "use_transport", False) is True
+        getattr(getattr(slack_cfg(orch), "messaging", None), "use_transport", False) is True
         and activation != ACTIVATION_REVIEW
     )
     if _use_transport:
@@ -2479,6 +2820,15 @@ async def _route_message(
                 # handle_message (parity: don't drop these on the transport path).
                 consolidator=orch.consolidator,
                 user_display_name=_sender_display,
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
+                # Echo-loop guard parity with native handle_message: the
+                # transport path suppresses its error reply for trusted-bot
+                # messages (a reply is itself a bot-authored event the peer
+                # admits, so replying would ping-pong).
+                from_trusted_bot=from_trusted_bot,
             )
         )
         orch._session_tasks[session_key] = t
@@ -2487,7 +2837,7 @@ async def _route_message(
             orch._handler_tasks.discard(task)
             if orch._session_tasks.get(session_key) is task:
                 del orch._session_tasks[session_key]
-            _cleanup_image_temps()
+            _cleanup_attachment_temps()
             # Drain queue: only if no other task took over this session.
             # Mirrors native _on_done so messages queued while this session was
             # busy aren't stranded when the transport path is the active route.
@@ -2543,7 +2893,7 @@ async def _route_message(
         )
     except Exception:
         logger.exception("Failed to create handle_message task")
-        _cleanup_image_temps()
+        _cleanup_attachment_temps()
         return
 
     orch._session_tasks[session_key] = t
@@ -2552,7 +2902,7 @@ async def _route_message(
         orch._handler_tasks.discard(task)
         if orch._session_tasks.get(session_key) is task:
             del orch._session_tasks[session_key]
-        _cleanup_image_temps()
+        _cleanup_attachment_temps()
         # Drain queue: only if no other task took over this session
         try:
             if session_key not in orch._session_tasks and orch.sessions:

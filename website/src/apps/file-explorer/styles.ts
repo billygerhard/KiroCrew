@@ -6,11 +6,11 @@ export const FE_CSS = `
 .mc-fe-fade-right { right:0; background:linear-gradient(to left, var(--bg), transparent); }
 .mc-fe-tabs { display:flex; align-items:stretch; gap:2px; padding:6px 8px 0; overflow-x:auto; scrollbar-width:thin; }
 .mc-fe-tabs::-webkit-scrollbar { height:3px; }
-.mc-fe-tabs::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+.mc-fe-tabs::-webkit-scrollbar-thumb { background:var(--muted); border-radius:2px; }
 .mc-fe-tab { display:inline-flex; align-items:center; gap:4px; padding:6px 8px 6px 10px; border:1px solid var(--border); border-bottom:none; border-radius:6px 6px 0 0; background:var(--card); color:var(--muted); cursor:pointer; user-select:none; transition:background .12s, color .12s; flex-shrink:0; }
 .mc-fe-tab.is-active { background:var(--bg); color:var(--text); border-color:var(--border); }
 .mc-fe-tab.is-current-folder { border-bottom-color:var(--bg); }
-.mc-fe-tab-label { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:200px; }
+.mc-fe-tab-label { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; max-width:200px; }
 .mc-fe-tab-close { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px; border-radius:3px; opacity:.5; flex-shrink:0; }
 .mc-fe-tab-close:hover { opacity:1; background:color-mix(in srgb, var(--text) 12%, transparent); }
 .mc-fe-tab-new { display:inline-flex; align-items:center; justify-content:center; padding:6px 10px; background:transparent; border:none; color:var(--muted); cursor:pointer; border-radius:4px; flex-shrink:0; }
@@ -32,6 +32,21 @@ export const FE_CSS = `
 .mc-fe-bc:hover { color:var(--text); background:color-mix(in srgb, var(--text) 10%, transparent); }
 .mc-fe-bc-sep { color:var(--muted); opacity:.4; font-family:var(--mono, ui-monospace, monospace); }
 .mc-fe-split { flex:1; display:flex; min-height:0; overflow:hidden; }
+/* Narrow: the tree becomes a drawer under a top bar, so the row turns into a
+   column and the divider turns with it. The left pane's border-right would draw
+   a stray vertical rule once stacked. */
+.mc-fe-split.is-stacked { flex-direction:column; }
+/* Stacked, the tree must FILL the column and scroll inside it. Left non-shrinking
+   it takes its CONTENT height instead -- measured 1553px inside a 718px split --
+   so its own overflow-y never engages and the split's hidden overflow clips the
+   rest with no way to reach it. A zero min-height is required for the same
+   reason: a flex item will not otherwise shrink below its content. */
+.mc-fe-split.is-stacked > .mc-fe-left { flex:1 1 0%; min-height:0; }
+.mc-fe-split.is-stacked > .mc-fe-left { border-right:none; border-bottom:1px solid var(--border); }
+/* Hidden rather than unmounted: the pane keeps its scroll position across a
+   rotation that crosses the breakpoint. */
+.mc-fe-left.is-hidden, .mc-fe-right.is-hidden { display:none; }
+.mc-fe-treebar { flex-shrink:0; justify-content:flex-start; gap:6px; width:100%; border-radius:0; border-left:none; border-right:none; border-top:none; }
 .mc-fe-left { flex-shrink:0; min-height:0; overflow-y:auto; overflow-x:hidden; border-right:1px solid var(--border); background:var(--bg); }
 .mc-fe-resizer { width:4px; flex-shrink:0; background:transparent; cursor:col-resize; transition:background .15s; }
 .mc-fe-resizer:hover { background:var(--accent); opacity:.5; }

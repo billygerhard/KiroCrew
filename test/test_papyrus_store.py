@@ -33,6 +33,7 @@ from unittest import mock
 
 import pytest
 
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.apps.builtins.papyrus.backend import store
 
 
@@ -95,8 +96,7 @@ class TestSafeChild:
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "a" * 2000)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
+    @requires_symlinks
     def test_rejects_a_symlink_escaping_the_project(self, project: Path) -> None:
         """A cloned repo can ship a symlink whose target is outside the project.
 
@@ -109,14 +109,12 @@ class TestSafeChild:
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "evil-link.tex")
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
     def test_rejects_a_path_through_a_symlinked_directory(self, project: Path) -> None:
         """The escape can also be a mid-path DIRECTORY link, not just a file one."""
         outside = project.parent / "outside-dir"
         outside.mkdir()
         (outside / "secret.tex").write_text("secret", encoding="utf-8")
-        os.symlink(outside, project / "linked")
+        make_dir_link(project / "linked", outside)
         with pytest.raises(store.PathRejected):
             store.safe_child(project, "linked/secret.tex")
 
@@ -245,8 +243,7 @@ class TestListFiles:
         assert not any(f.startswith(".") for f in listed)
         assert "main.tex" in listed
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
+    @requires_symlinks
     def test_skips_symlinks_entirely(self, project: Path) -> None:
         """A tree walk that follows links is how containment leaks."""
         outside = project.parent / "outside.tex"
@@ -588,6 +585,30 @@ class TestProjectConfigIsContained:
         store.write_project_config(project, {"main_file": "x.tex"})
         assert secret.read_text(encoding="utf-8") == original
 
+    def test_a_junctioned_config_is_refused(self, project: Path, tmp_path: Path) -> None:
+        """The two tests above skip on Windows, where os.symlink needs
+        SeCreateSymbolicLinkPrivilege -- so the one link type an unprivileged
+        Windows user CAN create had no coverage here at all.
+
+        The link points INSIDE the project on purpose: `safe_child` answers "does
+        this resolve inside the project", and an in-project link satisfies it, so
+        an out-of-project link is refused by containment whether or not the link
+        guard fires and cannot tell the two builds apart. Asserted on
+        `_config_path` rather than `read_project_config`, because reading a
+        directory fails anyway and the outcome would look right while the guard
+        was never consulted.
+
+        A junction is directory-only, so it cannot stand in for the
+        `.papyrus.json -> paper.tex` overwrite the symlink tests cover; what it
+        does is slip past a refusal this module documents as link-type-agnostic.
+        """
+        inside = project / "chapters"
+        inside.mkdir(exist_ok=True)
+        (project / store.PROJECT_CONFIG_FILENAME).unlink(missing_ok=True)
+        make_dir_link(project / store.PROJECT_CONFIG_FILENAME, inside)
+
+        assert store._config_path(project) is None
+
     @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
     def test_an_in_project_config_symlink_cannot_overwrite_the_manuscript(
         self, project: Path
@@ -717,11 +738,11 @@ class TestGitMachineryIsNotDocumentContent:
 class TestASymlinkedProjectEntryIsRefused:
     """`projects/<name>` must be a real directory under `projects_dir`, never a link.
 
-    The containment check used to accept `resolved == projects_dir` (the `resolved
-    != base_resolved` disjunct), and `projects/pwn -> .` satisfied exactly that.
-    The blast radius was total: every OTHER paper became a "child" of the fake
-    project, so `safe_child` resolved `other-paper/main.tex` as an in-project path
-    (cross-project read AND write), and `DELETE /project?name=pwn` ran `rmtree` on
+    A containment check that accepts `resolved == projects_dir` (the `resolved
+    != base_resolved` disjunct) is satisfied by `projects/pwn -> .`, and the blast
+    radius is total: every OTHER paper becomes a "child" of the fake project, so
+    `safe_child` resolves `other-paper/main.tex` as an in-project path
+    (cross-project read AND write), and `DELETE /project?name=pwn` runs `rmtree` on
     the projects ROOT — destroying every paper the user had.
     """
 
@@ -730,7 +751,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "thesis").mkdir()
         (pdir / "thesis" / "main.tex").write_text("SECRET", encoding="utf-8")
-        (pdir / "pwn").symlink_to(".", target_is_directory=True)
+        make_dir_link(pdir / "pwn", pdir)
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("pwn", tmp_path)
@@ -740,7 +761,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir.mkdir(parents=True, exist_ok=True)
         outside = tmp_path / "outside"
         outside.mkdir()
-        (pdir / "escape").symlink_to(outside, target_is_directory=True)
+        make_dir_link(pdir / "escape", outside)
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("escape", tmp_path)
@@ -750,7 +771,7 @@ class TestASymlinkedProjectEntryIsRefused:
         pdir = store.projects_dir(tmp_path)
         pdir.mkdir(parents=True, exist_ok=True)
         (pdir / "real").mkdir()
-        (pdir / "alias").symlink_to(pdir / "real", target_is_directory=True)
+        make_dir_link(pdir / "alias", pdir / "real")
 
         with pytest.raises(store.PathRejected):
             store.safe_project_dir("alias", tmp_path)
@@ -772,14 +793,17 @@ class TestReparseLinkCoversJunctions:
     drift apart on which link types they cover.
     """
 
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="symlink creation needs privilege on Windows"
-    )
-    def test_a_symlink_is_a_reparse_link(self, tmp_path: Path) -> None:
+    def test_a_directory_link_is_a_reparse_link(self, tmp_path: Path) -> None:
+        """A junction on Windows, a directory symlink on POSIX.
+
+        The junction leg is the whole point of this helper, so it must be the leg
+        exercised on Windows: `make_dir_link` needs no privilege there, while a
+        directory symlink would raise WinError 1314 in an unelevated shell.
+        """
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        make_dir_link(link, real)
         assert store.is_reparse_link(link) is True
 
     def test_a_plain_directory_is_not(self, tmp_path: Path) -> None:
@@ -800,10 +824,11 @@ class TestReparseLinkCoversJunctions:
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        make_dir_link(link, real)
 
         with mock.patch.object(store, "_ISJUNCTION", None):
-            # A symlink is still caught by the `is_symlink()` leg.
+            # Without `isjunction`, a POSIX symlink is still caught by the
+            # `is_symlink()` leg and a Windows junction by the stat-field fallback.
             assert store.is_reparse_link(link) is True
             assert store.is_reparse_link(plain) is False
 
@@ -844,3 +869,81 @@ class TestReparseLinkCoversJunctions:
         with mock.patch.object(store, "is_reparse_link", return_value=True):
             with pytest.raises(store.PathRejected, match="symlink"):
                 store.safe_project_dir("looks-real", tmp_path)
+
+
+class TestTheWalkAndTheScanRefuseJunctionsToo:
+    """Both directory walks must refuse a link through ``is_reparse_link``.
+
+    ``is_reparse_link``'s own docstring states the contract: "every place this
+    module refuses a link at a name Kiro Crew owns has to refuse a junction too, or
+    the refusal is POSIX-only". ``safe_project_dir`` honours it. ``list_files`` and
+    ``list_projects`` asked ``is_symlink()``, which does NOT report a Windows
+    directory junction -- and a junction is precisely a DIRECTORY link, so it is the
+    ``is_dir()`` arm of both loops that it reaches:
+
+    * ``list_files`` skips the link, then descends the directory. A junction is not
+      skipped and IS a directory, so the walk follows it out of the project and
+      returns names from wherever it points, under project-relative paths.
+    * ``list_projects`` skips a linked entry, then treats the directory as a real
+      project. A junction under ``projects/`` is therefore enumerated as a project,
+      which is the entry ``safe_project_dir`` refuses outright at the other door.
+
+    Junctions are the link type a Windows user can create WITHOUT elevation, so
+    these are the platform's cheapest bypass. Asserted through the shared helper
+    rather than by creating a real junction, because ``os.path.isjunction`` is 3.12+
+    and always ``False`` off Windows -- the same technique the project-entry test
+    above uses.
+    """
+
+    def test_the_file_walk_does_not_descend_a_junction(self, project: Path) -> None:
+        outside = project.parent / "outside"
+        outside.mkdir()
+        (outside / "secret.tex").write_text("secret", encoding="utf-8")
+        junction = project / "linked"
+        junction.mkdir()
+        (junction / "secret.tex").write_text("secret", encoding="utf-8")
+
+        with mock.patch.object(store, "is_reparse_link", lambda p: Path(p) == junction):
+            listed = store.list_files(project)
+
+        assert "linked/secret.tex" not in listed
+        assert "main.tex" in listed
+
+    def test_the_file_walk_consults_the_shared_helper(self, project: Path) -> None:
+        """A junction is only refused if the walk ASKS the helper about it."""
+        (project / "sub").mkdir(exist_ok=True)
+        seen: list[str] = []
+
+        def _spy(p):
+            seen.append(Path(p).name)
+            return False
+
+        with mock.patch.object(store, "is_reparse_link", _spy):
+            store.list_files(project)
+
+        assert "sub" in seen
+
+    def test_a_junction_under_projects_is_not_listed_as_a_project(self, data_root: Path) -> None:
+        pdir = store.projects_dir(data_root)
+        real = pdir / "paper"
+        real.mkdir(parents=True)
+        (real / "main.tex").write_text("", encoding="utf-8")
+        junction = pdir / "pwn"
+        junction.mkdir()
+        (junction / "main.tex").write_text("", encoding="utf-8")
+
+        with mock.patch.object(store, "is_reparse_link", lambda p: Path(p) == junction):
+            names = [p.name for p in store.list_projects(data_root)]
+
+        assert names == ["paper"]
+
+    @requires_symlinks
+    def test_a_symlinked_project_entry_is_still_skipped(self, data_root: Path) -> None:
+        """Regression control: the POSIX leg the previous check already covered."""
+        pdir = store.projects_dir(data_root)
+        real = pdir / "paper"
+        real.mkdir(parents=True)
+        (real / "main.tex").write_text("", encoding="utf-8")
+        make_dir_link(pdir / "alias", real)
+
+        assert [p.name for p in store.list_projects(data_root)] == ["paper"]

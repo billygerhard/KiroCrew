@@ -8,15 +8,69 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 NPM_VERSION = "10.8.2"
-AUDIT_TIMEOUT_SECONDS = 120
+# Per ATTEMPT. `npm audit --package-lock-only` is one bulk-advisory POST to the
+# registry, normally seconds; a slow registry stalls it rather than failing it,
+# so the ceiling is what turns a stall into a retryable failure. Sized from
+# observation, not hope: on a degraded registry a single lockfile has taken
+# ~60s on a good night and just over 120s on a bad one -- and the latter
+# COMPLETED on its second attempt, so it was slow, not hung. 120s left no
+# headroom for that shape; 180s does, while a genuinely hung registry still
+# fails within the budget below.
+AUDIT_TIMEOUT_SECONDS = 180
+# The audit is a read-only query and idempotent, so a transient registry or
+# network failure -- the attempt timing out, or npm reporting a connection-level
+# error -- is retried. Anything else (a malformed report, an exit code npm does
+# not document, a real finding) is definitive and is NOT retried: a retry cannot
+# change it and would only delay the fail-closed answer.
+AUDIT_ATTEMPTS = 3
+AUDIT_RETRY_BACKOFF_SECONDS = (5.0, 20.0)
+# Wall-clock budget for ALL audits together, so retries cannot outgrow the CI
+# job's own timeout (15 minutes, leaving room for checkout and toolchain
+# setup): an attempt never gets more than the time left, and no retry starts
+# with less than one full attempt's ceiling remaining. Three lockfiles at the
+# degraded pace above (one slow attempt each, one retry) fit; a registry that
+# stays down still fails closed inside it.
+AUDIT_TOTAL_BUDGET_SECONDS = 720
+# Substrings that mark npm's own connection-level failures. A stderr carrying
+# one of them (with an exit status other than the documented 0/1 audit results)
+# is transient; every other stderr is treated as definitive.
+TRANSIENT_STDERR_MARKERS = (
+    "ETIMEDOUT",
+    "ESOCKETTIMEDOUT",
+    "ERR_SOCKET_TIMEOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "EAI_AGAIN",
+    "ENOTFOUND",
+    "EPIPE",
+    "socket hang up",
+    "FETCH_ERROR",
+    "E429",
+    "E500",
+    "E502",
+    "E503",
+    "E504",
+)
 MAX_EXCEPTION_DAYS = 30
+# Lead time on the expiry warning. An exception stays valid through its expiry
+# date and the gate fails closed the day after, so this is the window in which
+# the owner can still renew or remove it before a build breaks.
+EXPIRY_WARNING_DAYS = 7
 EXCEPTIONS_FILENAME = ".vulnerability-exceptions.json"
+#: Recorded count of unexcepted build-chain advisories, per lockfile. The
+#: build-chain pass REPORTS rather than blocks: widening the audit to dev
+#: packages and making those findings block in one step is how a gate ends up
+#: switched off by whoever it stopped. Failing only on an increase makes the
+#: report immediately useful and gives it teeth against new debt, without
+#: holding existing debt against an unrelated PR.
+BUILD_CHAIN_BASELINE_FILENAME = "build-chain-audit-baseline.json"
 AUDITED_LOCKFILES = (
     "website/package-lock.json",
     "website/electron/package-lock.json",
@@ -169,6 +223,49 @@ def load_exception_rules(path: Path, *, today: date | None = None) -> list[Excep
     return validate_exception_document(document, today=today)
 
 
+def expiring_exception_rules(
+    rules: Sequence[ExceptionRule],
+    *,
+    today: date,
+    within_days: int = EXPIRY_WARNING_DAYS,
+) -> list[tuple[ExceptionRule, int]]:
+    """Return (rule, days remaining) for exceptions inside the warning window.
+
+    An already-expired rule is never returned: ``validate_exception_document``
+    rejects it outright, so by the time a rule reaches here it is still valid and
+    the count is zero or positive. Zero means the expiry date itself, which is
+    the last day the rule holds.
+    """
+    upcoming: list[tuple[ExceptionRule, int]] = []
+    for rule in rules:
+        remaining = (rule.expires - today).days
+        if 0 <= remaining <= within_days:
+            upcoming.append((rule, remaining))
+    # Soonest first, then by scope, so repeated runs emit an identical ordering.
+    upcoming.sort(key=lambda item: (item[0].expires, item[0].package, item[0].advisory))
+    return upcoming
+
+
+def expiry_warning_lines(
+    rules: Sequence[ExceptionRule],
+    *,
+    today: date,
+    within_days: int = EXPIRY_WARNING_DAYS,
+) -> list[str]:
+    """Render one actionable GitHub warning annotation per expiring exception."""
+    lines: list[str] = []
+    for rule, remaining in expiring_exception_rules(rules, today=today, within_days=within_days):
+        when = "today" if remaining == 0 else f"in {remaining} day(s)"
+        fails_on = rule.expires + timedelta(days=1)
+        lines.append(
+            f"::warning::vulnerability exception for {rule.package} {rule.advisory} "
+            f"(owner {rule.owner}) expires {when} on {rule.expires.isoformat()}; "
+            f"this audit fails closed from {fails_on.isoformat()} until the exception is "
+            f"renewed or removed in {EXCEPTIONS_FILENAME}"
+        )
+    return lines
+
+
 def locate_npx(which: Callable[[str], str | None] = shutil.which) -> str:
     npx = which("npx")
     if not npx:
@@ -319,18 +416,46 @@ def parse_audit_report(output: str, *, returncode: int, lockfile: str) -> list[F
     return findings
 
 
-def audit_command(npx: str) -> list[str]:
-    return [
+def audit_command(npx: str, *, include_dev: bool = False) -> list[str]:
+    """Build the pinned `npm audit` argv.
+
+    ``include_dev`` drops ``--omit=dev`` so the report also covers the
+    build-chain: packages npm classifies as development-only still execute on
+    every CI runner and every contributor's machine during build and test, with
+    the same privileges as the build itself, and some of them contribute shipped
+    bytes. ``--omit=dev`` excludes exactly those, so it excludes the half that
+    runs arbitrary code at install and build time.
+
+    The default stays runtime-only so the blocking decision keeps the scope it
+    has always had; the build-chain pass is counted separately.
+    """
+    command = [
         npx,
         "--yes",
         f"npm@{NPM_VERSION}",
         "audit",
-        "--omit=dev",
+    ]
+    if not include_dev:
+        command.append("--omit=dev")
+    command += [
         "--package-lock-only",
         "--ignore-scripts",
         "--audit-level=high",
         "--json",
     ]
+    return command
+
+
+def warm_command(npx: str) -> list[str]:
+    """Resolve and cache the pinned npm WITHOUT auditing anything.
+
+    `npx --yes npm@<version>` downloads that npm on a cold runner before it can
+    run the audit, so on the first lockfile the download used to be paid inside
+    the audit's own timeout -- a slow registry then failed the gate before a
+    single advisory was asked for. Warming once up front moves that cost to its
+    own bounded step; the audits that follow hit the npx cache.
+    """
+    return [npx, "--yes", f"npm@{NPM_VERSION}", "--version"]
 
 
 def _shell_quote(value: str) -> str:
@@ -356,12 +481,130 @@ def _audit_failure_details(project_dir: Path, command: Sequence[str], stderr: st
     return "\n".join(details)
 
 
+def is_transient_failure(returncode: int, stderr: str) -> bool:
+    """Whether a failed npm run looks like a registry/network fault worth retrying.
+
+    Exit 0 and 1 are npm's documented audit RESULTS (clean / findings) and are
+    never transient, whatever stderr says; any other exit is transient only when
+    stderr carries one of npm's connection-level markers.
+    """
+    if returncode in (0, 1):
+        return False
+    return any(marker in stderr for marker in TRANSIENT_STDERR_MARKERS)
+
+
+class Deadline:
+    """Shared wall-clock budget for every attempt of every audit in one run."""
+
+    def __init__(self, seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._ends_at = clock() + seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self._ends_at - self._clock())
+
+    def attempt_timeout(self) -> float:
+        """The ceiling for the next attempt: one attempt's worth, or what is left."""
+        return min(float(AUDIT_TIMEOUT_SECONDS), self.remaining())
+
+    def can_retry(self, *, after_pause: float = 0.0) -> bool:
+        """A retry needs the backoff it will sleep PLUS a full attempt's ceiling
+        left, or it would wake up already short and only time out."""
+        return self.remaining() >= after_pause + AUDIT_TIMEOUT_SECONDS
+
+
+def _with_transient_retries(
+    label: str,
+    attempt: Callable[[float], subprocess.CompletedProcess[str]],
+    *,
+    deadline: Deadline,
+    describe_failure: Callable[[str], str],
+    sleeper: Callable[[float], None] = time.sleep,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``attempt`` until it returns a non-transient result or the retries run out.
+
+    Raises :class:`GateError` (fail closed) after the last permitted transient
+    failure, naming how many attempts were made so a persistent registry outage
+    reads as one rather than as a flaky gate.
+    """
+    for index in range(1, AUDIT_ATTEMPTS + 1):
+        timeout = deadline.attempt_timeout()
+        if timeout <= 0:
+            raise GateError(f"{label}: audit time budget exhausted before attempt {index}")
+        try:
+            result = attempt(timeout)
+        except subprocess.TimeoutExpired as exc:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            failure = f"timed out after {int(timeout)}s"
+        except (OSError, subprocess.SubprocessError) as exc:
+            stderr_value = getattr(exc, "stderr", "")
+            stderr = stderr_value if isinstance(stderr_value, str) else ""
+            failure = f"could not run: {exc}"
+        else:
+            if not is_transient_failure(result.returncode, result.stderr or ""):
+                return result
+            stderr = result.stderr or ""
+            failure = f"failed with a transient registry/network error (exit {result.returncode})"
+        pause = AUDIT_RETRY_BACKOFF_SECONDS[min(index - 1, len(AUDIT_RETRY_BACKOFF_SECONDS) - 1)]
+        if index >= AUDIT_ATTEMPTS or not deadline.can_retry(after_pause=pause):
+            raise GateError(
+                f"{label} {failure} on attempt {index} of {AUDIT_ATTEMPTS}; giving up\n"
+                f"{describe_failure(stderr)}"
+            )
+        print(f"{label} {failure} on attempt {index} of {AUDIT_ATTEMPTS}; retrying in {pause:g}s")
+        sleeper(pause)
+    raise AssertionError("unreachable: the loop returns or raises")
+
+
+def warm_npm(
+    npx: str,
+    *,
+    deadline: Deadline,
+    repo_root: Path = _REPO_ROOT,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    """Fetch the pinned npm once and prove it is the pinned one before auditing."""
+    command = warm_command(npx)
+
+    def attempt(timeout: float) -> subprocess.CompletedProcess[str]:
+        return runner(
+            command,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def describe(stderr: str) -> str:
+        return _audit_failure_details(repo_root, command, stderr)
+
+    result = _with_transient_retries(
+        f"npm@{NPM_VERSION} warm-up",
+        attempt,
+        deadline=deadline,
+        describe_failure=describe,
+        sleeper=sleeper,
+    )
+    reported = (result.stdout or "").strip()
+    if result.returncode != 0 or reported != NPM_VERSION:
+        raise GateError(
+            f"npm@{NPM_VERSION} warm-up did not yield the pinned npm "
+            f"(exit {result.returncode}, reported {reported!r})\n"
+            f"{describe(result.stderr or '')}"
+        )
+
+
 def run_audit(
     lockfile: str,
     *,
     npx: str,
     repo_root: Path = _REPO_ROOT,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    deadline: Deadline | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    include_dev: bool = False,
 ) -> list[Finding]:
     lock_path = repo_root / lockfile
     project_dir = lock_path.parent
@@ -370,34 +613,36 @@ def run_audit(
     if not (project_dir / "package.json").is_file():
         raise GateError(f"audited package manifest is missing beside {lockfile}")
 
-    command = audit_command(npx)
-    try:
-        result = runner(
+    command = audit_command(npx, include_dev=include_dev)
+    if deadline is None:
+        deadline = Deadline(AUDIT_TOTAL_BUDGET_SECONDS)
+
+    def attempt(timeout: float) -> subprocess.CompletedProcess[str]:
+        return runner(
             command,
             cwd=project_dir,
             capture_output=True,
             text=True,
-            timeout=AUDIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired as exc:
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        details = _audit_failure_details(project_dir, command, stderr)
-        raise GateError(
-            f"npm audit timed out after {AUDIT_TIMEOUT_SECONDS}s for {lockfile}\n{details}"
-        ) from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        stderr_value = getattr(exc, "stderr", "")
-        stderr = stderr_value if isinstance(stderr_value, str) else ""
-        details = _audit_failure_details(project_dir, command, stderr)
-        raise GateError(f"npm audit could not run for {lockfile}: {exc}\n{details}") from exc
+
+    def describe(stderr: str) -> str:
+        return _audit_failure_details(project_dir, command, stderr)
+
+    result = _with_transient_retries(
+        f"npm audit for {lockfile}",
+        attempt,
+        deadline=deadline,
+        describe_failure=describe,
+        sleeper=sleeper,
+    )
 
     try:
         return parse_audit_report(result.stdout, returncode=result.returncode, lockfile=lockfile)
     except GateError as exc:
         stderr = result.stderr if isinstance(result.stderr, str) else ""
-        details = _audit_failure_details(project_dir, command, stderr)
-        raise GateError(f"{exc}\n{details}") from exc
+        raise GateError(f"{exc}\n{describe(stderr)}") from exc
 
 
 def unexcepted_findings(
@@ -406,14 +651,137 @@ def unexcepted_findings(
     return [finding for finding in findings if not any(rule.matches(finding) for rule in rules)]
 
 
+def load_build_chain_baseline(path: Path) -> dict[str, int]:
+    """Read the recorded per-lockfile build-chain counts.
+
+    A missing or unreadable file yields an empty mapping, which reads every
+    lockfile as unmeasured rather than as zero: treating "no baseline" as zero
+    would make the very first run report an increase for debt that predates it.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, Mapping):
+        return {}
+    counts = raw.get("lockfiles")
+    if not isinstance(counts, Mapping):
+        return {}
+    return {
+        str(name): value
+        for name, value in counts.items()
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    }
+
+
+def build_chain_regressions(
+    counts: Mapping[str, int], baseline: Mapping[str, int]
+) -> list[tuple[str, int, int]]:
+    """Lockfiles whose unexcepted build-chain count rose above its baseline.
+
+    Only an INCREASE is reported. A lockfile absent from the baseline is not a
+    regression, and a count that fell is not one either -- the baseline is
+    lowered by regenerating it, never raised to make CI pass.
+    """
+    regressions: list[tuple[str, int, int]] = []
+    for lockfile in sorted(counts):
+        recorded = baseline.get(lockfile)
+        if recorded is None:
+            continue
+        found = counts[lockfile]
+        if found > recorded:
+            regressions.append((lockfile, found, recorded))
+    return regressions
+
+
+def write_build_chain_baseline(path: Path, counts: Mapping[str, int]) -> None:
+    """Record *counts* as the new baseline, preserving the file's own comment."""
+    comment = ""
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+    if isinstance(existing, Mapping):
+        comment = str(existing.get("_comment", ""))
+    document: dict[str, Any] = {}
+    if comment:
+        document["_comment"] = comment
+    document["version"] = 1
+    document["lockfiles"] = {name: counts[name] for name in sorted(counts)}
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def measure_build_chain(
+    npx: str, rules: Sequence[ExceptionRule], *, deadline: Deadline
+) -> dict[str, int]:
+    """Count unexcepted build-chain advisories per lockfile, skipping failures.
+
+    Takes the caller's *deadline* rather than opening its own. The obvious-looking
+    alternative -- a second budget so an advisory count can never eat the time the
+    blocking pass needs -- adds its seconds to the wall clock instead, and the job
+    that gates release allows 900s while the blocking budget alone is 720s. Sharing
+    the deadline bounds BOTH passes by that one number, and costs the blocking pass
+    nothing, because this runs only once its verdict is already decided. What is
+    left over is exactly what the advisory pass may spend.
+    """
+    counts: dict[str, int] = {}
+    for lockfile in AUDITED_LOCKFILES:
+        try:
+            findings = run_audit(lockfile, npx=npx, deadline=deadline, include_dev=True)
+        except GateError as exc:
+            print(f"NOTE: build-chain audit not measured for {lockfile}: {exc}")
+            continue
+        counts[lockfile] = len(unexcepted_findings(findings, rules))
+    return counts
+
+
+def update_baseline() -> int:
+    """Regenerate the build-chain baseline from a live audit."""
+    try:
+        rules = load_exception_rules(_REPO_ROOT / EXCEPTIONS_FILENAME, today=_utc_today())
+        npx = locate_npx()
+        deadline = Deadline(AUDIT_TOTAL_BUDGET_SECONDS)
+        warm_npm(npx, deadline=deadline)
+    except GateError as exc:
+        print(f"ERROR: cannot regenerate the build-chain baseline: {exc}", file=sys.stderr)
+        return 1
+    counts = measure_build_chain(npx, rules, deadline=deadline)
+    if len(counts) != len(AUDITED_LOCKFILES):
+        # A partial measurement would record a low number for an unmeasured
+        # lockfile, which is the one way this file can silently weaken.
+        print(
+            "ERROR: refusing to record a partial baseline "
+            f"({len(counts)} of {len(AUDITED_LOCKFILES)} lockfiles measured)",
+            file=sys.stderr,
+        )
+        return 1
+    path = _REPO_ROOT / BUILD_CHAIN_BASELINE_FILENAME
+    write_build_chain_baseline(path, counts)
+    print(f"Recorded build-chain baseline for {len(counts)} lockfile(s) in {path.name}.")
+    return 0
+
+
 def main() -> int:
     try:
-        rules = load_exception_rules(_REPO_ROOT / EXCEPTIONS_FILENAME)
+        # One `today` for both the validation and the warning, so a run spanning
+        # UTC midnight cannot judge the same rule against two different dates.
+        today = _utc_today()
+        rules = load_exception_rules(_REPO_ROOT / EXCEPTIONS_FILENAME, today=today)
+        # Emitted BEFORE the audit: the audit reaches the network and can fail
+        # for reasons of its own, and the owner still needs the expiry notice
+        # when it does. The gate runs before every release build, so the
+        # notice reaches whoever cuts the release that would carry the
+        # exception.
+        for line in expiry_warning_lines(rules, today=today):
+            print(line)
         npx = locate_npx()
+        deadline = Deadline(AUDIT_TOTAL_BUDGET_SECONDS)
+        print(f"Resolving npm@{NPM_VERSION} ...")
+        warm_npm(npx, deadline=deadline)
         findings: list[Finding] = []
         for lockfile in AUDITED_LOCKFILES:
             print(f"Auditing production dependencies in {lockfile} with npm@{NPM_VERSION} ...")
-            findings.extend(run_audit(lockfile, npx=npx))
+            findings.extend(run_audit(lockfile, npx=npx, deadline=deadline))
         blocked = unexcepted_findings(findings, rules)
     except GateError as exc:
         print(f"ERROR: production dependency audit failed closed: {exc}", file=sys.stderr)
@@ -434,8 +802,48 @@ def main() -> int:
         f"Production dependency audit passed: {len(AUDITED_LOCKFILES)} lockfiles, "
         f"{excepted_count} governed exception(s)."
     )
+    report_build_chain(npx, rules, deadline=deadline)
     return 0
 
 
+def report_build_chain(
+    npx: str, rules: Sequence[ExceptionRule], *, deadline: Deadline
+) -> None:
+    """Report build-chain advisories against their baseline. Never fails.
+
+    Reached only after the blocking pass has passed, and it returns None so it
+    has no way to change the exit status. Its own failures are printed and
+    dropped: this pass exists to make the build-chain visible, and a report that
+    can break a build is a block wearing a report's name. It spends what remains
+    of the caller's *deadline*, so it cannot push the job past its own timeout.
+    """
+    counts = measure_build_chain(npx, rules, deadline=deadline)
+
+    if not counts:
+        print("NOTE: build-chain audit produced no measurement; baseline not compared.")
+        return
+
+    baseline = load_build_chain_baseline(_REPO_ROOT / BUILD_CHAIN_BASELINE_FILENAME)
+    for lockfile in sorted(counts):
+        recorded = baseline.get(lockfile)
+        recorded_text = "no baseline" if recorded is None else str(recorded)
+        print(
+            f"Build-chain advisories in {lockfile}: {counts[lockfile]} "
+            f"(baseline {recorded_text})"
+        )
+
+    regressions = build_chain_regressions(counts, baseline)
+    if regressions:
+        print(
+            "NOTE: build-chain advisory count ROSE above its baseline. This pass "
+            "reports only; the count is the worklist, and lowering it is what "
+            "clears the note:"
+        )
+        for lockfile, found, recorded in regressions:
+            print(f"  {lockfile}: {found} advisories, baseline {recorded}")
+
+
 if __name__ == "__main__":
+    if "--update-baseline" in sys.argv[1:]:
+        raise SystemExit(update_baseline())
     raise SystemExit(main())

@@ -10,9 +10,15 @@ import { resolveLegacyHighlightId } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 
 describe('resolveLegacyHighlightId', () => {
-  it('maps slack.* ids to channels.* (nav regroup tab collapse)', () => {
-    expect(resolveLegacyHighlightId('slack.slash-command')).toBe('channels.slash-command')
-    expect(resolveLegacyHighlightId('slack.owner-slack-member-id')).toBe('channels.owner-slack-member-id')
+  it('maps slack.* ids to the suffixed channels.* forms (tab collapse + label suffix)', () => {
+    expect(resolveLegacyHighlightId('slack.slash-command')).toBe('channels.slash-command-slack')
+    expect(resolveLegacyHighlightId('slack.owner-slack-member-id')).toBe('channels.owner-slack-member-id-slack')
+  })
+
+  it('maps pre-suffix channels.* ids (all SlackPanel rows) to the -slack forms', () => {
+    expect(resolveLegacyHighlightId('channels.slash-command')).toBe('channels.slash-command-slack')
+    // A suffixed (current) id passes through untouched.
+    expect(resolveLegacyHighlightId('channels.folder-name-teams')).toBe('channels.folder-name-teams')
   })
 
   it('maps the four positional voice AWS ids to their qualified forms', () => {
@@ -34,12 +40,29 @@ describe('resolveLegacyHighlightId', () => {
     expect(resolveLegacyHighlightId('display.zoom-level')).toBe('display.zoom-level')
   })
 
+  // The pin toggle's label moved from "prompt" to "turn" vocabulary, and the
+  // derived id moved with it.
+  it('maps the pin toggle id to its turn-vocabulary form', () => {
+    expect(resolveLegacyHighlightId('chat.pin-the-latest-prompt')).toBe('chat.pin-the-latest-turn')
+  })
+
+  // The peer-session preview card was relabeled from "Remote instance sessions"
+  // back to "Remote crew sessions" when the remote-crew vocabulary was restored;
+  // registry ids derive from the label, so a bookmark saved against the old id
+  // would silently stop highlighting.
+  it('maps the peer-session preview id to its restored crew form', () => {
+    expect(resolveLegacyHighlightId('developer.remote-instance-sessions'))
+      .toBe('developer.remote-crew-sessions')
+  })
+
   it('every migrated target exists in the generated registry', () => {
     const ids = new Set(SETTINGS_REGISTRY.map(e => e.id))
     for (const legacy of [
       'slack.slash-command', 'slack.owner-slack-member-id', 'slack.phase-reactions', 'slack.show-thinking',
       'voice.aws-profile', 'voice.aws-profile-2', 'voice.aws-region', 'voice.aws-region-2',
       'voice.aws-profile-polly', 'voice.aws-region-polly',
+      'chat.pin-the-latest-prompt',
+      'developer.remote-instance-sessions',
     ]) {
       const target = resolveLegacyHighlightId(legacy)
       expect(ids.has(target), `${legacy} -> ${target} missing from registry`).toBe(true)

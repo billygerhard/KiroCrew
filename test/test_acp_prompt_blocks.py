@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import random
+from pathlib import Path
 
 import pytest
 
+from kiro_crew import hooks
 from kiro_crew.acp import prompt_blocks
 from kiro_crew.acp.prompt_blocks import (
     _POSIX_PATH_RE,
@@ -22,6 +25,7 @@ from kiro_crew.acp.prompt_blocks import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_EDGE_PX,
     build_prompt_blocks,
+    summarize_prompt_structure,
 )
 
 # Smallest valid 1x1 PNG.
@@ -101,8 +105,15 @@ class TestBuildPromptBlocks:
 
     @pytest.mark.parametrize("suffix,mime", sorted(IMAGE_MEDIA_TYPES.items()))
     def test_every_supported_suffix_maps_to_its_mime(self, tmp_path, suffix, mime):
+        # Fixtures are format-faithful (real bytes per format, not one PNG
+        # renamed): the emitted mimeType tracks the header-DETECTED format,
+        # because the backend validates the bytes, not the file extension.
+        pil = pytest.importorskip("PIL.Image")
+        fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
+               ".gif": "GIF", ".webp": "WEBP", ".bmp": "BMP"}[suffix]
         p = tmp_path / f"img{suffix}"
-        p.write_bytes(_PNG)
+        mode = "P" if fmt == "GIF" else "RGB"
+        pil.new(mode, (2, 2)).save(p, format=fmt)
         blocks = build_prompt_blocks(f"see {p}")
         assert blocks[1]["mimeType"] == mime
 
@@ -201,14 +212,330 @@ class TestPlatformPathGrammar:
             r"C:\Users\alice\AppData\Local\Temp\tmpabc.png",
             r"C:/Users/alice/AppData/Local/Temp/tmpabc.png",
             r"\\fileserver\team\diagram.jpg",
+            "//fileserver/team/diagram.jpg",
         ],
     )
     def test_windows_pattern_matches_native_absolute_paths(self, text):
-        """The shapes the gateway actually produces on Windows."""
+        """The shapes the gateway actually produces on Windows.
+
+        The forward-slash UNC form is what the dashboard composer serializes
+        into message text (a markdown destination cannot carry raw
+        backslashes), and Windows file APIs accept it verbatim.
+        """
         assert prompt_blocks._WINDOWS_PATH_RE.search(text) is not None
+
+    def test_windows_pattern_extracts_dashboard_unc_image_markdown(self):
+        """A UNC upload serialized by the dashboard must yield the usable path.
+
+        This is the sender-side wire form for a roaming-profile upload: the
+        composer emits ``![image](//host/share/...)``. The extracted group must
+        be the path itself (openable via ``open()`` on Windows), not a mangled
+        span, or the agent silently receives no image block.
+        """
+        text = "![image](//fileserver/home/me/.kiro/crew/uploads/shot.png)"
+        m = prompt_blocks._WINDOWS_PATH_RE.search(text)
+        assert m is not None
+        assert m.group(1) == "//fileserver/home/me/.kiro/crew/uploads/shot.png"
+
+    def test_windows_pattern_ignores_urls(self):
+        """``//`` acceptance must not make ``https://host/x.png`` a candidate."""
+        assert prompt_blocks._WINDOWS_PATH_RE.search("see https://example.com/docs/logo.png") is None
+        assert prompt_blocks._WINDOWS_PATH_RE.search("see http://host/a.png here") is None
 
     def test_windows_pattern_requires_an_absolute_path(self):
         assert prompt_blocks._WINDOWS_PATH_RE.search(r"shots\logo.png") is None
+
+
+class TestUncProbeGate:
+    """UNC-shaped candidates must never reach the filesystem un-gated.
+
+    ``Path.is_file()`` on a UNC path makes Windows open an SMB connection to
+    the named host, so untrusted message text (``\\\\evil\\share\\x.png`` or
+    ``//evil/share/x.png``) would trigger an outbound credential probe. Only
+    UNC paths under the gateway's own attachment roots may be probed.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,want",
+        [
+            (r"\\host\share\x.png", True),
+            ("//host/share/x.png", True),
+            (r"C:\Users\me\x.png", False),
+            ("C:/Users/me/x.png", False),
+            ("/tmp/x.png", False),
+        ],
+    )
+    def test_unc_shape_detection(self, raw, want):
+        assert hooks.is_unc_shape(raw) is want
+
+    def test_attacker_host_is_refused(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home"
+        )
+        assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+
+    def test_unc_under_a_unc_data_home_is_allowed(self, monkeypatch):
+        """Roaming profile: the data home ITSELF is a UNC share."""
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.peek_data_home",
+            lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
+        )
+        allowed = hooks.unc_probe_allowed(
+            r"\\fileserver\home\me\.kiro\crew\uploads\shot.png"
+        )
+        forward = hooks.unc_probe_allowed(
+            "//fileserver/home/me/.kiro/crew/uploads/shot.png"
+        )
+        # normcase/normpath only fold separators and case on Windows, so the
+        # cross-separator equivalence holds there; on POSIX the gate is never
+        # consulted (the probe loop is os.name == "nt" scoped).
+        if os.name == "nt":
+            assert allowed is True
+            assert forward is True
+
+    def test_sibling_share_on_same_server_is_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.peek_data_home",
+            lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
+        )
+        if os.name == "nt":
+            assert hooks.unc_probe_allowed(r"\\fileserver\other\x.png") is False
+
+    # --- kiro agents dir as a trusted UNC root ----------------------
+    #
+    # Forward-slash UNC spellings are used for every assertion that must hold
+    # on the Linux CI box: ``normcase``/``normpath`` leave a ``//host/share``
+    # spelling intact on POSIX, so the purely lexical gate behaves exactly as
+    # it does on Windows. Backslash spellings only normalize on Windows, so
+    # those assertions are additionally guarded like the older tests above.
+
+    _UNC_KIRO_HOME = "//fileserver/profiles/alice/.kiro"
+
+    def _patch_roots(self, monkeypatch, tmp_path, agents_dir):
+        """Local data home + the given agents dir, isolating the new root."""
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: agents_dir)
+
+    def test_unc_kiro_agents_dir_is_allowed(self, monkeypatch, tmp_path):
+        """On a roaming-profile (UNC) home, a spec under the
+        kiro agents dir passes the gate. The data home is patched LOCAL so the
+        admission can only come from the new agents root."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
+        if os.name == "nt":
+            assert (
+                hooks.unc_probe_allowed(r"\\fileserver\profiles\alice\.kiro\agents\foo.json")
+                is True
+            )
+
+    def test_sibling_share_refused_for_agents_root(self, monkeypatch, tmp_path):
+        """Same HOST, different share: proves the new root is prefix-anchored,
+        not host-anchored."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed("//fileserver/other/agents/foo.json") is False
+
+    def test_neighbour_directory_of_agents_root_refused(self, monkeypatch, tmp_path):
+        """``agents-evil`` is not under ``agents``: the comparison must require
+        a separator boundary, not a bare ``startswith``."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents-evil/foo.json") is False
+
+    def test_local_agents_root_is_not_admitted(self, monkeypatch, tmp_path):
+        """On an ordinary local home the added root admits nothing: UNC
+        candidates stay refused (the ``is_unc_shape(rootn)`` skip), and the
+        root itself is not admitted by exact match either -- the assertion
+        that keeps the skip from being dropped for the new root."""
+        local_agents = tmp_path / ".kiro" / "agents"
+        self._patch_roots(monkeypatch, tmp_path, local_agents)
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
+        assert hooks.unc_probe_allowed(str(local_agents)) is False
+        assert hooks.unc_probe_allowed(str(local_agents / "foo.json")) is False
+
+    def test_broken_agents_root_fails_safe(self, monkeypatch):
+        """``kiro_agents_dir()`` raising (broken home resolution) must not take
+        the gate down: the always-computable roots still apply and the function
+        stays total."""
+
+        def boom():
+            raise RuntimeError("no usable home")
+
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.peek_data_home",
+            lambda: Path("//fileserver/home/me/.kiro/crew"),
+        )
+        assert hooks.unc_probe_allowed("//fileserver/home/me/.kiro/crew/uploads/x.png") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+
+    def test_agents_root_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """``kiro_agents_dir()`` resolves
+        ``KIRO_HOME`` (``Path.resolve()`` -- filesystem I/O, SMB on a UNC
+        override), so the gate must NOT consult it per check. The root is
+        memoized on the raw ``KIRO_HOME`` + accessor identity; repeated gate
+        checks under one configuration hit the accessor exactly once."""
+        calls: list[int] = []
+
+        def counting_agents_dir():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/agents")
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", counting_agents_dir)
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/bar.json") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    def test_data_home_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """The data home is the OTHER resolving root, and it needs the same memo.
+
+        ``data_home()`` is cheap only on its default-home branch. With
+        ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` first, on
+        every call, which does ``Path(override).expanduser().resolve()`` --
+        and a roaming profile is precisely when that override names a share, so
+        the per-check cost is an SMB round-trip. ``config_dir()``'s own memo
+        does not cover it: that memo sits behind the predicate.
+
+        Same contract as the agents root above, asserted the same way: the
+        accessor is consulted once per configuration, not once per check.
+        """
+        calls: list[int] = []
+
+        def counting_data_home():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/crew")
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", counting_data_home)
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: tmp_path / "agents")
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/a.png") is True
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/b.png") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    def test_agents_root_failure_is_memoized_not_retried(self, monkeypatch, tmp_path):
+        """A failing resolution is memoized as root-absent for the
+        configuration: the gate must not re-run a resolve that can block on an
+        SMB timeout on every subsequent check."""
+        calls: list[int] = []
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("no usable home")
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert hooks.unc_probe_allowed("//evil/share/y.png") is False
+        assert len(calls) == 1
+
+    class _NtOs:
+        """Proxy for the ``os`` module that reports ``name == "nt"``.
+
+        Installed onto ``hooks`` only (``monkeypatch.setattr(hooks, "os", ...)``)
+        so ``validate_file_path``'s Windows-only UNC branch runs, while every
+        other module keeps the real ``os``: a GLOBAL ``os.name`` patch makes
+        ``pathlib.Path.home()`` raise ``RuntimeError`` on this POSIX box, which
+        crashes ``security.is_sensitive_path``'s cache-key derivation.
+
+        ``path.realpath`` is additionally stubbed to a LEXICAL no-op (review
+        finding): the simulated-Windows tests must never hand the synthetic
+        UNC host to a real resolver -- on a Windows host that resolution is
+        itself the outbound SMB probe the gate exists to prevent.
+        """
+
+        name = "nt"
+
+        class _LexicalPath:
+            @staticmethod
+            def realpath(p):
+                return p
+
+            def __getattr__(self, attr):
+                return getattr(os.path, attr)
+
+        path = _LexicalPath()
+
+        def __getattr__(self, attr):
+            return getattr(os, attr)
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "the downstream resolution of the synthetic UNC host would itself be "
+        "the outbound SMB probe the gate exists to prevent",
+    )
+    def test_validate_file_path_accepts_unc_agents_spec(self, monkeypatch, tmp_path):
+        """The surrounding gate: hooks' view of ``os`` is shimmed to report
+        ``"nt"`` so ``validate_file_path`` consults the UNC gate on the Linux
+        CI box; the gate itself is lexical, and the forward-slash spelling is
+        the one ``normpath`` preserves on POSIX."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        monkeypatch.setattr(hooks, "os", self._NtOs())
+        assert hooks.validate_file_path(self._UNC_KIRO_HOME + "/agents/foo.json") is not None
+        assert hooks.validate_file_path("//evil/share/x.png") is None
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "the downstream resolution of the synthetic UNC host would itself be "
+        "the outbound SMB probe the gate exists to prevent",
+    )
+    def test_read_agent_spec_under_unc_agents_dir(self, monkeypatch, tmp_path):
+        """A spec under a UNC-shaped kiro agents dir
+        parses instead of silently reading as absent (``None``).
+
+        Windows-resolver simulation, stated per the task spec: hooks' view of
+        ``os`` is shimmed to report ``"nt"`` (see ``_NtOs``) so
+        ``validate_file_path`` consults the UNC gate, and the spec path reaches
+        the reader through a stub whose ``resolve`` keeps the UNC spelling --
+        on a real roaming-profile host ``Path.resolve`` keeps a UNC path UNC,
+        while on this POSIX box it would collapse the leading ``//`` and dodge
+        the gate entirely. The double-slash spelling of a real local file IS
+        openable on Linux, so everything downstream of the gate (realpath,
+        ``O_NOFOLLOW`` open, JSON parse) runs for real.
+        """
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "foo.json").write_text('{"name": "foo", "model": "m1"}', encoding="utf-8")
+        unc_agents = "/" + str(agents)  # //local/... -- UNC-shaped
+        unc_spec = unc_agents + "/foo.json"
+
+        class _WindowsResolvedPath:
+            """Duck-typed spec path whose ``resolve`` keeps the UNC spelling."""
+
+            name = "foo.json"
+
+            def resolve(self, strict=False):
+                return Path(unc_spec)
+
+        self._patch_roots(monkeypatch, tmp_path, Path(unc_agents))
+        monkeypatch.setattr(hooks, "os", self._NtOs())
+        # The real Windows descriptor witness keeps this as a UNC path. Linux's
+        # /proc witness canonicalizes the openable ``//tmp`` stand-in to
+        # ``/tmp``; model the Windows result so this cross-platform fixture
+        # exercises the intended validated-path/opened-path equality.
+        monkeypatch.setattr(hooks, "_fd_real_path", lambda _fd: unc_spec)
+        assert _read_agent_spec(_WindowsResolvedPath()) == {"name": "foo", "model": "m1"}
+
+    def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
+        """End-to-end: build_prompt_blocks must not touch the filesystem for a
+        refused UNC candidate."""
+        if os.name != "nt":
+            pytest.skip("probe loop is Windows-scoped")
+        probed: list[str] = []
+        real_is_file = Path.is_file
+
+        def spy(self):  # type: ignore[no-untyped-def]
+            probed.append(str(self))
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", spy)
+        prompt_blocks.build_prompt_blocks(r"look at \\evil\share\x.png please")
+        assert not any("evil" in p for p in probed)
 
     def test_active_pattern_follows_the_host(self):
         expected = (
@@ -402,11 +729,17 @@ class TestImageDownscale:
 
 
 def _noise_image(tmp_path, w, h, name="noise.png", fmt="PNG"):
-    """An image that resists compression, so its encoded size tracks pixel count."""
+    """An image that resists compression, so its encoded size tracks pixel count.
+
+    Built from one bytes buffer rather than a list of per-pixel tuples: at
+    2400x2400 that list is 5.76M three-tuples, ~390 MiB of transient peak for a
+    17 MB image, and it was the largest single-test excursion in the suite. A
+    worker's high-water mark is what the memory budget has to reserve for, so a
+    spike nobody sees still costs every other worker headroom.
+    """
     pil = pytest.importorskip("PIL.Image")
     rnd = random.Random(1234)
-    img = pil.new("RGB", (w, h))
-    img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)) for _ in range(w * h)])
+    img = pil.frombytes("RGB", (w, h), rnd.randbytes(w * h * 3))
     p = tmp_path / name
     img.save(p, format=fmt)
     return p
@@ -425,8 +758,10 @@ class TestImageEncodedBudget:
         assert prompt_blocks.MAX_IMAGE_B64_BYTES == 5 * 1024 * 1024
 
     def test_b64_len_matches_real_encoding(self):
+        from kiro_crew.imaging import _b64_len
+
         for n in (0, 1, 2, 3, 4, 100, 1023, 4096):
-            assert prompt_blocks._b64_len(n) == len(base64.b64encode(b"x" * n))
+            assert _b64_len(n) == len(base64.b64encode(b"x" * n))
 
     def test_image_inside_dimension_cap_but_over_budget_is_shrunk(self, tmp_path):
         """The exact production defect: dimensions are already legal, so the
@@ -474,4 +809,236 @@ class TestImageEncodedBudget:
         gives up and hands back a path instead."""
         p = _noise_image(tmp_path, 1000, 1000)
         blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=64)
+        assert [b["type"] for b in blocks] == ["text"]
+
+
+class TestSummarizePromptStructure:
+    """Content-free outbound-request STRUCTURE diagnostics.
+
+    The summary lets an operator tell a stale/invalid model id apart from a
+    structurally malformed payload the next time a turn is rejected as
+    "Improperly formed request" -- WITHOUT ever recording message content, so
+    it is safe to log even though the kiro-cli data dir holds SSO tokens.
+    """
+
+    def test_counts_text_and_image_blocks(self):
+        blocks = [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "data": "x", "mimeType": "image/png"},
+            {"type": "image", "data": "y", "mimeType": "image/png"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 3
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["image"] == 2
+
+    def test_counts_empty_text_blocks(self):
+        blocks = [
+            {"type": "text", "text": "real content"},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "\n\t"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 4
+        # Three of the four text blocks are blank/whitespace-only.
+        assert out["empty_text_blocks"] == 3
+
+    def test_text_block_missing_text_key_counts_as_empty(self):
+        """A ``{"type": "text"}`` with no ``text`` key at all is as
+        structurally suspect as one whose ``text`` is a blank string, so it
+        folds into the empty count alongside present-but-blank text. This is
+        exactly the malformed-payload signal the diagnostic exists to surface.
+        """
+        blocks = [
+            {"type": "text", "text": "real content"},
+            {"type": "text"},  # no text key at all
+            {"type": "text", "text": None},  # present but not a string
+            {"type": "text", "text": "   "},  # present but blank
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 4
+        assert out["type_counts"]["text"] == 4
+        # The missing key, the non-string, and the blank string all count.
+        assert out["empty_text_blocks"] == 3
+
+    def test_reports_tool_use_and_tool_result_imbalance(self):
+        """A tool_result with no matching tool_use is the classic malformed
+        transcript; the two top-level counts expose the imbalance directly."""
+        blocks = [
+            {"type": "tool_use", "id": "1"},
+            {"type": "tool_use", "id": "2"},
+            {"type": "tool_result", "tool_use_id": "1"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["tool_use"] == 2
+        assert out["tool_result"] == 1
+        assert out["tool_use"] != out["tool_result"]
+        assert out["type_counts"]["tool_use"] == 2
+        assert out["type_counts"]["tool_result"] == 1
+
+    def test_reports_total_byte_size(self):
+        blocks = [{"type": "text", "text": "hello world"}]
+        out = summarize_prompt_structure(blocks)
+        assert out["total_bytes"] == len(json.dumps(blocks))
+        assert out["total_bytes"] > 0
+
+    def test_summary_contains_no_message_content(self):
+        """A content sentinel placed in a block's
+        text must not appear anywhere in repr() of the summary."""
+        sentinel = "SENTINEL_SECRET_TOKEN_ghp_deadbeef"
+        blocks = [
+            {"type": "text", "text": f"please look at {sentinel} now"},
+            {"type": "image", "data": sentinel, "mimeType": "image/png"},
+            {"type": "tool_use", "id": sentinel, "input": {"arg": sentinel}},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert sentinel not in repr(out)
+        # And the redaction did not cost the shape: still three blocks.
+        assert out["block_count"] == 3
+
+    def test_unknown_block_types_fold_into_other(self):
+        blocks = [
+            {"type": "text", "text": "x"},
+            {"type": "audio", "data": "z"},
+            {"type": "resource_link", "uri": "file:///x"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["other"] == 2
+
+    def test_malformed_block_list_does_not_raise(self):
+        """A diagnostics helper must never break a live turn: odd inputs yield
+        a partial/minimal summary instead of propagating an exception."""
+        for bad in (
+            [{"nonsense": 1}, None],
+            "not a list at all",
+            None,
+            42,
+            [None, None, None],
+            [{"type": "text"}],  # text key missing
+        ):
+            out = summarize_prompt_structure(bad)
+            assert isinstance(out, dict)
+            assert "block_count" in out
+            assert "type_counts" in out
+            assert "total_bytes" in out
+
+    def test_unserializable_content_still_yields_counts(self):
+        """Content that json.dumps cannot serialize must not sink the summary:
+        structural counts survive and total_bytes reports -1 (unknown)."""
+
+        class _Unserializable:
+            pass
+
+        blocks = [
+            {"type": "text", "text": "ok"},
+            {"type": "image", "data": _Unserializable()},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 2
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["image"] == 1
+        # default=str is applied, so this actually serializes; but if a type
+        # ever defeats even that, total_bytes falls back to -1 rather than
+        # raising. Assert the summary is coherent either way.
+        assert isinstance(out["total_bytes"], int)
+
+    def test_empty_block_list(self):
+        out = summarize_prompt_structure([])
+        assert out["block_count"] == 0
+        assert out["type_counts"] == {}
+        assert out["empty_text_blocks"] == 0
+        assert out["tool_use"] == 0
+        assert out["tool_result"] == 0
+        assert out["total_bytes"] == len(json.dumps([]))
+
+    def test_non_list_argument_reports_coherent_size(self):
+        """A non-list/tuple argument normalises to an empty block list, and
+        ``total_bytes`` measures THAT normalised list -- not the raw argument.
+        So the size stays coherent with the counts (``block_count: 0`` reads as
+        an empty ``[]``) instead of "0 blocks, N bytes" describing a payload the
+        counts claim is empty. This is exactly the malformed-argument path the
+        diagnostic exists to serve."""
+        empty_bytes = len(json.dumps([]))
+        for bad in ("not a list at all", {"type": "text", "text": "x"}, 42, None):
+            out = summarize_prompt_structure(bad)
+            assert out["block_count"] == 0
+            assert out["total_bytes"] == empty_bytes
+
+
+class TestLinkedAncestorGate:
+    """On Windows, a candidate beneath a linked ANCESTOR must be refused
+    BEFORE the first filesystem probe -- ``is_file()`` resolves every
+    ancestor, so the probe itself would traverse the link and open the SMB
+    connection the lexical UNC screen exists to prevent.
+
+    NOTE: under the module-local os patch, ``_PATH_RE`` keeps the grammar
+    chosen at import time, so candidates here stay host-native; the Windows
+    CI shard exercises real backslash shapes via ``tmp_path`` (see
+    ``test_natively_produced_path_is_inlined_on_this_host``)."""
+
+    def _windows(self, monkeypatch):
+        import types
+
+        # Patch ONLY prompt_blocks' view of os (its sole runtime use is the
+        # two gates' os.name checks; _PATH_RE was chosen at import time) --
+        # patching the global os.name would make pathlib dispatch WindowsPath
+        # everywhere on a POSIX test host.
+        monkeypatch.setattr(prompt_blocks, "os", types.SimpleNamespace(name="nt"))
+
+    def test_linked_ancestor_candidate_is_refused_before_any_probe(self, tmp_path, monkeypatch):
+        """Ordering IS the property: the leaf probe is wired to explode, so a
+        regression that probes first fails loudly instead of silently."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: str(tmp_path))
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the ancestor walk")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
+        # The candidate is skipped, not inlined; the text keeps the path so
+        # the turn still carries a usable reference.
+        assert [b["type"] for b in blocks] == ["text"]
+        assert str(p) in blocks[0]["text"]
+
+    def test_bypassing_the_guard_restores_the_probe(self, tmp_path, monkeypatch):
+        """Mutation check: with the walk reporting no link, the same candidate
+        is probed and inlined again -- so the refusal above is attributable to
+        the guard, not to some other screen."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_the_walk_is_not_consulted_on_posix(self, tmp_path, monkeypatch):
+        """macOS /tmp and /var are symlinks to /private/*; an unconditional
+        walk would refuse every image staged in a temp dir there."""
+        if os.name == "nt":
+            pytest.skip("gate is active on Windows by design")
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk ran on POSIX")
+
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", _boom)
+        p = _png(tmp_path)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_a_leaf_link_is_refused_before_the_probe(self, tmp_path, monkeypatch):
+        """The walk deliberately excludes the leaf, so the leaf gets its own
+        junction-aware check -- is_file() FOLLOWS a final-component link."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(prompt_blocks, "is_link_or_junction", lambda _p: True)
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the leaf link check")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
         assert [b["type"] for b in blocks] == ["text"]

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import type { PullRequestSource } from '../types'
+import type { PullRequestSource, PullRequestStatus } from '../types'
 import { MAX_PULL_REQUEST_SOURCES } from '../utils/pullRequestLinks'
 
 const mockApi = vi.hoisted(() => ({
@@ -19,15 +19,79 @@ vi.mock('../components/MarkdownRenderer', () => ({
 
 import PullRequestPanel, {
   CHECK_POLL_MAX_FAILURES,
+  SOURCE_REMOUNT_REVALIDATE_MS,
   pullRequestCheckPollDelay,
   pullRequestCiSignal,
   pullRequestIsLive,
   pullRequestLifecycleState,
   pullRequestMergeBlocker,
+  selectedSourceStatus,
+  shouldRetrySourceRead,
+  sourceBusyRetryDelay,
   STATUS_FOLLOWUP_MAX,
   stateLabel,
   statusPollDelay,
 } from '../components/PullRequestPanel'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
+
+/** An ApiError-shaped rejection: the human message plus the raw body the client
+ *  preserves, which is where the machine-readable code lives. */
+function apiError(body: Record<string, unknown>): Error & { body: string } {
+  const raw = JSON.stringify(body)
+  return Object.assign(new Error(String(body.error || '')), { body: raw })
+}
+
+describe('source read retry policy', () => {
+  it('retries a busy gateway, bounded', () => {
+    const busy = apiError({ error: 'Too many source requests are pending.', code: 'source_busy' })
+    expect(pullRequestErrorDetails(busy).sourceBusy).toBe(true)
+    expect(shouldRetrySourceRead(0, busy)).toBe(true)
+    expect(shouldRetrySourceRead(1, busy)).toBe(true)
+    // Bounded: a permanently saturated gateway surfaces the error instead of
+    // retrying forever.
+    expect(shouldRetrySourceRead(2, busy)).toBe(false)
+  })
+
+  it('does NOT retry a provider error', () => {
+    const provider = apiError({ error: 'gh could not authenticate', code: 'provider_error' })
+    expect(pullRequestErrorDetails(provider).sourceBusy).toBe(false)
+    expect(shouldRetrySourceRead(0, provider)).toBe(false)
+  })
+
+  it('does not treat an unlabelled error as retryable', () => {
+    // Pre-fix bodies and plain-text network errors carry no code; retrying them
+    // would delay a message the user must act on.
+    expect(shouldRetrySourceRead(0, apiError({ error: 'boom' }))).toBe(false)
+    expect(shouldRetrySourceRead(0, new Error('network down'))).toBe(false)
+  })
+
+  it('backs off between attempts', () => {
+    expect(sourceBusyRetryDelay(0)).toBe(2_000)
+    expect(sourceBusyRetryDelay(1)).toBe(4_000)
+  })
+})
+
+describe('owner-not-configured mutation refusal', () => {
+  it('recognizes the code and swaps in the localized guidance', () => {
+    const denied = apiError({
+      error: 'this action needs a configured owner; set the Owner ID in Settings → Messaging Channels → Slack, then sign in again',
+      code: 'owner_not_configured',
+    })
+    const details = pullRequestErrorDetails(denied)
+    expect(details.ownerNotConfigured).toBe(true)
+    // The localized guidance replaces the server's English prose: the code,
+    // not the prose, is the contract.
+    expect(details.message).toContain('Owner Slack member ID')
+    expect(details.message).toContain('Slack')
+  })
+
+  it('leaves a generic forbidden untouched', () => {
+    const generic = apiError({ error: 'forbidden' })
+    const details = pullRequestErrorDetails(generic)
+    expect(details.ownerNotConfigured).toBe(false)
+    expect(details.message).toBe('forbidden')
+  })
+})
 
 const github: PullRequestSource = {
   provider: 'github',
@@ -109,12 +173,14 @@ describe('PullRequestPanel', () => {
     expect(screen.getByText('Github', { exact: false })).toBeInTheDocument()
     expect(screen.getByText('src/panel.tsx')).toBeInTheDocument()
     expect(screen.getByText('1 File Changed')).toBeInTheDocument()
-    // Diffs stay unmounted until explicitly expanded, then parse after the
-    // drawer animation deferral.
-    expect(screen.queryByText('new')).not.toBeInTheDocument()
+    // Diffs stay unmounted until explicitly expanded, then mount after the
+    // drawer animation deferral. Row CONTENT is not asserted here: Pierre
+    // renders it inside a shadow root, which Testing Library cannot query — the
+    // loading placeholder giving way to the diff surface is the observable
+    // contract from the light DOM.
+    expect(screen.queryByTestId('pr-diff-surface')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /src\/panel\.tsx/i }))
-    expect(await screen.findByText('new')).toBeInTheDocument()
-    expect(screen.getByText('old')).toBeInTheDocument()
+    expect(await screen.findByTestId('pr-diff-surface')).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /All checks passed/i })).toBeInTheDocument()
     const githubTab = screen.getByRole('tab', { name: /PR #12/i })
     const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
@@ -167,6 +233,45 @@ describe('PullRequestPanel', () => {
     expect(within(githubTab).queryByLabelText('Checks running')).not.toBeInTheDocument()
   })
 
+  it('shows merge conflicts on selected and background source tabs instead of passing CI', async () => {
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com'
+        ? gitlab
+        : { ...github, mergeable: 'conflicting', mergeStateStatus: 'dirty' },
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [github.url]: { state: 'open', ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' },
+        [gitlab.url]: { state: 'open', ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' },
+      },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+    await waitFor(() => expect(mockApi.pullRequestStatuses).toHaveBeenCalled())
+
+    for (const name of [/PR #12/i, /MR !7/i]) {
+      const tab = screen.getByRole('tab', { name })
+      expect(await within(tab).findByLabelText('Merge conflicts')).toBeInTheDocument()
+      expect(within(tab).queryByLabelText('Checks passed')).not.toBeInTheDocument()
+    }
+  })
+
+  it('keeps failed CI as the source-tab status when a merge conflict also exists', async () => {
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [gitlab.url]: { state: 'open', ci: 'failed', mergeable: 'conflicting', mergeStateStatus: 'dirty' },
+      },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+
+    const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
+    expect(await within(gitlabTab).findByLabelText('Checks failed')).toBeInTheDocument()
+    expect(within(gitlabTab).queryByLabelText('Merge conflicts')).not.toBeInTheDocument()
+  })
+
   it('leaves source tabs unmarked while no status is known yet', async () => {
     renderPanel()
     await screen.findByText('Add source tabs')
@@ -174,6 +279,56 @@ describe('PullRequestPanel', () => {
     const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
     expect(within(gitlabTab).queryByLabelText('Merged')).not.toBeInTheDocument()
     expect(within(gitlabTab).queryByLabelText('Open')).not.toBeInTheDocument()
+  })
+
+  it('keeps the cached CI glyph when a degraded payload flags checks as partial', async () => {
+    // The provider's checks read failed: the full payload carries an EMPTY
+    // checks list flagged in partialSections, while the backend's keep-known
+    // rule preserved the last CI value in the chip cache.
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com'
+        ? gitlab
+        : { ...github, checks: [], partialSections: ['checks'] },
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: { [github.url]: { state: 'open', ci: 'failed' } },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    // The kept value survives the selected tab's own full-payload projection.
+    expect(await within(githubTab).findByLabelText('Checks failed')).toBeInTheDocument()
+  })
+
+  it('clears the CI glyph on a clean empty-checks payload despite a stale cached one', async () => {
+    // No partial flag: the checks section is authoritatively empty (no CI
+    // configured), so a stale cached glyph must NOT be resurrected.
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com'
+        ? gitlab
+        : { ...github, checks: [] },
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [github.url]: { state: 'open', ci: 'failed' },
+        [gitlab.url]: { state: 'open', ci: 'failed' },
+      },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+
+    // The unselected tab renders the cached glyph — proof the status batch
+    // has landed before the absence below is asserted.
+    const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
+    expect(await within(gitlabTab).findByLabelText('Checks failed')).toBeInTheDocument()
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    expect(within(githubTab).queryByLabelText('Checks failed')).not.toBeInTheDocument()
+    expect(within(githubTab).queryByLabelText('Checks passed')).not.toBeInTheDocument()
+    expect(within(githubTab).queryByLabelText('Checks running')).not.toBeInTheDocument()
   })
 
   it('paces the strip poll by the server TTL, with a bounded fast follow-up', () => {
@@ -235,6 +390,74 @@ describe('PullRequestPanel', () => {
     ])).toBe('failed')
   })
 
+  it('layers the selected payload over its cached chip status field by field', () => {
+    const cached = { state: 'open' as const, ci: 'running' as const, mergeable: 'conflicting', mergeStateStatus: 'dirty' }
+
+    // The payload speaks to every field here, so it wins outright -- that is
+    // the point of preferring it: the tab must not lag the header badge above.
+    expect(selectedSourceStatus({ ...github, mergeable: 'mergeable', mergeStateStatus: 'clean' }, cached))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'mergeable', mergeStateStatus: 'clean' })
+
+    // A payload that does not settle the merge pair keeps the cached one. The
+    // provider reports '' for "no answer", so an empty string must not erase a
+    // value the backend settled earlier -- and the pair must survive AT ALL,
+    // which a whole-record rebuild from the payload silently dropped.
+    expect(selectedSourceStatus({ ...github, mergeable: '', mergeStateStatus: undefined }, cached))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // Any field this panel does not recompute rides along untouched, so a new
+    // status field does not need this function edited to survive selection.
+    expect(selectedSourceStatus(github, { ...cached, extra: 'keep' } as PullRequestStatus))
+      .toMatchObject({ extra: 'keep' })
+
+    // No cached entry at all: the payload alone still produces a usable status.
+    expect(selectedSourceStatus({ ...github, mergeable: 'mergeable' }, undefined))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'mergeable', mergeStateStatus: undefined })
+
+    // Degraded checks section: CI falls back to the glyph the backend kept
+    // alive rather than being erased, and the merge pair is unaffected by it.
+    expect(selectedSourceStatus({ ...github, checks: [], partialSections: ['checks'] }, cached))
+      .toEqual({ state: 'open', ci: 'running', mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // An empty checks section that is NOT flagged partial means "no CI here",
+    // so a stale glyph is cleared instead of kept.
+    expect(selectedSourceStatus({ ...github, checks: [] }, cached).ci).toBeUndefined()
+  })
+
+  it('treats an unsettled merge answer as absent and drops the pair once terminal', () => {
+    const cached = { state: 'open' as const, ci: 'passed' as const, mergeable: 'conflicting', mergeStateStatus: 'dirty' }
+
+    // `unknown` is GitHub still computing the merge commit -- a state every push
+    // re-enters -- so it must not overwrite a settled value, or the pair would
+    // flicker off and back on through the recompute window. Same rule as `''`.
+    expect(selectedSourceStatus({ ...github, mergeable: 'unknown', mergeStateStatus: 'unknown' }, cached))
+      .toMatchObject({ mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // A cached value that is ITSELF unsettled is not a value either: the field
+    // reads absent rather than reporting 'unknown' as an answer.
+    const unsettledCache = { state: 'open' as const, mergeable: 'unknown', mergeStateStatus: '' }
+    const fromUnsettled = selectedSourceStatus({ ...github, mergeable: '', mergeStateStatus: '' }, unsettledCache)
+    expect(fromUnsettled.mergeable).toBeUndefined()
+    expect(fromUnsettled.mergeStateStatus).toBeUndefined()
+
+    // Merged or closed: mergeability is a question about a merge that can still
+    // happen, so a retained `conflicting` would be an answer to a question
+    // nobody asked. The pair is dropped even though the cache still carries it.
+    const merged = selectedSourceStatus({ ...gitlab, mergeable: '', mergeStateStatus: '' }, cached)
+    expect(merged.state).toBe('merged')
+    expect(merged.mergeable).toBeUndefined()
+    expect(merged.mergeStateStatus).toBeUndefined()
+
+    const closed = selectedSourceStatus({ ...github, state: 'CLOSED' }, cached)
+    expect(closed.state).toBe('closed')
+    expect(closed.mergeable).toBeUndefined()
+
+    // A state outside the known set is NOT terminal — it has no lifecycle glyph,
+    // and treating it as terminal would silently discard a settled pair.
+    expect(selectedSourceStatus({ ...github, state: 'locked' }, cached))
+      .toMatchObject({ mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+  })
+
   it('shows an actionable warning when the local GitHub CLI is not logged in', async () => {
     mockApi.pullRequestSource.mockRejectedValueOnce(
       new Error('{"error":"not logged into any GitHub hosts. Run `gh auth login`, then retry."}'),
@@ -263,6 +486,51 @@ describe('PullRequestPanel', () => {
     expect(alert).toHaveTextContent('gh auth login')
     expect(alert).not.toHaveTextContent('GitHub CLI login required')
     expect(alert).not.toHaveTextContent('{"error"')
+  })
+
+  function renderWithRetained(dataUpdatedAt: number) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData<PullRequestSource>(['pull-request-source', github.url], github, {
+      updatedAt: dataUpdatedAt,
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url: github.url, provider: 'github', number: 12, repo: 'widgets' }]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+          onAddToChat={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+  }
+
+  it('revalidates a retained payload older than the gateway cache window on mount', async () => {
+    // Stale-while-revalidate: the retained payload paints at once (no spinner)
+    // and a background refetch runs, because this gateway's own events cannot
+    // see a teammate's review or comment.
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    await waitFor(() => expect(mockApi.pullRequestSource).toHaveBeenCalledWith(github.url, false))
+  })
+
+  it('does not refetch a retained payload the gateway would still serve from cache', () => {
+    // Inside the window a refetch returns the same bytes; a sibling view that
+    // shares this key (Code Review Sage) would otherwise pay two reads per open.
+    renderWithRetained(Date.now() - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(mockApi.pullRequestSource).not.toHaveBeenCalled()
+  })
+
+  it('shows a compact notice, not the full error card, when a background revalidation fails', async () => {
+    mockApi.pullRequestSource.mockRejectedValue(apiError({ error: 'gh: HTTP 401 Bad credentials' }))
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    await screen.findByRole('status')
+    // The loaded pull request stays on screen with a one-line notice above it...
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(screen.getByRole('status')).toHaveTextContent(/showing the last loaded version/i)
+    // ...and the full-height "could not load" card never appears over it.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('caps rendered source tabs at the per-slot limit', () => {
@@ -443,7 +711,54 @@ describe('PullRequestPanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Reviews 3/i }))
     expect(screen.getByText('Please cover this case.')).toBeInTheDocument()
     fireEvent.click(screen.getAllByRole('button', { name: 'Add to chat' })[0])
-    expect(onAddToChat).toHaveBeenCalledWith(expect.stringContaining('PR comment from reviewer'))
+    expect(onAddToChat).toHaveBeenCalledWith(
+      expect.stringContaining('Quoting a pull request comment by reviewer'))
+  })
+
+  it('drops the source strip when there is only one source to pick', async () => {
+    // A single-source host (the Code Review Sage detail pane, whose left rail
+    // already chose the pull request) would otherwise get a tab bar holding one
+    // tab that does nothing. Two sources: the strip earns its row.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url: github.url, provider: 'github', number: 12, repo: 'widgets' }]}
+          selectedUrl={github.url}
+          onSelect={vi.fn()}
+        />
+      </QueryClientProvider>,
+    )
+    await screen.findByText('Add source tabs')
+    expect(screen.queryByRole('tablist', { name: 'Pull requests' })).not.toBeInTheDocument()
+    // The SECTION bar is still there -- only the source picker is suppressed.
+    expect(screen.getByRole('tablist', { name: 'Pull request sections' })).toBeInTheDocument()
+  })
+
+  it('offers the comment composer on a pull request with no comments yet', async () => {
+    // The thread list owns the "comment on this pull request" box, so gating it on
+    // an existing comment would make the FIRST comment the one you cannot post.
+    mockApi.pullRequestSource.mockResolvedValue({ ...github, comments: [] })
+    renderPanel()
+    await screen.findByText('Add source tabs')
+    const sections = screen.getByRole('tablist', { name: 'Pull request sections' })
+    fireEvent.click(within(sections).getByRole('tab', { name: /Reviews/i }))
+    expect(await screen.findByText(/Comment on this pull request/i)).toBeTruthy()
+  })
+
+  it('refreshes the SHARED source cache after a thread write', async () => {
+    // Sage's detail pane observes the same key, so invalidating anything else
+    // leaves both readers showing the state from before the write.
+    mockApi.resolvePullRequestThread.mockResolvedValue({ resolved: true })
+    const { client } = renderPanel()
+    await screen.findByText('Add source tabs')
+    const sections = screen.getByRole('tablist', { name: 'Pull request sections' })
+    fireEvent.click(within(sections).getByRole('tab', { name: /Reviews/i }))
+    const spy = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+    await waitFor(() => expect(mockApi.resolvePullRequestThread).toHaveBeenCalled())
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: ['pull-request-source', github.url] })))
   })
 
   it('hands a failed CI check off to chat', async () => {
@@ -506,12 +821,18 @@ describe('PullRequestPanel', () => {
     await screen.findByText('Add source tabs')
     fireEvent.click(screen.getByRole('tab', { name: /Reviews 3/i }))
 
-    // One resolvable+unresolved comment gets the button, the resolved one gets the indicator,
-    // the top-level comment gets neither.
-    expect(screen.getAllByRole('button', { name: /Resolve/i })).toHaveLength(1)
-    expect(screen.getByText('Resolved')).toBeInTheDocument()
+    // Only the open, resolvable thread offers Resolve; the top-level comment has
+    // no thread to resolve. Matched exactly -- /Resolve/i also catches the
+    // "Hide resolved" toggle.
+    expect(screen.getAllByRole('button', { name: 'Resolve' })).toHaveLength(1)
 
-    fireEvent.click(screen.getByRole('button', { name: /Resolve/i }))
+    // Resolved threads are settled business, so they are behind a toggle rather
+    // than inline. Revealing one offers Reopen, not Resolve.
+    expect(screen.queryByRole('button', { name: 'Reopen' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Show resolved/i }))
+    expect(screen.getByRole('button', { name: 'Reopen' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
     await waitFor(() =>
       expect(mockApi.resolvePullRequestThread).toHaveBeenCalledWith(github.url, 'PRRT_thread1'),
     )
@@ -523,8 +844,9 @@ describe('PullRequestPanel', () => {
     await screen.findByText('Add source tabs')
     fireEvent.click(screen.getByRole('tab', { name: /Reviews 3/i }))
 
-    fireEvent.click(screen.getByRole('button', { name: /Resolve/i }))
-    expect(await screen.findByText('Could not resolve')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+    // The provider's own message, surfaced next to the button that failed.
+    expect(await screen.findByText('boom')).toBeInTheDocument()
   })
 
   it('fetches the selected GitLab merge request', async () => {
@@ -757,5 +1079,97 @@ describe('PullRequestPanel merge-blocker banner', () => {
 
     expect(await screen.findByText('Add source tabs')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
+describe('source tab project disambiguation', () => {
+  /** Render the panel with an explicit source list, without renderPanel's fixed
+   *  two-source pair. Payload fetches are mocked to the gitlab fixture for any
+   *  gitlab host — the tab LABELS come from the sources prop, not the payload. */
+  function renderWithSources(srcs: Array<{ url: string; provider: 'github' | 'gitlab'; number: number; repo: string; kind: 'change' | 'issue' }>) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    return render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={srcs}
+          selectedUrl={srcs[0].url}
+          onSelect={() => {}}
+          onAddToChat={vi.fn()}
+        />
+      </QueryClientProvider>,
+    )
+  }
+
+  it('qualifies each tab with its project when two projects share an MR IID', async () => {
+    // Two different GitLab projects, both MR !1. Bare `MR !1` tabs would be
+    // indistinguishable; the fix prefixes each with its full project path.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.com/group-b/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+    ])
+
+    const tabA = await screen.findByRole('tab', { name: /group-a\/service MR !1/i })
+    const tabB = await screen.findByRole('tab', { name: /group-b\/service MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+    // The tabs must not be the same element — the whole point of the fix.
+    expect(tabA).not.toBe(tabB)
+    expect(tabA.textContent).toContain('group-a/service')
+    expect(tabB.textContent).toContain('group-b/service')
+  })
+
+  it('qualifies with the host when the same project path exists on two hosts', async () => {
+    // Self-managed GitLab: the same group/project path on two hosts, same IID.
+    // The path alone no longer discriminates, so the host joins the qualifier.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.internal/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+    ])
+
+    // Host+path is 3 segments, so the minimal-unique-suffix shortener kicks
+    // in; the hosts differ, so one trailing segment cannot discriminate and
+    // the suffix grows until it includes the host.
+    const tabA = await screen.findByRole('tab', { name: /gitlab\.com\/group-a\/service MR !1/i })
+    const tabB = screen.getByRole('tab', { name: /gitlab\.internal\/group-a\/service MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+  })
+
+  it('keeps the discriminating tail visible for deep paths sharing a prefix', async () => {
+    // Two deep subgroup paths that differ only at the LAST segment. An
+    // end-truncated qualifier would render both as `platform/services/… MR !1`
+    // and restore the ambiguity; the shortener instead keeps the unique tail.
+    renderWithSources([
+      { url: 'https://gitlab.com/platform/services/ingest/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'ingest', kind: 'change' },
+      { url: 'https://gitlab.com/platform/services/egress/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'egress', kind: 'change' },
+    ])
+
+    const tabA = await screen.findByRole('tab', { name: /…\/ingest MR !1/i })
+    const tabB = screen.getByRole('tab', { name: /…\/egress MR !1/i })
+    expect(tabA).toBeInTheDocument()
+    expect(tabB).toBeInTheDocument()
+    // The shared prefix is elided, not the discriminating tail.
+    expect(tabA.textContent).not.toContain('platform/services')
+    expect(tabB.textContent).not.toContain('platform/services')
+  })
+
+  it('leaves a single-project session on the concise bare label', async () => {
+    // Two MRs from the SAME project: no ambiguity, so no project prefix.
+    renderWithSources([
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/1', provider: 'gitlab', number: 1, repo: 'service', kind: 'change' },
+      { url: 'https://gitlab.com/group-a/service/-/merge_requests/2', provider: 'gitlab', number: 2, repo: 'service', kind: 'change' },
+    ])
+
+    // Wait for the selected source's payload to settle first: once it loads,
+    // the selected tab gains a lifecycle glyph whose aria-label joins the
+    // accessible name, so an anchored whole-name match would only ever pass on
+    // the pre-fetch frame and silently stop checking the settled panel.
+    expect(await screen.findByText('GitLab source')).toBeInTheDocument()
+    const tabs = screen.getAllByRole('tab')
+    const labels = tabs.map(tab => tab.textContent ?? '')
+    expect(labels.some(text => text.includes('MR !1'))).toBe(true)
+    expect(labels.some(text => text.includes('MR !2'))).toBe(true)
+    // The project path never leaks into a single-project tab label.
+    for (const text of labels) expect(text).not.toContain('group-a/service')
   })
 })

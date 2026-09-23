@@ -4,14 +4,15 @@
 Idempotently adds an origin for the backend + a '<slug>/api/*' cache behavior
 routing to it (no caching, all-viewer-except-host so the origin sees the right
 Host). Two origin flavors:
-  * API Gateway (default): plain HTTPS custom origin, no OAC. Guardrail-safe -
-    the Lambda behind it is not world-accessible.
+  * API Gateway (default): plain HTTPS custom origin, no OAC. The Lambda behind
+    it is not world-accessible - only API Gateway may invoke it.
   * Lambda Function URL (--oac): adds a Lambda OAC so CloudFront SigV4-signs the
     origin request (for AWS_IAM Function URLs in unrestricted accounts).
 
 Append-only: preserves the existing config (default S3 behavior, other apps).
 CloudFront is global; region is only for CLI profile plumbing.
 """
+
 import argparse
 import json
 import os
@@ -27,7 +28,6 @@ OAC_NAME = "kirocrew-deploy-lambda-oac"
 
 
 def aws(profile, region, *args):
-    cmd = ["aws"] + (["--profile", profile] if profile else []) + ["--region", region, *args]
     # Every AWS spawn from these LLM-facing helpers MUST route through
     # the sandbox chokepoint. Failing open when kiro_crew is not importable
     # would run completely unsandboxed, which is exactly the environment an
@@ -35,7 +35,8 @@ def aws(profile, region, *args):
     # run via the package venv (pip install -e / the skill's documented
     # invocation), never bare python3 without kiro_crew on sys.path.
     try:
-        from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+        from kiro_crew.deploy.engine import resolve_aws_bin
+        from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
     except ImportError:
         sys.stderr.write(
             "error: kiro_crew package not importable — refusing to spawn AWS "
@@ -43,20 +44,32 @@ def aws(profile, region, *args):
             "python (see skills/artifact-deploy/SKILL.md).\n"
         )
         sys.exit(1)
-    wrapped_argv, env, cleanup = sandboxed_spawn_argv(cmd)
-    _preexec = resource_limit_preexec()
-    # Kernel RLIMIT ceiling on the child (fork bomb / FD / mem / CPU) — the
-    # spawn-audit rule requires this on every sandbox-routed spawn.
-    r = subprocess.run(  # noqa: S603
-        wrapped_argv, capture_output=True, text=True, env=env, preexec_fn=_preexec
+    # Resolved absolutely (shared deploy-engine resolver) so a GUI-launched
+    # gateway's minimal PATH still finds the CLI.
+    cmd = (
+        [resolve_aws_bin()]
+        + (["--profile", profile] if profile else [])
+        + ["--region", region, *args]
     )
-    if cleanup:
-        import os as _os
-
-        try:
-            _os.unlink(cleanup)
-        except OSError:
-            pass
+    wrapped_argv, env, cleanup = sandboxed_spawn_argv(cmd)
+    # Kernel RLIMIT ceiling on the child (fork bomb / FD / mem / CPU) — the
+    # spawn-audit rule requires this on every sandbox-routed spawn; run_limited
+    # delivers it after exec via the spawn shim rather than in a fork child.
+    # The timeout bounds an otherwise-unbounded synchronous AWS CLI call so a
+    # stalled endpoint cannot hang the deploy indefinitely.
+    try:
+        r = run_limited(  # noqa: S603
+            wrapped_argv, capture_output=True, text=True, env=env, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"error: aws command timed out after 300s: {' '.join(cmd)}\n")
+        sys.exit(1)
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
         sys.exit(r.returncode)
@@ -94,14 +107,24 @@ def ensure_lambda_oac(profile, region):
 
 def _validate_args(profile: str, region: str, dist_id: str, slug: str) -> None:
     """Validate all argv before any aws call. Exit 2 on mismatch."""
-    _PROFILE_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+    # VERBATIM copy of kiro_crew.constants.AWS_PROFILE_NAME_PATTERN:
+    # this script runs standalone (no package import), so the shared shape is
+    # embedded literally and byte-equality is enforced by the drift guard in
+    # test/test_aws_profile_charset.py. No leading '-' (option-shaped), '+'
+    # admitted (IAM Identity Center names), \Z rejects trailing newlines,
+    # length capped at 128.
+    _PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+][A-Za-z0-9_.+-]{0,127}\Z")
     _REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
     _DIST_ID_RE = re.compile(r"^[A-Z0-9]{13,14}$")
     _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
     errors = []
     if profile and not _PROFILE_RE.match(profile):
-        errors.append(f"--profile: invalid format: {profile!r}")
+        errors.append(
+            f"--profile: invalid format: {profile!r} (allowed: letters, digits, "
+            "'.', '_', '+', '-'; no leading '-'; max 128 chars — ':' and '/' "
+            "are no longer accepted)"
+        )
     if not _REGION_RE.match(region):
         errors.append(f"--region: not a valid AWS region: {region!r}")
     if not _DIST_ID_RE.match(dist_id):
@@ -136,9 +159,11 @@ _SENSITIVE_PREFIXES: tuple[str, ...] = (
     ".git-credentials",
     ".kiro/crew/.env",
     ".kiro/crew/sel_hmac.key",
+    ".kiro/crew/trust",
     ".kiro/crew/security_events.jsonl",
     ".kirocrew/.env",
     ".kirocrew/sel_hmac.key",
+    ".kirocrew/trust",
     ".kirocrew/security_events.jsonl",
 )
 

@@ -22,6 +22,7 @@ from kiro_crew.dashboard.handlers.mcp import (
     _find_server_spec_anywhere,
     _get_mcp_lock,
     _is_valid_mcp_name,
+    _offload_config_write,
     _set_kirocrew_entry,
 )
 from kiro_crew.mcp_providers.base import ProviderRegistry, ProviderUnavailableError
@@ -44,12 +45,19 @@ _DETAIL_TIMEOUT_SECS = 15.0
 def _build_registry() -> ProviderRegistry:
     """Build the provider registry with all available providers.
 
-    The official registry is always registered (public API, no auth).
-    The edition capability provider is registered only when the CPP
-    capability manager reports available — external installs never see it.
+    The official registry is registered unless the composed ``discovery`` policy
+    refuses it — the seam a managed deployment uses to restrict installable
+    servers to its own registry. The edition capability provider is registered
+    only when the CPP capability manager reports available — external installs
+    never see it.
     """
     registry = ProviderRegistry()
-    registry.register(OfficialRegistryProvider())
+
+    from kiro_crew.dashboard.handlers._shared import admits_registry
+
+    official = OfficialRegistryProvider()
+    if admits_registry("mcp", official.name, official.api_base):
+        registry.register(official)
 
     # The edition capability manager (CPP seam) registers as a second
     # provider only when this edition actually installs one — the public
@@ -130,8 +138,10 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     """GET /api/mcp/discover?q=<query>[&provider=<name>][&limit=N]
 
     Multi-provider MCP server search. A query shorter than 2 chars returns
-    ``{"results": [], "providers": [...]}`` WITHOUT calling any provider —
-    the cheap availability probe the frontend gates its UI on.
+    ``{"results": [], "providers": [...], "provider_outcomes": []}``
+    WITHOUT calling any provider — the cheap availability probe the frontend
+    gates its UI on. Completed searches add one ``provider_outcomes`` row per
+    attempted provider while preserving the legacy ``providers`` name list.
     """
     query = request.query.get("q", "").strip()
     provider_filter = request.query.get("provider", "").strip() or None
@@ -140,13 +150,17 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     except ValueError:
         limit = 20
 
-    registry = _get_registry()
+    registry = await asyncio.to_thread(_get_registry)
     provider_names = [p.name for p in registry.available_providers]
 
     if len(query) < _MIN_QUERY_LEN:
-        return web.json_response({"results": [], "providers": provider_names})
+        return web.json_response(
+            {"results": [], "providers": provider_names, "provider_outcomes": []}
+        )
 
-    results = await registry.search(query, provider=provider_filter, limit=limit)
+    search_response = await registry.search_with_outcomes(
+        query, provider=provider_filter, limit=limit
+    )
 
     # Cross-ref against KiroCrew's configured servers so the UI can badge
     # already-installed entries. list_servers() reads config files
@@ -154,7 +168,7 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
     configured = await asyncio.to_thread(_configured_server_names)
 
     items = []
-    for r in results:
+    for r in search_response.results:
         # A discovered server lands in config under its sanitized short name
         # (or, for legacy slashed ids, its kiro-safe alias) — check all
         # plausible keys plus the raw provider id (edition registry ids).
@@ -178,6 +192,11 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
             }
         )
 
+    provider_outcomes = [
+        {"name": _redact_external(outcome.name), "status": outcome.status}
+        for outcome in search_response.provider_outcomes
+    ]
+    failed_provider_count = sum(outcome["status"] != "ok" for outcome in provider_outcomes)
     sel().log_tool_invocation(
         session_key=request.get("session_key", "dashboard"),
         tool_name="discover_mcp_servers",
@@ -187,9 +206,16 @@ async def api_mcp_discover(request: web.Request) -> web.Response:
             "query": query,
             "provider_filter": provider_filter or "all",
             "result_count": str(len(items)),
+            "failed_provider_count": str(failed_provider_count),
         },
     )
-    return web.json_response({"results": items, "providers": provider_names})
+    return web.json_response(
+        {
+            "results": items,
+            "providers": provider_names,
+            "provider_outcomes": provider_outcomes,
+        }
+    )
 
 
 async def api_mcp_discover_detail(request: web.Request) -> web.Response:
@@ -203,7 +229,7 @@ async def api_mcp_discover_detail(request: web.Request) -> web.Response:
     if not provider_name or not server_id:
         return web.json_response({"error": "Both 'provider' and 'id' are required"}, status=400)
 
-    registry = _get_registry()
+    registry = await asyncio.to_thread(_get_registry)
     provider = registry.get(provider_name)
     if provider is None:
         return web.json_response({"error": f"Unknown provider '{provider_name}'"}, status=400)
@@ -279,7 +305,7 @@ async def api_mcp_discover_install(request: web.Request) -> web.Response:
 
 async def _install_from_official(request: web.Request, server_id: str) -> web.Response:
     """Fetch the registry entry, translate, and write into KiroCrew scope."""
-    registry = _get_registry()
+    registry = await asyncio.to_thread(_get_registry)
     provider = registry.get("official")
     if provider is None or not provider.is_available():
         return web.json_response({"error": "Provider 'official' is not available"}, status=503)
@@ -330,7 +356,9 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             return web.json_response({"error": "name already in use"}, status=409)
         if existing is None:
             # Fresh install: always written disabled (consent default).
-            _set_kirocrew_entry(name, enabled=enable_now, spec=spec)
+            # The store write can apply a Windows owner-only DACL —
+            # blocking filesystem work kept off the event loop.
+            await _offload_config_write(_set_kirocrew_entry, name, enabled=enable_now, spec=spec)
         else:
             # Identical spec already present — a reinstall is a pure no-op:
             # the user's env values AND enabled/disabled state survive.
@@ -379,7 +407,7 @@ async def _install_via_capability(request: web.Request, server_id: str) -> web.R
     if not _is_valid_mcp_name(server_id):
         return web.json_response({"error": f"Invalid server id '{server_id[:64]}'"}, status=400)
 
-    registry = _get_registry()
+    registry = await asyncio.to_thread(_get_registry)
     provider = registry.get("capability")
     if provider is None or not provider.is_available():
         return web.json_response({"error": "Provider 'capability' is not available"}, status=503)

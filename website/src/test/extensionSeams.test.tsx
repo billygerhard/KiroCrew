@@ -11,7 +11,7 @@
  * caught before release, while the core (or first) registration is preserved.
  * In production the same collision degrades to warn-and-ignore.
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { lazy } from 'react'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -19,10 +19,15 @@ import { render } from '@testing-library/react'
 import ErrorBoundary from '../components/ErrorBoundary'
 import {
   registerBuiltinComponents,
-  getBuiltinComponent,
+  getBuiltinApp,
   hasBuiltinComponent,
 } from '../apps/builtinRegistry'
 import { registerBuiltinIcons, getBuiltinIcon } from '../apps/builtinIcons'
+import {
+  registerAutolinkRules,
+  getAutolinkRules,
+  resetAutolinkRulesForTest,
+} from '../utils/autolinkRules'
 import { registerThemeBranding, getThemeBranding } from '../themeBranding'
 import { registerTopBarWidgets, getTopBarWidgets } from '../apps/topBarWidgets'
 import {
@@ -31,9 +36,32 @@ import {
   DEFAULT_SHORTCUTS,
   RESERVED_PANEL_CODES,
 } from '../hooks/useKeyboardShortcuts'
+import { eventKeyToken, registryAltNonShiftKeys } from '../lib/shortcutRegistry'
+
+/** Every `KeyboardEvent.code` a registry Alt chord could name — letters, digits, the punctuation the chords use. */
+const CANDIDATE_CODES = [
+  'Comma', 'Enter', 'Backquote', 'ArrowLeft', 'ArrowRight', 'Slash',
+  ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `Key${l}`),
+  ...'123456789'.split('').map(d => `Digit${d}`),
+]
 import { registerTheme, getRegisteredThemes } from '../hooks/useTheme'
 import { registerCapsuleSegment, getCapsuleSegments } from '../apps/capsuleSegments'
 import { registerOverviewStatCards, getOverviewStatCards } from '../pages/overviewStatCards'
+import { registerOverviewPanel, getOverviewPanel } from '../pages/overviewPanel'
+import {
+  suppressOverviewBuiltin,
+  isOverviewBuiltinSuppressed,
+} from '../pages/overviewBuiltins'
+import {
+  registerMobileConnectRenderer,
+  getMobileConnectRenderers,
+  canRenderMobileConnectKind,
+} from '../components/mobileConnectRenderers'
+import {
+  registerRemoteProvisionerRenderer,
+  getRemoteProvisionerRenderer,
+  canRenderRemoteProvisionerKind,
+} from '../components/remoteProvisionerRenderers'
 import { apiTransport } from '../api/apiTransport'
 // Importing the client installs the blessed transport (installApiTransport runs
 // at client module load), so `apiTransport` is populated for the test below.
@@ -44,17 +72,19 @@ const Dummy = () => null
 describe('builtinRegistry — page seam', () => {
   it('registers a new route and resolves it', () => {
     const Comp = lazy(async () => ({ default: Dummy }))
-    registerBuiltinComponents({ '/seam-test-page': Comp })
+    registerBuiltinComponents({ '/seam-test-page': { component: Comp, appId: 'seam-test-page' } })
     expect(hasBuiltinComponent('/seam-test-page')).toBe(true)
-    expect(getBuiltinComponent('/seam-test-page')).toBe(Comp)
+    expect(getBuiltinApp('/seam-test-page')?.component).toBe(Comp)
   })
 
   it('throws on a duplicate route in dev/test; core wins', () => {
     const first = lazy(async () => ({ default: Dummy }))
     const second = lazy(async () => ({ default: Dummy }))
-    registerBuiltinComponents({ '/seam-dup': first })
-    expect(() => registerBuiltinComponents({ '/seam-dup': second })).toThrow(/already registered/)
-    expect(getBuiltinComponent('/seam-dup')).toBe(first)
+    registerBuiltinComponents({ '/seam-dup': { component: first, appId: 'seam-dup' } })
+    expect(() =>
+      registerBuiltinComponents({ '/seam-dup': { component: second, appId: 'seam-dup' } }),
+    ).toThrow(/already registered/)
+    expect(getBuiltinApp('/seam-dup')?.component).toBe(first)
   })
 })
 
@@ -186,6 +216,18 @@ describe('panel shortcut — nav seam', () => {
         for (let d = 1; d <= 9; d++) consumed.add(`Digit${d}`)
       }
     }
+    // The registry-dispatched action chords (⌥K help, ⌥, settings, ⌥↩ focus)
+    // are no longer `code ===` literals in the handler: `matchShortcutEvent`
+    // claims them before panel routing. Their non-shift Alt codes come from the
+    // registry itself, so a chord added or re-aliased there lands in this set
+    // without a handler edit.
+    for (const key of registryAltNonShiftKeys()) {
+      // Token → code is the inverse of `eventKeyToken`; resolved against a
+      // candidate list rather than spelled out so the two cannot disagree.
+      const code = CANDIDATE_CODES.find(c => eventKeyToken({ code: c, key: '' }) === key)
+      expect(code, `registry alt chord key ${key} maps to a code`).toBeDefined()
+      consumed.add(code!)
+    }
     // The core panel chords (KeyC/N/P/S) live in CORE_PANEL_MAP, dispatched at
     // the panelMap block itself — not "pre-panel" — so exclude them here.
     for (const code of Object.keys(CORE_PANEL_MAP)) consumed.delete(code)
@@ -238,16 +280,45 @@ describe('apiTransport — exported blessed transport (not a registry)', () => {
     }
   })
 
-  it('methods are stable wrappers — destructuring at module-init must not throw', () => {
-    // extensions.ts is imported before client.ts in main.tsx, so an edition
-    // that destructures the transport at its own module-init could reach it
-    // before install. The wrappers resolve at CALL time, so destructuring is
-    // always safe (no import-ordering hazard); only calling before install
-    // would error, which never happens after startup.
-    expect(() => {
-      const { get, post, put } = apiTransport
-      return [get, post, put]
-    }).not.toThrow()
+  it('a reference destructured BEFORE install still forwards after it', async () => {
+    // The previous body only asserted that destructuring does not throw — a plain
+    // property read on an object literal, which cannot throw whatever the seam
+    // does, so the test held no matter how the wrappers were written.
+    //
+    // The invariant that actually matters for import order: `extensions.ts` is
+    // imported before `client.ts` in `main.tsx`, so an edition may capture
+    // `apiTransport.get` at its own module-init, BEFORE any transport is
+    // installed, and that captured reference must still reach the transport
+    // installed later. That is what "resolves at CALL time" buys, and it fails
+    // the moment a wrapper is replaced by a direct bind to `_installed`.
+    //
+    // Run it against a FRESH, uninstalled copy of the module rather than swapping
+    // the process-wide singleton the rest of this file's tests share: `_installed`
+    // has no getter, so the real transport cannot be read back to restore it, and
+    // installing `apiTransport` itself (the wrapper object) would make
+    // `_resolve().get()` call itself — unbounded recursion. `vi.resetModules()`
+    // gives an isolated instance whose `_installed` starts null, exactly the
+    // edition's module-init state.
+    vi.resetModules()
+    const fresh = await import('../api/apiTransport')
+
+    // Captured from the fresh module BEFORE anything is installed into it.
+    const { get } = fresh.apiTransport
+
+    const calls: string[] = []
+    fresh.installApiTransport({
+      ...fresh.apiTransport,
+      get: (async (url: string) => { calls.push(url); return 'from-stub' }) as typeof fresh.apiTransport.get,
+    })
+
+    // The pre-captured reference reaches the LATER-installed transport, which is
+    // exactly what an edition destructuring at module-init depends on.
+    await expect((get as (u: string) => Promise<unknown>)('/probe')).resolves.toBe('from-stub')
+    expect(calls).toEqual(['/probe'])
+
+    // Drop the isolated registry so the file's shared `apiTransport` import is
+    // untouched; the next importer gets the normal singleton again.
+    vi.resetModules()
   })
 })
 
@@ -285,6 +356,204 @@ describe('overviewStatCards — settings status-card seam', () => {
   })
 })
 
+describe('overviewPanel — lower-region single-owner slot', () => {
+  it('is empty in the stock build until something claims it', () => {
+    expect(getOverviewPanel()).toBeNull()
+  })
+
+  it('registers a panel and returns it', () => {
+    const Comp = () => null
+    registerOverviewPanel({ id: 'testpanel:a', component: Comp })
+    expect(getOverviewPanel()).toEqual({ id: 'testpanel:a', component: Comp })
+  })
+
+  it('throws on a second claim in dev/test; the first owner keeps the slot', () => {
+    // The slot is deliberately singular: a second registrant is a collision,
+    // not an append, so the region never has two owners negotiating layout.
+    expect(() =>
+      registerOverviewPanel({ id: 'testpanel:b', component: () => null }),
+    ).toThrow(/already owns the overview panel slot/)
+    expect(getOverviewPanel()?.id).toBe('testpanel:a')
+  })
+})
+
+describe('overviewBuiltins — built-in suppression seam', () => {
+  it('suppresses nothing in the stock build', () => {
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(false)
+  })
+
+  it('suppresses a built-in surface once asked', () => {
+    suppressOverviewBuiltin('tailnet-mobile')
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
+  })
+
+  it('is idempotent — a repeat is agreement, not a collision', () => {
+    // Deliberately unlike `overviewPanel` above, which throws on a second claim
+    // because two owners cannot share one slot. Two parties that both want a
+    // surface GONE do not conflict, so a repeat must not fail-loud the way a
+    // duplicate contribution does — HMR and a twice-imported module both hit
+    // this path.
+    expect(() => suppressOverviewBuiltin('tailnet-mobile')).not.toThrow()
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
+  })
+})
+
+describe('mobileConnectRenderers — phone-connection method renderer seam', () => {
+  // The registry is a module singleton, so every test here is self-contained on
+  // its OWN kind and none asserts an absolute registry size — an assertion like
+  // that passes or fails on test ORDER once a sibling has registered (it fails
+  // under --sequence.shuffle). The "core registers nothing" claim is the one
+  // that genuinely needs an untouched registry, so it takes a fresh module.
+  it('registers nothing of its own — a fresh registry is empty', async () => {
+    vi.resetModules()
+    const fresh = await import('../components/mobileConnectRenderers')
+    expect(fresh.getMobileConnectRenderers()).toEqual([])
+    for (const kind of fresh.BUILTIN_MOBILE_CONNECT_KINDS) {
+      expect(fresh.canRenderMobileConnectKind(kind)).toBe(true)
+    }
+    expect(fresh.canRenderMobileConnectKind('seam_test_unregistered')).toBe(false)
+  })
+
+  it('registering a kind is what makes it drawable', () => {
+    const Comp = () => null
+    expect(canRenderMobileConnectKind('seam_test_new')).toBe(false)
+    registerMobileConnectRenderer({ kind: 'seam_test_new', component: Comp })
+    // The single definition of the renderable set: this predicate is what gates
+    // the nav rail's row, so registering is what makes the row appear at all.
+    expect(canRenderMobileConnectKind('seam_test_new')).toBe(true)
+    expect(getMobileConnectRenderers()).toContainEqual({ kind: 'seam_test_new', component: Comp })
+  })
+
+  it('refuses a built-in kind — that would be an override, not a contribution', () => {
+    // `tailnet_qr` and `login_link` are drawn by core sections whose mint
+    // endpoints the core audits. Silently replacing one would let a composition
+    // step redirect a credential mint the core still believes it owns.
+    expect(() =>
+      registerMobileConnectRenderer({ kind: 'tailnet_qr', component: () => null }),
+    ).toThrow(/drawn by a built-in section/)
+    expect(getMobileConnectRenderers().some(r => r.kind === 'tailnet_qr')).toBe(false)
+  })
+
+  it('refuses a kind that could never match a descriptor verbatim', () => {
+    // Blank, whitespace-padded, and non-string all route to one rejection: the
+    // readers compare the server's `kind` verbatim, so normalizing here would
+    // register a key nothing can ever match, and reaching for `.trim()` on a
+    // non-string would throw a raw TypeError in production instead of degrading.
+    for (const kind of ['', '   ', ' padded_qr ', 123 as unknown as string]) {
+      expect(() => registerMobileConnectRenderer({ kind, component: () => null })).toThrow(
+        /non-empty method kind with no surrounding whitespace/,
+      )
+    }
+    expect(getMobileConnectRenderers().some(r => r.kind.includes('padded'))).toBe(false)
+  })
+
+  it('throws on a duplicate kind in dev/test; the first renderer keeps it', () => {
+    const first = () => null
+    const second = () => null
+    registerMobileConnectRenderer({ kind: 'seam_test_dup', component: first })
+    expect(() =>
+      registerMobileConnectRenderer({ kind: 'seam_test_dup', component: second }),
+    ).toThrow(/already has a renderer/)
+    expect(getMobileConnectRenderers().find(r => r.kind === 'seam_test_dup')?.component).toBe(first)
+  })
+})
+
+describe('remoteProvisionerRenderers — remote-instance provisioner form seam', () => {
+  // Same shape as the mobile-connect block above: the registry is a module
+  // singleton, so every test here is self-contained on its OWN kind and none
+  // asserts an absolute registry size — an assertion like that passes or fails on
+  // test ORDER once a sibling has registered (it fails under --sequence.shuffle).
+  // The "core registers nothing" claim is the one that genuinely needs an
+  // untouched registry, so it takes a fresh module.
+  it('registers nothing of its own — a fresh registry is empty', async () => {
+    vi.resetModules()
+    const fresh = await import('../components/remoteProvisionerRenderers')
+    expect(fresh.getRemoteProvisionerRenderer('seam_test_unlisted')).toBeUndefined()
+    for (const kind of fresh.BUILTIN_REMOTE_PROVISIONER_KINDS) {
+      // Drawable because the PANEL draws it, so there is no renderer to hand back.
+      expect(fresh.canRenderRemoteProvisionerKind(kind)).toBe(true)
+      expect(fresh.getRemoteProvisionerRenderer(kind)).toBeUndefined()
+    }
+    expect(fresh.canRenderRemoteProvisionerKind('seam_test_unlisted')).toBe(false)
+  })
+
+  it('registering a kind is what makes it drawable', () => {
+    const Comp = () => null
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(false)
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_devspace', component: Comp })
+    // The single definition of the renderable set: this predicate is what the
+    // setup tab filters the server's provisioner list on, so registering is what
+    // makes the row selectable at all.
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(true)
+    expect(getRemoteProvisionerRenderer('seam_test_devspace')?.component).toBe(Comp)
+  })
+
+  it('refuses the built-in kind — that would be an override, not a contribution', () => {
+    // `aws_ec2` is drawn by RemoteCrewPanel's own prerequisites card and launch
+    // form. Silently replacing it would let a composition step redirect a launch
+    // into a different AWS account while the core still believes it owns the form.
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'aws_ec2', component: () => null }),
+    ).toThrow(/drawn by a built-in form/)
+    expect(getRemoteProvisionerRenderer('aws_ec2')).toBeUndefined()
+  })
+
+  it('refuses a kind that could never match a server row verbatim', () => {
+    // Blank, whitespace-padded, and non-string all route to one rejection: the
+    // readers compare the server's `kind` verbatim, so normalizing here would
+    // register a key nothing can ever match, and reaching for `.trim()` on a
+    // non-string would throw a raw TypeError in production instead of degrading.
+    for (const kind of ['', '   ', ' padded_devspace ', 123 as unknown as string]) {
+      expect(() => registerRemoteProvisionerRenderer({ kind, component: () => null })).toThrow(
+        /non-empty provisioner kind with no surrounding whitespace/,
+      )
+    }
+    expect(getRemoteProvisionerRenderer(' padded_devspace ')).toBeUndefined()
+  })
+
+  it('throws on a duplicate kind in dev/test; the first renderer keeps it', () => {
+    const first = () => null
+    const second = () => null
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: first })
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: second }),
+    ).toThrow(/already has a renderer/)
+    expect(getRemoteProvisionerRenderer('seam_test_prov_dup')?.component).toBe(first)
+  })
+})
+
+describe('autolinkRules — bare-token autolink seam', () => {
+  afterEach(() => resetAutolinkRulesForTest())
+
+  it('ships empty in the core, so stock rendering is unchanged', () => {
+    expect(getAutolinkRules()).toHaveLength(0)
+  })
+
+  it('a registered rule is retrievable and normalised to a global pattern', () => {
+    registerAutolinkRules([
+      { id: 'seam-token', pattern: /\bZZ-\d+\b/, href: 'https://example.invalid/{match}' },
+    ])
+    const rules = getAutolinkRules()
+    expect(rules).toHaveLength(1)
+    expect(rules[0].id).toBe('seam-token')
+    expect(rules[0].pattern.global).toBe(true)
+  })
+
+  it('a duplicate id is fail-loud in dev/test and preserves the first registration', () => {
+    const rule = {
+      id: 'seam-token-dup',
+      pattern: /\bZZ-\d+\b/g,
+      href: 'https://first.invalid/{match}',
+    }
+    registerAutolinkRules([rule])
+    expect(() =>
+      registerAutolinkRules([{ ...rule, href: 'https://second.invalid/{match}' }]),
+    ).toThrow(/already registered/)
+    expect(getAutolinkRules().filter(r => r.id === 'seam-token-dup')).toHaveLength(1)
+    expect(getAutolinkRules()[0].href).toBe('https://first.invalid/{match}')
+  })
+})
+
 describe('builtinRegistry — route-shape guard', () => {
   // BuiltinAppRoute resolves /:builtinApp from ONE pathname segment and never
   // the query/hash — so anything that isn't a bare plain segment registers but
@@ -299,15 +568,22 @@ describe('builtinRegistry — route-shape guard', () => {
     ['/', 'root only'],
   ])('throws on unresolvable route %s (%s)', route => {
     expect(() =>
-      registerBuiltinComponents({ [route]: lazy(async () => ({ default: Dummy })) }),
+      registerBuiltinComponents({
+        [route]: { component: lazy(async () => ({ default: Dummy })), appId: 'seam-shape' },
+      }),
     ).toThrow(/plain path segment/)
     expect(hasBuiltinComponent(route)).toBe(false)
   })
 
+  // The route charset and the appId charset are independent: a route may carry
+  // uppercase, `_` and `.` because it is a URL path segment, while the appId is a
+  // storage key held to `[a-z0-9-]`.
   it.each(['/seam-single', '/Reports', '/my_app', '/a.b', '/x~y-z'])(
     'accepts a single plain path segment route %s',
     route => {
-      registerBuiltinComponents({ [route]: lazy(async () => ({ default: Dummy })) })
+      registerBuiltinComponents({
+        [route]: { component: lazy(async () => ({ default: Dummy })), appId: 'seam-shape-ok' },
+      })
       expect(hasBuiltinComponent(route)).toBe(true)
     },
   )
@@ -373,6 +649,7 @@ describe('composition root — stock extensions.ts is empty', () => {
   it('capsule-segment + overview-stat-card seams are empty in the stock build', () => {
     expect(getCapsuleSegments().every(s => !s.id.startsWith('edition:'))).toBe(true)
     expect(getOverviewStatCards().every(c => !c.id.startsWith('edition:'))).toBe(true)
+    expect(getOverviewPanel()?.id.startsWith('edition:') ?? false).toBe(false)
   })
 
   it('importing it adds no registrations beyond the seeded core state', async () => {

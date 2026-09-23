@@ -4,6 +4,7 @@ import { S } from './styles'
 import type { Scope, Flow, DiscoveryScreen } from './types'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 interface Props {
   scope: Scope
   picked: string[]
@@ -24,6 +25,7 @@ const sameSet = (a: string[], b: string[]) => a.length === b.length && a.every((
 // Discovery found candidate screens. Routes are knowable; flows are a guess —
 // so flows are offered as suggestions the user confirms and can reorder.
 export default function ScopingPicker(p: Props) {
+  const ime = useImeGuard()
   const { scope, picked, refBrief, dragId } = p
   const groups = new Map<string, DiscoveryScreen[]>()
   scope.screens.forEach(s => {
@@ -84,6 +86,15 @@ export default function ScopingPicker(p: Props) {
                 const isDragging = dragId === s.id
                 const canDrag = ord >= 0 && picked.length > 1
                 return (
+                  // Role, tab stop, click and keydown are gated on the SAME `off`
+                  // flag, so a pickable row is a complete checkbox widget
+                  // (role + tabIndex 0 + Enter/Space) and the unrenderable one keeps
+                  // only the drag cleanup handlers — onDragEnd/onDrop, which are
+                  // pointer-only and do nothing but preventDefault and clear dragId.
+                  // Those two are in the rule's handler set, which is part of why it
+                  // fires; it also cannot credit the ternary role, so it reads the
+                  // widget as a bare div.
+                  // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- role="checkbox" + tabIndex 0 + Enter/Space ship together on the branch that has the click
                   <div
                     key={s.id}
                     style={{ ...S.pickRow, ...(off ? S.pickRowOff : {}), ...(isDragging ? S.pickRowDrag : {}) }}
@@ -128,12 +139,12 @@ export default function ScopingPicker(p: Props) {
             aria-label={i18nT('apps.designCritique.scopingPicker.optional_brief_who_is_it_for_and_what_is_the_mai')}
             placeholder={i18nT('apps.designCritique.scopingPicker.optional_who_is_it_for_and_what_s_the_main_task')}
             onChange={(e) => p.setRefBrief(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && picked.length) p.runScoped() }}
+            {...ime.bindEnter({ onEnter: () => { if (picked.length) p.runScoped() } })}
           />
           <button style={{ ...S.bigStart, ...(picked.length ? {} : S.startOff) }} disabled={!picked.length} onClick={p.runScoped}>
             <PencilRuler size={16} />
-            {picked.length > 1 ? 'Critique this flow · ' + picked.length + ' screens'
-              : picked.length === 1 ? 'Critique this screen' : 'Pick at least one screen'}
+            {picked.length > 1 ? i18nT('apps.designCritique.scopingPicker.critique_this_flow_count_screens', { count: picked.length })
+              : picked.length === 1 ? i18nT('apps.designCritique.scopingPicker.critique_this_screen') : i18nT('apps.designCritique.scopingPicker.pick_at_least_one_screen')}
           </button>
           <button style={{ ...S.linkBtn, alignSelf: 'center' }} onClick={p.onStartOver}>{i18nT('apps.designCritique.scopingPicker.start_over')}</button>
         </div>

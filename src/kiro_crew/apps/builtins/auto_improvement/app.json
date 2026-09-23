@@ -15,10 +15,21 @@
     "One resumable chat session per pull request, finding, and run"
   ],
   "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "skills": ["skills/ai-discover", "skills/metric-design"],
-  "agents": ["agents/discovery.json", "agents/pr-author.json"],
+  "agents": ["agents/discovery.json", "agents/pr-author.json", "agents/scout.json", "agents/engineer.json"],
   "backend": {
-    "routes": "backend.routes:register_routes"
+    "routes": "backend.routes:register_routes",
+    "hooks": {
+      "on_startup": "backend.crew:on_startup",
+      "on_shutdown": "backend.crew:on_shutdown"
+    }
   },
   "mcpServers": {
     "auto-improvement": {
@@ -66,5 +77,14 @@
   "heroImage": "/app-assets/auto-improvement/hero-light.svg",
   "heroImageDark": "/app-assets/auto-improvement/hero-dark.svg",
   "heroImageDetail": "/app-assets/auto-improvement/hero-detail-light.svg",
-  "heroImageDetailDark": "/app-assets/auto-improvement/hero-detail-dark.svg"
+  "heroImageDetailDark": "/app-assets/auto-improvement/hero-detail-dark.svg",
+  "useCases": [
+    "Prove measurable performance gains or reproducible bug fixes before turning survivors into reviewable GitHub changes."
+  ],
+  "configuration": [
+    "The gateway host needs git and an authenticated gh CLI; connect a GitHub repository, choose its base branch, and calibrate a ruler before performance runs."
+  ],
+  "screenshots": [
+    "/app-assets/auto-improvement/screenshot-main.png"
+  ]
 }

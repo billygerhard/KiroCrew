@@ -35,6 +35,7 @@ ALLOWED_SIBLING_IMPORTS: dict[str, set[str]] = {
     "validate": set(),
     "dsl": set(),
     "schema": set(),  # leaf: structured-output validator, no intra-pkg deps
+    "preview": set(),  # leaf: static plan preview for the graph view, stdlib ast only
     "events": set(),  # imports only the package root (__init__)
     "registry": set(),  # leaf: background-run registry, imports only __init__ (store via DI)
     "agent_exec": set(),  # production agent_fn adapter; imports llm_helpers (external),
@@ -43,11 +44,21 @@ ALLOWED_SIBLING_IMPORTS: dict[str, set[str]] = {
     #                       llm_helpers (external), no intra-pkg siblings — OPTIONAL adapter
     "store": set(),  # durable JSON-per-run persistence; imports config.paths + security
     #                  (external), no intra-pkg siblings — an OPTIONAL persistence adapter
+    "library": {"store"},  # reusable-definition persistence; shares store path resolution
     "context": {"validate"},
     "runner": {"validate", "dsl", "events", "context", "schema", "registry"},
     # service is the gateway-side façade ABOVE runner — composes the engine for the
     # live process (chat tools / app / injection). Top of the stack.
-    "service": {"validate", "registry", "runner", "agent_exec", "agent_pool", "store"},
+    "service": {
+        "validate",
+        "registry",
+        "runner",
+        "agent_exec",
+        "agent_pool",
+        "store",
+        "library",
+        "events",
+    },
 }
 
 # Modules outside the package the engine must never import directly (F1).

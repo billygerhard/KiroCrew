@@ -1,6 +1,6 @@
 ---
 name: frontend-design-workflow
-description: Workflow for frontend features, visual changes, and product design changes. Present mockup options before writing code, build against the project's design system, capture the right evidence type (screenshots vs video), and run a new-user usability review before finalizing. Use when building or changing UI, styling, layouts, animations, or any user-facing visual surface.
+description: Workflow for frontend features and visual/product design changes — present mockup options before code, build on the project's design system, capture the right evidence (screenshots vs video), run a new-user usability review. Use when building or changing UI, styling, layout or animation.
 triggers: mockup, mockups, frontend, redesign, restyle, visual change, UI change, design change, landing page, new page, new component
 ---
 
@@ -64,11 +64,20 @@ evidence where the change is reviewed: in the pull-request description
 (following the repository's convention) when a PR workflow exists,
 otherwise directly in the conversation.
 
+Capture the evidence with the shipped skills rather than improvising:
+`web-verify` for screenshots of a surface you changed on a local dev server, and
+`browser-recording` for a video or GIF of motion or a multi-step flow. A narrated
+demo needs `feature-demo-recording`, which ships with the Dev Fleet app rather
+than as a built-in skill, so it is only available where that app is installed.
+
 ## Phase 4 — New-user usability review
 
 Before declaring the change ready, run a dedicated review from a
-**brand-new, non-technical user's perspective** — as a separate sub-agent
-when available, so the reviewer has no builder's context. The reviewer
+**brand-new, non-technical user's perspective** — as a separate sub-agent via
+`spawn_run`, with `solo_reason="fresh_context"` (the review is wrong if the
+reviewer can see the builder's context, which is also why a one-task
+`spawn_run` needs the reason), `include_project=true` so it can open the UI but
+`include_memory=false` so the reviewer has no builder's context. The reviewer
 answers:
 
 - **Discoverability**: can a first-time user find this feature without

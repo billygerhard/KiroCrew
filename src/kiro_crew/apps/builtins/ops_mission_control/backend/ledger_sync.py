@@ -52,12 +52,35 @@ from typing import Any
 
 from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, policy_store
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers import read_config
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+)
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
 _GIT_BINARY = "git"
+
+#: The identity this app commits under, supplied on the argv of every git invocation.
+#:
+#: These commits are the APP's, not the operator's: a ledger sync is machine-to-machine,
+#: it runs unattended, and the repository lives under the data home where nobody edits it
+#: by hand. Naming the app is therefore the honest attribution -- and it is also what makes
+#: the behaviour the same on every host. Relying on the ambient `user.email` meant that on
+#: a host with no git identity configured (a fresh container, a CI runner, a locked-down
+#: image) `git commit` refused with "Author identity unknown", the push that followed had
+#: nothing to send, and the operator saw only "push errored" with no reason.
+#:
+#: `.invalid` is the reserved TLD for exactly this (RFC 2606), so the address cannot route.
+_COMMIT_IDENTITY = (
+    "-c",
+    "user.name=Kiro Crew ops-mission-control",
+    "-c",
+    "user.email=ops-mission-control@kirocrew.invalid",
+)
 
 #: Config keys. A remote URL is not a credential (auth is the remote's job — an SSH
 #: key or a `gh` login the operator already has), so these live in plain app config.
@@ -90,6 +113,30 @@ _SAFE_BRANCH_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]{0,98}")
 #: existed. ``status()`` reads it so the operator hears about it without pull/push
 #: changing behaviour.
 _align_refusal: str = ""
+
+#: Why the last git invocation never started, when the SANDBOX refused it rather than git
+#: failing. Recorded the same way ``_align_refusal`` is — observed, not predicted — because
+#: predicting it is not possible from the platform alone: ``sandbox.unavailable_kind()``
+#: reports "no backend" without knowing whether the operator has set
+#: ``agent.sandbox_allow_unsandboxed_exec``, so a platform check would claim sync is dead
+#: on a host where it works. Windows is where this actually fires: Kiro Crew has a Seatbelt
+#: backend and a Linux user-namespace backend and no native Windows one, so ``wrap_argv``
+#: fail-closes before git is ever executed. ``status()`` reads this so Settings names the
+#: real reason instead of leaving the operator with "pull errored".
+_sandbox_refusal: str = ""
+
+#: Operator-facing explanation for a sandbox refusal of the git transport. Kept next to the
+#: state it describes so the two cannot drift. Deliberately says what STILL works: the
+#: ledger, the board, dispatch and every provider are in-process and completely unaffected
+#: — only the git transport that shares the ledger with teammates is refused.
+_SANDBOX_REFUSAL_DETAIL = (
+    "git could not start: no OS sandbox backend is available on this host, so the "
+    "spawn was refused before git ran. Kiro Crew sandboxes this transport because the "
+    "remote URL and branch come from settings. Windows has no native backend, so ledger "
+    "sync needs agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json, "
+    "or a macOS or Linux host as the publishing instance. Everything else keeps working: "
+    "the ledger, the board and every provider are local and never spawn git."
+)
 
 #: Wall-clock cap per git invocation. A hung fetch against an unreachable remote must
 #: not stall the dispatch heartbeat, which is the caller.
@@ -329,7 +376,10 @@ async def _git(*args: str) -> tuple[int, str, str]:
     Routed through ``sandboxed_spawn_argv`` for OS filesystem isolation, because the
     remote URL and branch come from config an agent can influence and git reads its own
     config files on the way. This is the chokepoint ``test/test_spawn_audit.py`` requires.
-    Never raises on a non-zero exit — the caller decides what that means.
+    Never raises on a non-zero exit — the caller decides what that means. The one
+    exception: a TRANSIENT sandbox refusal (cold backend-probe cache) still raises
+    ``SandboxUnavailableError`` rather than becoming an rc, so ``sync_safely``'s bounded
+    retry can fire on it; every other refusal becomes rc=126.
 
     Resource limits come from ``create_subprocess_limited``, NOT from
     ``preexec_fn=resource_limit_preexec()``. This is an ASYNC spawn, and a ``preexec_fn``
@@ -338,10 +388,38 @@ async def _git(*args: str) -> tuple[int, str, str]:
     in the child, ``Popen._execute_child`` then blocks the event loop in an unbounded
     ``os.read`` with no await point for a timeout to reach, and the orphan keeps a duplicate
     of every inherited fd — the dashboard's listening socket included. The shim applies the
-    same limits after ``exec`` instead. Caught by ``test/test_spawn_preexec_guard.py``
-    (issue #935), a core gate this app had not been run against.
+    same limits after ``exec`` instead. Caught by ``test/test_spawn_preexec_guard.py``,
+    a core gate every spawn in this app must pass.
     """
-    argv, env, cleanup = sandboxed_spawn_argv([_GIT_BINARY, *args])
+    # Identity on the ARGV, not in the repo's config: `-c` beats config, so it holds
+    # even against a repo-local `user.email` an agent could have written, and it needs
+    # no `git config` write of our own. Passed on every verb -- the read-only ones
+    # ignore it, and scoping it to `commit` would miss the next verb that makes one.
+    global _sandbox_refusal
+    try:
+        argv, env, cleanup = await sandboxed_spawn_argv_async(
+            [_GIT_BINARY, *_COMMIT_IDENTITY, *args], _prepare=sandboxed_spawn_argv
+        )
+    except SandboxUnavailableError as exc:
+        # The sandbox fail-closed, so git never ran. A non-transient refusal is turned
+        # into a non-zero rc rather than left to propagate, because the prep call sits
+        # OUTSIDE the try below: an exception here escaped every caller's rc handling
+        # and reached `sync_safely`, which logs it and returns the bare string
+        # "pull errored" — an operator on Windows got no reason at all. rc=126 joins
+        # the family already in use here (124 timeout, 127 no binary).
+        # A TRANSIENT refusal is re-raised instead: `sync_safely`'s except-Exception
+        # clause retries once on it, and that retry must not be suppressed by turning
+        # it into an rc here — the retry exists because the cache-warm fault clears in
+        # milliseconds and rc=126 would fail the whole sync for something that was never
+        # a real refusal.
+        if exc.kind == "transient":
+            raise
+        _sandbox_refusal = _SANDBOX_REFUSAL_DETAIL
+        logger.warning("ops-mission-control: ledger sync git spawn refused by sandbox: %s", exc)
+        return 126, "", _SANDBOX_REFUSAL_DETAIL
+    # A host that has been fixed (backend installed, or the opt-in set) must stop showing
+    # the refusal in Settings.
+    _sandbox_refusal = ""
     try:
         proc = await create_subprocess_limited(
             *argv,
@@ -785,7 +863,12 @@ async def _stage_and_commit(message: str, *, allow_empty_message_only: bool = Fa
         return False
     rc, _, err = await _git("commit", "--no-edit", "-q", "-m", message)
     if rc != 0 and "nothing to commit" not in err.lower():
-        logger.debug("ops-mission-control: ledger commit skipped: %s", err.strip()[:200])
+        # WARNING, not debug. A refused commit is not a quiet no-op: the push that follows
+        # then has nothing to send and fails with git's `src refspec HEAD does not match
+        # any`, which names the push and says nothing about the commit that never
+        # happened. That is how the real cause stayed invisible on a host where the commit
+        # could not be made at all -- the operator sees "push errored" and no reason.
+        logger.warning("ops-mission-control: ledger commit refused: %s", err.strip()[:200])
         return False
     return rc == 0
 

@@ -11,7 +11,7 @@ vi.mock('../pages/aidlc/TaskDetailPanel', () => ({ default: () => <div data-test
 
 const mockRun = (overrides: Partial<ProjectRun> = {}): ProjectRun => ({
   task_id: 'run-1', name: 'Test Run', running: false, status: 'completed',
-  steps: 3, completed: 3, failed: 0, skipped: 0, current_step: 3,
+  tasks: 3, completed: 3, failed: 0, skipped: 0, current_task: 3,
   spec: 'test.md', spec_name: 'Test', error: '',
   tokens_used: 1000, replan_count: 0,
   started_at: Date.now() / 1000 - 60, finished_at: Date.now() / 1000,
@@ -92,5 +92,49 @@ describe('ProjectDetailPage', () => {
   it('hides Export YAML button when the run has no tasks', () => {
     renderWithProviders(<ProjectDetailPage run={mockRun({ task_details: [] })} />)
     expect(screen.queryByText('Export YAML')).not.toBeInTheDocument()
+  })
+
+  it('shows the auto-approve badge in the detail header when the run has a live grant', () => {
+    // Mirror of the project-card badge in ProjectsPage. Live-grant predicate
+    // matches the run-detail toggle sync at ProjectsPage.tsx:202. The detail
+    // header has more room than the rail card so the visible "Auto-approve"
+    // text is kept above the `sm` viewport breakpoint (per Fable UX
+    // 2026-08-18); below `sm` it collapses to icon-only so a narrow phone
+    // or heavily localized locale cannot overflow the row (per GPT 5.6
+    // 2026-08-19). The text span is in the DOM either way, gated by CSS —
+    // jsdom does not compute media queries, so `toHaveTextContent` finds it.
+    renderWithProviders(<ProjectDetailPage run={mockRun({ auto_approve: true, auto_approve_remaining_secs: 3600 })} />)
+    const autoApproveBadge = screen.getByTestId('auto-approve-badge')
+    expect(autoApproveBadge).toBeInTheDocument()
+    expect(autoApproveBadge).toHaveAttribute('role', 'img')
+    expect(autoApproveBadge).toHaveTextContent(/auto-approve/i)
+  })
+
+  it('collapses the detail-header badge text to icon-only below the sm viewport breakpoint', () => {
+    // Verify the responsive-hide contract: the text is wrapped in a span
+    // with `hidden sm:inline` so overflow at 320px / 220px is closed while
+    // wide viewports keep the human-readable label.
+    renderWithProviders(<ProjectDetailPage run={mockRun({ auto_approve: true, auto_approve_remaining_secs: 3600 })} />)
+    const autoApproveBadge = screen.getByTestId('auto-approve-badge')
+    const textSpan = Array.from(autoApproveBadge.querySelectorAll('span')).find(
+      element => /auto-approve/i.test(element.textContent ?? ''),
+    )
+    expect(textSpan, 'expected a child <span> with the visible label').toBeTruthy()
+    expect(textSpan!.className).toMatch(/\bhidden\b/)
+    expect(textSpan!.className).toMatch(/\bsm:inline\b/)
+  })
+
+  it('does not show the auto-approve badge in the detail header when the run has no live grant', () => {
+    renderWithProviders(<ProjectDetailPage run={mockRun({ auto_approve: false })} />)
+    expect(screen.queryByTestId('auto-approve-badge')).not.toBeInTheDocument()
+  })
+
+  it('does not show the auto-approve badge in the detail header when the grant has expired', () => {
+    // Regression for GPT/Fable review Issue A (2026-08-18): expired grant
+    // (auto_approve: true, auto_approve_remaining_secs: 0) must NOT surface
+    // trust on the detail header — matches the live-grant sync at
+    // ProjectsPage.tsx:202.
+    renderWithProviders(<ProjectDetailPage run={mockRun({ auto_approve: true, auto_approve_remaining_secs: 0 })} />)
+    expect(screen.queryByTestId('auto-approve-badge')).not.toBeInTheDocument()
   })
 })

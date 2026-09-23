@@ -1,6 +1,9 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ChatMessage } from '../types'
 import { searchableTextMemo } from '../utils/searchableText'
+import { hasCommandModifier } from '../utils/commandModifier'
+import { isMac } from '../utils/platform'
+import { focusComposer } from '../pages/chat/composerFocus'
 
 export interface SearchMatch {
   /** Index into the messages[] Redux array. */
@@ -22,6 +25,15 @@ export function useMessageSearch(messages: ChatMessage[], activeSlot: string | n
   // Bumped every time the find shortcut fires so the SearchBar can re-focus and
   // select-all — letting the user immediately type a new query over the old one.
   const [focusNonce, setFocusNonce] = useState(0)
+  // Mirror of isOpen readable from the identity-stable close() below. close()
+  // must keep useCallback([]) — ChatPage's handleFileOpen/handleFolderOpen list
+  // `search.close` in their dep arrays precisely because it never churns — so
+  // it cannot read the isOpen state directly without changing identity. Synced
+  // post-commit, which is exact for close(): every caller is an event handler
+  // (Escape, the bar's close button, ChatPage's file/folder-open paths) and
+  // event handlers only run after the commit that made the bar visible.
+  const isOpenRef = useRef(false)
+  useEffect(() => { isOpenRef.current = isOpen }, [isOpen])
 
   // Debounced match computation (50ms)
   useEffect(() => {
@@ -68,10 +80,20 @@ export function useMessageSearch(messages: ChatMessage[], activeSlot: string | n
 
   const open = useCallback(() => setIsOpen(true), [])
   const close = useCallback(() => {
+    // Focus is handed back only when the bar was actually open: ChatPage's
+    // file/folder-open handlers call close() unconditionally to un-gate the
+    // dock, and a close that never dismissed anything must not steal focus.
+    const wasOpen = isOpenRef.current
+    isOpenRef.current = false
     setIsOpen(false)
     setTerm('')
     setMatches([])
     setCurrentIdx(0)
+    // In the close path itself — not the Escape handler — so the bar's own
+    // close button hands typing back to the composer identically. focusComposer
+    // already defers a frame, skips touch devices, and no-ops when the composer
+    // is unmounted or the session switched, so closing never throws.
+    if (wasOpen) focusComposer()
   }, [])
   const next = useCallback(() => {
     setCurrentIdx(prev => (matches.length === 0 ? 0 : (prev + 1) % matches.length))
@@ -90,7 +112,21 @@ export function useMessageSearch(messages: ChatMessage[], activeSlot: string | n
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+      // `hasCommandModifier` accepts either primary modifier, which is right for
+      // every chord except this one on a Mac: Ctrl+F is Cocoa's `forward-char`
+      // Emacs binding, live in every text field including the composer, so
+      // answering it here would open the find pane instead of moving the caret
+      // one character right. On Mac the pane is ⌘F only and bare Ctrl+F falls
+      // through unhandled; Windows/Linux keep Ctrl+F, where no such binding
+      // exists. (Ctrl+⌘F stays with macOS either way — hasCommandModifier
+      // rejects both-modifiers so Toggle Full Screen survives.)
+      if (hasCommandModifier(e) && (!isMac || e.metaKey) && e.key === 'f') {
+        // Yield to a surface that already answered the chord. In an edit
+        // session Pierre binds cmdOrCtrl+f on its own content element and calls
+        // preventDefault() without stopPropagation(), so this document-level
+        // handler still runs; opening chat search here would stack a
+        // transcript-scoped find on top of the editor's own find panel.
+        if (e.defaultPrevented) return
         // Yield Cmd/Ctrl+F to app surfaces that own their own in-file find
         // (e.g. the file explorer). Without this, an in-file search hijacks
         // the key and opens the chat message-search pane instead. This

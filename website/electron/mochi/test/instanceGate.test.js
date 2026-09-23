@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 
-const { parseMochiEnabled, enabledOrTrust } = require("../instanceGate");
+const { parseMochiEnabled, remoteEnabledState, hostDisabledMeansTeardown } = require("../instanceGate");
 
 test("both payload shapes are understood", () => {
   // {apps: [...]} — the documented shape.
@@ -40,11 +40,52 @@ test("missing enabled flag reads as disabled, not as enabled", () => {
   assert.strictEqual(parseMochiEnabled({ apps: [{ name: "mochi" }] }), false);
 });
 
-test("a non-answer is TRUSTED, so one slow reply cannot move the pet", () => {
-  assert.strictEqual(enabledOrTrust(null), true);
+test("a non-answer stays UNKNOWN — neither a 'no' that moves the pet nor a 'yes' that creates one", () => {
+  // THE BUG THIS ENCODES: the old rule trusted a non-answer as "enabled". With
+  // Mochi switched off on the host, a stored remote pointer and a tunnel that
+  // had just come back, one timed-out probe made the reconcile tick CREATE a
+  // full-display screen-saver-level overlay for a disabled app, which then failed
+  // to load and blanketed every display with nothing the user could dismiss.
+  assert.strictEqual(remoteEnabledState(null), "unknown");
+  assert.notStrictEqual(remoteEnabledState(null), "enabled");
+  assert.notStrictEqual(remoteEnabledState(null), "disabled");
 });
 
 test("a real answer is passed through untouched", () => {
-  assert.strictEqual(enabledOrTrust(true), true);
-  assert.strictEqual(enabledOrTrust(false), false);
+  assert.strictEqual(remoteEnabledState(true), "enabled");
+  assert.strictEqual(remoteEnabledState(false), "disabled");
+});
+
+// ── hostDisabledMeansTeardown ──────────────────────────────────────────────────
+//
+// THE BUG THIS ENCODES: disabling Mochi on the crew serving this window removed a
+// pet that a DIFFERENT crew was still serving, with its own Mochi still enabled.
+// The host owns "should there be a pet" only for ITSELF: when the pet shows
+// instance X, X serves the page, the token and every /api/apps/mochi/* call, so the
+// host's switch says nothing about whether that pet can continue.
+
+test("host disabled tears the pet down when the pet is showing the host", () => {
+  // 'self' means the host IS the thing being shown, so there is nothing to keep.
+  assert.strictEqual(hostDisabledMeansTeardown("self", true), true);
+  assert.strictEqual(hostDisabledMeansTeardown("self", false), true);
+});
+
+test("host disabled KEEPS a pet that a live remote is still serving", () => {
+  // The regression this whole change exists to prevent.
+  assert.strictEqual(hostDisabledMeansTeardown("crew-remote", true), false);
+});
+
+test("host disabled tears down when the remote is no longer usable", () => {
+  // A definite resolve away from the remote (tunnel down, or Mochi switched off
+  // there too) falls back to self — which is disabled — so there is genuinely no
+  // pet left to keep.
+  assert.strictEqual(hostDisabledMeansTeardown("crew-remote", false), true);
+});
+
+test("an uninterpretable shown-id tears down rather than keeping an orphan", () => {
+  // Fail CLOSED on a value we cannot read: keeping a pet whose origin is unknown
+  // leaves an inert always-on-top window with no way to explain itself.
+  for (const bad of [null, undefined, "", "   ", 42, {}]) {
+    assert.strictEqual(hostDisabledMeansTeardown(bad, true), true, `${JSON.stringify(bad)}`);
+  }
 });

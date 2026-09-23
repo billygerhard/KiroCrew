@@ -6,6 +6,7 @@ import type { TodoList } from '../../types'
 import { useRowDisclosure } from './rowDisclosure'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Rows rendered before the list scrolls internally — bounds DOM on long plans. */
 const MAX_VISIBLE_ROWS = 12
 
@@ -21,6 +22,7 @@ const MAX_VISIBLE_ROWS = 12
  * absent at the data layer.
  */
 const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: { slot: string | null; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   // Select the primitive-bearing todo object for this slot only, so unrelated
   // slot churn in the slots array doesn't re-render the pill.
@@ -43,7 +45,11 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0
 
   return (
-    <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+    // `relative z-[2]` clears the transcript's bottom mask (`z-[1]`), which
+    // overshoots below the scrollport edge for a composer status stack it assumes
+    // is empty. Whenever this bar is the topmost thing in that stack, an auto
+    // z-index let the mask's opaque tail shave its top border and corners.
+    <div className="px-4 mx-auto w-full relative z-[2]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       {/* Collapsed = a small pill that hugs its content; expanded = a full-width
           panel. Keeping the collapsed state inline stops it reading as another
           full-width bar competing with the composer below it. */}
@@ -60,7 +66,7 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
           aria-label={expanded
             ? i18nT('pages.chat.taskProgressBar.aria_collapse_task_list', { done, total })
             : i18nT('pages.chat.taskProgressBar.aria_expand_task_list', { done, total })}
-          className={`flex items-center gap-2 py-1.5 text-[13px] font-mono bg-transparent border-none cursor-pointer hover:bg-accent/5 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent ${
+          className={`flex items-center gap-2 py-1.5 text-[13px] font-mono bg-transparent border-none cursor-pointer hover:bg-accent/5 transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent ${
             expanded ? 'w-full px-3' : 'px-3 min-w-0'
           }`}
         >

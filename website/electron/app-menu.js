@@ -19,13 +19,16 @@ function buildMenuTemplate(deps) {
     isMac,
     appName,
     openSettings, // navigate dashboard to /settings
-    openAbout, // navigate dashboard to /settings?tab=about (version + updates)
+    openAbout, // navigate dashboard to /settings/about (version + updates)
     reload,
     forceReload,
     toggleDevTools,
     zoomActualSize,
     zoomIn,
     zoomOut,
+    alwaysOnTop, // initial checked state for Keep on Top (restored preference)
+    toggleAlwaysOnTop,
+    openNewSessionWindow,
     openNewConnectionWindow,
     renameCurrentWindow,
     promptRemoteHost,
@@ -33,15 +36,31 @@ function buildMenuTemplate(deps) {
     openConfigFile,
   } = deps;
 
-  // Shared destinations. CmdOrCtrl+, is the Settings convention on macOS and
-  // the emerging one elsewhere (VS Code, Chrome DevTools, Slack).
-  const settingsItem = { label: "Settings…", accelerator: "CmdOrCtrl+,", click: openSettings };
+  // Shared destinations. Settings keeps its Cmd+, accelerator on macOS (the
+  // platform convention). Off macOS the caption reads Alt+, and is DISPLAYED
+  // ONLY: `registerAccelerator: false` is a Linux/Windows option that shows a
+  // chord without binding it, so this menu claims no key and the in-page handler
+  // in src/lib/shortcutRegistry.ts keeps Alt+, together with its focus and
+  // enable/disable gates. Ctrl+, is absent by design: there Ctrl is the comma
+  // key for Chinese/Japanese IMEs (Ctrl+, types the fullwidth comma), so a
+  // REGISTERED menu accelerator on Ctrl+, swallows the keystroke before the IME
+  // sees it and a CJK user cannot type a comma at all. `isMac` is the single
+  // "this platform can hold Ctrl+," predicate shared by both surfaces; the
+  // caption is what tells a user reaching for Ctrl+, where the chord now lives.
+  const settingsItem = {
+    label: "Settings…",
+    ...(isMac
+      ? { accelerator: "CmdOrCtrl+," }
+      : { accelerator: "Alt+,", registerAccelerator: false }),
+    click: openSettings,
+  };
   const aboutItem = { label: `About ${appName}`, click: openAbout };
 
   return [
     ...(isMac
       ? [
           {
+            id: "app-menu",
             label: appName,
             submenu: [
               aboutItem,
@@ -60,14 +79,16 @@ function buildMenuTemplate(deps) {
         ]
       : [
           {
+            id: "file-menu",
             // Windows/Linux home for Settings; the quit role renders as
             // "Exit" on Windows and "Quit" on Linux.
             label: "File",
             submenu: [settingsItem, { type: "separator" }, { role: "quit" }],
           },
         ]),
-    { role: "editMenu" },
+    { id: "edit-menu", role: "editMenu" },
     {
+      id: "view-menu",
       label: "View",
       submenu: [
         // Explicit handlers, not { role: ... }: the roles target the focused
@@ -80,6 +101,17 @@ function buildMenuTemplate(deps) {
         { label: "Zoom Out", accelerator: "CmdOrCtrl+-", click: zoomOut },
         { type: "separator" },
         { role: "togglefullscreen" },
+        // Checkable, no accelerator: there is no cross-platform convention for
+        // always-on-top, and inventing one risks colliding with an existing
+        // binding. `checked` seeds from the restored preference; main.js
+        // reconciles it with the window's ACTUAL state after every toggle.
+        {
+          label: "Keep on Top",
+          type: "checkbox",
+          id: "keep-on-top",
+          checked: !!alwaysOnTop,
+          click: toggleAlwaysOnTop,
+        },
         { type: "separator" },
         {
           label: "Toggle Developer Tools",
@@ -91,9 +123,21 @@ function buildMenuTemplate(deps) {
       ],
     },
     {
+      id: "connection-menu",
       label: "Connection",
       submenu: [
-        { label: "New Connection Window…", accelerator: "CmdOrCtrl+N", click: openNewConnectionWindow },
+        ...(isMac
+          ? [
+              { label: "New Window", accelerator: "Cmd+Shift+N", click: openNewSessionWindow },
+              { type: "separator" },
+            ]
+          : []),
+        // NOT CmdOrCtrl+N. Cmd+N is "new session" in the renderer (the chord every
+        // editor and chat client uses — see src/lib/shortcutRegistry.ts, #4608),
+        // and a menu accelerator would take the keystroke before the page saw it.
+        // A new connection window is a rare, dialog-opening action; it gets the
+        // Alt-shifted variant so it stays reachable from the keyboard.
+        { label: "New Connection Window…", accelerator: "CmdOrCtrl+Alt+N", click: openNewConnectionWindow },
         // No accelerator: Cmd+Shift+R is Force Reload (platform standard).
         { label: "Rename Window…", click: renameCurrentWindow },
         { type: "separator" },
@@ -102,9 +146,20 @@ function buildMenuTemplate(deps) {
         { label: "Open Config File", click: openConfigFile },
       ],
     },
-    { role: "windowMenu" },
+    // macOS keeps the stock Window menu (Minimize, Zoom, Front — no Close entry,
+    // so Cmd+W reaches the renderer). Windows/Linux write it out: the stock role
+    // puts "Close" on Ctrl+W, which is "close session" in the renderer, so the
+    // window close moves to Ctrl+Shift+W — the VS Code / Chrome convention (Ctrl+W
+    // closes a tab, Ctrl+Shift+W the window; Alt+F4 still works).
+    isMac
+      ? { id: "window-menu", role: "windowMenu" }
+      : {
+          id: "window-menu",
+          label: "Window",
+          submenu: [{ role: "minimize" }, { role: "zoom" }, { role: "close", accelerator: "Ctrl+Shift+W" }],
+        },
     // Windows/Linux home for About (Help > About <app>).
-    ...(isMac ? [] : [{ label: "Help", submenu: [aboutItem] }]),
+    ...(isMac ? [] : [{ id: "help-menu", label: "Help", submenu: [aboutItem] }]),
   ];
 }
 

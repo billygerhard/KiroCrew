@@ -40,9 +40,16 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.config import KiroCrewConfig
-from kiro_crew.hooks import TOOL_DENY, HookManager, hooks_config_from_config_dict
+from kiro_crew.hooks import (
+    TOOL_DENY,
+    HookManager,
+    hook_gate_kwargs,
+    hooks_config_from_config_dict,
+)
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import SIGKILL, kill_process_tree
-from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from .git_safety import GIT_SAFE_CONFIG, require_pinned
 
@@ -301,10 +308,9 @@ _COMMAND_WRAPPERS: dict[str, int] = {
     "script": 0,
     # SHELL BUILTIN wrappers. These are not on PATH, so they only appear inside a shell —
     # but a nested `sh -c "..."` argument is re-analyzed from the top by this same table, so
-    # omitting them left a hole. Measured before adding them: bare `git push` was REFUSED
-    # while `command git push` and `exec git push` were both ALLOWED. `command` was raised by
-    # the GPT review of this branch; `exec` and `builtin` are the same class and were found
-    # by testing the neighbours rather than waiting for the next review round.
+    # omitting them leaves a hole: bare `git push` is REFUSED while `command git push` and
+    # `exec git push` would both be ALLOWED. `exec` and `builtin` are the same class as
+    # `command`, so all three are listed.
     "command": 0,
     "exec": 0,
     "builtin": 0,
@@ -417,9 +423,9 @@ def _refusal(text: str, *, depth: int) -> str:
                 opt = wrapped[0]
                 # A short option without `=` is assumed to take a value (`nice -n 5`); a long
                 # option takes one only if it is a KNOWN value-taking wrapper option
-                # (`env --unset FOO`). Long options were previously all treated as valueless,
-                # which let `env --unset FOO curl …` leave `FOO` as the command and pass the
-                # `curl` behind it — the bypass this branch now closes. An inline `--opt=value`
+                # (`env --unset FOO`). Treating every long option as valueless would let
+                # `env --unset FOO curl …` leave `FOO` as the command and pass the `curl`
+                # behind it — the bypass this table closes. An inline `--opt=value`
                 # carries its own value, so it consumes nothing extra.
                 if "=" in opt:
                     takes_value = 0
@@ -491,7 +497,9 @@ def _requested_command(ev: object) -> str:
     return ""
 
 
-def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
+def _governance_denial(
+    ev: object, *, session_key: str, agent: str, tool_kind: str | None = None
+) -> str:
     """A deny reason from the PLATFORM's governance chokepoint, or "" to allow.
 
     The unattended runner had its OWN approval gate (the allowlist + shell denylist
@@ -521,23 +529,33 @@ def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
         # custom denied command was silently unenforced for the UNATTENDED agent — the one
         # caller that most needs it. Raised by the GPT review.
         manager = HookManager(hooks_config_from_config_dict(getattr(cfg, "hooks", {}) or {}))
-        tool_kind = getattr(ev, "tool_kind", "") or getattr(ev, "tool_purpose", "")
+        if tool_kind is None:
+            tool_kind = getattr(ev, "tool_kind", "") or getattr(ev, "tool_purpose", "")
         command = _requested_command(ev)
         result = manager.on_tool_call(
             (getattr(ev, "title", "") or tool_kind or "").strip(),
             session_key=session_key,
             agent=agent,
             app="auto-improvement",
-            tool_kind=tool_kind,
-            raw_params=getattr(ev, "raw_tool_params", None),
-            command=command or None,
-            # From the EVENT, not derived from the command. `HookManager.on_tool_call` denies
-            # when `is_shell and not command` — a shell tool whose command could not be
-            # recovered must not be judged on its LLM-authored title (`acp/types.py` states
-            # that contract). Computing it as `bool(command)` inverted exactly that case: no
-            # command meant is_shell=False, so the request was treated as a non-shell tool and
-            # skipped the branch written for it.
-            is_shell=bool(getattr(ev, "is_shell", False)) or bool(command),
+            # The shared extraction threads every enforcement-relevant event field
+            # (params, diff path, trusted MCP identity, and whatever comes next); the
+            # three overrides are this runner's provider-agnostic readings of a stream
+            # that may not be an ``AcpEvent``: ``tool_kind`` shares the allowlist's
+            # resolved kind (direct callers retain the event fallback),
+            # ``command`` is recovered by ``_requested_command`` from
+            # the raw params rather than ``AcpEvent.shell_command``, and ``is_shell`` is
+            # taken from the EVENT, not derived from the command. `HookManager.on_tool_call`
+            # denies when `is_shell and not command` — a shell tool whose command could
+            # not be recovered must not be judged on its LLM-authored title
+            # (`acp/types.py` states that contract). Computing it as `bool(command)`
+            # inverted exactly that case: no command meant is_shell=False, so the request
+            # was treated as a non-shell tool and skipped the branch written for it.
+            **hook_gate_kwargs(
+                ev,
+                tool_kind=tool_kind,
+                command=command or None,
+                is_shell=bool(getattr(ev, "is_shell", False)) or bool(command),
+            ),
         )
         if getattr(result, "action", "") == TOOL_DENY:
             return (getattr(result, "reason", "") or "denied by governance policy").strip()
@@ -691,10 +709,9 @@ class AgentRunner:
         This agent runs with ``--dangerously-skip-permissions``, so its Bash tool is
         unattended: the worktree stays VISIBLE (there would be nothing to edit otherwise)
         while the operator's credential directories are hidden and the environment is
-        scrubbed. Review of this branch asked for the fallback to be DELETED; sandboxing
-        addresses the same concern — a malicious repository prompt can no longer reach
-        credentials outside the worktree — without removing the only path that works when
-        no in-process provider is configured.
+        scrubbed. Sandboxing is what makes keeping this fallback safe — a malicious
+        repository prompt cannot reach credentials outside the worktree — so the only
+        path that works when no in-process provider is configured stays available.
         """
         root = str(Path(cwd).resolve()) if cwd else None
         # STRICT mode, not the default "standard": "standard" deliberately leaves ~/.aws
@@ -718,8 +735,11 @@ class AgentRunner:
         # (`profiles/github_repo/profile.py:strip_credential_env`) and the agent spawn is
         # the other place untrusted content executes, so it gets the same treatment.
         scrubbed_env = strip_credential_env(scrubbed_env)
-        popen = subprocess.Popen(
-            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- argv LIST, no shell=True, so there is no shell to inject into and shlex.quote() does not apply. Every element is either a literal or a value the app itself computed (prompt text, model name, worktree paths); an argv element can only ever be one argument to CLAUDE_BIN. The marker sits on the tainted ARGUMENT line because that is where semgrep anchors this rule.  # noqa: E501
+        popen = popen_limited(
+            # argv LIST, no shell=True, so there is no shell to inject into and
+            # shlex.quote() does not apply. Every element is either a literal or a value
+            # the app itself computed (prompt text, model name, worktree paths); an argv
+            # element can only ever be one argument to CLAUDE_BIN.
             sandboxed,
             cwd=root,
             stdout=subprocess.PIPE,
@@ -727,7 +747,6 @@ class AgentRunner:
             text=True,
             bufsize=1,  # line-buffered so streamed lines arrive promptly
             env=scrubbed_env,
-            preexec_fn=resource_limit_preexec(),
             # Make the child its own process group so we can kill it (and any children it
             # spawned) cleanly on stop without taking the parent down.
             start_new_session=True,
@@ -851,7 +870,7 @@ class AgentRunner:
             )
 
         # `sandboxed_spawn_argv` may write a launcher script the caller owns; its contract
-        # is that the caller unlinks it once the child no longer needs it. The streaming
+        # is that the caller unlinks it once the child is done with it. The streaming
         # path has many exits, so this is a finally rather than a call per return.
         try:
             if streaming:
@@ -890,8 +909,14 @@ class AgentRunner:
 
         dur = time.monotonic() - t0
         if proc.returncode != 0:
+            # Redact BEFORE the tail cut: a credential straddling the bound keeps its
+            # right half otherwise, a fragment no downstream pass can match. Tail (not
+            # a head bound) because the END of stderr carries the
+            # actionable error; slicing redacted text can at worst split a marker.
             return AgentResult(
-                ok=False, error=f"exit {proc.returncode}: {proc.stderr[-400:]}", duration_s=dur
+                ok=False,
+                error=f"exit {proc.returncode}: {redact_via_context(proc.stderr or '')[-400:]}",
+                duration_s=dur,
             )
         try:
             envelope = json.loads(proc.stdout)
@@ -1009,7 +1034,8 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             self._terminate_group(popen)
         stderr_thread.join(timeout=2.0)  # let the drain finish; tail comes from its buffer
-        stderr_tail = ("".join(stderr_chunks))[-400:]
+        # Redact BEFORE the tail cut, same reason as the non-streaming path above.
+        stderr_tail = redact_via_context("".join(stderr_chunks))[-400:]
 
         dur = time.monotonic() - t0
         with self._cost_lock:
@@ -1169,13 +1195,26 @@ class SessionAgentRunner:
     @staticmethod
     def available() -> bool:
         """True iff a Kiro Crew provider factory can be built (a backend is configured).
-        Lets the backend prefer this runner and fall back to the subprocess ``claude -p``
-        runner only when no provider is available."""
+        Lets the backend prefer this runner; there is no subprocess fallback left, so a
+        False here means the backend stays offline."""
         try:
 
             cfg = KiroCrewConfig.load()
             return cfg.create_provider_factory() is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
+            # Do NOT discard this. ``create_provider_factory`` has a single method-level
+            # return and cannot yield None, so False is reachable ONLY from this handler —
+            # i.e. only when something raised. The backend's offline reason already tells
+            # the operator that "the gateway config load or the provider-factory
+            # construction raised", and without this line it can never say WHAT raised.
+            # The realistic cause is the acp → client → session → config.loader circular
+            # import the loader documents, which resolves only when ``acp`` is imported
+            # first.
+            logger.warning(
+                "SessionAgentRunner.available(): provider factory could not be built, "
+                "reporting the agent runner as unavailable",
+                exc_info=True,
+            )
             return False
 
     def ensure_agent_registered(self) -> bool:
@@ -1246,6 +1285,11 @@ class SessionAgentRunner:
         self._provider_factory = cfg.create_provider_factory()
         return self._provider_factory
 
+    def _allows_tool(self, event: object, tool: str, allowed: list[str] | None) -> bool:
+        if getattr(event, "is_shell", False):
+            return _tool_permitted("Bash", allowed)
+        return _tool_permitted(tool, allowed)
+
     def _emit_activity(self, ev: dict) -> None:
         if self._on_activity is None:
             return
@@ -1311,7 +1355,17 @@ class SessionAgentRunner:
         t0,
         max_turns=0,
         allowed_tools=None,
+        session_key=None,
+        provider=None,
+        governance_agent: str = "",
     ) -> AgentResult:
+        # ``governance_agent`` is the identity the platform governance gate judges
+        # tool requests under; it defaults to ``self.agent_name``. A crew member
+        # runs on a shared TEMPLATE (``self.agent_name`` selects the provider and
+        # the tool set) but is governed under its own member ALIAS, which the
+        # dashboard and messaging paths also key their profiles on — so a member
+        # whose alias carries a task-scoped profile is held to that profile here too.
+        governance_agent = governance_agent or self.agent_name
         # Build a provider for THIS task. The factory's FIRST positional is the
         # session_key (namespaces the provider's work dir); ``agent`` selects the
         # KIRO AGENT — which is what scopes the tool set. Passing the app's
@@ -1331,18 +1385,21 @@ class SessionAgentRunner:
         # Stable across processes (Python's builtin hash() is per-run salted): the
         # session key only needs to be unique per worktree, not secret.
         digest = hashlib.sha256((cwd or self.agent_name).encode()).hexdigest()[:12]
-        session_key = f"auto-improvement-{digest}"
-        provider = None
+        session_key = session_key or f"auto-improvement-{digest}"
+        owns_provider = provider is None
+        cost = 0.0
+        cost_accounted = False
         try:
-            try:
-                provider = factory(session_key, agent=self.agent_name, cwd=cwd)
-            except TypeError:
-                # Older/other factories may not accept cwd / agent kwargs.
+            if owns_provider:
                 try:
-                    provider = factory(session_key, agent=self.agent_name)
+                    provider = factory(session_key, agent=self.agent_name, cwd=cwd)
                 except TypeError:
-                    provider = factory(session_key)
-            await provider.start()
+                    # Older/other factories may not accept cwd / agent kwargs.
+                    try:
+                        provider = factory(session_key, agent=self.agent_name)
+                    except TypeError:
+                        provider = factory(session_key)
+                await provider.start()
             text_parts: list[str] = []
             # Streamed assistant text arrives as MANY tiny provider chunks (often sub-word
             # token slivers like "ismatched-" / "ncation would"). Emitting one activity
@@ -1359,12 +1416,15 @@ class SessionAgentRunner:
             # path), not a duplicate. Fixes "⚙ read · Read File" (no filename): the initial
             # tool_call has empty rawInput; the path arrives in the refinement.
             announced_tool_detail: dict[str, str] = {}
+            # Kiro permission frames can omit kind. Retain the classification
+            # from the preceding tool_call with the SAME id, never its title.
+            announced_tool_kind: dict[str, str] = {}
             deadline = t0 + timeout_s
             full_prompt = (append_system + "\n\n" + prompt) if append_system else prompt
-            # HARD WALL-CLOCK WATCHDOG (operator directive 2026-06-15): the old `async for`
-            # only checked the deadline BETWEEN events, so a long in-turn await (the agent
-            # thinking/reading for minutes inside one stream step) could blow past timeout_s
-            # unbounded — the runaway 10-min discovery run. We instead drive the stream as an
+            # HARD WALL-CLOCK WATCHDOG (operator directive): a plain `async for` only checks
+            # the deadline BETWEEN events, so a long in-turn await (the agent
+            # thinking/reading for minutes inside one stream step) can blow past timeout_s
+            # unbounded — a runaway multi-minute discovery run. Drive the stream as an
             # explicit async iterator and bound EACH event fetch with asyncio.wait_for on the
             # REMAINING budget. A stall is force-cancelled and we return the accumulated text
             # (so any findings already streamed survive). Falls back to the plain async-for if
@@ -1379,8 +1439,10 @@ class SessionAgentRunner:
                 # The tool calls billed before an early return are real money — omitting
                 # them (the old behavior, which only accrued on success) made the ceiling
                 # under-count for timeout/max_turns, the EXPECTED common outcomes.
+                nonlocal cost_accounted
                 with self._cost_lock:
                     self._total_cost_usd += cost
+                cost_accounted = True
                 return AgentResult(
                     ok=ok,
                     error=error,
@@ -1407,8 +1469,11 @@ class SessionAgentRunner:
                     # In-turn stall exceeded the budget — force-cancel and harvest text.
                     return _finish(ok=False, error=f"timeout after {timeout_s}s")
                 kind = getattr(ev, "kind", "")
-                if getattr(ev, "cost_usd", 0.0):
-                    cost = float(ev.cost_usd) or cost
+                reported_cost = getattr(ev, "cost_usd", 0.0) or getattr(
+                    getattr(ev, "usage", None), "cost_usd", 0.0
+                )
+                if reported_cost:
+                    cost = float(reported_cost) or cost
                 if kind == EVENT_PERMISSION_REQUEST:
                     # AUTO-APPROVE EVERY tool/MCP the provider asks for — never block on a
                     # permission prompt (the subagent runs unattended; a blocked tool would
@@ -1427,21 +1492,25 @@ class SessionAgentRunner:
                     # approval landed out-of-order relative to the read loop, the agent never
                     # saw its tool result, and the run hung to the timeout. Inline await is
                     # the proven pattern and completes the turn.
-                    tool = getattr(ev, "tool_kind", "") or getattr(ev, "tool_purpose", "")
+                    tool = (
+                        getattr(ev, "tool_kind", "")
+                        or announced_tool_kind.get(getattr(ev, "tool_call_id", ""), "")
+                        or getattr(ev, "tool_purpose", "")
+                    )
                     rid = getattr(ev, "request_id", "")
                     # ENFORCE the caller's allowlist. `allowed_tools` was accepted by `run`
                     # and never forwarded here, so every request was granted whatever it
                     # asked for. That matters most for a WATCHER: it reads PR comments
                     # through `gh`, so a malicious comment could ask for a shell and get it,
-                    # against an authenticated GitHub session. Raised by review of this
-                    # branch. Deny-by-default only when a caller supplied a list — an
-                    # absent list keeps the previous behavior for callers that never set one.
+                    # against an authenticated GitHub session. Deny-by-default applies only
+                    # when a caller supplied a list — an absent list imposes no allowlist.
                     # FIRST gate: the platform governance chokepoint (`hooks.on_tool_call`)
                     # — the enterprise ceiling, builtin denied rules, and sensitive-path
                     # (~/.aws/~/.ssh) blocks that the dashboard/Slack paths honor. This
-                    # unattended runner previously skipped it and relied only on the
-                    # app-local checks below. Raised by the Arbiter's review of this branch.
-                    gov = _governance_denial(ev, session_key=session_key, agent=self.agent_name)
+                    # unattended runner must not rely only on the app-local checks below.
+                    gov = _governance_denial(
+                        ev, session_key=session_key, agent=governance_agent, tool_kind=tool
+                    )
                     if gov:
                         logger.warning("refusing tool %r — governance: %s", tool, gov)
                         await self._reject(provider, rid, tool=tool, session_key=session_key)
@@ -1461,7 +1530,7 @@ class SessionAgentRunner:
                             }
                         )
                         continue
-                    if not _tool_permitted(tool, allowed_tools):
+                    if not self._allows_tool(ev, tool, allowed_tools):
                         logger.warning("refusing tool %r — not in the caller's allowed_tools", tool)
                         await self._reject(provider, rid, tool=tool, session_key=session_key)
                         self._emit_activity(
@@ -1484,6 +1553,7 @@ class SessionAgentRunner:
                     tcid = getattr(ev, "tool_call_id", "") or ""
                     if tcid:
                         announced_tool_detail[tcid] = detail
+                        announced_tool_kind[tcid] = getattr(ev, "tool_kind", "") or ""
                     text_buf.flush()  # close the current thought before the tool line
                     self._emit_activity(
                         {"kind": "tool", "tool": getattr(ev, "tool_kind", "tool"), "detail": detail}
@@ -1491,8 +1561,8 @@ class SessionAgentRunner:
                     # ENFORCE max_turns on the ACP/session path. Unlike the subprocess runner
                     # (which passes --max-turns to claude), the streaming provider has no turn
                     # limit of its own — so a thinking agent with no terminal commitment reads
-                    # tools until the wall-clock (the discovered=0 over-investigation, validated
-                    # 2026-06-16). Counting tool calls and stopping at the cap is the real
+                    # tools until the wall-clock (the discovered=0 over-investigation).
+                    # Counting tool calls and stopping at the cap is the real
                     # convergence lever: it ends the stream and returns the accumulated text
                     # (a late JSON answer survives). max_turns<=0 disables the cap.
                     tool_calls += 1
@@ -1529,7 +1599,10 @@ class SessionAgentRunner:
             text_buf.flush()  # emit any trailing partial line at turn end
             return _finish(ok=True)
         finally:
-            if provider is not None:
+            if not cost_accounted:
+                with self._cost_lock:
+                    self._total_cost_usd += cost
+            if provider is not None and owns_provider:
                 try:
                     await provider.shutdown()
                 except Exception:  # noqa: BLE001
@@ -1610,7 +1683,7 @@ class SessionAgentRunner:
             # allowlist/denylist check AND the `critical=True` audit-or-deny write. The
             # unattended loop is exactly the caller that must not buy a blanket exemption
             # with its first approval; re-deciding per call is the whole point of routing
-            # through here. Raised by the GPT review of this branch.
+            # through here.
             await provider.approve_tool(rid)
         except Exception:  # noqa: BLE001
             pass
@@ -1619,13 +1692,12 @@ class SessionAgentRunner:
 def _repro_test_dir(worktree: Path) -> str:
     """The directory this repo actually keeps tests in — ``tests`` or ``test``.
 
-    The prompt used to hard-code ``test/``, but a repo using ``tests/`` (plural) then got
-    a reproducing test written into a directory that does not exist, so T2 could never
-    collect it and EVERY candidate failed ``test_invalid`` regardless of fix quality.
-    Found by running docs/system-specs/modules/auto-improvement-test-plan.md against Zedmor/chess_test, which uses ``tests/``.
+    Hard-coding ``test/`` in the prompt breaks a repo that keeps its tests in ``tests/``
+    (plural): the reproducing test lands in a directory that does not exist, so T2 cannot
+    collect it and EVERY candidate fails ``test_invalid`` regardless of fix quality.
 
-    The edit fence already permits both (``_ADDABLE_TEST_GLOBS``), so only the
-    instruction was wrong. Prefers an EXISTING directory; falls back to ``test``.
+    The edit fence permits both (``_ADDABLE_TEST_GLOBS``), so the directory only has to be
+    named correctly here. Prefers an EXISTING directory; falls back to ``test``.
     """
     counts = {
         name: len(list((Path(worktree) / name).glob("test_*.py")))
@@ -1745,7 +1817,8 @@ def author_bug_fix(
         "not yours to fix and must be left alone.\n"
         "When you DO fix, reply with a one-line summary of the edit."
     )
-    res = runner.run(
+    role_runner = runner.for_role("implementation") if hasattr(runner, "for_role") else runner
+    res = role_runner.run(
         prompt,
         cwd=str(worktree),
         allowed_tools=["Bash", "Read", "Edit", "Write", "Grep", "Glob"],
@@ -1783,10 +1856,12 @@ def author_bug_fix(
     # --porcelain`` reports every change kind (modified, added, staged, untracked), so it
     # is the correct presence check.
     require_pinned(worktree)
+    where = str(Path(worktree).absolute())
     st = subprocess.run(
-        ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "status", "--porcelain"],
+        ["git", "-C", where, *_GIT_SAFE_CONFIG, "status", "--porcelain"],
         capture_output=True,
-        text=True,
+        cwd=where,
+        **UTF8_TEXT,
     )
     if not st.stdout.strip():
         return False
@@ -1921,7 +1996,8 @@ def author_perf_fix(
         "wastes a reviewer's time and pollutes the measurement record.\n"
         "When you DO change something, reply with a one-line summary of the edit."
     )
-    res = runner.run(
+    role_runner = runner.for_role("implementation") if hasattr(runner, "for_role") else runner
+    res = role_runner.run(
         prompt,
         cwd=str(worktree),
         allowed_tools=["Bash", "Read", "Edit", "Write", "Grep", "Glob"],
@@ -1937,9 +2013,13 @@ def author_perf_fix(
     if not res.ok and not is_bounded_exit:
         return False
     require_pinned(worktree)
+    # ``cwd=`` beside ``-C``, the same absolute path for both: the child's working
+    # directory must be the worktree, not whatever the gateway inherited.
+    where = str(Path(worktree).absolute())
     st = subprocess.run(
-        ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "status", "--porcelain"],
+        ["git", "-C", where, *_GIT_SAFE_CONFIG, "status", "--porcelain"],
         capture_output=True,
-        text=True,
+        cwd=where,
+        **UTF8_TEXT,
     )
     return bool(st.stdout.strip())

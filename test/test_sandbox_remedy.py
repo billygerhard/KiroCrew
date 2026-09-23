@@ -1,11 +1,11 @@
 """The sandbox probe must report WHICH host mechanism denied the namespace.
 
-Issue #1660: on Ubuntu the gate screen showed ``unshare(CLONE_NEWNS) failed with
-errno 1 (EPERM)`` and a retry button, and nothing else. The probe already knew
-the mechanism — it deliberately performs the two unshare steps separately so a
-NEWNS denial can be told apart from a NEWUSER denial — but that knowledge died
-inside a prose reason string. These tests pin the machine-readable token that
-carries it out, and the invariant that it never outlives its failure.
+On Ubuntu the gate screen can show only ``unshare(CLONE_NEWNS) failed with
+errno 1 (EPERM)`` and a retry button. The probe already knows the mechanism —
+it deliberately performs the two unshare steps separately so a NEWNS denial can
+be told apart from a NEWUSER denial — but that knowledge must not die inside a
+prose reason string. These tests pin the machine-readable token that carries it
+out, and the invariant that it never outlives its failure.
 """
 
 from __future__ import annotations
@@ -19,14 +19,22 @@ import kiro_crew.sandbox as sb
 
 
 @pytest.fixture(autouse=True)
-def _clean_probe_state() -> Any:
+def _clean_probe_state(monkeypatch) -> Any:
     """Each test starts and ends with no cached backend or probe verdict.
 
     Joining the background warm thread is part of that isolation, not politeness:
     it writes the same `_last_unshare_failure` record these tests plant, so a thread still in flight from an earlier test lands mid-test
     and replaces a planted verdict with the real host's one. Joining (rather than
     sleeping) makes that deterministic.
+
+    Clears ``KIROCREW_SANDBOX_ACTIVE`` to prevent the "already inside sandbox"
+    passthrough from short-circuiting tests on sandboxed hosts.
     """
+    monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
+    monkeypatch.setattr(
+        sb, "_KIRO_INTERNAL_SETTINGS_PATH",
+        "/nonexistent/kirocrew-test/amazon-internal.json",
+    )
     _join_warm_thread()
     sb.reset_backend()
     yield
@@ -89,6 +97,26 @@ class TestRemedyForStep:
     def test_unmapped_errno_on_a_real_step_is_left_unclassified(self) -> None:
         # Better to fall back to the doctor pointer than to guess a remedy.
         assert sb._remedy_for_step(sb._PROBE_STEP_NEWNS, errno.EIO) == ""
+
+    @pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM])
+    def test_a_refused_propagation_mount_is_the_container_policy(self, err: int) -> None:
+        # Reached only after BOTH unshares succeeded, so the process owns every
+        # capability in its namespace and the kernel itself never refuses this:
+        # EACCES is the runtime's default AppArmor profile (`deny mount`), EPERM a
+        # seccomp filter. One remedy — relax the container policy or accept the
+        # container as the boundary — so one token.
+        assert sb._remedy_for_step(sb._PROBE_STEP_MOUNT_PRIVATE, err) == sb.REMEDY_MOUNT_DENIED
+
+    def test_a_mount_denial_is_not_the_userns_remedy(self) -> None:
+        # Same errno as the Ubuntu NEWNS case, different step: the AppArmor
+        # userns profile would be the WRONG fix for a container that already
+        # grants both namespaces.
+        assert sb._remedy_for_step(sb._PROBE_STEP_MOUNT_PRIVATE, errno.EPERM) != (
+            sb.REMEDY_APPARMOR_USERNS
+        )
+
+    def test_an_unmapped_mount_errno_is_left_unclassified(self) -> None:
+        assert sb._remedy_for_step(sb._PROBE_STEP_MOUNT_PRIVATE, errno.EIO) == ""
 
 
 class TestRemedyRecording:
@@ -158,6 +186,29 @@ class TestRemedyRecording:
         sb.reset_backend()
         assert sb.unavailable_remedy() == ""
 
+    def test_unavailable_reason_reads_the_same_recorded_failure(self) -> None:
+        # Sibling accessor: reason and remedy come from ONE recorded tuple, so a
+        # diagnostic surface can never pair failure A's text with failure B's fix.
+        sb._record_probe_failure(
+            False,
+            "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)",
+            sb.REMEDY_APPARMOR_USERNS,
+        )
+        assert sb.unavailable_reason() == "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)"
+
+    def test_unavailable_reason_is_empty_when_the_last_probe_succeeded(self) -> None:
+        sb._record_probe_failure(False, "x", sb.REMEDY_APPARMOR_USERNS)
+        sb._last_unshare_failure = None
+        assert sb.unavailable_reason() == ""
+
+    def test_remedy_guidance_is_the_shared_guidance_text(self) -> None:
+        # The public accessor must serve the one shared prose table, so doctor
+        # and the dashboard can never drift from the mechanism's own guidance.
+        assert sb.remedy_guidance(sb.REMEDY_APPARMOR_USERNS) == sb._linux_remedy_guidance(
+            sb.REMEDY_APPARMOR_USERNS
+        )
+        assert sb.remedy_guidance("not-a-token") == ""
+
     def test_a_deferred_on_loop_probe_reports_no_remedy(self) -> None:
         """The synthetic on-loop transient describes no host mechanism.
 
@@ -206,8 +257,24 @@ class TestGuidanceProse:
             sb.REMEDY_MAX_USER_NAMESPACES,
             sb.REMEDY_NO_USER_NS,
             sb.REMEDY_USERNS_DENIED,
+            sb.REMEDY_MOUNT_DENIED,
         ):
             assert sb._linux_remedy_guidance(token), token
+
+    def test_mount_guidance_names_the_container_fix_and_the_opt_out(self) -> None:
+        """A denied mount is fixed at the container, without root.
+
+        The guidance must name AppArmor (the mechanism behind EACCES), the
+        unconfined switch for both Docker and Kubernetes, say that no privilege
+        is needed, and still name the documented opt-out — an operator who
+        cannot change the pod policy has exactly one other way forward.
+        """
+        guidance = sb._linux_remedy_guidance(sb.REMEDY_MOUNT_DENIED)
+        assert "AppArmor" in guidance
+        assert "apparmor=unconfined" in guidance
+        assert "appArmorProfile" in guidance
+        assert "no root or CAP_SYS_ADMIN" in guidance
+        assert "sandbox_allow_unsandboxed_exec=true" in guidance
 
     def test_unknown_token_yields_no_guidance(self) -> None:
         assert sb._linux_remedy_guidance("") == ""
@@ -353,3 +420,53 @@ class TestWrapArgvWiring:
         assert caught.value.kind == "transient"
         assert caught.value.remedy == ""
         assert "kirocrew service install" not in str(caught.value)
+
+    def test_a_container_mount_denial_is_told_about_apparmor_not_seccomp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The container branch must follow the STEP that failed.
+
+        Its seccomp-profile advice fixes a refused unshare. A refused propagation
+        mount after both unshares succeeded is the runtime's default AppArmor
+        profile, which no seccomp profile changes — an operator sent through that
+        change would come back with the identical failure.
+        """
+        self._force_no_backend(monkeypatch)
+        monkeypatch.setattr(sb, "is_docker_container", lambda: True)
+        _plant_failure(
+            False,
+            f"{sb._PROBE_STEP_MOUNT_PRIVATE} failed with errno 13 (EACCES)",
+            sb.REMEDY_MOUNT_DENIED,
+        )
+
+        with pytest.raises(sb.SandboxUnavailableError) as caught:
+            sb.wrap_argv(["/bin/true"])
+
+        message = str(caught.value)
+        assert caught.value.remedy == sb.REMEDY_MOUNT_DENIED
+        assert "apparmor=unconfined" in message
+        assert "appArmorProfile" in message
+        assert "blocks user namespace creation" not in message
+        # The documented escape hatches stay named: an operator who cannot change
+        # the pod policy still has a way forward.
+        assert "KIROCREW_ALLOW_UNSANDBOXED=1" in message
+        assert "sandbox_allow_unsandboxed_exec=true" in message
+
+    def test_a_container_unshare_denial_keeps_the_seccomp_advice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_no_backend(monkeypatch)
+        monkeypatch.setattr(sb, "is_docker_container", lambda: True)
+        _plant_failure(
+            False,
+            f"{sb._PROBE_STEP_NEWUSER} failed with errno 1 (EPERM)",
+            sb.REMEDY_USERNS_DENIED,
+        )
+
+        with pytest.raises(sb.SandboxUnavailableError) as caught:
+            sb.wrap_argv(["/bin/true"])
+
+        message = str(caught.value)
+        assert "blocks user namespace creation" in message
+        assert "kirocrew-seccomp.json" in message
+        assert "apparmor=unconfined" not in message

@@ -9,8 +9,9 @@
  * privileges without user intent.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 const getApp = vi.fn()
 const listRegistry = vi.fn()
@@ -47,13 +48,19 @@ const REGISTRY_APP = {
 
 /** Render the detail route, optionally with router state or a query string. */
 function renderDetail({ search = '', state }: { search?: string; state?: unknown } = {}) {
+  // `useTrustGate` invalidates the ['trusted-apps'] / ['apps'] queries after a
+  // grant, so it needs a QueryClient in scope. The app root always provides
+  // one; the harness has to as well.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <MemoryRouter initialEntries={[{ pathname: '/apps/detail/secretary', search, state }]}>
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[{ pathname: '/apps/detail/secretary', search, state }]}>
       <Routes>
         <Route path="/apps/detail/:name" element={<AppDetailPage />} />
         <Route path="/apps" element={<div>apps list</div>} />
-      </Routes>
-    </MemoryRouter>,
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   )
 }
 
@@ -62,7 +69,7 @@ describe('AppDetailPage — auto-action deep links', () => {
     vi.clearAllMocks()
     system.mockResolvedValue({ hostname: '' })
     installFromRegistryStream.mockResolvedValue({ ok: true })
-    getApp.mockRejectedValue(new Error('not installed'))
+    getApp.mockRejectedValue(Object.assign(new Error('not installed'), { status: 404 }))
     listRegistry.mockResolvedValue({ apps: [REGISTRY_APP], serverPlatform: { os: 'darwin', arch: 'arm64' } })
   })
 
@@ -114,5 +121,88 @@ describe('AppDetailPage — auto-action deep links', () => {
     })
     renderDetail({ state: { autoAction: 'update' } })
     await waitFor(() => expect(installFromRegistryStream).toHaveBeenCalled())
+  })
+
+  it('syncs a PATH-installed app from its directory, never through the registry', async () => {
+    // The registry install stream can only serve an app the registry lists, so
+    // an app installed from a directory used to fail its own Sync with
+    // "app not found in registry" while being installed, enabled and working.
+    getApp.mockResolvedValue({
+      name: 'secretary', displayName: 'Secretary', version: '0.1.0', enabled: true,
+      source: '/home/u/apps/secretary', origin: 'local',
+      resources: 'gateway', lifecycle: 'gateway', installedAt: '2026-07-01T00:00:00Z',
+      manifest: { displayName: 'Secretary', description: 'Slack inbox manager.', author: 'zezhexu' },
+    })
+    listRegistry.mockResolvedValue({ apps: [], serverPlatform: { os: 'darwin', arch: 'arm64' } })
+    renderDetail({ state: { autoAction: 'update' } })
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('secretary'))
+    expect(installFromRegistryStream).not.toHaveBeenCalled()
+  })
+
+  it('keeps the registry stream for an app whose source IS a registry ref', async () => {
+    getApp.mockResolvedValue({
+      name: 'secretary', displayName: 'Secretary', version: '1.0.0', enabled: true,
+      source: 'registry:secretary', origin: 'registry',
+      resources: 'gateway', lifecycle: 'gateway', installedAt: '2026-07-01T00:00:00Z',
+      manifest: { displayName: 'Secretary', description: 'Slack inbox manager.', author: 'zezhexu' },
+    })
+    renderDetail({ state: { autoAction: 'update' } })
+    await waitFor(() => expect(installFromRegistryStream).toHaveBeenCalled())
+    expect(updateApp).not.toHaveBeenCalled()
+  })
+
+  it('dispatches update when there is no installed record and a catalog row supplies a non-string source', async () => {
+    // With no installed record, the page spreads the CATALOG row into its app
+    // object. registry.py copies index keys verbatim for a row it has not
+    // installed, so `source` can be an object; an unguarded startsWith throws
+    // inside this effect and Sync never dispatches at all.
+    getApp.mockRejectedValue(Object.assign(new Error('not installed'), { status: 404 }))
+    listRegistry.mockResolvedValue({
+      apps: [{
+        ...REGISTRY_APP, installed: true, installedVersion: '1.1.0',
+        origin: 'local', source: { type: 'git' },
+      }],
+      serverPlatform: { os: 'darwin', arch: 'arm64' },
+    })
+    renderDetail({ state: { autoAction: 'update' } })
+    // origin 'local' means path-installed, so it must reach the update endpoint.
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('secretary'))
+    expect(installFromRegistryStream).not.toHaveBeenCalled()
+  })
+
+  it('states that a path-installed sync succeeded, since the page is otherwise unchanged', async () => {
+    // Both surfaces this fix wires need the reflection: a same-version re-copy
+    // leaves the page byte-identical, so silence reads as a no-op.
+    getApp.mockResolvedValue({
+      name: 'secretary', displayName: 'Secretary', version: '0.1.0', enabled: true,
+      source: '/home/u/apps/secretary', origin: 'local',
+      resources: 'gateway', lifecycle: 'gateway', installedAt: '2026-07-01T00:00:00Z',
+      manifest: { displayName: 'Secretary', description: 'Slack inbox manager.', author: 'zezhexu' },
+    })
+    listRegistry.mockResolvedValue({ apps: [], serverPlatform: { os: 'darwin', arch: 'arm64' } })
+    updateApp.mockResolvedValue({ ok: true })
+    renderDetail({ state: { autoAction: 'update' } })
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('secretary'))
+    expect(await screen.findByText(/Synced Secretary from its source directory/)).toBeInTheDocument()
+  })
+
+  it('names the registry, not a source directory, when a registry-sourced app is synced', async () => {
+    // The Sync button is not gated on source, and the backend re-clones a
+    // registry-sourced app from the registry — so the source-directory wording
+    // would be a false statement about where the update came from.
+    getApp.mockResolvedValue({
+      name: 'secretary', displayName: 'Secretary', version: '1.0.0', enabled: true,
+      source: 'registry:secretary', origin: 'registry',
+      resources: 'gateway', lifecycle: 'gateway', installedAt: '2026-07-01T00:00:00Z',
+      manifest: { displayName: 'Secretary', description: 'Slack inbox manager.', author: 'zezhexu' },
+    })
+    listRegistry.mockResolvedValue({ apps: [], serverPlatform: { os: 'darwin', arch: 'arm64' } })
+    updateApp.mockResolvedValue({ ok: true })
+    renderDetail({})
+    const sync = await screen.findByRole('button', { name: /Sync/i })
+    fireEvent.click(sync)
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('secretary'))
+    expect(await screen.findByText(/Updated Secretary from the registry/)).toBeInTheDocument()
+    expect(screen.queryByText(/from its source directory/)).not.toBeInTheDocument()
   })
 })

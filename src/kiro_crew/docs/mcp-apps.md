@@ -5,40 +5,25 @@ alongside its text, the dashboard mounts that resource as a live, interactive
 component in the chat instead of showing you a wall of JSON. Ask for a diagram and
 the excalidraw server gives you an editable Excalidraw canvas in the conversation;
 other servers ship PDF viewers, forms, and dashboards the same way. This is the
-[SEP-1865](https://modelcontextprotocol.io) `ui` extension, and it works with any
-conforming server — nothing is hardcoded per vendor.
+[SEP-1865](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
+`ui` extension — Kiro Crew targets the **Stable 2026-01-26** revision — and it works with any conforming command-based stdio server: nothing is hardcoded per vendor.
 
-If you just want it working: **Developer → Shared MCP gateway → on**, then switch
-your server on under **Poolable MCP servers**. The rest of this page explains why
-both are needed and what to check when a render does not appear.
+If you just want it working: **Developer → MCP Management → route the server → on**. Routing adds the server to `mcp_gateway.stub_servers`; the rest of this page explains what that changes and what to check when a render does not appear.
 
 ## Enabling it
 
-Two gates must both pass. Neither is about the app itself — both are about **MCP
-pooling**, because the gateway daemon is what intercepts the tool result and
-resolves the `ui://` resource. Both have a UI toggle; you should not need to edit
-config by hand.
+Routing is the required gate: the gateway daemon intercepts a routed server's tool result and resolves its `ui://` resource. Backend sharing is a separate optional pool-wide setting; neither requires hand-editing config.
 
-> **Platform:** the shared gateway needs Unix-domain sockets, so it is supported on
-> **macOS and Linux only**. On Windows the toggle is disabled and MCP Apps are
-> unavailable.
+> **Platform:** the shared gateway is supported on macOS, Linux, and Windows. It uses a Unix-domain socket on POSIX and a named pipe on Windows.
 
 ### From the dashboard
 
 Both live on the **Developer** page (sidebar → **Developer**):
 
-1. **Turn on "Shared MCP gateway."** ⚠️ This restarts all active sessions onto the
-   new MCP routing, so in-flight agent work is interrupted — do it between tasks,
-   not mid-turn. Your dashboard stays signed in. The toggle asks for confirmation
-   and offers a roll-back.
-2. **In "Poolable MCP servers," switch on the server whose app you want.** The
-   toggle writes the central allowlist and re-applies it in-process — no restart.
-   You can set this up before enabling the gateway; it simply has no effect until
-   the gateway is on.
+1. **Route the server through the gateway** in MCP Management. This adds the server to `mcp_gateway.stub_servers`; applying the routing change rebuilds affected agent MCP toolsets, so do it between tasks.
+2. **Share MCP Backends** is optional. `mcp_gateway.enabled` controls whether already routed stdio servers share backends across sessions; it is independent of whether their `ui://` resources render.
 
-   A row is **read-only** when the server can't be pooled: it's denylisted, its
-   transport isn't stdio (HTTP servers aren't poolable), or it's already poolable
-   via its own `poolable: true` and so isn't governed by the allowlist.
+Only command-based stdio entries can be routed through a stub. URL-based HTTP/SSE entries remain direct and cannot render MCP Apps through this host.
 
 Optionally, to render apps in the right side panel instead of inline, turn on
 **Settings → Chat → Messages → "MCP Apps in Side Panel."** No restart or refresh
@@ -50,28 +35,51 @@ For scripted or headless setups:
 
 ```json
 {
-  "mcp_gateway": { "enabled": true, "poolable_servers": ["excalidraw"] },
+  "mcp_gateway": { "stub_servers": ["excalidraw"] },
   "dashboard":   { "mcp_app_panel": true }
 }
 ```
 
-A server can also opt itself in from its own MCP entry, which is the escape hatch
-for third-party configs you don't want to duplicate into the allowlist:
+`stub_servers` is empty by default, so an untouched config renders no apps and runs no broker. Routing a server is the opt-in.
+Backend sharing is a separate, opt-in decision:
+
+```json
+{ "mcp_gateway": { "enabled": true, "stub_servers": ["excalidraw"] } }
+```
+
+`mcp_gateway.stub_servers` is the only thing that gives a server a stub. A
+`poolable: true` on the server's own MCP entry used to work as a second way in,
+and no longer does:
 
 ```json
 { "mcpServers": { "excalidraw": { "command": "...", "poolable": true } } }
 ```
 
-MCP Apps have **no enablement flag of their own** — they follow
-`mcp_gateway.enabled`. The full resolution order in `_mcp_apps_enabled()` is:
+That key is now ignored and stripped before the entry reaches kiro-cli. It could
+not be honoured coherently — the broker's start gate and the session's overlay
+both read the config list, so a spec-level opt-in produced a stub nothing pointed
+at. List the server instead, from the config above or from MCP Management.
+
+MCP Apps has no switch of its own any more. Capability follows THE STUB: the stub a
+stubbed server gets is what carries the render and callback path, so stubbing the
+server is what grants the feature. There is no way to *grant* Apps with a
+preference — but the two ways to say **no** still hold, so nobody who already
+turned it off starts rendering server-authored UI on upgrade:
 
 | Condition | Result |
 |---|---|
 | `KIROCREW_MCP_APPS` = `0`/`false`/`no`/`off` | disabled (explicit kill-switch, wins over everything) |
-| `KIROCREW_MCP_APPS` = `1`/`true`/`yes` | enabled (explicit override — tests, e2e harness) |
-| `KIROCREW_MCP_APPS` unset | follows `mcp_gateway.enabled`, read **live** from config |
+| stored `mcp_gateway.apps_enabled` = `false` | disabled, even with `KIROCREW_MCP_APPS` on — a released opt-out is still honoured |
+| config unreadable | disabled (fails closed — the stored preference cannot be confirmed) |
+| `KIROCREW_MCP_APPS` = `1`/`true`/`yes`, no stored opt-out | enabled (explicit override — tests, e2e harness) |
+| nothing set | enabled — reaching the gate already means the server was stubbed |
 
-Read live per call, so toggling the gateway takes effect without restarting the
+`apps_enabled` is **retired going forward**: nothing writes it, MCP Management does
+not surface it, and a fresh install never has it. It is read in exactly one
+direction — an operator-written `false` keeps withholding the feature. Absent
+defaults to on, so "not configured" is not an opt-out.
+
+Read live per call, so toggling the feature takes effect without restarting the
 daemon.
 
 ### Worked example: excalidraw diagrams
@@ -80,23 +88,21 @@ The excalidraw MCP server ships a `ui://` app, so it is the quickest way to see
 this working end to end:
 
 1. Add the server to your MCP config as usual and confirm the agent can call it.
-2. **Developer → Shared MCP gateway → on.**
-3. **Developer → Poolable MCP servers → `excalidraw` → on.**
-4. Ask for a diagram: *"draw me a sequence diagram of the login flow."*
+2. Ask for a diagram: *"draw me a sequence diagram of the login flow."*
 
 You should get a live, editable Excalidraw canvas in the chat — hand-drawn shapes
-that animate in as they stream, which you can then drag around and edit. If you
-instead get a wall of JSON-ish text, step 3 is almost certainly the one that
-didn't take.
+that animate in as they stream, which you can then drag around and edit.
 
-**Why the poolable gate is the usual culprit:** a server that isn't poolable is
-parented to `kiro-cli` and never passes through the gateway, so nothing intercepts
-its result. The tool still works — you just get its text. There is no error
-message, which is exactly what makes it confusing.
+**If you get a wall of JSON-ish text instead:** nothing intercepted the result.
+Check `KIROCREW_MCP_APPS` is not set to an off value and that
+the server is stubbed — the stub is the only switch that governs
+rendering. There is no error message when a result goes un-intercepted, which is
+what makes it confusing: the tool still worked, you just got its text.
 
-**Not every server should be pooled.** A pooled backend is shared across
-sessions, so a server that reads per-session credentials or env vars from its own
-process environment must stay unpooled.
+**Sharing is a separate question.** A shared backend serves several sessions from
+one process, so a server that reads per-session credentials or env vars from its
+own process environment should stay unshared. That choice does not affect whether
+its apps render.
 
 ## Where apps render: inline or side panel
 
@@ -188,6 +194,87 @@ Kiro Crew harvests declared URIs from `tools/list` when the backend starts — a
 tool that declared a `ui://` resource renders even when its individual results
 carry no `_meta`.
 
+## Deviations from SEP-1865
+
+Kiro Crew targets the Stable 2026-01-26 revision. Two things an app author should
+know, because a spec-conforming app may otherwise wait for something that never
+arrives.
+
+**No sandbox proxy — the frame is null-origin instead.** The spec requires a web
+host to wrap the view in an intermediate *sandbox proxy* at a different origin
+(`allow-scripts allow-same-origin` on the outer frame) and to hand the HTML over
+via a `ui/notifications/sandbox-proxy-ready` → `ui/notifications/sandbox-resource-ready`
+handshake. Kiro Crew does not do this. It renders app HTML in a **single
+null-origin iframe** — `sandbox="allow-scripts allow-forms"`, deliberately
+without `allow-same-origin` — with the CSP injected as a `<meta>` element ahead
+of any server-supplied byte.
+
+This is a deliberate trade, not an oversight: the spec's proxy arrangement gives
+the *inner* frame `allow-same-origin` relative to the proxy origin, whereas a
+null-origin frame has no origin to share at all. The consequences for an app:
+
+- The two `sandbox-*` notifications are never sent and never answered. Do not
+  wait for them; the `ui/initialize` handshake is the only entry point.
+- There is no stable per-app origin, so `_meta.ui.domain` has no effect. Anything
+  keyed to an origin — OAuth callbacks, CORS allowlists, API-key origin pinning —
+  will not work. Cookies and `localStorage` are unavailable for the same reason.
+- Because the frame has no storage, unmounting it loses in-canvas state. That is
+  why the panel goes to such lengths to keep frames mounted (see above).
+
+**Methods this host does not implement yet.** A conforming app must tolerate
+these being absent, per the spec's own graceful-degradation rule:
+
+| Method | Status |
+|---|---|
+| `ui/message` | not implemented |
+| `ui/update-model-context` | answered `-32601` |
+| `ui/resource-teardown` | not sent |
+| `ui/notifications/tool-cancelled` | not sent |
+| app-initiated `resources/read`, `ping` | not answered |
+| `pip` display mode | not offered (`availableDisplayModes` is `inline`, `fullscreen`) |
+
+The `hostContext` reply carries `theme`, `displayMode`, `availableDisplayModes`,
+`containerDimensions` and — when the dashboard palette resolves —
+`styles.variables`. Kiro Crew resolves its own design tokens for the active
+theme and mode, maps them onto the spec's `McpUiStyleVariableKey` set, and sends
+them in `hostContext.styles.variables` both in the `ui/initialize` result and in
+`ui/notifications/host-context-changed` when the theme changes under a mounted
+app. An app on the SDK's `applyHostStyleVariables` / `useHostStyleVariables`
+therefore paints in the user's active dashboard palette, and `theme` is still
+sent alongside so `applyDocumentTheme` gets the right `color-scheme`.
+
+The honest residue, so a spec-conforming app is not surprised:
+
+- **`styles.css.fonts` is still not sent.** The default app CSP allows fonts only
+  from `'self'` and `data:`, so a forwarded `@font-face` naming a dashboard-origin
+  or remote URL would be blocked inside the frame anyway.
+- **`--font-sans` / `--font-mono` usually do not survive sanitization.** The value
+  filter rejects the quoted family names in Kiro Crew's font stacks, so those two
+  keys are typically absent from the payload; they resolve only for a locally
+  installed face named by a bare identifier.
+- **`--color-background-info` arrives as a `color-mix()` expression**, not a flat
+  color: the dashboard derives that one wash from its info hue rather than storing
+  it, and the handoff passes the derivation through with the hue resolved
+  (`color-mix(in srgb, #0891b2 12%, transparent)`). It paints identically, but if
+  your app nests host variables inside a `color-mix()` of its own — which is what
+  Tailwind's `/40`-style opacity modifiers compile to — that key is the one that
+  will not survive the nesting. Consume it directly, or declare a fallback.
+- **No typography scale is sent — keep your own.** `--font-weight-*`, every
+  `--font-*-size` and `--font-*-line-height`, plus `--border-radius-xs`,
+  `--border-radius-full`, `--border-width-regular` and `--shadow-hairline`, are
+  never in the payload. Kiro Crew has no stored value for them, and sending an
+  invented number would make your app paint a size the dashboard does not render.
+  What you DO get is the palette, the two font families, `--border-radius-sm/md/lg/xl`
+  and `--shadow-sm/md/lg`. Pair those with your own type scale.
+- **Still declare your own fallbacks.** Colors arrive all-or-nothing and the
+  non-color keys arrive independently, so any given variable may be absent. Declare
+  a fallback for every CSS variable your app consumes, and keep keying off `theme`
+  for light/dark.
+
+Everything in the spec's `draft` revision — app-provided tools,
+`sampling/createMessage`, `ui/download-file` — is out of scope until that revision
+stabilises.
+
 ## How a render actually reaches your screen
 
 Useful when something renders as text and you need to find where the chain broke:
@@ -199,7 +286,10 @@ Useful when something renders as text and you need to find where the chain broke
    so a slow app degrades to text rather than wedging the turn.
 3. The gateway writes the payload to a spool file at
    `$KIROCREW_HOME/mcp-apps/<uuid4hex>.json` and injects an opaque marker
-   `[kirocrew-mcp-app:<uuid4hex>]` into the tool result *text*.
+   `[kirocrew-mcp-app:<uuid4hex>]` at the START of the tool result *text*. It
+   leads the text (rather than trailing it) so it survives the ACP result
+   truncation cuts before the detector below runs — a long first text block
+   would otherwise lose a trailing marker and the app would never mount.
 4. That text reaches the dashboard backend as a tool result. `mcp_apps_render.py`
    detects the marker, loads the spooled payload, pushes an `mcp_app_render`
    websocket event to the chat slot, and strips the marker from the transcript.
@@ -219,10 +309,8 @@ app HTML is **server-controlled code running in your dashboard**.
   never reads the payload file — only deterministic code does.
 - **Missing, corrupt, or oversized spool files are tolerated**, so a bad payload
   cannot crash a turn.
-- **The dashboard CSP allows `https://esm.sh`.** `srcdoc` iframes inherit the
-  parent's CSP header, and apps commonly load their module graph from esm.sh via
-  importmap — without that allowance the app's scripts never execute and you get a
-  blank frame.
+- **The dashboard CSP allows `https://esm.sh`.** `srcdoc` iframes inherit the parent's CSP header, and apps commonly load their module graph from esm.sh via importmap — without that allowance the app's scripts never execute and you get a blank frame.
+- **Per-app CSP is additive and sanitized.** Resource metadata can request `resourceDomains`, `connectDomains`, `frameDomains`, and `baseUriDomains`; the host accepts only `https://` origin tokens, emits a CSP meta tag before app HTML, and otherwise starts from a deny-by-default policy. The parent response CSP can only further restrict that policy.
 - The host declares a limited capability set to the app (`serverTools`,
   `openLinks`). Link opening is gated to `https://` only.
 
@@ -230,16 +318,17 @@ app HTML is **server-controlled code running in your dashboard**.
 
 | Symptom | Most likely cause |
 |---|---|
-| Tool output renders as plain text | the server is not switched on in **Developer → Poolable MCP servers** — check this first |
-| Still text after enabling the server | the **Shared MCP gateway** toggle is off, or `KIROCREW_MCP_APPS` is set to an off value and is overriding it |
-| The gateway toggle is disabled / greyed out | you're on Windows — the shared gateway needs Unix-domain sockets (macOS and Linux only) |
-| A server's poolable row won't toggle | it's denylisted, or not stdio transport (HTTP servers can't be pooled), or already poolable via its own `poolable: true` |
+| Tool output renders as plain text | the server has no stub in MCP Management, or `KIROCREW_MCP_APPS` is set to an off value |
+| Still text with both of those right | the broker did not start — check the gateway log for `mcp-gateway: broker ready`, which names the switch that started it |
+| The gateway toggle is unavailable | confirm the gateway process and local IPC endpoint can start; the broker supports macOS, Linux, and Windows |
+| A server cannot be routed | only command-based stdio entries can receive a stub; URL-based HTTP/SSE entries stay direct |
 | Frame mounts but the canvas is blank | the app's scripts did not execute — check the browser console for CSP or network errors reaching its CDN |
 | Feature toggle missing from Settings | stale frontend bundle — hard-refresh the dashboard |
 | A new render appears inline despite `mcp_app_panel: true` | the flag is read at render time; diagrams already in scrollback do not move |
 | Panel shows "This app render is no longer available" | the payload was evicted (bounded per slot) — ask the agent to render it again |
-| Agent sessions all restarted unexpectedly | expected: flipping the **Shared MCP gateway** toggle re-routes MCP and interrupts in-flight work |
+| Agent sessions all restarted unexpectedly | expected: routing a server, or flipping backend sharing, re-routes MCP and interrupts in-flight work |
 
 For **which** iframe host a new dashboard feature should use, and why an iframe
 can never be moved in the DOM without reloading it, see
-[Dashboard iframe hosts](dashboard-iframe-hosts.md).
+[Dashboard iframe hosts](https://github.com/kirodotdev/KiroCrew/blob/main/docs/architecture/dashboard-iframe-hosts.md)
+in the contributor documentation.

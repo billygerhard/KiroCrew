@@ -57,15 +57,28 @@ launchd analogue of systemd's ``no_user_unit``: installed, but not controllable
 this way, and actionable rather than a silent false success. An indirected agent
 with the legacy restart contract reports ``agent_restart_contract_outdated``. A
 loaded agent whose launcher has been deleted is reported as ``live_program_missing``.
+
+Hosts where NEITHER manager can be driven (:data:`FOREGROUND_ELIGIBLE`) get one
+last resort: :class:`ForegroundBackend`, which hands the bounce to a detached
+``kirocrew restart`` instead of a service manager. Strictly ordered
+systemd > launchd > foreground, and fail-safe by construction — it never
+signals anything itself, so a failed spawn leaves the running gateway
+untouched and the operator keeps the manual-restart advisory.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
-import uuid
+import subprocess
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import IO, Awaitable, Callable, Protocol, TypeVar
+
+from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config.paths import config_dir
+from kiro_crew.executors import subprocess_executor
 
 # service.* is import-safe on every platform (it only touches launchctl/systemctl
 # when called) and never imports apps.*, so there is no cycle to dodge here.
@@ -78,10 +91,20 @@ from kiro_crew.service.macos import (
     write_live_program,
 )
 
-# (rc, stdout, stderr) — server.py's sandboxed subprocess chokepoint. Injected
+
+async def _off_loop(fn: Callable[..., "T"], *args: object) -> "T":
+    """Run a filesystem-touching callable on the subprocess executor.
+
+    These backends run on the GATEWAY's event loop, which serves the whole dashboard:
+    a drop-in write, a plist read or a marker scan must not happen inline on it.
+    """
+    return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), fn, *args)
+
+# (rc, stdout, stderr) — live.py's sandboxed subprocess chokepoint. Injected
 # rather than imported so every spawn stays audited through the one seam the
-# tests already patch, and so this module has no import cycle with server.py.
+# tests already patch, and so this module has no import cycle with live.py.
 RunCmd = Callable[..., Awaitable[tuple[int, str, str]]]
+T = TypeVar("T")
 #: ``shutil.which``-shaped tool lookup, injected for the same reason as the
 #: platform string (see :func:`backend`).
 Which = Callable[[str], "str | None"]
@@ -135,17 +158,21 @@ def reject_unsafe(raw: str) -> str:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    """Write *content* to *path* atomically (temp sibling + ``os.replace``).
+    """Write *content* to *path* atomically (unique temp sibling + rename).
 
-    ``os.replace`` is an atomic same-filesystem rename, so a crash or partial
-    write never leaves a half-written service definition behind.
+    Thin delegate to :func:`kiro_crew.atomic_write.atomic_write`, kept as a
+    named function because it is the seam Dev Fleet's tests drive the staging
+    failure path through. The shared helper carries the
+    ``mkstemp``-plus-rename shape this needs, plus the Windows
+    sharing-violation rename retry and the ``except BaseException`` temp
+    cleanup a hand-rolled ``finally`` would have to provide.
+
+    ``fsync`` stays off and no explicit *mode* is passed, so the write lands
+    at the umask default exactly as ``Path.write_text`` does. Encoding is
+    pinned to UTF-8 rather than following the locale, which is what the
+    generated unit text (systemd reads it as UTF-8) requires.
     """
-    tmp = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
-    try:
-        tmp.write_text(content)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    atomic_write(path, content)
 
 
 class GatewayServiceBackend(Protocol):
@@ -200,7 +227,7 @@ class SystemdBackend:
     adapter existed, including the wire codes the dashboard already maps
     (``no_systemd`` / ``no_user_unit``).
 
-    The drop-in path and renderer are INJECTED from ``server.py`` rather than
+    The drop-in path and renderer are INJECTED from ``live.py`` rather than
     reimplemented here. They are the seam a dozen existing tests patch
     (``monkeypatch.setattr(mod, "_dropin_path", ...)`` /
     ``"_dropin_content"``), and keeping them where the tests already point means
@@ -226,11 +253,15 @@ class SystemdBackend:
         self._dropin_path = dropin_path
         self._dropin_content = dropin_content
 
-    def _available(self) -> bool:
-        return self._platform == "linux" and bool(self._which("systemctl"))
+    async def _available(self) -> bool:
+        # ``which`` walks every PATH entry with stat/access: off the loop, like every
+        # other filesystem step here, so a stalled PATH mount cannot stall the gateway.
+        if self._platform != "linux":
+            return False
+        return bool(await _off_loop(self._which, "systemctl"))
 
     async def status(self) -> str:
-        if not self._available():
+        if not await self._available():
             return "no_systemd"
         # Gate on the unit being known to the --user manager: a `service
         # install` SYSTEM unit is not controllable with a --user drop-in, and
@@ -241,7 +272,7 @@ class SystemdBackend:
         return "ok" if rc == 0 else "no_user_unit"
 
     async def active(self) -> bool:
-        if not self._available():
+        if not await self._available():
             return False
         rc, _out, _err = await self._run(
             ["systemctl", "--user", "is-active", self._unit()], timeout=5
@@ -253,7 +284,7 @@ class SystemdBackend:
         ExecStart main-PID spawn, so it changes the instant the NEW process
         starts (a unit can enter ``active`` before its replacement main PID
         exists) and can never repeat or go backwards if NTP steps the clock."""
-        if not self._available():
+        if not await self._available():
             return None
         rc, out, _err = await self._run(
             ["systemctl", "--user", "show", self._unit(),
@@ -300,9 +331,13 @@ class SystemdBackend:
             content = self._dropin_content(worktree, kcbin)
         except _UnsafeTargetValue as exc:
             return False, "unsafe_path", f"unsafe value in unit directive: {exc}"
-        try:
+
+        def _write() -> None:
             dropin.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_text(dropin, content)
+
+        try:
+            await _off_loop(_write)
         except OSError as exc:
             return False, "write_failed", f"failed to write drop-in: {exc}"
         rc, _out, stderr = await self._run(
@@ -315,7 +350,7 @@ class SystemdBackend:
     async def reload(self) -> None:
         """Re-read unit files. Called on the rollback path so the loaded config
         matches the restored disk state rather than the rejected override."""
-        if self._available():
+        if await self._available():
             await self._run(["systemctl", "--user", "daemon-reload"], timeout=10)
 
     def rollback(self, prior: str | None) -> bool:
@@ -379,8 +414,10 @@ class LaunchdBackend:
     def plist_path() -> Path:
         return PLIST_PATH
 
-    def _available(self) -> bool:
-        return self._platform == "darwin" and bool(self._which("launchctl"))
+    async def _available(self) -> bool:
+        if self._platform != "darwin":
+            return False
+        return bool(await _off_loop(self._which, "launchctl"))
 
     # -- state --
     async def _print(self) -> tuple[int, str]:
@@ -390,7 +427,7 @@ class LaunchdBackend:
         return rc, out
 
     async def status(self) -> str:
-        if not self._available():
+        if not await self._available():
             return "no_launchd"
         rc, _out = await self._print()
         if rc != 0:
@@ -399,26 +436,32 @@ class LaunchdBackend:
         # ProgramArguments goes through our launcher. An agent installed by an
         # older build points straight at a bin path; rewriting the launcher would
         # then be a silent no-op, so say so instead.
-        try:
-            if str(self.live_program()) not in self.plist_path().read_text():
+
+        def _probe() -> str | None:
+            try:
+                if str(self.live_program()) not in self.plist_path().read_text():
+                    return "agent_not_indirected"
+            except OSError:
                 return "agent_not_indirected"
-        except OSError:
-            return "agent_not_indirected"
-        # The plist is right but the launcher itself is gone (a "reset the app"
-        # gesture that deleted Application Support). The agent would fail to
-        # spawn at next login with nothing on screen to explain it, so name the
-        # repair rather than reporting a healthy service.
-        if not self.live_program().exists():
-            return "live_program_missing"
-        if (
-            not restart_contract_current(self.plist_path())
-            or not loaded_restart_contract_current(_out)
-        ):
+            # The plist is right but the launcher itself is gone (a "reset the app"
+            # gesture that deleted Application Support). The agent would fail to
+            # spawn at next login with nothing on screen to explain it, so name the
+            # repair rather than reporting a healthy service.
+            if not self.live_program().exists():
+                return "live_program_missing"
+            if not restart_contract_current(self.plist_path()):
+                return "agent_restart_contract_outdated"
+            return None
+
+        probed = await _off_loop(_probe)
+        if probed is not None:
+            return probed
+        if not loaded_restart_contract_current(_out):
             return "agent_restart_contract_outdated"
         return "ok"
 
     async def active(self) -> bool:
-        if not self._available():
+        if not await self._available():
             return False
         rc, out = await self._print()
         if rc != 0:
@@ -446,7 +489,7 @@ class LaunchdBackend:
         restart window to confuse the handshake. ``None`` when the agent is
         loaded but not running — callers degrade rather than wait forever.
         """
-        if not self._available():
+        if not await self._available():
             return None
         rc, out = await self._print()
         return None if rc != 0 else self._parse_pid(out)
@@ -468,7 +511,7 @@ class LaunchdBackend:
         SIGTERM has before SIGKILL. This is safe to call from inside the process
         being restarted, since launchd performs both the signal and the respawn.
         """
-        if not restart_contract_current(self.plist_path()):
+        if not await _off_loop(restart_contract_current, self.plist_path()):
             return False, (
                 "launchd agent restart contract is outdated; re-run "
                 "`kirocrew service install`"
@@ -532,7 +575,7 @@ class LaunchdBackend:
         except _UnsafeTargetValue as exc:
             return False, "unsafe_path", f"unsafe value in live target: {exc}"
         try:
-            write_live_program(content, self.live_program())
+            await _off_loop(write_live_program, content, self.live_program())
         except OSError as exc:
             return False, "write_failed", f"failed to write live launcher: {exc}"
         return True, "", ""
@@ -552,6 +595,307 @@ class LaunchdBackend:
             return False
 
 
+# --- foreground (last resort) --------------------------------------------------
+
+#: Eligibility codes under which the foreground backend may be attempted: the
+#: primary manager reported "nothing here to drive" at all. Deliberately
+#: EXCLUDES the codes where a manager exists but is mis-set-up
+#: (``user_unit_inactive``, ``agent_not_indirected``,
+#: ``agent_restart_contract_outdated``, ``live_program_missing``): those hosts
+#: have a named remedy, and a foreground kill-and-respawn behind the manager's
+#: back would leave the manager's view of its own job wrong.
+FOREGROUND_ELIGIBLE = frozenset(
+    {"no_systemd", "no_user_unit", "no_launchd", "no_agent"}
+)
+
+#: ``(port) -> pid | None`` — the pid sidecar the gateway writes beside its
+#: run-marker (see :mod:`kiro_crew.instances.run_marker`).
+ReadPid = Callable[[int], "int | None"]
+#: ``(port) -> launcher path | None`` — the run-marker's recorded launcher.
+ReadLauncher = Callable[[int], "str | None"]
+#: ``() -> [port, ...]`` — ports named by run-markers on disk.
+MarkerPorts = Callable[[], "list[int]"]
+#: ``(pid) -> bool`` — liveness probe (``platform_compat.pid_exists``).
+PidExists = Callable[[int], bool]
+#: ``(argv) -> None`` — establish a DETACHED process running *argv*, raising
+#: ``OSError`` when it cannot be established. The seam the tests inject a fake
+#: through; the real one is :func:`default_detached_spawn`.
+DetachedSpawn = Callable[[list[str]], None]
+
+
+#: ``() -> reason | None`` — is THIS process confined in a way a spawned
+#: replacement gateway would inherit? See :func:`default_confinement`.
+Confinement = Callable[[], "str | None"]
+
+
+def default_confinement() -> "str | None":
+    """Why a process spawned from here would inherit confinement, or ``None``.
+
+    The app backend this code runs in is spawned by the gateway through
+    ``wrap_argv`` (+ ``cgroup_scope_argv``): on a sandbox-capable host it lives
+    inside a user/mount namespace (or macOS seatbelt) and the
+    ``kirocrew-agents.slice`` cgroup scope. Namespaces and cgroups are
+    INHERITED by children regardless of ``start_new_session``, so a
+    ``kirocrew restart`` spawned from here would produce a replacement gateway
+    that (a) sees the sandbox's altered filesystem view forever, (b) carries an
+    agent-sized ``MemoryMax``/``TasksMax`` ceiling for the whole gateway, and
+    (c) — because ``cli.main()`` clears the inherited ``KIROCREW_SANDBOX_ACTIVE``
+    marker — re-wraps its own agent spawns in a NESTED sandbox that may fail.
+    Worse, the detached child shares the backend's scope, so a scope kill
+    mid-restart could strand the host with NO gateway.
+
+    Detection is deny-by-default on the two purpose-built signals:
+
+    * ``KIROCREW_SANDBOX_ACTIVE`` — exported only by the namespace launcher /
+      seatbelt env prefix, i.e. only ever present INSIDE the sandbox.
+    * ``kirocrew-agents.slice`` in ``/proc/self/cgroup`` — the transient scope
+      ``cgroup_scope_argv`` places every backend in (Linux only; the file does
+      not exist elsewhere and an unreadable file is treated as unconfined,
+      matching hosts where the scope probe failed and no scope was applied).
+    """
+    if os.environ.get("KIROCREW_SANDBOX_ACTIVE"):
+        return "the Dev Fleet backend runs inside the Kiro Crew OS sandbox"
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if "kirocrew-agents.slice" in cgroup:
+        return "the Dev Fleet backend runs inside the kirocrew-agents cgroup scope"
+    return None
+
+
+def default_detached_spawn(argv: list[str]) -> None:
+    """Spawn *argv* detached from this process (new session / own group).
+
+    The command must OUTLIVE us — it is ``kirocrew restart``, which kills the
+    gateway that (transitively) owns this backend — so it gets its own session
+    on POSIX (immune to our SIGHUP/SIGTERM propagation and to the gateway's
+    process-group teardown of app backends) and a detached console-less group
+    on Windows, mirroring ``cli_server._spawn_detached_gateway``. Output goes
+    to the same ``gateway.log`` the ``logs`` command tails, falling back to
+    ``DEVNULL`` when the log cannot be opened (a restart must not be refused
+    over a diagnostics file).
+
+    Raises ``OSError`` when the process cannot be established; the caller
+    treats that as "no replacement path exists" and falls back to the manual
+    advisory WITHOUT having signalled anything.
+    """
+    stdout: "IO[str] | int"
+    try:
+        log_path = config_dir() / "gateway.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 — closed below
+    except OSError:
+        stdout = subprocess.DEVNULL
+    # argv is a validated launcher + fixed arguments (never LLM- or
+    # request-derived), same trust class as the systemd-run invocation the
+    # managed path issues.
+    try:
+        subprocess.Popen(  # noqa: S603
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            cwd=str(Path.home()),
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=(
+                platform_compat.DETACHED_PROCESS | platform_compat.CREATE_NEW_PROCESS_GROUP
+            ),
+        )
+    finally:
+        # Unlike cli_server's short-lived CLI process, this runs inside the
+        # long-lived app backend: the child holds its own duplicate of the fd
+        # after Popen, so the parent's copy must be closed on BOTH outcomes or
+        # every attempt (notably the failing ones, where the backend lives on)
+        # leaks a handle.
+        if not isinstance(stdout, int):
+            stdout.close()
+
+
+class ForegroundBackend:
+    """LAST-RESORT restart for a gateway that no service manager owns.
+
+    On a host where neither systemd nor launchd can be driven (see
+    :data:`FOREGROUND_ELIGIBLE`) the gateway is just a foreground/detached
+    process, with no manager to ask for a bounce: the fallback is for Make Live
+    to stage the live-target pointer and stop, telling the operator to run
+    ``kirocrew restart`` themselves. This backend performs exactly that command
+    FOR them, detached so it survives the death
+    of the gateway it bounces, and otherwise reuses the CLI's whole
+    kill-and-respawn path (lsof+SIGTERM the incumbent, wait, spawn a detached
+    replacement that reads the staged pointer, poll ``/api/ready``) rather than
+    reimplementing any of it.
+
+    Selection ordering is strictly systemd > launchd > foreground: callers only
+    construct this after the platform backend reported one of the
+    :data:`FOREGROUND_ELIGIBLE` codes, so no host that works today changes
+    behaviour.
+
+    **Identity.** There is no ``ExecMainStartTimestampMonotonic`` here, so
+    ``start_id`` is the pid the gateway records in its ``run/gateway-<port>.pid``
+    sidecar (written before readiness is published, cleared/rewritten by the
+    replacement) — the same identity ``kirocrew restart`` itself waits on, and
+    an opaque changes-on-replacement token exactly like the launchd PID the
+    dashboard handshake already consumes.
+
+    **Locating the gateway.** A gateway is a singleton per data home
+    (``gateway.lock``), and it prunes other ports' markers at startup, so the
+    run-markers normally name exactly one port. This backend requires exactly
+    ONE marker whose recorded pid is alive; zero (no gateway / no marker) or
+    several (stale crash leftovers that could make ``--port`` ambiguous) make it
+    report unavailable and the caller keeps the manual advisory.
+
+    **FAIL SAFE.** This class never signals any process itself. Its only
+    mutation is establishing the detached ``kirocrew restart``; when the binary
+    cannot be resolved or the spawn fails, nothing has been killed and the
+    running gateway is untouched — a failed restart that leaves no gateway is
+    far worse than the manual-advisory status quo.
+
+    **Confinement gate.** The Dev Fleet backend usually runs inside the
+    gateway-applied OS sandbox and ``kirocrew-agents.slice`` cgroup scope,
+    both of which a spawned replacement would inherit (see
+    :func:`default_confinement`). When confinement is detected this backend
+    reports unavailable and never spawns; only an unconfined backend (sandbox
+    off/unavailable on this host) may perform the foreground restart.
+    """
+
+    kind = "foreground"
+
+    def __init__(self, *, marker_ports: MarkerPorts, read_pid: ReadPid,
+                 read_launcher: ReadLauncher, pid_exists: PidExists,
+                 spawn: DetachedSpawn = default_detached_spawn,
+                 confinement: Confinement = default_confinement,
+                 ) -> None:
+        self._marker_ports = marker_ports
+        self._read_pid = read_pid
+        self._read_launcher = read_launcher
+        self._pid_exists = pid_exists
+        self._spawn = spawn
+        self._confinement = confinement
+
+    # -- discovery --
+    def _locate(self) -> "tuple[int, int] | None":
+        """``(port, pid)`` of the single live foreground gateway, or ``None``.
+
+        A marker is not proof of liveness (a crash leaves it behind), so only
+        markers whose recorded pid still exists count. Ambiguity — more than one
+        live (port, pid) — returns ``None`` rather than guessing which gateway
+        to bounce.
+        """
+        live: list[tuple[int, int]] = []
+        for port in self._marker_ports():
+            pid = self._read_pid(port)
+            if pid is not None and self._pid_exists(pid):
+                live.append((port, pid))
+        return live[0] if len(live) == 1 else None
+
+    @staticmethod
+    def _usable_launcher(path: "str | None") -> "str | None":
+        """*path* when it is an absolute, executable ``kirocrew`` file."""
+        if not path:
+            return None
+        p = Path(path)
+        # Basename check mirrors cli_server._own_console_script: a restart must
+        # exec the entry point it claims to be, never whatever an odd marker or
+        # PATH entry happens to name. .stem so a Windows ``kirocrew.exe`` would
+        # also pass, though callers currently construct this backend POSIX-only.
+        if p.stem != "kirocrew" or not p.is_absolute():
+            return None
+        try:
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        except OSError:
+            return None
+        return None
+
+    def _resolve_binary(self, port: int) -> "str | None":
+        """The ``kirocrew`` launcher to run the restart with, or ``None``.
+
+        ONLY the run-marker's recorded launcher — written by the running
+        gateway about ITSELF into the keystone-fenced ``run/`` dir (0600 inside
+        0700, on the sensitive-path floor), so the restart respawns the same
+        install/edition being replaced and the path is one no agent file tool
+        can have planted. A ``shutil.which("kirocrew")`` fallback is
+        deliberately ABSENT: ``PATH`` for this backend includes user-writable
+        directories (``~/.local/bin``), so an agent-planted impostor could be
+        executed by an operator's Make Live click. A host whose marker records
+        no launcher (a source-tree ``python -m kiro_crew`` launch) keeps the
+        manual advisory — never a guessed or PATH-trusted binary.
+        """
+        return self._usable_launcher(self._read_launcher(port))
+
+    # -- protocol subset (status / identity / restart / plan) --
+    async def status(self) -> str:
+        """``ok`` when a restart can actually be attempted on this host."""
+
+        def _probe() -> str:
+            if self._confinement() is not None:
+                return "backend_confined"
+            located = self._locate()
+            if located is None:
+                return "no_foreground_gateway"
+            if self._resolve_binary(located[0]) is None:
+                return "no_kirocrew_binary"
+            return STATUS_OK
+
+        return await _off_loop(_probe)
+
+    async def start_id(self) -> "str | None":
+        """The recorded gateway pid, or ``None`` (callers degrade, never wait)."""
+        located = await _off_loop(self._locate)
+        return None if located is None else str(located[1])
+
+    async def restart_detached(self) -> "tuple[bool, str]":
+        """Establish a detached ``kirocrew restart``. ``(ok, error)``.
+
+        Re-resolves rather than trusting an earlier ``status()``: the gateway
+        (and its marker) can change between the probe and the act. On ANY
+        failure nothing has been signalled — the incumbent keeps running and
+        the caller keeps the manual advisory.
+        """
+        def _restart_sync() -> "tuple[bool, str]":
+            confined = self._confinement()
+            if confined is not None:
+                # A replacement spawned from inside the sandbox/cgroup scope would
+                # inherit that confinement for the gateway's whole lifetime — and a
+                # scope kill mid-restart could strand the host with no gateway.
+                return False, confined
+            located = self._locate()
+            if located is None:
+                return False, "no single live foreground gateway to restart"
+            port, _pid = located
+            kcbin = self._resolve_binary(port)
+            if kcbin is None:
+                return False, "kirocrew binary could not be resolved"
+            # --port pins the restart to the gateway the marker names, exactly as
+            # cli_server passes the resolved port to its own detached spawn — the
+            # child must not re-resolve and disagree.
+            try:
+                self._spawn([kcbin, "restart", "--port", str(port)])
+            except OSError as exc:
+                return False, f"could not establish detached restart: {exc}"[:200]
+            return True, ""
+
+        # cgroup read, marker scan, launcher stats, log open and the Popen itself
+        # are all blocking: one executor hop for the whole act.
+        return await _off_loop(_restart_sync)
+
+    def plan(self, worktree: Path, kcbin: Path) -> dict:
+        """Describe — without mutating anything — how the restart would run."""
+        located = self._locate()
+        port = located[0] if located is not None else None
+        resolved = self._resolve_binary(port) if port is not None else None
+        return {
+            "restart_backend": "foreground",
+            "restart_command": (
+                f"{resolved} restart --port {port}"
+                if resolved is not None and port is not None
+                else "kirocrew restart"
+            ),
+        }
+
+
 # --- selection ---------------------------------------------------------------
 
 def backend(run_cmd: RunCmd, *, unit: Callable[[], str],
@@ -564,13 +908,13 @@ def backend(run_cmd: RunCmd, *, unit: Callable[[], str],
     ``platform`` and ``which`` are INJECTED rather than read from this module's
     own ``sys`` / ``shutil``. The caller resolves them through its own module
     globals, which keeps the existing test seams working: the dev_fleet tests
-    drive platform detection by patching ``server.sys`` / ``server.shutil``, and
+    drive platform detection by patching ``live.sys`` / ``live.shutil``, and
     a direct read here would silently escape those patches — the Linux paths
-    would then be "passing" tests that no longer exercise them.
+    would then be "passing" tests that do not exercise them.
 
     ``None`` is NOT "everything is fine, just hide the buttons" — callers must
     surface it as an explicit, reasoned unavailability (see
-    ``_gateway_service_state`` in ``server.py``), because a silently hidden
+    ``_gateway_service_reason`` in ``live.py``), because a silently hidden
     Restart control is exactly how the macOS gap went unnoticed.
     """
     if platform == "linux":

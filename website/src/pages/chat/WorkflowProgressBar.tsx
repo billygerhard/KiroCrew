@@ -1,15 +1,17 @@
 import { useEffect, useMemo, memo, useState } from 'react'
 import { Workflow, Loader2, CheckCircle2, AlertCircle, ChevronDown } from 'lucide-react'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { clearWorkflowRun } from '../../store/chatSlice'
+import { clearWorkflowRun, isTerminalWorkflowStatus, reconcileWorkflowRuns } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { WorkflowRunProgress } from '../../store/chatSlice'
 import WorkflowRunTree from '../../apps/workflows/WorkflowRunTree'
 import WorkflowSourcePanel from '../../apps/workflows/WorkflowSourcePanel'
 import { useRunSnapshot } from '../../apps/workflows/useRunSnapshot'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
+import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const EMPTY_RUNS: Record<string, WorkflowRunProgress> = {}
 // How long a finished/failed/cancelled run lingers before being dropped.
 const TERMINAL_LINGER_MS = 4000
@@ -24,6 +26,7 @@ const TERMINAL_LINGER_MS = 4000
  *  The full run snapshot (with events + source) is fetched on expand and
  *  refreshed every ~2s while the run is still running. */
 const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: string | null }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const runs = useAppSelector(s => s.chat.workflowRuns ?? EMPTY_RUNS)
   // Only show runs launched FROM this chat session — a run sticks to the chat
@@ -73,9 +76,29 @@ const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: 
 
   if (visible.length === 0) return null
 
+  // This band sits BETWEEN the virtualized transcript and the composer, and is
+  // not a shrinkable flex item — so an unbounded expanded body (phase tree +
+  // result + View source, easily taller than the viewport) grows the band until
+  // the composer is clipped out of view entirely. Cap it and scroll internally,
+  // the same way the sibling TaskProgressBar caps its expanded list.
+  // Applied only while something is expanded so the collapsed one-liner keeps
+  // its exact previous rendering and never shows a stray scrollbar.
+  // overscroll-contain stops a scroll that bottoms out here from chaining into
+  // the transcript behind it.
+  const anyExpanded = visible.some(r => expanded[r.run_id])
+
   return (
-    <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <div className="mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up overflow-hidden">
+    // `relative z-[2]` clears the transcript's bottom mask (`z-[1]`), which
+    // overshoots below the scrollport edge for a composer status stack it assumes
+    // is empty. Whenever this bar is the topmost thing in that stack, an auto
+    // z-index let the mask's opaque tail shave its top border and corners.
+    <div className="px-4 mx-auto w-full relative z-[2]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+      <div
+        data-testid="workflow-progress-bar"
+        className={`mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up ${
+          anyExpanded ? 'max-h-[45vh] overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden'
+        }`}
+      >
         {visible.map(r => (
           <ExpandableRunRow
             key={r.run_id}
@@ -111,6 +134,23 @@ function ExpandableRunRow({
     enabled: expanded,
   })
 
+  // The snapshot IS the authority, so a row still stored as running while its own
+  // snapshot reports a terminal status is a missed terminal frame — the header
+  // would otherwise keep spinning next to a tree that already says "finished".
+  // Routed through the same monotonic merge as the connect-time reconcile, so it
+  // can only ever advance a running row, never rewind one.
+  const dispatch = useAppDispatch()
+  const snapStatus = snapshot?.status
+  useEffect(() => {
+    if (run.status !== 'running') return
+    if (!isTerminalWorkflowStatus(snapStatus)) return
+    dispatch(reconcileWorkflowRuns([{
+      run_id: run.run_id,
+      status: snapStatus,
+      error: snapshot?.error ?? undefined,
+    }]))
+  }, [dispatch, run.run_id, run.status, snapStatus, snapshot?.error])
+
   return (
     <div className="border-b border-accent/10 last:border-b-0">
       <button
@@ -121,7 +161,7 @@ function ExpandableRunRow({
       >
         <span className="shrink-0 mt-0.5">
           {run.status === 'running' && <Loader2 size={14} className="text-accent animate-spin" />}
-          {run.status === 'finished' && <CheckCircle2 size={14} className="text-green-500" />}
+          {run.status === 'finished' && <CheckCircle2 size={14} className="text-ok" />}
           {(run.status === 'failed' || run.status === 'cancelled') && <AlertCircle size={14} className="text-danger" />}
         </span>
         <div className="min-w-0 flex-1">
@@ -135,23 +175,32 @@ function ExpandableRunRow({
           {run.status === 'running' && lastLog && (
             <div className="text-muted truncate italic text-[12px]">{lastLog}</div>
           )}
-          {run.status === 'failed' && errMsg && (
-            <div className="text-danger truncate text-[12px]">{errMsg}</div>
-          )}
         </div>
         <ChevronDown
           size={14}
           className={`text-muted shrink-0 mt-0.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
         />
       </button>
+      {/* Outside the toggle button, not inside it as the plain red line was:
+          the notice carries its own hand-off button, and a button inside a
+          button is invalid markup that screen readers flatten. askAgent on —
+          the bar is a status surface with nothing editable, and the composer
+          draft beneath it is persisted per slot, so a hand-off loses nothing. */}
+      {run.status === 'failed' && errMsg && (
+        <div className="pl-9 pr-3 pb-1.5">
+          <ErrorNotice variant="inline" message={errMsg} askAgent testId="workflow-run-error" />
+        </div>
+      )}
 
       {expanded && (
         <div className="px-3 pb-2 pt-1 flex flex-col gap-2">
-          {snapshotError && (
-            <div className="text-[11px] text-red-500 border border-red-500/30 rounded p-2">
-              {i18nT('pages.chat.workflowProgressBar.could_not_load_run_snapshot')} {sanitizeLlmOutput(snapshotError).slice(0, 200)}
-            </div>
-          )}
+          {/* The label is the `title` and the backend reason the `message`, so
+              the reason stays the journal lookup key for the hand-off. */}
+          <ErrorNotice
+            title={i18nT('pages.chat.workflowProgressBar.could_not_load_run_snapshot')}
+            message={snapshotError ? sanitizeLlmOutput(snapshotError).slice(0, 200) : null}
+            askAgent
+          />
           <WorkflowRunTree
             events={snapshot?.events ?? []}
             status={
@@ -160,6 +209,7 @@ function ExpandableRunRow({
             }
             result={snapshot?.result}
             error={snapshot?.error ?? run.error ?? null}
+            errorCode={snapshot?.error_code}
           />
           <WorkflowSourcePanel
             run_id={run.run_id}

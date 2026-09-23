@@ -22,7 +22,9 @@ pinned ``pytest`` for async fixtures.
 from __future__ import annotations
 
 import dataclasses
+import http.server
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -88,6 +90,29 @@ def profiles_dir(tmp_path, monkeypatch):
     gp.reset_store()
     yield directory
     gp.reset_store()
+
+
+@pytest.fixture(autouse=True)
+def no_agent_spec_rewrite(monkeypatch):
+    """Never let a test rewrite the operator's real ``~/.kiro/agents``.
+
+    Flipping the computer-use enable rebuilds the agent spec (the enable is a
+    spec-emission gate, so the tools would otherwise not appear until the next
+    gateway start). That rebuild writes ``~/.kiro/agents/kirocrew.json``, which is
+    machine-wide and deliberately NOT under the ``KIROCREW_HOME`` this module's
+    ``home`` fixture redirects — so every enable-flipping test would touch the
+    developer's live agent config, and a plain clone (CI, or a checkout that is not
+    a git worktree) has no guard that stops it.
+
+    Autouse rather than per-test: this file has a dozen tests that flip the enable
+    for unrelated reasons (auth, validation, corrupt-file handling), and each new
+    one would silently inherit the problem. The three tests that ASSERT on the
+    rebuild re-patch it with their own recorder, which still wins — a later
+    ``monkeypatch.setattr`` overrides this one and both unwind at teardown.
+    """
+    import kiro_crew.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", lambda **_: Path("/dev/null"))
 
 
 @pytest.fixture(autouse=True)
@@ -297,7 +322,8 @@ class TestPermissionProbe:
 
         async def _spawn(*argv, **_kw):
             # Fixed argv, no shell, nothing request-derived.
-            assert argv[1:] == (cu_api.DOCTOR_SUBCOMMAND, *cu_api.DOCTOR_ARGS)
+            expected = (cu_api.DOCTOR_SUBCOMMAND, *cu_api.DOCTOR_ARGS)
+            assert argv[-len(expected) :] == expected
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", _spawn)
@@ -829,22 +855,15 @@ class TestConfigSection:
         assert "computer_use" in KiroCrewConfig.load().to_dict()
 
     def test_state_path_is_on_the_keystone_floor(self):
+        from kiro_crew import sandbox
         from kiro_crew.config.loader import computer_use_state_path
-        from kiro_crew.security import (
-            _CREW_SECRET_LEAVES,
-            is_sensitive_bash_command,
-            is_sensitive_path,
-        )
+        from kiro_crew.security import _CREW_SECRET_LEAVES, is_sensitive_path
 
         assert "computer_use.json" in _CREW_SECRET_LEAVES
         assert computer_use_state_path().name == "computer_use.json"
         assert is_sensitive_path("~/.kiro/crew/computer_use.json") is True
-        for command in (
-            "cat ~/.kiro/crew/computer_use.json",
-            "echo x > ~/.kiro/crew/computer_use.json",
-            "tee ~/.kiro/crew/computer_use.json",
-        ):
-            assert is_sensitive_bash_command(command)
+        # The shell plane is sealed by the sandbox, not matched by text.
+        assert "computer_use.json" in sandbox._CREW_READONLY_LEAVES
 
 
 # ── POST /api/computer-use/frame — the live-view (PiP) ingress ──
@@ -1168,6 +1187,106 @@ class TestLiveViewSuppression:
         assert no_real_post == []
 
 
+class TestTheFrameRelayIsNeverProxied:
+    """The relay POST carries the gateway's local secret, so it must not proxy.
+
+    ``urlopen`` builds its opener from ``getproxies()`` and urllib has no implicit
+    loopback exemption, so with ``http_proxy`` set — routine in a container or on a
+    corporate desktop — a POST to ``http://127.0.0.1:<port>`` goes to the proxy in
+    absolute form with ``X-Internal-Secret`` attached, in cleartext. The relay runs
+    through ``loopback_urlopen``, whose opener carries an explicit
+    ``ProxyHandler({})``.
+
+    ``_post_frame`` is called DIRECTLY rather than through ``emit_snapshot_frame``:
+    every other case in this file replaces ``_post_frame`` wholesale, so the
+    transport inside it is the one part of the relay with no coverage at all.
+
+    Both listeners are real sockets on port 0, following ``test_cron_trigger.py`` —
+    the kernel hands out a free port, so no ``xdist_group`` marker is needed.
+    """
+
+    SECRET = "canary-not-a-real-frame-secret"
+
+    # ``getproxies_environment`` ignores uppercase ``HTTP_PROXY`` when
+    # ``REQUEST_METHOD`` is set (the httpoxy CGI guard), so that is cleared too —
+    # otherwise a CI runner exporting it would make this pass vacuously.
+    _PROXY_ENV_KEYS = (
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+        "REQUEST_METHOD",
+    )
+
+    @staticmethod
+    def _serve(sink: list):
+        """A listener that records the secret header it saw, then answers 200."""
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):  # noqa: N802 - stdlib naming
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                sink.append(
+                    {
+                        "requestline": self.requestline,
+                        "secret": self.headers.get("X-Internal-Secret"),
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, fmt, *args):
+                pass  # keep pytest output clean
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, server.server_address[1]
+
+    def test_the_secret_reaches_the_gateway_and_never_the_proxy(self, home, monkeypatch):
+        from kiro_crew.computer_use import screencast
+
+        gateway_hits: list[dict] = []
+        proxy_hits: list[dict] = []
+        gateway, gateway_port = self._serve(gateway_hits)
+        proxy, proxy_port = self._serve(proxy_hits)
+        try:
+            for key in self._PROXY_ENV_KEYS:
+                monkeypatch.delenv(key, raising=False)
+            monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_port}")
+            # The real ``_headers()`` runs, so the header the ingress authenticates
+            # with is the one under test rather than a literal in this file.
+            (home / ".local_secret").write_text(self.SECRET, encoding="utf-8")
+            monkeypatch.setattr(
+                screencast,
+                "_ingress_url",
+                lambda: f"http://127.0.0.1:{gateway_port}{screencast.FRAME_INGRESS_PATH}",
+            )
+
+            screencast._post_frame({"data": "QUJD", "format": "jpeg"})
+
+            assert proxy_hits == [], f"the frame secret reached the proxy: {proxy_hits}"
+            # Positive leg too: ``_post_frame`` swallows every failure, so "the proxy
+            # saw nothing" alone would also pass if the POST had never happened.
+            assert [h["secret"] for h in gateway_hits] == [self.SECRET]
+            # Origin-form request line confirms a direct connection rather than a
+            # proxied one, which is sent absolute-form.
+            assert gateway_hits[0]["requestline"].startswith(
+                f"POST {screencast.FRAME_INGRESS_PATH}"
+            )
+        finally:
+            gateway.shutdown()
+            proxy.shutdown()
+
+
 class TestInvokePublishesTheFrameScope:
     """The invoke leg is what makes a capture attributable to a surface."""
 
@@ -1252,7 +1371,7 @@ class TestAnAppTokenCannotWriteTheKeystone:
     ``enable_state.save_state`` deliberately bypasses ``is_sensitive_path`` — that is
     what lets the operator's own Settings panel write a file the agent cannot read or
     write with a tool. So this handler is the only thing standing between an
-    App-Kit-scoped token and ``enabled: true``. It used to check nothing at all:
+    App-Kit-scoped token and ``enabled: true``. Checking nothing is unsafe:
     ``request["user"]`` is truthy for an app token too, and an app whose manifest
     declares ``permissions.api: ["/api/computer-use"]`` passes
     ``app_token_path_allowed`` (verified: a bare ``/api/computer-use`` pattern matches
@@ -1310,7 +1429,7 @@ class TestAnAppTokenCannotWriteTheKeystone:
 class TestMixedSaveIsAllOrNothing:
     """A mixed state+limits PUT must not half-apply (reviewer finding).
 
-    The keystone write lands first, so a corrupt ``config.json`` used to leave the
+    The keystone write lands first, so a corrupt ``config.json`` can leave the
     SECURITY state applied — the feature enabled, or the real-pointer opt-in set —
     while the response told the operator the save had failed. The ceiling had moved
     and nothing said so.
@@ -1421,7 +1540,11 @@ class TestEnableRestartsSessions:
 
     @staticmethod
     def _spy(monkeypatch) -> list:
-        """Record calls to ``_reset_all_sessions`` without touching real sessions."""
+        """Record calls to ``_reset_all_sessions`` without touching real sessions.
+
+        The spec rebuild the enable flip performs is stubbed module-wide by the
+        ``no_agent_spec_rewrite`` autouse fixture, so it needs no handling here.
+        """
         calls: list = []
         import kiro_crew.dashboard.handlers.sessions as sessions_mod
 
@@ -1497,6 +1620,162 @@ class TestEnableRestartsSessions:
         assert body["sessions_reset"] == 0
         assert json.loads(state_file.read_text())[STATE_KEY_ENABLED] is True
 
+    @pytest.mark.asyncio
+    async def test_the_flip_REBUILDS_the_agent_spec(self, state_file, monkeypatch):
+        """The enable is a spec-emission gate, so the reset needs a fresh spec.
+
+        ``agent._computer_use_spec_gate`` keeps ``kirocrew-computer`` out of the
+        emitted spec while the keystone is off, so restarting sessions without
+        rebuilding would restart them into a spec that still omits the server —
+        the operator enables the feature and the tools appear only after the next
+        gateway start.
+        """
+        import kiro_crew.agent as agent_mod
+
+        self._spy(monkeypatch)
+        built: list = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **k: (built.append(k), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert len(built) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_NO_OP_resave_does_not_rebuild(self, state_file, monkeypatch):
+        """Same narrowness as the reset: no transition, no work."""
+        import kiro_crew.agent as agent_mod
+
+        state_file.write_text(json.dumps({STATE_KEY_ENABLED: True}), encoding="utf-8")
+        self._spy(monkeypatch)
+        built: list = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **k: (built.append(k), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert built == []
+
+    @pytest.mark.asyncio
+    async def test_the_spec_rebuild_HOLDS_the_config_lock(self, state_file, monkeypatch):
+        """**The rebuild must not escape the lock that serialises keystone writes.**
+
+        The rebuild READS the keystone and WRITES the spec. Outside the lock, two
+        overlapping PUTs interleave: an enable's slower rebuild can land its spec
+        AFTER a later disable's, leaving a spec that mounts — and therefore spawns
+        — the server the keystone now forbids. Holding the lock makes
+        read-decide-write atomic against every keystone writer, so whichever
+        rebuild finishes last is the one that read the final state.
+
+        Asserted on the lock's own state at rebuild time rather than on source
+        order: a lock acquired and released before the call would read the same in
+        the source and fix nothing.
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        self._spy(monkeypatch)
+        # Resolved on the loop: ``_get_config_lock`` needs a running loop, and the
+        # rebuild itself runs in a worker thread where there is none.
+        lock = _get_config_lock()
+        held: list[bool] = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **_: (held.append(lock.locked()), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert held == [True], "the spec rebuild ran outside the config lock"
+
+    @pytest.mark.asyncio
+    async def test_no_test_here_can_reach_the_REAL_spec_rebuild(self, state_file, monkeypatch):
+        """Ratchet for the ``no_agent_spec_rewrite`` autouse fixture.
+
+        Without this, deleting that fixture fails nothing: every test would still
+        pass while quietly rewriting the developer's ``~/.kiro/agents``. The
+        assertion is behavioural — it flips the enable for real and checks that
+        what the handler called was the stub, not the module's own function.
+        """
+        import kiro_crew.agent as agent_mod
+
+        reached: list[str] = []
+        current = agent_mod.rebuild_agent_config
+        if getattr(current, "__name__", "") != "<lambda>":
+            # The guard is gone; install a tripwire so the call is observable.
+            monkeypatch.setattr(
+                agent_mod,
+                "rebuild_agent_config",
+                lambda **_: (reached.append("real"), Path("/dev/null"))[1],
+            )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert reached == [], (
+            "the real rebuild_agent_config was reachable — the no_agent_spec_rewrite "
+            "autouse fixture is missing or no longer autouse"
+        )
+
+    @pytest.mark.asyncio
+    async def test_patching_the_agent_module_REACHES_the_handler(self, state_file, monkeypatch):
+        """The guard above only works because the import resolves at CALL time.
+
+        ``api_computer_use_config_save`` imports ``rebuild_agent_config`` inside the
+        function. Hoisting it to module scope would bind the name at import time,
+        so patching ``kiro_crew.agent`` would not reach this call site — and
+        the guard above would keep passing while every enable-flipping test wrote
+        the operator's real ``~/.kiro/agents`` again.
+
+        Asserted POSITIVELY (the stub must have run), because "the real one did not
+        run" is also true when nothing ran at all.
+        """
+        import kiro_crew.agent as agent_mod
+
+        ran: list[str] = []
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config",
+            lambda **_: (ran.append("stub"), Path("/dev/null"))[1],
+        )
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+        assert resp.status == 200
+        assert ran == ["stub"], (
+            "patching kiro_crew.agent no longer reaches the handler's call site — the "
+            "import was hoisted to module scope, which defeats no_agent_spec_rewrite"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rebuild_does_not_fail_the_SAVE(self, state_file, monkeypatch):
+        """Same rule the reset already followed: the write landed and was audited.
+
+        The fallback is the pre-existing behaviour — the tool surface appears on
+        the next gateway start — and the sessions are still reset, because a stale
+        ``tools/list`` is a separate problem from a stale spec.
+        """
+        import kiro_crew.agent as agent_mod
+
+        calls = self._spy(monkeypatch)
+
+        def _boom(**_):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config", _boom)
+        async with _client() as client:
+            resp = await client.put("/api/computer-use/config", json={"enabled": True})
+            body = await resp.json()
+        assert resp.status == 200
+        assert body["enabled"] is True
+        assert len(calls) == 1
+        assert json.loads(state_file.read_text())[STATE_KEY_ENABLED] is True
+
 
 class TestAMalformedKeystoneStillRendersSettings:
     """GPT 5.6 BLOCKING, confirmed: a hand-edited keystone 500'd the config GET.
@@ -1568,3 +1847,204 @@ class TestAMalformedKeystoneStillRendersSettings:
         state_file.write_text(json.dumps({"enabled": True, "allowed_apps": "Preview"}))
         with pytest.raises(PolicyStateError):
             enable_state.load_policy_config()
+
+
+# ── Machine-readable error codes ──
+
+
+class TestErrorCodes:
+    """Every refusal from this module carries a machine-readable ``code``.
+
+    The contract gate in ``test/test_error_code_contract.py`` inventories
+    prose-only refusals in ``error-code-baseline.json``; this module held 20 of
+    them. The prose is kept and keeps its meaning -- it is demoted to advisory,
+    not removed -- so a client that only reads ``error`` is unaffected.
+
+    Both of this module's consumers are already built for the code, which is why
+    this conversion is backend-only:
+
+    * the browser panel (``website/src/pages/settings/ComputerUsePanel.tsx``)
+      never renders the server's prose -- its ``onError`` shows a fixed localized
+      string -- so there is no copy to move and no catalog to translate;
+    * the stdio shim reaches ``/invoke`` through ``mcp_core._http_error_body``,
+      which ALREADY parses a top-level ``code``, validates it as
+      ``[a-z0-9_.-]{1,64}`` and passes it on, and the capture thread's
+      ``screencast._post_frame`` discards the response body entirely.
+    """
+
+    # -- the per-file ratchet --
+    #
+    # The repo-wide gate only fails on a NET regression, so it would let a new
+    # prose-only refusal land here behind an unrelated deletion. These two run
+    # the gate's OWN scanner, so the per-file rule cannot drift from it.
+
+    @staticmethod
+    def _findings():
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_error_code_contract as gate
+
+        return [f for f in gate.scan() if f.path == "dashboard/handlers/computer_use.py"]
+
+    def test_no_refusal_in_this_module_is_prose_only(self) -> None:
+        missing = sorted(f.lineno for f in self._findings() if f.bucket == "missing_code")
+        assert missing == [], (
+            "these src/kiro_crew/dashboard/handlers/computer_use.py lines refuse with "
+            f"prose and no machine-readable code: {missing}"
+        )
+
+    def test_the_ratchet_can_actually_fail(self) -> None:
+        """Self-check: a scan matching nothing would pass the assertion above vacuously."""
+        coded = [f for f in self._findings() if f.bucket == "compliant"]
+        assert len(coded) == 20, f"scanner reached {len(coded)} coded sites, expected 20"
+        assert all(f.code_value for f in coded)
+
+    # -- PUT /api/computer-use/config --
+
+    @staticmethod
+    async def _put(client: TestClient, body) -> tuple[int, dict]:
+        resp = await client.put("/api/computer-use/config", json=body)
+        return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    async def test_body_is_not_a_json_object(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, ["enabled"])
+        assert status == 400
+        assert body["code"] == "body_not_object"
+        assert body["error"]
+
+    @pytest.mark.asyncio
+    async def test_enabled_of_the_wrong_type(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, {"enabled": "yes"})
+        assert status == 400
+        assert body["code"] == "invalid_field_type"
+
+    @pytest.mark.asyncio
+    async def test_an_integer_limit_of_the_wrong_type(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, {"max_tree_nodes": "1200"})
+        assert status == 400
+        assert body["code"] == "invalid_field_type"
+
+    @pytest.mark.asyncio
+    async def test_an_integer_limit_out_of_range_is_a_different_code(self, home: Path) -> None:
+        """The distinction a caller cannot make without matching English.
+
+        A value of the right type that is simply too large is a different refusal
+        from a value of the wrong type, and only the code separates them.
+        """
+        async with _client() as client:
+            status, body = await self._put(client, {"max_tree_nodes": 10**9})
+        assert status == 400
+        assert body["code"] == "value_out_of_range"
+
+    @pytest.mark.asyncio
+    async def test_a_boolean_limit_of_the_wrong_type(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, {"attach_screenshot": 1})
+        assert status == 400
+        assert body["code"] == "invalid_field_type"
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_app_pattern_list(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, {"allowed_apps": "Preview"})
+        assert status == 400
+        assert body["code"] == "invalid_app_patterns"
+
+    @pytest.mark.asyncio
+    async def test_a_body_naming_no_known_field(self, home: Path) -> None:
+        async with _client() as client:
+            status, body = await self._put(client, {"nothing_we_know": True})
+        assert status == 400
+        assert body["code"] == "no_known_fields"
+
+    # -- POST /api/computer-use/invoke (machine leg) --
+
+    @pytest.mark.asyncio
+    async def test_invoke_without_a_tool(self, home: Path) -> None:
+        async with _client() as client:
+            resp = await client.post("/api/computer-use/invoke", json={"args": {}})
+            body = await resp.json()
+        assert resp.status == 400
+        assert body["code"] == "tool_required"
+
+    @pytest.mark.asyncio
+    async def test_invoke_with_non_object_args(self, home: Path) -> None:
+        async with _client() as client:
+            resp = await client.post(
+                "/api/computer-use/invoke", json={"tool": "screenshot", "args": ["a"]}
+            )
+            body = await resp.json()
+        assert resp.status == 400
+        assert body["code"] == "invalid_args"
+
+    @pytest.mark.asyncio
+    async def test_the_code_survives_the_shims_own_error_decoder(self, home: Path) -> None:
+        """The code is only worth adding if the shim's decoder keeps it.
+
+        ``mcp_core._http_error_body`` drops any ``code`` that is not a short
+        identifier, so this drives the REAL decoder over this handler's REAL body
+        rather than asserting that the two shapes look compatible.
+        """
+        import io as _io
+        import urllib.error
+
+        from kiro_crew.mcp_core import _http_error_body
+
+        async with _client() as client:
+            resp = await client.post("/api/computer-use/invoke", json={"args": {}})
+            raw = await resp.read()
+
+        decoded = _http_error_body(
+            urllib.error.HTTPError(
+                "http://127.0.0.1/api/computer-use/invoke",
+                400,
+                "Bad Request",
+                {},
+                _io.BytesIO(raw),
+            )
+        )
+        assert decoded["code"] == "tool_required"
+
+    # -- POST /api/computer-use/frame (machine leg) --
+
+    @pytest.mark.asyncio
+    async def test_frame_without_the_internal_secret(self, home: Path) -> None:
+        async with TestClient(TestServer(_frame_app(grant_internal_auth=False))) as client:
+            resp = await client.post("/api/computer-use/frame", json=_VALID_FRAME)
+            body = await resp.json()
+        assert resp.status == 403
+        assert body["code"] == "internal_secret_required"
+
+    @pytest.mark.asyncio
+    async def test_frame_carrying_no_frame_data(self, home: Path) -> None:
+        async with TestClient(TestServer(_frame_app())) as client:
+            resp = await client.post("/api/computer-use/frame", json={"format": "jpeg"})
+            body = await resp.json()
+        assert resp.status == 400
+        assert body["code"] == "no_frame_data"
+
+    # -- the behavioural ratchet --
+
+    @pytest.mark.asyncio
+    async def test_every_config_refusal_carries_both_a_code_and_its_prose(self, home: Path) -> None:
+        """No refusal path may regress to prose-only, and none may drop the advisory
+        text an existing client still reads."""
+        for payload in (
+            ["enabled"],
+            {"enabled": "yes"},
+            {"max_tree_nodes": "1200"},
+            {"max_tree_nodes": 10**9},
+            {"attach_screenshot": 1},
+            {"allowed_apps": "Preview"},
+            {"nothing_we_know": True},
+        ):
+            async with _client() as client:
+                status, body = await self._put(client, payload)
+            assert status == 400, payload
+            assert isinstance(body.get("code"), str) and body["code"], payload
+            assert isinstance(body.get("error"), str) and body["error"], payload

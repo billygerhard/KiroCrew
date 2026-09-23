@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
+import dashboardReducer from '../store/dashboardSlice'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
@@ -48,8 +49,13 @@ function makeStore(parentMessages: Array<{ role: string; content: string }> = []
     },
   }
   return configureStore({
-    reducer: { chat: chatReducer },
-    preloadedState: preloaded as never,
+    // SideChat reads the gateway flag through useConnected (s.dashboard.connected),
+    // so the store needs the dashboard slice; preload it connected so sends work.
+    reducer: { chat: chatReducer, dashboard: dashboardReducer },
+    preloadedState: {
+      ...(preloaded as object),
+      dashboard: { ...dashboardReducer(undefined, { type: '@@INIT' }), connected: true },
+    } as never,
   })
 }
 
@@ -118,10 +124,13 @@ describe('SideChat stale-context banner', () => {
     fireEvent.change(textarea, { target: { value: 'doomed q' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => {
-      expect(screen.getByText('doomed q')).toBeInTheDocument()
+      expect(store.getState().chat.slotSide['slot-1']?.messages).toHaveLength(1)
     })
+    // Rolled back out of the transcript — and handed back to the composer rather
+    // than lost, since a rejected submit is a reachable path (e.g. queue full).
     await waitFor(() => {
-      expect(screen.queryByText('doomed q')).not.toBeInTheDocument()
+      expect(store.getState().chat.slotSide['slot-1']?.messages ?? []).toHaveLength(0)
     })
+    expect(textarea).toHaveValue('doomed q')
   })
 })

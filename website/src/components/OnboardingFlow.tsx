@@ -6,12 +6,14 @@ import { ArrowRight, Check, Monitor, Sun, Moon } from 'lucide-react'
 import { useTheme, type ModePreference, type ColorTheme } from '../hooks/useTheme'
 import { GhostWithArm } from '../assets/onboarding/GhostIcons'
 import { Btn, SendBtn } from './ui'
+import ErrorNotice from './ErrorNotice'
 import OnboardingChapterShell, { OnboardingShellContext } from './OnboardingChapterShell'
 import { api } from '../api/client'
 import { capRoleOther, clampRoleOther } from '../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../lib/profileOptions'
 
 import { i18nT } from '../i18n/t'
+import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
 /**
  * First-run onboarding flow (5 steps) — the Customize chapter plus the feature
  * tour. It is the LAST of the three first-run chapters: Import setup runs first,
@@ -137,6 +139,7 @@ export default function OnboardingFlow({
   // onComplete when the host does not distinguish the two.
   onSkipAll?: () => void
 }) {
+  const ime = useImeGuard()
   const navigate = useNavigate()
   const {
     colorTheme,
@@ -156,6 +159,13 @@ export default function OnboardingFlow({
   // Which dialog step already received its initial focus (see the trap effect).
   // Reset on close so reopening focuses again.
   const initialFocusKeyRef = useRef('')
+  // Shared IME latch for the modal-step Tab trap below (steps 1-2 only, like
+  // the trap itself): a Tab that lands during an IME composition (or its
+  // post-`compositionend` window) is choosing a candidate, not leaving the
+  // field, so the trap must decline it instead of yanking focus and aborting
+  // the composition (`useDialogFocusTrap` is the reference consumer of the
+  // same seam).
+  const imeLatch = useDocumentImeLatch(open && step <= 2)
 
   // ── Step-2 profile state ──────────────────────────────────────────────────
   const [role, setRole] = useState('')
@@ -442,19 +452,25 @@ export default function OnboardingFlow({
       if (items.length === 0) return
       const first = items[0]
       const last = items[items.length - 1]
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault()
-        last.focus()
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault()
-        first.focus()
-      }
+      const wrapsBackward = e.shiftKey && document.activeElement === first
+      const wrapsForward = !e.shiftKey && document.activeElement === last
+      // A mid-dialog Tab is the browser's to move, so it is also not the
+      // trap's to claim — claiming it would consume legitimate navigation
+      // inside the post-composition latch window.
+      if (!wrapsBackward && !wrapsForward) return
+      // A Tab the IME owns must not cycle focus — the user is choosing a
+      // candidate, not leaving the field. `claimKey` owns the whole decline;
+      // it must run before the preventDefault() and focus move so the IME
+      // keeps the key (see its contract in useImeGuard.ts).
+      if (!imeLatch.claimKey(e)) return
+      e.preventDefault()
+      ;(wrapsBackward ? last : first).focus()
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
     // shellHost?.sectionSlot: in host mode the dialog mounts a pass after the
     // flow opens, so re-run once it exists to install the trap + initial focus.
-  }, [open, step, skipAll, savingProfile, dialogRef, shellHost?.sectionSlot])
+  }, [open, step, skipAll, savingProfile, dialogRef, shellHost?.sectionSlot, imeLatch])
 
   if (!open) return null
 
@@ -488,7 +504,7 @@ export default function OnboardingFlow({
         panelFootnote={i18nT('components.onboardingFlow.change_anything_later_in_settings')}
         header={
           <div className="mt-6">
-            <h1 tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-none">
+            <h1 tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-hidden">
               {i18nT('components.onboardingFlow.pick_your_look')}
             </h1>
             <p className="mt-2 text-sm leading-relaxed text-muted">
@@ -564,7 +580,7 @@ export default function OnboardingFlow({
         panelFootnote={i18nT('components.onboardingFlow.change_anything_later_in_settings')}
         header={
           <div className="mt-6">
-            <h1 tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-none">
+            <h1 tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-hidden">
               {i18nT('components.onboardingFlow.tell_kiro_about_you')}
             </h1>
             <p className="mt-2 text-sm leading-relaxed text-muted">
@@ -629,17 +645,12 @@ export default function OnboardingFlow({
               // truncates mid-surrogate-pair.
               setRoleOther(capRoleOther(e.target.value))
             }}
-            onKeyDown={e => {
-              // Enter in a single-field reveal should advance, not submit the
-              // dialog's first button.
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                if (!savingProfile) void next()
-              }
-            }}
+            // Enter in a single-field reveal should advance, not submit the
+            // dialog's first button (claimEnter consumes the accepted key).
+            {...ime.bindEnter({ onEnter: () => { if (!savingProfile) void next() } })}
             placeholder={i18nT('components.onboardingFlow.e_g_solutions_architect_sre_founder')}
             aria-label={i18nT('components.onboardingFlow.describe_your_role')}
-            className="mt-2 w-full rounded-lg border border-border bg-transparent px-3 py-2 text-[13px] text-text placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-60"
+            className="mt-2 w-full rounded-lg border border-border bg-transparent px-3 py-2 text-[13px] text-text placeholder:text-muted focus-visible:border-accent focus:outline-hidden disabled:opacity-60"
           />
         )}
 
@@ -673,10 +684,15 @@ export default function OnboardingFlow({
           ))}
         </div>
 
+        {/* No hand-off: the onboarding answers (techLevel and the other
+            chapter picks) are unsaved wizard state — this notice exists
+            because the save of exactly those answers failed. */}
         {profileSaveError && (
-          <p role="alert" className="text-[12.5px] mt-3 mb-0" style={{ color: 'var(--danger)' }}>
-            {i18nT('components.onboardingFlow.couldn_t_save_your_answers_press_next_to_retry_o')}
-          </p>
+          <ErrorNotice
+            className="mt-3 text-[12.5px]"
+            message={i18nT('components.onboardingFlow.couldn_t_save_your_answers_press_next_to_retry_o')}
+            testId="onboarding-profile-save-error"
+          />
         )}
       </OnboardingChapterShell>
     )

@@ -34,7 +34,7 @@ const H = vi.hoisted(() => {
     chat: {
       slotStatusDetail: {} as Record<
         string,
-        { kind: string; text: string; ts: number; toolName?: string }
+        { kind: string; purpose?: string; label?: string; ts: number; toolName?: string }
       >,
     },
   }
@@ -69,12 +69,17 @@ const H = vi.hoisted(() => {
     indices: [] as number[],
     groupLabel: 'Current',
     onActivate: onActivateRecent,
+    // Optional preview hook; the Alt+Enter IME-guard test installs a spy here.
+    onAltActivate: undefined as (() => void) | undefined,
   }
   const allProvider = { id: 'all', label: 'All', icon: null, search: vi.fn(async () => [allResult]) }
   const sessionsProvider = {
     id: 'sessions',
     label: 'Sessions',
     icon: null,
+    // Mirrors the real provider's declared minimum (SESSIONS_MIN_QUERY_CHARS);
+    // the declared-equals-enforced pin lives in sessionsProvider.test.ts.
+    minQueryChars: 2,
     search: vi.fn(async () => [sessResult]),
   }
   const pagesProvider = { id: 'pages', label: 'Pages', icon: null, search: vi.fn(() => []) }
@@ -90,12 +95,15 @@ const H = vi.hoisted(() => {
   const settingsProvider = { id: 'settings', label: 'Settings', icon: null, search: vi.fn(() => []) }
   const appsProvider = { id: 'apps', label: 'Apps', icon: null, search: vi.fn(async () => []) }
   // Stable return for the mocked keyboard-nav hook (constant identities avoid
-  // re-render loops in the palette's effects).
+  // re-render loops in the palette's effects). `claimKey` defaults to "not
+  // composing" so the keyboard tests exercise the palette's own branches; the
+  // IME-guard test flips it per call.
   const navReturn = {
     selected: 0,
     setSelected: vi.fn(),
     selectedRef: { current: 0 },
     itemRefs: { current: [] as (HTMLElement | null)[] },
+    claimKey: vi.fn(() => true),
   }
   const nav = {
     current: null as null | {
@@ -434,11 +442,44 @@ describe('CommandPalette — render', () => {
     expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
 
     H.storeState.chat.slotStatusDetail = {
-      'chat-1': { kind: 'tool', text: 'Running: read /workspace/src/app.ts', ts: 1 },
+      'chat-1': { kind: 'tool', purpose: 'Running: read /workspace/src/app.ts', ts: 1 },
     }
     rerender(<CommandPalette open onClose={vi.fn()} />)
 
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
+  })
+
+  it('refreshes recents when only the status string changes under a stable kind and ts', async () => {
+    // The live fingerprint has to read the field each phase actually carries: a
+    // tool phase's `purpose`, any other phase's `label`. A refinement that
+    // rewrites the purpose (same kind, same tick) must still re-run the search.
+    H.storeState.dashboard.slots = [
+      { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
+    ]
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'tool', purpose: 'Terminal', ts: 1 },
+    }
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'tool', purpose: 'List the temp dir', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'thinking', label: 'Compacting…', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(3))
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'thinking', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(4))
   })
 
   it('refreshes recents when the simplified-tool-names preference changes', async () => {
@@ -449,7 +490,7 @@ describe('CommandPalette — render', () => {
       { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
     ]
     H.storeState.chat.slotStatusDetail = {
-      'chat-1': { kind: 'tool', text: 'Reading the app entrypoint', ts: 1 },
+      'chat-1': { kind: 'tool', purpose: 'Reading the app entrypoint', ts: 1 },
     }
     const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
     await screen.findByText('Recent Session')
@@ -477,6 +518,20 @@ describe('CommandPalette — render', () => {
     render(<CommandPalette open={false} onClose={vi.fn()} />, { wrapper })
     expect(screen.queryByRole('dialog')).toBeNull()
   })
+
+  it('lets the search input shrink so a narrow row never clips the close button', async () => {
+    // The header row is one flex line: search icon · scope chip · input · Tab
+    // hint · close button. Everything except the input is shrink-0, and an
+    // <input> defaults to `min-width: auto` (~20 characters), so without an
+    // explicit min-w-0 the input refuses to yield and the ROW overflows instead.
+    // The modal is overflow-hidden, so the overflow is not scrollable — it clips
+    // whatever trails the input, losing the close button entirely on a narrow
+    // viewport. JSDOM has no layout, so the contract is pinned on the class.
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    const input = await screen.findByRole('textbox', { name: 'Search everywhere' })
+    expect(input.className).toContain('flex-1')
+    expect(input.className).toContain('min-w-0')
+  })
 })
 
 describe('CommandPalette — keyboard & activation', () => {
@@ -495,6 +550,78 @@ describe('CommandPalette — keyboard & activation', () => {
     // Scope chip adopted: placeholder narrows and the sessions provider serves.
     expect(await screen.findByPlaceholderText('Search sessions…')).toBeInTheDocument()
     expect(await screen.findByText('Session Result')).toBeInTheDocument()
+  })
+
+  it('offers NO folders scope — reaching a folder by name belongs to the Command Bar app', async () => {
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    // "fold" uniquely prefixes nothing here. If a Folders provider is ever put
+    // back into this host, the hint label appears and Tab adopts the scope — and
+    // this assertion is the thing that says so, because the feature would then
+    // have two implementations (this one and `apps/command-bar/foldersProvider`)
+    // free to disagree about ranking and about what a reveal does.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'fold' } })
+    await waitFor(() => expect(H.allProvider.search).toHaveBeenCalled())
+    expect(screen.queryByText('Folders')).toBeNull()
+
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+
+    // No scope was adopted: the query still reads as an unscoped search.
+    expect(screen.queryByPlaceholderText('Search folders…')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('fold')
+  })
+
+  it('a Tab the IME guard declines does not adopt the scope or clear the query', async () => {
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'sess' } })
+    expect(await screen.findByText('Sessions')).toBeInTheDocument() // the hint label
+
+    // The shared hook's latch declines the key (composition live, or the
+    // committing keydown inside the post-composition window): the palette's
+    // window-capture branch must bail out before adopting the scope hint and
+    // wiping the half-composed query.
+    H.navReturn.claimKey.mockClear()
+    H.navReturn.claimKey.mockReturnValueOnce(false)
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    expect(H.navReturn.claimKey).toHaveBeenCalledTimes(1)
+    expect(screen.queryByPlaceholderText('Search sessions…')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('sess')
+
+    // Once the latch clears, the same Tab adopts the scope as before.
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    expect(await screen.findByPlaceholderText('Search sessions…')).toBeInTheDocument()
+  })
+
+  it('an Alt+Enter the IME guard declines does not fire the preview', async () => {
+    const onAltActivate = vi.fn()
+    H.recentResult.onAltActivate = onAltActivate
+    try {
+      render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+      await screen.findByText('Recent Session')
+
+      H.navReturn.claimKey.mockReturnValueOnce(false)
+      act(() => {
+        fireEvent.keyDown(window, { key: 'Enter', altKey: true })
+      })
+      expect(onAltActivate).not.toHaveBeenCalled()
+
+      // Guard clear: the same chord previews the selected row.
+      act(() => {
+        fireEvent.keyDown(window, { key: 'Enter', altKey: true })
+      })
+      expect(onAltActivate).toHaveBeenCalledTimes(1)
+    } finally {
+      H.recentResult.onAltActivate = undefined
+    }
   })
 
   it('a leading sigil ($) instantly scopes to Skills and strips the sigil', async () => {
@@ -815,5 +942,173 @@ describe('CommandPalette — per-type Enter matrix (dispatchEnter routing)', () 
     choose(true)
     expect(run).toHaveBeenCalledTimes(1)
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * Scoped-provider error state (issue #1928).
+ *
+ * A scoped tab whose provider's search REJECTS must render a distinct failure
+ * state (message + retry) rather than the ordinary "No matches" empty copy,
+ * which would mislabel a backend failure as an empty corpus. The All aggregator
+ * is unaffected: it guards each provider and always RESOLVES with a blended
+ * list (pinned by allAggregator.test.ts), so isError is never set on the All
+ * tab.
+ */
+describe('CommandPalette — scoped provider error state (issue #1928)', () => {
+  // The file-scoped afterEach uses vi.clearAllMocks(), which clears call history
+  // but NOT a mockRejectedValue implementation — restore the Sessions provider's
+  // default resolve so a rejection set here cannot leak into a later test.
+  afterEach(() => {
+    H.sessionsProvider.search.mockResolvedValue([H.sessResult])
+  })
+
+  it('renders a distinct error state with a Retry (not "No matches") when a scoped provider search rejects', async () => {
+    H.sessionsProvider.search.mockRejectedValue(new Error('backend down'))
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    // Scope to Sessions via prefix + Tab, then the empty-query scoped listing
+    // is served by the (now rejecting) Sessions provider.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'sess' } })
+    await screen.findByText('Sessions') // scope hint label
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+
+    expect(await screen.findByText('Search failed')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument()
+    // The ordinary empty copy must NOT appear for a failure.
+    expect(screen.queryByText('No matches')).toBeNull()
+  })
+
+  it('the Retry button refetches the scoped provider and shows the results', async () => {
+    H.sessionsProvider.search
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValue([H.sessResult])
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'sess' } })
+    await screen.findByText('Sessions')
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+
+    const retry = await screen.findByRole('button', { name: /Retry/ })
+    fireEvent.click(retry)
+
+    // The refetch resolves this time, so the row renders and the error clears.
+    expect(await screen.findByText('Session Result')).toBeInTheDocument()
+    expect(screen.queryByText('Search failed')).toBeNull()
+  })
+
+  it('the All tab shows "No matches" (never the error state) when the aggregator swallows provider failures', async () => {
+    // The real All aggregator catches each provider and resolves with []; a
+    // fully-swallowed fan-out therefore looks like an empty result, not an
+    // error. isError stays false, so the ordinary empty copy shows.
+    H.allProvider.search.mockResolvedValue([])
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'zzz' } })
+
+    expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText('Search failed')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Retry/ })).toBeNull()
+
+    H.allProvider.search.mockResolvedValue([H.allResult])
+  })
+})
+
+/**
+ * Sub-threshold "keep typing" empty state (issue #1830).
+ *
+ * A scoped tab whose provider declares `minQueryChars` must render honest
+ * "Type at least N characters…" copy for a non-empty query below the minimum,
+ * instead of the generic "No matches" (the provider never searched, so nothing
+ * was "matched" against). Ordering ratchet: isError and loading each keep
+ * their existing copy, and the All tab (whose client-side scopes can answer a
+ * one-character query) never shows the new state.
+ */
+describe('CommandPalette — sub-threshold min-query empty state (issue #1830)', () => {
+  const KEEP_TYPING = 'Type at least 2 characters to search sessions'
+
+  // Restore defaults that clearAllMocks does not reset (implementations).
+  afterEach(() => {
+    H.sessionsProvider.search.mockResolvedValue([H.sessResult])
+    H.allProvider.search.mockResolvedValue([H.allResult])
+    H.recentsProvider.search.mockResolvedValue([H.recentResult])
+  })
+
+  /** Scope the palette to Sessions (prefix + Tab), then type `q`. */
+  async function scopeToSessionsAndType(q: string) {
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    const input = screen.getByRole('textbox', { name: 'Search everywhere' })
+    fireEvent.change(input, { target: { value: 'sess' } })
+    await screen.findByText('Sessions') // scope hint label
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    fireEvent.change(input, { target: { value: q } })
+  }
+
+  it('renders the keep-typing copy (not "No matches") for a one-character Sessions query', async () => {
+    // Mirror the real provider: a sub-threshold query resolves to [].
+    H.sessionsProvider.search.mockResolvedValue([])
+    await scopeToSessionsAndType('k')
+
+    expect(await screen.findByText(KEEP_TYPING, {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText('No matches')).toBeNull()
+  })
+
+  it('still renders "No matches" for an at-threshold query that genuinely matches nothing', async () => {
+    H.sessionsProvider.search.mockResolvedValue([])
+    await scopeToSessionsAndType('zz')
+
+    expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText(KEEP_TYPING)).toBeNull()
+  })
+
+  it('a provider failure keeps the error copy even for a sub-threshold query (ordering ratchet)', async () => {
+    H.sessionsProvider.search.mockRejectedValue(new Error('backend down'))
+    await scopeToSessionsAndType('k')
+
+    expect(await screen.findByText('Search failed', {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText(KEEP_TYPING)).toBeNull()
+  })
+
+  it('a scoped provider WITHOUT a declared minimum keeps "No matches" for a one-character query', async () => {
+    // Pins the `minQueryChars != null` guard: the pages provider declares no
+    // minimum, so a sub-2-char query on its tab is a genuine search whose
+    // empty result must say "No matches" — a future "default minimum" would
+    // break this. (The All-tab test covers scopeProvider === undefined; this
+    // covers a scoped provider with the field absent.)
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    const input = screen.getByRole('textbox', { name: 'Search everywhere' })
+    fireEvent.change(input, { target: { value: 'pag' } })
+    await screen.findByText('Pages') // scope hint label
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    fireEvent.change(input, { target: { value: 'k' } })
+
+    expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText(/Type at least/)).toBeNull()
+  })
+
+  it('the All tab never shows the keep-typing state for a one-character query', async () => {
+    // Unscoped: the aggregator blends client-side scopes that CAN answer one
+    // character. An empty blend is a genuine "No matches", not "keep typing".
+    H.allProvider.search.mockResolvedValue([])
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'k' } })
+
+    expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
+    expect(screen.queryByText(KEEP_TYPING)).toBeNull()
   })
 })

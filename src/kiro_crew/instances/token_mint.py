@@ -20,12 +20,13 @@ Security (standard practices):
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, LEGACY_CONFIG_DIR_NAME
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS, TTL_PATTERN
+from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +43,13 @@ REMOTE_BIN_CANDIDATES: tuple[str, ...] = (
 
 # ttl accepted by `kirocrew token --ttl`: a positive integer with an h/m suffix
 # (e.g. "20h", "30m"). Validated to keep it out of the remote command unchecked.
-_TTL_RE = re.compile(r"^[1-9][0-9]{0,3}[hm]$")
+_TTL_RE = re.compile(TTL_PATTERN)
 
 # Extract the JWT from a `kirocrew token` URL: http://localhost:7777?token=eyJ...
 # (also matches https://.../?token=...&foo=bar).
 _TOKEN_RE = re.compile(r"[?&]token=([^\s&]+)")
 
-# Bare KiroCrew-token / JWT shape, used to scrub a token that reached stdout
+# Bare Kiro Crew token / JWT shape, for scrubbing a token that reached stdout
 # outside a URL before a stdout tail is put into an exception message.
 #
 # The segment count is `{1,4}` REPEATED, not a fixed `head.payload.sig` triple:
@@ -76,8 +77,8 @@ _OUTPUT_TAIL_CHARS = 300
 _OUTPUT_SCAN_CHARS = _OUTPUT_TAIL_CHARS * 8
 
 # Stand-in for the run touching the scan window's left edge: the slice may have
-# cut it out of the middle of a secret, leaving a suffix the token patterns can
-# no longer recognise.
+# cut it out of the middle of a secret, leaving a suffix the token patterns
+# cannot recognise.
 #
 # The floor is deliberately LOW rather than set to the window-minus-tail
 # "reachability" distance. A clipped fragment 2000+ chars from the end looks
@@ -92,7 +93,9 @@ _CLIPPED_RUN_RE = re.compile(r"^[A-Za-z0-9_\-.=+/%%:?&]{%d,}" % _CLIPPED_RUN_MIN
 _CLIPPED_MARKER = "<clipped>"
 
 # How long to wait for the remote `kirocrew token` to return before giving up.
-_DEFAULT_MINT_TIMEOUT_SECS = 30.0
+# Canonical default lives in instances.constants (user-tunable via
+# ``instances.mint_timeout_secs``); aliased here for the local call sites.
+_DEFAULT_MINT_TIMEOUT_SECS = DEFAULT_MINT_TIMEOUT_SECS
 
 
 class TokenMintError(Exception):
@@ -112,7 +115,7 @@ def _validate_ttl(ttl: str) -> str:
 def ttl_to_seconds(ttl: str) -> int:
     """Convert a validated ``<int>[hm]`` ttl string to seconds.
 
-    Used to schedule proactive token refresh before the cap. Raises
+    Schedules proactive token refresh before the cap. Raises
     :class:`TokenMintError` for a malformed ttl.
     """
     ttl = _validate_ttl(ttl)
@@ -200,6 +203,27 @@ def build_candidate_command(
             "  fi;",
             "done;",
             f'echo "kirocrew binary not found in any of: {", ".join(candidates)}" >&2;',
+            'echo "candidate diagnosis:" >&2;',
+            f"for b in {expanded}; do",
+            '  if [ -L "$b" ]; then',
+            '    __t=$(readlink -f "$b" 2>/dev/null);',
+            '    if [ -z "$__t" ] || [ ! -e "$__t" ]; then',
+            '      echo "  $b: DANGLING symlink -> $(readlink "$b" 2>/dev/null) (target missing)" >&2;',
+            "    else",
+            '      echo "  $b: symlink -> $__t (not executable)" >&2;',
+            "    fi;",
+            '  elif [ ! -e "$b" ]; then',
+            '    echo "  $b: absent" >&2;',
+            "  else",
+            '    echo "  $b: present, NOT executable" >&2;',
+            "  fi;",
+            '  case "$b" in',
+            "    */.venv/bin/*)",
+            '      __v="${b%/bin/*}";',
+            '      if [ -x "$__v/bin/python" ]; then echo "    $__v/bin/python present" >&2; else echo "    $__v/bin/python MISSING" >&2; fi;',
+            "      ;;",
+            "  esac;",
+            "done;",
             "exit 127",
         ]
     )
@@ -321,19 +345,24 @@ def build_remote_token_command(
     )
 
 
-def _build_ssh_argv(ssh_host: str, remote_command: str) -> list[str]:
+def _build_ssh_argv(
+    ssh_host: str, remote_command: str, *, connect_timeout_secs: float = 10.0
+) -> list[str]:
     """Build the local ``ssh`` argv (no local shell) to run *remote_command*.
 
     ``BatchMode=yes`` fails fast instead of hanging on an interactive password
-    prompt; ``ConnectTimeout`` bounds the TCP connect. ``ssh_host`` is validated
-    by the caller (registry / tunnel manager) before reaching here.
+    prompt; ``ConnectTimeout`` bounds the TCP connect (and, on OpenSSH >= 8.6,
+    the banner/KEX exchange — which is where a slow ProxyCommand spends its
+    time, so the mint passes its own configurable budget here instead of the
+    10s fail-fast default). ``ssh_host`` is validated by the caller
+    (registry / tunnel manager) before reaching here.
     """
     return [
         "ssh",
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={max(1, round(connect_timeout_secs))}",
         "-o",
         "AddressFamily=inet",
         ssh_host,
@@ -353,10 +382,13 @@ def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     Why stripping is mandatory: unlike stderr, stdout is the one stream that
     *does* carry the minted JWT on success. This tail is only ever built on a
     failure path, but a partially-successful remote (URL printed, then a
-    non-zero exit) could still put a live credential in it — so the token is
-    substituted out FIRST, before the generic credential/exfil redactors run,
-    and the result is truncated to the last *limit* chars (the tail, because the
-    reason is the last thing printed).
+    non-zero exit) could still put a live credential in it. The generic
+    credential/exfil redactors run FIRST: the exfiltration-URL pass keys on the
+    token-bearing URL shape, so scrubbing the token value first would disarm it
+    and let a suspicious destination survive. The token-specific
+    ``_TOKEN_RE`` / ``_JWT_RE`` substitutions run AFTER as belt-and-suspenders
+    for token shapes the generic passes miss. The result is truncated to the
+    last *limit* chars (the tail, because the reason is the last thing printed).
 
     Why the scan is bounded: the scrubbers cost ~1s per MB of stdout and `re`
     holds the GIL, so scanning an unbounded remote payload stalls the gateway's
@@ -373,9 +405,9 @@ def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     window = stdout
     if len(window) > _OUTPUT_SCAN_CHARS:
         window = _CLIPPED_RUN_RE.sub(_CLIPPED_MARKER, window[-_OUTPUT_SCAN_CHARS:], count=1)
-    stripped = _TOKEN_RE.sub(lambda m: m.group(0)[0] + "token=<redacted>", window)
-    stripped = _JWT_RE.sub("<redacted>", stripped)
-    safe = redact_exfiltration_urls(redact_credentials(stripped)[0])[0]
+    safe = redact(window)
+    safe = _TOKEN_RE.sub(lambda m: m.group(0)[0] + "token=<redacted>", safe)
+    safe = _JWT_RE.sub("<redacted>", safe)
     return safe.strip()[-limit:]
 
 
@@ -415,7 +447,7 @@ async def mint_remote_token(
     remote_command = build_remote_token_command(
         remote_bin, ttl=ttl, port=remote_port, embed_parent_port=embed_parent_port
     )
-    argv = _build_ssh_argv(ssh_host, remote_command)
+    argv = _build_ssh_argv(ssh_host, remote_command, connect_timeout_secs=timeout_secs)
     logger.info("Minting token on %s (ttl=%s)", ssh_host, ttl)  # no token in logs
 
     try:
@@ -430,11 +462,7 @@ async def mint_remote_token(
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError as e:
-        proc.kill()
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+        await kill_and_reap(proc)
         raise TokenMintError(f"timed out minting token on {ssh_host} after {timeout_secs}s") from e
 
     stdout = stdout_b.decode("utf-8", "replace")
@@ -442,7 +470,7 @@ async def mint_remote_token(
     # stderr is proxy-controlled (WSSH banner etc.); redact credentials/exfil URLs
     # before surfacing it in an exception that may reach logs/status. The token
     # only ever appears on stdout, never stderr.
-    safe_stderr = redact_exfiltration_urls(redact_credentials(stderr)[0])[0] if stderr else ""
+    safe_stderr = redact(stderr) if stderr else ""
 
     if proc.returncode != 0:
         # stderr may carry the "binary not found" diagnostic — safe to log; it
@@ -474,6 +502,7 @@ async def run_remote_kirocrew(
     remote_bin: str = "",
     marker_port: int | None = None,
     timeout_secs: float = 60.0,
+    connect_timeout_secs: float = 10.0,
 ) -> tuple[int, str]:
     """Run ``kirocrew <subcommand>`` on *ssh_host* over SSH.
 
@@ -487,11 +516,21 @@ async def run_remote_kirocrew(
     (same fix as token mint), instead of the blind PATH candidate search. This
     is what makes the dashboard "restart remote" action work on a host whose
     ``~/.local/bin/kirocrew`` points at an uninstalled worktree.
+
+    *connect_timeout_secs* — this is the same one-shot ssh-exec shape as
+    :func:`mint_remote_token`, so it pays the same proxy handshake cost on
+    CONNECT (OpenSSH >= 8.6 counts banner/KEX against ``ConnectTimeout``).
+    Callers should pass the resolved ``instances.mint_timeout_secs`` budget
+    rather than leaving the 10s fail-fast default, or a restart on a
+    slow-proxy host fails on the connect even after the user tuned the
+    tunable for exactly this. Independent of *timeout_secs* (the overall
+    wait_for budget): the outer wait_for is still the ultimate bound
+    regardless of what ``ConnectTimeout`` allows internally.
     """
     remote_command = build_remote_command(
         remote_bin, subcommand, marker_port=_validate_port(marker_port)
     )
-    argv = _build_ssh_argv(ssh_host, remote_command)
+    argv = _build_ssh_argv(ssh_host, remote_command, connect_timeout_secs=connect_timeout_secs)
     logger.info("Running 'kirocrew %s' on %s", subcommand, ssh_host)
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -504,12 +543,10 @@ async def run_remote_kirocrew(
     try:
         _out, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError:
-        proc.kill()
-        with contextlib.suppress(ProcessLookupError):
-            await proc.wait()
+        await kill_and_reap(proc)
         return -1, f"timed out after {timeout_secs}s"
     err = err_b.decode("utf-8", "replace").strip()
     # Proxy-controlled stderr (e.g. a WSSH banner) can carry credential-looking
     # text or exfil URLs; redact before returning since callers surface this tail.
-    safe_err = redact_exfiltration_urls(redact_credentials(err)[0])[0] if err else ""
+    safe_err = redact(err) if err else ""
     return (proc.returncode if proc.returncode is not None else -1), safe_err[:300]

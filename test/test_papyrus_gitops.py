@@ -33,8 +33,30 @@ from unittest import mock
 
 import pytest
 
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import sandbox
 from kiro_crew.apps.builtins.papyrus.backend import gitops
+
+
+def _hermetic_git_env() -> dict[str, str]:
+    """This process's environment with the host's git configuration held away.
+
+    The against-real-git demonstrations below build a repository whose CONFIG is
+    the attack, so the only config git may read is the one the test wrote: the
+    operator's global and system files are pointed away (a ``credential.helper``
+    or ``core.hooksPath`` there would run during the very commands under test),
+    and an inherited ``GIT_DIR`` / ``GIT_WORK_TREE`` is dropped so ``cwd`` is the
+    repository git operates on.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+    }
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 @pytest.fixture()
@@ -78,19 +100,28 @@ class _GitScript:
         return next(c for c in self.calls if c[0] == verb)
 
 
+#: Every transport the URL gate accepts. Shared by the accept test and the
+#: trailing-newline regression test so a new transport is automatically covered
+#: by both.
+_ACCEPTED_URLS = (
+    "https://example.com/group/paper.git",
+    "http://example.com/paper",
+    "ssh://git@example.com/paper.git",
+    "git://example.com/paper.git",
+    "git@example.com:group/paper.git",
+)
+
+
 class TestUrlValidation:
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "https://example.com/group/paper.git",
-            "http://example.com/paper",
-            "ssh://git@example.com/paper.git",
-            "git://example.com/paper.git",
-            "git@example.com:group/paper.git",
-        ],
-    )
+    @pytest.mark.parametrize("url", _ACCEPTED_URLS)
     def test_accepts_known_transports(self, url: str) -> None:
         assert gitops.GIT_URL_RE.match(url)
+
+    @pytest.mark.parametrize("url", _ACCEPTED_URLS)
+    def test_rejects_trailing_newline_on_accepted_url(self, url: str) -> None:
+        """Python's ``$`` matches before a trailing newline; the ``\\Z`` anchor
+        must not, or ``.match`` on a client URL hands the newline to git argv."""
+        assert gitops.GIT_URL_RE.match(url + "\n") is None
 
     @pytest.mark.parametrize(
         "url",
@@ -153,8 +184,8 @@ class TestClone:
         """The destructive race, and the reason for the staging dir.
 
         Two concurrent clones of the same project name both proceed; the loser gets
-        git's "destination path already exists" error, and its cleanup used to delete
-        the WINNER's freshly-cloned checkout — turning a duplicate-request 500 into
+        git's "destination path already exists" error, and its cleanup must not delete
+        the WINNER's freshly-cloned checkout — which would turn a duplicate-request 500 into
         data loss for the request that succeeded.
         """
         dest = tmp_path / "dest"
@@ -723,7 +754,6 @@ class TestFsmonitorAndOtherHooksAreNeutralized:
             assert key in source, f"{key} is not pinned — repo config can still run it"
 
 
-@pytest.mark.asyncio
 class TestPackProgramsArePinnedForEveryRemote:
     """`remote.<name>.uploadpack` / `.receivepack` name a COMMAND, and the subsection is
     ATTACKER-CHOSEN — the same defect as `filter.<name>.clean`.
@@ -759,6 +789,7 @@ class TestPackProgramsArePinnedForEveryRemote:
         turn every local call into an error."""
         assert gitops._pack_program_args([subcommand, "-x"]) == [subcommand, "-x"]
 
+    @pytest.mark.asyncio
     async def test_the_pin_reaches_the_built_argv(self) -> None:
         captured: list[list[str]] = []
 
@@ -779,6 +810,7 @@ class TestPackProgramsArePinnedForEveryRemote:
         # Directly after the subcommand, which is where a subcommand's own flag belongs.
         assert argv[argv.index("push") + 1] == "--receive-pack=git-receive-pack"
 
+    @pytest.mark.asyncio
     async def test_against_real_git_a_selected_remote_cannot_run_its_receivepack(
         self, tmp_path: Path
     ) -> None:
@@ -793,19 +825,15 @@ class TestPackProgramsArePinnedForEveryRemote:
         hostile = tmp_path / "recv.sh"
         hostile.write_text(f"#!/bin/sh\necho ran > {marker}\nexit 1\n", encoding="utf-8")
         hostile.chmod(0o755)
+        env = _hermetic_git_env()
 
         def _run(*args: str, cwd: Path = work) -> None:
             subprocess.run(
-                [git, *args], cwd=cwd, capture_output=True, text=True, timeout=60
+                [git, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60
             )
 
-        subprocess.run(
-            [git, "init", "-q", "--bare", "-b", "main", str(upstream)],
-            capture_output=True, timeout=60,
-        )
-        subprocess.run(
-            [git, "clone", "-q", str(upstream), str(work)], capture_output=True, timeout=60
-        )
+        _run("init", "-q", "--bare", "-b", "main", str(upstream), cwd=tmp_path)
+        _run("clone", "-q", str(upstream), str(work), cwd=tmp_path)
         _run("config", "user.email", "t@example.invalid")
         _run("config", "user.name", "t")
         (work / "f.txt").write_text("x\n", encoding="utf-8")
@@ -821,6 +849,7 @@ class TestPackProgramsArePinnedForEveryRemote:
              *gitops._pack_program_args(["push"]))
         assert not marker.exists(), "a selected remote's receivepack executed"
 
+    @pytest.mark.asyncio
     async def test_against_real_git_a_selected_remote_cannot_run_its_uploadpack(
         self, tmp_path: Path
     ) -> None:
@@ -834,19 +863,15 @@ class TestPackProgramsArePinnedForEveryRemote:
         hostile = tmp_path / "up.sh"
         hostile.write_text(f"#!/bin/sh\necho ran > {marker}\nexit 1\n", encoding="utf-8")
         hostile.chmod(0o755)
+        env = _hermetic_git_env()
 
-        def _run(*args: str) -> None:
+        def _run(*args: str, cwd: Path = work) -> None:
             subprocess.run(
-                [git, *args], cwd=work, capture_output=True, text=True, timeout=60
+                [git, *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=60
             )
 
-        subprocess.run(
-            [git, "init", "-q", "--bare", "-b", "main", str(upstream)],
-            capture_output=True, timeout=60,
-        )
-        subprocess.run(
-            [git, "clone", "-q", str(upstream), str(work)], capture_output=True, timeout=60
-        )
+        _run("init", "-q", "--bare", "-b", "main", str(upstream), cwd=tmp_path)
+        _run("clone", "-q", str(upstream), str(work), cwd=tmp_path)
         _run("config", "user.email", "t@example.invalid")
         _run("config", "user.name", "t")
         (work / "f.txt").write_text("x\n", encoding="utf-8")
@@ -1242,6 +1267,7 @@ class TestTheAttributesPinCannotBeNeutralized:
         assert "*.pdf binary" in content
         assert content.splitlines()[-1] == gitops._ATTRIBUTES_PIN.strip()
 
+    @requires_symlinks
     def test_a_symlinked_attributes_file_is_refused(self, tmp_path: Path) -> None:
         repo = self._repo(tmp_path)
         victim = tmp_path / "victim.txt"
@@ -1254,12 +1280,17 @@ class TestTheAttributesPinCannotBeNeutralized:
         assert victim.read_text(encoding="utf-8") == "original\n"
 
     def test_a_symlinked_info_directory_is_refused(self, tmp_path: Path) -> None:
-        """`mkdir(exist_ok=True)` is a no-op on a link, so the dir needs its own check."""
+        """`mkdir(exist_ok=True)` is a no-op on a link, so the dir needs its own check.
+
+        A DIRECTORY link, so on Windows it is a junction (no privilege, and the
+        reparse type `is_symlink()` misses) — kept exercised there via
+        `make_dir_link` rather than skipped.
+        """
         repo = tmp_path / "paper"
         (repo / ".git").mkdir(parents=True)
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        (repo / ".git" / "info").symlink_to(elsewhere, target_is_directory=True)
+        make_dir_link(repo / ".git" / "info", elsewhere)
 
         with pytest.raises(gitops.GitError, match="symlink"):
             gitops._pin_attributes_sync(repo)
@@ -1335,9 +1366,6 @@ class TestTheAttributesPinCannotBeNeutralized:
             with pytest.raises(gitops.GitError, match="symlink"):
                 gitops._pin_attributes_sync(repo)
 
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="symlink creation needs privilege on Windows"
-    )
     def test_a_linked_git_dir_is_refused(self, tmp_path: Path) -> None:
         """`.git` itself is the OUTERMOST name that must not be a link.
 
@@ -1346,6 +1374,11 @@ class TestTheAttributesPinCannotBeNeutralized:
         non-links *inside that repo*, so both checks pass and a `GET /git` status
         poll rewrites a different repository's attributes — outside this project
         entirely. The rule has to hold for every segment traversed by name.
+
+        `.git` is a DIRECTORY link, which on Windows is a junction (needs no
+        privilege and is the very reparse type `is_symlink()` misses) — so
+        `make_dir_link` keeps this exercised on the platform the guard was written
+        for, rather than skipping it there.
         """
         project = tmp_path / "paper"
         project.mkdir()
@@ -1353,16 +1386,13 @@ class TestTheAttributesPinCannotBeNeutralized:
         (victim / "info").mkdir(parents=True)
         original = "*.tex text eol=lf\n"
         (victim / "info" / "attributes").write_text(original, encoding="utf-8")
-        (project / ".git").symlink_to(victim, target_is_directory=True)
+        make_dir_link(project / ".git", victim)
 
         with pytest.raises(gitops.GitError, match="symlink"):
             gitops._pin_attributes_sync(project)
         # The other repository was not touched.
         assert (victim / "info" / "attributes").read_text(encoding="utf-8") == original
 
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="symlink creation needs privilege on Windows"
-    )
     def test_the_refusal_is_sel_audited(self, tmp_path: Path) -> None:
         """A security decision that leaves no record is indistinguishable from a
         no-op afterwards, and AUTOSDE requires a SEL event for every permission
@@ -1371,7 +1401,7 @@ class TestTheAttributesPinCannotBeNeutralized:
         project.mkdir()
         victim = tmp_path / "victim"
         (victim / "info").mkdir(parents=True)
-        (project / ".git").symlink_to(victim, target_is_directory=True)
+        make_dir_link(project / ".git", victim)
 
         with mock.patch.object(gitops, "_audit") as audit:
             with pytest.raises(gitops.GitError):

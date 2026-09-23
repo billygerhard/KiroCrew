@@ -3,10 +3,10 @@
  * verifies loading state, fleet table, and empty state.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
-import DevFleetPage, { mergeLogWindow, LOG_GAP_MARKER, pruneVerdictLabel, gatewayRecovered } from '../pages/DevFleetPage'
+import DevFleetPage, { mergeLogWindow, LOG_GAP_MARKER, pruneVerdictLabel, gatewayRecovered, __resetDevFleetNoticesForTests } from '../pages/DevFleetPage'
 
 function renderPage() {
   return renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
@@ -19,6 +19,11 @@ const FLEET = {
     { name: 'unprov', is_main: false, running: false, has_dist: false, behind: 0, last_updated_at: Date.now() / 1000 - 7200 },
   ],
 }
+
+// The page keeps its latest action failure in module state (so a failure that
+// lands while the page is unmounted is still shown on return); a suite must
+// not carry one test's failure into the next.
+beforeEach(() => { __resetDevFleetNoticesForTests() })
 
 describe('DevFleetPage', () => {
   beforeEach(() => {
@@ -47,6 +52,68 @@ describe('DevFleetPage', () => {
     })
     renderPage()
     await waitFor(() => expect(screen.getByText('No worktrees found')).toBeInTheDocument())
+  })
+
+  it('main row warns when the primary checkout is parked on a non-base branch', async () => {
+    // Regression: the primary checkout was left on a merged PR's feature
+    // branch. The row's name is hardcoded to the base branch, so without the
+    // badge the fleet claimed "main" while showing that branch's merged PR
+    // pill — contradictory, and the truth only surfaced when Pull+Build
+    // refused to sync.
+    const data = {
+      base_branch: 'main',
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: true, behind: 117, branch: 'fix/old-merged-pr', pr: { number: 1742, state: 'MERGED', url: 'https://github.com/org/repo/pull/1742', isDraft: false } },
+      ],
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Parked on fix/old-merged-pr')).toBeInTheDocument())
+    // The tooltip explains the consequence (Pull+Build refuses to sync).
+    expect(screen.getByText('Parked on fix/old-merged-pr')).toHaveAttribute('title', expect.stringContaining('fix/old-merged-pr'))
+  })
+
+  it('main row keeps the plain label when the primary checkout is on the base branch', async () => {
+    const data = {
+      base_branch: 'main',
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: true, behind: 0, branch: 'main' },
+      ],
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText(/main/).length).toBeGreaterThan(0))
+    expect(screen.queryByText(/^Parked on /)).toBeNull()
+  })
+
+  it('main row does not false-flag when the payload lacks base_branch', async () => {
+    // An older backend that omits base_branch must not trigger the warning —
+    // comparing against a hardcoded 'main' would false-flag repos whose base
+    // branch has a different name.
+    const data = {
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: true, behind: 0, branch: 'trunk' },
+      ],
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(data), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText(/main/).length).toBeGreaterThan(0))
+    expect(screen.queryByText('Parked on trunk')).toBeNull()
   })
 
   it('shows error state on network failure', async () => {
@@ -157,6 +224,223 @@ describe('DevFleetPage', () => {
     await waitFor(() => expect(runCalls).toBeGreaterThan(0), { timeout: 3000 })
   })
 
+  it('reattaches to in-flight sync when syncMain gets "already running" with run_id', async () => {
+    let runPolls = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, opts) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      // POST /sync refuses a second concurrent run with HTTP 409, naming the
+      // in-flight run. Mocking this as a 200 made the test vacuous: the client
+      // throws on any non-2xx, so a 200 exercised a branch the backend can
+      // never produce while the real 409 path surfaced a raw JSON error toast.
+      if (u.includes('/sync') && opts?.method?.toUpperCase() === 'POST') {
+        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'sync already running', run_id: 'run-inflight-99' }), { status: 409 }))
+      }
+      if (u.includes('/run?id=run-inflight-99')) {
+        runPolls++
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'running', output: ['npm ci...'], started: Date.now() / 1000 - 10,
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    // Click Pull+Build confirm
+    const trigger = screen.getByText('Pull+Build').closest('button') as HTMLButtonElement
+    fireEvent.click(trigger)
+    const start = await screen.findByRole('button', { name: 'Start' })
+    fireEvent.click(start)
+    // Should reattach and start polling the in-flight run
+    await waitFor(() => expect(runPolls).toBeGreaterThan(0), { timeout: 3000 })
+  })
+
+  it('reattaches to completed sync on page load showing result', async () => {
+    const FLEET_WITH_DONE_SYNC = {
+      ...FLEET,
+      sync_run_id: 'run-done-456',
+      build_pending: true,
+    }
+    let runCalls = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_DONE_SYNC), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-done-456')) {
+        runCalls++
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 0, output: ['All steps complete'], started: Date.now() / 1000 - 120,
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText('main').length).toBeGreaterThan(0))
+    // Should fetch and display the completed run result
+    await waitFor(() => expect(runCalls).toBeGreaterThan(0), { timeout: 3000 })
+  })
+
+  it('reattaches to a running provision on page load via provision_run_id', async () => {
+    const FLEET_WITH_PROV = {
+      ...FLEET,
+      worktrees: FLEET.worktrees.map((w) =>
+        w.name === 'unprov' ? { ...w, provision_run_id: 'run-prov-live' } : w),
+    }
+    let runCalls = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_PROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-live')) {
+        runCalls++
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'running', output: ['[provision] creating venv \u2026'], started: Date.now() / 1000 - 30,
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // The reattach fetches the run and rehydrates the running stepper
+    await waitFor(() => expect(runCalls).toBeGreaterThan(0), { timeout: 3000 })
+    await waitFor(() => expect(screen.getByText('Provisioning')).toBeInTheDocument(), { timeout: 3000 })
+  })
+
+  it('reattaches to a failed provision on page load restoring the persisted failure', async () => {
+    const FLEET_WITH_FAILED = {
+      ...FLEET,
+      worktrees: FLEET.worktrees.map((w) =>
+        w.name === 'unprov' ? { ...w, provision_run_id: 'run-prov-dead' } : w),
+    }
+    let dismissBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, opts) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_FAILED), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-dead')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 1, output: ['npm ERR! build failed'], started: Date.now() / 1000 - 300,
+        }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        dismissBody = JSON.parse(String(opts?.body))
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // Failed run persists across the reload: red label + log auto-expanded.
+    // The last log line renders twice (inline strip + expanded <pre> panel).
+    await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.getAllByText('npm ERR! build failed').length).toBeGreaterThanOrEqual(2)
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(dismissBody).toEqual({ name: 'unprov', run_id: 'run-prov-dead' }))
+    await waitFor(() => expect(screen.queryByText('Provision failed (exit 1)')).toBeNull())
+  })
+
+  it('a slow dismiss does not erase a replacement failure that arrived while it was in flight', async () => {
+    // Regression: dismissProv awaits the server round-trip, so a REPLACEMENT
+    // provision can fail and reattach to the same worktree before the response
+    // lands. Deleting the strip unconditionally then hid the NEW failure (and
+    // its log) until the next reload. The clear is now guarded on the run id
+    // the user actually dismissed.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    let rid = 'run-prov-dead'
+    let releaseDismiss: (() => void) | null = null
+    const dismissPending = new Promise<void>((resolve) => { releaseDismiss = resolve })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          ...FLEET,
+          worktrees: FLEET.worktrees.map((w) => (w.name === 'unprov' ? { ...w, provision_run_id: rid } : w)),
+        }), { status: 200 }))
+      }
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-dead')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 1, output: ['old failure'], started: Date.now() / 1000 - 300,
+        }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-prov-new')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 2, output: ['new failure'], started: Date.now() / 1000 - 10,
+        }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        return dismissPending.then(() => new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    try {
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // Dismiss the OLD failure; the POST stays in flight.
+      fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+
+      // A replacement provision fails and the next fleet poll reattaches it.
+      rid = 'run-prov-new'
+      await act(async () => { await vi.advanceTimersByTimeAsync(13000) })
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // The stale dismissal now resolves — it must leave the new strip alone.
+      releaseDismiss!()
+      await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+      expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reattached polling keeps the fetched log prefix and marks a scrolled gap', async () => {
+    // Regression: the reattach effect fetches the run once, then hands off to
+    // the poll loop. If the loop starts from an EMPTY accumulator, output that
+    // scrolled between the fetch and the first poll silently replaces the
+    // fetched prefix. Seeding the accumulator means a zero-overlap window can
+    // only produce the visible LOG_GAP_MARKER, never a dropped prefix.
+    const FLEET_WITH_PROV = {
+      ...FLEET,
+      worktrees: FLEET.worktrees.map((w) =>
+        w.name === 'unprov' ? { ...w, provision_run_id: 'run-prov-scroll' } : w),
+    }
+    let runCalls = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_PROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-scroll')) {
+        runCalls++
+        // Reattach fetch: still running, early output visible.
+        if (runCalls === 1) {
+          return Promise.resolve(new Response(JSON.stringify({
+            status: 'running', output: ['early-line-A', 'early-line-B'], started: Date.now() / 1000 - 30,
+          }), { status: 200 }))
+        }
+        // First poll tick: run failed and the tail window scrolled entirely
+        // past the fetched prefix (zero overlap).
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 1, output: ['late-line-Z'], started: Date.now() / 1000 - 30,
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // Both the row strip and the completion toast carry the failure label.
+    await waitFor(() => expect(screen.getAllByText('Provision failed (exit 1)').length).toBeGreaterThan(0), { timeout: 6000 })
+    // The expanded <pre> must retain the fetched prefix, mark the gap, and
+    // append the new tail — in that order.
+    const pre = document.querySelector('pre') as HTMLPreElement
+    expect(pre).not.toBeNull()
+    expect(pre.textContent).toContain('early-line-A')
+    expect(pre.textContent).toContain(LOG_GAP_MARKER)
+    expect(pre.textContent).toContain('late-line-Z')
+    expect(pre.textContent!.indexOf('early-line-A')).toBeLessThan(pre.textContent!.indexOf('late-line-Z'))
+  })
+
   it('renders sort dropdown with all 4 options', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = typeof url === 'string' ? url : (url as Request).url
@@ -179,6 +463,86 @@ describe('DevFleetPage', () => {
     // And picking one actually re-sorts: 'behind' puts feature-x (behind 3) first.
     fireEvent.click(screen.getByRole('option', { name: 'Sort: behind' }))
     await waitFor(() => expect(trigger).toHaveTextContent('Sort: behind'))
+  })
+
+  it('status sort orders equal pod-status rows by PR state, not alphabetically', async () => {
+    // Names are chosen so plain alphabetical order (a→e) CONTRADICTS the
+    // expected review-state order (open → draft → no PR → closed → merged);
+    // without the prRank secondary key this test fails.
+    const FLEET_PR = {
+      worktrees: [
+        { name: 'main', is_main: true, running: false, has_dist: true, behind: 0 },
+        { name: 'wt-a-merged', is_main: false, running: false, has_dist: false, pr: { number: 1, state: 'MERGED', url: 'https://github.com/org/repo/pull/1', isDraft: false } },
+        { name: 'wt-b-closed', is_main: false, running: false, has_dist: false, pr: { number: 2, state: 'CLOSED', url: 'https://github.com/org/repo/pull/2', isDraft: false } },
+        { name: 'wt-c-nopr', is_main: false, running: false, has_dist: false },
+        { name: 'wt-d-draft', is_main: false, running: false, has_dist: false, pr: { number: 4, state: 'OPEN', url: 'https://github.com/org/repo/pull/4', isDraft: true } },
+        { name: 'wt-e-open', is_main: false, running: false, has_dist: false, pr: { number: 5, state: 'OPEN', url: 'https://github.com/org/repo/pull/5', isDraft: false } },
+        // Pod status stays the PRIMARY key: a running pod with a merged PR
+        // still sorts above every not-built row.
+        { name: 'wt-z-pod-merged', is_main: false, running: true, has_dist: true, port: 7781, health: 200, pr: { number: 6, state: 'MERGED', url: 'https://github.com/org/repo/pull/6', isDraft: false } },
+      ],
+    }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_PR), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('wt-e-open')).toBeInTheDocument())
+    // Default sort is 'status'. Expected order: pod-up row first, then the
+    // not-built rows by review state (open, draft, no PR, closed, merged).
+    const expected = ['wt-z-pod-merged', 'wt-e-open', 'wt-d-draft', 'wt-c-nopr', 'wt-b-closed', 'wt-a-merged']
+    const els = expected.map((n) => screen.getByText(n))
+    for (let i = 0; i < els.length - 1; i++) {
+      expect(
+        els[i].compareDocumentPosition(els[i + 1]) & Node.DOCUMENT_POSITION_FOLLOWING,
+        `${expected[i]} should render before ${expected[i + 1]}`,
+      ).toBeTruthy()
+    }
+  })
+
+  it('renders the live-state-unknown notice above the rows when the gateway could not report pointer state', async () => {
+    // A broker outage yields rows (git still enumerates worktrees) but no
+    // live/staged badge. Without the notice that reads as "nothing is live", the
+    // opposite remedy from the true one — so the notice must be present, and
+    // the rows must still render beneath it.
+    const FLEET_UNKNOWN = { ...FLEET, live_state_known: false }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNKNOWN), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    const notice = await waitFor(() => screen.getByTestId('fleet-live-state-unknown'))
+    expect(notice.textContent).toMatch(/live state unavailable/i)
+    expect(notice.textContent).toMatch(/unknown, not empty/i)
+    expect(screen.getByText('feature-x')).toBeInTheDocument()
+    // The notice precedes the first row in document order.
+    const row = screen.getByText('feature-x')
+    expect(notice.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // With no row marked live, the "not live" guard would offer Make live on every
+    // row, the already-live one included. During the outage the control is
+    // disabled; its tooltip is the notice's short title (the long help names "this
+    // notice", which a tooltip has no view of).
+    const makeLive = screen.getByTestId('fleet-make-live-disabled-unknown') as HTMLButtonElement
+    expect(makeLive.disabled).toBe(true)
+    expect(makeLive.title).toMatch(/live state unavailable/i)
+  })
+
+  it('does not render the live-state-unknown notice when the pointer state was read', async () => {
+    const FLEET_KNOWN = { ...FLEET, live_state_known: true }
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_KNOWN), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => screen.getByText('feature-x'))
+    expect(screen.queryByTestId('fleet-live-state-unknown')).toBeNull()
+    expect(screen.queryByTestId('fleet-make-live-disabled-unknown')).toBeNull()
   })
 
   it('shows build-pending chip when fleet.build_pending is true', async () => {
@@ -221,6 +585,30 @@ describe('DevFleetPage', () => {
     expect(gridDiv).toBeUndefined()
   })
 
+  it('shows a setup state, not a discovery error, when no checkout was found', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify({ worktrees: [], needs_setup: true }), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('devfleet-needs-setup')).toBeInTheDocument())
+    // A first run is a question, not a failure: no alert, and nothing claiming a
+    // path is missing that the user never chose.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByText('Discovery Error')).not.toBeInTheDocument()
+    expect(screen.getByText('No Kiro Crew checkout found')).toBeInTheDocument()
+    expect(screen.getByText(/KIROCREW_DEVFLEET_REPO=/)).toBeInTheDocument()
+    // Controls that act on a fleet which does not exist yet are suppressed:
+    // rendering them invites a click whose only answer is a failure toast.
+    expect(screen.queryByText('Prune merged')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('Filter worktrees…')).not.toBeInTheDocument()
+    // Counts are dashed, not zeroed: "WORKTREES 0" asserts something about a
+    // fleet that was never located, which is the false certainty this fix removes.
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(3)
+  })
+
   it('shows discovery error prominently when fleet returns error field', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
       const u = typeof url === 'string' ? url : (url as Request).url
@@ -232,6 +620,11 @@ describe('DevFleetPage', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument())
     expect(screen.getByText('Discovery Error')).toBeInTheDocument()
     expect(screen.getByText('sandbox disabled: no git binary found')).toBeInTheDocument()
+    // The fleet is equally unknown here, so the same chrome is equally wrong:
+    // "WORKTREES 0" would assert a count nobody measured, and Prune merged has
+    // nothing to act on (it answers 409 repo_unreadable).
+    expect(screen.queryByText('Prune merged')).not.toBeInTheDocument()
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(3)
   })
 
   it('is registered in builtin component registry', async () => {
@@ -239,9 +632,10 @@ describe('DevFleetPage', () => {
     expect(hasBuiltinComponent('/dev-fleet')).toBe(true)
   })
 
-  it('syncPhaseFromLines only advances on ::step:: markers, not pip done lines', async () => {
-    // Import the module to access syncPhaseFromLines indirectly via the component
-    // We test the stepper behavior through the rendered output
+  it('reports a running sync as indeterminate — a spinner, never a percentage', async () => {
+    // Step markers tell the UI which step is in flight; they must NOT be turned
+    // back into a completion percentage, because the five steps differ in
+    // duration by more than an order of magnitude.
     const FLEET_SYNC = {
       ...FLEET,
       sync_run_id: 'run-marker-test',
@@ -253,7 +647,8 @@ describe('DevFleetPage', () => {
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
       if (u.includes('/run?id=run-marker-test')) {
         pollCount++
-        // Output contains pip's "done" but NO ::step:: markers beyond index 0
+        // Output carries pip's "done" lines and a step marker — neither may be
+        // rendered as quantified progress.
         return Promise.resolve(new Response(JSON.stringify({
           status: 'running',
           output: [
@@ -263,6 +658,8 @@ describe('DevFleetPage', () => {
             'Successfully installed package done',
             'done',
           ],
+          step: 3,
+          step_label: 'npm ci',
           started: Date.now() / 1000 - 30,
         }), { status: 200 }))
       }
@@ -270,13 +667,50 @@ describe('DevFleetPage', () => {
     })
     renderPage()
     await waitFor(() => expect(pollCount).toBeGreaterThan(0), { timeout: 3000 })
-    // Percent must reflect ONLY the ::step:: marker (index 0) — pip's stray
-    // "done" lines must not drive the coarse progress toward completion.
     const bar = await screen.findByRole('progressbar')
-    const pct = Number(bar.getAttribute('aria-valuenow'))
-    expect(pct).toBeGreaterThanOrEqual(0)
-    expect(pct).toBeLessThan(25) // still inside the Pull/pip band, nowhere near done
-    expect(screen.getByText(/~\d+%/)).toBeInTheDocument()
+    // Indeterminate: the ARIA value attributes must be absent, not zeroed.
+    expect(bar.getAttribute('aria-valuenow')).toBeNull()
+    expect(bar.getAttribute('aria-valuemax')).toBeNull()
+    expect(bar.className).toContain('animate-spin')
+    expect(screen.queryByText(/~?\d+%/)).toBeNull()
+    // The honest step signal — the server's label — is still shown.
+    expect(await screen.findByText('npm ci')).toBeInTheDocument()
+  })
+
+  it('spins the Prune merged button while the merged-scan is in flight', async () => {
+    let release: (() => void) | null = null
+    const gate = new Promise<void>((r) => { release = r })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/prune-candidates')) {
+        // A big fleet keeps this scan open for seconds; hold it open here.
+        return gate.then(() => new Response(JSON.stringify({ ok: true, candidates: [{ name: 'merged-branch', code: 'merged' }], kept: [], scanned: 1 }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const btn = screen.getByText('Prune merged').closest('button') as HTMLButtonElement
+    expect(btn.querySelector('.animate-spin')).toBeNull()
+    // Idle: destructive affordance is on.
+    expect(btn.className).toContain('text-danger')
+    fireEvent.click(btn)
+    await waitFor(() => expect(btn.getAttribute('aria-busy')).toBe('true'))
+    expect(btn.querySelector('.animate-spin')).not.toBeNull()
+    // In flight the label names the read-only action, not the destructive one:
+    // a spinner on a danger-styled "Prune merged" reads as "deletion running".
+    expect(btn.textContent).toContain('Scanning for merged…')
+    expect(screen.queryByText('Prune merged')).toBeNull()
+    // …and the danger variant is suppressed for the scan's whole window.
+    expect(btn.className).not.toContain('text-danger')
+    release!()
+    await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument(), { timeout: 3000 })
+    expect(btn.querySelector('.animate-spin')).toBeNull()
+    // Scan over: label and destructive affordance are restored.
+    expect(btn.textContent).toContain('Prune merged')
+    expect(btn.className).toContain('text-danger')
   })
 
   it('prune dialog renders with candidates and kept rows', async () => {
@@ -337,7 +771,7 @@ describe('DevFleetPage', () => {
     const item = within(await screen.findByRole('menu')).getByText('Make live')
     fireEvent.click(item)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" for the worktree that is already live', async () => {
@@ -408,6 +842,25 @@ describe('DevFleetPage', () => {
     renderPage()
     await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
     expect(screen.queryByTestId('serving-install-warning')).toBeNull()
+  })
+
+  // The notices share the content column with the stat cards and the Worktrees
+  // card below them, and neither of those is width-capped. A cap on the notices
+  // alone leaves them hugging the left edge of a wide window while everything
+  // under them runs full width, which reads as a half-rendered page.
+  it('lets the notices fill the content column instead of capping their width', async () => {
+    mockFleet({
+      serving_install_reason: 'served by an install outside the managed checkout.',
+      main_repo_inferred: true,
+      main_repo: '/Users/dev/kirocrew',
+      worktrees: [{ name: 'main', is_main: true, running: false, has_dist: true, behind: 0 }],
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('serving-install-warning')).toBeInTheDocument())
+    for (const id of ['serving-install-warning', 'inferred-main-checkout']) {
+      const capped = Array.from(screen.getByTestId(id).classList).filter((c) => c.startsWith('max-w-'))
+      expect(capped).toEqual([])
+    }
   })
 
   it('explains WHY pods are unavailable instead of failing silently', async () => {
@@ -489,7 +942,7 @@ describe('DevFleetPage', () => {
     expect(btn).toBeInTheDocument()
     fireEvent.click(btn)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "main" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “main” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" on the MAIN row when main IS live', async () => {
@@ -618,7 +1071,7 @@ describe('DevFleetPage', () => {
     fireEvent.click(screen.getByLabelText('More actions'))
     fireEvent.click(within(await screen.findByRole('menu')).getByText('Make live'))
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('outside-click closes the portaled row-actions menu', async () => {
@@ -675,6 +1128,311 @@ describe('DevFleetPage', () => {
     expect(menu.style.top).toBe('')
   })
 
+  /* ─── Pull+Build confirm popover: portal + flip ─── */
+  // The confirm popover used to be position:absolute inside the row, so the
+  // Worktrees Card's `.card-glow { overflow: hidden }` clipped it. It is now
+  // portaled to <body> with fixed positioning, like the row-actions menu.
+  async function openPullBuildConfirm({ focusTrigger = false } = {}) {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByText('Pull+Build').closest('button') as HTMLButtonElement
+    // A real browser focuses a clicked button; the test DOM does not. Only a
+    // test that depends on that (the focus-return policy below) needs it, so
+    // it stays opt-in rather than papering over the difference everywhere.
+    if (focusTrigger) trigger.focus()
+    fireEvent.click(trigger)
+    return { trigger, pop: await screen.findByRole('dialog') }
+  }
+
+  it('renders the Pull+Build confirm popover in a portal on document.body (escapes Card overflow)', async () => {
+    const { pop } = await openPullBuildConfirm()
+    // Portaled: a direct child of <body>, not nested inside the row Card whose
+    // overflow:hidden previously cut the popover off mid-render.
+    expect(pop.parentElement).toBe(document.body)
+    expect(pop.getAttribute('aria-label')).toBe('Pull + Build main')
+    expect(within(pop).getByText('Pulls main and rebuilds (~6 min). Does NOT restart.')).toBeInTheDocument()
+  })
+
+  it('Start inside the portaled confirm popover still fires the sync request', async () => {
+    const { pop } = await openPullBuildConfirm()
+    // The outside-click guard must exclude the portaled popover itself, or the
+    // mousedown preceding this click would close it before the click lands.
+    fireEvent.click(within(pop).getByText('Start'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    await waitFor(() => {
+      const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      const urls = calls.map((c) => (typeof c[0] === 'string' ? c[0] : (c[0] as Request).url))
+      expect(urls.some((u) => u.includes('/sync'))).toBe(true)
+    })
+  })
+
+  it('outside-click and Escape close the portaled confirm popover', async () => {
+    const { trigger } = await openPullBuildConfirm()
+    fireEvent.mouseDown(document.body)
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    fireEvent.click(trigger)
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('keeps keyboard focus within the confirm popover and restores it after Cancel', async () => {
+    const { trigger, pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+    const start = within(pop).getByText('Start')
+    expect(pop.getAttribute('aria-modal')).toBe('true')
+    expect(cancel).toHaveFocus()
+
+    // The browser's normal Tab behavior moves from Cancel to Start. The dialog
+    // only owns the two boundaries that would otherwise leave it.
+    start.focus()
+    fireEvent.keyDown(document.body, { key: 'Tab' })
+    expect(cancel).toHaveFocus()
+    fireEvent.keyDown(document.body, { key: 'Tab', shiftKey: true })
+    expect(start).toHaveFocus()
+
+    fireEvent.click(cancel)
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('outside-click dismissal leaves focus where the click put it, not back on the trigger', async () => {
+    // The popover now takes Escape, the Tab ring and the IME latch from the
+    // shared dialog contract, but NOT its focus-return half: that restores on
+    // unmount unconditionally, and an outside click must leave focus where the
+    // browser routed it (#2533). Turn `restoreFocus` back on and this goes red.
+    const { trigger, pop } = await openPullBuildConfirm({ focusTrigger: true })
+    expect(within(pop).getByText('Cancel')).toHaveFocus()
+    fireEvent.mouseDown(document.body)
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(trigger).not.toHaveFocus()
+  })
+
+  it('declines a boundary Tab that belongs to an IME composition', async () => {
+    // On WebKit the keydown that commits a candidate arrives AFTER
+    // compositionend with `isComposing` already false — unguarded, the trap
+    // would yank focus and abort the composition. Both ring boundaries are
+    // buttons today, so no composition can start on them; this pins that the
+    // trap stays safe if the popover ever grows a text field.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+    const start = within(pop).getByText('Start')
+    expect(cancel).toHaveFocus()
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+
+    // Declined: focus stays where it was instead of wrapping to Start.
+    expect(cancel).toHaveFocus()
+    expect(start).not.toHaveFocus()
+  })
+
+  it('declines the forward-boundary Tab too — each branch carries its own claim', async () => {
+    // The scan requires the claim BETWEEN a branch and its focus move, but a
+    // behavioural pin per boundary is what proves the claim actually runs:
+    // one guarded branch must not stand in for its sibling.
+    const { pop } = await openPullBuildConfirm()
+    const start = within(pop).getByText('Start')
+    start.focus()
+    expect(start).toHaveFocus()
+
+    fireEvent.compositionStart(start)
+    fireEvent.compositionEnd(start)
+    fireEvent.keyDown(document, { key: 'Tab' })
+
+    // Declined: no wrap back to Cancel.
+    expect(start).toHaveFocus()
+  })
+
+  it('declines an Escape that belongs to an IME composition (popover stays open)', async () => {
+    // Escape on the same document-capture listener closes the popover AND
+    // yanks focus back to the trigger — the same harm as the Tab wrap, so
+    // the same claim guards it.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    // Declined: the popover is still there and focus did not move.
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(cancel).toHaveFocus()
+  })
+
+  it('confirm popover opens downward when there is room below', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByText('Pull+Build').closest('button') as HTMLButtonElement
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue({
+      top: 100, bottom: 120, left: 400, right: 440, width: 40, height: 20, x: 400, y: 100, toJSON: () => ({}),
+    } as DOMRect)
+    fireEvent.click(trigger)
+    const pop = await screen.findByRole('dialog') as HTMLElement
+    expect(pop.getAttribute('data-placement')).toBe('down')
+    expect(pop.style.position).toBe('fixed')
+    expect(pop.style.top).not.toBe('')
+    expect(pop.style.bottom).toBe('')
+  })
+
+  it('confirm popover flips upward when near the viewport bottom', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByText('Pull+Build').closest('button') as HTMLButtonElement
+    // A row a few px above the bottom edge is exactly the case in the bug
+    // report: no room below, so the popover must flip up instead of being cut.
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue({
+      top: window.innerHeight - 8, bottom: window.innerHeight - 4, left: 400, right: 440, width: 40, height: 20, x: 400, y: window.innerHeight - 8, toJSON: () => ({}),
+    } as DOMRect)
+    fireEvent.click(trigger)
+    const pop = await screen.findByRole('dialog') as HTMLElement
+    expect(pop.getAttribute('data-placement')).toBe('up')
+    expect(pop.style.bottom).not.toBe('')
+    expect(pop.style.top).toBe('')
+  })
+
+  /* ─── Row-actions menu: focus containment (#2533) ─── */
+  // ConfirmBtn's half of #2533 landed separately (see the confirm-dialog
+  // role=dialog/Escape test above); MenuBtn was left with Escape-only
+  // handling, so all three parts — focus entry, Tab containment, and focus
+  // return — are implemented here for the menu.
+
+  it('row-actions menu moves focus onto the first item when it opens, and Tab wraps within it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'Tab' })
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Tab', shiftKey: true })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+  })
+
+  it('row-actions menu ArrowDown/ArrowUp cycle focus through items and wrap at both ends', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    // Down walks forward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[1]).toHaveFocus()
+    // Down on the last item wraps to the first.
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+    // Up on the first item wraps to the last.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    // Up walks backward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 2]).toHaveFocus()
+  })
+
+  it('row-actions menu Home/End jump to the first/last item', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'End' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Home' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu declines an arrow that belongs to an IME composition', async () => {
+    // On WebKit the keydown that moves through composition candidates can
+    // arrive AFTER compositionend with `isComposing` already false — an
+    // unguarded arrow branch would move menu focus mid-composition. Menu
+    // items are non-editable today; this pins the claim stays load-bearing
+    // if the menu ever grows a focusable text field.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.compositionStart(menuItems[0])
+    fireEvent.compositionEnd(menuItems[0])
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    // Declined: focus stays put instead of moving to the second item.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu arrows enter the list when focus is outside it: Down to first, Up to last', async () => {
+    // Reachable edge: the fleet page polls, so an item holding focus can
+    // unmount mid-open and drop activeElement to <body>.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu lets modified arrows through untouched (OS/browser shortcuts)', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown', metaKey: true })
+    fireEvent.keyDown(menu, { key: 'ArrowDown', ctrlKey: true })
+    fireEvent.keyDown(menu, { key: 'End', altKey: true })
+    // Not the menu's keys: focus did not move.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('selecting a row-actions menu item returns focus to the trigger', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(within(menu).getAllByRole('button')[0])
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('scroll-closing the row-actions menu restores focus to the trigger instead of orphaning it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    // Focus-entry put focus inside the menu; a wheel scroll moves no DOM
+    // focus, so without the restore the unmount would drop focus to <body>.
+    expect(within(menu).getAllByRole('button')[0]).toHaveFocus()
+    fireEvent.scroll(window)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
   /* ─── Provision progress: expandable log panel + failure persistence ─── */
   // 'unprov' is the only non-main has_dist:false row, so it renders the single
   // "Provision" button. Provision polling uses real 2s sleeps, hence the
@@ -709,6 +1467,7 @@ describe('DevFleetPage', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
       if (u.includes('/pod/provision')) return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-f' }), { status: 200 }))
       if (u.includes('/run?id=run-f')) return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 1, output: ['npm ERR! boom', 'FATAL: npm run build failed'] }), { status: 200 }))
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -718,12 +1477,12 @@ describe('DevFleetPage', () => {
     fireEvent.click(screen.getByText('Provision'))
     // The persistent strip is proven by its dismiss button (the toast has no
     // this uniquely targets the persisted stepper) survives instead of vanishing.
-    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 4000 })
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 4000 })
     // The log auto-expands on failure: a non-last output line shows in the panel.
     expect(screen.getByText(/npm ERR! boom/)).toBeInTheDocument()
     // Dismiss clears the persisted stepper and restores the Provision entry point.
-    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
-    await waitFor(() => expect(screen.queryByLabelText('Dismiss provision status')).toBeNull())
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(screen.queryByTestId('provision-error-unprov')).toBeNull())
     expect(screen.getByText('Provision')).toBeInTheDocument()
   }, 15000)
 
@@ -799,7 +1558,7 @@ describe('DevFleetPage', () => {
     await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
     fireEvent.click(screen.getByText('Provision'))
     // Ends in failure so the accumulated log auto-expands and persists.
-    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 10000 })
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 10000 })
     // Both the earliest line (window 1, only ever in the first poll) and the
     // latest (final window) are present, proving windows were merged not
     // replaced. 'line-early-1' is unique to the panel; 'line-5' also shows in
@@ -851,6 +1610,61 @@ describe('DevFleetPage', () => {
     expect(screen.getByTestId('prune-item-wt-b')).toHaveAttribute('data-status', 'failed')
     expect(screen.getByText('pod still active after shutdown')).toBeInTheDocument()
     expect(screen.getByText('Prune complete')).toBeInTheDocument()
+  }, 15000)
+
+  it('force-only prune counts the forced worktree and reports success (issue #4128)', async () => {
+    // Force-overriding a KEPT worktree sends it in force_names, disjoint from
+    // the regular candidate names. The counter and success tally must cover it
+    // — otherwise the denominator drops to 0 (the impossible "1/0") and the
+    // toast turns red ("Prune 0: failed") on a removal that actually succeeded.
+    let runBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/prune-candidates')) return Promise.resolve(new Response(JSON.stringify({
+        // No regular candidates — only a kept worktree offered for force-override.
+        ok: true, candidates: [], kept: [{ name: 'wt-kept', code: 'merged_new_commits' }], scanned: 1,
+      }), { status: 200 }))
+      if (u.includes('/prune-run')) {
+        runBody = init?.body ? JSON.parse(String(init.body)) : null
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, total: 1 }), { status: 200 }))
+      }
+      if (u.includes('/prune-status')) {
+        // Backend tracks the forced item: it is in total/items and done bumps.
+        return Promise.resolve(new Response(JSON.stringify({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-kept', ok: true }],
+          items: { 'wt-kept': { status: 'done', error: null } },
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Prune merged'))
+    await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument())
+    // Check the force-override box on the kept row, then remove + confirm.
+    // The dialog opens from an async handler. Drain that commit before changing
+    // the controlled checkbox, then observe its checked state before submitting.
+    await act(async () => {})
+    const forceCheckbox = screen.getByLabelText('Force remove wt-kept') as HTMLInputElement
+    fireEvent.click(forceCheckbox)
+    await waitFor(() => expect(forceCheckbox).toBeChecked())
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    // The forced worktree is tracked as its own checklist row and finishes done.
+    await waitFor(() => expect(screen.getByTestId('prune-item-wt-kept')).toHaveAttribute('data-status', 'done'), { timeout: 8000 })
+    // Counter reads 1/1 (not 1/0) and completion is the success state.
+    expect(screen.getByText((_, el) => el?.textContent === 'Finished 1/1')).toBeInTheDocument()
+    expect(screen.getByText('Prune complete')).toBeInTheDocument()
+    // Success toast (green), not the red "Prune: 0 failed".
+    expect(screen.getByText('Pruned 1 worktree(s)')).toBeInTheDocument()
+    expect(screen.queryByText(/Prune: \d+ failed/)).not.toBeInTheDocument()
+    // The forced name went out in force_names, not the regular names list.
+    // pruneExecute now always includes discard_untracked_paths as a MAP (empty
+    // here: wt-kept carries no untracked-only scratch classification).
+    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'], discard_untracked_paths: {} })
   }, 15000)
 
   it('refetches the fleet with fresh=1 once a prune finishes', async () => {
@@ -1239,4 +2053,129 @@ describe('DevFleetPage restart handshake', () => {
       Object.defineProperty(window.location, 'reload', { configurable: true, value: origReload })
     }
   }, 12000)
+})
+
+// ─── Issue #5294: synchronous per-worktree in-flight guard ────────────────────
+// The Provision button's busy state lives in React prov[] state.  setState is
+// async: the button only becomes disabled after the next render commit.  A rapid
+// double-click fires BOTH onClick handlers in the same render turn, so the second
+// click sees prov.status===undefined (unchanged) and fires a second POST.
+//
+// The fix: provInFlightRef is checked and set SYNCHRONOUSLY before the first
+// await, so the second invocation is blocked regardless of React render timing.
+//
+// These tests verify the invariants at the component level by invoking the
+// handler twice in one render turn (fireEvent × 2 with no await between them).
+describe('provision singleflight guard (issue #5294)', () => {
+  beforeEach(() => { vi.restoreAllMocks() })
+
+  const FLEET_UNPROV = {
+    worktrees: [
+      { name: 'main', is_main: true, running: false, has_dist: true, behind: 0 },
+      { name: 'unprov', is_main: false, running: false, has_dist: false, behind: 0 },
+    ],
+  }
+
+  it('regression: only one POST is sent for two rapid clicks (proves guard works)', async () => {
+    // Two fireEvent.click calls with no render between them (same render turn)
+    // simulate the rapid double-click scenario described in issue #5294.
+    // The synchronous guard in provInFlightRef blocks the second invocation
+    // before the first async handler's `await` returns — only ONE POST reaches
+    // the backend regardless of how fast the user clicks.
+    // IMPORTANT: this test proves the fix is effective; see the comment in the
+    // production code for why React setState alone cannot block the second click.
+    let provisionPosts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision')) {
+        provisionPosts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-sf-' + provisionPosts }), { status: 200 }))
+      }
+      // run poll stays running forever so the first provision is still in-flight
+      if (u.includes('/run?id=')) return Promise.resolve(new Response(JSON.stringify({ status: 'running', output: [] }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    const btn = screen.getByText('Provision')
+    // Rapid double-click: both clicks in the same render turn (no await between).
+    fireEvent.click(btn)
+    fireEvent.click(btn)
+    // Wait for async work to settle.
+    await waitFor(() => expect(provisionPosts).toBeGreaterThan(0), { timeout: 4000 })
+    // The synchronous guard blocks the second click — exactly one POST sent.
+    expect(provisionPosts).toBe(1)
+  }, 10000)
+
+  it('guard is released after a failure so the user can retry provisioning', async () => {
+    // After a failed provision the user dismisses the error and clicks Provision
+    // again.  The guard must be cleared in the finally block so this retry can
+    // proceed rather than being silently blocked.
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) {
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision')) {
+        posts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-retry-' + posts }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-retry-1')) {
+        // First run fails immediately.
+        return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 1, output: ['npm ERR! failed'] }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-retry-2')) {
+        // Second run stays running (we only care that the POST went out).
+        return Promise.resolve(new Response(JSON.stringify({ status: 'running', output: [] }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // First click — provision fails.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 6000 })
+    // Dismiss the failure stepper.
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(screen.getByText('Provision')).toBeInTheDocument(), { timeout: 3000 })
+    // Retry — must succeed (guard was released in finally).
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(posts).toBe(2), { timeout: 4000 })
+  }, 20000)
+
+  it('guard cleans up cleanly after a successful provision so a subsequent provision can be started', async () => {
+    // After a successful run the stepper auto-clears and the row shows Provision
+    // again.  A click on that restored button must not be silently blocked by a
+    // stale guard entry.
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) {
+        // After success, fleet still shows has_dist:false so Provision is re-shown.
+        return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      }
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision')) {
+        posts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-ok-' + posts }), { status: 200 }))
+      }
+      if (u.includes('/run?id=')) {
+        return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 0, output: ['done'] }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // First provision succeeds and clears.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(screen.getByText('Provision')).toBeInTheDocument(), { timeout: 6000 })
+    // Second provision — must not be silently swallowed.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(posts).toBe(2), { timeout: 4000 })
+  }, 20000)
 })

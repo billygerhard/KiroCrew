@@ -8,7 +8,7 @@ files / secret env vars and exfiltrated them, because the command ran via
 Fixes under test:
   1. storage-time deny-list on ``command``      (_vet_shell_command)
   2. exec-time sandbox raised to ``cc``         (run_command_sandboxed)
-  3. cron_add no longer in default allowedTools  (config/defaults.json)
+  3. cron_add absent from default allowedTools   (config/defaults.json)
   4. secret env vars scrubbed from cron env      (_clean_cron_env)
   5. storage-time scan of script contents        (_vet_script_file)
   6. validation regex documented as input-shape  (covered by 1+2)
@@ -16,18 +16,27 @@ Fixes under test:
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import sys
+import threading
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
+from kiro_crew import mcp_cron, mcp_shared
 from kiro_crew.mcp_cron import (
     _call_tool_inner,
     _glob_could_reach_credentials,
+    _not_found,
     _substitute_local_assignments,
+    _unidentified_caller_refusal,
+    _unowned_row_refusal,
     _vet_script_contents,
     _vet_script_file,
     _vet_shell_command,
@@ -253,6 +262,16 @@ BENIGN_COMMANDS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
+
+
 @pytest.mark.parametrize("cmd", MALICIOUS_COMMANDS)
 def test_vet_shell_command_blocks_malicious(cmd):
     err = _vet_shell_command(cmd)
@@ -311,6 +330,65 @@ def test_assignment_limit_fails_closed_not_open():
     assert _vet_shell_command(at_limit) is None, "64 harmless assignments must pass"
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "A= B=x;C=;  D=$A\nE='s\\h'",
+            [("A", ""), ("B", "x"), ("C", ""), ("D", "$A"), ("E", "'s\\h'")],
+        ),
+        (
+            " \t\r\n\u2003A=one&&B=two|C=three",
+            [("A", "one"), ("B", "two"), ("C", "three")],
+        ),
+        ("echo-a=b cmd a=b -Xc=d _ok=e 9BAD=f", [("a", "b"), ("_ok", "e")]),
+        ("A=x;B=$A;A=y", [("A", "x"), ("B", "$A"), ("A", "y")]),
+        (
+            "A='one two' B=\"three four\" C=.s''sh",
+            [("A", "'one"), ("B", '\"three'), ("C", ".s''sh")],
+        ),
+        (
+            "A='left;B=middle|C=right'",
+            [("A", "'left"), ("B", "middle"), ("C", "right'")],
+        ),
+        (
+            "A=one\\ two B=three\\;C=four",
+            [("A", "one\\"), ("B", "three\\"), ("C", "four")],
+        ),
+        ("A=B=C _= 9BAD=x éBAD=y A-é=z", [("A", "B=C"), ("_", "")]),
+        (
+            "def=x True=y __=z a0=q K=bad Ａ=bad Á=bad",
+            [("def", "x"), ("True", "y"), ("__", "z"), ("a0", "q")],
+        ),
+    ],
+)
+def test_assignment_boundaries_preserve_capture_order_and_empty_values(command, expected):
+    assert list(mcp_cron._iter_local_assignments(command)) == expected
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n"])
+def test_whitespace_assignment_lists_keep_the_exact_admission_limit(separator):
+    assignments = separator.join(f"Z{i}=x" for i in range(64))
+    assert _vet_shell_command(assignments + "; echo done") is None
+    error = _vet_shell_command(assignments + separator + "LAST=x; echo done")
+    assert error is not None and "too many variable assignments" in error
+
+
+@pytest.mark.parametrize(
+    ("prefix", "separator"),
+    [
+        ("\t" * 20_000, ""),
+        ("A" * 20_000 + " " + "9" * 20_000 + "=ignored", "; "),
+    ],
+    ids=["long-whitespace", "long-non-assignment-words"],
+)
+def test_long_prefix_never_hides_later_assignments(prefix, separator):
+    assert list(mcp_cron._iter_local_assignments(prefix)) == []
+    command = prefix + separator + "A=.s B=sh; cat ~/$A$B/id_rsa"
+    assert list(mcp_cron._iter_local_assignments(command)) == [("A", ".s"), ("B", "sh")]
+    assert _substitute_local_assignments(command).endswith("cat ~/.ssh/id_rsa")
+
+
 @pytest.mark.parametrize("cmd", BENIGN_COMMANDS)
 def test_vet_shell_command_allows_benign(cmd):
     assert _vet_shell_command(cmd) is None, f"should allow: {cmd!r}"
@@ -363,6 +441,41 @@ def test_glob_matching_cost_is_bounded():
     assert _glob_could_reach_credentials("cat ~/.??h/id_rsa")
     assert _glob_could_reach_credentials("cat ~/." + "*" * 300 + "/id_rsa")
     assert not _glob_could_reach_credentials("rm /tmp/*.log")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", False),
+        ("plain", False),
+        ("abc[", False),
+        ("abc]", False),
+        ("][", False),
+        ("][x]", True),
+        ("[]", True),
+        ("[[]", True),
+        ("[\n]", True),
+        ("[\n", False),
+        ("*", True),
+        ("?", True),
+    ],
+)
+def test_glob_markers_distinguish_literal_brackets_and_complete_pairs(value, expected):
+    assert mcp_cron._contains_glob_meta(value) is expected
+
+
+def test_glob_word_limit_applies_only_after_wildcard_detection():
+    at_limit = "/tmp/" + "x" * 250 + "*"
+    assert len(at_limit) == 256
+    assert not _glob_could_reach_credentials("cat " + at_limit)
+    assert _glob_could_reach_credentials("cat " + at_limit + "x")
+    literal = "[" * 20_000
+    assert not _glob_could_reach_credentials("cat " + literal)
+    assert _glob_could_reach_credentials("cat " + literal + "]")
+    # A pair across whitespace is not a glob in either individual shell word.
+    assert not _glob_could_reach_credentials("cat [\n]")
+    assert _glob_could_reach_credentials("cat ~/.s[s]h/id_rsa")
+    assert not _glob_could_reach_credentials("cat ~/notes/[ab].txt")
 
 
 def test_vet_shell_command_empty_is_clean():
@@ -436,6 +549,78 @@ def test_vet_script_contents_allows_benign(body):
     assert _vet_script_contents(body) is None
 
 
+# A cron script body is PYTHON SOURCE, not a shell command line. Each body below
+# READS NOTHING: it describes, redacts or documents a fenced store. Routing any of
+# them through the shell gate refuses it -- a backslash run read as a collapsible
+# separator, a docstring read as a `find` command line -- yet each is the shape a
+# redaction helper or a well-documented script actually has. They must all vet clean.
+BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE = [
+    'import re\nSCRUB = re.compile(r"%LOCALAPPDATA%\\\\kiro-cli")\n',
+    'import re\nSCRUB = re.compile(r"/home/\\\\S*/\\\\.kiro/crew/security_policy.json")\n',
+    'import re\nSCRUB = re.compile(pattern=r"%LOCALAPPDATA%\\\\\\\\kiro-cli")\n',
+    'import re\n\n\ndef scrub(s):\n    redacted = re.sub(r"%LOCALAPPDATA%\\\\\\\\kiro-cli", "<X>", s)\n    return str(redacted)\n',
+    # A prose docstring naming the store.
+    'def run(ctx):\n    """Never touch %LOCALAPPDATA%\\\\kiro-cli -- it is the keystone."""\n',
+    # A docstring opening with a verb the shell traversal grammar models.
+    'def run(ctx):\n    """Find commits on main that belong to no pull request and report them.\n\n'
+    + "".join(f"    Step {i}: check `item_{i}` against `rule_{i}` and `note_{i}`.\n" for i in range(40))
+    + '    """\n    return None\n',
+    # Long enough that counting every line as a pipeline stage exhausts the shell
+    # gate's stage budget.
+    "".join(f"value_{i} = {i}\n" for i in range(700)),
+    # `os.environ` code plus a `|` in a regex literal plus a filter word in a comment,
+    # far apart -- the env-pipeline shape the ordered-existence rules assemble.
+    "import os\nregion = os.environ.get('AWS_REGION')\n"
+    + "x = 1\n" * 200
+    + "PAT = r'foo|bar'\n"
+    + "x = 2\n" * 200
+    + "# grep through the results later\n",
+]
+
+
+@pytest.mark.parametrize("body", BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE)
+def test_vet_script_contents_allows_source_that_only_names_a_fenced_store(body):
+    assert _vet_script_contents(body) is None, f"should allow: {body[:80]!r}"
+
+
+def test_script_body_is_never_a_shell_gate_subject(monkeypatch):
+    """RATCHET: the cron script gate must not route a source body through any shell
+    matcher. Every shell-grammar pass added to ``is_sensitive_bash_command`` produces
+    another class of false denial on ordinary Python scripts -- separator collapse,
+    stage budget, ordered-existence env rules, `find`-grammar docstrings -- because a
+    shell matcher handed a document reads the document as one command line. So the
+    stop handing it one, not to add another AST layer. If this test fails, the coupling
+    is back: put the detector in ``_vet_script_contents`` as a whole-body, source-aware
+    match, or leave the concern to the sandbox that runs the script.
+    """
+    from kiro_crew import mcp_cron, security
+
+    def trip(*a, **k):
+        raise AssertionError("shell matcher reached with a source body")
+
+    monkeypatch.setattr(security, "is_sensitive_bash_command", trip)
+    monkeypatch.setattr(mcp_cron, "is_sensitive_bash_command", trip)
+    for name in ("is_denied", "_check_alt_traversal_reaches_fence",
+                 "_check_find_traversal_reaches_fence", "_check_env_credential_access",
+                 "_fence_hit_in_collapsed", "_check_sensitive_via_normalizer"):
+        if hasattr(security, name):
+            monkeypatch.setattr(security, name, trip)
+    assert not hasattr(security, "is_sensitive_source_body"), (
+        "the source-body shell entry point was removed on purpose; do not reintroduce it"
+    )
+    for body in BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE + BENIGN_SCRIPTS:
+        assert _vet_script_contents(body) is None
+    for body in MALICIOUS_SCRIPTS:
+        assert _vet_script_contents(body) is not None
+
+
+def test_vet_script_contents_refuses_an_oversized_body_rather_than_scanning_part():
+    body = "x = 1\n" * (mcp_cron._MAX_SCRIPT_SCAN_BYTES // 6 + 2)
+    assert len(body) > mcp_cron._MAX_SCRIPT_SCAN_BYTES
+    err = _vet_script_contents(body)
+    assert err is not None and "too large to security-scan" in err
+
+
 def test_vet_script_file_reads_and_blocks(tmp_path):
     f = tmp_path / "evil.py"
     f.write_text("import os\nopen(os.path.expanduser('~/.aws/credentials')).read()\n")
@@ -446,6 +631,213 @@ def test_vet_script_file_reads_and_blocks(tmp_path):
 def test_vet_script_file_missing_file_errors(tmp_path):
     err = _vet_script_file(str(tmp_path / "nope.py"))
     assert err is not None and err.startswith("Error:")
+
+
+def _assert_descriptors_closed(descriptors):
+    """Every descriptor the vetter opened must be released before it returns."""
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def _refuse_content_read(*args, **kwargs):
+    raise AssertionError("an unverified script leaf reached the content reader")
+
+
+def test_resolved_fifo_is_refused_before_a_blocking_read(monkeypatch, tmp_path):
+    import builtins
+
+    from kiro_crew.config.loader import config_dir
+    from kiro_crew.cron_script import resolve_script_path
+
+    make_fifo = getattr(os, "mkfifo", None)
+    if make_fifo is None:
+        pytest.skip("the host has no FIFO creation primitive")
+    script = config_dir().resolve() / "crons" / "waiting.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    make_fifo(script)
+    resolved, function = resolve_script_path(f"{script}:run")
+    assert function == "run"
+    original_open = builtins.open
+
+    def no_blocking_read(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(path) == script:
+            raise AssertionError("the scanner attempted a blocking FIFO read")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", no_blocking_read)
+    err = _vet_script_file(resolved)
+    assert err is not None and "regular file" in err
+
+
+@requires_symlinks
+@pytest.mark.parametrize("without_nofollow", [False, True])
+def test_script_leaf_swap_never_reads_the_target(monkeypatch, tmp_path, without_nofollow):
+    script = tmp_path.resolve() / "review.py"
+    script.write_text("print('safe')\n", encoding="utf-8")
+    target = tmp_path.resolve() / "private-target"
+    target.write_text("private content must not reach the reader", encoding="utf-8")
+    if without_nofollow:
+        monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+    original_open = os.open
+    descriptors = []
+    swapped = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if Path(path) == script:
+            script.unlink()
+            script.symlink_to(target)
+            swapped.append(path)
+        descriptor = original_open(path, flags, *args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+    monkeypatch.setattr(os, "fdopen", _refuse_content_read)
+    err = _vet_script_file(str(script))
+    assert swapped
+    assert err is not None and err.startswith("Error:")
+    assert "private content" not in err
+    _assert_descriptors_closed(descriptors)
+
+
+def test_fifo_substituted_during_open_is_nonblocking_and_refused(monkeypatch, tmp_path):
+    make_fifo = getattr(os, "mkfifo", None)
+    if make_fifo is None:
+        pytest.skip("the host has no FIFO creation primitive")
+    script = tmp_path.resolve() / "review.py"
+    script.write_text("print('safe')\n", encoding="utf-8")
+    original_open = os.open
+    descriptors = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if Path(path) == script:
+            assert flags & getattr(os, "O_NONBLOCK", 0), "FIFO open must never block"
+            script.unlink()
+            make_fifo(script)
+        descriptor = original_open(path, flags, *args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+    err = _vet_script_file(str(script))
+    assert err is not None and "regular file" in err
+    assert descriptors
+    _assert_descriptors_closed(descriptors)
+
+
+def test_regular_script_keeps_utf8_replacement_and_universal_newlines(monkeypatch, tmp_path):
+    script = tmp_path / "review.py"
+    script.write_bytes(b"# caf\xc3\xa9\r\n# invalid: \xff\r\nprint('safe')\r\n")
+    seen = []
+    monkeypatch.setattr(mcp_cron, "_vet_script_contents", lambda text: seen.append(text))
+    assert _vet_script_file(str(script)) is None
+    assert seen == ["# caf\u00e9\n# invalid: \ufffd\nprint('safe')\n"]
+
+
+def test_script_parent_swap_before_metadata_never_reads_the_target(monkeypatch, tmp_path):
+    root = tmp_path.resolve()
+    parent = root / "crons" / "nested"
+    parent.mkdir(parents=True)
+    script = parent / "review.py"
+    script.write_text("print('safe')\n", encoding="utf-8")
+    target = root / "private-target"
+    target.mkdir()
+    (target / script.name).write_text("private content must not reach the reader", encoding="utf-8")
+    original_sensitive = mcp_cron.is_sensitive_path
+    original_fd_path = mcp_cron.fd_real_path
+    swapped = []
+    descriptors = []
+
+    def swap_after_path_check(path):
+        result = original_sensitive(path)
+        if Path(path) == script and not swapped:
+            assert not result
+            parent.rename(root / "original-cron-directory")
+            make_dir_link(parent, target)
+            swapped.append(path)
+        return result
+
+    def observed_fd_path(descriptor):
+        descriptors.append(descriptor)
+        actual = original_fd_path(descriptor)
+        assert actual is not None and Path(actual) == target / script.name
+        return actual
+
+    monkeypatch.setattr(mcp_cron, "is_sensitive_path", swap_after_path_check)
+    monkeypatch.setattr(mcp_cron, "fd_real_path", observed_fd_path)
+    monkeypatch.setattr(os, "fdopen", _refuse_content_read)
+    err = _vet_script_file(str(script))
+    assert swapped and descriptors
+    assert err is not None and "cannot verify cron script path" in err
+    assert "private content" not in err
+    _assert_descriptors_closed(descriptors)
+
+
+def test_script_unknown_descriptor_path_is_refused_before_read(monkeypatch, tmp_path):
+    script = tmp_path / "review.py"
+    script.write_text("print('safe')\n", encoding="utf-8")
+    descriptors = []
+
+    def unavailable_fd_path(descriptor):
+        descriptors.append(descriptor)
+        return None
+
+    monkeypatch.setattr(mcp_cron, "fd_real_path", unavailable_fd_path)
+    monkeypatch.setattr(os, "fdopen", _refuse_content_read)
+    err = _vet_script_file(str(script))
+    assert descriptors
+    assert err is not None and "cannot verify cron script path" in err
+    _assert_descriptors_closed(descriptors)
+
+
+class TestOversizedScriptIsRefusedNotTruncated:
+    """Reading exactly the cap is a fence BYPASS, not a bound: the vetter sees a body
+    at the limit, scans it clean, and the sandbox then executes the whole file. So the
+    read goes one character past the cap and an oversized script is refused."""
+
+    #: One long statement per line, ~607 chars, so a verdict here is about the read
+    #: boundary and not about line count.
+    _LINE = 'v = "' + "a" * 600 + '"\n'
+
+    def _body_over_the_cap(self) -> str:
+        return self._LINE * ((mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)) + 2)
+
+    def test_the_read_probes_one_past_the_cap(self):
+        assert mcp_cron._SCRIPT_READ_PROBE_BYTES == mcp_cron._MAX_SCRIPT_SCAN_BYTES + 1
+
+    def test_a_credential_read_past_the_cap_is_not_allowed(self, tmp_path):
+        """The regression: with the read capped AT the limit this returned None and the
+        script ran in full."""
+        prefix = self._body_over_the_cap()
+        f = tmp_path / "evil.py"
+        f.write_text(prefix + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8")
+        assert len(prefix) > mcp_cron._MAX_SCRIPT_SCAN_BYTES, "payload must sit past the cap"
+
+        err = _vet_script_file(str(f))
+        assert err is not None, "a script whose tail was never scanned must not be allowed"
+        assert "too large to security-scan" in err
+
+    def test_a_script_at_the_cap_is_still_scanned_in_full(self, tmp_path):
+        """No false refusal at the boundary: the probe byte only fires ABOVE the cap."""
+        f = tmp_path / "big_ok.py"
+        body = (self._LINE * (mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)))[
+            : mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        ]
+        f.write_text(body, encoding="utf-8")
+        assert len(body) <= mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        assert _vet_script_file(str(f)) is None
+
+    def test_a_credential_read_inside_the_cap_is_still_blocked(self, tmp_path):
+        """The refusal above is not doing the work a real scan should: a payload the
+        reader DOES reach is still denied on its merits, not on its size."""
+        f = tmp_path / "evil_small.py"
+        f.write_text(
+            self._LINE * 10 + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8"
+        )
+        err = _vet_script_file(str(f))
+        assert err is not None
+        assert "too large to security-scan" not in err
 
 
 class TestCronAddScriptGuard:
@@ -538,7 +930,7 @@ def test_run_command_uses_cc_sandbox(monkeypatch):
     assert captured.get("mode") == "cc"
 
 
-# ── Fix 3: defaults.json no longer auto-approves cron_add ──────────────────
+# ── Fix 3: defaults.json does not auto-approve cron_add ────────────────────
 
 def test_defaults_allowedtools_excludes_cron_add():
     import kiro_crew
@@ -603,3 +995,296 @@ def test_vet_script_file_blocks_sensitive_symlink(monkeypatch, tmp_path):
     assert err is not None and "blocked by security policy" in err
     # The secret content must NOT leak into the error message.
     assert "AKIAIOSFODNN7EXAMPLE" not in err
+# ── A cron refusal frame carries the MCP ``isError`` flag ──────────────────
+#
+# Every refusal on this server is a plain string starting ``Error:``. The SEL
+# audit half already reads that prefix (``mcp_shared`` derives ``outcome``
+# from it), but the WIRE frame said nothing, so a client could only tell a
+# refusal from an answer by pattern-matching the prose. The cron server now
+# opts in to ``error_prefix_is_error``, which adds ``isError`` to the frame and
+# leaves the prose byte-identical -- both halves are asserted per producer.
+
+
+def _cron_loop_kwargs(monkeypatch) -> dict:
+    """The keyword arguments mcp_cron's entry point hands the stdio loop.
+
+    Captured from :func:`mcp_cron.run_mcp_server` rather than written as a
+    literal, so dropping ``error_prefix_is_error=True`` there fails the frame
+    assertions below instead of leaving them green against a stale constant.
+    """
+    captured: dict = {}
+
+    def _capture(_name, _version, _list_tools, _call_tool, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(mcp_cron, "run_mcp_stdio_loop", _capture)
+    mcp_cron.run_mcp_server()
+    return captured
+
+
+class _CronLoopHarness:
+    """Run the real stdio loop over a pipe, configured the way cron configures it.
+
+    Responses are captured by patching ``mcp_shared.respond``; SEL and
+    tool-policy resolution are stubbed so the loop needs no gateway. On POSIX
+    the loop answers from its worker thread and on Windows from the synchronous
+    branch -- the same assertions cover both, so neither platform can lose the
+    flag silently.
+    """
+
+    def __init__(self, monkeypatch, call_tool_fn, policy=None):
+        self.responses: list = []
+        rfd, self._wfd = os.pipe()
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.open(rfd, "rb")))
+        monkeypatch.setattr(mcp_shared, "respond", self._record)
+        resolved = policy or mcp_shared.ToolPolicy(frozenset(), "")
+        monkeypatch.setattr(mcp_shared, "_resolve_tool_policy", lambda *a, **k: resolved)
+        monkeypatch.setattr(mcp_shared, "sel", lambda: MagicMock())
+        self._thread = threading.Thread(
+            target=mcp_shared.run_mcp_stdio_loop,
+            args=("kirocrew-cron", "1.0.0", lambda: [], call_tool_fn),
+            kwargs=_cron_loop_kwargs(monkeypatch),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _record(self, req_id, result, error=None) -> None:
+        self.responses.append((req_id, result, error))
+
+    def call(self, tool_name: str) -> dict:
+        """Send one tools/call and return the result payload the loop wrote."""
+        os.write(
+            self._wfd,
+            (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": {}},
+                    }
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not self.responses:
+            time.sleep(0.02)
+        assert self.responses, f"loop never answered tools/call for {tool_name}"
+        return self.responses[0][1]
+
+    def close(self) -> None:
+        os.close(self._wfd)
+        self._thread.join(timeout=5.0)
+
+
+@pytest.fixture
+def cron_loop(monkeypatch):
+    """Factory: build a cron-configured loop around one canned tool result."""
+    harnesses: list = []
+
+    def _make(result_text: str) -> _CronLoopHarness:
+        harness = _CronLoopHarness(monkeypatch, lambda _name, _args: result_text)
+        harnesses.append(harness)
+        return harness
+
+    yield _make
+    for harness in harnesses:
+        harness.close()
+
+
+# One entry per refusal producer reached by a cron tool: the unidentified-caller
+# refusal (cron_add, cron_remove_all and the per-job ownership gate all raise
+# it) and the ownership gate's two indistinguishable answers.
+CRON_REFUSAL_PRODUCERS = [
+    pytest.param(_unidentified_caller_refusal, "cron_add", id="cron_add-unidentified"),
+    pytest.param(
+        _unidentified_caller_refusal, "cron_remove_all", id="cron_remove_all-unidentified"
+    ),
+    pytest.param(_unidentified_caller_refusal, "cron:job-1", id="ownership-unidentified"),
+    pytest.param(_not_found, "job-1", id="ownership-not-found"),
+    pytest.param(_unowned_row_refusal, "job-1", id="ownership-unowned-row"),
+]
+
+
+@pytest.mark.parametrize("producer,subject", CRON_REFUSAL_PRODUCERS)
+def test_cron_refusal_frame_is_flagged_and_prose_is_unchanged(
+    monkeypatch, cron_loop, producer, subject
+):
+    """The frame gains ``isError``; the refusal text stays byte-identical."""
+    monkeypatch.setattr(mcp_cron, "sel", lambda: MagicMock())
+    refusal = producer(subject)
+    assert refusal.startswith("Error:")
+
+    result = cron_loop(refusal).call("cron_list")
+
+    assert result.get("isError") is True
+    assert result["content"] == [{"type": "text", "text": refusal}]
+
+
+def test_cron_success_frame_carries_no_error_flag(cron_loop):
+    """Opting in must not flag an ordinary answer -- only ``Error:`` prose."""
+    result = cron_loop("Removed job: job-1").call("cron_remove")
+
+    assert "isError" not in result
+    assert result["content"] == [{"type": "text", "text": "Removed job: job-1"}]
+
+
+def test_mcp_tool_client_raises_on_a_flagged_cron_refusal(monkeypatch, cron_loop):
+    """The one in-tree consumer turns the flagged frame into a RuntimeError.
+
+    Before the flag it read the refusal prose back as a successful answer, so a
+    cron script could not tell a refused write from a completed one.
+    """
+    from kiro_crew.cron_script import McpToolClient
+
+    monkeypatch.setattr(mcp_cron, "sel", lambda: MagicMock())
+    refusal = _unidentified_caller_refusal("cron_add")
+    result = cron_loop(refusal).call("cron_add")
+
+    client = object.__new__(McpToolClient)
+    client._server_name = "kirocrew-cron"
+    monkeypatch.setattr(
+        McpToolClient, "_rpc", lambda self, method, params=None: {"result": result}
+    )
+    with pytest.raises(RuntimeError, match="MCP tool error"):
+        client.call_tool("cron_add", {})
+
+
+def test_unknown_tool_answer_is_a_flagged_failure(cron_loop):
+    """A mistyped or removed tool name reaches the client as a flagged failure.
+
+    ``cron_script`` spawns this server and talks to it directly, so an unknown
+    name arrives with no gateway to reject it first. ``_call_tool`` -- the
+    function the loop is handed -- answers it at its own argument validation,
+    ahead of the ``Unknown tool:`` fall-through inside ``_call_tool_inner``, and
+    that answer is ``Error:``-prefixed. This pins that the wire path stays
+    prefixed, so the fall-through cannot become reachable-and-unflagged without
+    reddening here.
+    """
+    answer = mcp_cron._call_tool("no_such_cron_tool", {})
+    assert answer.startswith("Error:")
+    assert mcp_cron._call_tool_inner("no_such_cron_tool", {}).startswith("Unknown tool:")
+
+    result = cron_loop(answer).call("no_such_cron_tool")
+
+    assert result.get("isError") is True
+    assert result["content"] == [{"type": "text", "text": answer}]
+
+
+# The shared loop refuses a call itself in two places, before the tool ever runs:
+# an unreadable tool policy and a tool the operator excluded. Both answer in
+# ``Error:`` prose, so on an opted-in server both must be flagged like every other
+# refusal -- otherwise the guarantee has two holes inside the same function.
+POLICY_REFUSALS = [
+    pytest.param(mcp_shared.ToolPolicy(frozenset(), "identity_unattested"), id="unresolved"),
+    pytest.param(mcp_shared.ToolPolicy(frozenset({"cron_add"}), ""), id="excluded"),
+]
+
+
+# ``cron_trigger`` hands back whatever ``trigger_cron_job`` reports, and that
+# reporter mixes prefixed messages (``Error: HTTP 500``) with bare ones (a gateway
+# 404's ``Job not found:``). The SEL row on the branch already says ``outcome=error``,
+# so the wire says it too -- marked at the boundary that knows, rather than by
+# listing the reporter's strings, which is what keeps a message added there covered.
+TRIGGER_FAILURES = [
+    pytest.param("Job not found: job-1", "Error: Job not found: job-1", id="bare-404"),
+    pytest.param("Error: HTTP 500", "Error: HTTP 500", id="already-marked-not-doubled"),
+    pytest.param(
+        "Error: cannot reach gateway. Is `kirocrew gateway` running?",
+        "Error: cannot reach gateway. Is `kirocrew gateway` running?",
+        id="already-marked-unreachable",
+    ),
+]
+
+
+@pytest.mark.parametrize("reported,expected", TRIGGER_FAILURES)
+def test_trigger_failure_reaches_the_wire_marked(
+    monkeypatch, tmp_path, cron_loop, reported, expected
+):
+    """A refused trigger is marked once -- never unmarked, never doubled."""
+    from kiro_crew.cron import CronService
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+    added = _call_tool_inner(
+        "cron_add",
+        {"name": f"trig-{uuid.uuid4().hex[:8]}", "command": "echo hello", "every": 120},
+    )
+    assert "Added job" in added, added
+    jid = CronService(base_dir=tmp_path).list_jobs(include_disabled=True)[0].id
+
+    monkeypatch.setattr(mcp_cron, "trigger_cron_job", lambda *a, **k: (False, reported))
+    answer = _call_tool_inner("cron_trigger", {"job_id": jid})
+
+    assert answer == expected
+    assert not answer.startswith("Error: Error:")
+    assert cron_loop(answer).call("cron_trigger").get("isError") is True
+
+
+def test_trigger_rejects_a_malformed_job_id_as_an_error(cron_loop):
+    """The local id pre-check is a refusal, so it is marked like the rest."""
+    answer = _call_tool_inner("cron_trigger", {"job_id": "not a valid id"})
+
+    assert answer.startswith("Error:")
+    assert cron_loop(answer).call("cron_trigger").get("isError") is True
+
+
+# A mutation whose store call comes back falsey was REFUSED: the row the ownership
+# gate just saw is gone (a concurrent delete between the check and the write). Its
+# answer sits one line below the committed one, so an unprefixed answer there frames
+# exactly like the "Removed job: <id>" above it and a cron script reads a refused
+# delete as a completed one. AUTOSDE `a-refusal-is-not-a-commit`.
+#
+# The race is reproduced at its seam rather than with sleeps: the job really exists,
+# so the gate really passes, and the store method really reports the refusal.
+REFUSED_MUTATIONS = [
+    pytest.param("cron_update", {"every": 300}, "update_job", id="cron_update"),
+    pytest.param("cron_remove", {}, "remove_job", id="cron_remove"),
+    pytest.param("cron_pause", {}, "enable_job", id="cron_pause"),
+    pytest.param("cron_resume", {}, "enable_job", id="cron_resume"),
+]
+
+
+@pytest.mark.parametrize("tool,extra_args,store_method", REFUSED_MUTATIONS)
+def test_refused_mutation_is_an_error_not_a_commit(
+    monkeypatch, tmp_path, cron_loop, tool, extra_args, store_method
+):
+    """A refused write answers ``Error:`` and reaches the client flagged."""
+    from kiro_crew.cron import CronService
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+    added = _call_tool_inner(
+        "cron_add",
+        {"name": f"race-{uuid.uuid4().hex[:8]}", "command": "echo hello", "every": 120},
+    )
+    assert "Added job" in added, added
+    jid = CronService(base_dir=tmp_path).list_jobs(include_disabled=True)[0].id
+
+    # The row exists, so the ownership gate passes; the write is what refuses.
+    monkeypatch.setattr(CronService, store_method, lambda *a, **k: False)
+    answer = _call_tool_inner(tool, {"job_id": jid, **extra_args})
+
+    assert answer.startswith("Error:"), answer
+    assert jid in answer  # post-gate, so naming the row it owns is fine
+    assert cron_loop(answer).call(tool).get("isError") is True
+
+
+@pytest.mark.parametrize("policy", POLICY_REFUSALS)
+def test_shared_loop_policy_refusal_is_flagged_on_the_cron_server(monkeypatch, policy):
+    """Both pre-dispatch refusals carry ``isError`` and keep their own prose."""
+    harness = _CronLoopHarness(
+        monkeypatch,
+        lambda _name, _args: "unreachable: the policy gate answers before the tool",
+        policy=policy,
+    )
+    try:
+        result = harness.call("cron_add")
+    finally:
+        harness.close()
+
+    text = result["content"][0]["text"]
+    assert text.startswith("Error:")
+    assert "unreachable" not in text  # the gate answered; the tool never ran
+    assert result.get("isError") is True

@@ -1,4 +1,4 @@
-"""Unit tests for chat_slack.py — Slack link, handoff, channel listing."""
+"""Unit tests for chat_slack.py — Slack link, channel listing."""
 
 from __future__ import annotations
 
@@ -7,15 +7,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from chat_test_helpers import _make_state
+from chat_test_helpers import _make_state, drain_background_tasks
 
 
 def _make_slack_app(state):
     from kiro_crew.dashboard.chat_slack import (
-        api_chat_slot_handoff,
         api_chat_slot_slack_link,
         api_chat_slot_slack_unlink,
-        api_handoff_channels,
         api_slack_channels,
     )
 
@@ -24,8 +22,6 @@ def _make_slack_app(state):
     app.router.add_post("/api/chat/slots/{slot}/slack-link", api_chat_slot_slack_link)
     app.router.add_post("/api/chat/slots/{slot}/slack-unlink", api_chat_slot_slack_unlink)
     app.router.add_get("/api/slack/channels", api_slack_channels)
-    app.router.add_post("/api/chat/slots/{slot}/handoff", api_chat_slot_handoff)
-    app.router.add_get("/api/handoff-channels", api_handoff_channels)
     return app
 
 
@@ -65,6 +61,7 @@ class TestSlackLink:
         async with TestClient(TestServer(_make_slack_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert resp.status == 200
+            await drain_background_tasks(state)
             data = await resp.json()
             assert data["ok"] is True
             assert data["thread_ts"] == "ts123"
@@ -240,6 +237,7 @@ class TestSlackLinkUnlinkRoundTrip:
         async with TestClient(TestServer(_make_slack_app(state))) as client:
             link = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert link.status == 200
+            await drain_background_tasks(state)
             link_data = await link.json()
             ts = link_data["thread_ts"]
             assert state.sessions.get_session_for_thread(ts) == "dashboard:s1"
@@ -315,29 +313,6 @@ class TestSlackChannels:
             assert unresolved["name"] == "C0AU38Q0E4B"
 
 
-class TestHandoff:
-    @pytest.mark.asyncio
-    async def test_handoff_no_slack(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        state = _make_state(tmp_path)
-        state.get_or_create_slot("s1")
-        state.slack_client = None
-        async with TestClient(TestServer(_make_slack_app(state))) as client:
-            resp = await client.post("/api/chat/slots/s1/handoff")
-            assert resp.status == 503
-
-
-class TestHandoffChannels:
-    @pytest.mark.asyncio
-    async def test_deprecated_endpoint(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        state = _make_state(tmp_path)
-        async with TestClient(TestServer(_make_slack_app(state))) as client:
-            resp = await client.get("/api/handoff-channels")
-            assert resp.status == 200
-            assert await resp.json() == {}
-
-
 class TestSlackLinkAnchorTitleFallback:
     """B-lite: the fresh-anchor title must never be the raw slot key —
     fallback chain: slot.title → first-prompt snippet → 'New session'."""
@@ -357,6 +332,7 @@ class TestSlackLinkAnchorTitleFallback:
         async with TestClient(TestServer(_make_slack_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert resp.status == 200
+            await drain_background_tasks(state)
 
     def _anchor_text(self, state) -> str:
         return state.slack_client.post_message.await_args_list[0].args[1]

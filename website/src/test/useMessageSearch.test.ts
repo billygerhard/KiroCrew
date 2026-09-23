@@ -287,6 +287,16 @@ describe('useMessageSearch keyboard shortcuts', () => {
     expect(result.current.isOpen).toBe(false)
   })
 
+  it('Ctrl+Cmd+F is left to the OS (macOS Toggle Full Screen), not captured', () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    const e = new KeyboardEvent('keydown', { key: 'f', metaKey: true, ctrlKey: true, cancelable: true })
+    act(() => { document.dispatchEvent(e) })
+    // Both modifiers held is an OS chord: the bar must stay shut AND the event
+    // must not be consumed, or the application menu never receives it.
+    expect(result.current.isOpen).toBe(false)
+    expect(e.defaultPrevented).toBe(false)
+  })
+
   it('Escape does nothing when not open', () => {
     const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
     act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
@@ -308,5 +318,117 @@ describe('useMessageSearch keyboard shortcuts', () => {
     } finally {
       document.body.removeChild(root)
     }
+  })
+
+  it('Ctrl/Cmd+F is ignored when another surface already answered the chord', () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    // Pierre's editor binds cmdOrCtrl+f on its own content element and calls
+    // preventDefault() without stopPropagation(), so this document-level
+    // handler still sees the event. Opening chat search here would stack a
+    // transcript-scoped find on top of the editor's own find panel.
+    const inner = document.createElement('div')
+    document.body.appendChild(inner)
+    inner.addEventListener('keydown', e => { e.preventDefault() })
+    try {
+      act(() => {
+        inner.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true }))
+      })
+      expect(result.current.isOpen).toBe(false)
+    } finally {
+      document.body.removeChild(inner)
+    }
+  })
+
+  it('still opens chat search when no other surface claimed the chord', () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    // Control for the case above: an unclaimed chord must still reach chat
+    // search, so the bail cannot be satisfied by an always-yield handler.
+    const inner = document.createElement('div')
+    document.body.appendChild(inner)
+    try {
+      act(() => {
+        inner.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true }))
+      })
+      expect(result.current.isOpen).toBe(true)
+    } finally {
+      document.body.removeChild(inner)
+    }
+  })
+})
+
+describe('close() hands focus back to the composer', () => {
+  // Real timers here (this block never touches the debounce): focusComposer
+  // defers with requestAnimationFrame, driven by the same flushFrame recipe
+  // as composerFocus.test.ts.
+  const flushFrame = async () => {
+    await Promise.resolve()
+    await new Promise<void>(r => requestAnimationFrame(() => r()))
+    await Promise.resolve()
+  }
+
+  let composer: HTMLTextAreaElement
+
+  beforeEach(() => {
+    composer = document.createElement('textarea')
+    // The stable probe focusComposer resolves through; the aria-label is
+    // translated at runtime and deliberately not part of the lookup.
+    composer.setAttribute('data-composer-input', '')
+    document.body.appendChild(composer)
+  })
+  afterEach(() => { composer.remove() })
+
+  it('closing an open bar restores focus to the composer', async () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    act(() => result.current.open())
+    act(() => result.current.close())
+    await flushFrame()
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('Escape hands typing back to the composer', async () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    act(() => result.current.open())
+    act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
+    await flushFrame()
+    expect(result.current.isOpen).toBe(false)
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('close() on an already-closed bar does not steal focus', async () => {
+    // ChatPage's file/folder-open handlers call close() unconditionally to
+    // un-gate the dock panel; a close that dismissed nothing must not yank
+    // the caret away from wherever the user is typing.
+    const other = document.createElement('input')
+    document.body.appendChild(other)
+    other.focus()
+    try {
+      const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+      act(() => result.current.close())
+      await flushFrame()
+      expect(document.activeElement).toBe(other)
+    } finally {
+      other.remove()
+    }
+  })
+
+  it('closing never throws when the composer is not mounted', async () => {
+    composer.remove()
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    act(() => result.current.open())
+    act(() => result.current.close())
+    await expect(flushFrame()).resolves.toBeUndefined()
+    expect(result.current.isOpen).toBe(false)
+  })
+
+  it('session-switch reset still closes the bar without focusing the composer', async () => {
+    const { result, rerender } = renderHook(
+      ({ slot }: { slot: string }) => useMessageSearch(messages, slot),
+      { initialProps: { slot: 'slot-1' } },
+    )
+    act(() => result.current.open())
+    rerender({ slot: 'slot-2' })
+    await flushFrame()
+    expect(result.current.isOpen).toBe(false)
+    expect(document.activeElement).not.toBe(composer)
   })
 })

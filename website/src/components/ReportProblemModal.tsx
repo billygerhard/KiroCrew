@@ -3,7 +3,6 @@ import { useMutation } from '@tanstack/react-query'
 import {
   CheckCircle2,
   AlertCircle,
-  FolderOpen,
   Download,
   ExternalLink,
   Loader2,
@@ -29,12 +28,14 @@ interface ReportProblemModalProps {
  * (`ReportProblemCard`) and the nav rail's "Report issue" link (`App.tsx`) —
  * so a user who reaches for the rail gets the redacted bundle instead of a bare
  * link to the issue tracker. Keeping ONE component means the collect call, the
- * redaction notice, and the three deliveries can never drift between surfaces.
+ * redaction notice, and the deliveries can never drift between surfaces.
  *
  * Calls the shared diagnostics collector (the same engine behind
  * `kirocrew doctor --bundle`): collects gateway + kiro-cli logs and crash
- * reports, scrubs secrets, zips them, and offers three deliveries — reveal in
- * Finder, download, or open a pre-filled GitHub issue.
+ * reports, scrubs secrets, zips them, and offers two deliveries — download the
+ * bundle, or open a pre-filled GitHub issue. The saved path is shown above the
+ * actions, so a local user can find the bundle on disk without a third button
+ * in the row (the two-button-per-row cap).
  */
 export default function ReportProblemModal({ open, onClose }: ReportProblemModalProps) {
   const [note, setNote] = useState('')
@@ -154,10 +155,6 @@ export default function ReportProblemModal({ open, onClose }: ReportProblemModal
             {i18nT('components.reportProblemModal.saved_to')} <code>{result.zip_path}</code>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Btn onClick={() => api.revealPath(result.zip_path)}>
-              <FolderOpen size={13} className="lucide-inline" />{' '}
-              {i18nT('components.reportProblemModal.show_in_finder')}
-            </Btn>
             <a href={result.download_url} download>
               <Btn>
                 <Download size={13} className="lucide-inline" />{' '}

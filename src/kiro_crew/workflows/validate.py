@@ -19,12 +19,14 @@ socket egress (B7).
 
 Spec: ``docs/system-specs/modules/workflows.md``. Never relax a check here without
 a matching update to the invariant tests (GATE group B in
-``docs/system-specs/modules/workflow-gates.md``).
+``docs/system-specs/modules/workflows.md``).
 """
 
 from __future__ import annotations
 
 import ast
+import re
+import string
 import symtable
 from dataclasses import dataclass, field
 from typing import Any
@@ -127,6 +129,144 @@ FORBIDDEN_NAMES = frozenset(
 # All imports are rejected regardless; this set only sharpens the error message.
 DETERMINISM_MODULES = frozenset({"time", "random", "uuid", "datetime", "secrets", "os"})
 
+# Introspection attributes that are neither dunders nor underscore-prefixed, so
+# the dunder/private rules below miss them, yet each hands back the frame /
+# globals / builtins chain that reaches ``__import__`` and the real builtins:
+#   gen.gi_frame.f_back.f_builtins["__import__"]
+# Blocked by exact name wherever they appear in the tree (``_Validator`` walks
+# helper bodies too), so no amount of aliasing or indirection gets past them.
+#
+# Unlike the ``.format`` refusal (monotone) and the private-``_`` rule
+# (structural), this one is an ENUMERATION that the runtime layer does not back
+# up: ``f_back.f_builtins`` hands back the runner's real builtins, which
+# ``build_safe_globals`` never gets to curate. Completeness is load-bearing --
+# re-audit this set on every Python version bump, because a newly added frame
+# or generator introspection alias would be a silent bypass.
+FORBIDDEN_ATTRS = frozenset(
+    {
+        # generator / coroutine / async-generator introspection
+        "gi_frame",
+        "gi_code",
+        "gi_yieldfrom",
+        "gi_running",
+        "cr_frame",
+        "cr_code",
+        "cr_await",
+        "cr_running",
+        "cr_origin",
+        "ag_frame",
+        "ag_code",
+        "ag_await",
+        "ag_running",
+        # frame object
+        "f_back",
+        "f_globals",
+        "f_builtins",
+        "f_locals",
+        "f_code",
+        "f_trace",
+        # traceback object
+        "tb_frame",
+        "tb_next",
+        # function object (py2-era aliases still resolve on some builds)
+        "func_globals",
+        "func_code",
+        "func_builtins",
+    }
+)
+
+
+# ``str.format`` / ``str.format_map`` interpret their template at RUNTIME, so the
+# traversal need not exist as any literal the AST can see. Folding closes one
+# spelling at a time and every spelling left open is a silent escape:
+#
+#     left = "{0."; right = "_session_key}"; (left + right).format(ctx)
+#     "".join(["{0.", "__class__}"]).format(ctx)
+#     (left + right).format_map({"c": ctx})
+#
+# — none of which is a foldable literal-only subtree. Constant tracking would
+# have to chase assignment, join, slicing, arithmetic and values read from
+# ``ctx``; the grammar is open-ended, and each miss is a bypass. So the CALL is
+# refused instead, which is monotone: with no runtime template interpreter
+# reachable, there is nothing for an assembled traversal to be fed to.
+#
+# f-strings are the replacement and lose nothing, because their fields are real
+# AST — ``f"{ctx._session_key}"`` is already caught by ``visit_Attribute``. The
+# literal scan below stays as defence in depth for a template that is written
+# out in full.
+FORBIDDEN_CALL_ATTRS = frozenset({"format", "format_map"})
+
+
+def _attr_reason(attr: str) -> str | None:
+    """Why *attr* may not be accessed, or None if it is allowed.
+
+    One predicate shared by attribute-node checks and the format-string scan so
+    a name blocked as ``x.__class__`` is blocked identically inside a
+    ``"{0.__class__}".format(x)`` field — the two must never diverge.
+    """
+    if _is_dunder(attr):
+        return f"dunder attribute access '.{attr}' is not allowed"
+    if attr.startswith("_"):
+        # Single-underscore is the private-API convention; a workflow reaching
+        # ``ctx._ports`` (directly or via a helper that forwards ctx) is grabbing
+        # host internals the public surface deliberately withholds.
+        return f"private attribute access '.{attr}' is not allowed"
+    if attr in FORBIDDEN_CALL_ATTRS:
+        return (
+            f"'.{attr}' is not allowed: its template is interpreted at run time, "
+            "where a traversal can be assembled from parts no static check can "
+            "resolve — use an f-string, whose fields are visible to this validator"
+        )
+    if attr in FORBIDDEN_ATTRS:
+        return f"introspection attribute access '.{attr}' is not allowed"
+    return None
+
+
+_MAX_FORMAT_RECURSION = 5
+
+
+# A deeply nested expression (a 1000-term ``+`` chain, nested calls, ...) can
+# exhaust the C stack inside ``ast.parse`` or any of the recursive tree walks
+# below. ``validate`` promises never to raise on a hostile script, and the
+# workflow HTTP API would turn a leaked ``RecursionError`` into a 500, so such a
+# script is rejected with this reason instead.
+_TOO_DEEP_ERROR = "expression nesting is too deep to validate"
+
+
+def _format_field_reasons(value: str, *, _depth: int = 0) -> list[str]:
+    """Reasons a str literal is a ``str.format`` traversal escape, if any.
+
+    ``"{0.__class__.__mro__}".format(ctx)`` never appears as an ``Attribute``
+    node — the traversal lives inside the string literal and only ``.format`` /
+    ``.format_map`` (both plain, allowed method names) trigger it — so the AST
+    walk cannot see it. Parse each replacement field's attribute components and
+    apply the same ``_attr_reason`` predicate; recurse into nested fields inside
+    a format spec (``"{0:{1.__class__}}"``). A string that is not a valid format
+    string would raise at run time rather than escape, so it is left alone.
+
+    Depth is bounded to prevent a recursion bomb (deeply nested format specs)
+    from crashing the validator with ``RecursionError``.
+    """
+    if _depth > _MAX_FORMAT_RECURSION:
+        return ["format string nesting exceeds maximum depth"]
+    reasons: list[str] = []
+    try:
+        parsed = list(string.Formatter().parse(value))
+    except (ValueError, RecursionError):
+        return reasons
+    for _literal, field_name, format_spec, _conversion in parsed:
+        if field_name:
+            # field_name := arg_name ("." attr | "[" index "]")* ; pull the
+            # ``.attr`` components (indices cannot name an attribute).
+            for attr in re.findall(r"\.([A-Za-z_][A-Za-z0-9_]*)", field_name):
+                reason = _attr_reason(attr)
+                if reason is not None:
+                    reasons.append(reason)
+        if format_spec:
+            reasons.extend(_format_field_reasons(format_spec, _depth=_depth + 1))
+    return reasons
+
+
 ENTRYPOINT = "workflow"
 META_NAME = "META"
 
@@ -173,6 +313,70 @@ CORE_CTX_SURFACE = frozenset(
 )
 
 
+def _budget_ctx_attributes(tree: ast.Module, source: str) -> list[ast.Attribute]:
+    """Find context attributes without treating a helper's own ``ctx`` as the run."""
+    entry = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == ENTRYPOINT
+        ),
+        None,
+    )
+    if entry is None:
+        return []
+    params = entry.args.posonlyargs + entry.args.args
+    if not params:
+        return []
+    ctx_name = params[0].arg
+    attributes: list[ast.Attribute] = []
+    scopes: dict[tuple[str, int], symtable.SymbolTable] = {}
+
+    def _collect_scopes(table: symtable.SymbolTable) -> None:
+        scopes[(table.get_name(), table.get_lineno())] = table
+        for child in table.get_children():
+            _collect_scopes(child)
+
+    try:
+        _collect_scopes(symtable.symtable(source, "<workflow>", "exec"))
+    except (SyntaxError, ValueError):
+        return []  # Invalid scope declarations cannot execute.
+
+    def _shadows(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> bool:
+        if not isinstance(node, ast.Lambda):
+            # Python decides local bindings for the whole function, including
+            # exception/loop targets, but excludes global/nonlocal declarations.
+            table = scopes.get((node.name, node.lineno))
+            if table is not None and ctx_name in table.get_identifiers():
+                symbol = table.lookup(ctx_name)
+                # This budget-only authoring aid follows lexical context bindings.
+                # Globals are ambiguous; the runtime property protects real ctx.
+                return symbol.is_local() or symbol.is_global()
+        args = node.args
+        params = list(args.args) + list(args.posonlyargs) + list(args.kwonlyargs)
+        if args.vararg is not None:
+            params.append(args.vararg)
+        if args.kwarg is not None:
+            params.append(args.kwarg)
+        return any(a.arg == ctx_name for a in params)
+
+    def _walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                if _shadows(child):
+                    continue  # ctx is rebound inside — not the workflow context
+            if (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id == ctx_name
+            ):
+                attributes.append(child)
+            _walk(child)
+
+    _walk(entry)
+    return attributes
+
+
 def check_ctx_surface(source: str, available: "frozenset[str] | set[str]") -> list[str]:
     """Return an error per reference to an unavailable attribute on the WORKFLOW
     CONTEXT parameter — SCOPE-AWARE: a shadowed ``ctx`` name is not the context.
@@ -183,7 +387,7 @@ def check_ctx_surface(source: str, available: "frozenset[str] | set[str]") -> li
     references bound to the ``workflow`` entrypoint's context parameter are
     checked; a helper whose OWN parameter or local happens to share the name
     (e.g. ``def read(ctx): return ctx.get("key")`` called with a dict) is out of
-    scope — flagging it would retroactively reject previously-valid scripts.
+    scope — flagging it would retroactively reject already-valid scripts.
     Helpers that receive the REAL context are under-enforced by design: their
     misuse still fails at run time with the explicit unwired-port RuntimeError.
     A syntactically invalid source returns ``[]`` — ``validate`` rejects it.
@@ -260,6 +464,36 @@ def _is_dunder(name: str) -> bool:
     return len(name) >= 5 and name.startswith("__") and name.endswith("__")
 
 
+def _try_fold_str_binop(node: ast.BinOp) -> str | None:
+    """Try to constant-fold a string concatenation BinOp tree.
+
+    Returns the combined string if ALL leaves are str constants joined by ``+``,
+    or None if any leaf is a non-constant expression (runtime value that cannot
+    be evaluated statically). This lets the validator catch split-literal
+    bypasses like ``"{" + "0._session_key}"`` where each half is individually
+    harmless but the result is a dangerous format string.
+    """
+    if isinstance(node.op, ast.Add):
+        left = _fold_str_operand(node.left)
+        right = _fold_str_operand(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _fold_str_operand(node: ast.expr) -> str | None:
+    """Resolve a node to a string if it is a str constant or a tree of str
+    constants joined by ``+``; otherwise return None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _fold_str_operand(node.left)
+        right = _fold_str_operand(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 class _Validator(ast.NodeVisitor):
     """Walks the whole tree (including helper defs) collecting violations."""
 
@@ -284,10 +518,36 @@ class _Validator(ast.NodeVisitor):
         )
 
     def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802 (ast.NodeVisitor API)
-        if _is_dunder(node.attr):
-            self.errors.append(
-                f"line {node.lineno}: dunder attribute access '.{node.attr}' is not allowed"
-            )
+        reason = _attr_reason(node.attr)
+        if reason is not None:
+            self.errors.append(f"line {node.lineno}: {reason}")
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802 (ast.NodeVisitor API)
+        # ``str.format`` / ``format_map`` traversal hides the attribute walk
+        # inside a string literal, out of reach of visit_Attribute. Scan the
+        # literal's format fields with the same predicate. Checking every str
+        # constant (not only those we can prove reach ``.format``) is deliberate:
+        # a literal that spells out an introspection traversal has no legitimate
+        # use, and tying the check to call-site analysis would reopen the gap.
+        if isinstance(node.value, str):
+            for reason in _format_field_reasons(node.value):
+                self.errors.append(f"line {node.lineno}: {reason} (in a format string)")
+        self.generic_visit(node)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:  # noqa: N802 (ast.NodeVisitor API)
+        # String concatenation (``"{" + "0._session_key}"``) produces two
+        # separate Constant nodes that individually look harmless but whose
+        # combined result is a dangerous format string. Resolve the full value
+        # at compile time (only when ALL leaves are str constants — runtime
+        # expressions are out of reach for static analysis) and re-validate.
+        if isinstance(node.op, ast.Add):
+            combined = _try_fold_str_binop(node)
+            if combined is not None:
+                for reason in _format_field_reasons(combined):
+                    self.errors.append(
+                        f"line {node.lineno}: {reason} " f"(in a concatenated format string)"
+                    )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:  # noqa: N802 (ast.NodeVisitor API)
@@ -363,7 +623,7 @@ def _check_undefined_names(source: str, errors: list[str]) -> None:
 
 def _is_ctx_call(node: ast.AST, methods: frozenset[str]) -> str | None:
     """If ``node`` is a call ``ctx.<m>(...)`` with ``<m>`` in ``methods``, return
-    the method name; else None. Used to spot DSL-contract misuse structurally."""
+    the method name; else None. Spots DSL-contract misuse structurally."""
     if not isinstance(node, ast.Call):
         return None
     func = node.func
@@ -457,12 +717,17 @@ class _DslContractVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _check_dsl_contract(tree: ast.Module, errors: list[str]) -> None:
-    """Static half of the DSL-contract gate: awaiting sync ctx methods, and
-    dereferencing nullable awaited ctx results without a None-guard."""
+def _check_dsl_contract(tree: ast.Module, source: str, errors: list[str]) -> None:
+    """Reject invalid ctx calls, nullable dereferences, and budget rebinding."""
     visitor = _DslContractVisitor()
     visitor.visit(tree)
     errors.extend(visitor.errors)
+    for node in _budget_ctx_attributes(tree, source):
+        if node.attr == "budget" and isinstance(node.ctx, (ast.Store, ast.Del)):
+            errors.append(
+                f"line {node.lineno}: ctx.budget is read-only; set budget_total when "
+                "starting the workflow, or keep script-local limits in a local variable"
+            )
 
 
 def _extract_meta(tree: ast.Module, errors: list[str]) -> dict[str, Any] | None:
@@ -527,21 +792,26 @@ def validate(source: str, *, max_bytes: int = MAX_SCRIPT_BYTES) -> ValidationRes
         tree = ast.parse(source)
     except SyntaxError as exc:
         return ValidationResult(ok=False, errors=[f"syntax error: {exc}"])
+    except RecursionError:
+        return ValidationResult(ok=False, errors=[_TOO_DEEP_ERROR])
 
     errors: list[str] = []
-    visitor = _Validator()
-    visitor.visit(tree)
-    errors.extend(visitor.errors)
+    try:
+        visitor = _Validator()
+        visitor.visit(tree)
+        errors.extend(visitor.errors)
 
-    meta = _extract_meta(tree, errors)
-    _check_entrypoint(tree, errors)
-    # Runtime-half of B3: reject names that would NameError in the sandbox
-    # (e.g. an exception type or stdlib name the model used but the sandbox omits),
-    # so authoring catches+regenerates before launch instead of failing mid-run.
-    _check_undefined_names(source, errors)
-    # DSL-contract half: reject awaiting sync ctx methods and unguarded None-deref
-    # of awaited nullable ctx results — two authoring-bug classes that cause
-    # runtime crashes (``can't await NoneType``; ``'NoneType' has no attribute``).
-    _check_dsl_contract(tree, errors)
+        meta = _extract_meta(tree, errors)
+        _check_entrypoint(tree, errors)
+        # Runtime-half of B3: reject names that would NameError in the sandbox
+        # (e.g. an exception type or stdlib name the model used but the sandbox omits),
+        # so authoring catches+regenerates before launch instead of failing mid-run.
+        _check_undefined_names(source, errors)
+        # Contract errors feed authoring retries before a malformed script can run.
+        _check_dsl_contract(tree, source, errors)
+    except RecursionError:
+        # Every walk above recurses with the tree's depth; a script deep enough
+        # to exhaust the stack is refused, not surfaced as a server error.
+        return ValidationResult(ok=False, errors=[_TOO_DEEP_ERROR])
 
     return ValidationResult(ok=not errors, errors=errors, meta=meta)

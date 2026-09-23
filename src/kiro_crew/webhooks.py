@@ -22,7 +22,7 @@ Both stores use the same on-disk discipline as ``register_hook``:
 read-modify-write under an advisory ``flock`` on a sidecar ``.lock`` file,
 then an atomic ``os.replace`` of a 0600 temp file.
 
-SECRET AT REST — ``webhook_tokens.json`` is no longer hash-only. Bearer tokens
+SECRET AT REST — ``webhook_tokens.json`` is not hash-only. Bearer tokens
 are still stored as sha256 digests and cannot be recovered from the file, but
 each entry's ``signing_secret`` is a LIVE secret held in plaintext: an HMAC is
 symmetric, so the verifier has to be able to recompute it. That is an accepted
@@ -38,9 +38,7 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
-import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -48,6 +46,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.validation import sanitize_string
 
@@ -187,8 +186,11 @@ def locked(path: Path) -> Iterator[None]:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / (path.name + ".lock")
-    with open(lock_path, "w") as lock_fd:
-        with platform_compat.flock_exclusive(lock_fd.fileno()):
+    # Open non-truncating; see ``platform_compat.open_lock_file`` for why ``"w"``
+    # loses the lock on Windows. Parent mkdir stays (the helper does
+    # not create parent dirs).
+    with platform_compat.open_lock_file(lock_path) as lock_fd:
+        with platform_compat.flock_exclusive(lock_fd):
             yield
 
 
@@ -197,43 +199,24 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
     Call inside :func:`locked` so concurrent writers cannot lose updates.
 
-    Permissions go through ``platform_compat``: ``os.fchmod`` is POSIX-only, so
-    calling it directly raises ``AttributeError`` on Windows and breaks every
-    store write there. ``restrict_to_owner`` is applied to the temp file BEFORE
-    ANY PAYLOAD BYTES ARE WRITTEN, not just before the rename — the store holds
-    signing secrets, and on Windows a bare 0600 is a no-op, so locking down
-    after the write left a window where the secrets sat in a file carrying only
-    the parent directory's inherited ACL. Locking an empty file closes that
-    window, and because the temp file is never at its final path unrestricted,
-    the published store is owner-only from the first byte. The descriptor stays
-    open across the call: on Windows ``os.open`` shares read/write/delete, so
-    ``icacls`` can still open the file for WRITE_DAC.
+    ``restrict_to_owner=True`` is the load-bearing argument here and is NOT a
+    synonym for ``mode=0o600``: this store holds signing secrets, and on
+    Windows a bare 0600 is a no-op, so the helper applies the owner-only DACL
+    to the temp file BEFORE ANY PAYLOAD BYTE IS WRITTEN. Locking down after
+    the write would leave a window where the secrets sit in a file carrying only
+    the parent directory's inherited ACL. That ordering is
+    :func:`atomic_write`'s documented contract rather than hand-rolled here,
+    which also brings the Windows ``os.replace`` sharing-violation retry.
+
+    Content is ``bytes`` rather than ``str`` on purpose: ``indent=2`` embeds
+    newlines, and text mode would translate them to CRLF on Windows.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    try:
-        platform_compat.restrict_to_owner(tmp)
-        # Wrap the descriptor in a file object rather than calling os.write:
-        # os.write is a single write(2) and may write FEWER bytes than asked
-        # under disk pressure, returning the count with no error. Ignoring that
-        # count would atomically replace a valid token store or run history with
-        # truncated JSON. Python's buffered writer loops until the whole buffer
-        # is out, so the full-payload guarantee comes from the stdlib.
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1  # fdopen owns it now; the finally must not double-close
-            platform_compat.fchmod_safe(handle.fileno(), 0o600)
-            handle.write(json.dumps(payload, indent=2).encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, str(path))
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write(
+        path,
+        json.dumps(payload, indent=2).encode("utf-8"),
+        fsync=True,
+        restrict_to_owner=True,
+    )
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -294,10 +277,10 @@ class WebhookTokenStore:
 
         ``_read_json`` already fails closed on bytes it cannot parse. This is the
         same hazard one level up: JSON that parses fine but whose container is
-        not a list, or whose rows are not credential rows, used to be filtered
-        away silently — and every caller that mutates the store (``mint``,
+        not a list, or whose rows are not credential rows, must not be filtered
+        away silently — every caller that mutates the store (``mint``,
         ``revoke``, ``stamp_used``) writes the loaded list straight back, so the
-        filtered-out rows were deleted on the next write. That destroys issued
+        filtered-out rows would be deleted on the next write. That destroys issued
         credentials and their signing secrets, and because the kill switch lives
         in this same file it could also drop the disabled state. Refusing keeps
         the bytes on disk for an operator to inspect, at the cost of erroring the
@@ -363,6 +346,24 @@ class WebhookTokenStore:
             write_json_atomic(self.path, data)
         return bool(enabled)
 
+    @staticmethod
+    def _public_entry(entry: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
+        """Build the explicit, secret-free source shape used by every response."""
+        return {
+            "id": entry.get("id", ""),
+            "label": entry.get("label", ""),
+            "display_prefix": entry.get("display_prefix", ""),
+            "last4": entry.get("last4", ""),
+            "created_at": float(entry.get("created_at") or 0.0),
+            "last_used_at": entry.get("last_used_at"),
+            "legacy": legacy,
+            "require_signature": bool(entry.get("require_signature")),
+            # Rows minted before source routing remain readable and preserve
+            # their legacy caller-selected routing behavior.
+            "agent": str(entry.get("agent") or ""),
+            "enabled": entry.get("enabled", True) is not False,
+        }
+
     def public_entries(self, legacy_token: str = "") -> list[dict[str, Any]]:
         """Entries safe to hand a dashboard client (no hash, no raw secret).
 
@@ -379,32 +380,24 @@ class WebhookTokenStore:
             # legacy value has no fixed public prefix, so echoing its head
             # would leak secret material to the dashboard.
             out.append(
-                {
-                    "id": LEGACY_TOKEN_ID,
-                    "label": LEGACY_TOKEN_LABEL,
-                    "display_prefix": "hooks.webhook_token",
-                    "last4": legacy_token[-4:],
-                    "created_at": 0.0,
-                    "last_used_at": None,
-                    "legacy": True,
-                    # The config scalar has no signing secret to verify against,
-                    # so it stays bearer-only rather than breaking on upgrade.
-                    "require_signature": False,
-                }
+                self._public_entry(
+                    {
+                        "id": LEGACY_TOKEN_ID,
+                        "label": LEGACY_TOKEN_LABEL,
+                        "display_prefix": "hooks.webhook_token",
+                        "last4": legacy_token[-4:],
+                        "created_at": 0.0,
+                        "last_used_at": None,
+                        # The config scalar has no signing secret to verify
+                        # against, so it remains bearer-only on upgrade.
+                        "require_signature": False,
+                        "agent": "",
+                        "enabled": True,
+                    },
+                    legacy=True,
+                )
             )
-        for entry in self._load():
-            out.append(
-                {
-                    "id": entry.get("id", ""),
-                    "label": entry.get("label", ""),
-                    "display_prefix": entry.get("display_prefix", ""),
-                    "last4": entry.get("last4", ""),
-                    "created_at": float(entry.get("created_at") or 0.0),
-                    "last_used_at": entry.get("last_used_at"),
-                    "legacy": False,
-                    "require_signature": bool(entry.get("require_signature")),
-                }
-            )
+        out.extend(self._public_entry(entry) for entry in self._load())
         return out
 
     def entry_for(self, token_id: str) -> dict[str, Any] | None:
@@ -441,7 +434,7 @@ class WebhookTokenStore:
         write_json_atomic(self.path, data)
 
     def create(
-        self, label: str, require_signature: bool = True
+        self, label: str, require_signature: bool = True, agent: str = ""
     ) -> tuple[str, str, dict[str, Any]]:
         """Mint a token. Returns ``(raw_secret, signing_secret, public_entry)``.
 
@@ -452,6 +445,9 @@ class WebhookTokenStore:
         false — a caller that cannot compute an HMAC gets a bearer-only token.
         """
         clean_label = sanitize_label(label)
+        if not isinstance(agent, str):
+            raise WebhookError("agent must be a string")
+        clean_agent = agent.strip()
         raw = TOKEN_PREFIX + secrets.token_urlsafe(32)[:TOKEN_ENTROPY_CHARS]
         signing_secret = (
             SIGNING_SECRET_PREFIX + secrets.token_urlsafe(32)[:SIGNING_SECRET_ENTROPY_CHARS]
@@ -468,6 +464,8 @@ class WebhookTokenStore:
             "last_used_at": None,
             "require_signature": bool(require_signature),
             "signing_secret": signing_secret,
+            "agent": clean_agent,
+            "enabled": True,
         }
         path = self.path
         with locked(path):
@@ -479,11 +477,48 @@ class WebhookTokenStore:
                 entry["id"] = "wht_" + secrets.token_hex(3)
             entries.append(entry)
             self._write_tokens(entries)
-        public = {
-            k: v for k, v in entry.items() if k not in ("token_hash", "signing_secret")
-        }
-        public["legacy"] = False
+        public = self._public_entry(entry)
         return raw, signing_secret, public
+
+    def update(
+        self,
+        token_id: str,
+        *,
+        agent: str | None = None,
+        enabled: bool | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update operator-owned source fields and return its public shape.
+
+        Credentials and signing policy are intentionally absent: rotating either
+        requires minting a new source so secrets retain one-time reveal semantics.
+        """
+        if agent is not None and not isinstance(agent, str):
+            raise WebhookError("agent must be a string")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise WebhookError("enabled must be a boolean")
+        clean_label = sanitize_label(label) if label is not None else None
+        clean_agent = agent.strip() if agent is not None else None
+
+        path = self.path
+        updated: dict[str, Any] | None = None
+        with locked(path):
+            entries = self._load()
+            for entry in entries:
+                if entry.get("id") != token_id:
+                    continue
+                if clean_label is not None:
+                    entry["label"] = clean_label
+                if clean_agent is not None:
+                    entry["agent"] = clean_agent
+                if enabled is not None:
+                    entry["enabled"] = enabled
+                updated = entry
+                break
+            if updated is None:
+                return None
+            self._write_tokens(entries)
+        return self._public_entry(updated)
 
     def delete(self, token_id: str) -> bool:
         """Remove the entry with *token_id*. False when unknown."""

@@ -10,16 +10,18 @@ is present in a dev environment but missing from ``setup.cfg``
 Hermetic — no network, no package installation, pure AST + configparser.
 
 Scope: only core kiro_crew modules (excludes apps/builtins/, knowledge/,
-workflows/, aidlc/ sub-trees which have their own dependency management).
+workflows/ sub-trees which have their own dependency management).
 
 The historical PyYAML gap and the opentelemetry
 gap both would have been caught by this gate on day one.
 """
+
 from __future__ import annotations
 
 import ast
 import configparser
 import pathlib
+import re
 import sys
 
 # --- Dist name -> importable root package mapping ---
@@ -61,10 +63,13 @@ _EXCLUDED_SUBTREES: tuple[str, ...] = (
     "apps/builtins/",
     "knowledge/",
     "workflows/",
-    "aidlc/",
     # Fork-only artifact-deploy reaper Lambda payload; boto3/botocore come
     # from the AWS Lambda runtime, not core startup imports.
     "deploy/skills/",
+    # Builtin skill scripts are standalone CLI tools with sibling imports
+    # (e.g. preflight.py imports push_guard.py via sys.path); they are not
+    # core startup code and have no bearing on pip install requirements.
+    "builtin_skills/",
 )
 
 
@@ -82,10 +87,30 @@ def _setup_cfg_path() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent / "setup.cfg"
 
 
+def _is_unpinned_read(line: str) -> bool:
+    """Whether *line* reads ``setup.cfg`` without pinning an explicit encoding."""
+    return ".read(" in line and "_setup_cfg_path()" in line and "encoding=" not in line
+
+
+def _read_setup_cfg() -> configparser.ConfigParser:
+    """Parse ``setup.cfg`` as UTF-8, whatever the host's locale codepage is.
+
+    ``ConfigParser.read`` without ``encoding=`` opens the file with
+    ``locale.getpreferredencoding()``. ``setup.cfg`` is UTF-8 and its comments
+    carry non-ASCII text, so on a Windows host whose ANSI codepage is a
+    double-byte one (cp932/cp936/cp950) the decode raises
+    ``UnicodeDecodeError`` and this build gate cannot run at all. Pinning the
+    encoding to UTF-8 matches how the file is written and how
+    ``test_coverage_omit_contract.py`` already reads it.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read(_setup_cfg_path(), encoding="utf-8")
+    return cfg
+
+
 def _parse_install_requires() -> set[str]:
     """Parse setup.cfg and return the set of declared import root names."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_setup_cfg_path())
+    cfg = _read_setup_cfg()
     raw = cfg.get("options", "install_requires", fallback="")
     declared: set[str] = set()
     for line in raw.strip().splitlines():
@@ -93,9 +118,16 @@ def _parse_install_requires() -> set[str]:
         if not line or line.startswith("#"):
             continue
         # Strip version specifiers and markers
-        dist_name = line.split(">=")[0].split("<=")[0].split("==")[0].split(
-            "!="
-        )[0].split("<")[0].split(">")[0].split(";")[0].strip()
+        dist_name = (
+            line.split(">=")[0]
+            .split("<=")[0]
+            .split("==")[0]
+            .split("!=")[0]
+            .split("<")[0]
+            .split(">")[0]
+            .split(";")[0]
+            .strip()
+        )
         normalized = dist_name.lower().replace("_", "-")
         import_name = _DIST_TO_IMPORT.get(normalized, dist_name.replace("-", "_"))
         declared.add(import_name)
@@ -112,15 +144,13 @@ def _is_in_try_except_importerror(node: ast.stmt, tree: ast.Module) -> bool:
                 handler.type is None  # bare except
                 or (
                     isinstance(handler.type, ast.Name)
-                    and handler.type.id
-                    in ("ImportError", "ModuleNotFoundError", "Exception")
+                    and handler.type.id in ("ImportError", "ModuleNotFoundError", "Exception")
                 )
                 or (
                     isinstance(handler.type, ast.Tuple)
                     and any(
                         isinstance(elt, ast.Name)
-                        and elt.id
-                        in ("ImportError", "ModuleNotFoundError", "Exception")
+                        and elt.id in ("ImportError", "ModuleNotFoundError", "Exception")
                         for elt in handler.type.elts
                     )
                 )
@@ -136,8 +166,7 @@ def _is_in_try_except_importerror(node: ast.stmt, tree: ast.Module) -> bool:
 
 def test_otlp_extra_declares_exact_http_exporter_version():
     """The documented kirocrew[otlp] install path must remain usable."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_setup_cfg_path())
+    cfg = _read_setup_cfg()
     requirements = [
         line.strip()
         for line in cfg.get("options.extras_require", "otlp").splitlines()
@@ -157,7 +186,7 @@ def _pyproject_text() -> str:
 def test_pyproject_declares_optional_dependencies_dynamic():
     """``optional-dependencies`` MUST be in pyproject's ``[project] dynamic``.
 
-    The extras (voice/desktop/dev/otlp) live in setup.cfg
+    The extras (voice/dev/otlp) live in setup.cfg
     ``[options.extras_require]``. Once a ``[project]`` table exists, setuptools
     ignores setup.cfg metadata for any field not declared dynamic — so dropping
     this entry silently strips EVERY extra from the built metadata. pip then
@@ -167,9 +196,7 @@ def test_pyproject_declares_optional_dependencies_dynamic():
     omission also broke the published wheel's ``kirocrew[voice]`` install path.
     """
     text = _pyproject_text()
-    dynamic_lines = [
-        ln for ln in text.splitlines() if ln.strip().startswith("dynamic")
-    ]
+    dynamic_lines = [ln for ln in text.splitlines() if ln.strip().startswith("dynamic")]
     assert dynamic_lines, "pyproject.toml [project] declares no `dynamic` field"
     joined = " ".join(dynamic_lines)
     assert "optional-dependencies" in joined, (
@@ -183,20 +210,20 @@ def test_pyproject_declares_optional_dependencies_dynamic():
 
 def test_declared_extras_match_setup_cfg():
     """Every setup.cfg extra stays reachable; guards the dynamic wiring above."""
-    cfg = configparser.ConfigParser()
-    cfg.read(_setup_cfg_path())
+    cfg = _read_setup_cfg()
     assert cfg.has_section("options.extras_require")
     extras = set(cfg.options("options.extras_require"))
-    # These four are referenced by docs, CI, and the Makefile; losing any of
+    # These three are referenced by docs, CI, and the Makefile; losing any of
     # them breaks a documented install path.
-    assert {"otlp", "voice", "desktop", "dev"} <= extras, (
-        f"expected the documented extras to exist in setup.cfg; got {sorted(extras)}"
-    )
+    assert {
+        "otlp",
+        "voice",
+        "dev",
+    } <= extras, f"expected the documented extras to exist in setup.cfg; got {sorted(extras)}"
 
 
 def _extra_requirements(extra: str) -> list[str]:
-    cfg = configparser.ConfigParser()
-    cfg.read(_setup_cfg_path())
+    cfg = _read_setup_cfg()
     return [
         line.strip()
         for line in cfg.get("options.extras_require", extra).splitlines()
@@ -220,6 +247,93 @@ def test_dev_extra_covers_test_imports():
         )
 
 
+def _dependency_group_requirements(group: str) -> list[str]:
+    """Requirement strings from a pyproject ``[dependency-groups]`` list.
+
+    Text-level, like every other pyproject read in this module. The list items
+    are plain double-quoted strings, so collecting quoted spans between the
+    group's opening ``[`` and its closing ``]`` reads exactly what pip's
+    ``--group`` resolver sees.
+    """
+    lines = _pyproject_text().splitlines()
+    requirements: list[str] = []
+    in_groups = in_list = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_groups = stripped.startswith("[dependency-groups]")
+            continue
+        if in_groups and not in_list:
+            if re.match(rf"{re.escape(group)}\s*=\s*\[", stripped):
+                in_list = True
+            continue
+        if in_list:
+            if stripped.startswith("]"):
+                break
+            match = re.match(r'"([^"]+)"', stripped)
+            if match:
+                requirements.append(match.group(1))
+    return requirements
+
+
+def _pinned_versions(requirements: list[str]) -> dict[str, str]:
+    """Map of normalized dist name -> exact ``==`` pin, ignoring unpinned specs."""
+    pins: dict[str, str] = {}
+    for spec in requirements:
+        if "==" not in spec:
+            continue
+        name, version = spec.split("==", 1)
+        name = name.split("[")[0].strip().lower().replace("_", "-")
+        pins[name] = version.split(";")[0].strip()
+    return pins
+
+
+def test_dev_extra_pins_agree_with_the_dev_dependency_group():
+    """Deps in BOTH the ``dev`` extra and the CI dev group must pin identically,
+    and the import-or-skip test enablers must be in the extra at all.
+
+    The group is what CI installs (``--group dev``); the extra is what
+    CONTRIBUTING.md tells a contributor to install (``.[dev]``). jsonschema and
+    PyJWT are not dev tools -- they are what makes guarded test modules RUN:
+    ``kiro_crew.config.validation`` imports jsonschema behind a try/except, so
+    an install without it silently skips the 11 config-validation guard tests
+    (pytest scores a skip as a pass), and ``test_teams_client.py``'s
+    ``importorskip`` does the same for the Teams token gate. A missing entry
+    means a locally green pytest that never ran those guards; a version skew is
+    quieter still -- both sides run, against different behavior.
+
+    imageio-ffmpeg is the loud member of the same family: ``test_transcribe.py``
+    imports it at module scope deliberately, so a ``.[dev]`` install without it
+    turns that whole module into a collection error rather than a silent skip.
+    It is listed here so deleting the setup.cfg line fails on the line that
+    explains why, instead of as an unexplained ImportError.
+    """
+    group_pins = _pinned_versions(_dependency_group_requirements("dev"))
+    extra_pins = _pinned_versions(_extra_requirements("dev"))
+
+    assert group_pins, "pyproject.toml [dependency-groups] dev declares no == pins"
+
+    # The enablers must be present in the extra, not merely consistent-if-present.
+    for enabler in ("jsonschema", "pyjwt", "imageio-ffmpeg"):
+        assert enabler in extra_pins, (
+            f"setup.cfg [options.extras_require] dev must pin {enabler!r} in sync "
+            "with pyproject's [dependency-groups] dev -- without it a `.[dev]` "
+            "install silently skips the guard tests that import it. "
+            f"Extra pins: {sorted(extra_pins)}"
+        )
+
+    skewed = {
+        name: (extra_pins[name], group_pins[name])
+        for name in extra_pins.keys() & group_pins.keys()
+        if extra_pins[name] != group_pins[name]
+    }
+    assert not skewed, (
+        "setup.cfg dev extra pins disagree with pyproject [dependency-groups] dev "
+        f"(extra, group): {skewed}. The extra's header comment mandates keeping "
+        "them in sync -- bump both in lockstep."
+    )
+
+
 def test_python_requires_agrees_between_pyproject_and_setup_cfg():
     """setup.cfg ``python_requires`` must match pyproject ``requires-python``.
 
@@ -227,8 +341,7 @@ def test_python_requires_agrees_between_pyproject_and_setup_cfg():
     bound in setup.cfg is dead config that advertises support for interpreters
     the package cannot actually run on.
     """
-    cfg = configparser.ConfigParser()
-    cfg.read(_setup_cfg_path())
+    cfg = _read_setup_cfg()
     cfg_req = cfg.get("options", "python_requires", fallback="").strip()
 
     proj_req = ""
@@ -273,15 +386,13 @@ def _collect_unguarded_imports(filepath: pathlib.Path) -> list[tuple[str, str]]:
                     handler.type is None
                     or (
                         isinstance(handler.type, ast.Name)
-                        and handler.type.id
-                        in ("ImportError", "ModuleNotFoundError", "Exception")
+                        and handler.type.id in ("ImportError", "ModuleNotFoundError", "Exception")
                     )
                     or (
                         isinstance(handler.type, ast.Tuple)
                         and any(
                             isinstance(elt, ast.Name)
-                            and elt.id
-                            in ("ImportError", "ModuleNotFoundError", "Exception")
+                            and elt.id in ("ImportError", "ModuleNotFoundError", "Exception")
                             for elt in handler.type.elts
                         )
                     )
@@ -296,9 +407,7 @@ def _collect_unguarded_imports(filepath: pathlib.Path) -> list[tuple[str, str]]:
                             imports_to_check.append((alias.name.split(".")[0], stmt))
                     elif isinstance(stmt, ast.ImportFrom):
                         if stmt.module and stmt.level == 0:
-                            imports_to_check.append(
-                                (stmt.module.split(".")[0], stmt)
-                            )
+                            imports_to_check.append((stmt.module.split(".")[0], stmt))
             # else: guarded, skip all body imports
 
         for root, stmt in imports_to_check:
@@ -360,7 +469,8 @@ def test_noop_recorder_when_otel_missing(monkeypatch):
         k
         for k in list(sys.modules)
         if k.startswith("opentelemetry")
-        or k in (
+        or k
+        in (
             "kiro_crew.metrics.provider",
             "kiro_crew.metrics.recorder",
             "kiro_crew.metrics.local_exporter",
@@ -399,9 +509,74 @@ def test_noop_recorder_when_otel_missing(monkeypatch):
         recorder.up_down_counter("test.updown", -1)
     finally:
         monkeypatch.undo()
-        # Restore modules
-        sys.modules.update(saved)
-        # Remove our injected module
+        # Drop the degraded copy we injected BEFORE restoring, never after.
+        # ``saved`` holds the ORIGINAL module object, and that object is what
+        # every module-level ``from kiro_crew.metrics.provider import
+        # get_recorder`` (context.py, session.py, skills.py, heartbeat.py,
+        # metrics/turns.py, dashboard/chat_runner.py, ...) is already bound to.
+        # Popping after the update therefore discards the original and the
+        # re-import installs a THIRD object, so the provider's module globals
+        # (``_recorder``, ``_initialized``, ``_build_generation``,
+        # ``_built_consent``, ``_config_sub``, the build-serializing ``_lock``)
+        # exist twice for the rest of the worker: a later test's
+        # ``monkeypatch.setattr(provider_mod, ...)`` patches the copy resolved
+        # by name while its bare ``get_recorder()`` runs out of the other one
+        # (test/metrics/test_provider.py's degrade-to-no-op and reader-reaping
+        # tests are exactly that shape), and ``reset_for_testing()`` can no
+        # longer clear the copy the import-time consumers emit through.
         sys.modules.pop("kiro_crew.metrics.provider", None)
-        # Re-import cleanly
-        importlib.import_module("kiro_crew.metrics.provider")
+        sys.modules.update(saved)
+        # Only re-import when there was nothing to put back — i.e. provider had
+        # not been imported before this test. Without the guard that branch
+        # would leave our ``_OTEL_AVAILABLE = False`` copy installed, which is
+        # strictly worse than a second clean one.
+        if "kiro_crew.metrics.provider" not in sys.modules:
+            importlib.import_module("kiro_crew.metrics.provider")
+
+
+# --- setup.cfg decoding: this gate must run on a non-UTF-8 locale host ---
+
+
+def test_setup_cfg_is_read_as_utf8_not_locale_default() -> None:
+    """The parse survives ``setup.cfg``'s non-ASCII bytes and keeps them intact.
+
+    ``setup.cfg`` is UTF-8 and its comments contain non-ASCII characters, so a
+    locale-default read is a decode error on a double-byte codepage and silent
+    mojibake on a single-byte one. Reading the raw bytes here rather than
+    trusting the host keeps the assertion meaningful on a UTF-8 CI runner too:
+    it pins that the file really does carry the bytes that make the encoding
+    argument necessary, so this test cannot quietly go vacuous if the comments
+    are ever rewritten to pure ASCII.
+    """
+    raw = _setup_cfg_path().read_bytes()
+    assert any(b > 0x7F for b in raw), "setup.cfg no longer has non-ASCII bytes"
+
+    # The decode must not depend on the host codepage.
+    cfg = _read_setup_cfg()
+    assert cfg.has_section("options")
+    assert cfg.get("options", "install_requires", fallback="")
+
+
+def test_every_setup_cfg_read_in_this_module_pins_the_encoding() -> None:
+    """Ratchet: no call site may fall back to the locale codepage again.
+
+    The behavioural test above only fails on a host whose preferred encoding
+    cannot decode UTF-8 -- it passes either way on a UTF-8 runner, which is
+    what CI uses. This static check is what actually holds the seam closed
+    there, so a future ``ConfigParser().read(path)`` cannot reintroduce the
+    crash for developers on cp932/cp936/cp950 machines.
+    """
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    offenders = [
+        (n, line.strip())
+        for n, line in enumerate(source.splitlines(), 1)
+        if _is_unpinned_read(line)
+    ]
+    assert not offenders, f"setup.cfg read without an explicit encoding: {offenders}"
+
+    # Self-check: the scan must be able to see a violation at all, otherwise a
+    # renamed helper would turn this ratchet into a permanent green no-op. The
+    # probe is assembled from fragments so that this line is not itself an
+    # offender the scan above would report.
+    probe = "cfg." + "read(" + "_setup_cfg_path())"
+    assert _is_unpinned_read(probe), "the ratchet's own scan no longer detects a violation"

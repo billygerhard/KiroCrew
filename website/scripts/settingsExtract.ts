@@ -2,20 +2,18 @@
  * Settings registry extractor (Search Everywhere — Settings provider).
  *
  * Parses `src/pages/settings/*.tsx` for JSX usages of settings primitives
- * (SettingsToggle, SettingsSelect, SettingsInput, SettingsStepper,
- * SettingsButtonGroup) and extracts label + description + primitive type.
+ * (SettingsToggle, SettingsSelect, SettingsMultiSelect, SettingsInput,
+ * SettingsStepper, SettingsButtonGroup) and extracts label + description +
+ * primitive type.
  *
  * A label/description is read from EITHER form:
  *   - a string literal          `label="Zoom Level"`
  *   - a translation call        `label={t('settings.display.language.label')}`
  *
  * The `t()` form is resolved against `src/i18n/locales/en.json`, so the
- * generated registry keeps holding real English text. This matters because the
- * registry powers command-palette settings SEARCH: if a translated label were
- * skipped (as a plain "dynamic label" is), that setting would silently vanish
- * from search — the control still renders, but nobody can find it. Resolving
- * the key instead of skipping it is what keeps i18n conversion invisible to the
- * search index.
+ * generated registry keeps holding real English text for command-palette
+ * search. Its catalog key is retained separately so deep-link highlighting can
+ * match the label rendered in the user's active locale.
  *
  * Search is indexed in English on purpose: `SETTINGS_REGISTRY` is generated at
  * build time and cannot vary per user language. Localizing it would mean
@@ -29,11 +27,13 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
-import type { SettingEntry, SettingPrimitiveType } from '../src/components/commandPalette/settingsTypes'
+import { SETTINGS_MANUAL } from '../src/components/commandPalette/settingsManual'
+import { settingsRoute } from '../src/components/commandPalette/settingsRoute'
+import type { ManualSettingEntry, SettingEntry, SettingPrimitiveType } from '../src/components/commandPalette/settingsTypes'
 
 export type { SettingEntry, SettingPrimitiveType }
 
-/** English catalogs, in load order (manual wins) — mirrors `src/i18n/index.ts`. */
+/** English catalogs, in load order (manual wins) — mirrors `src/i18n/enCatalog.ts`. */
 const EN_CATALOG_PATHS = [
   path.resolve(__dirname, '../src/i18n/locales/en.json'),
   path.resolve(__dirname, '../src/i18n/locales/en.manual.json'),
@@ -82,19 +82,29 @@ export function __resetCatalogCache(): void {
 /** Panel file → tab key mapping (derived from SettingsPage.tsx switch).
  *  Only panels that actually render inside a Settings tab are mapped — the
  *  fork is KiroACP-only and de-Amazoned, so upstream's Provider / Secretary /
- *  Sync / TaskKeeper panels are absent, and SharedMcpGatewayToggle /
- *  McpPoolableServers live on the standalone Developer page (not a Settings
- *  tab), so they are intentionally excluded to avoid dead deep-links.
+ *  Sync / TaskKeeper panels are absent, and controls that live on the
+ *  standalone Developer page rather than a Settings tab (e.g. McpManagement)
+ *  are intentionally excluded to avoid dead deep-links.
  *
  *  Entries may carry `params` — extra query params the deep link needs for
  *  the panel to actually mount (the Channels tab is a list-detail view, so
- *  its panels need `channel=<key>`). BotChannelPanel.tsx is intentionally
- *  UNMAPPED: its labels render for four different channels (Discord,
- *  Telegram, Webex, WeCom), so a registry entry would be ambiguous — there
- *  is no single `channel` value to attach. */
-type PanelTarget = string | { tab: string; params: Record<string, string> }
+ *  its panels need `channel=<key>`).
+ *
+ *  A panel may also map to SEVERAL targets. BotChannelPanel.tsx renders the
+ *  same labels for multiple channels, so it emits one entry per channel per
+ *  primitive. Each target's `labelSuffix` is appended to the label — and
+ *  therefore the id — of entries that carry a labelKey, keeping the four
+ *  otherwise-identical search results distinguishable. A literal-label entry
+ *  keeps its label untouched: highlighting matches the RENDERED text via
+ *  `data-setting-label`, and only a labelKey entry re-resolves the
+ *  un-suffixed catalog string at highlight time (useSettingHighlight). */
+type PanelTargetSingle = string | { tab: string; params: Record<string, string>; labelSuffix?: string }
+type PanelTarget = PanelTargetSingle | PanelTargetSingle[]
 
-const PANEL_TAB_MAP: Record<string, PanelTarget> = {
+/** Exported for the coverage gate (settingsCoverage.test.ts): a panel file
+ *  that renders Settings* primitives but is absent from this map is silently
+ *  dropped from search, so the gate cross-checks every panel file against it. */
+export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'OverviewPanel.tsx': 'overview',
   'ChatPanel.tsx': 'chat',
   'VoicePanel.tsx': 'voice',
@@ -103,27 +113,108 @@ const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
+  'ConnectionsPanel.tsx': 'connections',
+  'SecretsPanel.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
+  'ShortcutsPanel.tsx': 'shortcuts',
   // Added upstream (auto-skill generation) without a mapping here, so its two
   // settings were absent from command-palette search. Registered while
   // converting this file for i18n.
   'SkillsPanel.tsx': 'skills',
-  'SlackPanel.tsx': { tab: 'channels', params: { channel: 'slack' } },
+  // Privacy owns the two data-collection switches. Mapped so a SettingRef to
+  // `telemetry.enabled` resolves to a deep link into the control rather than a
+  // CLI command the user has to paste.
+  'PrivacyPanel.tsx': 'privacy',
+  // Every per-channel panel (standalone or fan-out) carries a labelSuffix:
+  // it disambiguates same-label rows across channels ("Folder name (Teams)")
+  // AND makes the derived ids order-stable — occurrence-numbered ids
+  // (`channels.folder-name-2`) silently re-target a different channel's row
+  // whenever a panel is added earlier in file order.
+  'SlackPanel.tsx': { tab: 'channels', params: { channel: 'slack' }, labelSuffix: 'Slack' },
+  'WebexPanel.tsx': { tab: 'channels', params: { channel: 'webex' }, labelSuffix: 'Webex' },
+  // Standalone per-channel panels, mounted by ChannelsPanel behind their
+  // channel= key exactly like WebexPanel.
+  'TeamsPanel.tsx': { tab: 'channels', params: { channel: 'teams' }, labelSuffix: 'Teams' },
+  'WeixinPanel.tsx': { tab: 'channels', params: { channel: 'weixin' }, labelSuffix: 'WeChat' },
+  'IMessagePanel.tsx': { tab: 'channels', params: { channel: 'imessage' }, labelSuffix: 'iMessage' },
+  'WhatsAppPanel.tsx': { tab: 'channels', params: { channel: 'whatsapp' }, labelSuffix: 'WhatsApp' },
+  // The shared bot-token panel: one source file whose labels render for the
+  // channels that mount it, so each extracted primitive fans out into one
+  // entry per channel. Webex is deliberately absent: ChannelsPanel routes
+  // channel=webex to the standalone WebexPanel (mapped above), so a webex
+  // fan-out entry would deep-link to controls that panel never renders.
+  'BotChannelPanel.tsx': [
+    { tab: 'channels', params: { channel: 'discord' }, labelSuffix: 'Discord' },
+    { tab: 'channels', params: { channel: 'telegram' }, labelSuffix: 'Telegram' },
+    { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
+  ],
   'DeveloperPanel.tsx': 'developer',
+  // W4 (descriptor-harness): read-only backend inventory panel; its
+  // data-setting-label anchors are indexed for palette deep links.
+  'BackendsPanel.tsx': 'backends',
+  // The Feature Previews cards DeveloperPanel mounts. Indexed on purpose: the
+  // old Developer-page tab kept itself out of search so "webhooks" would not
+  // advertise a hidden page, but a control visible on a Settings pane that
+  // search cannot find is the coverage gap settingsCoverage.test.ts exists to
+  // close — and the hit reaches the labelled opt-in switch, not the page.
+  'FeaturePreviewsSection.tsx': 'developer',
+  // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
+  // because it is a list and a detail rather than one row, and mapped here for the
+  // reason the section above is: a control on a Settings pane that search cannot
+  // find is the coverage gap this map exists to close.
+  //
+  // Every entry it yields is GOVERNED, unlike the rest of this map: the fleet
+  // ceiling `capabilities.decisions` can withdraw the whole card, so
+  // `settingsSearchCore.DECISIONS_SETTING_IDS` withholds these ids from a search
+  // that knows the feature is denied. A control added here without being added
+  // there would advertise a row the page does not draw — `settingsSearchGovernance`
+  // asserts the two stay in step.
+  'DecisionsCard.tsx': 'developer',
+  // The card's per-point DETAIL panel, split into its own module so the card can
+  // stay synchronous while this rides a lazy boundary. Mapped to the same tab: a
+  // control added to it belongs to the same deep link, and leaving it unmapped
+  // would mean the extractor never looks at the file at all.
+  'DecisionsPointPanel.tsx': 'developer',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',
+  // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also
+  // renders InstancesPanel.tsx's AddInstanceForm — both files map to the same
+  // tab so a primitive added to either lands on the right deep link.
+  'RemoteCrewPanel.tsx': 'instances',
 }
 
 /** Map component name → our type enum. */
 const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
   SettingsToggle: 'toggle',
   SettingsSelect: 'select',
+  // A searchable dropdown is still a select to every consumer of this registry:
+  // nothing branches on `SettingEntry.type`, so a distinct value would be surface
+  // with no reader. Give it a distinct one only when something renders it apart.
+  SettingsCombobox: 'select',
+  SettingsMultiSelect: 'select',
   SettingsInput: 'input',
   SettingsStepper: 'stepper',
   SettingsButtonGroup: 'buttonGroup',
+  // Shared composite controls that behave as settings rows and carry a `label`
+  // prop: a credential field with reveal/replace/clear affordances, and a
+  // string-list editor. Both render `data-setting-label` on their root, so
+  // deep-link highlighting works exactly like the Settings* primitives. To
+  // every consumer of this registry they are inputs (nothing branches on the
+  // distinction), so they map onto 'input' rather than minting reader-less
+  // type values.
+  SecretField: 'input',
+  TagListEditor: 'input',
+  // Regex -> URL rule-pair editor (ChatPanel). Same composite contract: `label`
+  // prop, `data-setting-label` on its frame, 'input' to every registry reader.
+  LinkPatternsEditor: 'input',
 }
 
 const PRIMITIVES = Object.keys(PRIMITIVE_MAP)
+
+/** The extractable tag names, exported (like PANEL_TAB_MAP) for the coverage
+ *  gate: a hand-copied list there would silently miss a ninth primitive added
+ *  here — the exact drift class the gate exists to catch. */
+export const EXTRACTABLE_PRIMITIVE_TAGS: readonly string[] = PRIMITIVES
 
 /** Convert a label to a kebab-case id segment. */
 function toKebab(s: string): string {
@@ -167,8 +258,74 @@ function extractStringProp(source: string, propName: string): string | undefined
     'g',
   )
   const tMatch = tCall.exec(source)
-  if (tMatch) return getEnCatalog()[tMatch[1]]
+  // `{{productName}}` is resolved to its stock default here, mirroring what
+  // i18next's `defaultVariables` renders at runtime. The registry is a SEARCH
+  // corpus: leaving the raw placeholder in would make a user's query for the
+  // product name stop matching these entries. The literal deliberately
+  // duplicates DEFAULT_PRODUCT_NAME in `src/i18n/index.ts`: importing that
+  // module here would drag i18next and every catalog into a build-time
+  // script for one constant.
+  if (tMatch) return getEnCatalog()[tMatch[1]]?.replaceAll('{{productName}}', 'Kiro Crew')
   return undefined
+}
+
+/** Return the catalog key when a JSX prop is a supported translation call. */
+function extractTranslationKeyProp(source: string, propName: string): string | undefined {
+  const tCall = new RegExp(
+    `${propName}=\\{\\s*(?:i18nT|t)\\(\\s*['"]([^'"]+)['"]\\s*\\)\\s*\\}`,
+    'g',
+  )
+  const match = tCall.exec(source)
+  if (!match) return undefined
+  return getEnCatalog()[match[1]] === undefined ? undefined : match[1]
+}
+
+/**
+ * Walk source from `start` (just after `<Component`) to find the complete
+ * props string, respecting brace depth so `>` inside `{...}` (arrow fns,
+ * ternaries) doesn't terminate the match early.
+ *
+ * Returns the props text (between the tag name and the closing `/>` or `>`),
+ * or null if we can't find a valid close within a reasonable window.
+ */
+function extractJsxProps(source: string, start: number): string | 'ceiling' | 'unbalanced' | null {
+  let depth = 0
+  let inString: '"' | "'" | '`' | null = null
+  const max = Math.min(source.length, start + 4000) // safety ceiling
+  for (let i = start; i < max; i++) {
+    const ch = source[i]
+    // Handle string state: skip characters inside quoted strings
+    if (inString !== null) {
+      if (ch === '\\') {
+        i++ // skip escaped character
+        continue
+      }
+      if (ch === inString) {
+        // Template literal: only exit if not an interpolation ${...}
+        // (We don't need to track interpolation depth because we only care
+        // about the template ending backtick at the top level of the string.)
+        inString = null
+      }
+      continue
+    }
+    // Not inside a string — check for string openers
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inString = ch
+      continue
+    }
+    if (ch === '{') {
+      depth++
+    } else if (ch === '}') {
+      depth--
+      if (depth < 0) return 'unbalanced'
+    } else if (ch === '>' && depth === 0) {
+      // Found the real closing `>` (or `/>` — the `/` is part of the preceding text)
+      return source.slice(start, i)
+    }
+  }
+  // Distinguish: hit the 4000-char ceiling vs hit EOF with unbalanced braces
+  if (depth !== 0) return 'unbalanced'
+  return 'ceiling'
 }
 
 /**
@@ -178,34 +335,65 @@ export function extractFromSource(
   source: string,
   fileName: string,
 ): { entries: SettingEntry[]; skipped: number } {
-  const target = PANEL_TAB_MAP[path.basename(fileName)]
-  if (!target) return { entries: [], skipped: 0 }
-  const tab = typeof target === 'string' ? target : target.tab
-  const params = typeof target === 'string' ? undefined : target.params
+  const mapped = PANEL_TAB_MAP[path.basename(fileName)]
+  if (!mapped) return { entries: [], skipped: 0 }
+  const targets = Array.isArray(mapped) ? mapped : [mapped]
 
   const entries: SettingEntry[] = []
   let skipped = 0
 
   for (const primitiveName of PRIMITIVES) {
-    const tagRe = new RegExp(`<${primitiveName}\\b([^>]*(?:\\n[^>]*)*)/?\\s*>`, 'g')
-    let tagMatch: RegExpExecArray | null
-    while ((tagMatch = tagRe.exec(source)) !== null) {
-      const props = tagMatch[1]
+    // Match the opening tag and capture all props until the self-closing `/>`
+    // or closing `>`. The naive `[^>]*` breaks when props contain `>` inside
+    // JSX expression braces (e.g. `onChange={v => f(v)}`). Instead, we find
+    // the tag start and then walk forward respecting brace depth to locate the
+    // true end of the opening tag.
+    const tagStartRe = new RegExp(`<${primitiveName}\\b`, 'g')
+    let tagStartMatch: RegExpExecArray | null
+    while ((tagStartMatch = tagStartRe.exec(source)) !== null) {
+      const propsStart = tagStartMatch.index + tagStartMatch[0].length
+      const props = extractJsxProps(source, propsStart)
+      if (props === 'ceiling' || props === 'unbalanced') {
+        const snippet = source.slice(propsStart, propsStart + 60).replace(/\n/g, ' ')
+        console.warn(
+          `[settingsExtract] SKIP (${props}) in ${fileName}: <${primitiveName} ${snippet}…`,
+        )
+        skipped++
+        continue
+      }
       const label = extractStringProp(props, 'label')
       if (!label) {
         skipped++
         continue
       }
+      const labelKey = extractTranslationKeyProp(props, 'label')
       const description = extractStringProp(props, 'description')
-      entries.push({
-        id: '',
-        label,
-        description: description || undefined,
-        tab,
-        type: PRIMITIVE_MAP[primitiveName],
-        occurrence: 1,
-        ...(params ? { params } : {}),
-      })
+      const configKey = extractStringProp(props, 'configKey')
+      const settingId = extractStringProp(props, 'settingId')
+      for (const target of targets) {
+        const tab = typeof target === 'string' ? target : target.tab
+        const params = typeof target === 'string' ? undefined : target.params
+        const suffix = typeof target === 'string' ? undefined : target.labelSuffix
+        // Suffix only labelKey entries: highlighting resolves labelKey to the
+        // rendered (un-suffixed) label, so DOM lookup still works. A literal
+        // label IS the rendered text and must stay byte-identical. The raw
+        // suffix rides along as `labelSuffix` so a localized display can
+        // re-append it to the resolved (un-suffixed) catalog string.
+        const displayLabel = suffix && labelKey ? `${label} (${suffix})` : label
+        entries.push({
+          id: '',
+          label: displayLabel,
+          ...(labelKey ? { labelKey } : {}),
+          ...(suffix && labelKey ? { labelSuffix: suffix } : {}),
+          description: description || undefined,
+          tab,
+          type: PRIMITIVE_MAP[primitiveName],
+          occurrence: 1,
+          ...(params ? { params } : {}),
+          ...(configKey ? { configKey } : {}),
+          ...(settingId ? { settingId } : {}),
+        })
+      }
     }
   }
 
@@ -241,10 +429,149 @@ export function extractAll(settingsDir: string): { entries: SettingEntry[]; skip
     entry.occurrence = count
   }
 
+  // Manual entries merge AFTER id assignment so an override can address a
+  // generated entry by its final id, and hand-assigned ids never participate
+  // in the dedup counters above.
+  allEntries = mergeManualEntries(allEntries, SETTINGS_MANUAL)
+
   // Sort deterministically
   allEntries.sort((a, b) => a.tab.localeCompare(b.tab) || a.label.localeCompare(b.label))
 
   return { entries: allEntries, skipped: totalSkipped }
+}
+
+/**
+ * Merge hand-curated entries (settingsManual.ts) into the generated list.
+ *
+ * A manual entry whose id equals a generated id REPLACES that entry — the
+ * escape hatch for attaching deep-link params the file-level PANEL_TAB_MAP
+ * cannot scope (e.g. SecurityPanel's `?section=` sub-selection). Any other
+ * manual entry is appended. Callers sort afterwards, so order here is
+ * irrelevant to the final registry.
+ *
+ * Validation throws at generation time rather than shipping a broken registry:
+ * a duplicate manual id would silently shadow one of the two entries, and an
+ * unresolvable labelKey would make deep-link highlighting query the DOM for a
+ * label no locale ever renders.
+ */
+export function mergeManualEntries(generated: SettingEntry[], manual: ManualSettingEntry[]): SettingEntry[] {
+  const seen = new Set<string>()
+  const cat = getEnCatalog()
+  const resolved: SettingEntry[] = []
+  for (const m of manual) {
+    if (seen.has(m.id)) {
+      throw new Error(`settingsManual: duplicate manual entry id '${m.id}' — every manual entry needs a unique id`)
+    }
+    seen.add(m.id)
+    if (cat[m.labelKey] === undefined) {
+      throw new Error(
+        `settingsManual: labelKey '${m.labelKey}' (entry '${m.id}') does not resolve in the English catalogs — use a key that exists in en.json/en.manual.json`,
+      )
+    }
+    if (m.descriptionKey && cat[m.descriptionKey] === undefined) {
+      throw new Error(
+        `settingsManual: descriptionKey '${m.descriptionKey}' (entry '${m.id}') does not resolve in the English catalogs — use a key that exists in en.json/en.manual.json`,
+      )
+    }
+    // Manual entries are key-only (the i18n gate forbids English prose
+    // literals in hand-written source); materialize the English strings here
+    // so the generated registry stays a plain-English search corpus.
+    const { descriptionKey, ...rest } = m
+    resolved.push({
+      ...rest,
+      label: cat[m.labelKey],
+      ...(descriptionKey ? { description: cat[descriptionKey] } : {}),
+    })
+  }
+  const byId = new Map(resolved.map(m => [m.id, m]))
+  const generatedIds = new Set(generated.map(g => g.id))
+  const merged = generated.map(g => byId.get(g.id) ?? g)
+  for (const m of resolved) {
+    if (!generatedIds.has(m.id)) merged.push(m)
+  }
+  return merged
+}
+
+/** `?highlight=` value prefix that resolves a control by its schema config key
+ *  instead of its English label — see `useSettingHighlight`. */
+const HIGHLIGHT_KEY_PREFIX = 'key:'
+
+/** Banner for the generated agent registry. JSON carries no comments, so the
+ *  "do not edit" and the pointer to the scheme doc have to be a field. */
+const AGENT_REGISTRY_COMMENT =
+  'AUTO-GENERATED from the dashboard settings panels by '
+  + 'website/scripts/gen-settings-registry.mjs — DO NOT EDIT. '
+  + 'How to use a route: settings-deeplink.md (same directory).'
+
+/**
+ * One settings control as the AGENT sees it — enough to name a control and to
+ * open it, and nothing more.
+ *
+ * `labelKey` / `labelSuffix` / `type` / `occurrence` / `params` are all
+ * deliberately absent: they exist so the FRONTEND can re-resolve a label or
+ * assemble a URL, and every one of them is a way for a reader that is not the
+ * dashboard to build a subtly wrong link. The prebuilt `route` is what replaces
+ * them.
+ */
+export interface AgentSettingEntry {
+  /** Registry id, `<tab>.<kebab-label>` — the identity used in `?highlight=`. */
+  id: string
+  /** English label as the panel renders it. */
+  label: string
+  /** Settings tab key, for naming the destination in prose ("Display → …"). */
+  tab: string
+  /** Prebuilt in-app link `/settings/<tab>[/<sub>]?…&highlight=…`, usable verbatim. */
+  route: string
+  /** In-panel help text, when the control has any. */
+  description?: string
+  /** Schema key this control writes, when it maps to exactly one. */
+  configKey?: string
+}
+
+/**
+ * Project the UI registry onto the agent-facing subset, with a prebuilt route.
+ *
+ * The route is built by `settingsRoute`, the same adapter the command palette
+ * uses, rather than assembled here from `tab` + `id`: a third of the entries
+ * carry `params` whose second-level key must become a PATH SEGMENT, and a
+ * reader that concatenated `/settings/<tab>?highlight=<id>` would land on a tab
+ * with no pane selected and no control to flash. Shipping the finished link
+ * means the agent never assembles one.
+ *
+ * `key:<configKey>` wins over the id form wherever a config key exists: the id
+ * form resolves this registry's ENGLISH label against the rendered DOM, so it
+ * cannot match a translated dashboard, while the `key:` form is a direct
+ * `data-setting-key` lookup. Same rule `test_tips.py` enforces for the curated
+ * tips' anchors.
+ */
+export function buildAgentRegistry(entries: SettingEntry[]): AgentSettingEntry[] {
+  return entries.map(entry => ({
+    id: entry.id,
+    label: entry.label,
+    tab: entry.tab,
+    // The highlight source is the ONLY thing overridden — path segments and the
+    // remaining query params stay `settingsRoute`'s business, so the two link
+    // forms cannot drift on where a sub-selection lives.
+    route: settingsRoute(
+      entry.configKey ? { ...entry, id: `${HIGHLIGHT_KEY_PREFIX}${entry.configKey}` } : entry,
+    ),
+    ...(entry.description ? { description: entry.description } : {}),
+    ...(entry.configKey ? { configKey: entry.configKey } : {}),
+  }))
+}
+
+/**
+ * Serialize the agent-facing registry bundled into the Python docs package
+ * (`src/kiro_crew/docs/settings-registry.generated.json`).
+ *
+ * Emitted from the SAME extraction pass as `settingsRegistry.gen.ts` so the
+ * agent's enumeration cannot describe a different set of controls than the
+ * dashboard renders; the vitest guard byte-matches this output against the
+ * committed file.
+ */
+export function generateAgentRegistryJson(entries: SettingEntry[]): string {
+  const payload = { $comment: AGENT_REGISTRY_COMMENT, settings: buildAgentRegistry(entries) }
+  return `${JSON.stringify(payload, null, 2)}\n`
 }
 
 /**

@@ -23,6 +23,7 @@ autouse conftest fixtures.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +32,10 @@ import pytest
 from kiro_crew.acp.types import TurnUsage
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.subagent import SubagentManager
+
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 # Implausibly large: no unit-test turn runs ~16 minutes, so a row carrying this
 # value can only have come from the provider, never from the local wall clock.
@@ -42,14 +47,14 @@ _TURN_SLEEP_SECS = 0.03
 
 
 def _text_event(text: str) -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
+    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text, runtime_global=False)
 
 
 def _complete_event(usage: TurnUsage | None = None) -> SimpleNamespace:
     """An EVENT_COMPLETE. With no ``usage`` it mirrors the real acp stream,
     where nothing assigns ``duration_ms`` and the row must fall back to the
     caller's ``elapsed_ms``."""
-    ev = SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn")
+    ev = SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
     if usage is not None:
         ev.usage = usage
     return ev
@@ -62,12 +67,17 @@ def _mock_sessions(stream_factory) -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously after every turn; as AsyncMock children they
+    # would hand back coroutines nobody awaits.
+    provider.context_window_tokens = lambda: 0
+    provider.context_used_tokens = lambda: 0
     provider.stream = MagicMock(side_effect=stream_factory)
     sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
     sessions.release = MagicMock()
     sessions.reset = AsyncMock()
     sessions.record_success = MagicMock()
     sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
     sessions.get_approval_policy = MagicMock(return_value="auto")
     sessions.has_session = MagicMock(return_value=True)
     sessions._provider = provider
@@ -140,16 +150,25 @@ async def test_subagent_turn_records_local_wall_clock():
 
         return _gen()
 
+    # Bracket the whole spawn so we have an OUTER wall-clock window that strictly
+    # encloses the subagent's internal one (_turn_t0 at stream start -> persist).
+    observed_start = time.monotonic()
     records = await _spawn_and_capture(stream_factory)
+    observed_elapsed_ms = (time.monotonic() - observed_start) * 1000
 
     assert len(records) == 1
     rec = records[0]
     assert rec["surface"] == "subagent"
-    # The fallback fired: a real, positive local measurement — not the literal
-    # 0 the provider-only read used to write into every row.
-    assert rec["duration_ms"] > 0
-    # Tie it to the real clock: >= the forced sleep, minus scheduling slop.
-    assert rec["duration_ms"] >= 20
+    # The fallback fired: a real, positive local measurement, not the literal 0
+    # a provider-only read would write into every row. Bound it as
+    # 0 < duration_ms <= observed rather than with a fixed floor. The lower
+    # bound (> 0) proves the clock advanced; the upper bound ties it to a real
+    # measurement (a bug writing an arbitrary constant would exceed the window
+    # that encloses it). Both are race-free: the internal window is a subset of
+    # the outer one on any platform, unlike a fixed floor, which races Windows'
+    # ~15.6 ms timer quantum when a 30 ms sleep rounds to one tick (~15 ms) (see
+    # testing-conventions.md, Determinism class 2, wall-clock races).
+    assert 0 < rec["duration_ms"] <= observed_elapsed_ms
 
 
 @pytest.mark.asyncio

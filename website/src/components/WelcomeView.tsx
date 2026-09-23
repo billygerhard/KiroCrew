@@ -1,8 +1,13 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, lazy, Suspense } from 'react'
 import { createPortal } from 'react-dom'
-import { Droplet, EyeOff, Ghost, RefreshCw, Undo2, VenetianMask } from 'lucide-react'
+import { EyeOff, Ghost, RefreshCw, Undo2, VenetianMask } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { KiroGhost } from './KiroGhost'
+// Lazy on purpose (same boundary SessionAutomationPopover takes in ChatInput):
+// the picker and its useBackends fetch hook render only on the welcome screen,
+// and a static import lands them in the App chunk on every page load. The App
+// chunk sits at its per-chunk budget, so the cold path pays for itself.
+const BackendSelector = lazy(() => import('./BackendSelector'))
 import { useTheme } from '../hooks/useTheme'
 import { getThemeBranding } from '../themeBranding'
 import { api } from '../api/client'
@@ -13,8 +18,12 @@ interface WelcomeViewProps {
   setInput: (v: string) => void
   memoryMode?: string
   onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void
-  cleanMode?: boolean
-  onToggleClean?: (clean: boolean) => void
+  /** The pending backend pick for the next new chat (`null` = inherit the default;
+   *  `''` = pinned to kiro-cli).
+   *  When `onSelectBackend` is also given, the welcome surface renders a
+   *  BackendSelector so a new chat can choose its harness before the first send. */
+  backend?: string | null
+  onSelectBackend?: (id: string) => void
 }
 
 function SuggestedPills({ setInput }: { setInput: (v: string) => void }) {
@@ -34,7 +43,7 @@ function SuggestedPills({ setInput }: { setInput: (v: string) => void }) {
     i18nT('components.welcomeView.suggestion_pipeline_status'),
     i18nT('components.welcomeView.suggestion_triage_tickets'),
     i18nT('components.welcomeView.suggestion_search_code'),
-    i18nT('components.welcomeView.suggestion_summarize_slack'),
+    i18nT('components.welcomeView.suggestion_summarize_chat'),
     i18nT('components.welcomeView.suggestion_write_design_doc'),
     i18nT('components.welcomeView.suggestion_review_cr'),
   ]
@@ -80,8 +89,8 @@ export default function WelcomeView({
   setInput,
   memoryMode,
   onSwitchMode,
-  cleanMode,
-  onToggleClean,
+  backend,
+  onSelectBackend,
 }: WelcomeViewProps) {
   const [anonOpen, setAnonOpen] = useState(false)
   const anonBtnRef = useRef<HTMLButtonElement>(null)
@@ -117,8 +126,15 @@ export default function WelcomeView({
       <div className="text-center">
         <div className="flex items-center justify-center gap-4">
           {mode !== 'orchestrator' && brandMark}
-          <h2 className="text-5xl font-light text-text-strong tracking-tight">{mode === 'orchestrator' ? i18nT('components.welcomeView.autopilot') : i18nT('components.welcomeView.what_can_i_do_for_you')}</h2>
-          {mode !== 'orchestrator' && <div className="w-[64px] shrink-0" />}
+          {/* 48px is a desktop size. At 320px the row leaves this heading 189px
+              between the 64px mark and the 64px spacer, which broke "What can I
+              do for you?" over 5 lines in English and 6 in German and French —
+              260-325px of hero before anything else. 30px holds it to 2 lines in
+              every locale measured. */}
+          <h2 className="text-3xl sm:text-5xl font-light text-text-strong tracking-tight">{mode === 'orchestrator' ? i18nT('components.welcomeView.autopilot') : i18nT('components.welcomeView.what_can_i_do_for_you')}</h2>
+          {/* Balances the mark so the heading reads optically centred. Purely
+              decorative, so it does not get to keep 64px of a phone's width. */}
+          {mode !== 'orchestrator' && <div className="hidden sm:block w-[64px] shrink-0" />}
         </div>
         {mode === 'orchestrator' && <p className="text-[13px] text-muted mt-1">{i18nT('components.welcomeView.simple_tasks_run_instantly_complex_ones_get_a_pl')}</p>}
       </div>
@@ -130,29 +146,28 @@ export default function WelcomeView({
           {i18nT('components.welcomeView.try_create_a_plan_to_analyze_kirocrew_code_packa')}
         </button>
       )}
-      {(onSwitchMode || onToggleClean) && (
+      {onSwitchMode && (
         <>
           {(() => {
-            // Clean supersedes the memory mode, so it counts as "ephemeral" for
-            // the trigger: an active clean OR a non-persistent memory mode means
-            // we're in some ephemeral state and the button offers to go back.
-            const ephemeralActive = cleanMode || currentMode !== 'persistent'
+            // A non-persistent memory mode is the ephemeral state; the trigger
+            // then offers the way back instead of the chooser.
+            const ephemeralActive = currentMode !== 'persistent'
+            const modeActionLabel = !ephemeralActive
+              ? i18nT('components.welcomeView.choose_memory_mode')
+              : currentMode === 'incognito'
+                ? i18nT('components.welcomeView.incognito_active_switch_to_persistent')
+                : i18nT('components.welcomeView.temporary_active_switch_to_persistent')
             return (
               <button
                 ref={anonBtnRef}
                 className="flex items-center gap-1.5 text-[12px] text-muted hover:text-warn transition-colors"
                 onClick={() => {
                   if (!ephemeralActive) setAnonOpen(!anonOpen)
-                  // Returning to default must fire exactly ONE recreation. Both
-                  // handlers do create-first-then-delete, so calling both leaks a
-                  // slot (two creates, one delete). Clean supersedes the memory
-                  // mode, so clear clean if it's on; otherwise reset memory mode.
-                  else if (cleanMode) onToggleClean?.(false)
-                  else onSwitchMode?.('persistent')
+                  else onSwitchMode('persistent')
                 }}
               >
                 {!ephemeralActive ? <Ghost size={13} /> : <Undo2 size={13} />}
-                <span>{!ephemeralActive ? i18nT('components.welcomeView.switch_to_ephemeral_mode') : i18nT('components.welcomeView.switch_back_to_default_mode')}</span>
+                <span>{modeActionLabel}</span>
               </button>
             )
           })()}
@@ -162,7 +177,7 @@ export default function WelcomeView({
               className="fixed z-[9999] bg-bg-elevated border border-border rounded-xl shadow-xl p-2 flex gap-2"
               style={(() => { const r = anonBtnRef.current?.getBoundingClientRect(); return { top: r ? r.bottom + 6 : '50%', left: r ? r.left + r.width / 2 : '50%', transform: 'translateX(-50%)' } })()}
             >
-              {onSwitchMode && ([
+              {([
                 { key: 'incognito' as const, Icon: EyeOff, label: i18nT('components.welcomeView.incognito'), desc: i18nT('components.welcomeView.incognito_desc'), color: 'text-warn' },
                 { key: 'temporary' as const, Icon: VenetianMask, label: i18nT('components.welcomeView.temporary'), desc: i18nT('components.welcomeView.temporary_desc'), color: 'text-aim' },
               ] as const).map(t => (
@@ -178,26 +193,19 @@ export default function WelcomeView({
                   <div className="text-[11px] text-muted leading-snug">{t.desc}</div>
                 </button>
               ))}
-              {/* Clean is a peer option in this group, but it is NOT a memory
-                  mode — it picks no memory_mode. It supersedes them entirely:
-                  the agent runs with its own identity only, no KiroCrew context
-                  or MCP servers injected. */}
-              {onToggleClean && (
-                <button
-                  className="w-[220px] p-3 rounded-lg border border-border hover:border-accent hover:bg-bg-hover transition-all text-left flex flex-col gap-1.5"
-                  onClick={() => { onToggleClean(true); setAnonOpen(false) }}
-                >
-                  <div className="flex items-center gap-1.5 text-[13px] font-semibold text-text">
-                    <Droplet size={14} className="text-accent" />
-                    <span>{i18nT('components.welcomeView.clean')}</span>
-                  </div>
-                  <div className="text-[11px] text-muted leading-snug">{i18nT('components.welcomeView.agent_only_no_kirocrew_context_or_mcp')}</div>
-                </button>
-              )}
             </div>,
             document.body
           )}
         </>
+      )}
+      {mode !== 'orchestrator' && onSelectBackend && (
+        // The new-chat backend (ACP harness) picker. Only rendered when the host
+        // supplies a handler, so surfaces that do not thread a pending pick (or a
+        // build with no selectable backends beyond the default) render nothing
+        // extra. The pick flows into createChatSlot on the first send.
+        <Suspense fallback={null}>
+          <BackendSelector value={backend ?? null} onSelect={onSelectBackend} />
+        </Suspense>
       )}
       {mode !== 'orchestrator' && <SuggestedPills setInput={setInput} />}
     </div>

@@ -32,8 +32,9 @@ sign      (ubuntu)  flatten artifacts, attest wheel/sdist/AppImage provenance,
                     extract the .app, run packaging/signing/sign.sh
                     -> signed/<channel>/<version>/<AppSlug>.zip
   |
-notarize  (macOS)   notarytool submit --wait, stapler staple, spctl gate,
-                    build a DMG from the STAPLED app, sign the DMG via a second
+notarize  (macOS)   notarize.sh submit + bounded polling with transient-error
+                    retries, stapler staple, spctl gate, build a DMG from the
+                    STAPLED app, sign the DMG via a second
                     CDSigner task, notarize + staple + gate the DMG, attest the
                     DMG, attach the gated artifact to the run
   |
@@ -146,7 +147,7 @@ be verified through a real notarization.
 `packaging/signing/Entitlements.entitlements` is the release-lane entitlements
 file. `website/electron/build/entitlements.mac.plist` is the electron-builder-lane
 twin. **The two signing paths read their OWN file**, so a key present in only one
-of them means that lane ships a broken bundle. `website/electron/packaging.test.js`
+of them means that lane ships a broken bundle. `website/electron/test/packaging.test.js`
 pins both.
 
 Under the hardened runtime an entitlement, not the `Info.plist` usage string, is
@@ -154,6 +155,16 @@ what grants a device capability. `com.apple.security.device.audio-input` is what
 makes the microphone work for voice input and streaming STT; without it the mic is
 refused with **no prompt at all** and no System Settings toggle to fix it. Camera
 is deliberately absent, because `permission-handler.js` denies video.
+
+Not every protected resource works that way, so do not generalize the mic rule.
+**Local network access has no entitlement** — on macOS 15 it is gated by TCC alone
+and declared solely by `NSLocalNetworkUsageDescription` in
+`website/electron/package.json`'s `build.mac.extendInfo`, which both lanes inherit
+from the same built bundle. Requesting
+`com.apple.developer.networking.multicast` to "fix" LAN access breaks signing
+unless Apple has provisioned it, and `com.apple.security.network.client` is an
+App-Sandbox key this bundle has no use for. `packaging.test.js` asserts both stay
+out of both files.
 
 ## Supply-chain ordering inside the jobs
 

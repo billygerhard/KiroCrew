@@ -2,13 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Maximize2, Minimize2, Shrink, Expand } from 'lucide-react'
 import { IconButton, IconButtonGroup } from './ui'
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
+import { useTheme } from '../hooks/useTheme'
 import { i18nT } from '../i18n/t'
 import {
   buildMcpAppSrcdoc,
   buildAllowAttribute,
   type McpAppRenderPayload,
 } from '../lib/mcpAppSrcdoc'
+import { readMcpAppStyleVariables, themeContextKey } from '../lib/mcpAppTheme'
 import { planReveal, prefersReducedMotion, hasRevealed, markRevealed } from './mcpAppReveal'
+import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
 
 /** Inline height for a rendered MCP App before it reports its own size. */
 const DEFAULT_HEIGHT = 480
@@ -19,7 +22,12 @@ const MAX_HEIGHT = 1200
 // MCP Apps UI-channel JSON-RPC method names (SEP-1865). The `ui/` namespace is
 // disjoint from the MCP tools namespace, carried over postMessage between the
 // host (this component) and the app iframe.
-const PROTOCOL_VERSION = '2025-11-21'
+/** The SEP-1865 revision this host speaks, returned in the `ui/initialize`
+ *  result. Must be a PUBLISHED revision id — the spec's own handshake examples
+ *  use the revision, and an app comparing against a value that was never
+ *  published cannot negotiate. Revisions live at
+ *  github.com/modelcontextprotocol/ext-apps/tree/main/specification. */
+const PROTOCOL_VERSION = '2026-01-26'
 const M_INITIALIZE = 'ui/initialize'
 const M_TOOLS_CALL = 'tools/call'
 const M_REQUEST_DISPLAY_MODE = 'ui/request-display-mode'
@@ -139,6 +147,13 @@ function dimensionsFor(
   const width = presentation === 'overlay' ? overlayWidthPx() : wideWidth
   if (width && width > 0) dims.width = Math.round(width)
   return dims
+}
+
+/** `{ styles: ... }` when variables resolved, `{}` when not - spread into a
+ *  hostContext so an unresolved palette omits the key rather than sending an
+ *  empty object (requirement 1.6). */
+function stylesField(vars: Record<string, string> | null) {
+  return vars ? { styles: { variables: vars } } : {}
 }
 
 /**
@@ -315,7 +330,7 @@ function OverlayChrome({
       // One notch below the promoted frame (z-[90]). Both sit above the chat
       // content and the topbar; see the wrapper's comment for what they can NOT
       // out-stack.
-      className="fixed inset-0 z-[89] bg-bg/70 backdrop-blur-sm"
+      className="fixed inset-0 z-[89] bg-bg/70 backdrop-blur-xs"
       onClick={onClose}
     />
   )
@@ -363,6 +378,53 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
   // Mirror for the stable message handler (which must not re-subscribe per mode).
   const presentationRef = useRef<Presentation>(presentation)
   presentationRef.current = presentation
+
+  // Theme reaches the app two ways, both over hostContext (this host still
+  // injects no CSS into the srcdoc — see mcpAppSrcdoc.ts). `theme` is the
+  // resolved 'dark' | 'light' mode, which maps 1:1 onto the protocol field and
+  // drives the app's `color-scheme`. Alongside it the host now sends
+  // `styles.variables` — the dashboard's own design tokens resolved for the
+  // active theme (see readMcpAppStyleVariables) — so an app paints in the user's
+  // palette rather than falling back to its own.
+  //
+  // Mirrored like `presentation` above because the bridge effect below closes
+  // over `[]` — it must not re-subscribe when the theme changes.
+  const { theme, themeVersion } = useTheme()
+
+  // ONE snapshot holding the mode name AND the palette, so the two can never be
+  // read independently — and keyed on `themeVersion` ALONE, which is what makes
+  // it correct rather than merely tidy.
+  //
+  // `themeVersion` is the signal `useTheme` maintains for exactly this: it bumps
+  // on mode change, color-theme change, an in-place theme-editor edit (same slug,
+  // new values), and `loadCustomThemes` completion — when an installed pack's CSS
+  // actually lands. Crucially it is bumped by the SAME provider effect that calls
+  // `applyTheme`, i.e. AFTER `data-theme` is on the element, so a snapshot taken
+  // on a `themeVersion` render reads the palette the new mode really renders.
+  //
+  // Keying on `theme` / `colorTheme` here was WRONG, not just redundant. Those
+  // change during RENDER, while `applyTheme` writes `data-theme` in a provider
+  // EFFECT — and React flushes child effects before parent ones. So on a
+  // dark→light switch this frame re-rendered with `theme: 'light'` while
+  // `getComputedStyle` still returned the DARK palette, and the notify effect
+  // below posted that mismatched pair one commit BEFORE the provider applied the
+  // CSS: the app painted the old palette under the new mode, then corrected
+  // itself when the version bump arrived. Now the pre-apply render reuses the
+  // cached snapshot, so the key is unchanged and nothing is posted until the mode
+  // and the palette agree. `McpAppFrame.test.tsx` pins the pairing.
+  const themeSnapshot = useMemo(
+    () => ({ theme, vars: readMcpAppStyleVariables() }),
+    // Omitting `theme` is the FIX, not an oversight: including it recomputes on
+    // the pre-`applyTheme` render, which is precisely the mismatched pair
+    // described above. It is still read here, and correctly, because
+    // `themeVersion` is bumped by the same effect that applies the CSS, so this
+    // render sees the new mode AND the new palette together. Pinned by the
+    // "never pairs a new mode with the previous palette" test.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see the note above
+    [themeVersion],
+  )
+  const themeSnapshotRef = useRef(themeSnapshot)
+  themeSnapshotRef.current = themeSnapshot
 
   // --- `wide`: breaking out of the chat column -------------------------------
   // The frame's width ceiling is not its own: the transcript row wrapper caps it
@@ -529,7 +591,8 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
                 hostInfo: { name: 'kirocrew', version: '0.1' },
                 hostCapabilities: HOST_CAPABILITIES,
                 hostContext: {
-                  theme: 'dark',
+                  theme: themeSnapshotRef.current.theme,
+                  ...stylesField(themeSnapshotRef.current.vars),
                   platform: 'web',
                   displayMode: PROTOCOL_MODE[presentationRef.current],
                   availableDisplayModes: AVAILABLE_DISPLAY_MODES,
@@ -650,6 +713,10 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
               const body = (await resp.json().catch(() => null)) as
                 | { result?: unknown; error?: unknown }
                 | null
+              // Raise the dashboard's re-auth prompt when the relay was denied
+              // for a stale pre-owner session; the error below still reaches
+              // the app iframe, which keeps its own failure handling.
+              if (!resp.ok) noteStaleOwnerResponse(resp.status, body)
               if (resp.ok && body && 'result' in body) {
                 post({ jsonrpc: '2.0', id: msg.id, result: body.result })
               } else if (body && body.error && typeof body.error === 'object') {
@@ -791,6 +858,10 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
           method: N_HOST_CONTEXT_CHANGED,
           // Partial context update — only the changed fields, per spec.
           params: {
+            // Both halves off the ONE snapshot: reading the mode and the palette
+            // from separate sources is exactly how they went out mismatched.
+            theme: themeSnapshotRef.current.theme,
+            ...stylesField(themeSnapshotRef.current.vars),
             displayMode: PROTOCOL_MODE[next],
             containerDimensions: dimensionsFor(next, wideWidth),
           },
@@ -799,6 +870,34 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
       )
     } catch { /* frame torn down */ }
   }, [])
+
+  // A theme switch must reach an app that is ALREADY mounted — fixing only the
+  // initialize reply above would leave the bug reachable by toggling the theme
+  // with an app open.
+  //
+  // Routed through `notifyHostContext` rather than its own postMessage so the
+  // frame keeps exactly one outbound post site: that one already carries the
+  // navigated-away guard and the wildcard-origin review annotation, and adding a
+  // second would mean re-auditing a null-origin sandboxed target.
+  //
+  // Compares the SERIALIZED theme half (the snapshot's mode + vars via
+  // themeContextKey), not `themeVersion` itself: that counter bumps on every
+  // `applyTheme` (a no-op re-apply included) and on every `loadCustomThemes`, so
+  // gating on it would post updates carrying identical values. Comparing what was
+  // last SENT is what makes a Color_Theme switch at constant mode fire while an
+  // identical palette does not — and it stays the compare-against-last-sent shape
+  // chosen over a first-run boolean because StrictMode remounts effects.
+  //
+  // The snapshot is also what keeps this effect from firing on the pre-`applyTheme`
+  // render: `themeSnapshot` is referentially unchanged there, so the key matches
+  // and nothing goes out until the mode and the palette agree.
+  const sentThemeKeyRef = useRef(themeContextKey(themeSnapshot.theme, themeSnapshot.vars))
+  useEffect(() => {
+    const key = themeContextKey(themeSnapshot.theme, themeSnapshot.vars)
+    if (sentThemeKeyRef.current === key) return
+    sentThemeKeyRef.current = key
+    notifyHostContext(presentationRef.current, wideWidthRef.current)
+  }, [themeSnapshot, notifyHostContext])
 
   // Host-initiated presentation change (the header controls).
   // The app MUST be told: it may gate an editable surface on the mode, and a
@@ -953,6 +1052,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
             </IconButton>
           </IconButtonGroup>
         </div>
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onLoad is a document-load lifecycle hook (it is how the bridge learns the app navigated away from our trusted srcdoc), not a user interaction; the keyboard reaches the app THROUGH the frame, not by activating it */}
         <iframe
           ref={iframeRef}
           onLoad={() => {
@@ -970,10 +1070,18 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
           // `[tabindex]:not([tabindex="-1"])`, which a bare <iframe> does not
           // satisfy — so Tab cycled on that one control and a keyboard user
           // could never reach the canvas they had just opened full screen.
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- the tab stop is the ONLY way into the sandboxed app's own focusable content; removing it strands keyboard users outside the frame
           tabIndex={0}
           allow={allow || undefined}
           className="w-full border-none bg-card block"
-          style={{ height: displayHeight }}
+          // `translateZ(0)` promotes the frame onto its own compositing layer.
+          // Without it an engine can lay the srcDoc document out, run its
+          // scripts and report a correct height while rasterizing nothing —
+          // and this frame is a full-screen overlay, so a skipped first paint
+          // is a blank viewport with no error state. The 3D form adds no
+          // visual offset with no perspective set. Same remedy as
+          // ArtifactBody / WidgetFrame / ArtifactThumbs; keep them in step.
+          style={{ height: displayHeight, transform: 'translateZ(0)' }}
           title={`${payload.server} / ${payload.tool}`}
         />
       </div>

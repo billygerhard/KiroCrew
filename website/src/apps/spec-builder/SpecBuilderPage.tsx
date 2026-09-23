@@ -5,16 +5,15 @@
 // a collapsible specs rail, the native chat (ChatEmbed), and a docs card with
 // selection-to-comment review + phase-gated approvals.
 //
-// ChatEmbed depends on the app-sdk's useAppApi(), which requires an
-// <AppApiProvider>. Builtin pages are NOT wrapped by AppHost, so this page
-// mounts its own scoped provider (limited to /api/chat for the embed).
+// ChatEmbed depends on the app-sdk's useAppApi(), so this page needs the SDK's
+// scoped-API layer (limited to /api/chat for the embed). It needs no identity
+// layer: BuiltinAppRoute already published this page's app identity above it.
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { X } from 'lucide-react'
-import { AppApiProvider } from '../../app-sdk'
+import { AppScopedApiProvider } from '../../app-sdk/scopedApi'
 import { specApi, LS, type SpecSummary } from './api'
-import { Btn } from './components/shared'
+import ErrorNotice from '../../components/ErrorNotice'
 import Workspace from './components/Workspace'
 import NewSpecView from './components/NewSpecView'
 import SettingsModal from './components/SettingsModal'
@@ -53,7 +52,7 @@ function SpecBuilderInner() {
   // also the repo's standard for server state.
   const specsQuery = useQuery({
     queryKey: ['spec-builder', 'specs'],
-    queryFn: () => specApi.list(),
+    queryFn: ({ signal }) => specApi.list(signal),
     refetchInterval: 15000,
   })
   // useMemo so the array identity is stable across renders — otherwise the
@@ -73,9 +72,9 @@ function SpecBuilderInner() {
 
   // Drop a restored selection that no longer exists (spec removed elsewhere).
   useEffect(() => {
-    if (specsQuery.isPending || !sel) return
+    if (specsQuery.isPending || specsQuery.isFetching || !sel) return
     if (!specs.some((s) => s.name === sel)) setSelRaw(null)
-  }, [specsQuery.isPending, specs, sel])
+  }, [specsQuery.isFetching, specsQuery.isPending, specs, sel])
 
   return (
     <div
@@ -94,12 +93,14 @@ function SpecBuilderInner() {
         </div>
       )}
 
-      {err && (
-        <div role="alert" aria-live="assertive" className="bg-danger-subtle text-danger px-3.5 py-2 text-[12px] shrink-0 flex justify-between items-center border-b border-border">
-          <span>{err}</span>
-          <Btn label={<X className="lucide-inline" />} ariaLabel={i18nT('apps.specBuilder.specBuilderPage.dismiss_error')} onClick={() => setErr('')} />
-        </div>
-      )}
+      {/* No hand-off: below this banner is either the new-spec form or the
+          workspace's spec chat composer, both holding unsaved text. */}
+      <ErrorNotice
+        className="shrink-0 m-2"
+        message={err}
+        onDismiss={() => setErr('')}
+        testId="spec-builder-error"
+      />
 
       {creating ? (
         <NewSpecView
@@ -120,7 +121,7 @@ function SpecBuilderInner() {
         />
       )}
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} setErr={setErr} />}
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -128,15 +129,12 @@ function SpecBuilderInner() {
 export default function SpecBuilderPage() {
   const navigate = useNavigate()
   return (
-    <AppApiProvider
+    <AppScopedApiProvider
       appName="spec-builder"
       allowedApiPaths={CHAT_API_PATHS}
-      allowedEvents={[]}
-      subscribeFn={() => () => {}}
       navigateFn={(path) => navigate(path)}
-      notifyFn={(message, opts) => window.dispatchEvent(new CustomEvent('mc:notify', { detail: { message, ...opts } }))}
     >
       <SpecBuilderInner />
-    </AppApiProvider>
+    </AppScopedApiProvider>
   )
 }

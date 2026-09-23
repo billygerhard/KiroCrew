@@ -9,6 +9,11 @@ import {
 } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { api } from '../api/client'
+// Leaf modules, deliberately not `../api/client`: that module is mocked with a
+// bare factory across most of the test corpus, and the replay path below must
+// not depend on exports those mocks never define.
+import { ApiError } from '../api/apiError'
+import { pendingRefresh } from '../api/refreshOnce'
 import { reportSeamCollision } from '../apps/seamCollision'
 import { safeSetItem } from '../utils/safeStorage'
 // Every stylesheet TEXT this hook injects is built there, so the i18n gate does
@@ -27,6 +32,7 @@ import {
 } from './themeCss'
 
 import { i18nT } from '../i18n/t'
+import type { ThemeLoaderIconName } from '../themeLoaderIcons'
 
 export type ModePreference = 'dark' | 'light' | 'system'
 export type ResolvedMode = 'dark' | 'light'
@@ -45,6 +51,12 @@ export interface ThemeFontFace {
   src: string
   weight?: number
   style?: string
+  /**
+   * Which Font Family option this face feeds: `sans` fills `--theme-font-sans`,
+   * `mono` fills `--theme-font-mono`. Absent means proportional, which is the
+   * only role a pack without this field can mean.
+   */
+  role?: 'sans' | 'mono'
 }
 
 export interface ThemeBranding {
@@ -120,6 +132,11 @@ export interface ThemeAssets {
   branding?: ThemeBranding
   fonts?: ThemeFontFace[]
   hasOverrides?: boolean
+  /** Stock symbol names for the chat loader's existing carousel. */
+  loaderIcons?: ThemeLoaderIconName[]
+  /** Pack-supplied raster loader artwork (Level 1): relative asset paths
+   *  (`loader/<file>.png`), cycled by the stock carousel as <img>s. */
+  loaderImages?: string[]
   // L2 assets: overlays, topbar, audio, persona.
   overlays?: ThemeOverlayDecl[]
   topbar?: ThemeTopbar
@@ -157,13 +174,21 @@ function resolveMode(pref: ModePreference): ResolvedMode {
   return pref === 'system' ? getSystemMode() : pref
 }
 
+/**
+ * The `data-theme` value the stylesheet keys a palette on. The default palette
+ * (`emerald`) is spelled as the bare mode — `dark` / `light` — because that is
+ * how `index.css` names its `:root` fallbacks; every other theme, custom ones
+ * included, is `<slug>-<mode>`. Exported so any other renderer of the same
+ * stylesheet (the Storybook preview) resolves the attribute through this one
+ * rule instead of restating it.
+ */
+export function themeDataAttribute(colorTheme: ColorTheme, mode: ResolvedMode): string {
+  return colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
+}
+
 function applyTheme(colorTheme: ColorTheme, mode: ResolvedMode, pref: ModePreference) {
   const el = document.documentElement
-  if (colorTheme.startsWith('custom-')) {
-    el.dataset.theme = `${colorTheme}-${mode}`
-  } else {
-    el.dataset.theme = colorTheme === 'emerald' ? mode : `${colorTheme}-${mode}`
-  }
+  el.dataset.theme = themeDataAttribute(colorTheme, mode)
   el.dataset.mode = mode
   // The PREFERENCE, exposed separately from the resolved mode because the two
   // mean different things to the Electron shell. `data-mode` is what to paint;
@@ -211,7 +236,7 @@ function removeCustomThemeCSS(slug: string) {
 // The stylesheet TEXT every step below injects is built in `./themeCss`; this
 // file keeps the DOM side (which tag, when, and when to revert it).
 
-/** Inject @font-face rules + a --font-body override for an installed theme. */
+/** Inject @font-face rules + the --theme-font-sans / --theme-font-mono role tokens. */
 function injectThemeFonts(theme: CustomThemeData) {
   const slug = safeSlug(theme.slug)
   if (!slug) return
@@ -230,28 +255,48 @@ const _OVERRIDES_ID = 'mc-theme-overrides'
 // Monotonic token so an in-flight fetch can't re-inject after a switch-away.
 let _overridesToken = 0
 
+/** Rules the runtime scoper removed from the ACTIVE theme's overrides.css. */
+export interface OverridesDropReport {
+  /** The pack slug the report belongs to, so a consumer can ignore a stale one. */
+  slug: string
+  /** Human-readable identifiers, one per dropped rule (selector, plus the
+   * offending property for a font pin). */
+  rules: string[]
+}
+
 /**
  * Apply/remove the active installed theme's runtime-scoped overrides.css.
- * Returns a promise that settles once the fetch+inject completes (or
- * immediately when there is nothing to fetch) so the theme-switch status
- * indicator has a natural "applied" point to clear on.
+ * Resolves once the fetch+inject completes (or immediately when there is
+ * nothing to fetch) so the theme-switch status indicator has a natural
+ * "applied" point to clear on. Resolves with the drop report when the scoper
+ * removed rules — the caller surfaces it in Settings, because a dropped rule
+ * means the theme on screen does not match what its author wrote, and a
+ * console line is not a user-facing channel.
  */
-function applyThemeOverrides(theme: CustomThemeData | undefined): Promise<void> {
+function applyThemeOverrides(theme: CustomThemeData | undefined): Promise<OverridesDropReport | null> {
   const myToken = ++_overridesToken
   document.getElementById(_OVERRIDES_ID)?.remove()
   const slug = theme ? safeSlug(theme.slug) : ''
-  if (!theme?.assets?.hasOverrides || !slug) return Promise.resolve()
-  if (typeof fetch !== 'function') return Promise.resolve()
+  if (!theme?.assets?.hasOverrides || !slug) return Promise.resolve(null)
+  if (typeof fetch !== 'function') return Promise.resolve(null)
   return fetch(`${assetBase(slug)}/styles/overrides.css`)
     .then((r) => (r.ok ? r.text() : ''))
-    .then((raw) => {
-      if (myToken !== _overridesToken || !raw) return // superseded or empty
-      const { css, dropped } = scopeOverridesCss(raw)
+    .then((raw): OverridesDropReport | null => {
+      if (myToken !== _overridesToken || !raw) return null // superseded or empty
+      const { css, dropped, droppedRules } = scopeOverridesCss(raw)
       if (dropped) {
+        // warn, not debug: a dropped rule means the pack asked for something the
+        // contract does not allow and the user sees a theme that does not match
+        // its author's intent. Chrome filters `debug` out of the default console
+        // level, so that channel reaches nobody. Named rules, not a bare count:
+        // the name is what turns the line into a work item for the pack author.
         // eslint-disable-next-line no-console -- intentional theme-scoper diagnostic
-        console.debug(`[theme] overrides.css: dropped ${dropped} disallowed rule(s)`)
+        console.warn(
+          `[theme] overrides.css: dropped ${dropped} disallowed rule(s): ${droppedRules.join('; ')}`,
+        )
       }
-      if (!css.trim()) return
+      const report = dropped ? { slug, rules: droppedRules } : null
+      if (!css.trim()) return report
       // Rewrite pack-relative url() refs → absolute asset-route URLs (the inline
       // <style> injection point means relative refs would 404 against the doc base).
       const scoped = rewriteOverridesUrls(css, slug)
@@ -260,32 +305,44 @@ function applyThemeOverrides(theme: CustomThemeData | undefined): Promise<void> 
       style.id = _OVERRIDES_ID
       style.textContent = scoped
       document.head.appendChild(style)
+      return report
     })
     .catch(() => {
       /* fetch failure → no overrides (silent) */
+      return null
     })
 }
 
-/** Apply/revert the active installed theme's branding (favicon + logo var). */
-function applyThemeBranding(theme: CustomThemeData | undefined) {
+interface ResolvedThemeBranding {
+  logo: string | null
+  favicon: string | null
+}
+
+/** Apply/revert an installed theme's branding and return shell-safe asset URLs. */
+function applyThemeBranding(theme: CustomThemeData | undefined): ResolvedThemeBranding {
   const root = document.documentElement
   document.getElementById('mc-theme-favicon')?.remove()
   root.style.removeProperty('--theme-logo')
   const b = theme?.assets?.branding
   const slug = theme ? safeSlug(theme.slug) : ''
-  if (!b || !slug) return
+  if (!b || !slug) return { logo: null, favicon: null }
+
   const fav = b.favicon ? safeAssetPath(b.favicon) : ''
-  if (fav) {
+  const favicon = fav ? `${assetBase(slug)}/${fav}` : null
+  if (favicon) {
     const link = document.createElement('link')
     link.id = 'mc-theme-favicon'
     link.rel = 'icon'
-    link.href = `${assetBase(slug)}/${fav}`
+    link.href = favicon
     document.head.appendChild(link)
   }
-  const logo = b.logo ? safeAssetPath(b.logo) : ''
-  if (logo) {
-    root.style.setProperty('--theme-logo', assetUrlValue(slug, logo))
+
+  const logoPath = b.logo ? safeAssetPath(b.logo) : ''
+  const logo = logoPath ? `${assetBase(slug)}/${logoPath}` : null
+  if (logoPath) {
+    root.style.setProperty('--theme-logo', assetUrlValue(slug, logoPath))
   }
+  return { logo, favicon }
 }
 
 /**
@@ -428,9 +485,22 @@ export interface ThemeContextValue {
    * never flickers.
    */
   themeSwitching: boolean
+  /**
+   * Rules the runtime scoper removed from the ACTIVE theme's overrides.css, or
+   * null when nothing was dropped (or no installed theme is active). Drives the
+   * Settings notice: a dropped rule means the theme on screen does
+   * not match what its author wrote, and the author's only other signal is a
+   * console warning no dashboard user has open. Condition-derived, not
+   * dismissal-based — it clears on its own once the pack is fixed.
+   */
+  overridesDropReport: OverridesDropReport | null
   allThemes: ThemeEntry[]
   /** Active installed theme's branding bot-name, or null for built-ins / L0. */
   brandName: string | null
+  /** Active installed theme's shell logo URL, or null for built-ins / L0. */
+  brandLogo: string | null
+  /** Active installed theme's browser favicon URL, or null for built-ins / L0. */
+  brandFavicon: string | null
   customThemes: ThemeEntry[]
   customThemeDataMap: Map<string, CustomThemeData>
   themeVersion: number
@@ -478,6 +548,11 @@ export function useTheme(): ThemeContextValue {
   return ctx
 }
 
+/** Read theme state when available without requiring standalone consumers to mount the provider. */
+export function useOptionalTheme(): ThemeContextValue | null {
+  return useContext(ThemeContext)
+}
+
 /**
  * Internal state hook — ONLY called once, by ThemeProvider. All theme state,
  * effects, listeners, and API calls live here. Consumers reach this via
@@ -503,11 +578,14 @@ function useThemeState(): ThemeContextValue {
   const [themeVersion, setThemeVersion] = useState(0)
   const bumpThemeVersion = useCallback(() => setThemeVersion(v => v + 1), [])
   const [onboarded, setOnboarded] = useState(() => !!localStorage.getItem('mc-onboarded'))
-  // Active installed theme's branding bot-name (null for built-ins / L0 themes).
+  // Active installed theme's branding for shell text, left-rail logo, and favicon.
   const [brandName, setBrandName] = useState<string | null>(null)
+  const [brandLogo, setBrandLogo] = useState<string | null>(null)
+  const [brandFavicon, setBrandFavicon] = useState<string | null>(null)
   // Lightweight "Applying…" indicator: true only while an INSTALLED theme's
   // async assets settle after a switch (built-ins/editor-customs are instant).
   const [themeSwitching, setThemeSwitching] = useState(false)
+  const [overridesDropReport, setOverridesDropReport] = useState<OverridesDropReport | null>(null)
   // Slugs of installed (folder/GitHub) themes — read synchronously in
   // setColorTheme (via a ref so its identity stays stable) to decide whether a
   // selection is one whose async assets warrant the indicator.
@@ -538,7 +616,7 @@ function useThemeState(): ThemeContextValue {
   const legacyMigrationStartedRef = useRef(false)
   const [themeBootReady, setThemeBootReady] = useState(false)
 
-  const loadCustomThemes = useCallback(async () => {
+  const loadCustomThemes = useCallback(async (replayed = false): Promise<void> => {
     try {
       const res = await api.themes()
       const themes: ThemeEntry[] = (res.themes || []).map(
@@ -566,8 +644,20 @@ function useThemeState(): ThemeContextValue {
       setCustomThemeDataMap(dataMap)
       setCustomThemesLoaded(true)
       bumpThemeVersion()
-    } catch {
-      // API not available yet — ignore
+    } catch (e) {
+      // `/api/theme/boot` is public and restores a persisted `custom-<slug>`
+      // selection on every load, but `/api/themes` is not: on a cold load with a
+      // lapsed access cookie it answers 403, the client starts a silent refresh
+      // in the background, and this ORIGINAL request still rejects. Every later
+      // request in the app succeeds on the refreshed cookie, so nothing else
+      // notices — but this is a one-shot boot fetch with no poll to bring it
+      // back, and swallowing the rejection left the selected theme's variables,
+      // fonts, and branding unloaded until the user reloaded by hand. Wait for
+      // the refresh that this failure triggered and replay exactly once.
+      if (replayed || !(e instanceof ApiError && e.authRequired)) return // API not available yet — ignore
+      const recovery = pendingRefresh()
+      if (recovery && !(await recovery).ok) return // refresh failed: the banner owns it now
+      await loadCustomThemes(true)
     }
   }, [bumpThemeVersion])
 
@@ -677,9 +767,7 @@ function useThemeState(): ThemeContextValue {
   // `prefers-color-scheme` immediately; Chromium then fires a change event on
   // the media query below if the effective value moved. No-op in a browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeMode?: (pref: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setThemeMode?.(mode)
   }, [mode])
 
@@ -687,9 +775,7 @@ function useThemeState(): ThemeContextValue {
   // mode changes. The overlay strip must match the dashboard chrome at all
   // times; sending on `resolved` (not `mode`) handles Auto switching correctly.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setTitleBarOverlayTheme?: (mode: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     bridge?.setTitleBarOverlayTheme?.(resolved)
   }, [resolved])
 
@@ -697,9 +783,7 @@ function useThemeState(): ThemeContextValue {
   // launch's boot splash (loading.html) paints in the user's chosen colour.
   // Reads the computed --accent after paint; a no-op in a plain browser.
   useEffect(() => {
-    const bridge = (window as unknown as {
-      electronAPI?: { setThemeAccent?: (hex: string) => void }
-    }).electronAPI
+    const bridge = window.electronAPI
     if (!bridge?.setThemeAccent) return
     const id = requestAnimationFrame(() => {
       const hex = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()
@@ -781,21 +865,32 @@ function useThemeState(): ThemeContextValue {
       ? customThemeDataMap.get(colorTheme.slice('custom-'.length))
       : undefined
     try {
-      applyThemeBranding(active)
+      const appliedBranding = applyThemeBranding(active)
       setBrandName(active?.assets?.branding?.botName ?? null)
+      setBrandLogo(appliedBranding.logo)
+      setBrandFavicon(appliedBranding.favicon)
     } catch {
       // A branding-application throw must not skip the overrides settle below,
       // which is what clears the "Applying…" indicator — otherwise it wedges.
       setBrandName(null)
+      setBrandLogo(null)
+      setBrandFavicon(null)
     }
     let cancelled = false
-    applyThemeOverrides(active).finally(() => {
-      if (cancelled) return
-      const remaining = Math.max(0, 150 - (Date.now() - switchStartRef.current))
-      window.setTimeout(() => {
-        if (!cancelled) setThemeSwitching(false)
-      }, remaining)
-    })
+    applyThemeOverrides(active)
+      .then((report) => {
+        // Publish (or clear) the drop report for the ACTIVE theme only — a
+        // resolve from a superseded switch is filtered by the cancel flag, and
+        // applyThemeOverrides itself returns null for a superseded token.
+        if (!cancelled) setOverridesDropReport(report)
+      })
+      .finally(() => {
+        if (cancelled) return
+        const remaining = Math.max(0, 150 - (Date.now() - switchStartRef.current))
+        window.setTimeout(() => {
+          if (!cancelled) setThemeSwitching(false)
+        }, remaining)
+      })
     return () => {
       cancelled = true
     }
@@ -926,8 +1021,11 @@ function useThemeState(): ThemeContextValue {
     colorTheme,
     setColorTheme,
     themeSwitching,
+    overridesDropReport,
     allThemes,
     brandName,
+    brandLogo,
+    brandFavicon,
     customThemes,
     customThemeDataMap,
     themeVersion,

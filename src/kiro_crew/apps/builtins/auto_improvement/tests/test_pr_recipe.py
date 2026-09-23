@@ -10,11 +10,14 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as pr
-from kiro_crew.apps.builtins.auto_improvement.spine.profile import PRRecipe
+from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+from kiro_crew.apps.builtins.auto_improvement.spine.profile import PRRecipe, StubPRRecipe
 
 
 def _broken_scanner(_text: str) -> str:
@@ -31,6 +34,147 @@ def _recipe(tmp_path: Path, **kw) -> pr.GitHubPRRecipe:
         base_ref=kw.pop("base_ref", "origin/main"),
         **kw,
     )
+
+
+def test_push_refuses_before_git_when_repository_safety_changed(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    # ``cwd=tmp_path`` on every test-side git: the child must never inherit pytest's
+    # working directory (the checkout).
+    subprocess.run(["git", "init", "-q", str(clone)], check=True, cwd=str(tmp_path))
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "diff.external", "/attacker/host-code"],
+        check=True,
+        cwd=str(tmp_path),
+    )
+    recipe = _recipe(tmp_path)
+    recipe._git = MagicMock()  # type: ignore[method-assign]
+
+    ok, note = recipe._push_fix_branch(branch="auto-improvement/bug-abc")
+
+    assert ok is False
+    assert "isolation changed" in note
+    recipe._git.assert_not_called()
+
+
+def _simulate_legacy_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make omitted ``Path.write_text`` encodings deterministic on every host."""
+    original = Path.write_text
+
+    def write_text(
+        path: Path,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> int:
+        return original(
+            path,
+            data,
+            encoding="cp1252" if encoding is None else encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+
+class TestQueueEncoding:
+    """Queue artifacts must preserve agent-authored Unicode on legacy Windows locales."""
+
+    _summary = "fix: 保存候選 🚀"
+    _description = "說明 🧪"
+    _diff = "+新增 🛠️\n"
+
+    def test_github_recipe_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        monkeypatch.setattr(pr.shutil, "which", lambda _name: None)
+        recipe = _recipe(tmp_path)
+
+        assert (
+            recipe.draft(
+                summary=self._summary,
+                description=self._description,
+                diff=self._diff,
+                fingerprint="github",
+            )
+            == "QUEUED:github"
+        )
+        assert (recipe.pr_queue_dir / "github.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (recipe.pr_queue_dir / "github.pr.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_direct_commit_copy_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        queue = tmp_path / "direct"
+        pipeline = CrPipeline(ledger=MagicMock(), measurer=MagicMock())
+        profile = SimpleNamespace(pr_recipe=SimpleNamespace(pr_queue_dir=queue))
+
+        pipeline._write_queue_copy(
+            profile=profile,
+            fp="direct",
+            summary=self._summary,
+            description=self._description,
+            diff=self._diff,
+        )
+
+        assert (queue / "direct.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (queue / "direct.pr.md").read_text(encoding="utf-8")
+
+    def test_dry_run_recipe_writes_utf8(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _simulate_legacy_locale(monkeypatch)
+        recipe = StubPRRecipe(tmp_path / "stub")
+
+        assert (
+            recipe.draft(
+                summary=self._summary,
+                description=self._description,
+                diff=self._diff,
+                fingerprint="stub",
+            )
+            == "QUEUED:stub"
+        )
+        assert (recipe.queue_dir / "stub.diff").read_text(encoding="utf-8") == self._diff
+        assert self._description in (recipe.queue_dir / "stub.pr.md").read_text(encoding="utf-8")
+
+
+class TestReproduceRepositorySafety:
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_retirement_precedes_reproduce_verdict_or_error(self, raises: bool) -> None:
+        ledger = MagicMock()
+        ledger.status_of.return_value = None
+        measurer = MagicMock()
+        if raises:
+            measurer.reproduce.side_effect = RuntimeError("gate failed")
+        else:
+            measurer.reproduce.return_value = MagicMock()
+        retire = MagicMock(return_value=True)
+        pipeline = CrPipeline(
+            ledger=ledger,
+            measurer=measurer,
+            retire_if_unsafe=retire,
+        )
+        winner = SimpleNamespace(candidate=SimpleNamespace(kind="perf", target="parser"))
+
+        outcome = pipeline.emit_perf(
+            profile=MagicMock(),
+            winner=winner,  # type: ignore[arg-type]
+            verify=MagicMock(),
+            cycle=1,
+            gated_commit_sha="abc",
+            diff_ref="diff",
+            base_anchor="main @ abc",
+        )
+
+        assert outcome.repository_retired is True
+        assert outcome.filed is False and outcome.committed_ready is False
+        retire.assert_called_once_with("reproduce")
 
 
 class TestProtocolConformance:
@@ -315,11 +459,11 @@ class TestPushedContentIsScanned:
     def test_a_scanner_that_cannot_run_refuses_rather_than_returning_the_text(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Fail CLOSED. This used to return the prose unscanned, on the reasoning that the
-        diff beside it had passed a fail-closed scan and the PR is only a draft — but the
+        """Fail CLOSED. Returning the prose unscanned is not defensible on the grounds
+        that the diff beside it passed a fail-closed scan and the PR is only a draft: the
         prose is a separate artifact, it is the part the agent wrote most freely, and a
         published PR description cannot be un-published. Every other egress path in this
-        app already fails closed. Raised by the GPT review of this branch."""
+        app fails closed."""
         import kiro_crew.security as security_mod
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.pr_recipe import (
             ProseRedactionUnavailable,
@@ -341,6 +485,7 @@ class TestPushedContentIsScanned:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as PR
 
         recipe = _recipe(tmp_path)
+        _simulate_legacy_locale(monkeypatch)
 
         gh_calls: list[list[str]] = []
         monkeypatch.setattr(PR.subprocess, "run", lambda argv, **kw: gh_calls.append(argv))
@@ -351,16 +496,20 @@ class TestPushedContentIsScanned:
         monkeypatch.setattr(security_mod, "redact", _broken_scanner)
         out = recipe.draft(
             fingerprint="fp-unscannable",
-            summary="fix: something",
-            description="body with aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
-            diff="--- a\n+++ b\n",
+            summary="fix: 保存候選 🚀",
+            description="說明 🧪 with aws_access_key_id=AKIAIOSFODNN7EXAMPLE",
+            diff="--- a\n+++ b\n+新增 🛠️\n",
         )
 
         assert out == "QUEUED:fp-unscannable", f"it published anyway: {out!r}"
         assert gh_calls == [], "gh was invoked with unscanned prose"
         # The evidence still survives on disk for the human.
-        assert (recipe.pr_queue_dir / "fp-unscannable.pr.md").is_file()
-        assert (recipe.pr_queue_dir / "fp-unscannable.diff").is_file()
+        assert "說明 🧪" in (recipe.pr_queue_dir / "fp-unscannable.pr.md").read_text(
+            encoding="utf-8"
+        )
+        assert "新增 🛠️" in (recipe.pr_queue_dir / "fp-unscannable.diff").read_text(
+            encoding="utf-8"
+        )
 
 
 class TestEveryPushPathScansContent:
@@ -373,19 +522,45 @@ class TestEveryPushPathScansContent:
 
     def test_the_shared_scanner_is_the_single_implementation(self) -> None:
         """Each push path must call ``push_policy.scan_content_for_secrets``, not its own
-        copy — three drifting copies is how one of them ends up without the fix."""
+        copy -- three drifting copies is how one of them ends up without the fix.
+
+        Every path also clears the external diff helper (``diff.external=``) on the git
+        read it scans, so a repository-writable ``diff.external`` cannot run an attacker
+        binary in place of the read. The two paths that render a human diff also pass
+        ``--no-ext-diff`` for the same reason; the driver reads objects with ``cat-file``
+        instead of rendering a diff, so it carries no ``--no-ext-diff`` and must render no
+        ``git diff`` at all.
+        """
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent
-        for rel in (
-            "profiles/github_repo/pr_recipe.py",
-            "spine/driver.py",
-            "backend/commit.py",
+        # ``renders_diff`` says whether the path scans rendered ``git diff`` output (and so
+        # must neutralize the external helper with ``--no-ext-diff``) or reads objects
+        # directly (and so must not render a diff to scan).
+        for rel, renders_diff in (
+            ("profiles/github_repo/pr_recipe.py", True),
+            ("spine/driver.py", False),
+            ("backend/commit.py", True),
         ):
             src = (root / rel).read_text(encoding="utf-8")
             assert "scan_content_for_secrets" in src, f"{rel} does not scan pushed content"
+            assert "diff.external=" in src, f"{rel} does not clear the external diff helper"
+            if renders_diff:
+                assert "--no-ext-diff" in src, f"{rel} permits external diff execution"
             # No path may re-import the raw scanners and hand-roll the decision.
             assert "redact_credentials" not in src, f"{rel} should delegate, not re-implement"
+
+        # The driver reads objects directly, so its scan method must not fall back to
+        # scanning a rendered diff, whose binary-file summary hides a credential the object
+        # itself carries. Scoped to the method rather than the file: other driver methods
+        # render diffs for unrelated reasons.
+        import inspect
+
+        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
+
+        scan_src = inspect.getsource(Driver._revision_scans_clean)
+        assert "--no-ext-diff" not in scan_src, "the driver scan renders a diff"
+        assert '"diff"' not in scan_src, "the driver scan renders a diff"
 
     def test_scanner_refuses_a_credential(self) -> None:
         from kiro_crew.apps.builtins.auto_improvement.spine.push_policy import (
@@ -406,30 +581,78 @@ class TestEveryPushPathScansContent:
         # An empty range is not a finding: nothing to publish means nothing to refuse.
         assert scan_content_for_secrets("")[0] is True
 
-    def test_the_direct_push_scan_range_is_not_self_diffing(self) -> None:
-        """A scanner that is CALLED but on an EMPTY range is not a gate. The driver's F10
-        push diffed ``{dest}..HEAD`` where ``dest`` is the local branch HEAD sits on the
-        tip of — so ``git diff <branch>..HEAD`` compared a ref to itself and returned
-        nothing, and the fail-closed credential scan passed on a 0-byte input. Measured:
-        a commit adding an AWS key gave a 0-byte ``<branch>..HEAD`` diff and a 144-byte
-        ``HEAD~1..HEAD`` diff. Pin the source so the self-diffing range cannot return.
-        Raised by the GPT review of this branch.
+    def test_the_direct_push_blob_listing_cannot_be_read_as_clean(self) -> None:
+        """A scanner that is CALLED but on an unread or empty listing is not a gate. The
+        driver enumerates the revision's changed blobs with ``diff-tree`` and reads each
+        one; if that listing read fails it exits non-zero with empty stdout, and treating
+        empty stdout as "nothing to scan" would pass the fail-closed credential gate on a
+        blob it never saw. The scan therefore refuses on the listing's exit status, and
+        its per-blob loop can only reach ``clean`` by reading every listed blob.
+
+        The listing is taken PER REVISION: ``diff-tree`` names the explicit ``rev`` with
+        ``--root`` so a root commit (which has no parent) is covered by the same listing,
+        and the scanned object is bound to the pushed object by construction. The scan is
+        NOT anchored on ``HEAD``, which each git call re-resolves separately, so a
+        concurrent writer cannot make the scanned object and the published object differ.
         """
+        import ast
         import inspect
+        import re
+        import textwrap
 
         from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
-        src = inspect.getsource(Driver._direct_push)
-        assert "HEAD~1..HEAD" in src, "the push scan no longer diffs the committed range"
-        # The buggy construct was `scan_range = f"{dest}..HEAD"` fed to `git diff`. Match the
-        # CODE, not a mention in a comment: an f-string building a `<var>..HEAD` diff range.
-        import re
+        scan_src = inspect.getsource(Driver._revision_scans_clean)
 
-        code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
-        code = "\n".join(code_lines)
+        def _executable_code(text: str) -> str:
+            """The method's executable statements only -- its docstring and comments
+            describe history that names ``HEAD`` and ranges the code itself must not use."""
+            tree = ast.parse(textwrap.dedent(text))
+            func = tree.body[0]
+            # Narrowed for the type checker as much as for the reader: this helper is only
+            # ever handed one method's source, so anything else is a caller mistake.
+            assert isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)), type(func)
+            body = func.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]  # drop the docstring
+            return "\n".join(ast.unparse(node) for node in body)
+
+        scan_code = _executable_code(scan_src)
+
+        # The listing enumerates the explicit revision's own objects with ``diff-tree``,
+        # rooted so a parentless commit is covered, rather than diffing a range.
+        assert re.search(
+            r"'diff-tree'.*'--root'.*rev", scan_code, re.DOTALL
+        ), "the scan does not list the revision's own blobs per revision with --root"
+        assert "'cat-file', 'blob'" in scan_code, "the scan does not read each blob's bytes"
+
+        # The listing read must fail closed: an empty or unread listing cannot reach clean.
+        assert (
+            "could not list the pushable blobs" in scan_code
+        ), "a failed blob listing does not fail closed"
+        assert (
+            "listing.returncode != 0" in scan_code
+        ), "the scan does not refuse on the listing's exit status"
+
+        # No self-diffing range may return: the scan reads objects, not a ``<ref>..<ref>``
+        # diff, so no ``..`` range and no ``HEAD``-anchored range appears in the code.
+        assert ".." not in scan_code, "a two-dot scan range is back in the code"
+        assert (
+            "HEAD" not in scan_code
+        ), "the scan is anchored on HEAD again, so it is not bound to the pushed object"
+
+        # ``_direct_push`` must delegate to the shared per-revision scan rather than
+        # re-growing its own range.
+        push_code = _executable_code(inspect.getsource(Driver._direct_push))
+        assert "_revision_scans_clean(" in push_code, "the push path does not scan its content"
         assert not re.search(
-            r'f"\{[A-Za-z_]+\}\.\.HEAD"', code
-        ), "a self-diffing f-string scan range is back in the code"
+            r"f'\{[A-Za-z_]+\}\.\.HEAD'", push_code
+        ), "a self-diffing f-string scan range is back in the push path"
 
     def test_a_committed_secret_is_actually_in_the_scanned_range(self, tmp_path) -> None:
         """End to end against a real repo: the range the driver scans for a one-commit
@@ -451,7 +674,11 @@ class TestEveryPushPathScansContent:
 
         def git(*args: str) -> subprocess.CompletedProcess:
             return subprocess.run(
-                ["git", "-C", str(tmp_path), *args], capture_output=True, text=True, env=env
+                ["git", "-C", str(tmp_path), *args],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(tmp_path),
             )
 
         git("init", "-q", "-b", "main", ".")
@@ -679,30 +906,43 @@ class TestLoggedStringsAreRebuiltFromConstants:
 
 
 class TestAFailedDiffIsNeverVacuouslyClean:
-    """A credential gate that reads an EMPTY diff must not conclude "clean".
+    """A credential gate that reads an EMPTY git output must not conclude "clean".
 
-    Raised by review of this branch against the driver's direct-push path. `_git` does not
-    raise, so a diff against a ref with no local head exits non-zero with empty stdout —
-    and `scan_content_for_secrets` reads blank text as "nothing to publish" and returns OK.
-    The fail-closed gate was therefore skipped and the commit would be pushed unscanned.
-    Reproduced before fixing: `git diff no-such-branch..HEAD` exits 128 with empty stdout.
+    ``_git`` does not raise, so a failed git read exits non-zero with empty stdout, and
+    ``scan_content_for_secrets`` reads blank text as "nothing to publish" and returns OK.
+    A path that treats empty stdout as nothing-to-scan therefore skips the fail-closed
+    gate and pushes the commit unscanned. The premise holds against a real repo:
+    ``git diff no-such-branch..HEAD`` exits 128 with empty stdout.
 
-    The scanner's blank-input shortcut is correct in itself — an empty range genuinely has
-    nothing to refuse — so the guard belongs at every CALL SITE, which is why this asserts
-    on all three rather than changing the scanner.
+    The scanner's blank-input shortcut is correct in itself -- an empty input genuinely
+    has nothing to refuse -- so the guard belongs at every git read in every CALL SITE.
+    The driver reads three kinds of object (the commit, the changed-blob listing, and
+    each blob), so all three of its reads must refuse on a non-zero exit.
     """
 
     def test_all_three_push_paths_check_the_git_exit_status(self) -> None:
+        import inspect
         from pathlib import Path
+
+        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
 
         root = Path(__file__).resolve().parent.parent
         for rel, marker in (
-            ("spine/driver.py", "proc.returncode != 0"),
             ("profiles/github_repo/pr_recipe.py", "proc.returncode != 0"),
             ("backend/commit.py", "scanned.returncode == 0"),
         ):
             src = (root / rel).read_text(encoding="utf-8")
-            assert marker in src, f"{rel} does not check the diff's exit status"
+            assert marker in src, f"{rel} does not check the git read's exit status"
+
+        # The driver reads three objects and each read must fail closed on a non-zero exit
+        # rather than scan its empty stdout as nothing-to-scan.
+        scan_src = inspect.getsource(Driver._revision_scans_clean)
+        for marker in (
+            "meta.returncode != 0",
+            "listing.returncode != 0",
+            "blob.returncode != 0",
+        ):
+            assert marker in scan_src, f"the driver scan does not refuse on `{marker}`"
 
     def test_blank_input_still_reads_as_clean(self) -> None:
         """Documents WHY the guard lives at the call sites: this shortcut is intended."""
@@ -718,11 +958,12 @@ class TestAFailedDiffIsNeverVacuouslyClean:
         """Pins the premise the guard rests on, so a git behavior change is caught here."""
         import subprocess
 
-        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, cwd=str(tmp_path))
         proc = subprocess.run(
             ["git", "-C", str(tmp_path), "diff", "no-such-branch..HEAD"],
             capture_output=True,
             text=True,
+            cwd=str(tmp_path),
         )
         assert proc.returncode != 0
         assert proc.stdout == ""
@@ -748,13 +989,14 @@ class TestCloneCannotReachTheRemoteAtAll:
         from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
 
         up, work = tmp_path / "upstream.git", tmp_path / "work"
-        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True)
-        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True)
+        cwd = str(tmp_path)  # never pytest's own working directory (the checkout)
+        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True, cwd=cwd)
+        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True, cwd=cwd)
         for k, v in (("user.email", "t@e"), ("user.name", "t")):
-            subprocess.run(["git", "-C", str(work), "config", k, v], check=True)
+            subprocess.run(["git", "-C", str(work), "config", k, v], check=True, cwd=cwd)
         (work / "a.txt").write_text("x")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd)
+        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True, cwd=cwd)
 
         clone_setup._disable_push(work)
 
@@ -762,22 +1004,27 @@ class TestCloneCannotReachTheRemoteAtAll:
             ["git", "-C", str(work), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
+            cwd=cwd,
         ).stdout.strip()
         assert "DISABLED" in fetch.upper(), "the FETCH url is a live push target"
 
         by_name = subprocess.run(
-            ["git", "-C", str(work), "push", "origin", "HEAD"], capture_output=True, text=True
+            ["git", "-C", str(work), "push", "origin", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
         )
         by_url = subprocess.run(
             ["git", "-C", str(work), "push", fetch, "HEAD:refs/heads/probe"],
             capture_output=True,
             text=True,
+            cwd=cwd,
         )
         assert by_name.returncode != 0
         assert by_url.returncode != 0
         # The decisive assertion: nothing reached the remote.
         branches = subprocess.run(
-            ["git", "-C", str(up), "branch"], capture_output=True, text=True
+            ["git", "-C", str(up), "branch"], capture_output=True, text=True, cwd=cwd
         ).stdout.strip()
         assert branches == "", f"a push escaped the sandbox: {branches!r}"
 
@@ -808,22 +1055,26 @@ class TestTrustedPublisherStillWorksAfterNeutralizing:
         )
 
         up, work = tmp_path / "up.git", tmp_path / "work"
-        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True)
-        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True)
+        cwd = str(tmp_path)  # never pytest's own working directory (the checkout)
+        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True, cwd=cwd)
+        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True, cwd=cwd)
         for k, v in (("user.email", "t@e"), ("user.name", "t")):
-            subprocess.run(["git", "-C", str(work), "config", k, v], check=True)
+            subprocess.run(["git", "-C", str(work), "config", k, v], check=True, cwd=cwd)
         (work / "a.txt").write_text("x")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd)
+        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True, cwd=cwd)
         # A real upstream base, so the pre-push content scan's diff resolves.
         subprocess.run(
             ["git", "-C", str(work), "push", "-q", "origin", "HEAD:refs/heads/main"],
             capture_output=True,
+            cwd=cwd,
         )
-        subprocess.run(["git", "-C", str(work), "fetch", "-q", "origin"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(work), "fetch", "-q", "origin"], capture_output=True, cwd=cwd
+        )
         (work / "b.txt").write_text("fix")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(work), "commit", "-qm", "the fix"], check=True)
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd)
+        subprocess.run(["git", "-C", str(work), "commit", "-qm", "the fix"], check=True, cwd=cwd)
 
         clone_setup._disable_push(work)
 
@@ -837,7 +1088,7 @@ class TestTrustedPublisherStillWorksAfterNeutralizing:
         ok, note = recipe._push_fix_branch(branch="auto-improvement/bug-abc123")
         assert ok is True, note
         branches = subprocess.run(
-            ["git", "-C", str(up), "branch"], capture_output=True, text=True
+            ["git", "-C", str(up), "branch"], capture_output=True, text=True, cwd=cwd
         ).stdout
         assert "auto-improvement/bug-abc123" in branches
 
@@ -853,8 +1104,9 @@ class TestTrustedPublisherStillWorksAfterNeutralizing:
         )
 
         up, work = tmp_path / "up.git", tmp_path / "work"
-        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True)
-        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True)
+        cwd = str(tmp_path)  # never pytest's own working directory (the checkout)
+        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True, cwd=cwd)
+        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True, cwd=cwd)
         clone_setup._disable_push(work)
         recipe = GitHubPRRecipe(
             user="u", clone_path=work, pr_queue_dir=tmp_path / "q", base_ref="origin/main"
@@ -862,14 +1114,20 @@ class TestTrustedPublisherStillWorksAfterNeutralizing:
         assert recipe._resolve_fetch_url() is None, "a neutralized clone must not yield a target"
 
 
+@pytest.mark.usefixtures("_public_dns")
 class TestOriginUrlMigratesOldConfigs:
-    """Neutralizing BOTH clone urls means the trusted publishers can no longer read the
-    remote out of git — they take it from config's ``origin_url``. A config written before
-    that change has no such key, and its clone still has a live fetch url.
+    """Neutralizing BOTH clone urls means the trusted publishers cannot read the
+    remote out of git — they take it from config's ``origin_url``. An older config has no
+    such key, and its clone still has a live fetch url.
 
     Found by inspecting the live dogfood configs on this host: both had ``clone`` set and
     no ``origin_url``. Without a migration they would silently degrade to queue-only after
     an upgrade, so the resolver falls back to the retained ``target_url``.
+
+    Every case runs through ``resolve_origin_url`` -> ``validate_target_url``, whose
+    SSRF screen resolves the host live and fails closed on resolver errors — so DNS is
+    pinned (the shared ``_public_dns`` fixture) and the refusal cases below fail for
+    the allowlist/identity reason they assert, never for a resolver hiccup.
     """
 
     def test_a_config_without_origin_url_still_resolves_a_target(self) -> None:
@@ -890,8 +1148,8 @@ class TestOriginUrlMigratesOldConfigs:
         # `origin_url` is preferred over the legacy `target_url` — but only when the two name
         # the SAME repository. Host-allowlisting alone let an injected config keep
         # `github.com` and swap the path, redirecting the push to another owner's repo, so the
-        # identity is pinned now. (This case previously used mismatched repos, which is
-        # precisely the attack it must refuse — see the mismatch assertion below.)
+        # identity is pinned too. Mismatched repos are precisely the attack it must
+        # refuse — see the mismatch assertion below.
         cfg = {"origin_url": "https://github.com/o/r.git", "target_url": "https://github.com/o/r"}
         assert resolve_origin_url(cfg) == "https://github.com/o/r.git"
 
@@ -947,18 +1205,22 @@ class TestPushedBranchActuallyContainsTheFix:
         import subprocess
 
         up, work = tmp_path / "up.git", tmp_path / "w"
-        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True)
-        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True)
+        cwd = str(tmp_path)  # never pytest's own working directory (the checkout)
+        subprocess.run(["git", "init", "-q", "--bare", str(up)], check=True, cwd=cwd)
+        subprocess.run(["git", "clone", "-q", str(up), str(work)], capture_output=True, cwd=cwd)
         for k, v in (("user.email", "t@e"), ("user.name", "t")):
-            subprocess.run(["git", "-C", str(work), "config", k, v], check=True)
+            subprocess.run(["git", "-C", str(work), "config", k, v], check=True, cwd=cwd)
         (work / "a.txt").write_text("original\n")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd)
+        subprocess.run(["git", "-C", str(work), "commit", "-qm", "init"], check=True, cwd=cwd)
         subprocess.run(
             ["git", "-C", str(work), "push", "-q", "origin", "HEAD:refs/heads/main"],
             capture_output=True,
+            cwd=cwd,
         )
-        subprocess.run(["git", "-C", str(work), "fetch", "-q", "origin"], capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(work), "fetch", "-q", "origin"], capture_output=True, cwd=cwd
+        )
         return up, work
 
     def test_a_committed_fix_reaches_the_pushed_branch(self, tmp_path) -> None:
@@ -970,11 +1232,13 @@ class TestPushedBranchActuallyContainsTheFix:
         )
 
         up, work = self._repo(tmp_path)
+        cwd = str(tmp_path)
         (work / "a.txt").write_text("FIXED\n")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd)
         subprocess.run(
             ["git", "-C", str(work), "commit", "-qm", "wip(auto-improvement): staging c1"],
             check=True,
+            cwd=cwd,
         )
         clone_setup._disable_push(work)
 
@@ -991,6 +1255,7 @@ class TestPushedBranchActuallyContainsTheFix:
             ["git", "-C", str(up), "show", "auto-improvement/bug-abc:a.txt"],
             capture_output=True,
             text=True,
+            cwd=cwd,
         ).stdout
         assert got.strip() == "FIXED", f"the drafted branch does not carry the fix: {got!r}"
 
@@ -999,13 +1264,20 @@ class TestPushedBranchActuallyContainsTheFix:
         import subprocess
 
         up, work = self._repo(tmp_path)
+        cwd = str(tmp_path)
         (work / "a.txt").write_text("FIXED\n")
-        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)  # staged, NOT committed
+        subprocess.run(
+            ["git", "-C", str(work), "add", "-A"], check=True, cwd=cwd
+        )  # staged, NOT committed
         subprocess.run(
             ["git", "-C", str(work), "push", "-q", str(up), "HEAD:refs/heads/staged-probe"],
             capture_output=True,
+            cwd=cwd,
         )
         got = subprocess.run(
-            ["git", "-C", str(up), "show", "staged-probe:a.txt"], capture_output=True, text=True
+            ["git", "-C", str(up), "show", "staged-probe:a.txt"],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
         ).stdout
         assert got.strip() == "original", "staging alone must not be mistaken for a commit"

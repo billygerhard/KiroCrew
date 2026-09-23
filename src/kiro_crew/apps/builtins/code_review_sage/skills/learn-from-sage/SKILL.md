@@ -17,11 +17,35 @@ Two files, one rule each:
   Reviews do NOT read it. It is merged into `learned-patterns.md` only when a
   human triggers **consolidation** (a one-shot AI merge), after which it's cleared.
 
+## The interpreter in every command below
+
+Commands here are written as `<python> …`. Replace `<python>` with the absolute
+interpreter path the task prompt names — it is the one the app itself runs, and
+it is the only interpreter guaranteed to exist on this host. Never substitute a
+bare `python3`: Windows has no such interpreter (the name resolves to a
+Microsoft Store app-execution alias that runs nothing), so the command would
+stage nothing and the learning would be silently lost. Outside a review
+session, use the interpreter running the app.
+
+## Where every path below is rooted
+
+Paths in this skill are **relative to the app root** — the directory holding
+`sage_lib/` and `data/`. A review or consolidation worker is already started
+there, so `sage_lib/store.py` resolves without any prefix. Deliberately relative,
+not `~/.kiro/crew/apps/code-review-sage/...`: `~` is expanded by the SHELL, and
+the task does not pin one — PowerShell expands it, `cmd.exe` passes it through
+literally, and Python then cannot open the file. Outside a worker session, `cd`
+into the app root first (`~/.kiro/crew/apps/code-review-sage` on macOS/Linux,
+`%USERPROFILE%\.kiro\crew\apps\code-review-sage` on Windows).
+
+Prefer your own file-read tool over `cat` for the reads below — it needs no shell
+at all, so it behaves the same on every host.
+
 ## Self-heal (first)
 
 ```bash
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/store.py --ensure
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py seed   # no-op if already seeded
+<python> sage_lib/store.py --ensure
+<python> sage_lib/learning.py seed   # no-op if already seeded
 ```
 
 ## Admissible sources only (no self-poisoning)
@@ -63,7 +87,7 @@ review** (not a separate pass):
    or drop it. When in doubt, prefer fewer, broader rules over many narrow ones.
 4. **Stage** it (cheap, no model merge yet):
    ```bash
-   python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py stage \
+   <python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py stage \
        --file /tmp/pattern.json --source fix_introduce [--namespace <name>]
    ```
    The pattern JSON carries: `title, scope (common), dimension, impact, guidance`.
@@ -97,7 +121,7 @@ When the human asks to consolidate (or the app's "Consolidate" button routes her
 3. Write the merged markdown to a temp file and apply it atomically — this
    replaces `learned-patterns.md` and clears the candidate:
    ```bash
-   python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py consolidate \
+   <python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py consolidate \
        --merged-file /tmp/merged-learned-patterns.md
    ```
    `consolidate` refuses empty content (never wipes the ruleset) and records a
@@ -112,11 +136,11 @@ When the human asks to consolidate (or the app's "Consolidate" button routes her
 
 Inspect staging anytime:
 ```bash
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-candidate [--namespace <name>]
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-patterns [--namespace <name>]
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py clear-candidate [--namespace <name>]
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-namespaces
-python3 ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-for-review  # union of active namespaces
+<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-candidate [--namespace <name>]
+<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-patterns [--namespace <name>]
+<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py clear-candidate [--namespace <name>]
+<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-namespaces
+<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-for-review  # union of active namespaces
 ```
 
 > Namespaces are supported: learnings are grouped by namespace. The `default`

@@ -21,9 +21,12 @@ from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
 from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     ACTIVE,
+    DISPATCH_LOCK,
+    START_LOCK,
     BadRequest,
     audit,
     data_root,
+    dispatch_line,
     field_bool,
     field_str,
     json_body,
@@ -110,13 +113,30 @@ async def handle_toggle_agent(request: web.Request) -> web.Response:
     agent_id = store.safe_agent_id(field_str(body, "agent_id", required=True, max_len=64))
     enable = field_bool(body, "enable", default=True)
 
+    # Enabling an agent creates its output file before committing the metadata.
+    # Keep that complete transaction ordered with meeting deletion so the file
+    # cannot recreate a directory after DELETE has returned 204.
+    async with START_LOCK:
+        # Agent initialization is slow but must finish before transcript can enter
+        # the new queue; otherwise the first line can arrive before the agent knows
+        # which output file it owns.
+        async with DISPATCH_LOCK:
+            return await _toggle_agent_locked(meeting_id, agent_id, enable, root)
+
+
+async def _toggle_agent_locked(
+    meeting_id: str, agent_id: str, enable: bool, root: Any
+) -> web.Response:
+    """Apply one agent toggle while the caller holds ``START_LOCK``."""
     config, agent_def, meta, fname, mdir = await asyncio.to_thread(
         _read_toggle_state, meeting_id, agent_id, enable, root
     )
     if agent_def is None:
         return web.json_response({"error": "unknown agent", "code": "agent_not_found"}, status=404)
     if meta is None:
-        return web.json_response({"error": "meeting not found", "code": "meeting_not_found"}, status=404)
+        return web.json_response(
+            {"error": "meeting not found", "code": "meeting_not_found"}, status=404
+        )
 
     # An ABSENT `agents_enabled` means "the configured defaults", not "none" — the
     # two are different values to `get_enabled_agents`, which treats `None` as
@@ -145,17 +165,18 @@ async def handle_toggle_agent(request: web.Request) -> web.Response:
         if session is not None:
             session.add_agent(agent_id, agent_def.get("agent") or "")
             if fname:
-                message = sess.build_init_message(
-                    agent_def,
-                    meta,
-                    f"{mdir}/{fname}",
-                    sess.build_cross_reference(
-                        mdir, sess.get_enabled_agents(config, enabled_list)
-                    ),
-                ) + "\n\nYou are joining mid-meeting. Wait for transcription."
-                await sess._safe_dispatch(
-                    session, agent_id, message, agent_def.get("agent") or ""
+                message = (
+                    sess.build_init_message(
+                        agent_def,
+                        meta,
+                        f"{mdir}/{fname}",
+                        sess.build_cross_reference(
+                            mdir, sess.get_enabled_agents(config, enabled_list)
+                        ),
+                    )
+                    + "\n\nYou are joining mid-meeting. Wait for transcription."
                 )
+                await sess._safe_dispatch(session, agent_id, message, agent_def.get("agent") or "")
     else:
         enabled_list = [x for x in enabled_list if x != agent_id]
         if session is not None:
@@ -259,14 +280,33 @@ async def handle_mute_agent(request: web.Request) -> web.Response:
 
     meta = await asyncio.to_thread(_apply_mute, meeting_id, agent_id, muted, root)
     if meta is None:
-        return web.json_response({"error": "meeting not found", "code": "meeting_not_found"}, status=404)
+        return web.json_response(
+            {"error": "meeting not found", "code": "meeting_not_found"}, status=404
+        )
 
-    session = ACTIVE.get(meeting_id)
-    if session is not None:
-        if muted:
-            session.muted_agents.add(agent_id)
-        else:
-            session.muted_agents.discard(agent_id)
+    # Under the admission lock, because a dispatch RESOLVES its recipients from
+    # this set across an awaited transcript write. Mutating it unlocked let a mute
+    # land inside that window, so the line was addressed by the mute state of a
+    # moment AFTER it was spoken — it reached the wrong agent set, and for a line
+    # held through initialization the wrong set was recorded and replayed later.
+    #
+    # The lock belongs HERE, on the one unlocked writer, rather than on the reader:
+    # both the live fan-out and the initialization hold read this set after their
+    # own transcript-append await inside `_common.dispatch_line`, so guarding a
+    # single dispatch branch would close one
+    # window and leave its twin open. Every other writer already holds this lock
+    # (`handle_toggle_agent` takes it, and `add_agent` runs inside it).
+    #
+    # Only the in-memory mutation is covered: the metadata write above is already
+    # serialized by its own transaction, and pulling it in would hold the admission
+    # lock across disk IO that dispatch does not need to wait for.
+    async with DISPATCH_LOCK:
+        session = ACTIVE.get(meeting_id)
+        if session is not None:
+            if muted:
+                session.muted_agents.add(agent_id)
+            else:
+                session.muted_agents.discard(agent_id)
 
     return web.json_response({"ok": True, "muted_agents": meta["muted_agents"]})
 
@@ -285,27 +325,17 @@ async def handle_dispatch_text(request: web.Request) -> web.Response:
     text = field_str(body, "text", required=True, max_len=k.MAX_TRANSCRIPT_CHARS)
     is_chat = field_bool(body, "chat", default=False)
 
-    session = ACTIVE.get(meeting_id)
-    if session is None:
-        return web.json_response({"error": "no active meeting", "code": "no_active_meeting"}, status=409)
-    if session.expired:
-        # Drain, not cancel: a long meeting whose next line arrives after the
-        # session lapsed still has whatever was queued when it went quiet, and
-        # that transcript is exactly what the final notes would otherwise omit.
-        await ACTIVE.drain_and_clear()
-        # Then mark it ended on disk, for the same reason gateway shutdown does
-        # (`routes/__init__._on_cleanup`): the live session is gone, so leaving the
-        # metadata saying `active` makes the dashboard show Live and keep recording
-        # into 409s. `ended` is both honest and recoverable — it is the one status
-        # the user can Restart from.
-        await asyncio.to_thread(sess.end_meeting_meta, meeting_id, data_root(request))
-        return web.json_response({"error": "meeting session expired", "code": "meeting_session_expired"}, status=410)
-
-    line = redact(text)
-    if is_chat:
-        line = f"{k.CHAT_PREFIX} {line}"
-    accepted = session.broadcast(line)
-    return web.json_response({"ok": True, "dispatched": accepted, "text": line})
+    # The admission transaction (live-session check, transcript append, fan-out,
+    # and the expiry side effects) is shared with the audio-import producer — see
+    # `_common.dispatch_line`. Only THIS producer opts into the initialization
+    # hold: a line of live speech arriving while the agents are still starting is
+    # wanted and is buffered, whereas a file import has no business
+    # trickling into a hold buffer — it is refused whole and retried.
+    source = k.TRANSCRIPT_SOURCE_TYPED if is_chat else k.TRANSCRIPT_SOURCE_SPEECH
+    segment, accepted, line = await dispatch_line(
+        request, meeting_id, text, source, chat=is_chat, hold_during_init=True
+    )
+    return web.json_response({"ok": True, "dispatched": accepted, "text": line, "segment": segment})
 
 
 async def handle_reset_agents(request: web.Request) -> web.Response:
@@ -313,7 +343,9 @@ async def handle_reset_agents(request: web.Request) -> web.Response:
     meeting_id = _meeting_id(request)
     session = ACTIVE.get(meeting_id)
     if session is None:
-        return web.json_response({"error": "no active meeting", "code": "no_active_meeting"}, status=409)
+        return web.json_response(
+            {"error": "no active meeting", "code": "no_active_meeting"}, status=409
+        )
     resumed = session.resume_all()
     audit("meetings.reset_agents", meeting_id, outcome="ok")
     return web.json_response(
@@ -334,7 +366,9 @@ async def handle_agent_message(request: web.Request) -> web.Response:
 
     session = ACTIVE.get(meeting_id)
     if session is None:
-        return web.json_response({"error": "no active meeting", "code": "no_active_meeting"}, status=409)
+        return web.json_response(
+            {"error": "no active meeting", "code": "no_active_meeting"}, status=409
+        )
     queue = session.agents.get(agent_id)
     if queue is None:
         raise BadRequest("agent is not part of this meeting", status=404)

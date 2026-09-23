@@ -38,18 +38,20 @@ from kiro_crew.weixin.transport import WeixinTransport
 
 
 # ── protocol headers ──────────────────────────────────────────────────────────
-def test_declared_capabilities_do_not_promise_files_without_a_media_path():
-    """``files`` must stay False while the transport has no media path.
+def test_declared_capabilities_match_the_directions_actually_implemented():
+    """Each ``files`` flag must track a real code path, per direction.
 
     The flag is a contract read by capability-aware callers (and, per the
-    channel-plugin RFC, eventually by the agent's own tool surface). iLink's
-    send path carries text only and inbound media is never decrypted or cached,
-    so declaring files=True advertises a capability the transport cannot
-    perform. Flip this together with the media implementation, not before.
+    channel-plugin RFC, eventually by the agent's own tool surface), so it is
+    wrong in BOTH directions: claiming a capability the transport lacks, and
+    denying one it has. Inbound landed (``weixin/media.py`` CDN download +
+    AES-128-ECB decrypt, fed through ``weixin/attachments.py``); outbound still
+    carries text only, because the ``getuploadurl`` + encrypted CDN PUT half is
+    unimplemented. Flip ``files_outbound`` in the change that lands it.
     """
     from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
 
-    assert WEIXIN_CAPABILITIES.files_inbound is False
+    assert WEIXIN_CAPABILITIES.files_inbound is True
     assert WEIXIN_CAPABILITIES.files_outbound is False
 
 
@@ -63,6 +65,19 @@ def test_headers_carry_required_ilink_fields():
     # Content-Length must be the UTF-8 byte length, not the char count.
     assert h["Content-Length"] == "7"
     assert h["X-WECHAT-UIN"]
+
+
+def test_headers_reuse_one_uin_across_requests():
+    """iLink binds the bot session to the UIN seen at authorization.
+
+    Re-rolling ``X-WECHAT-UIN`` per request made the first ``getupdates``
+    long-poll after a QR login come back ``-14`` (session expired), so every
+    request in a process must present the same UIN.
+    """
+    first = _headers("abc123", "{}")["X-WECHAT-UIN"]
+    assert all(_headers("abc123", "{}")["X-WECHAT-UIN"] == first for _ in range(5))
+    # Independent of token/body, since it identifies the client, not the call.
+    assert _headers(None, '{"k":1}')["X-WECHAT-UIN"] == first
 
 
 def test_headers_omit_authorization_without_credential():
@@ -133,6 +148,57 @@ def test_account_credentials_are_owner_only(tmp_path):
     save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
     path = tmp_path / "weixin" / "accounts" / "acct1.json"
     assert path.stat().st_mode & 0o077 == 0
+
+
+def test_account_credentials_lockdown_precedes_content(tmp_path, monkeypatch):
+    """The token must never exist in a file that has not been locked down yet.
+
+    On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
+    ``restrict_to_owner`` is the only protection; applying it after the write
+    left the bot credential readable under the parent directory's inherited ACL
+    for the whole write window. Asserted by measuring the file's
+    SIZE at the moment the lockdown is applied — zero means no payload byte
+    existed yet. A post-write stat passes on the buggy ordering too, so it
+    would not be a regression test.
+    """
+    from kiro_crew import platform_compat
+
+    sizes: list[int] = []
+    real_restrict = platform_compat.restrict_to_owner
+
+    def _measuring_restrict(target):
+        sizes.append(os.stat(target).st_size)
+        return real_restrict(target)
+
+    monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
+
+    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
+
+    assert sizes, "premise: the lockdown ran at all"
+    assert (
+        sizes[0] == 0
+    ), f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
+
+
+def test_account_credentials_survive_a_failed_lockdown(tmp_path, monkeypatch):
+    """``restrict_on_error="warn"`` keeps this site's established policy: the
+    credential write matters more than the permissions, so a lockdown failure
+    is logged but must not cost the account file."""
+    from kiro_crew import platform_compat
+
+    def _refuse(_target):
+        raise OSError("cannot resolve the invoking user's SID")
+
+    monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
+
+    save_weixin_account(
+        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
+    )
+
+    loaded = load_weixin_account(str(tmp_path), "acct1")
+    assert loaded is not None, "warn policy must keep the write"
+    assert loaded["token"] == "s3cr3t"
+    assert loaded["user_id"] == "u9"
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────
@@ -399,6 +465,62 @@ def test_gateway_home_follows_the_configured_data_home(tmp_path, monkeypatch):
     assert gw.data_home is paths_mod.data_home
 
 
+def test_gateway_wires_the_transport_into_the_dispatcher_before_connect(tmp_path):
+    """The config applier that pushes a reloaded ``weixin`` roster at the transport
+    resolves it through ``dispatcher.transport`` and treats a missing holder as
+    "not built yet, it will read the fresh section". That is only true while the
+    transport does not exist. Once it is constructed from the boot roster, a
+    revocation dispatched during the ``connect()`` await must find it wired, or
+    the removed user stays authorized until the next edit or a restart.
+    """
+    from types import SimpleNamespace
+
+    import kiro_crew.weixin.gateway as gw
+
+    class _Cfg:
+        class agent:
+            default_agent = "kirocrew"
+            approval_mode = "auto"
+
+        class messaging:
+            idle_reset_minutes = 0
+            daily_reset_hour = -1
+            dm_scope = "user"
+
+    class _CtxBuilder:
+        hooks = None
+
+        def build_message(self, text, is_new, session_key, **kw):
+            return (text, {})
+
+    holder_at_connect: list[object] = []
+
+    async def _connect(self):
+        # ``_dispatch`` is the dispatcher's bound handle_message; its __self__ is
+        # the dispatcher whose ``transport`` attribute the applier will read.
+        holder_at_connect.append(getattr(self._dispatch.__self__, "transport", None))
+
+    orch = SimpleNamespace(
+        _weixin_enabled=True,
+        _weixin_token="tok",
+        _weixin_account_id="acct1",
+        _weixin_home=str(tmp_path),
+        _weixin_allowed_user_ids=["friend"],
+        _approval_mode="auto",
+        _cfg=_Cfg(),
+        sessions=object(),
+        ctx_builder=_CtxBuilder(),
+        dashboard_state=None,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(gw.WeixinTransport, "connect", _connect)
+        client = asyncio.run(gw.maybe_start_weixin(orch))
+
+    assert client is not None, "the channel must have started"
+    assert len(holder_at_connect) == 1
+    assert isinstance(holder_at_connect[0], WeixinTransport)
+
+
 def test_rejected_sender_does_not_get_context_persisted(tmp_path, monkeypatch):
     """An unallowlisted stranger must not be able to mutate server-side state.
 
@@ -436,13 +558,7 @@ def test_allowed_sender_still_gets_context_persisted(tmp_path):
     assert t._ctx.get("acct1", "friend") == "ctx-keep"
 
 
-def test_options_trailer_is_stripped_from_the_end():
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
-    assert _strip_options("Here you go.\n\n[OPTIONS: Yes | No]") == "Here you go."
-
-
-def test_options_stripping_never_deletes_mid_response_content():
+def test_a_mid_response_options_mention_never_deletes_the_body():
     """Regression: a non-trailing "[OPTIONS:" must not swallow the body.
 
     The hand-rolled MULTILINE|DOTALL pattern let ``.*?`` span newlines, so an
@@ -450,23 +566,20 @@ def test_options_stripping_never_deletes_mid_response_content():
     between was silently deleted from the user's reply. The shared
     OPTIONS_RE_TRAILER anchors to end-of-string instead.
     """
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
     body = (
         "The dashboard renders `[OPTIONS: a | b]` as tappable chips.\n"
         "Important paragraph that must survive.\n"
         "A list: [1] first [2] second\n"
     )
-    out = _strip_options(body + "\n[OPTIONS: Keep | Discard]")
+    from kiro_crew.messaging.renderer import render_options_as_text
+    from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
+
+    out = render_options_as_text(body + "\n[OPTIONS: Keep | Discard]", WEIXIN_CAPABILITIES)
     assert "Important paragraph that must survive." in out
     assert "[1] first [2] second" in out
     assert "Keep | Discard" not in out
-
-
-def test_text_without_a_trailer_is_untouched():
-    from kiro_crew.weixin.turn_renderer import _strip_options
-
-    assert _strip_options("just an answer") == "just an answer"
+    # The trailer's own choices still reach the user, now as numbered lines.
+    assert out.endswith("1. Keep\n2. Discard")
 
 
 def test_poll_loop_backs_off_on_ret_keyed_session_expiry(tmp_path, monkeypatch):

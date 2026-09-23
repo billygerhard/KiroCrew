@@ -8,8 +8,10 @@ Every request is signed the way the gateway signs it, so the auth middleware is
 exercised on each call rather than bypassed. The folder picker is disabled via
 ``MD_NOTEBOOK_NO_PICKER`` so no GUI dialog can ever open during a run.
 """
+
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib
@@ -17,15 +19,21 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 
 import pytest
+import yarl
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from windows_sim import replace_sharing_violation
 
 from conftest import requires_symlinks
+from kiro_crew import atomic_write as atomic_write_mod
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.md_notebook import git_ops
 
@@ -127,10 +135,14 @@ class SignedClient:
         self, method: str, path: str, payload: Optional[dict[str, Any]] = None
     ) -> tuple[int, Any]:
         body = json.dumps(payload).encode() if payload is not None else b""
-        headers = self._headers(method, path, body)
+        # Sign the WIRE form of the target, as the gateway does: yarl requotes
+        # the human-readable path (e.g. a space becomes %20), and raw_path_qs
+        # is the exact request-target the client puts on the wire.
+        url = yarl.URL(path)
+        headers = self._headers(method, url.raw_path_qs, body)
         if payload is not None:
             headers["Content-Type"] = "application/json"
-        resp = await self._client.request(method, path, data=body or None, headers=headers)
+        resp = await self._client.request(method, url, data=body or None, headers=headers)
         try:
             return resp.status, await resp.json()
         except Exception:  # noqa: BLE001 — a non-JSON body is itself the failure
@@ -158,6 +170,13 @@ def fixtures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _seed_template: Pa
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "crew"))
     monkeypatch.setenv("KIROCREW_PROXY_SECRET", SECRET)
     monkeypatch.setenv("MD_NOTEBOOK_NO_PICKER", "1")
+    # Every auth-bearing route falls through ``resolve_auth`` to ``gh_token``,
+    # which spawns the host's real ``gh auth token`` whenever ``_find_gh`` finds
+    # a trusted install. That makes the verdict depend on whether the developer
+    # has gh installed and logged in, and can hand the backend under test a
+    # live token. Pin the resolver's own override to a path that does not exist
+    # so it answers "no gh" and the token path is exercised as a genuine absence.
+    monkeypatch.setenv("MD_NOTEBOOK_GH_BIN", str(tmp_path / "no-such-gh"))
     from kiro_crew.apps.builtins.md_notebook import server as server_mod
 
     # HOME and friends are resolved at import time, so rebind them to the temp
@@ -200,7 +219,15 @@ async def test_health_advertises_features(fixtures) -> None:
         assert status == 200
         assert body["ok"] is True
         # The UI compares this list to detect a backend older than the page.
-        for feature in ("createdAt", "attach", "saveGuard", "knowledge", "pickFolder"):
+        for feature in (
+            "createdAt",
+            "attach",
+            "saveGuard",
+            "knowledge",
+            "pickFolder",
+            "settings",
+            "autoSyncLoop",
+        ):
             assert feature in body["features"]
 
 
@@ -241,6 +268,52 @@ async def test_tampered_signature_is_rejected(fixtures) -> None:
         assert resp.status == 401
 
 
+def _sign_wire_target(method: str, wire_target: str, body: bytes = b"") -> dict[str, str]:
+    """Sign exactly as the gateway does (apps/routes.py::handle_app_api_proxy):
+    over the RAW, percent-encoded request-target, never a decoded form."""
+    ts = str(int(time.time()))
+    digest = hashlib.sha256(body).hexdigest()
+    msg = f"{ts}:{method}:{wire_target}:{digest}"
+    sig = hmac.new(SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {"X-KiroCrew-Proxy": f"{ts}:{sig}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire_target",
+    [
+        "/api/health?path=/tmp/my%20notes.md",  # space
+        "/api/health?path=/tmp/caf%C3%A9.md",  # non-ASCII
+        "/api/health?path=/tmp/my+notes.md",  # '+' (decodes to space in query)
+    ],
+)
+async def test_gateway_signed_escapable_query_verifies(fixtures, wire_target: str) -> None:
+    """A query parameter needing percent-escaping (a note path with a space or
+    non-ASCII character) must verify: the middleware has to recompute the HMAC
+    over the same RAW request-target the gateway signed, not aiohttp's decoded
+    path + query_string reconstruction (issue: note reads 401ing while plain
+    listings pass)."""
+    server_mod, _remote, _seed = fixtures
+    app = server_mod.create_app()
+    async with TestClient(TestServer(app)) as raw:
+        # encoded=True keeps the exact signed bytes on the wire, mirroring the
+        # gateway's yarl.URL(..., encoded=True) forwarding.
+        url = yarl.URL(wire_target, encoded=True)
+        resp = await raw.get(url, headers=_sign_wire_target("GET", wire_target))
+        assert resp.status == 200, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_gateway_signed_no_query_target_verifies(fixtures) -> None:
+    """Without a query string neither side appends a '?' — the raw and decoded
+    spellings coincide and the signature must still verify."""
+    server_mod, _remote, _seed = fixtures
+    app = server_mod.create_app()
+    async with TestClient(TestServer(app)) as raw:
+        resp = await raw.get("/api/health", headers=_sign_wire_target("GET", "/api/health"))
+        assert resp.status == 200, await resp.text()
+
+
 # ---------------------------------------------------------------------------
 # Vaults
 # ---------------------------------------------------------------------------
@@ -278,9 +351,7 @@ async def test_clone_with_escaping_subfolder_leaves_no_orphan(fixtures) -> None:
     """
     server_mod, remote, _seed = fixtures
     async with signed_client(server_mod) as client:
-        status, _ = await client.post(
-            "/api/vaults", {"url": str(remote), "subfolder": "/etc"}
-        )
+        status, _ = await client.post("/api/vaults", {"url": str(remote), "subfolder": "/etc"})
         assert status == 400
         _, listing = await client.get("/api/vaults")
         assert listing["vaults"] == []
@@ -334,9 +405,7 @@ async def test_attach_accepts_a_repo_with_no_remote(fixtures, tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_sync_on_a_local_only_vault_commits_without_pushing(
-    fixtures, tmp_path: Path
-) -> None:
+async def test_sync_on_a_local_only_vault_commits_without_pushing(fixtures, tmp_path: Path) -> None:
     """Sync degrades to a local commit: no fetch, no push, no error."""
     server_mod, _remote, _seed = fixtures
     local = tmp_path / "local-only"
@@ -540,10 +609,12 @@ async def test_every_path_route_refuses_non_note_paths(fixtures) -> None:
         assert (await client.delete("/api/note?path=.git/config"))[0] == 400
         assert (await client.put("/api/note", {"path": ".git/config", "content": "x"}))[0] == 400
         assert (await client.post("/api/note/duplicate", {"path": ".git/config"}))[0] == 400
-        assert (await client.post("/api/note/move", {"from": ".git/config", "to": "x.md"}))[0] == 400
-        assert (
-            await client.post("/api/note/move", {"from": "One.md", "to": ".git/config"})
-        )[0] == 400
+        assert (await client.post("/api/note/move", {"from": ".git/config", "to": "x.md"}))[
+            0
+        ] == 400
+        assert (await client.post("/api/note/move", {"from": "One.md", "to": ".git/config"}))[
+            0
+        ] == 400
         # A note-shaped name inside a dotted directory is refused too — the rule is
         # the component, not the extension alone.
         assert (await client.delete("/api/note?path=.trash/One.md"))[0] == 400
@@ -647,9 +718,7 @@ async def test_trash_open_reveals_the_vaults_own_trash(fixtures, monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_trash_open_of_a_scoped_vault_stays_inside_the_scope(
-    fixtures, monkeypatch
-) -> None:
+async def test_trash_open_of_a_scoped_vault_stays_inside_the_scope(fixtures, monkeypatch) -> None:
     """A subfolder-scoped vault's trash lives in the SCOPE, not the repo root —
     the same containment every other note path follows."""
     server_mod, remote, _seed = fixtures
@@ -693,9 +762,9 @@ async def test_autosave_commits_notes_only(fixtures) -> None:
         vault = await _clone(client, remote)
         root = Path(vault["localPath"])
         (root / "secrets.env").write_text("AWS_SECRET=hunter2\n", encoding="utf-8")
-        assert (
-            await client.put("/api/note", {"path": "One.md", "content": "# One\n\nedited\n"})
-        )[0] == 200
+        assert (await client.put("/api/note", {"path": "One.md", "content": "# One\n\nedited\n"}))[
+            0
+        ] == 200
 
         status, body = await client.post("/api/commit")
         assert status == 200, body
@@ -722,6 +791,32 @@ async def test_explicit_sync_still_commits_the_whole_scope(fixtures) -> None:
 
 
 @pytest.mark.asyncio
+async def test_notes_only_sync_still_pushes_but_excludes_non_notes(fixtures) -> None:
+    """The background loop's `notes_only=True` decouples notes-only STAGING from
+    `commit_only`'s stop-before-push. So a timed sync must (1) leave a stray
+    non-note file out of history and off the remote, yet (2) still push the note
+    edit — otherwise it would silently be a local-only commit and 'Synced N ago'
+    would lie."""
+    mod, remote, _seed = fixtures
+    async with signed_client(mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        (root / "secrets.env").write_text("AWS_SECRET=hunter2\n", encoding="utf-8")
+        assert (await client.put("/api/note", {"path": "One.md", "content": "# One\n\ntimed\n"}))[
+            0
+        ] == 200
+
+    result = await git_ops.sync(str(root), notes_only=True)
+
+    assert result["pushed"] is True, result
+    assert [c["path"] for c in result["committed"]] == ["One.md"]
+    # The note reached the remote; the stray file entered neither history nor push.
+    assert "timed" in _git("show", "HEAD:One.md", cwd=remote)
+    assert "secrets.env" not in _git("ls-files", cwd=root)
+    assert _git("status", "--porcelain", cwd=root).strip() == "?? secrets.env"
+
+
+@pytest.mark.asyncio
 async def test_autosave_of_a_scoped_vault_stays_in_scope(fixtures) -> None:
     """Notes-only staging names each path individually; they must all still be
     inside the vault's subfolder scope."""
@@ -731,7 +826,9 @@ async def test_autosave_of_a_scoped_vault_stays_in_scope(fixtures) -> None:
         root = Path(vault["localPath"])
         (root / "Outside.md").write_text("# outside the scope\n", encoding="utf-8")
         assert (
-            await client.put("/api/note", {"path": "Two.md", "content": "---\ntitle: Two\n---\n\nx\n"})
+            await client.put(
+                "/api/note", {"path": "Two.md", "content": "---\ntitle: Two\n---\n\nx\n"}
+            )
         )[0] == 200
 
         status, body = await client.post("/api/commit")
@@ -824,12 +921,10 @@ async def test_sync_never_stages_a_pre_existing_trash(fixtures) -> None:
         (trash / "secret.md").write_text("private, deleted in Obsidian\n", encoding="utf-8")
         # No delete has happened, so nothing has written the exclude entry yet.
         exclude = root / ".git" / "info" / "exclude"
-        assert not exclude.exists() or git_ops.TRASH_DIR not in exclude.read_text(
-            encoding="utf-8"
-        )
-        assert (
-            await client.put("/api/note", {"path": "One.md", "content": "# One\n\nedit\n"})
-        )[0] == 200
+        assert not exclude.exists() or git_ops.TRASH_DIR not in exclude.read_text(encoding="utf-8")
+        assert (await client.put("/api/note", {"path": "One.md", "content": "# One\n\nedit\n"}))[
+            0
+        ] == 200
 
         status, body = await client.post("/api/sync")
         assert status == 200, body
@@ -968,8 +1063,23 @@ def test_pat_stays_under_crew_home_ignoring_md_notebook_home(monkeypatch, tmp_pa
     assert str(stray) not in str(pat), pat
     assert pat.parts[-3:] == ("workspace", "md-notebook", "pat"), pat
     assert str(crew) in str(pat), pat
-    # Vaults, by contrast, DO follow MD_NOTEBOOK_HOME.
-    assert str(stray) in str(server_mod._vaults_json())
+    # settings.json carries `autoSync` (authorizes unattended push), so like the
+    # PAT it MUST stay under the crew data home behind the sensitive-path floor —
+    # MD_NOTEBOOK_HOME must not relocate it to an unprotected dir an agent could
+    # write.
+    settings = server_mod._settings_json()
+    assert str(stray) not in str(settings), settings
+    assert str(crew) in str(settings), settings
+    # The vault REGISTRY carries each vault's push target (remoteUrl/gitDir) that
+    # the unattended sync loop trusts, so vaults.json is fenced under the crew data
+    # home too — MD_NOTEBOOK_HOME must not relocate it where an agent could repoint
+    # the push.
+    vaults = server_mod._vaults_json()
+    assert str(stray) not in str(vaults), vaults
+    assert str(crew) in str(vaults), vaults
+    # The clone DATA, by contrast, is bulk per-instance content and DOES follow
+    # MD_NOTEBOOK_HOME.
+    assert str(stray) in str(server_mod._clone_root())
 
 
 def test_default_home_follows_kirocrew_home(monkeypatch, tmp_path: Path) -> None:
@@ -1025,6 +1135,25 @@ async def test_concurrent_clones_do_not_lose_a_vault(fixtures) -> None:
         assert len(listing["vaults"]) == 2, listing
 
 
+def test_vault_registry_commit_retries_windows_sharing_violation(fixtures, monkeypatch) -> None:
+    """A transient Windows handle on vaults.json must not lose a clone.
+
+    Clone/attach mutations are serialized, but Windows Search or an AV scanner
+    can still hold the registry open when the atomic rename lands. The shared
+    retry helper absorbs that bounded sharing-violation window.
+    """
+    server_mod, _remote, _seed = fixtures
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+    monkeypatch.setattr(atomic_write_mod, "_REPLACE_BACKOFF_SECONDS", 0)
+    vaults = [{"id": "v1", "localPath": "vault-one"}]
+
+    with replace_sharing_violation(match="vaults.json", times=1) as state:
+        server_mod._write_vaults_sync(vaults)
+
+    assert json.loads(server_mod._vaults_json().read_text(encoding="utf-8")) == vaults
+    assert state["n"] == 2, "the transient rename must be retried exactly once"
+
+
 # ---------------------------------------------------------------------------
 # Notes
 # ---------------------------------------------------------------------------
@@ -1039,11 +1168,45 @@ async def test_note_listing(fixtures) -> None:
         assert status == 200
         by_path = {n["path"]: n for n in body["notes"]}
         assert set(by_path) == {"One.md", "sub/Two.md"}
-        # Frontmatter title wins; otherwise the filename is used.
+        # The filename is the label. The seed's frontmatter `title` happens to
+        # equal its filename, so the divergent case is pinned separately below.
         assert by_path["sub/Two.md"]["title"] == "Two"
         assert by_path["One.md"]["title"] == "One"
         assert by_path["One.md"]["createdAt"] > 0
         assert by_path["One.md"]["syncStatus"] == "synced"
+
+
+@pytest.mark.asyncio
+async def test_display_name_is_the_filename_not_a_frontmatter_title(fixtures) -> None:
+    """A frontmatter ``title`` names a wikilink target, not the note in the rail.
+
+    One note must read the same on every surface -- the rail row, the editor header
+    and a search hit -- because the rail's rename field is seeded from that label
+    and renames the FILE. So display is the filename, while a link written against
+    a frontmatter title still resolves.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        await _clone(client, remote)
+        named = {"path": "Named.md", "content": "---\ntitle: A Different Title\n---\n\nbody\n"}
+        linker = {"path": "Linker.md", "content": "points at [[A Different Title]]\n"}
+        assert (await client.put("/api/note", named))[0] == 200
+        assert (await client.put("/api/note", linker))[0] == 200
+
+        status, body = await client.get("/api/notes")
+        assert status == 200, body
+        assert {n["path"]: n["title"] for n in body["notes"]}["Named.md"] == "Named"
+
+        # A search hit reads the same as the tree row for the same note, which also
+        # means the filename is what the boosted field matches on.
+        status, body = await client.get("/api/search?q=Named")
+        assert status == 200, body
+        assert {r["path"]: r["title"] for r in body["results"]}["Named.md"] == "Named"
+
+        # Resolution is unchanged: the frontmatter title is still a link target.
+        status, body = await client.get("/api/note?path=Named.md")
+        assert status == 200, body
+        assert [b["sourcePath"] for b in body["backlinks"]] == ["Linker.md"]
 
 
 @pytest.mark.asyncio
@@ -1181,9 +1344,7 @@ async def test_path_traversal_is_refused(fixtures) -> None:
         await _clone(client, remote)
         status, _ = await client.get("/api/note?path=../../etc/passwd")
         assert status == 400
-        status, _ = await client.put(
-            "/api/note", {"path": "../escape.md", "content": "nope"}
-        )
+        status, _ = await client.put("/api/note", {"path": "../escape.md", "content": "nope"})
         assert status == 400
 
 
@@ -1264,9 +1425,7 @@ async def test_move_refuses_a_dangling_symlink_destination(fixtures) -> None:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this platform/filesystem")
         assert dangling.is_symlink() and not dangling.exists()
-        status, body = await client.post(
-            "/api/note/move", {"from": "One.md", "to": "dst.md"}
-        )
+        status, body = await client.post("/api/note/move", {"from": "One.md", "to": "dst.md"})
         assert status == 409, body
         assert dangling.is_symlink(), "the dangling symlink must be left untouched"
         assert (root / "One.md").exists(), "the source note must not have moved"
@@ -1288,8 +1447,8 @@ async def test_reads_normalize_crlf_to_lf(fixtures) -> None:
 async def test_reads_a_note_with_an_unquoted_frontmatter_date(fixtures) -> None:
     """An unquoted YAML date in frontmatter must not 500 the read.
 
-    `yaml.safe_load` turns `date: 2026-08-01` into a `datetime.date`, which
-    `json.dumps` rejects — the metadata is now coerced to a string.
+    `yaml.safe_load` turns an unquoted date into a `datetime.date`, which
+    `json.dumps` rejects, so the read coerces the metadata to a string.
     """
     _mod, remote, _seed = fixtures
     async with signed_client(_mod) as client:
@@ -1465,7 +1624,7 @@ async def test_trash_does_not_overwrite_a_same_named_note(fixtures) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_refuses_rather_than_pushing_a_subset(fixtures) -> None:
+async def test_sync_refuses_rather_than_pushing_a_subset(fixtures, monkeypatch) -> None:
     """An explicit Sync must not commit only part of what the user asked for.
 
     `status()` reports a rename as TWO entries — old path deleted, new path added —
@@ -1474,6 +1633,11 @@ async def test_sync_refuses_rather_than_pushing_a_subset(fixtures) -> None:
     while the UI reports success. The autosave keeps the cap (it pushes nothing, and
     the next tick repairs a split), so it must still succeed here.
     """
+    # The production limit is an argv-safety bound, not part of this test's
+    # semantics.  Exercising all 500 paths makes a functional assertion depend
+    # on filesystem throughput under Windows CI load; a small injected limit
+    # still proves refusal and the complete two-batch autosave drain.
+    monkeypatch.setattr(git_ops, "MAX_STAGED_PATHS", 3)
     _mod, remote, _seed = fixtures
     async with signed_client(_mod) as client:
         vault = await _clone(client, remote)
@@ -1536,12 +1700,11 @@ async def test_delete_refreshes_backlinks(fixtures) -> None:
 async def test_sync_works_when_the_vault_already_ignores_the_trash(fixtures) -> None:
     """The Obsidian case: `.trash/` is in the vault's own .gitignore.
 
-    Regression for a real break. Keeping the trash out via an `:(exclude,literal)`
-    pathspec made `git add` treat `.trash` as an EXPLICITLY named ignored path and
-    fail the whole add ("use -f if you really want to add them", exit 1) — so sync
-    died in precisely the vaults most likely to have a trash folder already. No
-    pathspec names the trash now: staging lists only the paths `status()` reported,
-    and `status()` filters it out.
+    An `:(exclude,literal)` pathspec would make `git add` treat `.trash` as an
+    EXPLICITLY named ignored path and fail the whole add ("use -f if you really
+    want to add them", exit 1) in precisely the vaults most likely to have a
+    trash folder already. So staging names no pathspec for the trash: it lists
+    only the paths `status()` reported, and `status()` filters it out.
     """
     _mod, remote, _seed = fixtures
     async with signed_client(_mod) as client:
@@ -1668,9 +1831,7 @@ async def test_move_note(fixtures) -> None:
     _mod, remote, _seed = fixtures
     async with signed_client(_mod) as client:
         vault = await _clone(client, remote)
-        status, body = await client.post(
-            "/api/note/move", {"from": "One.md", "to": "moved/One.md"}
-        )
+        status, body = await client.post("/api/note/move", {"from": "One.md", "to": "moved/One.md"})
         assert status == 200
         assert body["path"] == "moved/One.md"
         # The target folder is created as needed.
@@ -1683,9 +1844,7 @@ async def test_move_refuses_to_overwrite(fixtures) -> None:
     _mod, remote, _seed = fixtures
     async with signed_client(_mod) as client:
         await _clone(client, remote)
-        status, body = await client.post(
-            "/api/note/move", {"from": "One.md", "to": "sub/Two.md"}
-        )
+        status, body = await client.post("/api/note/move", {"from": "One.md", "to": "sub/Two.md"})
         assert status == 409
         assert "already exists" in body["error"]
 
@@ -1788,7 +1947,7 @@ async def test_failed_pat_write_preserves_existing_token(fixtures, monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_failed_clone_preserves_existing_pat(fixtures) -> None:
-    """A clone that fails must not overwrite a previously-stored, valid PAT with
+    """A clone that fails must not overwrite an already-stored, valid PAT with
     the (possibly bad) token submitted alongside the failing request."""
     server_mod, _remote, _seed = fixtures
     async with signed_client(server_mod) as client:
@@ -1891,7 +2050,9 @@ async def test_sync_refuses_extra_push_url(fixtures) -> None:
         # A trusted pushurl plus an attacker pushurl — a --get (first value) check
         # would see only the trusted one and wrongly pass.
         _git("config", "--add", "remote.origin.pushurl", trusted, cwd=Path(root))
-        _git("config", "--add", "remote.origin.pushurl", "https://evil.invalid/x.git", cwd=Path(root))
+        _git(
+            "config", "--add", "remote.origin.pushurl", "https://evil.invalid/x.git", cwd=Path(root)
+        )
         with pytest.raises(git_ops.GitError):
             await git_ops.sync(root, branch=vault.get("branch"), trusted_remote=trusted)
 
@@ -1911,16 +2072,20 @@ async def test_sync_refuses_a_redirected_gitdir(fixtures) -> None:
 
         # A matching git dir syncs fine.
         res = await git_ops.sync(
-            root, branch=vault.get("branch"),
-            trusted_remote=vault["remoteUrl"], trusted_gitdir=gitdir,
+            root,
+            branch=vault.get("branch"),
+            trusted_remote=vault["remoteUrl"],
+            trusted_gitdir=gitdir,
         )
         assert "conflicts" in res
 
-        # A git dir that no longer matches (redirected .git) must refuse.
+        # A git dir that does not match (redirected .git) must refuse.
         with pytest.raises(git_ops.GitError):
             await git_ops.sync(
-                root, branch=vault.get("branch"),
-                trusted_remote=vault["remoteUrl"], trusted_gitdir="/tmp/some-other-gitdir",
+                root,
+                branch=vault.get("branch"),
+                trusted_remote=vault["remoteUrl"],
+                trusted_gitdir="/tmp/some-other-gitdir",
             )
 
 
@@ -1928,9 +2093,7 @@ async def test_sync_refuses_a_redirected_gitdir(fixtures) -> None:
 async def test_knowledge_unknown_vault(fixtures) -> None:
     server_mod, _remote, _seed = fixtures
     async with signed_client(server_mod) as client:
-        status, _ = await client.put(
-            "/api/vaults/knowledge", {"vault": "nope", "knowledge": True}
-        )
+        status, _ = await client.put("/api/vaults/knowledge", {"vault": "nope", "knowledge": True})
         assert status == 404
 
 
@@ -2001,7 +2164,7 @@ async def test_sync_reports_conflict_without_overwriting(fixtures) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Regression: GPT 5.6 review on PR #970
+# Subfolder path traversal must not escape the vault
 # ---------------------------------------------------------------------------
 
 
@@ -2054,7 +2217,13 @@ async def test_rejected_push_is_reported_not_swallowed(fixtures) -> None:
         vault = await _clone(client, remote)
 
         # Repoint origin at somewhere that cannot accept a push.
-        _git("remote", "set-url", "origin", str(remote.parent / "gone.git"), cwd=Path(vault["localPath"]))
+        _git(
+            "remote",
+            "set-url",
+            "origin",
+            str(remote.parent / "gone.git"),
+            cwd=Path(vault["localPath"]),
+        )
 
         status, body = await client.post(f"/api/sync?vault={vault['id']}", {})
         assert status >= 400, body
@@ -2072,7 +2241,9 @@ async def test_rejected_push_is_reported_not_swallowed(fixtures) -> None:
         "\\\\server\\share\\note.md",
     ],
 )
-def test_safe_join_rejects_escapes_before_touching_the_filesystem(fixtures, tmp_path: Path, rel: str) -> None:
+def test_safe_join_rejects_escapes_before_touching_the_filesystem(
+    fixtures, tmp_path: Path, rel: str
+) -> None:
     """Escapes are refused on the components, so no FS call sees the raw value.
 
     Windows-shaped inputs are included because a backslash is an ordinary
@@ -2148,7 +2319,9 @@ def test_ref_validation_rejects_option_shaped_branches(ref: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_skips_files_the_sensitive_path_gate_rejects(fixtures, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_index_skips_files_the_sensitive_path_gate_rejects(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A note the central gate refuses must not reach the search index.
 
     The vault walk lists files itself, so it never passes through `safe_join`.
@@ -2176,7 +2349,9 @@ async def test_index_skips_files_the_sensitive_path_gate_rejects(fixtures, monke
 
         monkeypatch.setattr(server_mod.hooks, "safe_read_file_bytes", gated)
 
-        status, body = await client.get(f"/api/search?q=borrowed-credential-body&vault={vault['id']}")
+        status, body = await client.get(
+            f"/api/search?q=borrowed-credential-body&vault={vault['id']}"
+        )
         assert status == 200, body
         assert secret_rel not in [hit["path"] for hit in body["results"]]
 
@@ -2249,6 +2424,11 @@ def test_notebook_pat_is_behind_the_sensitive_path_floor() -> None:
     # vault at an unrelated repo, so it is behind the floor under both prefixes.
     assert is_sensitive_path("~/.kiro/crew/workspace/md-notebook/vaults.json") is True
     assert is_sensitive_path("~/.kirocrew/workspace/md-notebook/vaults.json") is True
+    # settings.json carries `autoSync`, the bit that authorizes the background
+    # loop's unattended push — an agent that could write it would flip pushing on
+    # without the operator, so it is behind the floor under both prefixes too.
+    assert is_sensitive_path("~/.kiro/crew/workspace/md-notebook/settings.json") is True
+    assert is_sensitive_path("~/.kirocrew/workspace/md-notebook/settings.json") is True
     # Notes themselves must stay readable — the floor covers the token, not the vault.
     assert is_sensitive_path("~/.kiro/crew/workspace/md-notebook/vaults/v1/note.md") is False
 
@@ -2325,6 +2505,100 @@ async def test_probe_detects_a_checkout_filter_driver(fixtures) -> None:
 
 
 @pytest.mark.asyncio
+async def test_probe_allows_worktree_extension_without_config_file(fixtures) -> None:
+    """`extensions.worktreeConfig=true` with no `config.worktree` on disk is a
+    healthy EMPTY scope (git creates the file lazily). Probing it anyway exits
+    128 with a non-empty stderr, which reads as "unprobeable config" for a
+    filter-free vault."""
+    server_mod, remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        _git("config", "--local", "extensions.worktreeConfig", "true", cwd=root)
+        assert not (root / ".git" / "config.worktree").exists()
+        assert await git_ops.repo_supplied_driver(str(root)) == ""
+
+
+@pytest.mark.asyncio
+async def test_probe_still_refuses_worktree_scoped_driver(fixtures) -> None:
+    """The gate narrows WHEN the `--worktree` scope is probed, never what a
+    probed scope may declare: writing a worktree-scoped key creates the file,
+    and a driver in it must still refuse."""
+    server_mod, remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        _git("config", "--local", "extensions.worktreeConfig", "true", cwd=root)
+        _git("config", "--worktree", "filter.evil.smudge", "sh -c ':'", cwd=root)
+        assert "filter.evil.smudge" in await git_ops.repo_supplied_driver(str(root))
+
+
+@pytest.mark.asyncio
+async def test_probe_refuses_worktree_driver_under_valueless_extension(
+    fixtures,
+) -> None:
+    """git treats a valueless `[extensions] worktreeConfig` as TRUE and honors
+    `config.worktree` under it, but a raw `--get` returns an EMPTY string for
+    that form — a literal `== "true"` compare reads the extension as off and
+    never probes the scope a driver hides in. `--bool` folds every git-true
+    spelling to `true`."""
+    server_mod, remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        with open(root / ".git" / "config", "a") as fh:
+            fh.write("[extensions]\n\tworktreeConfig\n")
+        _git("config", "--worktree", "filter.evil.smudge", "sh -c ':'", cwd=root)
+        assert "filter.evil.smudge" in await git_ops.repo_supplied_driver(str(root))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.name == "nt" or sys.platform == "darwin",
+    reason="non-UTF-8 bytes are not legal NTFS or APFS/HFS+ name units",
+)
+async def test_run_git_surrogateescape_round_trips_a_non_utf8_path(tmp_path) -> None:
+    """`errors="surrogateescape"` is the decode the gitdir probe passes: a
+    path byte that is not valid UTF-8 must survive as a PEP 383 surrogate the
+    `os` layer restores byte-exactly, or the empty-scope classifier's lstat
+    inspects a U+FFFD path that names nothing and an EXISTING
+    `config.worktree` reads as the empty scope (see
+    kiro_crew.git_worktree_scope)."""
+    repo = tmp_path / os.fsdecode(b"v-\xff")
+    repo.mkdir()
+    _git("init", "-q", "--template=", ".", cwd=repo)
+    code, out, _ = await git_ops.run_git(
+        ["rev-parse", "--absolute-git-dir"],
+        str(repo),
+        check=False,
+        errors="surrogateescape",
+    )
+    assert code == 0
+    gitdir = out[:-1] if out.endswith("\n") else out
+    assert "\udcff" in gitdir, "the non-UTF-8 byte was rewritten by the decode"
+    assert os.path.isdir(gitdir)
+
+
+@pytest.mark.asyncio
+async def test_git_dir_probe_requests_byte_faithful_decoding(monkeypatch, tmp_path) -> None:
+    """The canonical-gitdir probe decodes with ``errors="surrogateescape"``: its
+    answer is fed to ``os.path.realpath`` and compared against the persisted
+    trusted git dir, so a non-UTF-8 path byte has to round-trip through
+    ``os.fsencode`` instead of collapsing to a U+FFFD that names no real path."""
+    seen: dict[str, Any] = {}
+
+    async def fake_run_git(args, cwd=None, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return 0, f"{tmp_path}\n", ""
+
+    monkeypatch.setattr(git_ops, "run_git", fake_run_git)
+    assert await git_ops._git_dir(str(tmp_path)) == os.path.realpath(tmp_path)
+    assert seen["args"] == ["rev-parse", "--absolute-git-dir"]
+    assert seen["kwargs"]["errors"] == "surrogateescape"
+
+
+@pytest.mark.asyncio
 async def test_probe_rejects_url_pushinsteadof_rewrite(fixtures) -> None:
     """`url.<attacker>.pushInsteadOf` rewrites the effective push URL at git's
     transport layer, so the trusted-remote check (which reads remote.origin.url)
@@ -2334,8 +2608,10 @@ async def test_probe_rejects_url_pushinsteadof_rewrite(fixtures) -> None:
         vault = await _clone(client, remote)
         root = Path(vault["localPath"])
         _git(
-            "config", "--local",
-            "url.https://evil.invalid/.pushInsteadOf", "https://github.com/",
+            "config",
+            "--local",
+            "url.https://evil.invalid/.pushInsteadOf",
+            "https://github.com/",
             cwd=root,
         )
         refused = await git_ops.repo_supplied_driver(str(root))
@@ -2359,11 +2635,14 @@ async def test_probe_rejects_core_worktree_redirect(fixtures) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key,value", [
-    ("http.proxy", "http://attacker:8080"),
-    ("http.sslVerify", "false"),
-    ("http.sslCAInfo", "/tmp/evil-ca.pem"),
-])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("http.proxy", "http://attacker:8080"),
+        ("http.sslVerify", "false"),
+        ("http.sslCAInfo", "/tmp/evil-ca.pem"),
+    ],
+)
 async def test_probe_rejects_repo_http_credential_leak_config(fixtures, key, value) -> None:
     """A vault-local http proxy / TLS override could route or expose the
     PAT-bearing sync request to an attacker; the probe must refuse it."""
@@ -2629,3 +2908,1493 @@ async def test_a_failed_save_leaves_the_previous_note_intact(fixtures) -> None:
 
         assert note.read_text("utf-8") == original
         assert not (root / "keep.md.tmp").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_contended_rename_does_not_lose_the_save(fixtures) -> None:
+    """A vault is a directory other processes hold open; a save must survive it.
+
+    On Windows ``os.replace`` raises ``PermissionError`` while ANY other handle is
+    open on either path. For a note that is expected rather than exotic: these are
+    Obsidian vaults, so the user's editor is often holding the file, and Windows
+    Search and AV both touch a freshly written one. A bare rename turns that
+    transient into a failed save -- the user loses what they just typed.
+
+    The other half of the contract is pinned by the test below: when the
+    contention coincides with a real external edit, the retry must yield to it
+    instead of publishing. Here nothing else changed the file, so the save is
+    simply completed.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        _, read = await client.get("/api/note?path=One.md")
+        target = Path(vault["localPath"]) / "One.md"
+
+        attempts: list[int] = []
+        real_replace = os.replace
+
+        def contended_once(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+            attempts.append(1)
+            if len(attempts) == 1:
+                # WinError 32, the sharing violation this retry exists for --
+                # and no external edit, so the file is unchanged between attempts.
+                raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            # The retry is Windows-only and backs off; select that branch on every
+            # platform and zero the wait so it costs no wall clock.
+            mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(_mod, "_SAVE_BACKOFF_SECONDS", 0.0)
+            mp.setattr(_mod.os, "replace", contended_once)
+            status, body = await client.put(
+                "/api/note",
+                {"path": "One.md", "content": "mine", "baseMtime": read["mtime"]},
+            )
+
+        assert status == 200, f"a transient sharing violation lost the save: {body}"
+        assert target.read_text(encoding="utf-8") == "mine"
+        assert len(attempts) == 2, f"expected one retry, saw {len(attempts)} attempt(s)"
+        assert not list(target.parent.glob("One.md.*.tmp")), "a temp file was left behind"
+
+
+@pytest.mark.asyncio
+async def test_a_contended_save_leaves_no_temp_behind(fixtures) -> None:
+    """A successful save must not leave a generated temp in the vault.
+
+    The cleanup after a refused rename is best-effort: if the same handle that
+    blocked the rename also blocks the unlink, the temp survives. Staging a FRESH
+    temp per attempt then meant a contended save could answer 200 with an orphan
+    ``One.md.<uuid>.tmp`` still sitting in the vault -- and nothing would tell the
+    user to look, because the save reported success.
+
+    That orphan is not inert. A user-initiated Sync stages every change
+    ``status()`` reports; only the unattended autosave is narrowed to ``.md``. So
+    the generated temp reaches a commit, and a push puts it on the remote.
+
+    One temp per save transaction removes the failure mode rather than cleaning
+    up after it: the same staged file is republished by each attempt, so success
+    consumes it.
+    """
+    _mod, remote, _seed = fixtures
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        target = root / "One.md"
+        _, read = await client.get("/api/note?path=One.md")
+
+        renames: list[str] = []
+        real_replace = os.replace
+        real_unlink = os.unlink
+
+        def contended_once(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+            renames.append(str(src))
+            if len(renames) == 1:
+                raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        def unlink_refused(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # The handle that blocked the rename blocks the cleanup too, which is
+            # the whole reason an orphan can survive.
+            if str(path).endswith(".tmp"):
+                raise PermissionError(32, "The process cannot access the file")
+            return real_unlink(path, *args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(_mod, "_SAVE_BACKOFF_SECONDS", 0.0)
+            mp.setattr(_mod.os, "replace", contended_once)
+            mp.setattr(_mod.os, "unlink", unlink_refused)
+            status, body = await client.put(
+                "/api/note",
+                {"path": "One.md", "content": "mine", "baseMtime": read["mtime"]},
+            )
+
+        assert status == 200, f"the contended save did not succeed: {body}"
+        assert target.read_text(encoding="utf-8") == "mine"
+
+        leftovers = sorted(p.name for p in root.glob("One.md.*.tmp"))
+        assert not leftovers, (
+            "a save answered 200 while leaving generated temp(s) in the vault, "
+            f"which a user Sync would commit: {leftovers}"
+        )
+        # The retry republished the SAME staged file rather than staging another.
+        assert len(set(renames)) == 1, f"each attempt staged its own temp: {sorted(set(renames))}"
+
+
+@pytest.mark.asyncio
+async def test_a_sync_during_the_retry_window_never_commits_the_staged_temp(
+    fixtures,
+) -> None:
+    """A Sync running while a save is between attempts must not commit its temp.
+
+    The save stages content into a sibling temp and renames it over the note. The
+    temp is a real untracked file in the user's vault for the whole of that gap,
+    and a contended rename stretches the gap across the entire retry budget. A
+    user-initiated Sync stages every change ``status()`` reports -- only the
+    unattended autosave is narrowed to ``.md`` -- so in that window a second tab
+    hitting Sync commits a half-published implementation detail and the push puts
+    it on the remote.
+
+    Shortening the window cannot fix this: it is never zero, and the cleanup
+    unlink is best-effort precisely because the handle that refused the rename
+    commonly refuses it too. ``git_ops.status`` therefore recognises the shape
+    ``staged_temp_name`` produces and refuses to report it as an addition.
+
+    Deterministic, never raced: the Sync runs INSIDE the parked backoff, so it is
+    guaranteed to land between attempt 1 and attempt 2, and the vault carries a
+    genuine non-note change so a Sync that silently did nothing cannot pass.
+    """
+    _mod, remote, _seed = fixtures
+    real_asyncio = asyncio
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        target = root / "One.md"
+        before = target.read_text(encoding="utf-8")
+        _, read = await client.get("/api/note?path=One.md")
+
+        # A real user change the whole-scope Sync MUST commit. Without it a Sync
+        # that no-opped would satisfy every assertion below.
+        (root / "attachment.png").write_bytes(bytes([0x89]) + b"PNG")
+
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+        parkings: list[int] = []
+        attempts: list[str] = []
+        real_replace = os.replace
+
+        def contended_once(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # Scoped to THIS note's publish. `os` is a shared module object, so
+            # the patch is global: the Sync driven from inside the retry gap runs
+            # git and rebuilds the cache, and those renames must neither absorb
+            # the injected failure nor be counted as attempts.
+            if str(dst).endswith("One.md"):
+                attempts.append(str(src))
+                if len(attempts) == 1:
+                    raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        class _GatedAsyncio:
+            """The real asyncio with the FIRST backoff parked on an event.
+
+            Only the first: the Sync driven from inside that gap runs through the
+            same module reference, and parking its waits too would deadlock the
+            test rather than test anything.
+            """
+
+            async def sleep(self, delay, *args, **kwargs):  # type: ignore[no-untyped-def]
+                parkings.append(1)
+                if len(parkings) == 1:
+                    parked.set()
+                    await resume.wait()
+                    return
+                await real_asyncio.sleep(delay, *args, **kwargs)
+
+            def __getattr__(self, name):  # type: ignore[no-untyped-def]
+                return getattr(real_asyncio, name)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(_mod.os, "replace", contended_once)
+            mp.setattr(_mod, "asyncio", _GatedAsyncio())
+
+            save = real_asyncio.create_task(
+                client.put(
+                    "/api/note",
+                    {"path": "One.md", "content": "mine", "baseMtime": read["mtime"]},
+                )
+            )
+            await real_asyncio.wait_for(parked.wait(), timeout=5)
+
+            # The exposure is real and present RIGHT NOW: the temp is on disk and
+            # git reports it as untracked. Asserting it keeps the rest of this
+            # test from passing because nothing was ever staged.
+            staged = [q.name for q in root.glob("One.md.*.tmp")]
+            assert len(staged) == 1, f"expected one staged temp, saw {staged}"
+            porcelain = _git("status", "--porcelain", "--untracked-files=all", cwd=root)
+            assert (
+                staged[0] in porcelain
+            ), f"git cannot see the temp, so this proves nothing: {porcelain!r}"
+
+            # A second tab hits Sync while the first save backs off.
+            sync_status, sync_body = await client.post("/api/sync")
+            assert sync_status == 200, sync_body
+            committed = [c["path"] for c in sync_body["result"]["committed"]]
+
+            resume.set()
+            save_status, save_body = await real_asyncio.wait_for(save, timeout=5)
+
+    assert committed == [
+        "attachment.png"
+    ], f"a Sync inside the retry backoff staged a generated temp: {committed}"
+    assert staged[0] not in _git("ls-files", cwd=root), "the temp entered local history"
+    assert staged[0] not in _git(
+        "ls-tree", "-r", "--name-only", "HEAD", cwd=Path(remote)
+    ), "the temp was pushed to the remote"
+
+    # The Sync committed against the note as it stood BEFORE the retry finished,
+    # and the save still lands afterwards: the filter costs the save nothing.
+    assert _git("show", "HEAD:One.md", cwd=root) == before.rstrip()
+    assert save_status == 200, f"the contended save was lost: {save_body}"
+    assert target.read_text(encoding="utf-8") == "mine"
+    assert len(attempts) == 2, f"expected one retry, saw {len(attempts)} attempt(s)"
+    # Both attempts republished the one staged temp the Sync just declined to see.
+    assert set(attempts) == {str(root / staged[0])}, f"the temp changed: {attempts}"
+    assert not list(root.glob("One.md.*.tmp")), "a temp survived a successful save"
+
+
+@pytest.mark.asyncio
+async def test_a_sync_while_the_temp_is_still_staging_never_commits_it(
+    fixtures,
+) -> None:
+    """Registration must precede the worker thread creating the temp.
+
+    The retry-window test above begins only after staging returns. A large note
+    exposes an earlier window: ``open`` creates the untracked temp, then the
+    worker can spend arbitrarily long writing and fsyncing it before returning
+    to the coroutine that registers it. A Sync in that interval could
+    commit a partial implementation detail.
+
+    Deterministic: the staging worker writes the real temp and parks BEFORE it
+    returns. Sync runs while the file is definitely present and the save caller
+    is definitely still awaiting staging.
+    """
+    _mod, remote, _seed = fixtures
+    real_asyncio = asyncio
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        root = Path(vault["localPath"])
+        target = root / "One.md"
+        _, read = await client.get("/api/note?path=One.md")
+
+        # Prove this is a real whole-scope Sync, not a no-op that happens to
+        # report no generated temp.
+        (root / "attachment.png").write_bytes(bytes([0x89]) + b"PNG")
+
+        temp_written = threading.Event()
+        release_stage = threading.Event()
+        staged: list[Path] = []
+        real_stage = _mod._stage_note_text_sync
+
+        def parked_stage(tmp, content):  # type: ignore[no-untyped-def]
+            real_stage(tmp, content)
+            staged_path = Path(tmp)
+            # Sync records lastSync through the same generic atomic writer.
+            # Park only this note; delaying settings.json would deadlock the
+            # request that is meant to inspect the note temp.
+            if staged_path.parent == root and staged_path.name.startswith("One.md."):
+                staged.append(staged_path)
+                temp_written.set()
+                # Not a synchronisation point -- `release_stage.set()` always
+                # runs in the `finally` below regardless of how long the Sync
+                # or the save's own retries take. This wait is a fail-safe
+                # against a genuine deadlock, not a race the test should ever
+                # actually run out on, so its budget is generous rather than
+                # tight: a loaded CI host's shared `to_thread` executor can
+                # make the Sync's own worker-thread git calls queue behind
+                # this parked slot, stretching how long `finally` takes to
+                # reach `release_stage.set()` well past a tight budget (flake
+                # class 2, see testing-conventions.md).
+                if not release_stage.wait(timeout=120):
+                    raise AssertionError("test never released the staging worker")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod, "_stage_note_text_sync", parked_stage)
+            save = real_asyncio.create_task(
+                client.put(
+                    "/api/note",
+                    {"path": "One.md", "content": "mine", "baseMtime": read["mtime"]},
+                )
+            )
+
+            save_status = 0
+            save_body: dict[str, Any] = {}
+            try:
+                assert await real_asyncio.to_thread(
+                    temp_written.wait, 10
+                ), "the save never created its staged temp"
+                assert len(staged) == 1 and staged[0].is_file(), staged
+                porcelain = _git("status", "--porcelain", "--untracked-files=all", cwd=root)
+                assert staged[0].name in porcelain, (
+                    "git cannot see the staged temp, so this proves nothing: " f"{porcelain!r}"
+                )
+
+                sync_status, sync_body = await client.post("/api/sync")
+                assert sync_status == 200, sync_body
+                committed = [c["path"] for c in sync_body["result"]["committed"]]
+            finally:
+                release_stage.set()
+                save_status, save_body = await real_asyncio.wait_for(save, timeout=10)
+
+    assert committed == [
+        "attachment.png"
+    ], f"a Sync while staging committed a generated temp: {committed}"
+    assert staged[0].name not in _git(
+        "ls-files", cwd=root
+    ), "the staging temp entered local history"
+    assert staged[0].name not in _git(
+        "ls-tree", "-r", "--name-only", "HEAD", cwd=Path(remote)
+    ), "the staging temp was pushed to the remote"
+    assert save_status == 200, f"the parked save failed: {save_body}"
+    assert target.read_text(encoding="utf-8") == "mine"
+    assert not staged[0].exists(), "the temp survived its successful publish"
+
+
+@pytest.mark.asyncio
+async def test_an_external_edit_during_the_retry_window_still_wins(fixtures) -> None:
+    """Retrying a contended save must not defeat the stale-write guard.
+
+    The save is an optimistic check-and-write: the client sends the mtime it
+    read, the server re-stats under the lock, and an external edit since that read is a
+    409 ESTALE rather than a silent overwrite.
+
+    Retrying only the RENAME would stretch the gap between that check and the
+    publish across the whole backoff, so an external edit completing inside the
+    gap would be overwritten by the next attempt — the guard defeated by the very
+    mechanism meant to make saves reliable. The retry therefore re-runs the
+    freshness check before each attempt.
+
+    Ordering is forced, not raced: the external write happens INSIDE the injected
+    rename failure, so it is guaranteed to land after attempt 1 and before
+    attempt 2's re-check.
+    """
+    _mod, remote, _seed = fixtures
+    external = "# One\n\nchanged by another program\n"
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        _, read = await client.get("/api/note?path=One.md")
+        target = Path(vault["localPath"]) / "One.md"
+
+        attempts: list[int] = []
+        real_replace = os.replace
+
+        def contended_then_external(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+            attempts.append(1)
+            if len(attempts) == 1:
+                # Another program finishes its write while we are between
+                # attempts. Its mtime is pinned forward rather than slept for:
+                # two writes can share one filesystem tick, which would make the
+                # guard's comparison a coin flip instead of the thing under test.
+                target.write_text(external, encoding="utf-8")
+                future = target.stat().st_mtime + 5
+                os.utime(target, (future, future))
+                raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        from kiro_crew import atomic_write as aw
+
+        with pytest.MonkeyPatch.context() as mp:
+            # Both backoff knobs are zeroed, both with raising=False, so this test
+            # asserts the CONTRACT rather than where the retry happens to live.
+            # That is what makes it a valid negative control: against a build that
+            # retries inside the rename it still runs, and fails because the
+            # external edit was published over -- not because a constant was
+            # missing from the module.
+            mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(aw.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(_mod, "_SAVE_BACKOFF_SECONDS", 0.0, raising=False)
+            mp.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0.0, raising=False)
+            mp.setattr(_mod.os, "replace", contended_then_external)
+            status, body = await client.put(
+                "/api/note",
+                {"path": "One.md", "content": "mine", "baseMtime": read["mtime"]},
+            )
+
+        assert status == 409, f"the external edit was not detected: {status} {body}"
+        assert body["code"] == "ESTALE"
+        assert (
+            target.read_text(encoding="utf-8") == external
+        ), "the retry published over an edit made during its own backoff"
+        assert "mine" not in target.read_text(encoding="utf-8")
+        # The second attempt must never have REACHED the rename: a re-check that
+        # runs first turns it into the conflict above. A build that retries the
+        # rename alone shows 2 here and has already overwritten the file.
+        assert (
+            len(attempts) == 1
+        ), f"a second publish attempt ran without revalidating: {len(attempts)} attempts"
+
+
+@pytest.mark.asyncio
+async def test_a_retrying_save_without_basemtime_cannot_overwrite_a_later_one(
+    fixtures,
+) -> None:
+    """A contended save must not resurrect itself over a save that already won.
+
+    ``baseMtime`` is optional (``saveNote(..., baseMtime?: number)``) and
+    ``_assert_note_is_fresh`` is a no-op without it, so for an unguarded save a
+    writer arriving during the retry backoff is invisible to every later attempt.
+    Releasing the per-note lock across that backoff therefore let an earlier
+    contended save republish over a later one that had already been acknowledged
+    with 200 -- rename order ``['A', 'B', 'A']``, final content ``A``.
+
+    Without a token there is nothing to detect the interleave with, so ordering
+    is preserved instead: the lock is held across the backoff, which is exactly
+    the serialization the un-retried code had.
+
+    Ordering is forced with events and a structural assertion on the lock, never
+    slept for.
+    """
+    _mod, remote, _seed = fixtures
+    real_asyncio = asyncio
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        target = Path(vault["localPath"]) / "One.md"
+
+        a_parked = asyncio.Event()
+        release_a = asyncio.Event()
+        renames: list[str] = []
+        real_replace = os.replace
+
+        def one_contention(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+            body = ""
+            try:
+                body = Path(src).read_text(encoding="utf-8")
+            except OSError:
+                pass
+            renames.append(body)
+            if len(renames) == 1:
+                raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        class _GatedAsyncio:
+            """The real asyncio with the retry backoff parked on an event.
+
+            Rebinding the module reference the server holds keeps the
+            substitution to this one call site; every other attribute
+            (``to_thread``, ``Lock``) proxies through untouched.
+            """
+
+            async def sleep(self, _delay, *args, **kwargs):  # type: ignore[no-untyped-def]
+                # Park only the FIRST backoff -- A's -- which is what pins the
+                # ordering. Later backoffs delegate to a real short wait: after A
+                # returns, api_note_save re-reads every note in the vault to
+                # recompute backlinks, OUTSIDE the per-note lock, so B's rename
+                # can hit a genuine Windows sharing violation there. Production
+                # absorbs that with the backoff; collapsing it to zero would burn
+                # B's whole budget inside A's read window and make this test fail
+                # on an artifact of its own instrumentation.
+                if not release_a.is_set():
+                    a_parked.set()
+                    await release_a.wait()
+                    return
+                await real_asyncio.sleep(0.01)
+
+            def __getattr__(self, name):  # type: ignore[no-untyped-def]
+                return getattr(real_asyncio, name)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+            mp.setattr(_mod.os, "replace", one_contention)
+            mp.setattr(_mod, "asyncio", _GatedAsyncio())
+
+            task_a = real_asyncio.create_task(
+                client.put("/api/note", {"path": "One.md", "content": "A"})
+            )
+            await real_asyncio.wait_for(a_parked.wait(), timeout=5)
+
+            # A is mid-retry with no freshness token. The note's lock must still
+            # be held, so a second save cannot slip in behind it.
+            assert _mod._save_lock(
+                str(target)
+            ).locked(), "the per-note lock was released during an unguarded retry"
+
+            task_b = real_asyncio.create_task(
+                client.put("/api/note", {"path": "One.md", "content": "B"})
+            )
+            # Yield generously rather than sleeping: if B could interleave it
+            # would have completed by now.
+            for _ in range(100):
+                await real_asyncio.sleep(0)
+            assert not task_b.done(), "a later save interleaved into the retry gap"
+
+            release_a.set()
+            status_a, body_a = await real_asyncio.wait_for(task_a, timeout=5)
+            status_b, body_b = await real_asyncio.wait_for(task_b, timeout=5)
+
+        assert status_a == 200, f"the earlier save failed: {body_a}"
+        assert status_b == 200, f"the later save failed: {body_b} renames={renames}"
+        # The invariant is ordering, not a retry count: every A attempt precedes
+        # every B attempt, so the earlier save can never republish after the later
+        # one. An exact count would encode how many times B happened to retry,
+        # which depends on a real collision with A post-save vault read.
+        assert renames == sorted(
+            renames, key=lambda body: body != "A"
+        ), f"an A attempt ran after a B attempt: {renames}"
+        assert "A" in renames and "B" in renames, f"both saves must publish: {renames}"
+        assert (
+            target.read_text(encoding="utf-8") == "B"
+        ), "an earlier contended save resurrected itself over a later one"
+
+
+@pytest.mark.asyncio
+async def test_a_tokenless_save_stages_inside_the_note_lock(fixtures) -> None:
+    """Staging is the slow half of the transaction, so it must be serialized too.
+
+    Without a ``baseMtime`` nothing can DETECT an interleaved writer, so order
+    is the only guarantee left -- and order has to cover stage-and-publish, not
+    just publish. Staging writes the entire note, so it is exactly where a large
+    save is slow: with staging outside the lock, a later save could take the
+    lock, publish and answer 200 while the earlier one was still writing its
+    temp, and the earlier one then published over it. Both answered 200 and the
+    later edit was gone.
+
+    No contention is injected here: this is not about a refused rename. The
+    parking point is staging itself, and the assertion is structural -- the
+    note's lock is held while A stages, so B cannot start.
+    """
+    _mod, remote, _seed = fixtures
+    real_asyncio = asyncio
+
+    async with signed_client(_mod) as client:
+        vault = await _clone(client, remote)
+        target = Path(vault["localPath"]) / "One.md"
+
+        a_staging = threading.Event()
+        release_a = threading.Event()
+        staged: list[str] = []
+        real_stage = _mod._stage_note_text_sync
+
+        def parked_stage(tmp, content):  # type: ignore[no-untyped-def]
+            # Runs on a worker thread (`asyncio.to_thread`), so the gate is a
+            # threading.Event, not an asyncio one.
+            staged.append(content)
+            if len(staged) == 1:
+                a_staging.set()
+                release_a.wait(timeout=10)
+            return real_stage(tmp, content)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_mod, "_stage_note_text_sync", parked_stage)
+
+            task_a = real_asyncio.create_task(
+                client.put("/api/note", {"path": "One.md", "content": "A"})
+            )
+            assert await real_asyncio.to_thread(
+                a_staging.wait, 10
+            ), "the first save never reached staging"
+
+            # The structural claim: A is only STAGING, has published nothing, and
+            # already holds the note's lock.
+            assert _mod._save_lock(
+                str(target)
+            ).locked(), "a tokenless save staged its temp outside the per-note lock"
+
+            task_b = real_asyncio.create_task(
+                client.put("/api/note", {"path": "One.md", "content": "B"})
+            )
+            # Yield generously rather than sleeping: were the lock free, B would
+            # have staged and published by now.
+            for _ in range(100):
+                await real_asyncio.sleep(0)
+            assert staged == [
+                "A"
+            ], f"a later save staged while the earlier one held the lock: {staged}"
+            assert not task_b.done(), "a later save completed while the earlier one was staging"
+
+            release_a.set()
+            status_a, body_a = await real_asyncio.wait_for(task_a, timeout=10)
+            status_b, body_b = await real_asyncio.wait_for(task_b, timeout=10)
+
+    assert status_a == 200, f"the earlier save failed: {body_a}"
+    assert status_b == 200, f"the later save failed: {body_b}"
+    assert staged == ["A", "B"], f"staging order was not preserved: {staged}"
+    assert (
+        target.read_text(encoding="utf-8") == "B"
+    ), "the earlier save published over the later one"
+
+
+@pytest.mark.asyncio
+async def test_the_vault_registry_write_also_retries(fixtures) -> None:
+    """The registry is re-read by every later request, so it has the same window."""
+    from kiro_crew import atomic_write as aw
+
+    server_mod, _remote, _seed = fixtures
+
+    attempts: list[int] = []
+    real_replace = os.replace
+
+    def contended_once(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(aw.platform_compat, "IS_WINDOWS", True)
+        mp.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0.0)
+        mp.setattr(aw.os, "replace", contended_once)
+        await asyncio.to_thread(server_mod._write_vaults_sync, [{"id": "v1"}])
+
+    assert json.loads(server_mod._vaults_json().read_text("utf-8")) == [{"id": "v1"}]
+    assert len(attempts) == 2, f"expected one retry, saw {len(attempts)} attempt(s)"
+
+
+# ---------------------------------------------------------------------------
+# Settings store and the server-side auto-sync loop
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_settings(server_mod, content: str) -> None:
+    """Drop a literal ``settings.json`` in place, as a hand or agent edit would."""
+    path = server_mod._settings_json()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _default_settings_body(server_mod) -> dict[str, Any]:
+    return {
+        "autoSync": False,
+        "autoSyncMins": server_mod.DEFAULT_AUTO_SYNC_MINS,
+        "lastSync": {},
+    }
+
+
+async def _wait_for(predicate: Callable[[], Any], message: str, budget: float = 5.0) -> None:
+    """Poll *predicate* until it is truthy, failing loudly if it never is.
+
+    A deadline poll rather than a fixed sleep: a loaded runner starves the loop's
+    task, and a fixed sleep would trade the assertion for a flake.
+    """
+    give_up_at = time.monotonic() + budget
+    while not predicate():
+        assert time.monotonic() < give_up_at, message
+        await asyncio.sleep(0.01)
+
+
+async def _noop_rebuild(vault: dict[str, Any]) -> dict[str, Any]:
+    return {}
+
+
+async def _no_auth() -> Optional[str]:
+    """Stand in for ``resolve_auth`` so no test mints a token from the real gh."""
+    return None
+
+
+def _clean_result() -> dict[str, Any]:
+    return {"pushed": True, "pulled": True, "committed": [], "conflicts": []}
+
+
+@pytest.fixture
+def loop_syncer(monkeypatch: pytest.MonkeyPatch):
+    """The syncer module with a fast tick and a compressed minute.
+
+    Only the two SCALES are patched, never the schedule arithmetic under test:
+    ``TICK_SEC`` is how often settings are re-read, ``SECONDS_PER_MINUTE`` is the
+    unit the stored interval is expressed in. Compressing both keeps the real
+    ratio between the shortest selectable interval (1 minute) and the longest
+    (1440) intact, so the interval assertions below hold with a wide margin
+    instead of depending on the scheduler's cooperation.
+    """
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    monkeypatch.setattr(syncer_mod, "TICK_SEC", 0.005)
+    monkeypatch.setattr(syncer_mod, "SECONDS_PER_MINUTE", 0.005)
+    return syncer_mod
+
+
+@asynccontextmanager
+async def running_syncer(syncer_mod) -> AsyncIterator[None]:
+    """Arm the loop and guarantee it is cancelled, even when the test fails.
+
+    A loop left running leaks a task into the next test's event loop, which
+    surfaces as some unrelated test failing rather than this one.
+    """
+    await syncer_mod.start_syncer(web.Application())
+    try:
+        yield
+    finally:
+        await syncer_mod.stop_syncer(web.Application())
+
+
+@pytest.mark.asyncio
+async def test_settings_default_when_the_file_is_absent(fixtures) -> None:
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.get("/api/settings")
+        assert status == 200, body
+        assert body["settings"] == _default_settings_body(server_mod)
+        # autoSync defaults OFF, and that default is the authorization boundary:
+        # enabling it is what lets the backend push to a remote unattended.
+        assert body["settings"]["autoSync"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sent,expected",
+    [(0, 1), (-30, 1), (1, 1), (10, 10), (1440, 1440), (99999, 1440)],
+)
+async def test_settings_put_clamps_the_interval(fixtures, sent: int, expected: int) -> None:
+    """Out-of-range minutes are clamped, and 0 is the one that matters: an
+    unclamped 0 would make the scheduler a busy loop pushing continuously."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put("/api/settings", {"autoSyncMins": sent})
+        assert status == 200, body
+        assert body["settings"]["autoSyncMins"] == expected
+        # The clamped value is what was PERSISTED, not just what was echoed.
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["autoSyncMins"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sent", ["soon", "10", None, True, 10.5, [], {}])
+async def test_settings_put_rejects_a_non_integer_interval(fixtures, sent: Any) -> None:
+    """A value that is not a whole number of minutes carries no interval to
+    clamp, so it is refused rather than silently replaced with a default."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put("/api/settings", {"autoSyncMins": sent})
+        assert status == 400, body
+        assert body["code"] == "invalid_auto_sync_mins"
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["autoSyncMins"] == server_mod.DEFAULT_AUTO_SYNC_MINS
+
+
+@pytest.mark.asyncio
+async def test_settings_put_rejects_a_non_boolean_auto_sync(fixtures) -> None:
+    """A truthy string must not enable unattended pushing."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put("/api/settings", {"autoSync": "yes"})
+        assert status == 400, body
+        assert body["code"] == "invalid_auto_sync"
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["autoSync"] is False
+
+
+@pytest.mark.asyncio
+async def test_settings_put_drops_unknown_keys(fixtures) -> None:
+    """A stale or hostile client must not be able to grow the file."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put(
+            "/api/settings", {"autoSync": True, "pushAnywhere": True, "vaults": []}
+        )
+        assert status == 200, body
+        assert body["settings"] == {
+            "autoSync": True,
+            "autoSyncMins": server_mod.DEFAULT_AUTO_SYNC_MINS,
+            "lastSync": {},
+        }
+        stored = json.loads(server_mod._settings_json().read_text(encoding="utf-8"))
+        assert set(stored) == {"autoSync", "autoSyncMins", "lastSync"}
+
+
+@pytest.mark.asyncio
+async def test_settings_writes_apply_in_arrival_order(fixtures) -> None:
+    """Ordering is the server's job, done by arrival order under the settings
+    lock — the client sends no ordering token. The last write the server accepts
+    wins, and a disable always applies, so auto-sync can never stay authorized
+    against a user (or another tab) that turned it off."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put("/api/settings", {"autoSync": True})
+        assert status == 200, body
+        assert body["settings"]["autoSync"] is True
+        # A disable is never dropped — revocation always applies.
+        status, body = await client.put("/api/settings", {"autoSync": False})
+        assert status == 200, body
+        assert body["settings"]["autoSync"] is False
+        _, get_body = await client.get("/api/settings")
+        assert get_body["settings"]["autoSync"] is False
+        # The last write the server accepts wins.
+        status, body = await client.put("/api/settings", {"autoSync": True})
+        assert status == 200, body
+        assert body["settings"]["autoSync"] is True
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_permission_flip_is_audited(fixtures) -> None:
+    """Enabling autoSync authorizes unattended `git push`; the permission flip
+    MUST leave a SEL record. A no-op re-write (True->True) writes nothing."""
+    from kiro_crew.sel import sel
+
+    server_mod, _remote, _seed = fixtures
+    fingerprint = "autoSyncMins=1439"  # unique to this test, so it isolates its events
+
+    def flip_outcomes() -> list[str]:
+        return [
+            e.get("outcome")
+            for e in sel().recent(limit=1000)
+            if e.get("operation") == "md_notebook.settings.autoSync"
+            and fingerprint in (e.get("resources") or "")
+        ]
+
+    async with signed_client(server_mod) as client:
+        await client.put("/api/settings", {"autoSync": True, "autoSyncMins": 1439})
+        await client.put("/api/settings", {"autoSync": True})  # no change -> no event
+        await client.put("/api/settings", {"autoSync": False})
+    outcomes = flip_outcomes()
+    assert outcomes.count("enabled") == 1, outcomes
+    assert outcomes.count("disabled") == 1, outcomes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",
+        '"autoSync"',
+        "null",
+        "42",
+        "{ not json at all",
+        '{"autoSync": "yes", "autoSyncMins": "ten", "lastSync": 7}',
+    ],
+)
+async def test_a_corrupt_settings_file_degrades_to_defaults(fixtures, raw: str) -> None:
+    """The file sits in an agent-writable directory, so its shape AND its fields
+    are untrusted — a broken document must degrade rather than 500 the endpoint,
+    and a truthy-but-not-boolean autoSync must fail toward NOT pushing."""
+    server_mod, _remote, _seed = fixtures
+    _write_raw_settings(server_mod, raw)
+    async with signed_client(server_mod) as client:
+        status, body = await client.get("/api/settings")
+        assert status == 200, body
+        assert body["settings"] == _default_settings_body(server_mod)
+
+
+@pytest.mark.asyncio
+async def test_a_mangled_last_sync_entry_does_not_cost_the_others(fixtures) -> None:
+    """Per-entry filtering: one bad timestamp must not erase every vault's."""
+    server_mod, _remote, _seed = fixtures
+    _write_raw_settings(
+        server_mod,
+        json.dumps(
+            {
+                "lastSync": {
+                    "good": 1700000000000,
+                    "stringy": "nope",
+                    "negative": -1,
+                    "flag": True,
+                }
+            }
+        ),
+    )
+    async with signed_client(server_mod) as client:
+        status, body = await client.get("/api/settings")
+        assert status == 200, body
+        assert body["settings"]["lastSync"] == {"good": 1700000000000}
+
+
+@pytest.mark.asyncio
+async def test_settings_put_refuses_a_client_supplied_last_sync(fixtures) -> None:
+    """lastSync is server-owned: a client sending one is claiming a sync
+    happened, and accepting it would show a backup time nothing earned."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put(
+            "/api/settings", {"autoSync": True, "lastSync": {"v1": 1700000000000}}
+        )
+        assert status == 400, body
+        assert body["code"] == "last_sync_read_only"
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["lastSync"] == {}
+        # Refused outright, so the autoSync riding along in the same request
+        # did not land either.
+        assert body["settings"]["autoSync"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_settings_request_changes_nothing(fixtures) -> None:
+    """Validation is two-phase. This pair is why it matters: a request that
+    enabled autoSync and then 400'd on the interval would leave unattended
+    pushing on, from a request the user was told had failed."""
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        status, body = await client.put(
+            "/api/settings", {"autoSync": True, "autoSyncMins": "whenever"}
+        )
+        assert status == 400, body
+        assert body["code"] == "invalid_auto_sync_mins"
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["autoSync"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_app_wires_the_auto_sync_loop(fixtures) -> None:
+    """The loop is armed by the backend app, not by a page: wired to a page's
+    lifecycle it would stop the moment the Notes tab closed, which is the whole
+    defect this replaces."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    app = server_mod.create_app()
+    assert syncer_mod.start_syncer in app.on_startup
+    assert syncer_mod.stop_syncer in app.on_cleanup
+
+
+@pytest.mark.asyncio
+async def test_the_loop_starts_and_stops_with_the_app(fixtures, loop_syncer) -> None:
+    server_mod, _remote, _seed = fixtures
+    async with signed_client(server_mod):
+        task = loop_syncer._sync_task
+        assert task is not None and not task.done()
+    assert loop_syncer._sync_task is None
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_starting_the_loop_twice_is_a_no_op(fixtures, loop_syncer) -> None:
+    """A second arm must not create a second loop: two loops committing in one
+    working tree race on index.lock and one of them loses its notes."""
+    server_mod, _remote, _seed = fixtures
+    async with running_syncer(loop_syncer):
+        first = loop_syncer._sync_task
+        await loop_syncer.start_syncer(web.Application())
+        assert loop_syncer._sync_task is first
+
+
+@pytest.mark.asyncio
+async def test_the_loop_does_nothing_while_auto_sync_is_off(
+    fixtures, loop_syncer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-in gate. The second half is the control — without it, a loop that
+    never ran at all would pass the first half just as well."""
+    server_mod, _remote, _seed = fixtures
+    cycles: list[int] = []
+
+    async def _count(*_a: Any) -> None:
+        cycles.append(1)
+
+    monkeypatch.setattr(loop_syncer, "_sync_once", _count)
+    _write_raw_settings(server_mod, json.dumps({"autoSync": False, "autoSyncMins": 1}))
+    async with running_syncer(loop_syncer):
+        # Many ticks at a (compressed) one-minute interval: without the gate this
+        # window would have produced dozens of pushes.
+        await asyncio.sleep(0.2)
+        assert cycles == []
+
+        _write_raw_settings(server_mod, json.dumps({"autoSync": True, "autoSyncMins": 1}))
+        await _wait_for(lambda: cycles, "enabling autoSync never produced a sync cycle")
+
+
+@pytest.mark.asyncio
+async def test_the_loop_picks_up_a_changed_interval_without_a_restart(
+    fixtures, loop_syncer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """settings.json is re-read every cycle, so shortening the interval takes
+    effect on the running loop instead of at the next gateway start."""
+    server_mod, _remote, _seed = fixtures
+    cycles: list[int] = []
+
+    async def _count(*_a: Any) -> None:
+        cycles.append(1)
+
+    monkeypatch.setattr(loop_syncer, "_sync_once", _count)
+    # The longest selectable interval: nothing is due for a compressed day.
+    _write_raw_settings(server_mod, json.dumps({"autoSync": True, "autoSyncMins": 1440}))
+    async with running_syncer(loop_syncer):
+        await asyncio.sleep(0.2)
+        assert cycles == [], "synced before the configured interval had elapsed"
+
+        # Shortened while the loop runs — no restart of the loop or the gateway.
+        _write_raw_settings(server_mod, json.dumps({"autoSync": True, "autoSyncMins": 1}))
+        await _wait_for(lambda: cycles, "a shortened interval never took effect")
+
+
+@pytest.mark.asyncio
+async def test_a_raising_vault_does_not_stop_the_others(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-vault containment: an unreachable remote costs that vault one cycle,
+    not auto-sync for every other vault until the gateway restarts."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    await server_mod.write_vaults(
+        [
+            {"id": "boom", "localPath": "/vaults/boom"},
+            {"id": "fine", "localPath": "/vaults/fine"},
+        ]
+    )
+    synced: list[str] = []
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        if local_path == "/vaults/boom":
+            raise git_ops.GitError("remote unreachable")
+        synced.append(local_path)
+        return _clean_result()
+
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    await syncer_mod._sync_once()
+
+    assert synced == ["/vaults/fine"]
+    settings = await server_mod.read_settings()
+    assert list(settings["lastSync"]) == ["fine"]
+
+
+@pytest.mark.asyncio
+async def test_the_loop_skips_read_only_vaults(fixtures, monkeypatch: pytest.MonkeyPatch) -> None:
+    """sync commits, merges and pushes — all writes — so a read-only vault must
+    not reach it, exactly as on the manual path."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    await server_mod.write_vaults(
+        [
+            {"id": "ro", "localPath": "/vaults/ro", "readOnly": True},
+            {"id": "rw", "localPath": "/vaults/rw"},
+        ]
+    )
+    synced: list[str] = []
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        synced.append(local_path)
+        return _clean_result()
+
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    await syncer_mod._sync_once()
+
+    assert synced == ["/vaults/rw"]
+    assert list((await server_mod.read_settings())["lastSync"]) == ["rw"]
+
+
+@pytest.mark.asyncio
+async def test_a_vault_forgotten_mid_cycle_is_skipped(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cycle snapshots the vault list at the top; a vault the user FORGETS
+    mid-cycle has had its authorization revoked and must not be pushed from the
+    stale snapshot. It is skipped while the still-connected vaults sync."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    full = [
+        {"id": "a", "localPath": "/vaults/a"},
+        {"id": "b", "localPath": "/vaults/b"},
+        {"id": "c", "localPath": "/vaults/c"},
+    ]
+    reduced = [full[0], full[2]]  # 'b' forgotten after the cycle's opening snapshot
+    calls = {"n": 0}
+
+    async def _read_vaults() -> list[dict[str, Any]]:
+        calls["n"] += 1
+        # First call is the cycle's opening snapshot (sees all three); every
+        # per-vault live re-read afterwards sees 'b' gone.
+        return full if calls["n"] == 1 else reduced
+
+    synced: list[str] = []
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        synced.append(local_path)
+        return _clean_result()
+
+    monkeypatch.setattr(server_mod, "read_vaults", _read_vaults)
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    await syncer_mod._sync_once()
+
+    # 'b' is skipped; 'a' and 'c' — still in the live registry — are pushed.
+    assert synced == ["/vaults/a", "/vaults/c"]
+
+
+@pytest.mark.asyncio
+async def test_a_mid_cycle_revocation_stops_the_remaining_vaults(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cycle pushes every vault in turn; disabling auto-sync mid-cycle must stop
+    the run rather than finish pushing the rest against a revoked authorization."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    await server_mod.write_vaults(
+        [
+            {"id": "a", "localPath": "/vaults/a"},
+            {"id": "b", "localPath": "/vaults/b"},
+            {"id": "c", "localPath": "/vaults/c"},
+        ]
+    )
+    synced: list[str] = []
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        synced.append(local_path)
+        return _clean_result()
+
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    # Authorized for the first vault, revoked before the second — the gate the
+    # loop passes in. The run must push 'a' and then stop, never reaching 'b'/'c'.
+    calls = {"n": 0}
+
+    async def _still_enabled() -> bool:
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    await syncer_mod._sync_once(_still_enabled)
+
+    assert synced == ["/vaults/a"]
+
+
+@pytest.mark.asyncio
+async def test_the_loop_passes_the_anti_tamper_pins(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unattended path must carry the same remote/gitdir pins as the manual
+    one. Nobody is watching this run, so a repointed remote that was not refused
+    would send the user's notes somewhere new with no step to intervene at."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    vault = {
+        "id": "v1",
+        "localPath": "/vaults/v1",
+        "branch": "main",
+        "subfolder": "notes",
+        "remoteUrl": "https://example.invalid/repo.git",
+        "gitDir": "/vaults/v1/.git",
+        "localOnly": False,
+    }
+    await server_mod.write_vaults([vault])
+    seen: list[dict[str, Any]] = []
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        seen.append({"localPath": local_path, **kwargs})
+        return _clean_result()
+
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    await syncer_mod._sync_once()
+
+    assert seen == [
+        {
+            "localPath": "/vaults/v1",
+            "branch": "main",
+            "pat": None,
+            "subfolder": "notes",
+            "trusted_remote": "https://example.invalid/repo.git",
+            "trusted_gitdir": "/vaults/v1/.git",
+            "local_only": False,
+            # A timer chose this run, so it stages notes ONLY even though it
+            # pushes — a stray non-note file must not reach the remote unasked.
+            "notes_only": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conflicts_do_not_record_a_sync_time(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A conflicted merge was aborted and pushed nothing, so stamping it would
+    tell the user their notes are backed up when they are still only local."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    await server_mod.write_vaults([{"id": "v1", "localPath": "/vaults/v1"}])
+
+    async def _sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "pushed": False,
+            "pulled": False,
+            "committed": [],
+            "conflicts": [{"path": "One.md", "local": "a", "remote": "b"}],
+        }
+
+    monkeypatch.setattr(git_ops, "sync", _sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    await syncer_mod._sync_once()
+
+    assert (await server_mod.read_settings())["lastSync"] == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_never_overlaps_the_previous_one(
+    fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two concurrent commits in one repository race on index.lock, and the
+    loser drops that cycle's notes from history."""
+    server_mod, _remote, _seed = fixtures
+    from kiro_crew.apps.builtins.md_notebook import syncer as syncer_mod
+
+    await server_mod.write_vaults([{"id": "v1", "localPath": "/vaults/v1"}])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[int] = []
+
+    async def _slow_sync(local_path: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(1)
+        started.set()
+        await release.wait()
+        return _clean_result()
+
+    monkeypatch.setattr(git_ops, "sync", _slow_sync)
+    monkeypatch.setattr(server_mod, "rebuild_cache", _noop_rebuild)
+    monkeypatch.setattr(server_mod, "resolve_auth", _no_auth)
+
+    first = asyncio.create_task(syncer_mod._sync_once())
+    await started.wait()
+    # A second entrant while the first cycle is mid-flight returns without
+    # touching the vault.
+    await syncer_mod._sync_once()
+    assert calls == [1]
+    release.set()
+    await first
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_records_and_returns_the_sync_time(fixtures) -> None:
+    """Deliverable of the single-writer rule: the handler stamps lastSync and
+    hands it back, so the UI updates without a second round-trip."""
+    server_mod, remote, _seed = fixtures
+    async with signed_client(server_mod) as client:
+        vault = await _clone(client, remote)
+        status, body = await client.post(f"/api/sync?vault={vault['id']}", {})
+        assert status == 200, body
+        stamped = body["lastSync"]
+        assert isinstance(stamped, int) and stamped > 0
+
+        status, body = await client.get("/api/settings")
+        assert status == 200, body
+        assert body["settings"]["lastSync"][vault["id"]] == stamped
+
+
+@pytest.mark.asyncio
+async def test_a_conflicted_manual_sync_reports_no_sync_time(fixtures) -> None:
+    """Same rule on the manual path: a conflict earns no timestamp."""
+    server_mod, remote, seed = fixtures
+    async with signed_client(server_mod) as client:
+        vault = await _clone(client, remote)
+        (seed / "One.md").write_text("# One\n\nREMOTE side\n", encoding="utf-8")
+        _git("add", "-A", cwd=seed)
+        _git("commit", "-m", "remote", cwd=seed)
+        _git("push", "origin", "main", cwd=seed)
+        await client.put("/api/note", {"path": "One.md", "content": "# One\n\nLOCAL side\n"})
+
+        status, body = await client.post(f"/api/sync?vault={vault['id']}", {})
+        assert status == 200, body
+        assert body["result"]["conflicts"], "expected a conflicted sync to test"
+        assert body["lastSync"] is None
+
+        status, body = await client.get("/api/settings")
+        assert body["settings"]["lastSync"] == {}
+
+
+# -- status() hides a temp only on proven ownership -------------------------
+#
+# `status()` may hide a path on ONE ground: this process currently knows it owns
+# the temp. The name shape is not ownership evidence -- `<name>.<32 hex>.tmp` is
+# what `staged_temp_name` produces, not a shape only it can produce -- so the
+# cases below pin both directions.
+
+NL = chr(10)
+HEX32 = "0123456789abcdef0123456789abcdef"
+
+
+def _seed_vault(tmp_path: Path, *files: str) -> Path:
+    repo = tmp_path / "vault"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "T")
+    for name in files:
+        (repo / name).write_text("seeded " + name + NL, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "seed")
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_user_file_in_the_temp_shape_stays_visible(
+    tmp_path: Path,
+) -> None:
+    """A user file NAMED like a staged temp is still the user's file.
+
+    `<name>.<32 hex>.tmp` is the shape this module produces; nothing stops a
+    user or another tool from producing it too. Hiding it on the shape alone
+    withheld real content from the user's own repository -- absent from the
+    pending badge, from the commit, and from the remote, with nothing to say it
+    had been dropped. Withholding unknown filesystem content is a worse failure
+    than committing a stray temp, so shape alone must not hide anything.
+    """
+    repo = _seed_vault(tmp_path, "Report.md")
+    genuine = "Report.md." + HEX32 + ".tmp"
+    (repo / genuine).write_text("a real file the user made" + NL, encoding="utf-8")
+
+    # The origin is untouched: nothing here looks like a rename.
+    assert (repo / "Report.md").exists()
+
+    kinds = {c.path: c.kind for c in await git_ops.status(str(repo))}
+    assert kinds.get(genuine) == "added", (
+        "status() hid a genuine user file because its NAME matched the staged-temp "
+        "shape, so it would never be committed or pushed: %r" % (kinds,)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_registered_in_flight_temp_is_hidden(tmp_path: Path) -> None:
+    """The one ground for hiding a path: this process owns it right now."""
+    repo = _seed_vault(tmp_path, "Note.md")
+    tmp_name = git_ops.staged_temp_name("Note.md")
+    (repo / tmp_name).write_text("in flight" + NL, encoding="utf-8")
+
+    with git_ops.inflight_temp(repo / tmp_name):
+        paths = {c.path for c in await git_ops.status(str(repo))}
+        assert tmp_name not in paths, "a temp this process is publishing reached status(): %r" % (
+            paths,
+        )
+
+    # Ownership ended, so the file is ordinary content again rather than being
+    # withheld forever. An orphan becoming visible is the safe failure direction.
+    paths = {c.path for c in await git_ops.status(str(repo))}
+    assert tmp_name in paths, (
+        "a temp stayed hidden after its transaction ended, so an orphan could "
+        "never be seen or cleaned by the user: %r" % (paths,)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rename_into_the_temp_shape_commits_both_halves(
+    tmp_path: Path,
+) -> None:
+    """A tracked file renamed into the temp shape must not lose either half.
+
+    The rename does not arrive as git's `R` record: the renamed file is
+    untracked, so `diff HEAD` reports only the old path as deleted and the new
+    path turns up in `ls-files --others`. Dropping the addition on shape left
+    the deletion standing alone, and the autosave committed the move as a
+    REMOVAL -- the file disappears from the remote while still sitting in the
+    vault under its new name.
+    """
+    repo = _seed_vault(tmp_path, "Note.md")
+    renamed_name = git_ops.staged_temp_name("Note.md")
+    (repo / "Note.md").rename(repo / renamed_name)
+
+    kinds = {c.path: c.kind for c in await git_ops.status(str(repo))}
+    assert (
+        kinds.get("Note.md") == "deleted"
+    ), "the rename's deleted half vanished from status(): %r" % (kinds,)
+    assert kinds.get(renamed_name) == "added", (
+        "status() dropped the rename's ADDED half while keeping its deletion, so "
+        "a Sync would commit this move as a removal: %r" % (kinds,)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_tokenless_retry_refuses_to_overwrite_an_external_edit(
+    fixtures, tmp_path: Path
+) -> None:
+    """A save with no ``baseMtime`` must not republish over an edit made in its gap.
+
+    ``_assert_note_is_fresh`` is a no-op without a client token, and the note
+    lock only serializes API writers -- an editor writing the file directly
+    (Obsidian, ``git pull``, a script) never takes it. So a contended rename that
+    backs off and retries could rename over whatever landed in the meantime and
+    answer 200, destroying a newer edit with no conflict reported.
+
+    The server therefore samples its OWN baseline before the first attempt and
+    revalidates against it before every retry. Deterministic: the external write
+    is performed from inside the injected backoff, so it is guaranteed to land
+    between attempt 1 and attempt 2.
+    """
+    _mod, _remote, _seed = fixtures
+
+    root = tmp_path / "tokenless-vault"
+    root.mkdir()
+    target = root / "One.md"
+    target.write_text("original" + NL, encoding="utf-8")
+
+    real_replace = os.replace
+    real_sleep = asyncio.sleep
+    attempts: list[str] = []
+
+    def contended_once(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(dst).endswith("One.md"):
+            attempts.append(str(src))
+            if len(attempts) == 1:
+                raise PermissionError(32, "The process cannot access the file")
+        return real_replace(src, dst, *args, **kwargs)
+
+    async def external_write_during_backoff(delay):  # type: ignore[no-untyped-def]
+        # THE external editor: lands in the retry gap, holds no lock, and leaves
+        # a strictly newer mtime.
+        if attempts:
+            target.write_text("edited in obsidian" + NL, encoding="utf-8")
+            future = time.time() + 5
+            os.utime(target, (future, future))
+        await real_sleep(0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", contended_once)
+        mp.setattr(_mod.platform_compat, "IS_WINDOWS", True)
+        mp.setattr(_mod.asyncio, "sleep", external_write_during_backoff)
+
+        with pytest.raises(_mod.ApiError) as excinfo:
+            await _mod._save_note_contents(target, "One.md", "my save" + NL, None)
+
+    assert excinfo.value.status == 409, "a tokenless retry answered %r instead of a conflict" % (
+        excinfo.value.status,
+    )
+    assert target.read_text(encoding="utf-8") == "edited in obsidian" + NL, (
+        "the tokenless retry republished over an external edit made during its "
+        "backoff -- the edit is gone and the client was never told"
+    )
+    leftovers = sorted(p.name for p in root.glob("One.md.*.tmp"))
+    assert not leftovers, "the refused save left its temp behind: %r" % (leftovers,)
+
+
+# --- inline #tag extraction ----------------------------------------------------
+
+
+def test_extract_tags_accepts_a_non_ascii_leading_character() -> None:
+    """A tag may start with any Unicode alphanumeric, as the tail already does.
+
+    Latin-script, Han, Hangul, Cyrillic and Greek leading characters all
+    register the same way. Tags feed an in-memory index, never a path, so
+    the wide lead cannot create a filesystem collision.
+    """
+    from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
+
+    assert notes_mod.extract_tags("#论文") == ["论文"]
+    assert notes_mod.extract_tags("#분기") == ["분기"]
+    assert notes_mod.extract_tags("#Отчет") == ["Отчет"]
+    assert notes_mod.extract_tags("#München") == ["München"]
+    assert notes_mod.extract_tags("#a논문") == ["a논문"]
+    assert notes_mod.extract_tags("see (#논문) note") == ["논문"]
+    assert notes_mod.extract_tags("#todo #论文 #todo") == ["todo", "论文"]
+
+
+def test_extract_tags_still_refuses_a_non_alphanumeric_lead() -> None:
+    """Only the script restriction is lifted; the shape rules stand."""
+    from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
+
+    assert notes_mod.extract_tags("#_foo") == []
+    assert notes_mod.extract_tags("#-x") == []
+    assert notes_mod.extract_tags("# tag") == []
+    assert notes_mod.extract_tags("#\u200bfoo") == []
+    assert notes_mod.extract_tags("#2024") == ["2024"]
+    assert notes_mod.extract_tags("#todo") == ["todo"]
+
+
+def test_extract_tags_ignores_masked_code_in_any_script() -> None:
+    """Code masking still wins over the wider lead: a tag inside fenced or
+    inline code is a sample, not an index entry."""
+    from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
+
+    assert notes_mod.extract_tags("```\n#논문\n```") == []
+    assert notes_mod.extract_tags("`#논문`") == []
+    assert notes_mod.extract_tags("real #논문 and `#가짜`") == ["논문"]

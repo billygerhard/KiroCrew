@@ -4,6 +4,7 @@ import { renderWithProviders, createTestStore } from './helpers'
 import NotificationFeed, { SEEN_CHANNELS_STORAGE_KEY } from '../components/notifications/NotificationFeed'
 import type { RootState } from '../store'
 import type { Notification } from '../types'
+import { approvalNotificationBody } from '../lib/approvalNotificationBody'
 
 const mockUpdateChannelSettings = vi.fn().mockResolvedValue({})
 
@@ -38,7 +39,7 @@ beforeEach(() => {
 })
 
 describe('NotificationFeed Phase 3: silenced (muted-channel) rows', () => {
-  it('hides silenced rows by default and reveals them via the Muted chip', () => {
+  it('hides silenced rows by default and reveals them via the Show muted chip', () => {
     renderFeed([
       mkN({ ts: '1', title: 'Visible note' }),
       mkN({ ts: '2', title: 'Muted note', silenced: true, priority: 'passive' }),
@@ -46,7 +47,7 @@ describe('NotificationFeed Phase 3: silenced (muted-channel) rows', () => {
     expect(screen.getByText('Visible note')).toBeTruthy()
     expect(screen.queryByText('Muted note')).toBeNull()
 
-    const chip = screen.getByRole('button', { name: /Muted \(1\)/ })
+    const chip = screen.getByRole('button', { name: /Show muted \(1\)/ })
     expect(chip.getAttribute('aria-pressed')).toBe('false')
     fireEvent.click(chip)
     expect(screen.getByText('Muted note')).toBeTruthy()
@@ -54,9 +55,30 @@ describe('NotificationFeed Phase 3: silenced (muted-channel) rows', () => {
     expect(screen.queryByText('Muted note')).toBeNull()
   })
 
+  // The label used to read "Muted (1)" in both states, which named the rows'
+  // state instead of the press's effect: a first-time user could not tell
+  // whether pressing reveals muted rows or mutes something. Each state must name
+  // the action the press performs.
+  it('names the action, so the label flips with the disclosure state', () => {
+    renderFeed([
+      mkN({ ts: '1', title: 'Visible note' }),
+      mkN({ ts: '2', title: 'Muted note', silenced: true, priority: 'passive' }),
+    ])
+    const chip = screen.getByRole('button', { name: /muted \(1\)/i })
+    expect(chip.textContent).toContain('Show muted (1)')
+    expect(chip.textContent).not.toContain('Hide')
+
+    fireEvent.click(chip)
+    expect(chip.textContent).toContain('Hide muted (1)')
+    expect(chip.textContent).not.toContain('Show')
+
+    fireEvent.click(chip)
+    expect(chip.textContent).toContain('Show muted (1)')
+  })
+
   it('does not render the Muted chip when nothing is silenced', () => {
     renderFeed([mkN({ ts: '1', title: 'Visible note' })])
-    expect(screen.queryByRole('button', { name: /Muted \(/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /muted \(/i })).toBeNull()
   })
 })
 
@@ -119,5 +141,25 @@ describe('NotificationFeed Phase 3: keep/mute prompt', () => {
     localStorage.setItem(SEEN_CHANNELS_STORAGE_KEY, JSON.stringify(['oncall-radar.ticket-update']))
     renderFeed([appNote])
     expect(screen.queryByText(/Keep receiving these\?/)).toBeNull()
+  })
+})
+
+describe('NotificationFeed approval excerpts', () => {
+  it.each(['panel', 'mac'] as const)('spends the %s excerpt budget on content, not fences', variant => {
+    const command = 'echo ```; rm -rf *cache*; echo ' + 'x'.repeat(160)
+    // Not an approval: every approval row renders its whole body, so the
+    // excerpt path is exercised on another kind carrying the same fenced body.
+    const store = createTestStore(stateWith([
+      mkN({ kind: 'cron', body: approvalNotificationBody('agent', command) }),
+    ]))
+    const { container } = renderWithProviders(
+      <NotificationFeed selectedTs={null} onSelect={() => {}} variant={variant} />, { store },
+    )
+    const limit = variant === 'mac' ? 140 : 80
+    const preview = `Source: agent · ${command}`.slice(0, limit)
+    expect(screen.getByText(preview).textContent).toBe(preview)
+    // The command's own triple run stays; neither four-backtick wrapper leaks.
+    expect(container.textContent).not.toContain('````')
+    expect(preview).toHaveLength(limit)
   })
 })

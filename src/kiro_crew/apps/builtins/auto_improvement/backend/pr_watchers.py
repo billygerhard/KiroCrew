@@ -60,6 +60,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from kiro_crew.platform.context import redact_via_context
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
 from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
 from . import pr_checks, store
 
@@ -131,13 +134,24 @@ _PR_URL_RE = re.compile(r"^https://[^\s]+/(?:pull|merge_requests)/\d+", re.IGNOR
 _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 
 
-def _git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+def _git(
+    *args: str, timeout: float = 60.0, cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
     # Callers pass their own ``-C <clone>``; recover it so the attributes pin (which unbinds
     # repository-controlled filter/diff drivers) is refreshed for the tree being touched.
-    if "-C" in args:
-        i = args.index("-C")
-        if i + 1 < len(args):
-            require_pinned(args[i + 1])
+    # The same path becomes the child's ``cwd``: ``-C`` fixes the tree git reads, but the
+    # working directory would otherwise be inherited from the gateway, which is the one
+    # thing about a host-side spawn that must never be ambient. Both name the SAME absolute
+    # path -- git resolves ``-C`` against the child's cwd, so a relative clone handed to both
+    # would be applied twice. A call with no ``-C`` (``clone``) names its cwd explicitly.
+    argv = list(args)
+    if "-C" in argv:
+        i = argv.index("-C")
+        if i + 1 < len(argv):
+            require_pinned(argv[i + 1])
+            argv[i + 1] = os.path.abspath(argv[i + 1])
+            if cwd is None:
+                cwd = argv[i + 1]
     # ``errors="replace"``, not a strict decode. `git diff` emits the CONTENT of changed
     # files, and a repository legitimately contains non-UTF-8 bytes — a PNG fixture, a
     # latin-1 source file. A strict decode raises UnicodeDecodeError from inside
@@ -148,11 +162,13 @@ def _git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     # need — whether the diff is EMPTY — and never fabricates emptiness, since a replaced
     # byte is still a byte.
     return subprocess.run(
-        ["git", *_GIT_SAFE_CONFIG, *args],
+        ["git", *_GIT_SAFE_CONFIG, *argv],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        cwd=cwd,
     )
 
 
@@ -163,7 +179,7 @@ def _gh(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     :func:`is_watchable_pr`), so no caller-controlled string reaches argv[0].
     """
     try:
-        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(["gh", *args], capture_output=True, timeout=timeout, **UTF8_TEXT)
     except (OSError, subprocess.SubprocessError) as exc:
         # gh absent / timed out: synthesize a failure so callers need no try block.
         return subprocess.CompletedProcess(
@@ -224,9 +240,25 @@ def setup_isolated_clone(
             shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         # --local hardlinks the object store: no network, near-instant, cheap on disk.
-        proc = _git("clone", "--local", shared_clone, dest, timeout=300)
+        # Absolute operands and the destination's parent as cwd: ``clone`` has no ``-C``
+        # to pin the child's working directory, and a relative operand must not be
+        # re-resolved against the pinned cwd.
+        dest_abs = os.path.abspath(dest)
+        proc = _git(
+            "clone",
+            "--local",
+            os.path.abspath(shared_clone),
+            dest_abs,
+            timeout=300,
+            cwd=os.path.dirname(dest_abs),
+        )
         if proc.returncode != 0:
-            return "", f"git clone --local failed: {(proc.stderr or '').strip()[:200]}"
+            # Redact BEFORE the bound: a slice can cut a credential in the URL git
+            # echoes mid-match, leaving a fragment no downstream pass recognises.
+            return "", (
+                f"git clone --local failed: "
+                f"{redact_via_context((proc.stderr or '').strip())[:200]}"
+            )
         if branch:
             checkout = _git("-C", dest, "checkout", branch, timeout=60)
             if checkout.returncode != 0:
@@ -241,7 +273,7 @@ def setup_isolated_clone(
                 shutil.rmtree(dest, ignore_errors=True)
                 return "", (
                     f"could not check out the pull request head {branch!r}: "
-                    f"{(checkout.stderr or '').strip()[:160]}"
+                    f"{redact_via_context((checkout.stderr or '').strip())[:160]}"
                 )
         _fetch_base_ref(dest, base_ref)
         neutralize_origin(dest)
@@ -1108,7 +1140,17 @@ class PRWatcherRegistry:
         itself stays best-effort (a lost patch must not fail the watcher), but "the patch
         was lost" and "the directory holding the commits may be deleted" are different
         decisions, and conflating them destroyed verified work.
+
+        No clone configured means no working tree to diff — there is nothing to export
+        and nothing to retain. Without this guard the fallback `git diff`/`git status`
+        calls below still ran with `-C ""`, which git treats as no `-C` at all: it walks
+        up from the process's real CWD and operates on whatever repository (or worktree)
+        happens to contain it, spawning a host-side git call — and `require_pinned`'s
+        attributes pin write — against the operator's real checkout instead of this run's
+        clone.
         """
+        if not clone:
+            return True
         try:
             self._export_fix(st, clone, attempt)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1328,7 +1370,7 @@ def publish_if_authorized(pr: str, status: dict[str, Any]) -> tuple[bool, str]:
     proc = _gh("pr", "ready", pr)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
-        return False, f"gh pr ready failed: {tail[0][:160]}"
+        return False, f"gh pr ready failed: {redact_via_context(tail[0])[:160]}"
     logger.info("watchers: marked %s ready for review (%s)", pr, reason)
     return True, reason
 
@@ -1368,7 +1410,7 @@ def _delete_clone_if_unowned(reg: PRWatcherRegistry, child: Path) -> bool:
 
 
 def sweep_orphan_clones(*, clones_root: str | None = None) -> int:
-    """Delete per-PR watcher clones whose watcher is no longer live. Returns the count.
+    """Delete per-PR watcher clones whose watcher is not live. Returns the count.
 
     A watcher removes its own clone on a clean exit, but a crash, a SIGKILL, or a gateway
     restart mid-run leaves it behind — and each is a full repo checkout, so they
@@ -1452,12 +1494,11 @@ def _work_items(status: dict[str, Any]) -> list[str]:
 def _redact(text: str) -> str:
     """Credential/exfiltration redaction for a watcher log line. FAIL-CLOSED.
 
-    This used to fail OPEN so "redaction must never be the reason a watcher stops logging".
-    The concern was right but the remedy leaked: `GET /watchers/{fp}/log` serves these lines
-    straight to the browser with NO second redaction pass, so this is the only scan standing
-    between agent/CI output and the operator's screen — the same boundary
-    `routes._redact_for_display` fails closed on. Fixed alongside the identical gap in
-    `runner._redact_activity`, which the GPT review of this branch raised.
+    Failing OPEN would honour "redaction must never be the reason a watcher stops logging",
+    but it leaks: `GET /watchers/{fp}/log` serves these lines straight to the browser with NO
+    second redaction pass, so this is the only scan standing between agent/CI output and the
+    operator's screen — the same boundary `routes._redact_for_display` fails closed on.
+    `runner._redact_activity` guards the identical surface for the activity feed.
 
     Failing closed still does not stop the watcher logging: the LINE is replaced by a fixed
     placeholder, so the log keeps advancing and the operator sees activity, just not

@@ -3,10 +3,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { QrCode, Loader2, Check, TriangleAlert, RefreshCw } from 'lucide-react'
 import { api, type WeixinConfigSave } from '../../api/client'
 import { WeixinLogo } from '../../components/WeixinLogo'
-import SimpleSelect from '../../components/SimpleSelect'
+import { SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
+import ErrorNotice from '../../components/ErrorNotice'
+import { useChannelFolderSave } from '../../hooks/useChannelFolderSave'
 import { TagListEditor } from './SlackPanel'
 
 import { i18nT } from '../../i18n/t'
+import { ChannelFolderBackfill } from './ChannelFolderBackfill'
+import { useImeGuard } from '../../hooks/useImeGuard'
+/** Brand name — do-not-translate, so it lives here rather than in the catalog. */
+const CHANNEL_NAME = "WeChat"
 const SETUP_GUIDE =
   'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/weixin-integration.md'
 
@@ -14,6 +20,13 @@ const SETUP_GUIDE =
 const POLL_MS = 1500
 /** Give up on an unscanned QR after this long (Tencent expires them anyway). */
 const QR_TTL_MS = 5 * 60 * 1000
+/**
+ * Consecutive failed status polls before the failure is said out loud. One or
+ * two are the long-poll endpoint's ordinary weather; three in a row (~5s) is a
+ * gateway that has stopped answering, and a QR that silently never confirms is
+ * indistinguishable from one nobody scanned.
+ */
+const QR_POLL_FAILURES_TO_REPORT = 3
 
 type Phase = 'idle' | 'starting' | 'waiting' | 'scanned' | 'confirmed' | 'expired' | 'error'
 
@@ -26,6 +39,7 @@ type Phase = 'idle' | 'starting' | 'waiting' | 'scanned' | 'confirmed' | 'expire
  * the bot credential itself.
  */
 export function WeixinPanel() {
+  const ime = useImeGuard()
   const qc = useQueryClient()
   const { data, isError } = useQuery({
     queryKey: ['weixin-config'],
@@ -38,20 +52,34 @@ export function WeixinPanel() {
   const [errMsg, setErrMsg] = useState('')
   const [sessionId, setSessionId] = useState('')
   const deadlineRef = useRef(0)
-
   // Server state goes through React Query, including the QR scan poll: the
   // status endpoint is polled via refetchInterval while a login session is open
   // and stops as soon as the flow reaches a terminal phase, so there is no
   // hand-rolled timer to leak on unmount.
   const polling = phase === 'waiting' || phase === 'scanned'
+  // Counted here, not read from React Query's `failureCount`: with `retry: false`
+  // that counter is reset at the start of EVERY `refetchInterval` fetch (each
+  // fetch gets a fresh retry budget), so it never exceeds 1 and a gate on it
+  // would never fire. Cleared by any successful poll and by a fresh login.
+  const [qrPollFailures, setQrPollFailures] = useState(0)
   const { data: qrStatus } = useQuery({
     queryKey: ['weixin-qr-status', sessionId],
-    queryFn: () => api.weixinQrStatus(sessionId),
+    queryFn: async () => {
+      try {
+        const r = await api.weixinQrStatus(sessionId)
+        setQrPollFailures(0)
+        return r
+      } catch (e) {
+        setQrPollFailures(n => n + 1)
+        throw e
+      }
+    },
     enabled: polling && !!sessionId,
     refetchInterval: polling ? POLL_MS : false,
     retry: false,
     // A long-poll endpoint fails transiently; keep the last value rather than
-    // flipping the UI to an error state.
+    // flipping the UI to an error state. A poll that keeps failing is reported
+    // below once the consecutive count reaches QR_POLL_FAILURES_TO_REPORT.
     gcTime: 0,
   })
 
@@ -93,6 +121,7 @@ export function WeixinPanel() {
     mutationFn: () => api.weixinQrStart(),
     onMutate: () => {
       setErrMsg('')
+      setQrPollFailures(0)
       setPhase('starting')
     },
     onSuccess: r => {
@@ -114,9 +143,51 @@ export function WeixinPanel() {
 
   const saveConfig = useMutation({
     mutationFn: (patch: Partial<WeixinConfigSave>) => api.saveWeixinConfig(patch),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['weixin-config'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['weixin-config'] })
+    },
   })
-  const save = (patch: Partial<WeixinConfigSave>) => saveConfig.mutate(patch)
+  // `onRevert` undoes an optimistic local flip when the server rejects the patch.
+  // It is passed by the toggle and NOT by the name field: a rejected name must
+  // keep the text the user typed (that is what lets them correct it), while a
+  // rejected toggle must snap back to the server's truth, or the switch reads
+  // "off" while the gateway is still filing sessions.
+  //
+  // `mutateAsync` rather than `mutate(patch, {…})`: per-call callbacks live on the
+  // mutation OBSERVER, and this panel saves on change, so a second save starting
+  // before the first resolves replaces them and the first call's handlers never
+  // run. Clicking the toggle is what blurs the name field, so "rename, then
+  // switch off" issues both saves back to back — the ordinary path, not a rare
+  // race. Attaching the handling to each returned promise keeps every call's own
+  // outcome. The mutation-level onSuccess still fires for shared work
+  // (invalidating the query).
+  //
+  // Feedback (the error line, the folder-name "Saved." check) lives HERE, on the
+  // per-call chain, guarded by a sequence: back-to-back saves resolve out of
+  // order, and only the LATEST attempt may speak for the panel. A slow rename
+  // resolving after a newer one was rejected must neither clear that rejection's
+  // error nor paint "Saved." next to it — both would assert the failed draft
+  // was stored.
+  //
+  // Folder field + save sequencing live in a shared hook: WeChat's and
+  // WhatsApp's panels are the two QR-paired channels and carried
+  // byte-identical copies of this. See useChannelFolderSave for the three
+  // invariants (accepted-vs-draft name, folder-only sequencing, and
+  // ownership-aware error clearing).
+  const {
+    folderOn,
+    folderName,
+    setFolderName,
+    folderSaved,
+    saveError,
+    toggleFolder,
+    commitFolderName,
+    save,
+  } = useChannelFolderSave<WeixinConfigSave>({
+    serverFolder: data?.session_folder,
+    defaultName: CHANNEL_NAME,
+    mutate: patch => saveConfig.mutateAsync(patch),
+  })
 
   const connected = !!data?.connected
   const credentialSet = !!data?.credential_set
@@ -142,7 +213,11 @@ export function WeixinPanel() {
         data-testid="weixin-status"
       >
         {isError ? (
-          <span className="text-[12.5px] text-muted">{i18nT('pages.settings.weixinPanel.status_unavailable')}</span>
+          // Read failure. askAgent ON: the only editable field on this panel is
+          // the session-folder name, and it commits `onBlur` — moving focus to
+          // the hand-off button is itself what saves it (the WhatsApp panel
+          // records the same reasoning).
+          <ErrorNotice variant="inline" message={i18nT('pages.settings.weixinPanel.status_unavailable')} askAgent />
         ) : connected ? (
           <>
             <span className="w-1.5 h-1.5 rounded-full bg-ok shrink-0" />
@@ -206,6 +281,19 @@ export function WeixinPanel() {
               <Loader2 size={12} className="animate-spin" />
               {phase === 'scanned' ? i18nT('pages.settings.weixinPanel.scanned_confirm_in_wechat') : i18nT('pages.settings.weixinPanel.waiting_for_scan')}
             </div>
+            {/* The status poll has stopped answering (see QR_POLL_FAILURES_TO_REPORT).
+                The code stays up because a scan may still land; the hand-off is on
+                because a gateway that stops answering is the agent's to diagnose and
+                nothing on this panel is an unsaved draft (the folder name commits
+                onBlur). */}
+            {qrPollFailures >= QR_POLL_FAILURES_TO_REPORT && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('pages.settings.weixinPanel.scan_status_poll_failing')}
+                askAgent
+                testId="weixin-poll-failing"
+              />
+            )}
           </div>
         )}
 
@@ -224,42 +312,50 @@ export function WeixinPanel() {
           </div>
         )}
 
+        {/* The login service's own failure (`r.error` body or a rejected start).
+            askAgent ON: reachability of Tencent's login service is exactly what
+            the agent can diagnose, and the folder name below commits `onBlur`, so
+            the navigation cannot lose it. */}
         {phase === 'error' && (
-          <div className="mt-3 flex items-center gap-1.5 text-[12.5px] text-danger" data-testid="weixin-error">
-            <TriangleAlert size={13} /> {errMsg}
-          </div>
+          <ErrorNotice
+            variant="inline"
+            className="mt-3 text-[12.5px]"
+            message={errMsg}
+            askAgent
+            testId="weixin-error"
+          />
         )}
       </div>
 
       {/* enable + access policy */}
-      <label
-        htmlFor="weixin-enabled-toggle"
-        className="flex items-center gap-2.5 cursor-pointer"
-      >
-        <input
-          id="weixin-enabled-toggle"
-          type="checkbox"
+      {/* Every other channel panel renders its enable switch as SettingsToggle;
+          the shared component owns the label association (visible text doubles
+          as the switch's accessible name) and the keyboard/AT semantics.
+          data-testid lives on this wrapper because SettingsToggle exposes only
+          data-setting-label — same move as weixin-dm-policy below. */}
+      {/* max-w: this panel has no SettingsCard, so an uncapped row would make
+          the whole pane width a Clickable save surface (this panel autosaves —
+          a stray click in the empty gap would silently disable the channel)
+          and push the switch far from its label. Content-scaling matches the
+          dm-policy select below. */}
+      <div data-testid="weixin-enabled" className="max-w-[380px]">
+        <SettingsToggle
+          label={i18nT('pages.settings.weixinPanel.enable_the_wechat_channel')}
           checked={!!data?.enabled}
           disabled={readOnly}
-          onChange={e => save({ enabled: e.target.checked })}
-          data-testid="weixin-enabled"
-          aria-label={i18nT('pages.settings.weixinPanel.enable_the_wechat_channel')}
+          onChange={v => save({ enabled: v })}
         />
-        <span className="text-[13px] text-text">{i18nT('pages.settings.weixinPanel.enable_the_wechat_channel')}</span>
-      </label>
+      </div>
 
       <div>
-        {/* Not a <label>: SimpleSelect renders a button, so `htmlFor` would point
-            at no form control. The caption keeps its key and is reused verbatim as
-            the trigger's accessible name. data-testid moves to this wrapper so the
-            Playwright drive (scripts/test-weixin-panel.mjs) still finds the field. */}
-        <div className="block" data-testid="weixin-dm-policy">
-          <span className="block text-[11px] text-muted mb-1.5">{i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}</span>
-          {/* maxWidth: the native select was content-sized; the Radix trigger is
-              w-full and this field is a stretch flex item, so without a cap it
-              would span the whole panel while every neighbouring control stays
-              content-scaled. */}
-          <SimpleSelect
+        {/* maxWidth: the trigger is w-full and this field is a stretch flex item,
+            so without a cap it would span the whole panel while every
+            neighbouring control stays content-scaled. data-testid stays on this
+            wrapper so the Playwright drive (scripts/test-weixin-panel.mjs)
+            still finds the field. */}
+        <div className="block" data-testid="weixin-dm-policy" style={{ maxWidth: 280 }}>
+          <SettingsSelect
+            label={i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}
             options={['open', 'allowlist', 'disabled']}
             optionLabels={[
               i18nT('pages.settings.weixinPanel.anyone_who_messages_the_bot'),
@@ -269,8 +365,6 @@ export function WeixinPanel() {
             value={data?.dm_policy || 'allowlist'}
             disabled={readOnly}
             onChange={v => save({ dm_policy: v })}
-            aria-label={i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}
-            style={{ maxWidth: 280 }}
           />
         </div>
       </div>
@@ -287,6 +381,88 @@ export function WeixinPanel() {
           />
         </div>
       )}
+
+      {/* Optional session filing, rendered from the same primitives, in the same
+          place, with the same divider as every other channel's copy of this
+          setting (`BotChannelPanel` for Telegram/Discord/WeCom, and the Slack,
+          Teams and Webex panels): bottom of the panel, below a rule, switch above
+          the name field. It used to be a bare checkbox wedged between the
+          DM-policy picker and the allowlist, which read as part of the
+          access-control block and sent users looking for it at the bottom, where
+          it was not.
+
+          Off by default: WeChat conversations stay unfiled, and a configured name
+          IS the on-state (the backend has one field, where "" means off).
+
+          This panel has no Save button — every other control saves on change — so
+          the toggle must persist immediately. Revealing the field without saving
+          loses the setting for anyone who turns it on, sees the name already
+          filled in, and leaves. The NAME still commits on blur / Enter rather
+          than per keystroke, which is why `SettingsInput` is given
+          `onBlur`/`onKeyDown` here and the other panels (which have a Save
+          button) pass neither. Renaming does not strand the folder it creates:
+          the channel's folder is found by its stamp, so a new name relabels that
+          same folder instead of building a second one. */}
+      <div className="border-t border-border mt-4 pt-4" data-testid="weixin-session-folder">
+        <SettingsToggle
+          label={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder')}
+          description={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
+          checked={folderOn}
+          disabled={readOnly}
+          onChange={toggleFolder}
+        />
+        {folderOn && (
+          <div className="mt-4">
+            <SettingsInput
+              label={i18nT('pages.settings.botChannelPanel.session_folder_name')}
+              description={i18nT('pages.settings.weixinPanel.created_for_you_when_you_turn_this_on_if_it_does')}
+              value={folderName}
+              disabled={readOnly}
+              placeholder={CHANNEL_NAME}
+              onChange={setFolderName}
+              {...ime.bindComposition({
+                onBlur: commitFolderName,
+              })}
+              onKeyDown={e => {
+                if (e.key !== 'Enter') return
+                // Early-return BEFORE the blur: a committing IME Enter must not commit.
+                if (ime.isComposing(e)) return
+                e.currentTarget.blur()
+              }}
+            />
+            {folderSaved && (
+              <p
+                className="inline-flex items-center gap-1.5 text-[12px] text-ok mt-1 mb-0"
+                role="status"
+                data-testid="weixin-session-folder-saved"
+              >
+                <Check size={13} /> {i18nT('pages.settings.botChannelPanel.saved')}
+              </p>
+            )}
+          </div>
+        )}
+        {!!data?.session_folder && (
+          <ChannelFolderBackfill
+            namespace="weixin"
+            folderName={data.session_folder}
+            disabled={readOnly}
+            testId="session-folder-backfill"
+          />
+        )}
+        {/* Outside the `folderOn` block on purpose: when an ENABLE is rejected
+            the revert returns the switch to the server's value — off, since the
+            server has no folder — so an error nested in that block would unmount
+            before it could paint and the failure would be silent.
+            No hand-off: `folderName` is the rejected draft this failure is about —
+            the hook deliberately keeps the typed text so it can be corrected, and
+            the navigation would discard it. */}
+        <ErrorNotice
+          variant="inline"
+          className="mt-1 text-[11.5px]"
+          message={saveError}
+          testId="weixin-session-folder-error"
+        />
+      </div>
 
       <p className="text-[11.5px] text-muted m-0">
         {i18nT('pages.settings.weixinPanel.group_chats_are_not_supported_ilink_bot_identiti')}{' '}

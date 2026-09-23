@@ -13,7 +13,10 @@ authorization boundary. This module makes the mapping authenticated:
 
 * :func:`publish_session_pid` — the ONLY legitimate write path (gateway-side).
   Writes the ``.txt`` file plus a ``session_pid_<pid>.sig`` sidecar containing
-  an HMAC-SHA256 over ``"<pid>:<session_key>"``, keyed with a subkey **derived
+  an HMAC-SHA256 over ``"<pid>:<body>"`` — *body* being the full published
+  ``.txt`` content: the session key alone (legacy), or the session key plus a
+  second line carrying the process START TOKEN (PID-recycle guard; see
+  below). The MAC is keyed with a subkey **derived
   from** the SEL trust root (``sel_hmac.key`` — the same key that makes the
   security event log tamper-evident, and whose reads are deny-listed for agent
   shells in ``security.py``) via a domain-separation label. The raw root key
@@ -22,6 +25,17 @@ authorization boundary. This module makes the mapping authenticated:
 * :func:`verify_session_pid` — used by STRICT identity resolvers
   (state-mutating MCP tools). Returns the session key only when the sidecar
   verifies; missing/invalid signature fails closed to ``""``.
+
+PID-recycle guard: binding only the pid NUMBER would let a mapping keep
+verifying once the OS recycled the pid, answering for the NEW process with
+the previous owner's session key until the next restart's orphan sweep.
+Publication records the process
+incarnation (``platform_compat.get_process_start_id`` — the same identity
+``session_pid.py`` writes into its ``<gw>:<pid>:<start_token>`` sweep
+records) and BOTH readers refuse on a proven mismatch, while an absent
+(legacy file) or unreadable (Windows) token stays "unknown", never a
+mismatch. Same-uid only: this is a robustness/misattribution guard, not a
+privilege boundary — the recycled process already runs as the same user.
 
 Why forgery dies: an agent cannot read ``sel_hmac.key`` (deny-listed), so it
 cannot produce a valid sidecar for a forged ``.txt``. Replaying another pid's
@@ -40,7 +54,7 @@ Threat model — what the sidecar does and does NOT defend against:
   own pid to another slot's key — no valid sidecar can be produced without
   the deny-listed root key), cross-pid replay (copying another pid's
   ``.txt``/``.sig`` pair — the pid is bound into the MAC), tampering
-  (redirecting a signed ``.txt`` — the old MAC no longer matches), and
+  (redirecting a signed ``.txt`` — the MAC does not match the new bytes), and
   symlink planting at the predictable paths on BOTH sides: publication uses
   ``atomic_write``/``os.replace`` (swaps a symlink out rather than following
   it), and verification opens with ``O_NOFOLLOW`` + regular-file check so a
@@ -76,11 +90,13 @@ import hmac
 import logging
 import os
 import stat
+import threading
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
-from kiro_crew.sel import sel_hmac_key_path
+from kiro_crew.sel import _sel_hmac_key_bytes, sel_hmac_key_path
 
 logger = logging.getLogger(__name__)
 
@@ -125,14 +141,142 @@ def _load_hmac_key() -> bytes | None:
     would let a first-touch race mint a key the SEL then distrusts. The path
     comes from :func:`kiro_crew.sel.sel_hmac_key_path` so both protocols
     always anchor on the same file.
+
+    The FILE is authoritative when it loads: it is the anchor every other
+    process resolves independently, so a publisher must not sign with anything
+    else while a verifier can still read it. When the file does NOT load, fall
+    back to the identical bytes the live ``SecurityEventLog`` validated at init
+    (:func:`kiro_crew.sel.sel_hmac_key_bytes`). Without that fallback this
+    protocol dies permanently the moment the resolved path stops resolving.
+    :func:`kiro_crew.sel.sel_hmac_key_path` re-resolves per call, so
+    a key relocated by a concurrent process (legacy -> ``trust/`` migration) is
+    followed rather than mourned; this fallback still carries the cases no path
+    can resolve away — deleted, chmod'd, truncated, or a relocation whose bytes
+    do not match the anchor and so are deliberately not adopted — where SEL
+    itself keeps signing from its cached copy and would otherwise leave every
+    identity-dependent MCP tool dead with no failing audit chain to point at it.
     """
     try:
         raw = sel_hmac_key_path().read_bytes()
     except OSError:
-        return None
-    if len(raw) < _HMAC_KEY_MIN_BYTES:
-        return None
-    return raw
+        raw = b""
+    if len(raw) >= _HMAC_KEY_MIN_BYTES:
+        # The FILE is intact — the only state every OTHER process can observe
+        # too — so re-arm both reports: a later break deserves a fresh
+        # operator-facing message rather than the debug line a retained entry
+        # would produce. Without this a trust root that breaks, is restored,
+        # then breaks again is silent, in the one case (long-lived gateway,
+        # never restarted) where the log is the only signal there is.
+        _clear_trust_root_reports()
+        return raw
+    live = _sel_hmac_key_bytes()
+    if live is not None:
+        _report_trust_root_broken()
+    return live
+
+
+_report_lock = threading.Lock()
+# ``(kind, resolved path)`` pairs already reported, so each operator-facing
+# message is emitted once per path per process instead of once per session
+# claim. Guarded by ``_report_lock``: publication runs on concurrent session
+# claims, and an unlocked check-then-add lets two of them both pass the
+# membership test and emit duplicate reports.
+_reported: set[tuple[str, str]] = set()
+
+
+def _report_once(kind: str) -> tuple[bool, str]:
+    """Claim the first report of *kind* for the current resolved path.
+
+    Returns ``(is_first, path)``. Keyed on the path so a genuine relocation is
+    reported again rather than suppressed by the previous location's entry, and
+    on the KIND so the two messages below — which tell an operator different
+    things — never silence each other.
+    """
+    path = str(sel_hmac_key_path())
+    key = (kind, path)
+    with _report_lock:
+        first = key not in _reported
+        _reported.add(key)
+    return first, path
+
+
+def _clear_trust_root_reports() -> None:
+    """Re-arm every report for the current resolved path."""
+    path = str(sel_hmac_key_path())
+    with _report_lock:
+        _reported.difference_update({k for k in _reported if k[1] == path})
+
+
+def _report_trust_root_broken() -> None:
+    """Report a broken key FILE that this process survived from memory.
+
+    Signing succeeds here, so nothing else in this process would complain — but
+    the file is what every OTHER process resolves, independently and fresh. A
+    verifier that never held these bytes still fails closed, so staying quiet
+    would move the original silent failure one layer over rather than remove
+    it: capability dead elsewhere, clean log here.
+    """
+    first, path = _report_once("file_broken")
+    if not first:
+        logger.debug("SEL trust root %s still unreadable (signing from memory)", path)
+        return
+    logger.error(
+        "SEL trust root %s is unreadable or shorter than %d bytes. This process "
+        "keeps signing session identities from the key bytes SecurityEventLog "
+        "validated at its own init, so publication still succeeds HERE — but "
+        "every other process resolves that file independently, so a verifier "
+        "which never held those bytes refuses the identity and sub-agent "
+        "dispatch and memory writes fail there. Restore the file: the in-memory "
+        "fallback lasts only as long as this process. Repeat occurrences log at "
+        "debug.",
+        path,
+        _HMAC_KEY_MIN_BYTES,
+    )
+
+
+def _report_signing_unavailable() -> None:
+    """Report a trust root this process cannot sign with at all, once per path.
+
+    Publication happens on every session claim, so an unthrottled log drowns
+    the file (observed at several lines a minute) — and a message that names
+    only the mechanism ("published unsigned") leaves an operator with no way to
+    connect it to the capabilities that just disappeared. This names the
+    consequence and the path to fix.
+    """
+    first, path = _report_once("unsignable")
+    if not first:
+        logger.debug("session identity signing still unavailable (trust root %s)", path)
+        return
+    logger.error(
+        "cannot sign session identities: SEL trust root %s is unreadable or "
+        "shorter than %d bytes, so every session_pid mapping is published "
+        "unsigned. Strict identity resolvers refuse an unsigned mapping, which "
+        "means the MCP tools that require a verified session — sub-agent "
+        "dispatch and memory writes among them — are refused in sandboxed "
+        "sessions until this is fixed. Restore the key file at that path, or "
+        "restart the gateway if another process relocated it. Repeat "
+        "occurrences log at debug.",
+        path,
+        _HMAC_KEY_MIN_BYTES,
+    )
+
+
+def signing_health() -> tuple[bool, Path]:
+    """Report whether this process can sign session identities, and from where.
+
+    For diagnostic surfaces (``kirocrew doctor``), which is the only place that
+    asks proactively: publication itself reports through
+    :func:`_report_signing_unavailable`, so an operator whose gateway is
+    actually claiming sessions already gets one loud line. This answers the
+    same question without waiting for a claim, and deliberately does NOT
+    construct :class:`~kiro_crew.sel.SecurityEventLog` — creating the trust
+    root as a side effect of asking about it would make the check report on a
+    state it just produced, and would put a directory mkdir plus a key write
+    behind a read-only command.
+
+    Blocking file I/O: callers on an event loop must offload it.
+    """
+    return _load_hmac_key() is not None, sel_hmac_key_path()
 
 
 def _derive_subkey(root: bytes) -> bytes:
@@ -147,21 +291,71 @@ def _derive_subkey(root: bytes) -> bytes:
     return hmac.new(root, _SUBKEY_DOMAIN, hashlib.sha256).digest()
 
 
-def _compute_sig(key: bytes, pid: int | str, session_key: str) -> str:
+def _compute_sig(key: bytes, pid: int | str, payload: str) -> str:
+    """MAC over ``"<pid>:<payload>"``, *payload* being the canonical ``.txt``
+    body: the bare session key (legacy) or ``"<session_key>\\n<start_token>"``
+    (recycle-guarded — see :func:`publish_session_pid`). Binding the pid
+    blocks cross-pid replay; covering the whole body means the start token,
+    when present, is signed — flipping only the token invalidates the MAC.
+    A legacy body produces a byte-identical message to the pre-token scheme,
+    so every signed mapping written before the format change still verifies.
+    """
     subkey = _derive_subkey(key)
-    return hmac.new(
-        subkey, f"{pid}:{session_key}".encode("utf-8"), hashlib.sha256
-    ).hexdigest()
+    return hmac.new(subkey, f"{pid}:{payload}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _parse_mapping_body(raw: str) -> tuple[str, str | None] | None:
+    """Split a ``.txt`` body into ``(session_key, start_token)``.
+
+    Dual-parse, following ``session_pid.py``'s legacy-vs-guarded record
+    handling (``<gw>:<pid>`` vs ``<gw>:<pid>:<start_token>``): one line is
+    the legacy pre-token form (token ``None``); two lines are
+    ``<session_key>\\n<start_token>``. The token rides a second LINE rather
+    than a colon field because — unlike that record's integer fields — the
+    session key itself contains colons (``dashboard:chat-7-...``), so a
+    colon split could not tell a legacy key from a key+token pair. Anything
+    else was never written by :func:`publish_session_pid` — refuse
+    (``None``) rather than guess a parse.
+    """
+    lines = raw.strip().split("\n")
+    if len(lines) == 1:
+        session_key = lines[0].strip()
+        return (session_key, None) if session_key else None
+    if len(lines) == 2:
+        session_key, token = lines[0].strip(), lines[1].strip()
+        return (session_key, token) if session_key and token else None
+    return None
+
+
+def _pid_recycled(pid: int | str, recorded_token: str) -> bool:
+    """True iff *pid*'s LIVE start token is readable and differs from
+    *recorded_token* — positive evidence the pid number was recycled to a
+    different process since the mapping was published.
+
+    The asymmetry here is the whole correctness argument (mirroring the
+    sweep guard around ``session_pid.py``'s ``_pid_start_token``): a
+    MISMATCH proves the pid now names a DIFFERENT process, so answering
+    with the mapped key would attribute the new process to the previous
+    owner's session — refuse, on the strict AND the lenient path. An
+    UNREADABLE live token (Windows, exited process, permission) is merely
+    UNKNOWN, never a mismatch — callers keep today's behaviour there, as
+    they do for an ABSENT recorded token (legacy file).
+    """
+    try:
+        live = platform_compat.get_process_start_id(int(pid))
+    except (TypeError, ValueError):
+        return False  # unparseable pid — identity unknown, not a mismatch
+    return live is not None and live != recorded_token
 
 
 def publish_session_pid(pid: int, session_key: str) -> None:
     """Publish the pid -> session-key mapping with its HMAC sidecar.
 
     Gateway-side only. Writes ``session_pid_<pid>.txt`` (the lenient-reader
-    contract, unchanged) and ``session_pid_<pid>.sig`` (the strict-resolver
+    contract) and ``session_pid_<pid>.sig`` (the strict-resolver
     trust anchor). When the SEL key is unavailable the mapping is published
     unsigned and any stale sidecar is removed — strict resolvers then fail
-    closed for this pid (pre-sidecar behavior) instead of trusting a
+    closed for this pid instead of trusting a
     signature that no longer matches.
 
     Both files are written via :func:`kiro_crew.atomic_write.atomic_write`
@@ -171,22 +365,36 @@ def publish_session_pid(pid: int, session_key: str) -> None:
     ``session_pid_<pid>.txt``/``.sig`` pointing at an arbitrary writable
     file — an in-place open would follow it and truncate the target.
     ``os.replace`` swaps the symlink itself out instead of following it.
+
+    PID-recycle guard: when the live process's start token is
+    readable (``platform_compat.get_process_start_id`` — the same
+    incarnation identity ``session_pid.py`` records in its
+    ``<gw>:<pid>:<start_token>`` sweep entries), it is appended to the
+    ``.txt`` as a second line and covered by the MAC, so readers can tell
+    "still the process this mapping was published for" from "the OS
+    recycled this pid number". An unreadable token (Windows, probe failure)
+    degrades to the legacy single-line form — readers then treat identity
+    as unknown, exactly as for a legacy file.
     """
     cfg = config_dir()
-    atomic_write(_txt_path(pid, cfg), session_key)
+    token = platform_compat.get_process_start_id(pid)
+    # The "\n" guard keeps a pathological multi-line session key (never
+    # produced by any surface — keys are single-line ``surface:slot`` shapes)
+    # from aliasing the legacy and token-bearing forms under one MAC.
+    if token and "\n" not in session_key:
+        body = f"{session_key}\n{token}"
+    else:
+        body = session_key
+    atomic_write(_txt_path(pid, cfg), body)
     key = _load_hmac_key()
     if key is None:
-        logger.warning(
-            "sel_hmac.key unavailable — session_pid_%s published unsigned "
-            "(strict resolvers will refuse this identity)",
-            pid,
-        )
+        _report_signing_unavailable()
         try:
             _sig_path(pid, cfg).unlink(missing_ok=True)
         except OSError:
             pass
         return
-    atomic_write(_sig_path(pid, cfg), _compute_sig(key, pid, session_key))
+    atomic_write(_sig_path(pid, cfg), _compute_sig(key, pid, body))
 
 
 # Upper bound for mapping-file reads. Session keys are short strings
@@ -277,27 +485,49 @@ def read_session_pid_txt(pid: int | str, cfg: Path | None = None) -> str:
     *cfg* overrides the mapping directory (callers that already resolved
     ``config_dir()`` pass it through); defaults to :func:`config_dir`.
     Returns ``""`` on any refusal or I/O error. Never raises.
+
+    A PROVEN pid-recycle (recorded start token present and the live token
+    readable but different — see :func:`_pid_recycled`) refuses on this
+    lenient path too, deliberately: several call sites try
+    :func:`verify_session_pid` first and fall back here (``peer_resolve``),
+    so a mismatch surfaced only from the strict path would be silently
+    recovered by the fallback and the stale attribution kept. A mismatch is
+    positive evidence of a wrong owner — unlike an absent or unreadable
+    token, which is merely unknown and resolves as before.
     """
     txt = _read_regular_nofollow(_txt_path(pid, cfg if cfg is not None else config_dir()))
-    return txt.strip() if txt is not None else ""
+    if txt is None:
+        return ""
+    parsed = _parse_mapping_body(txt)
+    if parsed is None:
+        return ""
+    session_key, token = parsed
+    if token is not None and _pid_recycled(pid, token):
+        return ""
+    return session_key
 
 
-def verify_session_pid(pid: int | str) -> str:
+def verify_session_pid(pid: int | str, cfg: Path | None = None) -> str:
     """Return the session key for *pid* iff its HMAC sidecar verifies.
 
     Fails closed to ``""`` on: missing ``.txt``, missing ``.sig``, a symlink
     or non-regular file at either path (see :func:`_read_regular_nofollow`),
     missing or short SEL key, or signature mismatch. Never raises.
+
+    *cfg* overrides the mapping directory (mirrors
+    :func:`read_session_pid_txt`); defaults to :func:`config_dir`.
     """
-    cfg = config_dir()
+    if cfg is None:
+        cfg = config_dir()
     txt = _read_regular_nofollow(_txt_path(pid, cfg))
     sig_raw = _read_regular_nofollow(_sig_path(pid, cfg))
     if txt is None or sig_raw is None:
         return ""
-    session_key = txt.strip()
+    parsed = _parse_mapping_body(txt)
     sig = sig_raw.strip()
-    if not session_key or not sig:
+    if parsed is None or not sig:
         return ""
+    session_key, token = parsed
     key = _load_hmac_key()
     if key is None:
         # Distinguishable from the MAC-mismatch warning below: this branch
@@ -317,11 +547,25 @@ def verify_session_pid(pid: int | str) -> str:
             pid,
         )
         return ""
-    expected = _compute_sig(key, pid, session_key)
+    # Recompute over the canonical body: legacy files (no token) produce the
+    # exact pre-change message, so existing signed mappings keep verifying.
+    payload = session_key if token is None else f"{session_key}\n{token}"
+    expected = _compute_sig(key, pid, payload)
     if not hmac.compare_digest(expected, sig):
         logger.warning(
             "session_pid_%s signature mismatch — refusing identity "
             "(possible forgery or stale sidecar)",
+            pid,
+        )
+        return ""
+    # Recycle check AFTER the MAC: the recorded token is only meaningful
+    # once the signature proves it is the one the publisher wrote. Mismatch
+    # = the pid was recycled → refuse; absent/unreadable = unknown → resolve
+    # (see _pid_recycled for why the asymmetry is load-bearing).
+    if token is not None and _pid_recycled(pid, token):
+        logger.warning(
+            "session_pid_%s start-token mismatch — pid was recycled; "
+            "refusing the previous owner's session identity",
             pid,
         )
         return ""

@@ -7,8 +7,17 @@ import { safeSetItem } from '../../utils/safeStorage'
 
 export type ContentWidth = 'compact' | 'comfortable' | 'full'
 
+/** Chat message bubble font-size bounds, in px. Mirrors useTerminalFont's
+ *  MIN/MAX_TERMINAL_FONT_SIZE bracket — below 12 body text is unreadable,
+ *  above 22 a bubble wastes more width wrapping than it gains in legibility. */
+export const MIN_MESSAGE_FONT_SIZE = 12
+export const MAX_MESSAGE_FONT_SIZE = 22
+export const DEFAULT_MESSAGE_FONT_SIZE = 14
+
 /** Send-key mode: enter (Enter sends), ctrl-enter (Ctrl+Enter sends), enter-ctrl-newline (Enter sends, Ctrl+Enter = newline) */
 export type SendMode = 'enter' | 'ctrl-enter' | 'enter-ctrl-newline'
+
+export type MemoryMode = 'persistent' | 'incognito' | 'temporary'
 
 export const CONTENT_WIDTH: Record<ContentWidth, { messages: string; input: string }> = {
   compact: { messages: '800px', input: '816px' },
@@ -35,19 +44,59 @@ export interface ChatConfig {
   followUpLayout: FollowUpLayout
   streamMode: StreamMode
   showContextPct: boolean
+  /** Show used/window token counts in the inline context readout. */
+  showContextTokens: boolean
   defaultAutopilot: boolean
   /** Pin the most recent prompt above the fold as a sticky banner. */
   pinLastPrompt: boolean
+  /** Spellcheck the message composer. When off, the composer input carries
+   *  `spellCheck={false}` so the browser draws no red misspelled-word
+   *  underlines. Default true — the behaviour every install has always had. */
+  spellcheck: boolean
+  /** Opt in to giving a folder that holds nothing no body at all, so it costs one
+   *  row instead of two. Default false: this changes how every empty folder in
+   *  the sidebar reads, and the row it removes is the only labelled "New chat in
+   *  <name>" affordance those folders have, so it is the user's call rather than
+   *  something a client with no stored config inherits. */
+  hideEmptyFolderBody: boolean
+  /** Which pane edge hosts the turn minimap. The right-edge variant replaces
+   *  the native scrollbar while the rail is shown. */
+  minimapSide: MinimapSide
+  /** Keep a long paste as full editable text in the composer instead of
+   *  collapsing it into a `[ Paste #N · M lines ]` chip. Default false: the chip
+   *  is what keeps the composer (and the sent bubble) from laying out a
+   *  hundred-thousand-line paste on the main thread, so the full-text shape is
+   *  the user's call rather than something a client with no stored config
+   *  inherits. Cmd/Ctrl+Shift+V remains the per-paste escape hatch either way. */
+  showFullPastes: boolean
+  /** Font size in px for message bubble body text (paragraphs, list items),
+   *  clamped to [MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE]. Scoped to the
+   *  message content itself — sidebar, session list, and other chrome are
+   *  unaffected, same as `contentWidth`. */
+  messageFontSize: number
 }
 
 export type FileChipStyle = 'expanded' | 'minimal'
 export type FollowUpLayout = 'multiline' | 'scroll'
+export type MinimapSide = 'left' | 'right'
 /** Per-char streaming entrance animation. 'immediate' restores the pre-buffer
  *  behavior (raw chunk paint + tail glow only). */
 export type StreamMode = 'immediate' | 'smooth'
 
 const LS_KEY = 'mc-chat-config'
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: true, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, defaultAutopilot: false, pinLastPrompt: true }
+/** `tagColumnsEnabled` MUST default to false: board-vs-list is derived from
+ *  this client-only flag AND the server-side column list, so a default of true
+ *  means any client with no stored config (a new user, a second browser, a
+ *  fresh Electron profile, a synced instance that inherited tag_boards.json,
+ *  or a client whose quota-safe write was dropped) opens straight into board
+ *  view the moment one column exists on the gateway — without anyone choosing
+ *  it. The sidebar's view toggle persists this flag BEFORE creating its first
+ *  column, so a deliberate board user always has an explicit `true` stored and
+ *  is unaffected by the default. */
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+
+const clampMessageFontSize = (n: number): number =>
+  Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
 
 const VALID_FILE_CHIP_STYLES: ReadonlySet<FileChipStyle> = new Set(['expanded', 'minimal'])
 const VALID_FOLLOW_UP_LAYOUTS: ReadonlySet<FollowUpLayout> = new Set(['multiline', 'scroll'])
@@ -78,8 +127,21 @@ export function loadChatConfig(): ChatConfig {
     if (!VALID_FOLLOW_UP_LAYOUTS.has(cfg.followUpLayout)) cfg.followUpLayout = 'scroll'
     if (!VALID_STREAM_MODES.has(cfg.streamMode)) cfg.streamMode = 'smooth'
     if (typeof cfg.showContextPct !== 'boolean') cfg.showContextPct = false
+    if (typeof cfg.showContextTokens !== 'boolean') cfg.showContextTokens = false
     if (typeof cfg.showTurnStats !== 'boolean') cfg.showTurnStats = true
     if (typeof cfg.pinLastPrompt !== 'boolean') cfg.pinLastPrompt = true
+    // Coerced, not trusted: a stored non-boolean must not decide whether the
+    // composer draws the browser's red spellcheck underlines.
+    if (typeof cfg.spellcheck !== 'boolean') cfg.spellcheck = true
+    // Coerced, not trusted: a stored non-boolean would otherwise make the empty
+    // folder shape depend on a truthy string.
+    if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false
+    // Coerced, not trusted: a stored non-boolean would otherwise let a truthy
+    // string turn off paste collapsing, which is the main-thread guard for a
+    // very large paste.
+    if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
+    if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
+    cfg.messageFontSize = typeof cfg.messageFontSize === 'number' ? clampMessageFontSize(cfg.messageFontSize) : DEFAULT_MESSAGE_FONT_SIZE
     return cfg
   }
   catch { return { ...DEFAULTS } }
@@ -94,12 +156,19 @@ export interface DashboardConfig {
   restore_sessions: boolean
   restore_window_minutes: number
   merge_queued_messages: boolean
+  default_memory_mode: MemoryMode
   widget_density: 'more' | 'less'
-  verbosity: 'default' | 'concise' | 'ultra'
+  use_builtin_browser: boolean
+  verbosity: 'default' | 'concise' | 'ultra' | 'answer_only'
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
   link_previews: boolean
+  link_patterns: { pattern: string; url: string }[]
   mcp_app_panel: boolean
+  auto_open_git_panel: boolean
+  session_card_source_links: boolean
   folder_suggestions_enabled: boolean
+  model_picker_hidden_models: string[]
+  model_picker_configured?: boolean
 }

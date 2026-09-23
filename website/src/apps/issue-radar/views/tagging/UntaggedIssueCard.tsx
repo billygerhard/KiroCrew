@@ -1,10 +1,12 @@
 import { Check, Plus, X } from 'lucide-react'
-import type { RepoLabel, SuggestedLabel, UntaggedIssue } from '../../api'
+import type { RepoLabel, RepoRef, SuggestedLabel, UntaggedIssue } from '../../api'
+import { providerTerms, readOnlyHint } from '../../lib/links'
 import { readableText, relativeTime } from '../../lib/format'
 import { safeHttpUrl } from '../../../../lib/safeUrl'
 import ShimmerLine from '../../components/ShimmerLine'
 
 import { i18nT } from '../../../../i18n/t'
+import ErrorNotice from '../../../../components/ErrorNotice'
 /** One row of the untagged queue — deliberately ONE line high, so a 50-issue
  * batch is scannable without scrolling past a card per issue.
  *
@@ -25,7 +27,7 @@ import { i18nT } from '../../../../i18n/t'
  * happened.
  */
 export default function UntaggedIssueCard({
-  issue, staged, suggestions, analyzed, labels, canWrite, applying, busy, applied, error,
+  issue, staged, suggestions, analyzed, labels, canWrite, repoRef, applying, busy, applied, error,
   onToggleSelect, selected, onStage, onApply, suggesting,
 }: {
   issue: UntaggedIssue
@@ -39,6 +41,10 @@ export default function UntaggedIssueCard({
   analyzed: boolean
   labels: RepoLabel[]
   canWrite: boolean
+  /** The active repo, for the provider's own vocabulary and for why a write is
+   * refused -- the remedy differs between "you lack access" and "this provider
+   * has no writes at all". Mirrors LabelsPanel, its sibling in this view. */
+  repoRef: RepoRef
   applying: boolean
   /** True while SOME apply is in flight, anywhere on the page. Applies are not
    * serialized server-side, so only one may run at a time. */
@@ -159,7 +165,9 @@ export default function UntaggedIssueCard({
               // aria-label, not an sr-only span: every row's button reads "Add",
               // so the number is what makes each one identifiable.
               aria-label={i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.add_labels_to', { number: issue.number })}
-              title={canWrite ? i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.add_these_labels_on_github') : i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.read_only_repo_needs_triage_or_push_access')}
+              title={canWrite
+                ? i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.add_these_labels_on', { provider: providerTerms(repoRef).providerName })
+                : readOnlyHint(repoRef, i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.read_only_repo_needs_triage_or_push_access'))}
               className="inline-flex items-center gap-1 text-[12px] px-2 py-0.5 rounded border border-accent/40 text-accent hover:bg-accent-subtle disabled:opacity-30 disabled:hover:bg-transparent cursor-pointer bg-transparent"
             >
               <Plus size={11} className={applying ? 'animate-pulse' : ''} /> {i18nT('apps.issueRadar.views.tagging.untaggedIssueCard.add')}
@@ -168,7 +176,8 @@ export default function UntaggedIssueCard({
         </span>
       </div>
 
-      {error && <div className="text-[12px] text-danger mt-1 ml-[42px]">{error}</div>}
+      {/* Applying labels acts on the persisted issue; the card has no input. */}
+      <ErrorNotice message={error} variant="inline" askAgent className="mt-1 ml-[42px]" />
     </div>
   )
 }

@@ -19,6 +19,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 
 import {
+  BOARD_WIDTH,
   DECK_TABS,
   countBoardSlides,
   filterDecks,
@@ -285,6 +286,37 @@ describe('board helpers', () => {
     unmount()
   })
 
+  it('promotes both board frames onto their own compositing layer without losing the scale', () => {
+    // BoardFrame only mounts its iframe once it has measured a container
+    // width, and jsdom reports 0 — pin the measurement so the scaled frame
+    // actually renders and its transform can be asserted.
+    const rect = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({
+      width: 960, height: 540, top: 0, left: 0, right: 960, bottom: 540, x: 0, y: 0,
+      toJSON: () => ({}),
+    } as DOMRect)
+    try {
+      const { container, unmount } = render(
+        <>
+          <BoardFrame html="<div class='slide'>a</div>" title="board" />
+          <BoardThumb html="<div class='slide'>a</div>" width={52} title="thumb" />
+        </>,
+      )
+      const frames = Array.from(container.querySelectorAll('iframe'))
+      expect(frames.length).toBe(2)
+      // `translateZ(0)` must be COMPOSED onto the scale, not replace it: the
+      // scale is each frame's whole geometry, and a bare translateZ(0) would
+      // render the 1920px document at full size inside the preview box.
+      expect(frames[0].style.transform).toBe(`scale(${960 / BOARD_WIDTH}) translateZ(0)`)
+      expect(frames[1].style.transform).toBe(`scale(${52 / BOARD_WIDTH}) translateZ(0)`)
+      for (const frame of frames) {
+        expect(frame.style.transformOrigin).toBe('top left')
+      }
+      unmount()
+    } finally {
+      rect.mockRestore()
+    }
+  })
+
   it('collects theme accents in order and skips gaps', () => {
     expect(templateAccents({ accent1: '#111', accent3: '#333' })).toEqual(['#111', '#333'])
     expect(templateAccents(undefined)).toEqual([])
@@ -330,6 +362,16 @@ vi.mock('../apps/pptx-maker/api', async () => {
 vi.mock('../api/client', () => ({
   api: { createChatSlot: vi.fn(async () => ({ key: 'pptx-1' })), revealPath: vi.fn(async () => ({})) },
 }))
+
+// Keep the real router (MemoryRouter, the route hooks the page relies on) but
+// make `useNavigate` observable, so a test can assert that a failed deck-start
+// does NOT navigate. Everything else resolves to the actual module.
+const navigateSpy = vi.fn()
+vi.mock('react-router-dom', async () => {
+  const actual =
+    await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return { ...actual, useNavigate: () => navigateSpy }
+})
 
 // The animated SVG renderer fetches and mutates real DOM; the page tests care
 // that a slide slot renders, not how the SVG is assembled. The sanitiser helper
@@ -529,13 +571,36 @@ describe('PptxMakerPage', () => {
     await renderPage()
     await userEvent.click(await screen.findByText('Spec mode'))
     await waitFor(() =>
-      // DOUBLE hyphen: `bridges._safe_link_name` registers the agent as
-      // `pptx-maker--pptx-maker-spec.json`, and that filename is what
-      // `kiro-cli --agent` resolves against. The slash form matches nothing and
-      // `--agent` falls back to the default agent instead of failing, so pinning
-      // the wrong spelling here would let a silently agent-less chat pass.
-      expect(api.createChatSlot).toHaveBeenCalledWith(undefined, 'pptx-maker--pptx-maker-spec'),
+      // The DECLARED agent name: dispatch resolves the value against each
+      // registered config's `name` field (`_scan_materialized_agents`), not the
+      // `pptx-maker--pptx-maker-spec.json` filename stem the registrar writes.
+      // The stem (and the slash namespace form) match nothing in that set, and
+      // resolution falls back to the default agent instead of failing, so
+      // pinning a wrong spelling here would let a silently agent-less chat pass.
+      expect(api.createChatSlot).toHaveBeenCalledWith(
+        undefined, 'pptx-maker-spec', undefined, undefined, 'persistent',
+      ),
     )
+  })
+
+  it('surfaces a visible error and does not navigate when the deck-start create fails', async () => {
+    // The reporter of the flash-and-return symptom inferred that a failed
+    // create was swallowed. It is not: a rejected createChatSlot sets the
+    // mutation's error state, which renders an ErrorNotice under the buttons,
+    // and onSuccess (the only navigate site) never runs. This pins that guard so
+    // the visible-error path cannot be quietly removed and reopen the report.
+    const { api } = await import('../api/client')
+    ;(api.createChatSlot as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('deck start blew up'),
+    )
+    await renderPage()
+    await userEvent.click(await screen.findByText('Vibe mode'))
+    // The error is shown to the user (ErrorNotice renders role="alert").
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('deck start blew up')
+    // And the bounce the reporter described (navigate away with nothing shown)
+    // does not happen: the only navigate call is in onSuccess.
+    expect(navigateSpy).not.toHaveBeenCalled()
   })
 
   it('switches to the library view and lists styles', async () => {

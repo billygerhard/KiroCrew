@@ -8,6 +8,7 @@ of a call that never became a run.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -27,6 +28,9 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(H, "_HOOK_STORE_PATH", Path(tmp_path) / "hooks.json")
     monkeypatch.setattr(H, "_sel", lambda: MagicMock())
     monkeypatch.setattr(H, "_legacy_hook_token", lambda: "")
+    monkeypatch.setattr(
+        H, "_installed_agent_names", lambda: {"kirocrew", "code-reviewer", "oncall"}
+    )
     # The failed-auth throttle, the replay seen-set and the in-flight session
     # registry are all process-global, so leaking them between tests would make a
     # later 401 come back as a 429, or a fresh call come back as a 409.
@@ -47,12 +51,26 @@ def _req(
     headers=None,
     sign_with: str | None = None,
     timestamp: int | None = None,
+    user: str = "local-app",
+    app_token: str = "",
+    owner_id: str = "",
 ):
     """Build a mocked request whose raw body matches its parsed body.
 
     ``sign_with`` adds the timestamp + signature headers for that signing
-    secret, computed over the same bytes ``request.read()`` returns — the
+    secret, computed over the same bytes ``request.read()`` returns -- the
     handler verifies raw bytes, so the test double has to be byte-accurate.
+
+    ``user`` / ``app_token`` / ``owner_id`` describe the CALLER, because
+    ``api_webhook_token_create`` is owner-gated
+    (``handlers._shared.require_owner_dashboard_request``) and the predicate
+    reads the claims the token-auth middleware publishes plus
+    ``state.owner_id``. The defaults are the standalone-local owner shape --
+    ``owner_id == ""`` with the signed local bootstrap subject ``local-app`` --
+    which is the same shape ``test/dashboard_owner_helpers.NoConfiguredOwner``
+    encodes for the fixtures that go through a ``TestClient``. A test that wants
+    a non-owner passes ``user=`` and ``owner_id=``; one that wants an app token
+    passes ``app_token=``.
     """
     hdrs = dict(headers or {})
     raw = b"" if body is None else json.dumps(body).encode("utf-8")
@@ -61,7 +79,11 @@ def _req(
         hdrs[webhooks.TIMESTAMP_HEADER] = str(stamp)
         hdrs[webhooks.SIGNATURE_HEADER] = webhooks.sign_payload(sign_with, stamp, raw)
     req = make_mocked_request(method, path, match_info=match_info or {}, headers=hdrs)
-    req.app["state"] = MagicMock()
+    state = MagicMock()
+    state.owner_id = owner_id
+    req.app["state"] = state
+    req["user"] = user
+    req["app"] = app_token
     # make_mocked_request's app is a Mock, so .get() would hand back a Mock
     # rather than the port the real Application holds.
     req.app.get = lambda key, default=None: {"port": 6776}.get(key, default)
@@ -197,9 +219,13 @@ class TestWebhooksRead:
 
 class TestTokenEndpoints:
     @pytest.mark.asyncio
-    async def test_create_returns_secret_once(self, wired):
+    async def test_create_returns_secret_once_with_routing(self, wired):
         resp = await H.api_webhook_token_create(
-            _req("POST", "/api/webhooks/tokens", {"label": "Review Bot"})
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                {"label": "Review Bot", "agent": "code-reviewer"},
+            )
         )
         assert resp.status == 201
         data = await _payload(resp)
@@ -207,15 +233,97 @@ class TestTokenEndpoints:
         raw = data["token"]
         assert raw.startswith(webhooks.TOKEN_PREFIX)
         assert "token_hash" not in data["entry"]
+        assert data["entry"]["agent"] == "code-reviewer"
+        assert data["entry"]["enabled"] is True
 
         listed = await _payload(await H.api_webhooks(_req("GET", "/api/webhooks")))
         assert listed["enabled"] is True
+        assert listed["tokens"][0]["agent"] == "code-reviewer"
         assert raw not in json.dumps(listed)
+
+    @pytest.mark.asyncio
+    async def test_create_requires_an_installed_destination(self, wired):
+        missing = await H.api_webhook_token_create(
+            _req("POST", "/api/webhooks/tokens", {"label": "Review Bot"})
+        )
+        assert missing.status == 400
+        assert (await _payload(missing))["code"] == "agent_required"
+
+        unknown = await H.api_webhook_token_create(
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                {"label": "Review Bot", "agent": "deleted-agent"},
+            )
+        )
+        assert unknown.status == 400
+        assert (await _payload(unknown))["code"] == "destination_agent_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_pin_commits_under_the_agents_spec_lock_and_reverifies(self, wired, monkeypatch):
+        """The template delete unlinks a spec while holding ``agents_spec_lock``
+        and counts webhook pins first; a mint or re-pin must therefore commit
+        under that lock and re-check the agent THERE, or a token can validate
+        against a file the delete is about to remove. Here the agent vanishes
+        between the loop-side pre-check and the locked commit: nothing is
+        minted, and a re-pin leaves the stored pin alone."""
+        names = [{"kirocrew", "code-reviewer", "oncall"}]
+        monkeypatch.setattr(H, "_installed_agent_names", lambda: names[-1])
+        held: list[bool] = []
+        vanish: list[str] = ["code-reviewer"]  # what a concurrent delete removes, once
+        real_lock = H.agents_spec_lock
+
+        @contextlib.contextmanager
+        def _spy_lock(agents_dir):
+            with real_lock(agents_dir):
+                held.append(True)
+                if vanish:  # the delete landed while we waited for the lock
+                    names.append(names[-1] - {vanish.pop()})
+                yield
+
+        monkeypatch.setattr(H, "agents_spec_lock", _spy_lock)
+        gone = await H.api_webhook_token_create(
+            _req("POST", "/api/webhooks/tokens", {"label": "Review Bot", "agent": "code-reviewer"})
+        )
+        assert gone.status == 400
+        assert (await _payload(gone))["code"] == "destination_agent_unavailable"
+        assert held == [True]
+        assert webhooks.token_store().count() == 0
+
+        # A re-pin walks the same path; a change that leaves the pin alone does not.
+        minted = await _payload(
+            await H.api_webhook_token_create(
+                _req("POST", "/api/webhooks/tokens", {"label": "Pager", "agent": "oncall"})
+            )
+        )
+        token_id = minted["entry"]["id"]
+        held.clear()
+        relabel = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{token_id}",
+                {"label": "Pager 2"},
+                match_info={"token_id": token_id},
+            )
+        )
+        assert relabel.status == 200 and held == []
+        vanish.append("oncall")
+        repin = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{token_id}",
+                {"agent": "oncall"},
+                match_info={"token_id": token_id},
+            )
+        )
+        assert repin.status == 400 and held == [True]
+        assert (await _payload(repin))["code"] == "destination_agent_unavailable"
+        assert webhooks.token_store().entry_for(token_id)["agent"] == "oncall"
 
     @pytest.mark.asyncio
     async def test_create_rejects_bad_label(self, wired):
         resp = await H.api_webhook_token_create(
-            _req("POST", "/api/webhooks/tokens", {"label": "  "})
+            _req("POST", "/api/webhooks/tokens", {"label": "  ", "agent": "kirocrew"})
         )
         assert resp.status == 400
         assert "required" in (await _payload(resp))["error"]
@@ -229,14 +337,100 @@ class TestTokenEndpoints:
     async def test_cap_returns_400_on_twenty_first(self, wired):
         for i in range(webhooks.MAX_TOKENS):
             r = await H.api_webhook_token_create(
-                _req("POST", "/api/webhooks/tokens", {"label": f"Bot {i}"})
+                _req(
+                    "POST",
+                    "/api/webhooks/tokens",
+                    {"label": f"Bot {i}", "agent": "kirocrew"},
+                )
             )
             assert r.status == 201
         resp = await H.api_webhook_token_create(
-            _req("POST", "/api/webhooks/tokens", {"label": "Too many"})
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                {"label": "Too many", "agent": "kirocrew"},
+            )
         )
         assert resp.status == 400
         assert "token limit reached" in (await _payload(resp))["error"]
+
+    @pytest.mark.asyncio
+    async def test_patch_updates_only_source_settings(self, wired):
+        created = await _payload(
+            await H.api_webhook_token_create(
+                _req(
+                    "POST",
+                    "/api/webhooks/tokens",
+                    {"label": "Review Bot", "agent": "code-reviewer"},
+                )
+            )
+        )
+        token_id = created["entry"]["id"]
+        resp = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{token_id}",
+                {"label": "CI callback", "agent": "oncall", "enabled": False},
+                match_info={"token_id": token_id},
+            )
+        )
+        assert resp.status == 200
+        entry = (await _payload(resp))["entry"]
+        assert entry["label"] == "CI callback"
+        assert entry["agent"] == "oncall"
+        assert entry["enabled"] is False
+        assert "token_hash" not in entry
+        assert "signing_secret" not in entry
+
+    @pytest.mark.asyncio
+    async def test_patch_reports_an_unavailable_store(self, wired):
+        store = webhooks.token_store()
+        _raw, _secret, entry = store.create("Review Bot", agent="kirocrew")
+        store.path.write_text("{truncated", encoding="utf-8")
+
+        resp = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                f"/api/webhooks/tokens/{entry['id']}",
+                {"label": "CI callback"},
+                match_info={"token_id": entry["id"]},
+            )
+        )
+
+        assert resp.status == 503
+        assert (await _payload(resp))["code"] == "store_unavailable"
+        assert store.path.read_text(encoding="utf-8") == "{truncated"
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_unknown_fields_and_legacy(self, wired, monkeypatch):
+        audit = MagicMock()
+        monkeypatch.setattr(H, "_sel", lambda: audit)
+        invalid = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                "/api/webhooks/tokens/nope",
+                {"require_signature": False},
+                match_info={"token_id": "nope"},
+            )
+        )
+        assert invalid.status == 400
+        assert (await _payload(invalid))["code"] == "invalid_source_patch"
+
+        legacy = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                "/api/webhooks/tokens/legacy",
+                {"enabled": False},
+                match_info={"token_id": "legacy"},
+            )
+        )
+        assert legacy.status == 400
+        assert (await _payload(legacy))["code"] == "legacy_credential_in_config"
+        audit.log_api_access.assert_called_once()
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "denied"
+        assert audit.log_api_access.call_args.kwargs["error"] == (
+            "legacy credential is config-managed"
+        )
 
     @pytest.mark.asyncio
     async def test_delete_unknown_is_404(self, wired):
@@ -257,12 +451,20 @@ class TestTokenEndpoints:
     async def test_revoke_one_leaves_others_authenticating(self, wired):
         a = await _payload(
             await H.api_webhook_token_create(
-                _req("POST", "/api/webhooks/tokens", {"label": "A"})
+                _req(
+                    "POST",
+                    "/api/webhooks/tokens",
+                    {"label": "A", "agent": "kirocrew"},
+                )
             )
         )
         b = await _payload(
             await H.api_webhook_token_create(
-                _req("POST", "/api/webhooks/tokens", {"label": "B"})
+                _req(
+                    "POST",
+                    "/api/webhooks/tokens",
+                    {"label": "B", "agent": "kirocrew"},
+                )
             )
         )
         resp = await H.api_webhook_token_delete(
@@ -294,9 +496,7 @@ class TestNonObjectJsonBodies:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("payload", [[], [1, 2], "text", 7, True])
     async def test_switch_rejects_non_object(self, wired, payload):
-        resp = await H.api_webhooks_switch(
-            _req("POST", "/api/webhooks/switch", payload)
-        )
+        resp = await H.api_webhooks_switch(_req("POST", "/api/webhooks/switch", payload))
         assert resp.status == 400
         assert (await _payload(resp))["error"] == "invalid JSON"
 
@@ -439,8 +639,8 @@ class TestEveryStoreTouchingHandlerIsGuarded:
     """A store failure must never reach the client as a 500.
 
     Reads refuse rather than reporting an empty file, and the shared hooks.json
-    write refuses rather than erasing the webhook contexts beside it. Those
-    refusals were being guarded one handler per review round, so this pins the
+    write refuses rather than erasing the webhook contexts beside it. Guarding
+    these refusals one handler at a time misses new handlers, so this pins the
     CLASS instead of the instances: every handler that touches a store is wrapped.
     """
 
@@ -452,8 +652,11 @@ class TestEveryStoreTouchingHandlerIsGuarded:
         store.path.write_text("{truncated", encoding="utf-8")
 
         resp = await H.api_webhook_token_delete(
-            _req("DELETE", f"/api/webhooks/tokens/{entry['id']}",
-                 match_info={"token_id": entry["id"]})
+            _req(
+                "DELETE",
+                f"/api/webhooks/tokens/{entry['id']}",
+                match_info={"token_id": entry["id"]},
+            )
         )
 
         assert resp.status == 503
@@ -466,7 +669,7 @@ class TestEveryStoreTouchingHandlerIsGuarded:
 
         Checked by reading the source rather than by exercising each route, so the
         assertion covers handlers this suite has no fixture for. Without it the
-        next handler added would repeat the same review round.
+        next handler added could reintroduce the bug unnoticed.
         """
         import inspect
         import re
@@ -491,15 +694,14 @@ class TestEveryStoreTouchingHandlerIsGuarded:
         unguarded = []
         for idx, match in enumerate(handlers):
             body_end = handlers[idx + 1].start() if idx + 1 < len(handlers) else len(source)
-            body = source[match.end():body_end]
+            body = source[match.end() : body_end]
             name = match.group(2)
             if store_call.search(body) and not match.group(1) and name not in exempt:
                 unguarded.append(name)
 
-        assert not unguarded, (
-            "these handlers touch a store but lack @_store_failure_guard: "
-            + ", ".join(unguarded)
-        )
+        assert (
+            not unguarded
+        ), "these handlers touch a store but lack @_store_failure_guard: " + ", ".join(unguarded)
 
 
 class TestOneTurnPerSessionKey:
@@ -520,7 +722,8 @@ class TestOneTurnPerSessionKey:
         raw, secret, _entry = webhooks.token_store().create("Review Bot")
         session_key = f"{H._HOOK_SESSION_PREFIX}shared"
         req = _req(
-            "POST", "/api/hooks/agent",
+            "POST",
+            "/api/hooks/agent",
             {"message": "go", "sessionKey": session_key},
             headers={"Authorization": f"Bearer {raw}"},
             sign_with=secret,
@@ -541,11 +744,74 @@ class TestOneTurnPerSessionKey:
         assert "still running" in (runs[0]["detail"] or "")
 
     @pytest.mark.asyncio
+    async def test_concurrent_same_key_is_claimed_before_capacity_await(self, wired, monkeypatch):
+        """A yielding capacity acquire cannot admit two turns for one key."""
+
+        class YieldingSemaphore:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.allow = asyncio.Event()
+                self.acquire_calls = 0
+                self.release_calls = 0
+
+            def locked(self):
+                return False
+
+            async def acquire(self):
+                self.acquire_calls += 1
+                self.entered.set()
+                await self.allow.wait()
+                return True
+
+            def release(self):
+                self.release_calls += 1
+
+        semaphore = YieldingSemaphore()
+        monkeypatch.setattr(H, "_hook_semaphore", semaphore)
+        run = AsyncMock(return_value=None)
+        monkeypatch.setattr(H, "_run_hook_agent", run)
+
+        raw, secret, _entry = webhooks.token_store().create("Review Bot")
+        session_key = f"{H._HOOK_SESSION_PREFIX}simultaneous"
+
+        def request(message):
+            return _req(
+                "POST",
+                "/api/hooks/agent",
+                {"message": message, "sessionKey": session_key},
+                headers={"Authorization": f"Bearer {raw}"},
+                sign_with=secret,
+            )
+
+        # The waits below are hang guards, not timing assertions: the test
+        # proves ORDER (the claim lands before the capacity await), and a loaded
+        # Windows runner has taken longer than a second to schedule the first
+        # request's coroutine as far as acquire().
+        bound = 10
+        first = asyncio.create_task(H.api_hooks_agent(request("first")))
+        await asyncio.wait_for(semaphore.entered.wait(), timeout=bound)
+
+        # The first request is paused inside acquire(). The claim must already
+        # be visible, so the second request finishes with session_busy instead
+        # of joining it at the capacity await.
+        second = await asyncio.wait_for(H.api_hooks_agent(request("second")), timeout=bound)
+        assert second.status == 409
+        assert (await _payload(second))["code"] == "session_busy"
+        assert semaphore.acquire_calls == 1
+
+        semaphore.allow.set()
+        accepted = await asyncio.wait_for(first, timeout=bound)
+        assert accepted.status == 200
+        await asyncio.sleep(0)
+        run.assert_awaited_once()
+
+        H._hook_inflight_sessions.discard(session_key)
+        semaphore.release()
+
+    @pytest.mark.asyncio
     async def test_the_key_is_released_when_the_turn_finishes(self, wired, monkeypatch):
         """A completed turn must not leave its key claimed forever."""
-        monkeypatch.setattr(
-            H, "_run_hook_inner", AsyncMock(return_value="done")
-        )
+        monkeypatch.setattr(H, "_run_hook_inner", AsyncMock(return_value="done"))
         state = MagicMock()
         state.sessions.record_failure = AsyncMock()
         state.sessions.reset = AsyncMock()
@@ -558,18 +824,88 @@ class TestOneTurnPerSessionKey:
         before = H._hook_semaphore._value
         await H._hook_semaphore.acquire()
         await H._run_hook_agent(
-            state, session_key, "hi", "Bot", None, True, 30,
+            state,
+            session_key,
+            "hi",
+            "Bot",
+            None,
+            True,
+            30,
         )
 
         assert session_key not in H._hook_inflight_sessions, "key stayed claimed"
         assert H._hook_semaphore._value == before, "capacity semaphore leaked a permit"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("crashed", [False, True])
+    async def test_teardown_withdraws_the_vouched_execution_identity(
+        self, wired, monkeypatch, crashed
+    ):
+        """A finished hook turn must not leave its identity in the process.
+
+        Same shape as the two leaks above, on a third resource. Hook keys are
+        per-request by default (``hook:default:{ts}``) and per-event keys are the
+        ordinary webhook pattern, so an entry that outlives the turn means one
+        permanent entry per authenticated request, recoverable only by restarting
+        the gateway. Neither ``release`` nor ``reset`` reaches it: ``reset``
+        recycles the session without going near the execution maps.
+
+        Parametrized over a crashed turn because the withdrawal lives in the
+        ``finally``, so the crash path must clear it too -- that is the path a
+        leak would otherwise accumulate on fastest.
+
+        The bind here stands in for ``_run_hook_inner``'s own, which is stubbed
+        out: the subject is the teardown, and the inner function's persistent-only
+        mode guard is what guarantees the entry is the vouched one.
+        """
+        from dataclasses import replace as dataclass_replace
+
+        from kiro_crew.execution_context import (
+            MemoryStoreRef,
+            bind_session_execution,
+            execution_for_store,
+            read_session_execution,
+            read_vouched_session_execution,
+        )
+
+        inner = AsyncMock(
+            side_effect=RuntimeError("boom") if crashed else None,
+            return_value=None if crashed else "done",
+        )
+        monkeypatch.setattr(H, "_run_hook_inner", inner)
+        state = MagicMock()
+        state.sessions.record_failure = AsyncMock()
+        state.sessions.reset = AsyncMock()
+        state.owner_id = None
+        state.slack_client = None
+        state.notify = MagicMock()
+
+        session_key = f"{H._HOOK_SESSION_PREFIX}default:1700000000"
+        # The default store, because the map write this pins is store-agnostic -- but it
+        # is NOT member-agnostic: a member-less execution is refused the vouch outright,
+        # so the id below is what makes this a vouched entry at all.
+        execution = dataclass_replace(
+            execution_for_store("", memory_mode="persistent"),
+            member_id="id-hook",
+            store=MemoryStoreRef("hook-store", "id-hook"),
+            template_id="kirocrew",
+        )
+        bind_session_execution(session_key, execution, replace_existing=True, vouch=True)
+        assert read_vouched_session_execution(session_key) == execution, "bind vouched nothing"
+
+        H._hook_inflight_sessions.add(session_key)
+        await H._hook_semaphore.acquire()
+        await H._run_hook_agent(state, session_key, "hi", "Bot", None, True, 30)
+
+        assert read_vouched_session_execution(session_key) is None, "vouched identity outlived it"
+        # The durable record is deliberately untouched: withdrawing this process's
+        # word is not the same as forgetting what the session was.
+        assert read_session_execution(session_key) == execution
+
+    @pytest.mark.asyncio
     async def test_a_crashed_turn_still_releases_the_key(self, wired, monkeypatch):
         """A failing turn must not wedge the session key permanently."""
-        monkeypatch.setattr(
-            H, "_run_hook_inner", AsyncMock(side_effect=RuntimeError("boom"))
-        )
+        monkeypatch.setattr(H, "_run_hook_inner", AsyncMock(side_effect=RuntimeError("boom")))
         state = MagicMock()
         state.sessions.record_failure = AsyncMock()
         state.sessions.reset = AsyncMock()
@@ -581,7 +917,13 @@ class TestOneTurnPerSessionKey:
         H._hook_inflight_sessions.add(session_key)
         await H._hook_semaphore.acquire()
         await H._run_hook_agent(
-            state, session_key, "hi", "Bot", None, True, 30,
+            state,
+            session_key,
+            "hi",
+            "Bot",
+            None,
+            True,
+            30,
         )
 
         assert session_key not in H._hook_inflight_sessions, "crashed turn wedged the key"
@@ -590,9 +932,9 @@ class TestOneTurnPerSessionKey:
 class TestDeliveryIsRecordedAfterItHappens:
     """Run history must name only destinations that actually received the result.
 
-    `delivered` used to be derived from intent (`deliver and result_text`) and the
-    record was written before delivery was attempted. Slack failures are caught
-    and logged, so a run whose DM failed was still stored as delivered to Slack —
+    Deriving `delivered` from intent (`deliver and result_text`) and writing the
+    record before delivery is attempted is wrong: Slack failures are caught
+    and logged, so a run whose DM fails would still be stored as delivered to Slack —
     and the run history is the only place an operator can check.
     """
 
@@ -618,22 +960,24 @@ class TestDeliveryIsRecordedAfterItHappens:
         before = H._hook_semaphore._value
         await H._hook_semaphore.acquire()
         await H._run_hook_agent(
-            state, f"{H._HOOK_SESSION_PREFIX}t", "hi", "Bot", None, True, 30,
+            state,
+            f"{H._HOOK_SESSION_PREFIX}t",
+            "hi",
+            "Bot",
+            None,
+            True,
+            30,
         )
         assert H._hook_semaphore._value == before, "capacity semaphore leaked a permit"
 
     @pytest.mark.asyncio
     async def test_a_failed_slack_dm_is_not_recorded_as_delivered(self, wired, monkeypatch):
-        monkeypatch.setattr(
-            H, "_run_hook_inner", AsyncMock(return_value="the agent answer")
-        )
+        monkeypatch.setattr(H, "_run_hook_inner", AsyncMock(return_value="the agent answer"))
         state = self._state()
         state.owner_id = "U123"
         state.notify = MagicMock()
         state.slack_client.open_dm = AsyncMock(return_value="D1")
-        state.slack_client.post_message = AsyncMock(
-            side_effect=RuntimeError("slack down")
-        )
+        state.slack_client.post_message = AsyncMock(side_effect=RuntimeError("slack down"))
 
         await self._run(state)
 
@@ -647,12 +991,8 @@ class TestDeliveryIsRecordedAfterItHappens:
         assert row["delivered"] is True
 
     @pytest.mark.asyncio
-    async def test_every_destination_failing_is_not_recorded_as_delivered(
-        self, wired, monkeypatch
-    ):
-        monkeypatch.setattr(
-            H, "_run_hook_inner", AsyncMock(return_value="the agent answer")
-        )
+    async def test_every_destination_failing_is_not_recorded_as_delivered(self, wired, monkeypatch):
+        monkeypatch.setattr(H, "_run_hook_inner", AsyncMock(return_value="the agent answer"))
         state = self._state()
         state.owner_id = None
         state.slack_client = None
@@ -666,9 +1006,7 @@ class TestDeliveryIsRecordedAfterItHappens:
 
     @pytest.mark.asyncio
     async def test_both_destinations_succeeding_names_both(self, wired, monkeypatch):
-        monkeypatch.setattr(
-            H, "_run_hook_inner", AsyncMock(return_value="the agent answer")
-        )
+        monkeypatch.setattr(H, "_run_hook_inner", AsyncMock(return_value="the agent answer"))
         state = self._state()
         state.owner_id = "U123"
         state.notify = MagicMock()
@@ -697,9 +1035,7 @@ class TestStoreFailuresDoNotCrashMutations:
         store.create("live")
         store.path.write_text("{truncated", encoding="utf-8")
 
-        resp = await H.api_webhooks_switch(
-            _req("POST", "/api/webhooks/switch", {"enabled": False})
-        )
+        resp = await H.api_webhooks_switch(_req("POST", "/api/webhooks/switch", {"enabled": False}))
 
         assert resp.status == 503
         body = await _payload(resp)
@@ -708,9 +1044,7 @@ class TestStoreFailuresDoNotCrashMutations:
         assert store.path.read_text(encoding="utf-8") == "{truncated"
 
     @pytest.mark.asyncio
-    async def test_a_script_hook_create_reports_an_unavailable_store(
-        self, wired, monkeypatch
-    ):
+    async def test_a_script_hook_create_reports_an_unavailable_store(self, wired, monkeypatch):
         """The shared-store refusal reaches the script-hook handlers too.
 
         Driven through a stub store that raises what ``ScriptHookStore._save``
@@ -727,8 +1061,7 @@ class TestStoreFailuresDoNotCrashMutations:
         monkeypatch.setattr(H, "_get_hook_store", lambda _state: _RefusingStore())
 
         resp = await H.api_hooks_create(
-            _req("POST", "/api/hooks",
-                 {"name": "fmt", "event": "Stop", "command": "true"})
+            _req("POST", "/api/hooks", {"name": "fmt", "event": "Stop", "command": "true"})
         )
 
         assert resp.status == 503
@@ -787,7 +1120,7 @@ class TestRunHistoryRedaction:
 class TestUnreadableStoreResponses:
     """A store that cannot be parsed must produce named errors, not 500s.
 
-    Store reads refuse rather than reporting an empty file (which previously let
+    Store reads refuse rather than reporting an empty file (which would otherwise let
     a single corrupt byte destroy every credential). That refusal is a raised
     exception, so every request path that touches a store needs to answer with
     something meaningful instead of letting it become an unhandled 500.
@@ -926,24 +1259,29 @@ class TestWebhookTest:
                 return _Resp()
 
         monkeypatch.setattr("aiohttp.ClientSession", _Session)
-        resp = await H.api_webhook_test(_req("POST", "/api/webhooks/test", {}))
+        resp = await H.api_webhook_test(_req("POST", "/api/webhooks/test", {"agent": "oncall"}))
         data = await _payload(resp)
         assert data["ok"] is True
         assert data["session_key"].startswith("hook:test:")
         assert seen["url"] == "http://127.0.0.1:6776/api/hooks/agent"
         assert seen["json"]["deliver"] is False
         assert seen["json"]["message"]
+        assert seen["json"]["agent"] == "oncall"
         assert seen["verified"] is not None
+        assert seen["entry"]["agent"] == "oncall"
         # The probe must exercise the signing path, not bypass it: its token
         # requires a signature and the headers it sent must verify against the
         # exact bytes it posted.
         assert seen["entry"]["require_signature"] is True
-        assert webhooks.verify_signature(
-            secret=seen["entry"]["signing_secret"],
-            timestamp=seen["headers"][webhooks.TIMESTAMP_HEADER],
-            signature=seen["headers"][webhooks.SIGNATURE_HEADER],
-            body=seen["data"],
-        ) is None
+        assert (
+            webhooks.verify_signature(
+                secret=seen["entry"]["signing_secret"],
+                timestamp=seen["headers"][webhooks.TIMESTAMP_HEADER],
+                signature=seen["headers"][webhooks.SIGNATURE_HEADER],
+                body=seen["data"],
+            )
+            is None
+        )
         # Probe token revoked afterwards — no residue in the store.
         assert webhooks.token_store().count() == 0
 
@@ -1012,6 +1350,161 @@ class TestWebhookTest:
         assert (await _payload(resp))["ok"] is False
 
 
+class TestSourceRouting:
+    @pytest.mark.asyncio
+    async def test_paused_source_is_rejected_before_body_read(self, wired):
+        raw, _secret, entry = webhooks.token_store().create(
+            "Review Bot", False, agent="code-reviewer"
+        )
+        webhooks.token_store().update(entry["id"], enabled=False)
+        req = _req(
+            "POST",
+            "/api/hooks/agent",
+            {"message": "must not be read"},
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+
+        resp = await H.api_hooks_agent(req)
+
+        assert resp.status == 503
+        assert (await _payload(resp))["code"] == "source_disabled"
+        req.read.assert_not_awaited()
+        assert webhooks.run_store().list_runs()[0]["outcome"] == webhooks.OUTCOME_DISABLED
+
+    @pytest.mark.asyncio
+    async def test_concurrent_source_revocation_is_audited_before_body_read(
+        self, wired, monkeypatch
+    ):
+        audit = MagicMock()
+        monkeypatch.setattr(H, "_sel", lambda: audit)
+        store = webhooks.token_store()
+        raw, _secret, entry = store.create("Review Bot", False, agent="code-reviewer")
+        monkeypatch.setattr(webhooks, "token_store", lambda: store)
+        monkeypatch.setattr(store, "entry_for", lambda _token_id: None)
+        req = _req(
+            "POST",
+            "/api/hooks/agent",
+            {"message": "must not be read"},
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+
+        resp = await H.api_hooks_agent(req)
+
+        assert resp.status == 401
+        assert (await _payload(resp))["code"] == "unauthorized"
+        req.read.assert_not_awaited()
+        audit.log_api_access.assert_called_once()
+        assert audit.log_api_access.call_args.kwargs["resources"] == f"token:{entry['id']}"
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "denied"
+        assert audit.log_api_access.call_args.kwargs["error"] == (
+            "webhook source revoked during admission"
+        )
+
+    @pytest.mark.asyncio
+    async def test_conflicting_request_agent_is_rejected(self, wired, monkeypatch):
+        audit = MagicMock()
+        monkeypatch.setattr(H, "_sel", lambda: audit)
+        raw, _secret, _entry = webhooks.token_store().create(
+            "Review Bot", False, agent="code-reviewer"
+        )
+        resp = await H.api_hooks_agent(
+            _req(
+                "POST",
+                "/api/hooks/agent",
+                {"message": "go", "agent": "oncall"},
+                headers={"Authorization": f"Bearer {raw}"},
+            )
+        )
+        body = await _payload(resp)
+        assert resp.status == 409
+        assert body["code"] == "agent_conflict"
+        assert body["destination_agent"] == "code-reviewer"
+        audit.log_api_access.assert_called_once()
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "denied"
+        assert audit.log_api_access.call_args.kwargs["error"] == (
+            "request agent conflicts with source destination"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mapped_agent_is_dispatched_when_body_omits_agent(self, wired):
+        raw, _secret, _entry = webhooks.token_store().create(
+            "Review Bot", False, agent="code-reviewer"
+        )
+        session_key = "hook:routed"
+        run = AsyncMock()
+        try:
+            with patch.object(H, "_run_hook_agent", new=run):
+                resp = await H.api_hooks_agent(
+                    _req(
+                        "POST",
+                        "/api/hooks/agent",
+                        {"message": "go", "sessionKey": session_key},
+                        headers={"Authorization": f"Bearer {raw}"},
+                    )
+                )
+                await asyncio.sleep(0)
+            assert resp.status == 200
+            assert run.await_args.args[4] == "code-reviewer"
+        finally:
+            H._hook_inflight_sessions.discard(session_key)
+            if H._hook_semaphore._value < H._HOOK_MAX_CONCURRENT:
+                H._hook_semaphore.release()
+
+    @pytest.mark.asyncio
+    async def test_deleted_mapped_agent_fails_closed(self, wired, monkeypatch):
+        audit = MagicMock()
+        monkeypatch.setattr(H, "_sel", lambda: audit)
+        raw, _secret, _entry = webhooks.token_store().create(
+            "Review Bot", False, agent="code-reviewer"
+        )
+        monkeypatch.setattr(H, "_installed_agent_names", lambda: {"oncall"})
+        resp = await H.api_hooks_agent(
+            _req(
+                "POST",
+                "/api/hooks/agent",
+                {"message": "go"},
+                headers={"Authorization": f"Bearer {raw}"},
+            )
+        )
+        body = await _payload(resp)
+        assert resp.status == 409
+        assert body["code"] == "destination_agent_unavailable"
+        assert body["destination_agent"] == "code-reviewer"
+        audit.log_api_access.assert_called_once()
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "denied"
+        assert audit.log_api_access.call_args.kwargs["error"] == (
+            "source destination agent is not installed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agent_discovery_failure_is_audited(self, wired, monkeypatch):
+        audit = MagicMock()
+        monkeypatch.setattr(H, "_sel", lambda: audit)
+        raw, _secret, _entry = webhooks.token_store().create(
+            "Review Bot", False, agent="code-reviewer"
+        )
+
+        def fail_discovery():
+            raise OSError("agent inventory unavailable")
+
+        monkeypatch.setattr(H, "_installed_agent_names", fail_discovery)
+        resp = await H.api_hooks_agent(
+            _req(
+                "POST",
+                "/api/hooks/agent",
+                {"message": "go"},
+                headers={"Authorization": f"Bearer {raw}"},
+            )
+        )
+        assert resp.status == 503
+        assert (await _payload(resp))["code"] == "agent_discovery_unavailable"
+        audit.log_api_access.assert_called_once()
+        assert audit.log_api_access.call_args.kwargs["outcome"] == "denied"
+        assert audit.log_api_access.call_args.kwargs["error"] == (
+            "destination-agent discovery unavailable"
+        )
+
+
 class TestRejectionPathsAreRecorded:
     @pytest.mark.asyncio
     async def test_unknown_bearer_is_rejected_before_body_read(self, wired):
@@ -1042,8 +1535,8 @@ class TestRejectionPathsAreRecorded:
     async def test_wrong_field_types_are_400_not_500(self, wired, payload, expected):
         """An authenticated caller's bad types must not become a server error.
 
-        ``{"message": 1}`` used to reach ``.strip()`` on an int, and a non-string
-        ``sessionKey`` reached ``.startswith()`` — both raise inside the handler
+        ``{"message": 1}`` can reach ``.strip()`` on an int, and a non-string
+        ``sessionKey`` reaches ``.startswith()`` — both raise inside the handler
         and surface as HTTP 500 on a request that authenticated correctly.
         """
         raw, _secret, _entry = webhooks.token_store().create("CI runner", False)
@@ -1121,9 +1614,10 @@ class TestRejectionPathsAreRecorded:
             sign_with=secret,
         )
         # Saturate the capacity gate.
-        held = [asyncio.ensure_future(H._hook_semaphore.acquire()) for _ in range(
-            H._HOOK_MAX_CONCURRENT
-        )]
+        held = [
+            asyncio.ensure_future(H._hook_semaphore.acquire())
+            for _ in range(H._HOOK_MAX_CONCURRENT)
+        ]
         await asyncio.gather(*held)
         try:
             resp = await H.api_hooks_agent(req)
@@ -1151,7 +1645,13 @@ class TestRejectionPathsAreRecorded:
         with patch.object(H, "_run_hook_inner", new=AsyncMock(return_value="done!")):
             await H._hook_semaphore.acquire()
             await H._run_hook_agent(
-                state, "hook:review:pr-3", "go", "Review Bot", None, True, 60,
+                state,
+                "hook:review:pr-3",
+                "go",
+                "Review Bot",
+                None,
+                True,
+                60,
                 token_id="wht_abc123",
             )
         runs = webhooks.run_store().list_runs()
@@ -1290,3 +1790,201 @@ class TestMalformedStoreDoesNotFiveHundredTheExternalRoute:
         )
 
         assert store.path.read_text(encoding="utf-8") == payload
+
+
+class TestTokenMintIsOwnerOnly:
+    """``POST /api/webhooks/tokens`` mints a credential for the agent-run route.
+
+    ``_verify_hook_token`` accepts the bearer this route returns on
+    ``POST /api/hooks/agent``, which runs a real agent turn with full tool
+    access, so the mint is owner-gated exactly like the closest guarded sibling
+    (``handlers/agents.py::api_kirocrew_agents_create`` ->
+    ``handlers/_shared.require_owner_dashboard_request``). These tests hold both
+    directions: the callers that legitimately mint today keep minting, and the
+    non-owner dashboard session that ordinary token auth admits does not.
+
+    The non-owner is a real principal: an allow-listed messaging user running
+    ``!dashboard`` authenticates with ``app == ""`` and ``sub != owner_id``.
+    """
+
+    _MINT = {"label": "Review Bot", "agent": "kirocrew", "require_signature": False}
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_session_is_refused(self, wired):
+        """THE DEFECT: an authenticated non-owner must not mint a bearer."""
+        resp = await H.api_webhook_token_create(
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                dict(self._MINT),
+                user="U0NONOWNER",
+                owner_id="U0THEOWNER",
+            )
+        )
+        assert resp.status == 403
+        assert (await _payload(resp))["code"] == "owner_only"
+        assert webhooks.token_store().count() == 0, (
+            "the refusal must be taken BEFORE the store write, or the credential "
+            "exists whatever the response says"
+        )
+
+    @pytest.mark.asyncio
+    async def test_app_token_caller_is_refused(self, wired):
+        """An app token is not the owner, the same answer the sibling gives it."""
+        resp = await H.api_webhook_token_create(
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                dict(self._MINT),
+                user="someapp",
+                app_token="someapp",
+                owner_id="U0THEOWNER",
+            )
+        )
+        assert resp.status == 403
+        assert (await _payload(resp))["code"] == "owner_only"
+        assert webhooks.token_store().count() == 0
+
+    @pytest.mark.asyncio
+    async def test_configured_owner_still_mints(self, wired):
+        """POSITIVE CONTROL: an exact owner match keeps the full 201 body."""
+        resp = await H.api_webhook_token_create(
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                {"label": "Review Bot", "agent": "kirocrew"},
+                user="U0THEOWNER",
+                owner_id="U0THEOWNER",
+            )
+        )
+        assert resp.status == 201
+        data = await _payload(resp)
+        assert data["ok"] is True
+        assert data["token"].startswith(webhooks.TOKEN_PREFIX)
+        assert data["signing_secret"].startswith(webhooks.SIGNING_SECRET_PREFIX)
+        assert data["entry"]["label"] == "Review Bot"
+        assert data["entry"]["agent"] == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_standalone_local_install_with_no_owner_still_mints(self, wired):
+        """POSITIVE CONTROL: the deployment an over-strict gate would break.
+
+        No owner configured is the standalone-local shape, where the predicate
+        accepts the signed local bootstrap subject. That install has no Slack
+        member id to match against, so refusing it would make the Webhooks page
+        unusable for every single-user gateway.
+        """
+        resp = await H.api_webhook_token_create(
+            _req(
+                "POST",
+                "/api/webhooks/tokens",
+                {"label": "CI runner", "agent": "kirocrew"},
+                user="local-app",
+                owner_id="",
+            )
+        )
+        assert resp.status == 201
+        assert (await _payload(resp))["entry"]["label"] == "CI runner"
+
+    @pytest.mark.asyncio
+    async def test_the_probe_route_still_mints_its_throwaway_credential(
+        self, wired, monkeypatch
+    ):
+        """POSITIVE CONTROL: the owner's own probe keeps working.
+
+        ``POST /api/webhooks/test`` mints a throwaway credential and drives a real
+        agent turn through it, so it carries the owner gate like the rest of this
+        management surface. The control that matters is therefore that the OWNER
+        still gets the full 200 body: a gate that refused here would take the
+        Webhooks page's "Send test" button away from the one caller entitled to it.
+        The non-owner direction is asserted in
+        ``test_the_sibling_routes_are_gated_too``.
+        """
+
+        class _Resp:
+            status = 200
+
+            async def text(self):
+                return ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, data=None, headers=None):
+                assert headers["Authorization"].startswith("Bearer ")
+                return _Resp()
+
+        monkeypatch.setattr("aiohttp.ClientSession", _Session)
+        resp = await H.api_webhook_test(
+            _req(
+                "POST",
+                "/api/webhooks/test",
+                {"message": "ping"},
+                user="U0THEOWNER",
+                owner_id="U0THEOWNER",
+            )
+        )
+        assert resp.status == 200
+        assert (await _payload(resp))["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_sibling_routes_are_gated_too(self, wired):
+        """The whole credential lifecycle and the kill switch share this gate.
+
+        Editing, revoking and the inbound kill switch are the same authorization
+        decision as minting: the caller controls credentials it does not own, or
+        one operator-owned boolean that silences every inbound integration. Each
+        must refuse the same non-owner with the same 403 body, and the assertion
+        reads the body rather than only the status so a refusal for some OTHER
+        reason -- a 403 from a store error, say -- cannot pass as the gate.
+        """
+        non_owner = {"user": "U0NONOWNER", "owner_id": "U0THEOWNER"}
+        refused = {"error": "owner authorization required", "code": "owner_only"}
+
+        patched = await H.api_webhook_token_update(
+            _req(
+                "PATCH",
+                "/api/webhooks/tokens/nope",
+                {"enabled": False},
+                match_info={"token_id": "nope"},
+                **non_owner,
+            )
+        )
+        assert patched.status == 403
+        assert await _payload(patched) == refused
+
+        deleted = await H.api_webhook_token_delete(
+            _req(
+                "DELETE",
+                "/api/webhooks/tokens/nope",
+                match_info={"token_id": "nope"},
+                **non_owner,
+            )
+        )
+        assert deleted.status == 403
+        assert await _payload(deleted) == refused
+
+        switched = await H.api_webhooks_switch(
+            _req("POST", "/api/webhooks/switch", {"enabled": False}, **non_owner)
+        )
+        assert switched.status == 403
+        assert await _payload(switched) == refused
+
+        probed = await H.api_webhook_test(
+            _req("POST", "/api/webhooks/test", {"message": "ping"}, **non_owner)
+        )
+        assert probed.status == 403
+        assert await _payload(probed) == refused

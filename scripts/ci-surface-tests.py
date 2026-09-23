@@ -34,6 +34,7 @@ which case the caller MUST fall back to running the full suite.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -56,6 +57,7 @@ _BACKEND_FOREIGN = re.compile(
     | \.tsx?\b             # a TypeScript filename appearing in an assertion
     | \.mjs\b
     | \.plist\b
+    | tsconfig\.json       # the frontend's config file, referenced by bare name
     | entitlements
     | \bnpm\b
     | vitest
@@ -71,6 +73,13 @@ _BACKEND_FOREIGN = re.compile(
 # eyeball grep kept missing:
 #   1. string literals   -- '../../../src/kiro_crew/connections/registry.json'
 #   2. path segments     -- path.resolve(__dirname, '..', '..', '..', 'test')
+#
+# Backend-owned config extensions close the last bare-name gap: a spec reads
+# pyproject.toml / setup.cfg / a workflow .yml through a pre-computed root
+# constant, so neither the escape forms nor a package name appear on the
+# referencing line. .yaml is almost backend-owned (workflows, compose);
+# website/AUTOSDE.yaml is the one frontend-owned exception, and per the
+# header above over-matching it only costs CI time.
 # ---------------------------------------------------------------------------
 _FRONTEND_FOREIGN = re.compile(
     r"""
@@ -83,6 +92,9 @@ _FRONTEND_FOREIGN = re.compile(
     | test[\\/]fixtures                               # shared parity fixtures
     | \bdocker\b
     | \.py\b                                          # a Python file in an assertion
+    | \.toml\b                                        # backend-owned config extensions
+    | \.cfg\b
+    | \.ya?ml\b
     """,
     re.VERBOSE,
 )
@@ -137,6 +149,34 @@ def _is_cross_surface(path: Path, pattern: re.Pattern[str]) -> bool:
     return bool(pattern.search(text))
 
 
+def _is_windows() -> bool:
+    """Whether the emitted paths will be consumed by a Windows pytest run.
+
+    A named seam rather than an inline ``os.name`` read so tests can exercise the
+    Windows branch without simulating the platform: patching ``os.name`` globally
+    also switches ``pathlib.Path`` to ``WindowsPath``, which cannot be
+    instantiated on POSIX.
+    """
+    return os.name == "nt"
+
+
+def _windows_collect_ignore(root: Path) -> frozenset[str]:
+    """Bare test filenames that ``test/conftest.py`` refuses to collect on Windows.
+
+    Read from the same file conftest reads, so the two cannot drift.
+    """
+    listfile = root / "test" / "windows-collect-ignore.txt"
+    try:
+        text = listfile.read_text(encoding="utf-8")
+    except OSError:
+        # Fail OPEN here, deliberately. A missing list must not silently empty
+        # the target set (that would skip real coverage); emitting the unfiltered
+        # list at worst reproduces today's behaviour.
+        return frozenset()
+    names = (ln.split("#", 1)[0].strip() for ln in text.splitlines())
+    return frozenset(n for n in names if n)
+
+
 def collect(surface: str) -> list[str]:
     """Repo-relative paths that must still run for a single-surface diff."""
     root = _repo_root()
@@ -152,6 +192,28 @@ def collect(surface: str) -> list[str]:
             for path in _iter_files(root, rel_dir, globs):
                 if _is_cross_surface(path, _FRONTEND_FOREIGN):
                     must_run.append(path.relative_to(root).as_posix())
+
+    if _is_windows():
+        # These paths are consumed as EXPLICIT pytest arguments, and an explicit
+        # argument bypasses both `collect_ignore` and the `pytest_ignore_collect`
+        # hook -- verified, not assumed. So conftest's Windows exclusion does not
+        # protect this path, and emitting a POSIX-only suite here collects it and
+        # fails the Windows shards on any diff that takes the reduced scope.
+        #
+        # Rebuild the entries as `test/`-relative paths rather than matching on
+        # the bare filename. The list is consumed by `test/conftest.py`, and
+        # pytest resolves `collect_ignore` relative to the conftest's own
+        # directory -- so the exclusion covers `test/<name>` and nothing else.
+        # A basename match would also drop a same-named suite under `transfer/`
+        # or the apps-builtins tree, which no conftest excludes and Windows
+        # collects fine: a silently skipped guard, the one outcome this
+        # selector's deny-by-default contract forbids.
+        #
+        # Join the string rather than going through pathlib: these are already
+        # `as_posix()` forms, so the separator is known, and it keeps the filter
+        # independent of which Path flavour the host provides.
+        excluded = {f"test/{name}" for name in _windows_collect_ignore(root)}
+        must_run = [rel for rel in must_run if rel not in excluded]
 
     return sorted(set(must_run))
 

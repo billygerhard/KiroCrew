@@ -11,6 +11,8 @@ import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+// Through `/all` so the German catalog the locale cases assert on is registered.
+import { i18next } from '../i18n/all'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
@@ -21,21 +23,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -69,15 +71,27 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatSlot } from '../types'
 
 const TOOL_DETAIL = {
   kind: 'tool',
-  text: 'Looking up the mic permission handler',
+  purpose: 'Looking up the mic permission handler',
   toolName: 'grep --include=*.ts setPermissionCheckHandler',
   ts: 1,
 }
 
-function renderSidebar(slots: any[], chat: Record<string, unknown>) {
+function renderSidebar(slots: ChatSlot[], chat: Record<string, unknown>) {
+  const legacyFixtures = chat.goalLoops as Record<string, { cycle_count: number; max_cycles: number }> | undefined
+  const { goalLoops: _legacyFixtures, ...chatState } = chat
+  const automations = Object.fromEntries(Object.entries(legacyFixtures ?? {}).map(([slotKey, loop]) => [
+    slotKey,
+    {
+      kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+      maxCycles: loop.max_cycles, cycleCount: loop.cycle_count, active: true,
+      lastFireAt: 0, stoppedReason: '',
+    },
+  ]))
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -85,8 +99,8 @@ function renderSidebar(slots: any[], chat: Record<string, unknown>) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, goalLoops: {}, ...chat } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, ...chatState, automations } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -110,10 +124,13 @@ beforeEach(() => {
   localStorage.clear()
   cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, simplifiedToolNames: true }
 })
-afterEach(() => vi.clearAllMocks())
+afterEach(async () => {
+  vi.clearAllMocks()
+  await i18next.changeLanguage('en')
+})
 
 describe('chat sidebar — tool status honors simplifiedToolNames', () => {
-  const slots = [{ key: 'k', title: 'sess', running: true, messages: 5, last_message: 'stale' }]
+  const slots = [{ key: 'k', title: 'sess', running: true, messages: 5, last_message: 'stale' }] as unknown as ChatSlot[]
 
   it('shows the agent purpose when the setting is on', () => {
     const { getByText, queryByText } = renderSidebar(slots, { slotStatusDetail: { k: TOOL_DETAIL } })
@@ -133,9 +150,34 @@ describe('chat sidebar — tool status honors simplifiedToolNames', () => {
     // going through the catalog rather than falling into the tool branch.
     cfg.value = { ...cfg.value, simplifiedToolNames: false }
     const { getByText } = renderSidebar(slots, {
-      slotStatusDetail: { k: { kind: 'thinking', text: 'Thinking…', ts: 1 } },
+      slotStatusDetail: { k: { kind: 'thinking', ts: 1 } },
     })
     expect(getByText(/Thinking…/)).toBeTruthy()
+  })
+
+  it('translates the fixed thinking phase at render time from its kind', async () => {
+    // The store keeps only the language-neutral `kind`; the row maps it to the
+    // catalog when it paints, so a UI language switch re-renders the row in the
+    // new language instead of freezing the phrase that was active at dispatch.
+    await i18next.changeLanguage('de')
+    const localized = i18next.t('pages.chatSidebar.thinking')
+    expect(localized).not.toBe('Thinking…')
+    const { getByText, queryByText } = renderSidebar(slots, {
+      slotStatusDetail: { k: { kind: 'thinking', ts: 1 } },
+    })
+    expect(getByText(localized)).toBeTruthy()
+    expect(queryByText(/Thinking…/)).toBeNull()
+  })
+
+  it('paints a server-supplied status verbatim even though it shares the thinking kind', async () => {
+    // `chat_status` frames land as `kind: 'thinking'` with their own label, so
+    // the catalog mapping applies only when no label came with the phase.
+    await i18next.changeLanguage('de')
+    const { getByText, queryByText } = renderSidebar(slots, {
+      slotStatusDetail: { k: { kind: 'thinking', label: 'Compacting…', ts: 1 } },
+    })
+    expect(getByText(/Compacting…/)).toBeTruthy()
+    expect(queryByText(i18next.t('pages.chatSidebar.thinking'))).toBeNull()
   })
 
   it('composes the goal-loop detail from the same setting-aware label', () => {

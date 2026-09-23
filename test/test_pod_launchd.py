@@ -38,8 +38,32 @@ def cfg(tmp_path, monkeypatch) -> PodConfig:
 
 @pytest.fixture(autouse=True)
 def _no_real_launchctl(monkeypatch):
-    """Never shell out to a real launchctl, and let require_backend pass."""
+    """Never drive a real service manager from the launchd unit tests."""
     monkeypatch.setattr(launchd, "require_backend", lambda: None)
+    monkeypatch.setattr(rt, "require_backend", lambda: None)
+
+
+@pytest.mark.parametrize(
+    ("platform", "is_macos", "is_windows"),
+    [("darwin", True, False), ("win32", False, True)],
+)
+def test_up_user_bus_preflight_is_linux_only(
+    monkeypatch, platform: str, is_macos: bool, is_windows: bool
+):
+    """A pod-up preflight must never drive launchd or Task Scheduler."""
+    from kiro_crew.pod import cli as pod_cli
+
+    monkeypatch.setattr(rt, "IS_LINUX", False)
+    monkeypatch.setattr(rt, "IS_MACOS", is_macos)
+    monkeypatch.setattr(rt, "IS_WINDOWS", is_windows)
+    monkeypatch.setattr(rt.sys, "platform", platform)
+    monkeypatch.setattr(
+        rt,
+        "require_backend",
+        lambda: pytest.fail("off-Linux pod up reached the user-bus preflight"),
+    )
+
+    pod_cli._require_up_user_bus("smoke")
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +144,7 @@ def test_env_selection_is_shared_with_the_systemd_backend(cfg):
 # --------------------------------------------------------------------------
 _RUNNING = "state = running\n\tpid = 4242\n\tlast exit code = 0\n"
 _DEAD = "state = waiting\n\tlast exit code = 1\n"
-_ABSENT = _cp(returncode=113, stderr="Could not find service \"x\" in domain")
+_ABSENT = _cp(returncode=113, stderr='Could not find service "x" in domain')
 
 
 def test_is_active_needs_a_live_pid(cfg, monkeypatch):
@@ -140,8 +164,8 @@ def test_is_active_false_when_label_absent(cfg, monkeypatch):
 
 
 def test_is_active_refuses_to_guess_on_an_operational_error(cfg, monkeypatch):
-    """Review blocker round 4: a non-absent launchctl failure must not read as
-    "not running" — down/removal guards would fail open and delete live state."""
+    """A non-absent launchctl failure must not read as "not running" —
+    down/removal guards would then fail open and delete live state."""
     monkeypatch.setattr(
         launchd, "launchctl", lambda *a, **k: _cp(returncode=5, stderr="Input/output error")
     )
@@ -206,16 +230,18 @@ def test_recent_journal_says_why_it_is_empty(cfg):
     assert "no pod log yet" in text
 
 
-def test_orphan_homes_reports_only_reapable_leftovers(cfg, monkeypatch):
-    """With no ExecStopPost, a crashed pod leaves its HOME; ls/down GC it."""
+def test_orphan_homes_skips_a_pod_with_an_installed_plist(cfg, monkeypatch):
+    """A per-pod plist means "installed", not orphaned — a name mid-`up` whose
+    gateway has not gone active yet must not be reported as reapable."""
     cfg.pod_root.mkdir(parents=True, exist_ok=True)
     (cfg.pod_root / "orphan").mkdir()
     (cfg.pod_root / "running").mkdir()
     (cfg.pod_root / "installed").mkdir()
     (cfg.pod_root / ".e2e-artifacts").mkdir()  # dot dirs are not pods
     launchd.write_plist(cfg, "installed")
-    monkeypatch.setattr(launchd, "active_names", lambda c: {"running"})
-    assert launchd.orphan_homes(cfg) == ["orphan"]
+    monkeypatch.setattr(rt, "IS_MACOS", True)
+    monkeypatch.setattr(rt, "active_names", lambda c: {"running"})
+    assert rt.orphan_homes(cfg) == ["orphan"]
 
 
 # --------------------------------------------------------------------------
@@ -228,8 +254,13 @@ def test_runtime_dispatches_to_launchd_on_macos(cfg, monkeypatch):
 
 
 def test_runtime_does_not_touch_launchd_off_macos(cfg, monkeypatch):
-    """The Linux/Windows contract: dispatch must not reach the launchd module."""
+    """The Linux contract: dispatch must not reach the launchd module.
+
+    ``IS_WINDOWS`` is pinned False too, so on the Windows shards this exercises
+    the systemd branch it stubs rather than the Task Scheduler backend.
+    """
     monkeypatch.setattr(rt, "IS_MACOS", False)
+    monkeypatch.setattr(rt, "IS_WINDOWS", False)
     monkeypatch.setattr(rt, "require_systemd", lambda: None)
     monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
 
@@ -297,10 +328,12 @@ def test_stop_removes_the_per_pod_plist_once_unloaded(cfg, monkeypatch):
 
 
 def test_stop_does_not_treat_a_generic_print_failure_as_unloaded(cfg, monkeypatch):
-    """Review blocker round 2: an OPERATIONAL print failure (rc!=0 without the
-    absent-service message) proves nothing about the label. Confirming the
-    unload on it would let teardown proceed against a possibly-live pod."""
-    monkeypatch.setattr(launchd, "launchctl", lambda *a, **k: _cp(returncode=5, stderr="Input/output error"))
+    """An OPERATIONAL print failure (rc!=0 without the absent-service message)
+    proves nothing about the label. Confirming the unload on it would let
+    teardown proceed against a possibly-live pod."""
+    monkeypatch.setattr(
+        launchd, "launchctl", lambda *a, **k: _cp(returncode=5, stderr="Input/output error")
+    )
     monkeypatch.setattr(launchd.time, "sleep", lambda _s: None)
     dst = launchd.write_plist(cfg, "smoke")
     cp = launchd.stop(cfg, "smoke", timeout=0.5)
@@ -327,9 +360,7 @@ def test_stop_preserves_everything_when_the_unload_cannot_be_confirmed(cfg, monk
 def test_stop_pod_does_not_reap_the_home_on_a_failed_unload(cfg, monkeypatch):
     """runtime.stop_pod must honour launchd.stop's authoritative failure."""
     monkeypatch.setattr(rt, "IS_MACOS", True)
-    monkeypatch.setattr(
-        rt.launchd, "stop", lambda c, n: _cp(returncode=1, stderr="preserved")
-    )
+    monkeypatch.setattr(rt.launchd, "stop", lambda c, n: _cp(returncode=1, stderr="preserved"))
     reaped: list[str] = []
     monkeypatch.setattr(rt, "cleanup_home", lambda c, n: reaped.append(n))
     cp = rt.stop_pod(cfg, "smoke")
@@ -366,9 +397,9 @@ def test_stop_pod_succeeds_when_the_home_is_gone(cfg, monkeypatch):
 
 
 def test_reap_sweep_aborts_when_a_new_pod_claims_the_name(cfg, monkeypatch):
-    """Blocking review finding round 3: down and up are independent endpoints
-    with no per-name lock, so the grace sweep must stand down the moment a NEW
-    pod claims the name — otherwise its live HOME lands under our rmtree."""
+    """Down and up are independent endpoints with no per-name lock, so the grace
+    sweep must stand down the moment a NEW pod claims the name — otherwise its
+    live HOME lands under our rmtree."""
     monkeypatch.setattr(rt, "IS_MACOS", True)
     monkeypatch.setattr(rt.launchd, "stop", lambda c, n: _cp(returncode=0))
     monkeypatch.setattr(rt.time, "sleep", lambda _s: None)
@@ -383,17 +414,15 @@ def test_reap_sweep_aborts_when_a_new_pod_claims_the_name(cfg, monkeypatch):
 
 
 def test_down_preserves_the_new_pods_checkout_pin_when_reclaimed(cfg, monkeypatch, capsys):
-    """Review blocker round 3 (part 2): after a reclaimed teardown, `down` must
-    NOT delete the per-pod env file — it pins the NEW pod's checkout."""
+    """After a reclaimed teardown, `down` must NOT delete the per-pod env file —
+    it pins the NEW pod's checkout."""
     import argparse
 
     from kiro_crew.pod import cli as pod_cli
 
     monkeypatch.setattr(rt, "validate_name", lambda n: n)
     monkeypatch.setattr(rt, "is_active", lambda c, n: True)
-    monkeypatch.setattr(
-        rt, "stop_pod", lambda c, n: _cp(returncode=0, stdout=rt.RECLAIMED_MARKER)
-    )
+    monkeypatch.setattr(rt, "stop_pod", lambda c, n: _cp(returncode=0, stdout=rt.RECLAIMED_MARKER))
     monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
     env = cfg.env_file("smoke")
     env.parent.mkdir(parents=True, exist_ok=True)
@@ -413,17 +442,17 @@ def test_install_backend_writes_nothing_on_macos(cfg, monkeypatch):
 
 
 def test_active_names_refuses_to_guess_on_an_operational_error(cfg, monkeypatch):
-    """Review blocker round 4 (same class as is_active): an empty set on a failed
-    domain print would tell pod ls / Dev Fleet that live pods are absent."""
+    """An empty set on a failed domain print would tell pod ls / Dev Fleet that
+    live pods are absent."""
     monkeypatch.setattr(launchd, "launchctl", lambda *a, **k: _cp(returncode=1, stderr="boom"))
     with pytest.raises(launchd.LaunchdError):
         launchd.active_names(cfg)
 
 
 def test_start_and_stop_hold_the_per_name_mutex(cfg, monkeypatch):
-    """Review blocker round 4: start (plist write + bootstrap) and the whole
-    stop (bootout + sweep) must serialize per name, or a down/up race deletes
-    the replacement pod's plist and HOME."""
+    """Start (plist write + bootstrap) and the whole stop (bootout + sweep) must
+    serialize per name, or a down/up race deletes the replacement pod's plist
+    and HOME."""
     import contextlib as _ctx
 
     held: list[str] = []
@@ -434,7 +463,7 @@ def test_start_and_stop_hold_the_per_name_mutex(cfg, monkeypatch):
         yield
         held.append(f"exit:{n}")
 
-    monkeypatch.setattr(rt.launchd, "pod_mutex", _fake_mutex)
+    monkeypatch.setattr(rt, "pod_name_mutex", _fake_mutex)
     monkeypatch.setattr(rt, "IS_MACOS", True)
     monkeypatch.setattr(rt.launchd, "write_plist", lambda c, n: None)
     monkeypatch.setattr(rt.launchd, "start", lambda c, n: _cp(returncode=0))
@@ -464,15 +493,15 @@ def test_pod_mutex_is_reentrant_within_a_thread(cfg):
     """The CLI holds the mutex across a transaction while start_pod/stop_pod
     re-acquire it inside; flock is per open-file-description, so without
     reentrancy that inner acquisition would deadlock against our own lock."""
-    with launchd.pod_mutex(cfg, "smoke"):
-        with launchd.pod_mutex(cfg, "smoke"):  # must not block
+    with rt.pod_name_mutex(cfg, "smoke"):
+        with rt.pod_name_mutex(cfg, "smoke"):  # must not block
             pass
 
 
 def test_down_fails_on_macos_when_stop_cannot_confirm_even_if_not_active(cfg, monkeypatch):
-    """Review blocker round 4: a loaded-but-dead agent has no pid (was_up False)
-    but its unload still needs confirming — a swallowed nonzero stop deleted the
-    checkout pin while leaving service, plist and HOME behind."""
+    """A loaded-but-dead agent has no pid (was_up False) but its unload still
+    needs confirming — a swallowed nonzero stop would delete the checkout pin
+    while leaving service, plist and HOME behind."""
     import argparse
 
     from kiro_crew.pod import cli as pod_cli
@@ -493,8 +522,8 @@ def test_down_fails_on_macos_when_stop_cannot_confirm_even_if_not_active(cfg, mo
 
 
 def test_up_pins_the_checkout_inside_the_name_mutex(cfg, monkeypatch, tmp_path):
-    """Review blocker round 4: the pin must move atomically with the start —
-    pinned outside the lock, a concurrent down's sweep deleted the fresh pin."""
+    """The pin must move atomically with the start — pinned outside the lock, a
+    concurrent down's sweep would delete the fresh pin."""
     import argparse
     import contextlib as _ctx
 
@@ -504,9 +533,22 @@ def test_up_pins_the_checkout_inside_the_name_mutex(cfg, monkeypatch, tmp_path):
 
     @_ctx.contextmanager
     def _tracked_mutex(c, n):
-        events.append("lock")
-        yield
-        events.append("unlock")
+        # Record only the OUTERMOST hold, because the real mutex is reentrant and
+        # this assertion is about the transaction's outer boundary. Inner
+        # re-acquisitions are legitimate and now routine: `write_env_file` takes it,
+        # and the plane lock borrows it under a reserved name. Counting those would
+        # make the first "unlock" below an inner one and the ordering meaningless.
+        depth[0] += 1
+        if depth[0] == 1:
+            events.append("lock")
+        try:
+            yield
+        finally:
+            if depth[0] == 1:
+                events.append("unlock")
+            depth[0] -= 1
+
+    depth = [0]
 
     checkout = tmp_path / "wt"
     (checkout / "website" / "static" / "dist").mkdir(parents=True)
@@ -520,7 +562,9 @@ def test_up_pins_the_checkout_inside_the_name_mutex(cfg, monkeypatch, tmp_path):
     monkeypatch.setattr(rt, "is_active", lambda c, n: False)
     monkeypatch.setattr(rt, "start_pod", lambda c, n: (events.append("start"), _cp())[1])
     monkeypatch.setattr(rt, "mint_token", lambda c, n, ttl: "t")
-    monkeypatch.setattr(pod_cli, "_wait_healthy", lambda c, n, p: (events.append("wait"), 200)[1])
+    monkeypatch.setattr(
+        pod_cli, "_wait_healthy", lambda c, n, p, tries=0: (events.append("wait"), 200)[1]
+    )
     monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
     args = argparse.Namespace(
         name="smoke", seed=None, json=True, provision=False, checkout=None, ttl="2h"
@@ -552,11 +596,20 @@ def test_up_failure_cleanup_stops_the_pod_inside_the_mutex(cfg, monkeypatch, tmp
 
     @_ctx.contextmanager
     def _tracked_mutex(c, n):
-        events.append("lock")
+        # See the sibling test: record only the OUTERMOST hold, since the real mutex
+        # is reentrant and inner re-acquisitions (`write_env_file`, the borrowed
+        # plane lock) would otherwise supply the first "unlock".
+        depth[0] += 1
+        if depth[0] == 1:
+            events.append("lock")
         try:
             yield
         finally:
-            events.append("unlock")
+            if depth[0] == 1:
+                events.append("unlock")
+            depth[0] -= 1
+
+    depth = [0]
 
     checkout = tmp_path / "wt"
     (checkout / "website" / "static" / "dist").mkdir(parents=True)
@@ -571,7 +624,7 @@ def test_up_failure_cleanup_stops_the_pod_inside_the_mutex(cfg, monkeypatch, tmp
     monkeypatch.setattr(rt, "start_pod", lambda c, n: _cp())
     monkeypatch.setattr(rt, "recent_journal", lambda c, n, lines: "")
     monkeypatch.setattr(rt, "stop_pod", lambda c, n: (events.append("stop"), _cp())[1])
-    monkeypatch.setattr(pod_cli, "_wait_healthy", lambda c, n, p: -1)  # boot failed
+    monkeypatch.setattr(pod_cli, "_wait_healthy", lambda c, n, p, tries=0: -1)  # boot failed
     monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
     args = argparse.Namespace(
         name="smoke", seed=None, json=True, provision=False, checkout=None, ttl="2h"
@@ -579,8 +632,8 @@ def test_up_failure_cleanup_stops_the_pod_inside_the_mutex(cfg, monkeypatch, tmp
     with pytest.raises(SystemExit):
         pod_cli._up(cfg, args)
     assert "stop" in events, "the failed boot must be stopped"
-    assert events.index("lock") < events.index("stop") < events.index(
-        "unlock"
+    assert (
+        events.index("lock") < events.index("stop") < events.index("unlock")
     ), f"the failure cleanup must stop the pod INSIDE the mutex: {events}"
 
 
@@ -592,11 +645,6 @@ def test_ls_translates_orphan_probe_failures_to_the_documented_error(cfg, monkey
     from kiro_crew.pod import cli as pod_cli
 
     monkeypatch.setattr(rt, "IS_MACOS", True)
-    monkeypatch.setattr(rt, "active_names", lambda c: set())
-
-    def _boom(c):
-        raise launchd.LaunchdError("launchctl print failed")
-
-    monkeypatch.setattr(launchd, "orphan_homes", _boom)
+    monkeypatch.setattr(launchd, "launchctl", lambda *a, **k: _cp(returncode=5, stderr="EIO"))
     with pytest.raises(rt.PodError):
         pod_cli._ls(cfg, argparse.Namespace(json=False))

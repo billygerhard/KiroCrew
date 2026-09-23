@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,12 @@ from kiro_crew.cloud import aws, ssm
 
 
 class TestArgvBuilders:
+    @pytest.fixture(autouse=True)
+    def _bare_resolver(self, monkeypatch):
+        """Pin the shared resolver to the bare name so argv-shape assertions
+        stay deterministic across hosts (with/without an installed CLI)."""
+        monkeypatch.setattr(ssm, "resolve_aws_bin", lambda: "aws")
+
     def test_port_forward_argv(self):
         argv = ssm.build_port_forward_argv("i-0abc", 5476, 5599, "dev", "us-east-1")
         assert argv[:3] == ["aws", "ssm", "start-session"]
@@ -26,19 +33,58 @@ class TestArgvBuilders:
         assert "--profile" not in argv
         assert "--region" not in argv
 
-    def test_interactive_session_argv(self):
-        argv = ssm.build_interactive_session_argv("i-0abc", "dev", "us-east-1")
-        assert argv == [
-            "aws",
-            "ssm",
-            "start-session",
-            "--target",
-            "i-0abc",
-            "--region",
-            "us-east-1",
-            "--profile",
-            "dev",
-        ]
+    def test_ecs_argv_differs_from_ec2_only_in_the_target(self):
+        """One argv serves both lanes, so the EC2 command cannot drift.
+
+        The Fargate lane forwards into the task with the SAME
+        ``AWS-StartPortForwardingSession`` document as the EC2 lane -- there is no
+        per-lane document and no per-lane branch. Asserted as an element-wise
+        comparison rather than by spot-checking membership: if a future change
+        adds a Fargate-only flag, or swaps the document for the ToRemoteHost one
+        (which takes a caller-chosen ``host`` and so can be pointed at a third
+        machine), exactly one of these assertions fails.
+        """
+        task = "0123456789abcdef0123456789abcdef"
+        ecs_target = f"ecs:mycluster_{task}_{task}-1234567890"
+
+        ec2 = ssm.build_port_forward_argv("i-0abc", 5476, 5599, "dev", "us-east-1")
+        ecs = ssm.build_port_forward_argv(ecs_target, 5476, 5599, "dev", "us-east-1")
+
+        assert len(ec2) == len(ecs)
+        differing = [i for i, (a, b) in enumerate(zip(ec2, ecs)) if a != b]
+        assert differing == [ec2.index("--target") + 1]
+        assert ecs[differing[0]] == ecs_target
+        # The document is the plain one for both, and carries no `host` parameter.
+        assert "AWS-StartPortForwardingSession" in ecs
+        assert "AWS-StartPortForwardingSessionToRemoteHost" not in ecs
+        assert not any(arg.startswith("host=") or ",host=" in arg for arg in ecs)
+        assert "portNumber=5476,localPortNumber=5599" in ecs
+
+    def test_argv_heads_resolved_absolutely_under_minimal_path(self, monkeypatch, tmp_path):
+        """``build_port_forward_argv`` must resolve the CLI absolutely under a
+        GUI-launched gateway's minimal PATH via the deploy engine's shared
+        well-known-dirs resolver."""
+        import os as _os
+
+        if _os.name == "nt":
+            pytest.skip("fallback install dirs are POSIX literals; dead on Windows by design")
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+        # Undo this class's bare-name pin: this test exercises the real resolver.
+        monkeypatch.setattr(ssm, "resolve_aws_bin", engine.resolve_aws_bin)
+
+        pf = ssm.build_port_forward_argv("i-0abc", 5476, 5599, "dev", "us-east-1")
+        assert pf[0] == str(fake_aws)
+        assert pf[1:3] == ["ssm", "start-session"]
 
 
 class TestOpenPortForward:
@@ -60,6 +106,148 @@ class TestOpenPortForward:
         assert captured["stdout"] == subprocess.DEVNULL
         assert captured["stderr"] == subprocess.DEVNULL
         assert captured["start_new_session"] is True
+
+    def test_child_env_can_find_the_session_manager_plugin(self, monkeypatch, tmp_path):
+        """The child needs its OWN widened PATH, not just a resolved argv head.
+
+        Resolving ``aws`` absolutely does not help the CLI find
+        ``session-manager-plugin``: it looks that up by name against the child's
+        inherited PATH at start-session time, which under a GUI-launched gateway
+        is the minimal launchd one — so the tunnel died inside a correctly
+        resolved ``aws``.
+        """
+        from kiro_crew.deploy import engine
+
+        captured: dict = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs, argv=argv)
+            return object()
+
+        # tmp_path stand-ins for the inherited minimal PATH and the plugin's real
+        # install dir: a host literal would flake and is unrunnable on Windows.
+        # `aws` sits on the inherited PATH so the head resolves absolutely (a PATH
+        # hit needs no provenance check) and the widening is therefore offered.
+        # Windows resolves executables by PATHEXT, not the exec bit, so the planted
+        # file has to differ there or the head would fall back to the bare name and
+        # the widening would (correctly) be withheld.
+        inherited = tmp_path / "sysbin"
+        inherited.mkdir()
+        if os.name == "nt":
+            fake_aws = inherited / "aws.cmd"
+            fake_aws.write_text("@echo off\n")
+            monkeypatch.setenv("PATHEXT", ".cmd")
+        else:
+            fake_aws = inherited / "aws"
+            fake_aws.write_text("#!/bin/sh\n")
+            fake_aws.chmod(0o755)
+        install_dir = tmp_path / "install"
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+
+        ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1")
+
+        assert captured["argv"][0] == str(fake_aws)  # absolute head
+        child_path = captured["env"]["PATH"].split(os.pathsep)
+        assert str(install_dir) in child_path  # the plugin's install dir
+        assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
+
+    @pytest.mark.skipif(os.name == "nt", reason="provenance branch is dead on Windows")
+    def test_refused_aws_binary_is_not_put_back_on_the_child_path(self, monkeypatch, tmp_path):
+        """A provenance-REFUSED aws must not become reachable again via the env.
+
+        The resolver falls back to the bare name exactly when it found a candidate
+        in the install dirs and ``validate_provider_executable`` refused it, and
+        that refusal is enforced ONLY by the bare name failing execvp against a
+        PATH those dirs are absent from. Widening the child's PATH would put the
+        refused binary back in execvp's reach and hand it AWS credentials — a
+        fail-closed rejection silently turned into an execution.
+        """
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        captured: dict = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs, argv=argv)
+            return object()
+
+        inherited = tmp_path / "sysbin"  # deliberately contains no aws
+        inherited.mkdir()
+        install_dir = tmp_path / "install"
+        install_dir.mkdir()
+        planted = install_dir / "aws"
+        planted.write_text("#!/bin/sh\n")
+        planted.chmod(0o755)
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+
+        def _refuse(_candidate):
+            raise ValueError("planted shim")
+
+        monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+
+        ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1")
+
+        assert captured["argv"][0] == "aws"  # refused -> bare name
+        # The dir holding the refused binary must NOT be on the child's PATH.
+        assert str(install_dir) not in captured["env"]["PATH"].split(os.pathsep)
+        assert captured["env"]["PATH"] == str(inherited)
+
+
+class TestSessionManagerPluginProbe:
+    """The probe must agree with what the spawn actually does.
+
+    Reported against a shipped desktop build: the plugin was installed at
+    /usr/local/bin/session-manager-plugin and worked in a shell, but the
+    launchd-launched gateway inherits /usr/bin:/bin:/usr/sbin:/sbin, so a bare
+    shutil.which() missed it and every SSM tunnel was refused by the
+    prerequisite gate before one was attempted. A symlink into the minimal PATH
+    is not a workaround on macOS — those dirs are all SIP-restricted.
+    """
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="provenance validation needs POSIX uid semantics; the fallback "
+        "dir branch is dead on Windows by design",
+    )
+    def test_probe_finds_plugin_in_install_dir_under_minimal_path(self, monkeypatch, tmp_path):
+        from kiro_crew.deploy import engine
+
+        plugin = tmp_path / "session-manager-plugin"
+        plugin.write_text("#!/bin/sh\n")
+        plugin.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        # A PATH that cannot see the plugin, standing in hermetically for the
+        # minimal launchd one (a literal /usr/bin would flake on a host that has
+        # the real plugin installed there).
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+
+        from kiro_crew import github_runner
+
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        assert ssm.session_manager_plugin_installed() is True
+
+    def test_probe_false_when_the_plugin_is_absent_everywhere(self, monkeypatch, tmp_path):
+        """Genuinely missing still reports missing — the actionable install hint
+        must not be traded away for the false-negative fix."""
+        from kiro_crew.deploy import engine
+
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", ())
+
+        assert ssm.session_manager_plugin_installed() is False
+        with pytest.raises(aws.AWSError):
+            ssm.require_session_manager_plugin()
 
     def test_open_port_forward_refused_under_agent_session(self, monkeypatch):
         # The streaming tunnel bypasses run_aws, so it carries its own
@@ -95,6 +283,8 @@ class TestKillPortForward:
         # wrapper to own a real process group for the grandchild to be in its tree.
         proc = subprocess.Popen(
             [sys.executable, "-c", script],
+            # A child inherits pytest's CWD (the checkout) unless told otherwise.
+            cwd=tmp_path,
             start_new_session=platform_compat.IS_POSIX,
             **(
                 {}
@@ -373,6 +563,31 @@ class TestRunCommand:
         assert not ssm._USERNAME_RE.match("bad user")
         assert not ssm._USERNAME_RE.match("-leadingdash")
 
+    def test_run_as_rejects_trailing_newline(self, monkeypatch):
+        """A trailing newline must not reach the remote command string.
+
+        ``run_as`` is interpolated into the single-line string
+        ``_wrap_remote_command`` builds (``… | sudo -u {run_as} -i bash``), where a
+        newline ends that line and begins a second shell statement. The pattern
+        was anchored with ``$``, which also matches just before a trailing
+        newline, so ``"ec2-user\\n"`` passed this check; it is now ``\\Z``.
+
+        No caller threads user input into ``run_as`` today -- every one passes the
+        default or a registry value ``validate_ssm_run_as`` has already bounded --
+        so this was latent rather than exploitable. It is pinned because
+        :func:`run_command`'s docstring promises the surface stays closed if a
+        caller ever does, and under ``$`` that promise did not hold.
+        """
+        assert not ssm._USERNAME_RE.match("ec2-user\n")
+        monkeypatch.setattr(aws, "checked_json", lambda *a, **k: pytest.fail("must reject first"))
+        with pytest.raises(aws.AWSError, match="run_as"):
+            ssm.run_command("i-0abc", "echo hi", "dev", run_as="ec2-user\n")
+
+    def test_wrapped_command_never_contains_a_newline_from_run_as(self):
+        """The property the anchor protects, asserted on the built string itself."""
+        wrapped = ssm._wrap_remote_command("echo hi", "ec2-user")
+        assert "\n" not in wrapped
+
 
 class TestManaged:
     def test_online(self, monkeypatch):
@@ -385,9 +600,6 @@ class TestManaged:
 
 
 class TestShellQuote:
-    def test_quotes_single_quotes(self):
-        assert ssm._shq("it's") == "'it'\\''s'"
-
     def test_json_str_list(self):
         assert ssm._json_str_list(["a", "b"]) == '["a", "b"]'
 

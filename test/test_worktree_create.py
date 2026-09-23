@@ -7,11 +7,15 @@ happy path against a throwaway git repo in tmp_path.
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import functools
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +23,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew import sandbox as sandbox_mod
+from kiro_crew.dashboard.handlers import worktree as wt_mod
 from kiro_crew.dashboard.handlers.worktree import (
     _FILTER_PROBE_FAILED,
     SandboxUnavailable,
@@ -31,7 +37,8 @@ from kiro_crew.dashboard.handlers.worktree import (
     _resolve_commit,
     _run_git,
     _worktree_branches,
-    _worktree_config_active,
+    _worktree_extension_on,
+    _worktree_probe_failure_is_empty_scope,
     api_worktree_create,
 )
 from kiro_crew.validation import FOLLOWUP_BRANCH_RE, is_valid_followup_branch
@@ -42,9 +49,57 @@ def _branch_exists(root: str, branch: str) -> bool:
     return bool(_resolve_commit(root, f"refs/heads/{branch}"))
 
 
-def _make_app(
-    *projects: str, app_claim: str | None = "", user: str = "owner"
-) -> web.Application:
+#: Every helper in this module that reaches git through ``worktree._run_git``,
+#: and therefore through ``sandbox.wrap_argv``. Calling one from an ``async def``
+#: body puts blocking sandbox preparation on the event loop, which `wrap_argv`
+#: refuses (see :func:`_off_loop`). ``TestNoBlockingGitOnTheEventLoop`` enforces
+#: that every such call in an async body goes through `_off_loop`.
+_BLOCKING_GIT_HELPERS = frozenset(
+    {
+        "_branch_exists",
+        "_checkout_filter",
+        "_claim_branch",
+        "_cleanup_partial",
+        "_require_sandbox_exec",
+        "_resolve_base_ref",
+        "_resolve_commit",
+        "_run_git",
+        "_sandbox_exec_reason",
+        "_worktree_branches",
+        "_worktree_extension_on",
+        "_worktree_probe_failure_is_empty_scope",
+        "_git_toplevel",
+    }
+)
+
+
+def _on_event_loop() -> bool:
+    """Whether the caller is running on an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+async def _off_loop(fn, /, *args):
+    """Await one of ``worktree.py``'s blocking git helpers on a worker thread.
+
+    ``sandbox.wrap_argv`` refuses to run on a running event loop — it performs
+    blocking sandbox preparation, so it must be reached from a thread. The
+    endpoint honours that: every sync helper
+    reached by ``api_worktree_create`` goes through ``asyncio.to_thread``.
+
+    An ``async def`` test body is ON the loop, so calling the same helper
+    directly trips the guard inside the *assertion* rather than in the code under
+    test, and the ``RuntimeError`` arrives dressed as ``SandboxUnavailable`` —
+    indistinguishable from the "this host has no sandbox backend" refusal the
+    tests legitimately assert. Mirror what production does instead.
+    """
+    return await asyncio.to_thread(fn, *args)
+
+
+def _make_app(*projects: str, app_claim: str | None = "", user: str = "owner") -> web.Application:
     """App whose state exposes one slot per allowed project directory.
 
     ``app_claim`` mirrors ``token_auth_middleware``'s ``request["app"]``: ``""``
@@ -62,12 +117,10 @@ def _make_app(
     app = web.Application(middlewares=[claims])
     state = MagicMock()
     # The gate requires the OWNER's own identity, not merely a dashboard claim
-    # (GPT review round 12), so the mock must carry a matching owner_id — a bare
+    # so the mock must carry a matching owner_id — a bare
     # MagicMock attribute here would 403 every request for the wrong reason.
     state.owner_id = "owner"
-    state._slots = {
-        f"chat-{i}": MagicMock(project=str(p)) for i, p in enumerate(projects) if p
-    }
+    state._slots = {f"chat-{i}": MagicMock(project=str(p)) for i, p in enumerate(projects) if p}
     app["state"] = state
     app.router.add_post("/api/worktree/create", api_worktree_create)
     return app
@@ -99,7 +152,7 @@ def _git(*args: str, cwd) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _sandbox_exec_reason() -> str:
-    """"" if a sandboxed git can actually run here, else why it cannot.
+    """ "" if a sandboxed git can actually run here, else why it cannot.
 
     `_run_git` routes through the OS-sandbox chokepoint, and the endpoint refuses
     with a 503 when isolation cannot be established. That is a real platform
@@ -107,7 +160,30 @@ def _sandbox_exec_reason() -> str:
     rather than fail. A backend-availability probe is not enough: GitHub Actions
     runners pass the user-namespace probe but deny `unshare(NEWNS)` at exec time
     (errno 1), which the launcher can only report from the child.
+
+    Resets ``sandbox._backend`` immediately before probing. Without this, the
+    ONE-TIME probe below reads whatever backend verdict another test file
+    already cached in this xdist worker's shared process — `_backend` has a
+    permanent fast path once set to "namespace" or "none", and no fixture in
+    THIS file clears it, so this file's own (also one-time, ``lru_cache``d)
+    verdict silently inherited a coin flip decided by test-collection order:
+    which file's tests happened to run first in this worker on a given
+    invocation. That is the flip this module's own caching cannot fix on its
+    own — the cache was deterministic, but keyed on stale ambient state rather
+    than a probe of THIS host. Forcing a fresh probe here makes the verdict
+    depend only on the host's actual sandbox availability.
     """
+    sandbox_mod.reset_backend()
+    # Never let a verdict be produced ON the event loop. `wrap_argv`'s loop guard
+    # would be cached here as "sandbox unavailable" and silently skip every
+    # git-touching test in this worker for the wrong reason — the exact failure
+    # mode that let the on-loop assertions below reach CI unnoticed (they skip or
+    # fail depending only on which test populated this cache first). Fail loudly
+    # instead; async callers must come through `_off_loop`.
+    assert not _on_event_loop(), (
+        "_sandbox_exec_reason() runs _run_git, which cannot be reached from the "
+        "event loop — call it via `await _off_loop(_require_sandbox_exec)`"
+    )
     with tempfile.TemporaryDirectory() as tmp:
         try:
             proc = _run_git(["--version"], tmp)
@@ -134,9 +210,25 @@ def _passthrough_spawn(argv, mode="standard", **kw):
     examined. Skipping would lose the coverage, and one such test was passing on
     Windows for the wrong reason — that RuntimeError is surfaced as
     ``SandboxUnavailable`` too, so the assertion held without the code under test
-    running (GPT review round 12 / round-11 CI).
+    running.
     """
     return list(argv), {}, None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sandbox_backend_session_boundary():
+    """Reset ``sandbox._backend`` at session END, mirroring the reset this file's
+    own :func:`_sandbox_exec_reason` already does at session START.
+
+    ``_sandbox_exec_reason()`` is ``lru_cache``d and forces a fresh probe on its
+    one call, but its result (a real "namespace" or "none" verdict for THIS
+    host) then sits in the shared ``sandbox`` module global for the rest of the
+    xdist worker's process. Clearing it here keeps this file from becoming the
+    same kind of ambient-state donor to whichever test module runs next in this
+    worker that this fix exists to stop this file from being a VICTIM of.
+    """
+    yield
+    sandbox_mod.reset_backend()
 
 
 @pytest.fixture(scope="session")
@@ -154,6 +246,14 @@ def _repo_template(tmp_path_factory):
     _git("init", "-q", "-b", "main", cwd=template)
     _git("config", "user.email", "test@example.com", cwd=template)
     _git("config", "user.name", "Test", cwd=template)
+    # The commit below can spawn background auto-maintenance (gc / maintenance
+    # run --auto), whose transient .git/objects/maintenance.lock races the
+    # per-test shutil.copytree of this template -- the lock is listed by the
+    # directory scan, then gone by the time copytree opens it (seen as a
+    # shutil.Error in the v0.4.0-insider.3 RC gate). Session scope makes the
+    # window span into the first tests, so switch maintenance off entirely.
+    _git("config", "gc.auto", "0", cwd=template)
+    _git("config", "maintenance.auto", "false", cwd=template)
     (template / "README.md").write_text("hi\n")
     _git("add", "README.md", cwd=template)
     _git("commit", "-q", "-m", "init", cwd=template)
@@ -222,20 +322,35 @@ class TestWorktreeCreate:
             assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_rejects_missing_directory(self, tmp_path):
+    async def test_rejects_missing_directory(self, tmp_path, monkeypatch):
         # Reaches the git probe, so it needs a host where the sandbox can run
         # (a refusal answers 503 before any directory check is reported).
-        _require_sandbox_exec()
-        async with TestClient(TestServer(_make_app(str(tmp_path)))) as client:
+        await _off_loop(_require_sandbox_exec)
+        # The allow-list maps the missing child onto its slot project, so what the
+        # git probe sees is the PROJECT -- which must not be inside a repository
+        # for the 400 to be the not-a-repository answer it is on CI. See
+        # test_rejects_non_git_directory for why that is constructed, not assumed.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        project = tmp_path / "project"
+        project.mkdir()
+        async with TestClient(TestServer(_make_app(str(project)))) as client:
             resp = await client.post(
                 "/api/worktree/create",
-                json={"repo": str(tmp_path / "nope"), "branch": "feat/x"},
+                json={"repo": str(project / "nope"), "branch": "feat/x"},
             )
             assert resp.status == 400
 
     @pytest.mark.asyncio
-    async def test_rejects_non_git_directory(self, tmp_path):
-        _require_sandbox_exec()
+    async def test_rejects_non_git_directory(self, tmp_path, monkeypatch):
+        await _off_loop(_require_sandbox_exec)
+        # "Not a git directory" is constructed, not assumed of tmp_path: a harness
+        # that pins TMPDIR under the checkout gives it a real .git among its
+        # ancestors, git's upward discovery resolves the toplevel to THAT checkout,
+        # and the handler answers 403 (toplevel outside the slot project) instead
+        # of 400. GIT_CEILING_DIRECTORIES is git's own seam for that walk and the
+        # sandboxed spawn inherits os.environ; the project is a CHILD of the
+        # ceiling because git checks its starting directory before consulting it.
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
         plain = tmp_path / "plain"
         plain.mkdir()
         async with TestClient(TestServer(_make_app(str(plain)))) as client:
@@ -306,8 +421,7 @@ class TestWorktreeCreate:
 class TestNoRepositoryCodeExecution:
     """`git worktree add` must not run the repository's own post-checkout hook.
 
-    This is the regression guard for the GPT HIGH on PR #461: the hook is
-    repo-controlled code, and it executing is what would otherwise demand
+    The hook is repo-controlled code, and its executing is what would otherwise demand
     OS-sandbox isolation on this spawn. The control case asserts the hook WOULD
     have fired without the overrides, so the test cannot silently pass because
     the harness failed to install a working hook.
@@ -353,7 +467,7 @@ class TestNoRepositoryCodeExecution:
     async def test_hooks_path_is_not_a_repo_writable_location(self, repo, tmp_path):
         """A hook planted at the OLD in-repo sentinel path must not execute.
 
-        Round 5 of the PR #461 review: `core.hooksPath` resolves relative to the
+        `core.hooksPath` resolves relative to the
         repository, so pointing it at `.git/kirocrew-no-hooks` left the
         suppression target inside a directory the checkout's own preparer can
         write. Planting `post-checkout` there turned the guard into the execution
@@ -373,7 +487,7 @@ class TestNoRepositoryCodeExecution:
         assert not marker.exists(), "hook planted at the in-repo sentinel path executed"
 
     def test_hooks_sink_is_a_non_directory_device(self):
-        """Round 8 HIGH: a same-uid gateway-owned directory was still plantable.
+        """A same-uid gateway-owned directory is plantable, so the sink is a non-directory device.
 
         `os.devnull` cannot be replaced or filled, so there is no window between
         one git call and the next in which a hook could appear.
@@ -392,7 +506,7 @@ class TestIdempotentReentry:
 
     The card creates the worktree, then opens a session. If the session step
     fails the worktree is already on disk, so a naive retry dead-ends on both
-    "directory already exists" and "branch already exists" (GPT review, PR #461).
+    "directory already exists" and "branch already exists".
     """
 
     @pytest.mark.asyncio
@@ -443,15 +557,13 @@ class TestIdempotentReentry:
             return real_run_git(args, cwd)
 
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
-            with patch(
-                "kiro_crew.dashboard.handlers.worktree._run_git", side_effect=fail_add
-            ):
+            with patch("kiro_crew.dashboard.handlers.worktree._run_git", side_effect=fail_add):
                 resp = await client.post(
                     "/api/worktree/create", json={"repo": str(repo), "branch": "feat/doomed"}
                 )
                 assert resp.status == 400
             assert not (repo.parent / "proj-wt-doomed").exists()
-            assert not _branch_exists(str(repo), "feat/doomed")
+            assert not await _off_loop(_branch_exists, str(repo), "feat/doomed")
             # And the retry path is clear: a good request now succeeds.
             ok = await client.post(
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/doomed"}
@@ -471,12 +583,12 @@ class TestIdempotentReentry:
                 )
                 assert resp.status == 400
         assert not (repo.parent / "proj-wt-nobase").exists()
-        assert not _branch_exists(str(repo), "feat/nobase")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/nobase")
 
 
 class TestConcurrencySafety:
-    """GPT review round 3, HIGH: check-then-create let two same-branch requests
-    both proceed, and the loser's cleanup then destroyed the winner's worktree.
+    """Check-then-create lets two same-branch requests both proceed, and the
+    loser's cleanup then destroys the winner's worktree.
     """
 
     def test_claim_is_atomic(self, repo):
@@ -500,7 +612,7 @@ class TestConcurrencySafety:
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/race"}
             )
             assert second.status == 409
-        assert _branch_exists(str(repo), "feat/race")
+        assert await _off_loop(_branch_exists, str(repo), "feat/race")
         assert os.path.isdir(path + "-moved")
 
     def test_cleanup_spares_a_worktree_registered_to_another_branch(self, repo):
@@ -511,25 +623,21 @@ class TestConcurrencySafety:
         assert _run_git(["worktree", "add", theirs, "feat/theirs"], str(repo)).returncode == 0
         # A different request unwinds ITS branch, whose derived dest collides.
         assert _claim_branch(str(repo), "feat/ours", sha) is True
-        _cleanup_partial(
-            str(repo), theirs, "feat/ours", claimed=True, created=True, base_sha=sha
-        )
+        _cleanup_partial(str(repo), theirs, "feat/ours", claimed=True, created=True, base_sha=sha)
         assert os.path.isdir(theirs), "another branch's worktree was destroyed"
         assert _branch_exists(str(repo), "feat/theirs")
         assert not _branch_exists(str(repo), "feat/ours")
 
     def test_cleanup_never_touches_a_directory_it_did_not_create(self, repo):
-        """GPT round 4 HIGH: `created=False` must mean hands off the path.
+        """`created=False` must mean hands off the path.
 
-        Previously "git lists nothing here" authorized an `rmtree`, which is also
+        Otherwise "git lists nothing here" authorizes an `rmtree`, which is also
         what a transient listing failure looks like.
         """
         squatter = repo.parent / "proj-wt-untouched"
         squatter.mkdir()
         (squatter / "precious.txt").write_text("do not delete")
-        _cleanup_partial(
-            str(repo), str(squatter), "feat/whatever", claimed=False, created=False
-        )
+        _cleanup_partial(str(repo), str(squatter), "feat/whatever", claimed=False, created=False)
         assert (squatter / "precious.txt").is_file()
 
     def test_cleanup_survives_a_failed_worktree_listing(self, repo):
@@ -537,16 +645,14 @@ class TestConcurrencySafety:
         ours = repo.parent / "proj-wt-ours"
         ours.mkdir()
         (ours / "marker").write_text("x")
-        with patch(
-            "kiro_crew.dashboard.handlers.worktree._worktree_branches", return_value=None
-        ):
+        with patch("kiro_crew.dashboard.handlers.worktree._worktree_branches", return_value=None):
             # created=True: the mkdir claim is what authorizes removal, not the
             # (unavailable) listing.
             _cleanup_partial(str(repo), str(ours), "feat/ours", claimed=False, created=True)
         assert not ours.exists()
 
     def test_cleanup_deletes_the_branch_after_an_rmtree_fallback(self, repo):
-        """Round 7 MEDIUM: prune must precede `branch -D`.
+        """Prune must precede `branch -D`.
 
         When `worktree remove` fails and the directory is dropped with `rmtree`,
         git still lists the worktree as checked out on that branch and refuses
@@ -575,7 +681,7 @@ class TestConcurrencySafety:
         assert not _branch_exists(str(repo), "feat/stale"), "claimed branch survived cleanup"
 
     def test_cleanup_spares_a_branch_another_worktree_adopted(self, repo):
-        """Round 13 BLOCKING: `update-ref -d` has no "used by worktree" guard.
+        """`update-ref -d` has no "used by worktree" guard.
 
         A concurrent `git worktree add` can check out the branch this request
         claimed while the request is failing. Compare-and-delete still matched
@@ -588,9 +694,7 @@ class TestConcurrencySafety:
         theirs = str(repo.parent / "proj-wt-adopted")
         assert _run_git(["worktree", "add", theirs, "feat/adopted"], str(repo)).returncode == 0
         ours = str(repo.parent / "proj-wt-ours-failed")
-        _cleanup_partial(
-            str(repo), ours, "feat/adopted", claimed=True, created=False, base_sha=sha
-        )
+        _cleanup_partial(str(repo), ours, "feat/adopted", claimed=True, created=False, base_sha=sha)
         assert _branch_exists(str(repo), "feat/adopted"), "deleted a branch in use"
         head = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], theirs)
         assert head.stdout.strip() == "feat/adopted"
@@ -600,9 +704,7 @@ class TestConcurrencySafety:
         reporting "already exists" is recoverable where a broken worktree is not."""
         sha = _resolve_commit(str(repo), "HEAD")
         assert _claim_branch(str(repo), "feat/unknown", sha) is True
-        with patch(
-            "kiro_crew.dashboard.handlers.worktree._worktree_branches", return_value=None
-        ):
+        with patch("kiro_crew.dashboard.handlers.worktree._worktree_branches", return_value=None):
             _cleanup_partial(
                 str(repo),
                 str(repo.parent / "proj-wt-unknown"),
@@ -614,8 +716,8 @@ class TestConcurrencySafety:
         assert _branch_exists(str(repo), "feat/unknown")
 
     def test_cleanup_spares_a_branch_that_advanced_after_the_claim(self, repo, tmp_path):
-        """Round 10 HIGH: `branch -D` force-deletes, so a concurrent commit landing
-        on the claimed ref between the claim and the cleanup was discarded with it.
+        """`branch -D` force-deletes, so a concurrent commit landing
+        on the claimed ref between the claim and the cleanup is discarded with it.
 
         Compare-and-delete (`update-ref -d <ref> <old>`) refuses once the ref has
         moved, so those commits stay reachable.
@@ -624,9 +726,7 @@ class TestConcurrencySafety:
         assert _claim_branch(str(repo), "feat/advanced", sha) is True
         # A concurrent process advances the claimed ref (a commit pushed into it).
         wt = tmp_path / "concurrent"
-        assert _run_git(
-            ["worktree", "add", str(wt), "feat/advanced"], str(repo)
-        ).returncode == 0
+        assert _run_git(["worktree", "add", str(wt), "feat/advanced"], str(repo)).returncode == 0
         (wt / "new.txt").write_text("work someone else did\n")
         _git("add", "new.txt", cwd=wt)
         _git("-c", "user.email=a@b.c", "-c", "user.name=a", "commit", "-qm", "concurrent", cwd=wt)
@@ -641,9 +741,9 @@ class TestConcurrencySafety:
             created=False,
             base_sha=sha,
         )
-        assert _resolve_commit(str(repo), "refs/heads/feat/advanced") == advanced, (
-            "cleanup discarded commits added after the claim"
-        )
+        assert (
+            _resolve_commit(str(repo), "refs/heads/feat/advanced") == advanced
+        ), "cleanup discarded commits added after the claim"
 
     def test_cleanup_leaves_a_branch_it_did_not_claim(self, repo):
         sha = _resolve_commit(str(repo), "HEAD")
@@ -669,11 +769,11 @@ class TestConcurrencySafety:
                 )
                 assert resp.status == 503, await resp.text()
         assert not (repo.parent / "proj-wt-blind").exists()
-        assert not _branch_exists(str(repo), "feat/blind")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/blind")
 
 
 class TestSlugCollision:
-    """GPT review round 3, MEDIUM: `_dir_slug` keeps only a branch's last
+    """`_dir_slug` keeps only a branch's last
     segment, so `feat/foo` and `fix/foo` derive the same destination. Reuse keyed
     on the path alone handed back the wrong branch's worktree.
     """
@@ -693,12 +793,13 @@ class TestSlugCollision:
             body = await second.json()
         assert "already exists" in body["error"]
         # The first worktree is untouched and still on its own branch.
-        assert _worktree_branches(str(repo))[os.path.normcase(dest)] == "feat/shared"
-        assert not _branch_exists(str(repo), "fix/shared")
+        trees = await _off_loop(_worktree_branches, str(repo))
+        assert trees[os.path.normcase(dest)] == "feat/shared"
+        assert not await _off_loop(_branch_exists, str(repo), "fix/shared")
 
 
 class TestCheckoutFilters:
-    """GPT review round 3, HIGH: `.gitattributes` can name a content filter whose
+    """`.gitattributes` can name a content filter whose
     driver is defined in repo-local config, and checkout runs it. `-c` cannot
     disable an arbitrary filter name, so such a repo is refused.
     """
@@ -706,7 +807,7 @@ class TestCheckoutFilters:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["filter.evil.process", "filter.evil.smudge"])
     async def test_local_filter_config_is_refused(self, repo, key):
-        _git("config", "--local", key, "sh -c 'touch /tmp/pwned'", cwd=repo)
+        _git("config", "--local", key, "sh -c ':'", cwd=repo)
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.post(
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/filtered"}
@@ -715,7 +816,7 @@ class TestCheckoutFilters:
             body = await resp.json()
         assert "content filter" in body["error"]
         assert not (repo.parent / "proj-wt-filtered").exists()
-        assert not _branch_exists(str(repo), "feat/filtered")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/filtered")
 
     @pytest.mark.asyncio
     async def test_unrelated_local_config_is_not_refused(self, repo):
@@ -730,7 +831,7 @@ class TestCheckoutFilters:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("key", ["filter.evil.process", "filter.evil.smudge"])
     async def test_worktree_scoped_filter_config_is_refused(self, repo, key):
-        """Round 6 HIGH: `--local` does not report worktree-scoped keys.
+        """`--local` does not report worktree-scoped keys.
 
         With `extensions.worktreeConfig=true` git also reads
         `$GIT_COMMON_DIR/config.worktree`. A filter driver declared only there was
@@ -738,9 +839,9 @@ class TestCheckoutFilters:
         it during checkout (verified empirically before this fix).
         """
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
-        _git("config", "--worktree", key, "sh -c 'touch /tmp/pwned'", cwd=repo)
+        _git("config", "--worktree", key, "sh -c ':'", cwd=repo)
         # Precondition: the old probe genuinely could not see this key.
-        local = _run_git(["config", "--local", "--name-only", "--list"], str(repo))
+        local = await _off_loop(_run_git, ["config", "--local", "--name-only", "--list"], str(repo))
         assert key not in local.stdout.splitlines()
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.post(
@@ -750,42 +851,79 @@ class TestCheckoutFilters:
             body = await resp.json()
         assert "content filter" in body["error"]
         assert not (repo.parent / "proj-wt-wtfiltered").exists()
-        assert not _branch_exists(str(repo), "feat/wtfiltered")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/wtfiltered")
+
+    @pytest.mark.asyncio
+    async def test_worktree_extension_override_cannot_hide_its_own_scope(self, repo):
+        """git takes the extension from the REPO config only, so a
+        worktree-scoped ``extensions.worktreeConfig=false`` leaves the scope
+        LIVE — but it wins a merged ``--get`` chain, so an extension probe
+        without ``--local`` reads the extension as off and never lists the
+        scope the driver hides in. The checkout must still refuse."""
+        _git("config", "extensions.worktreeConfig", "true", cwd=repo)
+        _git("config", "--worktree", "extensions.worktreeConfig", "false", cwd=repo)
+        _git("config", "--worktree", "filter.evil.smudge", "sh -c ':'", cwd=repo)
+        # Precondition: the merged read is genuinely poisoned while the scope
+        # stays live — or this case proves nothing.
+        merged = await _off_loop(
+            _run_git, ["config", "--bool", "--get", "extensions.worktreeConfig"], str(repo)
+        )
+        assert merged.stdout.strip() == "false"
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.post(
+                "/api/worktree/create", json={"repo": str(repo), "branch": "feat/wtoverride"}
+            )
+            assert resp.status == 409, await resp.text()
+            body = await resp.json()
+        assert "content filter" in body["error"]
+        assert not (repo.parent / "proj-wt-wtoverride").exists()
+        assert not await _off_loop(_branch_exists, str(repo), "feat/wtoverride")
 
     @pytest.mark.asyncio
     async def test_linked_worktree_scoped_filter_config_is_refused(self, repo, tmp_path):
-        """Round 7 HIGH: for a LINKED worktree, `config.worktree` lives under
+        """For a LINKED worktree, `config.worktree` lives under
         `$GIT_DIR` (`<common>/worktrees/<id>`), not under the common dir.
 
-        Probing the common dir therefore missed a filter declared in a linked
-        worktree's own config — `_worktree_config_active` returned False, the
-        `--worktree` scope was skipped, and the driver executed during checkout
-        (verified empirically before this fix).
+        A common-dir probe cannot see a filter declared in a linked
+        worktree's own config, so the guard resolves `--absolute-git-dir`:
+        with the extension on the scope is always listed, and the failure
+        classifier stats `$GIT_DIR`, never the common dir. A driver in the
+        linked worktree's file must refuse the checkout.
         """
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
         linked = tmp_path / "linked"
         _git("worktree", "add", str(linked), "-b", "linked-br", "HEAD", cwd=repo)
-        _git("config", "--worktree", "filter.evil.smudge", "sh -c 'touch /tmp/pwned'", cwd=linked)
+        _git("config", "--worktree", "filter.evil.smudge", "sh -c ':'", cwd=linked)
         # Precondition: the file is NOT where the common-dir probe looked.
-        common = _run_git(["rev-parse", "--git-common-dir"], str(linked)).stdout.strip()
-        gitdir = _run_git(["rev-parse", "--absolute-git-dir"], str(linked)).stdout.strip()
+        common = (
+            await _off_loop(_run_git, ["rev-parse", "--git-common-dir"], str(linked))
+        ).stdout.strip()
+        gitdir = (
+            await _off_loop(_run_git, ["rev-parse", "--absolute-git-dir"], str(linked))
+        ).stdout.strip()
         assert not os.path.isfile(os.path.join(common, "config.worktree"))
         assert os.path.isfile(os.path.join(gitdir, "config.worktree"))
-        assert _worktree_config_active(str(linked))
+        assert await _off_loop(_worktree_extension_on, str(linked))
+        # Were the probe ever to fail here, the classifier must keep the
+        # refusal: the linked worktree's own file EXISTS under $GIT_DIR.
+        assert not await _off_loop(_worktree_probe_failure_is_empty_scope, str(linked))
         async with TestClient(TestServer(_make_app(str(linked)))) as client:
             resp = await client.post(
                 "/api/worktree/create", json={"repo": str(linked), "branch": "feat/linked"}
             )
             assert resp.status == 409, await resp.text()
             assert "content filter" in (await resp.json())["error"]
-        assert not _branch_exists(str(repo), "feat/linked")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/linked")
 
     @pytest.mark.asyncio
     async def test_worktree_config_enabled_but_empty_still_succeeds(self, repo):
         """The extension alone must not refuse: `--worktree --list` exits 128 when
         no `config.worktree` file exists, and that is not a filter."""
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
-        assert not _worktree_config_active(str(repo))
+        assert await _off_loop(_worktree_extension_on, str(repo))
+        # The probe WILL fail (no config.worktree yet) and the classifier must
+        # clear that failure as the empty scope.
+        assert await _off_loop(_worktree_probe_failure_is_empty_scope, str(repo))
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.post(
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/extonly"}
@@ -795,14 +933,12 @@ class TestCheckoutFilters:
     def test_probe_failure_fails_closed(self, repo):
         """An unreadable config scope refuses rather than assuming "no filter"."""
         failed = subprocess.CompletedProcess(args=["git"], returncode=128, stdout="", stderr="x")
-        with patch(
-            "kiro_crew.dashboard.handlers.worktree._run_git", return_value=failed
-        ):
+        with patch("kiro_crew.dashboard.handlers.worktree._run_git", return_value=failed):
             assert _checkout_filter(str(repo)) == _FILTER_PROBE_FAILED
 
     @pytest.mark.asyncio
     async def test_included_filter_config_is_refused(self, repo, tmp_path):
-        """Round 8 HIGH: `include.path` hid the driver from the probe.
+        """`include.path` hides the driver from the probe.
 
         For a SPECIFIC scope query (`--local`/`--worktree`) git defaults
         include-following OFF, so a `filter.*.smudge` reached through
@@ -810,12 +946,14 @@ class TestCheckoutFilters:
         executing — during checkout (verified empirically before this fix).
         """
         included = tmp_path / "inc.cfg"
-        included.write_text('[filter "evil"]\n\tsmudge = "sh -c \\"touch /tmp/pwned\\""\n')
+        included.write_text('[filter "evil"]\n\tsmudge = "sh -c \\":\\""\n')
         _git("config", "--local", "include.path", str(included), cwd=repo)
         # Preconditions: resolvable by git, invisible without --includes.
-        resolved = _run_git(["config", "--includes", "--get", "filter.evil.smudge"], str(repo))
+        resolved = await _off_loop(
+            _run_git, ["config", "--includes", "--get", "filter.evil.smudge"], str(repo)
+        )
         assert resolved.stdout.strip()
-        blind = _run_git(["config", "--local", "--name-only", "--list"], str(repo))
+        blind = await _off_loop(_run_git, ["config", "--local", "--name-only", "--list"], str(repo))
         assert not [k for k in blind.stdout.splitlines() if k.startswith("filter.")]
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.post(
@@ -823,11 +961,11 @@ class TestCheckoutFilters:
             )
             assert resp.status == 409, await resp.text()
             assert "content filter" in (await resp.json())["error"]
-        assert not _branch_exists(str(repo), "feat/included")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/included")
 
 
 class TestRound9Hardening:
-    """Regressions for the round-9 review findings."""
+    """Invalid branch and ref names are rejected before a worktree is created."""
 
     @pytest.mark.parametrize(
         "bad",
@@ -871,19 +1009,17 @@ class TestRound9Hardening:
         """Fail CLOSED: no OS isolation available means the git spawn does not run."""
         from kiro_crew.dashboard.handlers import worktree as wt
 
-        with patch.object(
-            wt, "sandboxed_spawn_argv", side_effect=RuntimeError("no backend")
-        ):
+        with patch.object(wt, "sandboxed_spawn_argv", side_effect=RuntimeError("no backend")):
             async with TestClient(TestServer(_make_app(str(repo)))) as client:
                 resp = await client.post(
                     "/api/worktree/create", json={"repo": str(repo), "branch": "feat/nosbx"}
                 )
                 assert resp.status == 503, await resp.text()
                 assert "sandbox" in (await resp.json())["error"].lower()
-        assert not _branch_exists(str(repo), "feat/nosbx")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/nosbx")
 
     def test_git_runs_in_strict_sandbox_mode(self):
-        """Round 11 BLOCKING: `--includes` means `include.path` is repo-controlled,
+        """`--includes` means `include.path` is repo-controlled,
         so a hostile checkout could point it at `~/.aws/credentials` and have git
         read that file as config. "standard" leaves those paths visible; strict
         bind-mounts them away. Pinned so the mode cannot silently widen.
@@ -898,8 +1034,9 @@ class TestRound9Hardening:
             return list(argv), {}, None
 
         ok = subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr="")
-        with patch.object(wt, "sandboxed_spawn_argv", side_effect=fake_spawn), patch.object(
-            wt.subprocess, "run", return_value=ok
+        with (
+            patch.object(wt, "sandboxed_spawn_argv", side_effect=fake_spawn),
+            patch.object(wt.subprocess, "run", return_value=ok),
         ):
             wt._run_git(["--version"], os.getcwd())
         assert seen["mode"] == "strict"
@@ -912,7 +1049,7 @@ class TestRound9Hardening:
         `unshare(NEWNS)` is denied at exec time (errno 1). git never runs, and the
         non-zero exit was being reported downstream as "Not a git repository" —
         a misdiagnosis that sent the user looking at their repo instead of the
-        host. Round 9's CI run is where this surfaced.
+        host.
         """
         from kiro_crew.dashboard.handlers import worktree as wt
 
@@ -922,9 +1059,10 @@ class TestRound9Hardening:
             stdout="",
             stderr="sandbox: unshare(NEWNS) failed: errno 1\n",
         )
-        with patch.object(
-            wt, "sandboxed_spawn_argv", side_effect=_passthrough_spawn
-        ), patch.object(wt.subprocess, "run", return_value=denied):
+        with (
+            patch.object(wt, "sandboxed_spawn_argv", side_effect=_passthrough_spawn),
+            patch.object(wt.subprocess, "run", return_value=denied),
+        ):
             with pytest.raises(SandboxUnavailable):
                 wt._run_git(["--version"], os.getcwd())
 
@@ -936,9 +1074,10 @@ class TestRound9Hardening:
         failed = subprocess.CompletedProcess(
             args=["git"], returncode=128, stdout="", stderr="fatal: not a git repository\n"
         )
-        with patch.object(
-            wt, "sandboxed_spawn_argv", side_effect=_passthrough_spawn
-        ), patch.object(wt.subprocess, "run", return_value=failed):
+        with (
+            patch.object(wt, "sandboxed_spawn_argv", side_effect=_passthrough_spawn),
+            patch.object(wt.subprocess, "run", return_value=failed),
+        ):
             proc = wt._run_git(["status"], os.getcwd())
         assert proc.returncode == 128
 
@@ -948,16 +1087,17 @@ class TestRound9Hardening:
         if os.name != "posix":
             pytest.skip("NTFS rejects newlines in path components")
         dest = tmp_path / "wt\nnewline"
-        assert _run_git(
-            ["worktree", "add", str(dest), "-b", "feat/nl", "HEAD"], str(repo)
-        ).returncode == 0
+        assert (
+            _run_git(["worktree", "add", str(dest), "-b", "feat/nl", "HEAD"], str(repo)).returncode
+            == 0
+        )
         trees = _worktree_branches(str(repo))
         assert trees is not None
         assert trees.get(os.path.normcase(os.path.realpath(str(dest)))) == "feat/nl"
 
 
 class TestCallerIsolation:
-    """Round 8 HIGH: the allow-list spans EVERY slot's project, so an app caller
+    """The allow-list spans EVERY slot's project, so an app caller
     reaching this endpoint could create a worktree in another app's repository."""
 
     @pytest.mark.asyncio
@@ -969,12 +1109,12 @@ class TestCallerIsolation:
             )
             assert resp.status == 403
         assert not (repo.parent / "proj-wt-app").exists()
-        assert not _branch_exists(str(repo), "feat/app")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/app")
 
     @pytest.mark.asyncio
     async def test_non_owner_dashboard_subject_is_refused(self, repo):
-        """Round 12 BLOCKING: a dashboard token minted for another subject carries
-        `app == ""` and passed the round-8 gate, so it could create a worktree —
+        """A dashboard token minted for another subject carries
+        `app == ""` and passes the app-allow-list gate, so it could create a worktree —
         and a branch — in the OWNER's repository."""
         app = _make_app(str(repo), app_claim="", user="somebody-else")
         async with TestClient(TestServer(app)) as client:
@@ -982,7 +1122,7 @@ class TestCallerIsolation:
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/nonowner"}
             )
             assert resp.status == 403
-        assert not _branch_exists(str(repo), "feat/nonowner")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/nonowner")
 
     @pytest.mark.asyncio
     async def test_absent_auth_claim_is_refused(self, repo):
@@ -993,7 +1133,7 @@ class TestCallerIsolation:
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/noauth"}
             )
             assert resp.status == 403
-        assert not _branch_exists(str(repo), "feat/noauth")
+        assert not await _off_loop(_branch_exists, str(repo), "feat/noauth")
 
 
 class TestResolveBaseRef:
@@ -1064,3 +1204,256 @@ class TestRepoAllowList:
             assert resp.status == 403
             assert "outside" in (await resp.json())["error"]
         assert not (repo.parent / "proj-wt-x").exists()
+
+
+class TestLauncherAdvisoryIsNotARefusal:
+    """A sandbox launcher WARNING must never be read as "no sandbox backend".
+
+    The launcher's pre-exec hardlink scan degrades OPEN when it exhausts its
+    per-root file budget: /tmp on a busy host passes that budget from ordinary
+    churn, and failing closed would break every sandboxed spawn on such a host. It
+    says so on the child's stderr and execs the child anyway.
+
+    Reading that advisory as a refusal broke the endpoint on exactly those hosts,
+    because git commands here exit non-zero as a matter of course -- ``rev-parse
+    --verify --quiet`` on a branch that does not exist is the probe behind "does
+    this branch already exist", so the answer became "your host cannot sandbox
+    git" for every create.
+
+    Deliberately does NOT take the ``repo`` fixture. That fixture skips wherever
+    isolation cannot be established, which is every CI platform -- Windows has no
+    backend at all and ubuntu-latest denies ``unshare(NEWNS)`` under AppArmor -- so
+    the guard for the bug above would never run where it matters. Nothing here needs
+    a repo or a sandbox: ``run_limited`` is stubbed, the spawn goes through
+    ``_passthrough_spawn`` (the file's existing device for exactly this), and the cwd
+    only has to be a real directory.
+    """
+
+    _WARNING = (
+        "sandbox: WARNING — pre-exec hardlink scan truncated at 100000 files in "
+        "/tmp; scan incomplete (control degrades open)"
+    )
+    _FATAL = "sandbox: unshare(NEWNS) failed: errno 1"
+    #: The launcher's other fatal spelling: the host-trust pre-read that FAILS CLOSED.
+    #: Hand-typed like ``_WARNING`` above, and ratcheted by the same test below. The
+    #: path is illustrative; the severity word and the prefix are what classify it.
+    _FATAL_PRE_READ = (
+        "sandbox: FATAL — cannot read /home/u/hosts-file ([Errno 13] Permission "
+        "denied). Refusing to continue: proceeding without it would leave host-key "
+        "verification accepting any new key."
+    )
+
+    @pytest.fixture(autouse=True)
+    def _spawn_passthrough(self, monkeypatch):
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        monkeypatch.setattr(wt, "sandboxed_spawn_argv", _passthrough_spawn)
+
+    def _completed(self, returncode: int, stderr: str):
+        return subprocess.CompletedProcess(
+            args=["git"], returncode=returncode, stdout="", stderr=stderr
+        )
+
+    def test_a_warning_on_a_non_zero_exit_is_returned_as_data(self, tmp_path, monkeypatch):
+        """The non-zero exit is the ANSWER here, not an error to translate."""
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = self._WARNING + "\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+        proc = _run_git(["rev-parse", "--verify", "--quiet", "refs/heads/nope"], str(tmp_path))
+
+        assert proc.returncode == 1
+
+    def test_bytes_stdout_is_decoded_without_newline_translation(self, tmp_path, monkeypatch):
+        """``run_limited`` runs in bytes mode; the decode keeps a ``\\r`` in
+        git's stdout intact. Text mode's universal-newline translation would
+        rewrite it, misdirecting the empty-scope classifier's lstat to a path
+        that names nothing and clearing a scope whose ``config.worktree``
+        exists (see kiro_crew.git_worktree_scope)."""
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        monkeypatch.setattr(
+            wt,
+            "run_limited",
+            lambda *a, **k: subprocess.CompletedProcess(
+                args=["git"], returncode=0, stdout=b"/repo/wt\rcr/.git\n", stderr=b""
+            ),
+        )
+        proc = _run_git(["rev-parse", "--absolute-git-dir"], str(tmp_path))
+        assert proc.stdout == "/repo/wt\rcr/.git\n"
+
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="non-UTF-8 bytes are not legal NTFS or APFS/HFS+ name units",
+    )
+    def test_probe_finds_config_worktree_behind_a_non_utf8_path(self, tmp_path, monkeypatch):
+        """The decode's sibling defect to the newline rewrite: a gitdir byte
+        that is not valid UTF-8 must reach the classifier as a PEP 383
+        surrogate (``utf8_path_stdout``), or ``os.fsencode`` inside the lstat
+        rebuilds a U+FFFD path that names nothing and an EXISTING
+        ``config.worktree`` reads as the empty scope -- dropping the refusal."""
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        gitdir_bytes = os.fsencode(str(tmp_path)) + b"/git-\xff"
+        os.mkdir(gitdir_bytes)
+        with open(gitdir_bytes + b"/config.worktree", "wb"):
+            pass
+        monkeypatch.setattr(
+            wt,
+            "run_limited",
+            lambda *a, **k: subprocess.CompletedProcess(
+                args=["git"], returncode=0, stdout=gitdir_bytes + b"\n", stderr=b""
+            ),
+        )
+        assert wt._worktree_probe_failure_is_empty_scope(str(tmp_path)) is False
+
+    def test_a_fatal_launcher_line_still_refuses(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = self._FATAL + "\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+
+        with pytest.raises(SandboxUnavailable):
+            _run_git(["rev-parse", "HEAD"], str(tmp_path))
+
+    def test_a_fatal_line_a_warning_precedes_is_still_found(self, tmp_path, monkeypatch):
+        """Order must not decide it: ``startswith`` on the whole stderr missed this."""
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = f"{self._WARNING}\n{self._FATAL}\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+
+        with pytest.raises(SandboxUnavailable) as excinfo:
+            _run_git(["rev-parse", "HEAD"], str(tmp_path))
+
+        # The FATAL line alone, not the whole stderr: the message reaches the user as
+        # the reason the create was refused, and leading it with an advisory about
+        # /tmp names the wrong cause.
+        assert str(excinfo.value) == self._FATAL
+
+    @pytest.mark.skipif(
+        not hasattr(os, "getuid"),
+        reason="the namespace launcher is POSIX-only: _build_launcher_script reads "
+        "os.getuid(), which Windows has not got",
+    )
+    def test_the_launcher_emits_no_severity_the_classifier_does_not_know(self):
+        """Ratchet the coupling: `_WARNING` above is a hand-typed copy of the real text.
+
+        The classifier decides fatal-vs-advisory from one prefix, so a launcher line
+        that is neither -- a reworded advisory (``sandbox: note - ...``), or a second
+        non-fatal kind -- is read as a refusal, and on a busy-/tmp host every git
+        command that legitimately exits non-zero again reports "this host has no OS
+        sandbox backend". Nothing else pins that, because the tests above feed the
+        classifier their own strings.
+
+        Pinned as the SET of severities the launcher can emit, so adding one is a
+        deliberate edit here plus a decision about which side of the prefix it falls
+        on -- rather than a silent reclassification.
+        """
+        from kiro_crew.sandbox import _build_launcher_script
+
+        severities = {
+            token.split()[0]
+            for token in re.findall(r"sandbox: ([^'\"%\\\n]+)", _build_launcher_script("strict"))
+        }
+
+        assert severities == {
+            "unshare(NEWUSER)",
+            "unshare(NEWNS)",
+            "BLOCKED",
+            "WARNING",
+            "FATAL",
+        }
+        # And the one advisory is spelled the way the classifier looks for it.
+        assert self._WARNING.startswith(wt_mod._SANDBOX_LAUNCHER_WARNING_PREFIX)
+        assert wt_mod._SANDBOX_LAUNCHER_WARNING_PREFIX.startswith(
+            wt_mod._SANDBOX_LAUNCHER_PREFIX
+        ), "the advisory prefix must be a refinement of the launcher prefix, not a rival"
+        # FATAL is on the REFUSAL side, and deliberately so: the host-trust pre-read
+        # it reports from re-raises, so setup really does abort. Both halves are
+        # pinned, because each fails a different way -- without the launcher prefix
+        # the classifier would not see the line at all and the abort would surface as
+        # a bare git failure; with the ADVISORY prefix it would be downgraded to a
+        # warning and the caller would run on with host verification disarmed.
+        assert self._FATAL_PRE_READ.startswith(wt_mod._SANDBOX_LAUNCHER_PREFIX)
+        assert not self._FATAL_PRE_READ.startswith(wt_mod._SANDBOX_LAUNCHER_WARNING_PREFIX)
+
+    def test_the_fail_closed_pre_read_line_still_refuses(self, tmp_path, monkeypatch):
+        """The OTHER fatal spelling must refuse too, not come back as data.
+
+        ``_FATAL`` above is an ``unshare`` failure, so it shares no wording with this
+        one; a classifier keyed on anything narrower than the prefix pair would pass
+        that test and fail this one. Refusing is right because the pre-read re-raises:
+        the sandbox never came up, so running the git command bare would silently drop
+        the isolation the caller asked for.
+        """
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = self._FATAL_PRE_READ + "\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+
+        with pytest.raises(SandboxUnavailable) as excinfo:
+            _run_git(["rev-parse", "HEAD"], str(tmp_path))
+
+        assert str(excinfo.value) == self._FATAL_PRE_READ
+
+    def test_gits_own_error_is_never_mistaken_for_a_refusal(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = "fatal: not a git repository (or any of the parent directories): .git\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(128, stderr))
+        proc = _run_git(["rev-parse", "HEAD"], str(tmp_path))
+
+        assert proc.returncode == 128
+
+
+class TestNoBlockingGitOnTheEventLoop:
+    """Regression guard for the loop-guard regression (RC run 33295704858).
+
+    ``wrap_argv`` refuses to run on a running event loop, so every helper that
+    reaches git through ``worktree._run_git`` must be awaited on a worker thread
+    from an ``async def`` body — exactly as ``api_worktree_create`` does. When an
+    async test called one directly, the guard's ``RuntimeError`` surfaced as
+    ``SandboxUnavailable`` from inside the assertion, which is byte-identical to
+    the "this host has no sandbox backend" refusal these tests legitimately
+    assert. Worse, the shared ``_sandbox_exec_reason`` cache made the outcome
+    depend on ordering: poisoned from the loop it SKIPPED every git test in the
+    worker (green CI, no coverage), populated from a sync test it FAILED them.
+
+    A static check, not a runtime one: the offending call has to execute to be
+    caught otherwise, and the skip path is what hid it in the first place.
+    """
+
+    def test_no_blocking_git_helper_is_called_from_an_async_body(self):
+        tree = ast.parse(pathlib.Path(__file__).read_text(encoding="utf-8"))
+        offenders: list[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.on_loop = 0
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                self.on_loop += 1
+                self.generic_visit(node)
+                self.on_loop -= 1
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                # A plain ``def`` nested in an async body is a callback (a patch
+                # side_effect), and its caller decides where it runs — for these
+                # helpers that is always inside the endpoint's own worker thread.
+                outer, self.on_loop = self.on_loop, 0
+                self.generic_visit(node)
+                self.on_loop = outer
+
+            def visit_Call(self, node: ast.Call) -> None:
+                # `_off_loop(_branch_exists, ...)` passes the helper by REFERENCE,
+                # so it is a Name load and never reaches this branch.
+                if self.on_loop and getattr(node.func, "id", None) in _BLOCKING_GIT_HELPERS:
+                    offenders.append(f"{node.func.id}() on line {node.lineno}")
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        assert not offenders, (
+            "blocking git helper called on the event loop; wrap it with "
+            "`await _off_loop(helper, ...)`: " + ", ".join(offenders)
+        )

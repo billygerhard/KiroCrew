@@ -27,10 +27,19 @@ import kiro_crew
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import (
+    DashboardState,
+)
+from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.embeddings import get_shared_embedder, model_file_present
+from kiro_crew.executors import subprocess_executor
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform import current_context
-from kiro_crew.safety_override import safety_override, until_shutdown_permitted
+from kiro_crew.safety_override import (
+    cached_disabled_approval_modes,
+    safety_override,
+    until_shutdown_permitted,
+)
 from kiro_crew.stats import Stats
 
 logger = logging.getLogger(__name__)
@@ -129,13 +138,15 @@ def _get_telemetry_salt() -> bytes:
         return _IN_MEMORY_SALT
 
 
-def _yolo_duration_fields() -> tuple[str, bool]:
-    """``(configured_duration, until_shutdown_permitted)`` for the Settings card.
+def _yolo_duration_fields() -> tuple[str, bool, list[str]]:
+    """``(configured_duration, until_shutdown_permitted, disabled_approval_modes)``.
 
-    BOTH values touch the filesystem — the config read and the governance profile
-    resolution (``iterdir``/``stat`` over the profiles dir) — so this runs in a
-    worker thread, never on the event loop. ``/api/status`` is polled
-    continuously; doing this inline stalls the whole gateway on a slow home.
+    The first two touch the filesystem — the config read, and the ``yolo_duration``
+    governance resolution (``iterdir``/``stat`` over the profiles dir) — so this runs
+    in a worker thread, never on the event loop. ``/api/status`` is polled
+    continuously; doing this inline stalls the whole gateway on a slow home. The
+    disabled-modes list does NOT touch the filesystem (it reads the verdict pushed at
+    ceiling install) and only rides along here because it belongs in the same frame.
     """
     try:
         label = str(KiroCrewConfig.load().agent.yolo_duration)
@@ -147,36 +158,45 @@ def _yolo_duration_fields() -> tuple[str, bool]:
     except Exception:
         logger.debug("could not resolve until_shutdown permission", exc_info=True)
         permitted = True
-    return label, permitted
+    # ONE shared reader with ``status_snapshot`` AND with the per-tool-call
+    # enforcement predicate, so the HTTP, SSE and WS status frames cannot report a
+    # list the enforcement path disagrees with.
+    disabled_modes = cached_disabled_approval_modes()
+    return label, permitted, disabled_modes
+
+
+def _gateway_memory_fields() -> tuple[int, int]:
+    """``(gateway_rss_mb, watchdog_rss_max_mb)`` for the status payload.
+
+    The live resident set of THIS process (``platform_compat.proc_rss_bytes``,
+    the same reading ``/api/system`` reports as ``proc_mem_mb``) and the
+    configured per-session tree ceiling (``session.watchdog_rss_max_mb``; ``0``
+    when disabled). Both reads can touch the filesystem, so this runs in a
+    worker thread. Each degrades independently to ``0`` — an unreadable RSS
+    must not hide the ceiling, nor the reverse.
+    """
+    try:
+        rss_mb = int(platform_compat.proc_rss_bytes() // (1024 * 1024))
+    except Exception:
+        logger.debug("could not read gateway RSS for status", exc_info=True)
+        rss_mb = 0
+    try:
+        ceiling = int(KiroCrewConfig.load().session.watchdog_rss_max_mb)
+    except Exception:
+        logger.debug("could not read session.watchdog_rss_max_mb for status", exc_info=True)
+        ceiling = 0
+    return rss_mb, max(0, ceiling)
 
 
 async def api_status(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     uptime = time.time() - state.start_time
-    from kiro_crew.dashboard.handlers import (
-        _UPDATE_CHECK_INTERVAL,
-        _do_update_check,
-        _update_info,
-    )
-    from kiro_crew.dashboard.handlers import updates as _updates_mod
 
-    # Auto-recheck every 12h in background. Tracked in ``_background_tasks`` (this
-    # module's own documented pattern) rather than left as a bare create_task: the
-    # check now performs network I/O with a multi-second timeout, so an untracked
-    # task can be garbage-collected mid-flight or still be pending when the loop
-    # closes. ``_do_update_check`` is additionally single-flight, because the
-    # interval clock is only stamped once a check finishes.
-    if time.time() - _updates_mod._last_update_check > _UPDATE_CHECK_INTERVAL:
-        _bg = asyncio.create_task(_do_update_check())
-        state._background_tasks.add(_bg)
-        _bg.add_done_callback(state._background_tasks.discard)
-
-    data = state.status_snapshot(
-        update_available=bool(_update_info.get("available")),
-        update_self_updatable=bool(_update_info.get("self_updatable")),
-        update_checked=bool(_update_info.get("checked")),
-        update_command=str(_update_info.get("update_command") or ""),
-    )
+    # Route the lesson/cron counts through the ONE gateway-wide cache all three
+    # status emitters share, so the counts never compute inline on the event
+    # loop (JSONL + sqlite COUNT under the vector store lock, and a crons.json
+    # parse) — the freeze class no-blocking-call-on-event-loop guards against.
+    data = await cached_status_snapshot(state)
     static_info = _get_static_system_info()
     if state._owner_hash is not None:
         owner_hash = state._owner_hash
@@ -187,8 +207,13 @@ async def api_status(request: web.Request) -> web.Response:
         except Exception:
             owner_hash = "unknown"
     so_status = safety_override().status()
-    # Off-loop: both values hit the filesystem (see _yolo_duration_fields).
-    yolo_duration, until_shutdown_ok = await asyncio.to_thread(_yolo_duration_fields)
+    # Off-loop: the duration values hit the filesystem (see _yolo_duration_fields).
+    yolo_duration, until_shutdown_ok, disabled_approval_modes = await asyncio.to_thread(
+        _yolo_duration_fields
+    )
+    # Off-loop for the same reason: the RSS read is procfs I/O on Linux and the
+    # ceiling is a config read.
+    gateway_rss_mb, watchdog_rss_max_mb = await asyncio.to_thread(_gateway_memory_fields)
     data.update(
         {
             "uptime_secs": int(uptime),
@@ -199,6 +224,12 @@ async def api_status(request: web.Request) -> web.Response:
             "update_progress": state._update_progress,
             "version": kiro_crew.__version__,
             "platform": sys.platform,
+            # The gateway's own live resident set and the per-session tree
+            # ceiling the cleanup watchdog recycles at (0 = disabled), so
+            # `kirocrew status` can show what is bounding memory without the
+            # operator opening the System page.
+            "gateway_rss_mb": gateway_rss_mb,
+            "watchdog_rss_max_mb": watchdog_rss_max_mb,
             "yolo": so_status.active,
             "yolo_active": so_status.active,
             "yolo_expires_at": so_status.expires_at_iso or "",
@@ -211,6 +242,10 @@ async def api_status(request: web.Request) -> web.Response:
             # no-timed-expiry option — the Settings card lock-badges it when not.
             "yolo_duration": yolo_duration,
             "yolo_until_shutdown_permitted": until_shutdown_ok,
+            # Auto-approve modes forbidden by the ``approval_modes`` policy
+            # scope (subset of trust_reads/trust/yolo); the chat-footer approval
+            # picker hides each listed mode. Empty = all modes selectable.
+            "disabled_approval_modes": disabled_approval_modes,
             "owner_id_hash": owner_hash,
             "os_type": static_info.get("os", ""),
             "arch": static_info.get("arch", ""),
@@ -365,6 +400,131 @@ def _macos_memory_gb(total_bytes: int, vm_stat_output: str) -> tuple[float, floa
     return used_gb, free_gb
 
 
+#: Process-scan results, cached independently of the rest of the payload.
+_proc_scan_cache: dict[str, object] = {}
+_proc_scan_cache_ts: float = 0.0
+
+#: How long a process COUNT may be reused.
+#:
+#: Deliberately much longer than :data:`_METRICS_CACHE_TTL`, because the two
+#: answer different questions. CPU / memory / network are a live graph and are
+#: meaningless stale; "how many MCP processes exist" is a slow-moving fact that
+#: nobody reads at 2s resolution — and on any host without ``/proc`` it costs a
+#: whole-machine ``ps`` walk to obtain, which grows with the process count the
+#: shared MCP gateway multiplies. Tying it to the graph's refresh rate is what
+#: made every poll pay for it.
+_PROC_SCAN_CACHE_TTL = 15.0
+
+
+def _scan_mcp_processes() -> dict[str, object]:
+    """Count MCP-ecosystem processes by command-line signature.
+
+    A single process may match multiple signatures (e.g. a sandboxed kiro-cli
+    matches both "kirocrew_sandbox" and "kiro-cli"); per-category counts can
+    overlap, while ``mcp_total`` dedups by PID. kiro-cli is an optional backend;
+    the signature is harmless when it is not installed.
+
+    Sandbox counting platform differences:
+      Linux:  The namespace launcher (python3 ~/.kiro/crew/run/kirocrew_sandbox_*.py ...)
+              forks — the parent stays alive with "kirocrew_sandbox" in its
+              /proc/cmdline, so sandbox count is accurate.
+      macOS:  sandbox-exec execs the target command, replacing the process
+              image. The final cmdline becomes "kiro-cli ..." and the
+              "kirocrew_sandbox" string (only in the -f path arg) is lost.
+              Sandbox count will be 0 even when sandboxes are running.
+    """
+    try:
+        _my = os.getpid()
+        _counts: dict[str, int] = {"sandbox": 0, "kiro_cli": 0}
+        _seen: set[str] = set()
+        if sys.platform == "linux":
+            for d in os.listdir("/proc"):
+                if not d.isdigit() or int(d) == _my:
+                    continue
+                try:
+                    cmd = Path(f"/proc/{d}/cmdline").read_bytes()
+                    matched = False
+                    if b"kirocrew_sandbox" in cmd:
+                        _counts["sandbox"] += 1
+                        matched = True
+                    if b"kiro-cli" in cmd:
+                        _counts["kiro_cli"] += 1
+                        matched = True
+                    if matched:
+                        _seen.add(d)
+                except OSError:
+                    pass
+        else:
+            _sigs = {
+                "kirocrew_sandbox": "sandbox",
+                "kiro-cli": "kiro_cli",
+            }
+            try:
+                out = subprocess.check_output(
+                    ["ps", "-eo", "pid,command"],
+                    timeout=5,
+                    text=True,
+                )
+                for line in out.splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    pid_s, cmd = parts
+                    if pid_s.strip() == str(_my):
+                        continue
+                    matched = False
+                    for sig, key in _sigs.items():
+                        if sig in cmd:
+                            _counts[key] += 1
+                            matched = True
+                    if matched:
+                        _seen.add(pid_s.strip())
+            except Exception:
+                pass
+        return {"mcp_processes": _counts, "mcp_total": len(_seen)}
+    except Exception:
+        return {"mcp_processes": {"sandbox": 0, "kiro_cli": 0}, "mcp_total": 0}
+
+
+def _apply_mcp_process_counts(data: dict[str, object]) -> None:
+    """Merge the (separately cached) process counts into a metrics payload.
+
+    Cached rather than recomputed so the expensive scan runs on its own slow
+    cadence while the live numbers around it stay at the graph's refresh rate.
+    Called from the sampling thread, and the write is a single rebind of two
+    module globals, so no lock is needed: a racing pair of samplers publishes
+    one consistent snapshot or the other, never a mixture.
+    """
+    global _proc_scan_cache, _proc_scan_cache_ts
+    now = time.monotonic()
+    if not _proc_scan_cache or now - _proc_scan_cache_ts >= _PROC_SCAN_CACHE_TTL:
+        _proc_scan_cache = _scan_mcp_processes()
+        _proc_scan_cache_ts = now
+    data.update(_proc_scan_cache)
+
+
+def _local_ip() -> str:
+    """The address the kernel would source an outbound packet from, best-effort.
+
+    A UDP socket ``connect`` sends nothing (no handshake for a datagram socket),
+    it only selects a route, so ``getsockname`` yields the interface address
+    without a packet leaving the host; ``8.8.8.8`` is just a public address any
+    default route covers. Falls back to loopback when there is no route or no
+    network stack (an offline runner, a sandbox). The one place system-info
+    rendering reaches for the network, kept as its own seam so a test can pin
+    the answer instead of stubbing ``socket.socket`` -- replacing that CLASS
+    breaks ``isinstance`` checks inside asyncio's proactor loop on Windows.
+    """
+    try:
+        # Context manager guarantees the socket fd is closed on every path,
+        # including when connect()/getsockname() raise (CWE-772 fd leak).
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return str(s.getsockname()[0])
+    except Exception:
+        return "127.0.0.1"
+
+
 def _collect_system_metrics() -> dict[str, object]:
     """Collect system metrics synchronously (runs in thread pool).
 
@@ -373,11 +533,18 @@ def _collect_system_metrics() -> dict[str, object]:
     """
     data: dict[str, object] = dict(_get_static_system_info())
 
-    # Process memory (RSS)
+    # Process memory. `proc_mem_mb` is the LIVE resident set (falls when memory
+    # is released); `proc_mem_peak_mb` is the high-water mark since start, kept
+    # as a separate reading so a transient spike stays diagnosable without the
+    # live figure inheriting it.
     try:
         data["proc_mem_mb"] = round(platform_compat.proc_rss_bytes() / (1024 * 1024), 1)
     except Exception:
         data["proc_mem_mb"] = 0
+    try:
+        data["proc_mem_peak_mb"] = round(platform_compat.proc_peak_rss_bytes() / (1024 * 1024), 1)
+    except Exception:
+        data["proc_mem_peak_mb"] = 0
 
     # System-wide memory — cross-platform
     try:
@@ -462,15 +629,7 @@ def _collect_system_metrics() -> dict[str, object]:
                 cpu_pct = 0
     data["cpu_pct"] = cpu_pct
 
-    # Local IP address
-    try:
-        # Context manager guarantees the socket fd is closed on every path,
-        # including when connect()/getsockname() raise (CWE-772 fd leak).
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            data["ip"] = s.getsockname()[0]
-    except Exception:
-        data["ip"] = "127.0.0.1"
+    data["ip"] = _local_ip()
 
     # Network bytes + speed — cross-platform
     try:
@@ -553,73 +712,7 @@ def _collect_system_metrics() -> dict[str, object]:
     except Exception:
         data["child_processes"] = 0
 
-    # MCP ecosystem process count — scan for known command-line signatures.
-    # A single process may match multiple signatures (e.g. a sandboxed kiro-cli
-    # matches both "kirocrew_sandbox" and "kiro-cli"); per-category _counts can
-    # overlap, while mcp_total uses _seen for unique PID dedup. kiro-cli is an
-    # optional backend; the signature is harmless when it is not installed.
-    #
-    # Sandbox counting platform differences:
-    #   Linux:  The namespace launcher (python3 ~/.kiro/crew/run/kirocrew_sandbox_*.py ...)
-    #           forks — the parent stays alive with "kirocrew_sandbox" in its
-    #           /proc/cmdline, so sandbox count is accurate.
-    #   macOS:  sandbox-exec execs the target command, replacing the process
-    #           image. The final cmdline becomes "kiro-cli ..." and the
-    #           "kirocrew_sandbox" string (only in the -f path arg) is lost.
-    #           Sandbox count will be 0 even when sandboxes are running.
-    try:
-        _my = os.getpid()
-        _counts: dict[str, int] = {"sandbox": 0, "kiro_cli": 0}
-        _seen: set[str] = set()
-        if sys.platform == "linux":
-            for d in os.listdir("/proc"):
-                if not d.isdigit() or int(d) == _my:
-                    continue
-                try:
-                    cmd = Path(f"/proc/{d}/cmdline").read_bytes()
-                    matched = False
-                    if b"kirocrew_sandbox" in cmd:
-                        _counts["sandbox"] += 1
-                        matched = True
-                    if b"kiro-cli" in cmd:
-                        _counts["kiro_cli"] += 1
-                        matched = True
-                    if matched:
-                        _seen.add(d)
-                except OSError:
-                    pass
-        else:
-            _sigs = {
-                "kirocrew_sandbox": "sandbox",
-                "kiro-cli": "kiro_cli",
-            }
-            try:
-                out = subprocess.check_output(
-                    ["ps", "-eo", "pid,command"],
-                    timeout=5,
-                    text=True,
-                )
-                for line in out.splitlines():
-                    parts = line.split(None, 1)
-                    if len(parts) < 2:
-                        continue
-                    pid_s, cmd = parts
-                    if pid_s.strip() == str(_my):
-                        continue
-                    matched = False
-                    for sig, key in _sigs.items():
-                        if sig in cmd:
-                            _counts[key] += 1
-                            matched = True
-                    if matched:
-                        _seen.add(pid_s.strip())
-            except Exception:
-                pass
-        data["mcp_processes"] = _counts
-        data["mcp_total"] = len(_seen)
-    except Exception:
-        data["mcp_processes"] = {"sandbox": 0, "kiro_cli": 0}
-        data["mcp_total"] = 0
+    _apply_mcp_process_counts(data)
 
     # In-process embedder monitoring — the model runs inside the gateway process
     # now (no external server), so report functional availability instead of a
@@ -634,29 +727,76 @@ def _collect_system_metrics() -> dict[str, object]:
     except Exception:
         data["ollama_running"] = False
 
+    # Resource posture — advisory probe from the same cgroup-aware memory reader
+    # that drives the dynamic sub-agent cap and the injected [RESOURCES] line.
+    try:
+        from kiro_crew.resource_status import probe as _resource_probe
+        from kiro_crew.subagent import compute_max_subagents
+
+        status = _resource_probe()
+        data["resource_posture"] = status.posture
+        data["resource_available_gb"] = round(status.available_gb, 2)
+        data["resource_pressure_gb"] = status.pressure_gb
+        data["resource_critical_gb"] = status.critical_gb
+        try:
+            cfg = KiroCrewConfig.load()
+            data["subagent_cap"] = compute_max_subagents(cfg)
+        except Exception:
+            # Fallback: derive from available memory directly
+            if status.available_gb > 0:
+                data["subagent_cap"] = min(11, max(1, int(status.available_gb / 0.5)))
+            else:
+                data["subagent_cap"] = 3
+    except Exception:
+        data["resource_posture"] = "unknown"
+        data["resource_available_gb"] = -1.0
+        data["resource_pressure_gb"] = 4.0
+        data["resource_critical_gb"] = 2.0
+        data["subagent_cap"] = 3
+
     return data
 
 
-# Cached system metrics (avoid subprocess spawning on every 1s poll)
+# Cached system metrics (avoid subprocess spawning on every poll)
 _metrics_cache: dict[str, object] = {}
 _metrics_cache_ts: float = 0.0
 _METRICS_CACHE_TTL = 2.0  # seconds
+
+#: Guards a single in-flight collection. The TTL alone does NOT bound the work:
+#: it is only stamped AFTER a collection returns, so while one is still running
+#: every further poll saw a stale cache and launched its own. On a host where a
+#: collection is cheap (Linux: pure ``/proc`` reads) that never showed; on a host
+#: where it spawns several subprocesses the duplicate collections stack up,
+#: because the dashboard polls this endpoint at exactly the TTL. Coalescing makes
+#: concurrent pollers await the SAME collection, so N tabs and a slow host cost
+#: one collection, not N.
+_metrics_lock = LoopBoundLock()
 
 
 async def api_system(request: web.Request) -> web.Response:
     """System information endpoint with live CPU, memory, network metrics.
 
-    Caches results for 2 seconds to avoid spawning subprocesses on every
-    poll when multiple dashboard tabs are open.
+    Caches results briefly and coalesces concurrent collections, so several
+    dashboard tabs polling at once cost one collection rather than one each.
     """
     global _metrics_cache, _metrics_cache_ts
     now = time.monotonic()
     if now - _metrics_cache_ts < _METRICS_CACHE_TTL and _metrics_cache:
         return web.json_response(_metrics_cache)
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _collect_system_metrics)
-    _metrics_cache = data
-    _metrics_cache_ts = now
+    async with _metrics_lock:
+        # Re-check under the lock: whoever held it may have just refreshed, and
+        # this waiter wants that result rather than a second collection of its own.
+        now = time.monotonic()
+        if now - _metrics_cache_ts < _METRICS_CACHE_TTL and _metrics_cache:
+            return web.json_response(_metrics_cache)
+        loop = asyncio.get_running_loop()
+        # subprocess_executor (mc-subproc), NOT the default pool: this is
+        # browser-triggered on a 2s poll and spawns up to six subprocesses on a
+        # host without /proc, so leaving it in the default pool let it contend
+        # with the getaddrinfo calls the event loop files there.
+        data = await loop.run_in_executor(subprocess_executor(), _collect_system_metrics)
+        _metrics_cache = data
+        _metrics_cache_ts = time.monotonic()
     return web.json_response(data)
 
 
@@ -682,31 +822,15 @@ async def api_compliance_yolo_status(request: web.Request) -> web.Response:
 
 def _channel_members() -> tuple[str, ...]:
     """Canonical ``channel_type`` ids for the messaging channels, derived from
-    each transport's ``channel_type`` class attribute — the single source of
-    truth — so this list can never drift from the transports themselves.
-    Imported here (off the event loop, inside the executor worker) so the
-    transport modules' own imports don't run on the aiohttp loop.
+    the builtin channel registry — the single source of truth — so this list
+    can never drift from the channels themselves. Imported here (off the event
+    loop, inside the executor worker) so the channel modules' own imports don't
+    run on the aiohttp loop; the roster is cached after the first call.
     """
-    from kiro_crew.discord.transport import DiscordTransport
-    from kiro_crew.slack.transport import SlackTransport
-    from kiro_crew.teams.transport import TeamsTransport
-    from kiro_crew.telegram.transport import TelegramTransport
-    from kiro_crew.webex.transport import WebexTransport
-    from kiro_crew.wecom.transport import WeComTransport
-    from kiro_crew.weixin.transport import WeixinTransport
+    from kiro_crew.channels import builtin_channel_descriptors
+    from kiro_crew.messaging.registry import governed_members
 
-    return tuple(
-        t.channel_type
-        for t in (
-            SlackTransport,
-            DiscordTransport,
-            TelegramTransport,
-            WebexTransport,
-            WeComTransport,
-            TeamsTransport,
-            WeixinTransport,
-        )
-    )
+    return governed_members(builtin_channel_descriptors())
 
 
 def _collect_channel_governance() -> dict[str, object]:

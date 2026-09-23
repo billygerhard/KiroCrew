@@ -10,7 +10,7 @@ import { useAppDispatch, useAppSelector } from '../../../store'
 import { createSlot, resumeFromHistory, switchSlot } from '../../../store/chatSlice'
 import type { ChatSlot, ChatFolder, CronJob } from '../../../types'
 import type { Result, ResourceProvider } from '../types'
-import { toolStatusLabel } from '../../../utils/toolStatusLabel'
+import { toolStatusLabel, type ToolStatusDetail } from '../../../utils/toolStatusLabel'
 
 import { i18nT } from '../../../i18n/t'
 import { fmtDateFields, fmtRelative, toDate } from '../../../i18n/format'
@@ -180,7 +180,7 @@ function shortMsg(slot: ChatSlot): string {
 export function sessionStatus(
   slot: ChatSlot,
   unread: string[],
-  statusDetail?: { kind?: string; text?: string; toolName?: string },
+  statusDetail?: ToolStatusDetail,
   // Defaults to the ChatSettings default (on) so callers that don't care about
   // the preference keep the purpose-first behavior.
   simplifiedToolNames = true,
@@ -198,6 +198,16 @@ export function sessionStatus(
       style: 'pill',
       colorVar: '--warn',
       label: i18nT('components.commandPalette.providers.recentsProvider.approve'),
+      detail: shortMsg(slot) || undefined,
+    }
+  }
+  if (slot.needs_input) {
+    // Ranked with the approval pill and above "Thinking…": both are things the
+    // user owes the session, and a blocking question card leaves `running` true.
+    return {
+      style: 'pill',
+      colorVar: '--info',
+      label: i18nT('components.commandPalette.providers.recentsProvider.answer'),
       detail: shortMsg(slot) || undefined,
     }
   }
@@ -297,7 +307,7 @@ export function useRecentsProvider(): ResourceProvider {
             isNew: isNew || undefined,
             timestamp: isNew ? undefined : fmtRelativeTime(s.last_activity_ts ?? s.last_ts),
             onActivate: () => {
-              dispatch(switchSlot(s.key))
+              dispatch(switchSlot({ key: s.key, announceOnMissing: true }))
               navigate('/chat')
             },
           }

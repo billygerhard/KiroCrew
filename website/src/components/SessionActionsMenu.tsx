@@ -1,13 +1,17 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2 } from 'lucide-react'
+import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
+import SendToInstanceSubmenu from './SendToInstanceSubmenu'
+import ExportSessionItem from './ExportSessionItem'
+import ImportSessionItem from './ImportSessionItem'
 import SessionColorSwatches from './SessionColorSwatches'
 import LinkedSurfacesSection from './LinkedSurfacesSection'
 import { DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
 import { useAppSelector } from '../store'
+import { selectSlotSubagents } from '../store/chatSlice'
 import { useTagPopover } from '../hooks/useTagPopover'
 import { api } from '../api/client'
 import { useSessionActions } from '../hooks/useSessionActions'
@@ -34,6 +38,12 @@ export interface SessionActionsMenuProps {
   onReveal?: () => void
   /** Rename entry point — differs per surface (sidebar inline row-edit vs header title editor). */
   onRename?: () => void
+  /**
+   * Open this session as a tab on the calling surface. Present only where a tab
+   * strip exists (the dashboard chat surface), which is why it is a bubble prop
+   * and not internalised: there is no store-wide "tabs" the menu could reach.
+   */
+  onOpenInNewTab?: () => void
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
@@ -73,18 +83,18 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  * with dividers auto-collapsing between them):
  *   [informational]  MCP servers ▸  (header only)
  *   [tab modifiers]  Rename · Mark read/unread · Pin · Switch to Autopilot/Chat · Move to folder ▸ · Tags…
- *   [nav / access]   Reveal in sidebar (header only) · Copy link · Connected surfaces
+ *   [nav / access]   Reveal in sidebar (header only) · Copy link · Send a copy ▸ · Export to a file · Connected surfaces
  *   [colour]         colour swatches
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, infoSlots, onColorPicked,
+  variant, slotKey, mode, onReveal, onRename, onOpenInNewTab, infoSlots, onColorPicked,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
 
   // Generic, surface-agnostic actions — one definition, wired straight to the store.
-  const { toggleRead, togglePin, toggleMode, copyLink, move, close } = useSessionActions(mode)
+  const { toggleRead, togglePin, toggleMode, copyLink, move, reload, close } = useSessionActions(mode)
   // Popped-out window coordination (shared singleton — one channel for all menus).
   const { isPoppedOut, isSelfPopout, open: openPopout, focus: focusPopout, bringBack, returnSelfToMain } = useChatPopouts()
   // This menu also renders INSIDE a popout window (via the header). There the
@@ -102,8 +112,19 @@ export default function SessionActionsMenu({
   const isUnread = useAppSelector(s => s.dashboard.unreadSlots.includes(slotKey))
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
+  const isRunning = !!slot?.running
+  // Reload is also refused while sub-agent children are attached (the reset
+  // would tear down their shared runtime) — mirror that in the disable so a
+  // slot whose turn ended but whose children still run doesn't offer a click
+  // the backend will 409.
+  const slotSubagents = useAppSelector(s => selectSlotSubagents(s, slotKey))
+  const hasActiveSubagents = Object.values(slotSubagents).some(
+    a => a.status === 'pending' || a.status === 'running' || a.status === 'tool',
+  )
+  const reloadBlocked = isRunning || hasActiveSubagents
   const currentFolderId = slot?.folder_id
   const colorIndex = slot?.color_index
+  const colorHex = slot?.color_hex
 
   // Folders drive the Move submenu. A menu's Content only mounts while it's open
   // (Radix), so this keyed query effectively runs only while a menu is open and
@@ -150,6 +171,16 @@ export default function SessionActionsMenu({
           <Locate size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.reveal_in_sidebar')}
         </Item>
       ),
+      // Open as a session TAB on the surface this menu was opened from — the
+      // discoverable form of the middle-click/modifier-click gesture. Offered
+      // only where a caller passes the handler, because only the dashboard
+      // chat surface has a tab strip to open into; the popped-out window and
+      // the embed shell would have nowhere to put it.
+      onOpenInNewTab && (
+        <Item key="open-in-tab" onSelect={onOpenInNewTab}>
+          <PanelTop size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.open_in_new_tab')}
+        </Item>
+      ),
       // Pop out to a dedicated browser window — or, if already out, focus /
       // bring it back. Lets you keep typing to one session while looking at an
       // artifact or another view in the main window. Inside the popout window
@@ -175,6 +206,25 @@ export default function SessionActionsMenu({
       <Item key="copy" onSelect={() => copyLink(slotKey)}>
         <Link2 size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.copy_link')}
       </Item>,
+      // Copy this session to another Kiro Crew instance. Sits in nav/access
+      // rather than the tab-modifier group above because it changes nothing
+      // about this tab — the peer gets its own copy under its own key.
+      // Self-hiding when no instances are configured.
+      <SendToInstanceSubmenu key="send-instance" slotKey={slotKey} variant={variant} />,
+      // The same act with the live hop removed: a tunnel needs both machines up
+      // and reachable at once, a file does not. Adjacent to the submenu above
+      // so the two read as one choice about where the copy goes.
+      <ExportSessionItem
+        key="export-file"
+        slotKey={slotKey}
+        Item={Item}
+        memoryMode={slot?.memory_mode}
+      />,
+      // The reverse direction, and the reason it is here rather than in a global
+      // menu: the file this reads is the file the row above writes, and a user
+      // looking for "how do I get that file back in" looks where it came out.
+      // Acts on no session -- it creates one -- so it takes no slotKey.
+      <ImportSessionItem key="install-file" Item={Item} />,
       // Channel-neutral link state and actions — connected origins are read-only,
       // explicit mirrors can be reminded/stopped, and an otherwise-unlinked
       // dashboard session retains the existing Slack channel picker.
@@ -182,7 +232,32 @@ export default function SessionActionsMenu({
     ],
     // Colour — its own section
     [
-      <SessionColorSwatches key="color" slotKey={slotKey} colorIndex={colorIndex} onPicked={onColorPicked} />,
+      <SessionColorSwatches key="color" slotKey={slotKey} colorIndex={colorIndex} colorHex={colorHex} onPicked={onColorPicked} />,
+    ],
+    // Session runtime — relaunch the agent process in place so it picks up
+    // MCP servers / agent-spec / env changes made after the session started.
+    // Conversation preserved (resume via session/load). Disabled while a turn
+    // runs OR sub-agent children are attached: the backend answers 409 for
+    // both, so the disable makes the refusal visible instead of a dead click.
+    // The reason renders INLINE when blocked — a disabled Radix item carries
+    // data-[disabled]:pointer-events-none, so a hover `title` can never fire
+    // there and the grey row would otherwise explain nothing.
+    [
+      <Item
+        key="reload"
+        disabled={reloadBlocked}
+        title={i18nT('components.sessionActionsMenu.reload_session_tooltip')}
+        onSelect={() => reload(slotKey)}
+      >
+        <RotateCw size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.reload_session')}
+        {reloadBlocked && (
+          <span className="ml-auto text-[10px] text-muted">
+            {isRunning
+              ? i18nT('components.sessionActionsMenu.reload_blocked_running')
+              : i18nT('components.sessionActionsMenu.reload_blocked_subagents')}
+          </span>
+        )}
+      </Item>,
     ],
     // Close session — terminal, destructive
     [

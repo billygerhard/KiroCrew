@@ -14,11 +14,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 
 import pytest
 
+from kiro_crew.platform import governance
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance import (
+    CAPABILITY,
     MODE_ALLOW,
     MODE_DENY,
     SCOPE_CATALOG,
@@ -26,6 +29,7 @@ from kiro_crew.platform.governance import (
     SIGNATURE_UNSIGNED,
     SIGNATURE_UNVERIFIED,
     SIGNATURE_VERIFIED,
+    TIER_ENV,
     Bind,
     CapabilityGate,
     GovernanceCeiling,
@@ -37,6 +41,7 @@ from kiro_crew.platform.governance import (
     assert_governance_floor,
     assert_policy_signature_satisfied,
     compose_profiles,
+    compose_tier_ladder,
     deny_all_profile,
     load_security_policy,
     mcp_title_to_ref,
@@ -231,6 +236,21 @@ class TestCapabilityGate:
         g2 = CapabilityGate.from_dict({}, default_enabled=False)
         assert not g2.enabled
 
+    def test_from_dict_rejects_non_boolean_enabled(self):
+        # bool("false") is True — a stringly-typed disable must not permit.
+        # A present null is not "absent": default-ON scopes must not stay on.
+        for bogus in ("false", "true", 1, 0, ["yes"], None):
+            with pytest.raises(PlatformCompositionError, match="boolean"):
+                CapabilityGate.from_dict({"enabled": bogus}, default_enabled=True)
+
+    def test_known_capability_rejects_non_boolean_enabled(self):
+        # Default-ON siblings (memory_writes, browse, …) must not coerce
+        # enabled: "false" through bool() and stay on.
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_profile(
+                {"name": "host", "capabilities": {"memory_writes": {"enabled": "false"}}}
+            )
+
     def test_scopes_compose_independently(self):
         a = CapabilityGate(
             enabled=True,
@@ -296,6 +316,96 @@ class TestScopedMap:
         # posture is policy-only → preserved from ceiling.
         assert composed.posture_permits("slack", "allowed_team_ids", "T1").permitted
 
+    def test_three_tier_members_all_tighten(self):
+        # Regression: once one fold has produced an ``_AndRuleset``, the next
+        # fold must still honour that tier's narrowing instead of returning
+        # the existing pair unchanged.
+        t1 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}},
+            allow_posture=True,
+        )
+        t2 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord"]}}, allow_posture=False
+        )
+        t3 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack"]}}, allow_posture=False
+        )
+        composed = t1.compose(t2).compose(t3)
+        assert composed.permits_member("slack").permitted
+        # The third tier must tighten the already-composed pair.
+        assert not composed.permits_member("discord").permitted
+        assert not composed.permits_member("telegram").permitted
+
+    def test_nested_inner_denial_not_labelled_profile(self):
+        # When the inner half of an ``_AndRuleset`` is itself a nested pair,
+        # its denial is another policy tier, not the profile: the nested
+        # decision's own layer and label must propagate.
+        t1 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}},
+            allow_posture=True,
+        )
+        t2 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack"]}}, allow_posture=False
+        )
+        t3 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "telegram"]}}, allow_posture=False
+        )
+        composed = t1.compose(t2.compose(t3))
+        decision = composed.permits_member("discord")  # denied by t2, a nested tier
+        assert not decision.permitted
+        assert decision.layer == "policy"
+        assert not decision.reason.startswith("profile:")
+
+    def test_extends_chain_third_link_channels_narrowing_applies(self):
+        # Same shape through the public entry point: a three-link ``extends``
+        # chain carrying a channels ScopedMap.
+        grandparent = parse_profile(
+            {
+                "name": "gp",
+                "channels": {
+                    "members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}
+                },
+            }
+        )
+        parent = parse_profile(
+            {
+                "name": "parent",
+                "extends": "gp",
+                "channels": {"members": {"mode": "allow", "allow": ["slack", "discord"]}},
+            }
+        )
+        child = parse_profile(
+            {
+                "name": "child",
+                "extends": "parent",
+                "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
+            }
+        )
+        merged = compose_profiles(compose_profiles(grandparent, parent), child)
+        assert resolve(None, merged, "channels", "slack").permitted
+        assert not resolve(None, merged, "channels", "discord").permitted
+        assert not resolve(None, merged, "channels", "telegram").permitted
+
+    def test_tier_ladder_third_tier_channels_members_tighten(self):
+        # The tier ladder folds through the same ``ScopedMap.compose`` path;
+        # the lowest tier's channels narrowing must survive a three-tier fold.
+        managed = parse_policy(
+            _policy_body(
+                channels={"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}}
+            )
+        )
+        central = parse_policy(
+            _policy_body(channels={"members": {"mode": "allow", "allow": ["slack", "discord"]}})
+        )
+        subordinate = parse_policy(
+            _policy_body(channels={"members": {"mode": "allow", "allow": ["slack"]}})
+        )
+        ceiling = compose_tier_ladder(managed, central, subordinate)
+        assert ceiling is not None
+        assert resolve(ceiling, None, "channels", "slack").permitted
+        assert not resolve(ceiling, None, "channels", "discord").permitted
+        assert not resolve(ceiling, None, "channels", "telegram").permitted
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Loader — precedence + fail-closed (mirrors admission)
@@ -304,9 +414,7 @@ class TestLoader:
     def test_absent_returns_none(self, monkeypatch, tmp_path):
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         _nope = tmp_path / "nope.json"
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: _nope
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: _nope)
         assert load_security_policy() is None
 
     def test_env_path_wins(self, monkeypatch, tmp_path):
@@ -333,18 +441,14 @@ class TestLoader:
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         home = tmp_path / "security_policy.json"
         home.write_text(json.dumps(_policy_body()))
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: home
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: home)
         ceiling = load_security_policy()
         assert ceiling is not None
 
     def test_bundled_loader_precedence(self, monkeypatch, tmp_path):
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         _nope = tmp_path / "nope.json"
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: _nope
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: _nope)
         called = {}
 
         def bundled():
@@ -357,12 +461,38 @@ class TestLoader:
         assert "commands" in ceiling.controls
 
     def test_env_beats_bundled(self, monkeypatch, tmp_path):
+        """Env still outranks the bundled resource — but bundled IS now resolved.
+
+        The bundled loader is resolved even when the env tier is set, and this
+        test asserts that by failing if it does not run.  It is resolved
+        unconditionally, deliberately: the CENTRAL tier outranks env, and the
+        source it fetches from may be DECLARED by a lower tier's ``distribution``
+        block, so the bundled document has to be read for its declaration to be
+        seen even when env will win the subordinate slot.
+
+        The contract that still holds — and the one this pins — is the precedence
+        itself: tiers 3–5 are mutually exclusive with env first, so the env
+        document is the one that becomes the ceiling.  Asserted on identity rather
+        than on whether the loader ran, because "who won" is the invariant; "was
+        bundled consulted" is an implementation detail that just changed.
+        """
+        monkeypatch.delenv("KIROCREW_POLICY_URL", raising=False)
         p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
+        p.write_text(json.dumps(_policy_body(identity={"issuer": "env-tier"})))
         monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        # bundled_loader must NOT be consulted when env wins.
-        ceiling = load_security_policy(bundled_loader=lambda: pytest.fail("should not call"))
+        resolved = {}
+
+        def bundled():
+            resolved["yes"] = True
+            return _policy_body(identity={"issuer": "bundled-tier"})
+
+        ceiling = load_security_policy(bundled_loader=bundled)
         assert ceiling is not None
+        # Resolved, so a ``distribution`` block declared here would be seen…
+        assert resolved.get("yes")
+        # …but it does not win: env is the first present subordinate tier.
+        assert ceiling.identity_issuer == "env-tier"
+        assert ceiling.tier == TIER_ENV
 
     def test_wrong_version_fails_closed(self):
         with pytest.raises(PlatformCompositionError):
@@ -375,6 +505,102 @@ class TestLoader:
     def test_unknown_governed_key_fails_closed(self):
         with pytest.raises(PlatformCompositionError):
             parse_policy(_policy_body(bogus_scope={"mode": "allow"}))
+
+    def test_typod_sandbox_child_fails_closed(self):
+        """A typo'd ``min_level`` must RAISE, not vanish into the reserved scope.
+
+        A ``sandbox`` block that accepted ANY child into the write-only
+        ``sandbox._flags`` scope, so ``min_levl`` parsed clean and left the
+        floor absent — green validation, zero enforcement, on the ordinal with
+        the widest blast radius.  The message names the key so the operator can
+        see WHICH key was rejected.
+        """
+        with pytest.raises(PlatformCompositionError) as exc:
+            parse_policy(_policy_body(sandbox={"min_levl": "strict"}))
+        assert "sandbox.min_levl" in str(exc.value)
+        assert "fail-closed" in str(exc.value)
+
+    def test_typod_sandbox_child_does_not_silently_drop_the_floor(self):
+        """The regression's CONSEQUENCE: it must not parse to an absent floor.
+
+        Pinned separately from the raise so a future change that re-tolerates
+        the key cannot pass by merely raising somewhere else — what must never
+        happen again is a ceiling that reports success while
+        ``sandbox.min_level`` is unset.
+        """
+        try:
+            ceiling = parse_policy(_policy_body(sandbox={"min_levl": "strict"}))
+        except PlatformCompositionError:
+            return
+        pytest.fail(f"parsed clean with sandbox.min_level={ceiling.get('sandbox.min_level')!r}")
+
+    def test_reserved_sandbox_boot_flags_still_parse(self):
+        """The compatibility half: the documented reserved flags must still load."""
+        ceiling = parse_policy(
+            _policy_body(
+                sandbox={
+                    "min_level": "strict",
+                    "require_isolation": True,
+                    "env_scrub_prefixes": ["AWS_SECRET"],
+                }
+            )
+        )
+        assert isinstance(ceiling.get("sandbox.min_level"), OrdinalControl)
+        flags = ceiling.controls["sandbox._flags"]
+        assert flags == {"require_isolation": True, "env_scrub_prefixes": ["AWS_SECRET"]}
+
+    def test_sandbox_min_level_alone_still_parses(self):
+        """The overwhelmingly common shape must be untouched by the new check."""
+        ceiling = parse_policy(_policy_body(sandbox={"min_level": "strict"}))
+        assert isinstance(ceiling.get("sandbox.min_level"), OrdinalControl)
+        assert "sandbox._flags" not in ceiling.controls
+
+
+class TestBootFlagCoercion:
+    """Non-boolean ``boot`` gate flags read fail-closed, never via ``bool()``.
+
+    A ``"false"`` string is truthy, so the old read turned the terminal ON
+    for a policy that says off. Real booleans are honoured, absent keys take
+    their documented defaults, and anything else warns and reads in the
+    fail-closed direction per flag.
+    """
+
+    @staticmethod
+    def _boot(**flags):
+        body = _policy_body()
+        body["boot"] = flags
+        return parse_policy(body).boot
+
+    def test_absent_flags_take_documented_defaults(self):
+        boot = self._boot()
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_real_booleans_honoured(self):
+        boot = self._boot(require_sandbox=False, allow_terminal=True, fail_closed=False)
+        assert boot.require_sandbox is False
+        assert boot.allow_terminal is True
+        assert boot.fail_closed is False
+
+    def test_string_false_reads_fail_closed(self):
+        boot = self._boot(require_sandbox="false", allow_terminal="false", fail_closed="false")
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_string_true_reads_fail_closed(self):
+        boot = self._boot(require_sandbox="true", allow_terminal="true", fail_closed="true")
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_null_and_numbers_read_fail_closed(self):
+        for stray in (None, 0, 1):
+            boot = self._boot(require_sandbox=stray, allow_terminal=stray, fail_closed=stray)
+            assert boot.require_sandbox is True
+            assert boot.allow_terminal is False
+            assert boot.fail_closed is True
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -756,6 +982,138 @@ class TestExtensibility:
             parse_policy(_policy_body(capabilities={"bogus": {"enabled": True}}))
 
 
+class TestProfileUnknownCapabilityTolerance:
+    """A PROFILE tolerates an unregistered ``capabilities.*`` child, ASYMMETRICALLY.
+
+    Only ``{"enabled": true}`` is tolerated — it is inert, because a profile only
+    narrows and the intersection happens in ``resolve``. An unknown NARROWING
+    (``enabled: false``) or a malformed child still fails closed, because it is
+    indistinguishable from a typo'd narrowing of a CORE capability and honoring the
+    operator's intent means denying.
+
+    The cross-edition case this serves: an edition that ``register_scope``s extra
+    capability rows seeds a profile naming them with ``enabled: true``, and a build
+    WITHOUT those rows reads the same data home.
+    """
+
+    def test_unknown_capability_child_enabled_true_does_not_invalidate_the_profile(self):
+        prof = parse_profile(
+            {
+                "name": "host",
+                "capabilities": {
+                    "capability_install": {"enabled": True},
+                    "external_access": {"enabled": True},
+                    "spawn": {"enabled": False},
+                },
+            }
+        )
+        assert prof.name == "host"
+        # The unknown children are recorded, not enforced.
+        assert prof.unknown_scopes == (
+            "capabilities.capability_install",
+            "capabilities.external_access",
+        )
+        assert prof.get("capabilities.capability_install") is None
+        # …and the KNOWN sibling in the same block still parses and still governs.
+        assert prof.get("capabilities.spawn") == CapabilityGate(enabled=False)
+
+    def test_unknown_capability_child_enabled_false_fails_closed(self):
+        # THE TYPO-PROTECTION CASE. ``spwan`` is a typo for ``spawn``; tolerating it
+        # would silently PERMIT the capability the operator tried to disable. It must
+        # raise so the loader substitutes deny-all instead.
+        with pytest.raises(PlatformCompositionError):
+            parse_profile({"name": "host", "capabilities": {"spwan": {"enabled": False}}})
+
+    def test_unknown_capability_child_without_enabled_fails_closed(self):
+        # Intent is unreadable (it may carry scopes meant to narrow), so deny.
+        with pytest.raises(PlatformCompositionError):
+            parse_profile(
+                {"name": "host", "capabilities": {"vaulted": {"scopes": {"x": {"mode": "allow"}}}}}
+            )
+
+    def test_unknown_capability_child_non_dict_fails_closed(self):
+        for bogus in (True, False, "enabled", 1, [], None):
+            with pytest.raises(PlatformCompositionError):
+                parse_profile({"name": "host", "capabilities": {"vaulted": bogus}})
+
+    def test_enabled_must_be_exactly_true_not_merely_truthy(self):
+        # Guards against a widened predicate: only the boolean True is inert.
+        for truthy in (1, "true", ["yes"]):
+            with pytest.raises(PlatformCompositionError):
+                parse_profile({"name": "host", "capabilities": {"vaulted": {"enabled": truthy}}})
+
+    def test_unknown_capability_child_with_extra_keys_fails_closed(self):
+        # ENABLE-PLUS-NARROWING. A capability payload can carry inner narrowing
+        # rulesets (``spawn`` has ``agents``); a typo'd ``spwan`` declared
+        # ``{"enabled": true, "agents": {...allowlist...}}`` is an operator
+        # enabling spawn AND restricting which agents may be spawned. Skipping
+        # it would drop the inner narrowing, so any key beyond ``enabled``
+        # must fail closed. Only the exact one-key ``{"enabled": true}`` is
+        # provably inert.
+        with pytest.raises(PlatformCompositionError):
+            parse_profile(
+                {
+                    "name": "host",
+                    "capabilities": {
+                        "spwan": {
+                            "enabled": True,
+                            "agents": {"mode": "allow", "allow": []},
+                        }
+                    },
+                }
+            )
+
+    def test_unknown_capability_child_is_logged_with_profile_and_key(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            parse_profile({"name": "host", "capabilities": {"vaulted": {"enabled": True}}})
+        assert any(
+            "host" in r.getMessage() and "capabilities.vaulted" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    def test_same_key_in_a_policy_still_fails_closed(self):
+        # Tamper-evidence on the ceiling is unchanged (Rule 8): only the profile
+        # path is tolerant, and even there only for enabled:true.
+        with pytest.raises(PlatformCompositionError):
+            parse_policy(_policy_body(capabilities={"capability_install": {"enabled": True}}))
+
+    def test_policy_fallback_object_still_fails_closed(self):
+        # The policy's top-level ``fallback`` parses as a narrow-only profile but is
+        # NOT a profile FILE, so it gets no tolerance even for enabled:true.
+        with pytest.raises(PlatformCompositionError):
+            parse_policy(
+                _policy_body(fallback={"capabilities": {"capability_install": {"enabled": True}}})
+            )
+
+    def test_unknown_top_level_family_in_a_profile_still_fails_closed(self):
+        with pytest.raises(PlatformCompositionError):
+            parse_profile({"name": "host", "vault": {"mode": "allow", "allow": ["read"]}})
+
+    def test_a_profile_with_no_unknown_keys_records_nothing(self):
+        prof = parse_profile({"name": "host", "capabilities": {"spawn": {"enabled": True}}})
+        assert prof.unknown_scopes == ()
+
+    def test_extends_composition_preserves_the_record(self):
+        parent = parse_profile({"name": "base", "capabilities": {"vaulted": {"enabled": True}}})
+        child = parse_profile({"name": "leaf", "capabilities": {"othered": {"enabled": True}}})
+        merged = compose_profiles(parent, child)
+        assert merged.unknown_scopes == ("capabilities.vaulted", "capabilities.othered")
+
+    def test_a_registered_capability_parses_normally_again(self):
+        # Guards the append-only contract from the other side: once the row IS
+        # registered, the key stops being tolerated and starts being enforced.
+        register_scope("capabilities.capability_install", ScopeSpec(CAPABILITY))
+        try:
+            prof = parse_profile(
+                {"name": "host", "capabilities": {"capability_install": {"enabled": False}}}
+            )
+            assert prof.unknown_scopes == ()
+            assert prof.get("capabilities.capability_install") == CapabilityGate(enabled=False)
+        finally:
+            SCOPE_CATALOG.pop("capabilities.capability_install", None)
+
+
 class TestSchemaStrictness:
     """FIX-C: leaf additionalProperties:false + name regex + Rule-1 warning + posture-member."""
 
@@ -945,11 +1303,40 @@ class TestPolicySignatureStates:
             assert ceiling is not None
             assert ceiling.signature_state == SIGNATURE_UNVERIFIED
 
+    def test_a_lone_surrogate_signature_is_unverified_not_a_crash(self):
+        """``json.loads`` accepts ``"\\udc80"``; a strict ``encode`` would raise.
+
+        A UnicodeEncodeError is a ValueError, not a PlatformCompositionError, so it
+        would escape the loader and the host would degrade to ungoverned. The tier
+        ladder verifies a user-owned home file beneath the central document on every
+        load, so this is one byte in that file removing the fleet ceiling. It must
+        classify like every other malformed signature instead.
+        """
+        doc = json.loads(
+            '{"version": 1, "boot": {"fail_closed": true}, '
+            '"identity": {"issuer": "corp", "signature": "\\udc80"}}'
+        )
+        state, _detail = governance._policy_signature_state(doc, {"corp": "k"})
+        assert state == SIGNATURE_UNVERIFIED
+
+    def test_a_lone_surrogate_trust_key_is_unverified_not_a_crash(self):
+        """The other text the compare depends on: the key from the JSON trust root.
+
+        ``hmac_signature`` encodes the key before hashing; a strict encode raised on a
+        lone surrogate there, one call before the compare this class fixes.
+        """
+        doc = json.loads(
+            '{"version": 1, "boot": {"fail_closed": true}, '
+            '"identity": {"issuer": "corp", "signature": "abcd"}}'
+        )
+        trust_keys = json.loads('{"corp": "\\udc80"}')
+        assert len(trust_keys["corp"]) == 1  # a real lone surrogate, not the 6-char escape
+        state, _detail = governance._policy_signature_state(doc, trust_keys)
+        assert state == SIGNATURE_UNVERIFIED
+
     def test_non_ascii_signature_fails_closed_when_required(self, monkeypatch, tmp_path):
         """...and with the opt-in ON it must ABORT, not degrade to ungoverned."""
-        body = _policy_body(
-            identity={"issuer": "fleet-control", "signature": "tamper\u2013ed"}
-        )
+        body = _policy_body(identity={"issuer": "fleet-control", "signature": "tamper\u2013ed"})
         p = tmp_path / "policy.json"
         p.write_text(json.dumps(body))
         monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
@@ -1145,9 +1532,7 @@ class TestPolicySignatureOptIn:
                 bundled_loader=lambda: _policy_body(identity={"issuer": "fleet-control"})
             )
         # A correctly-signed bundled policy verifies and loads.
-        signed = _sign_policy(
-            _policy_body(identity={"issuer": "fleet-control"}), "trust-key"
-        )
+        signed = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), "trust-key")
         ceiling = load_security_policy(bundled_loader=lambda: signed)
         assert ceiling is not None
         assert ceiling.signature_state == SIGNATURE_VERIFIED
@@ -1218,9 +1603,7 @@ class TestPolicySignatureAbsenceGate:
             parse_policy(signed, signature_state=SIGNATURE_VERIFIED)
         )
 
-    def test_present_but_unverified_ceiling_does_NOT_satisfy_the_gate(
-        self, monkeypatch, tmp_path
-    ):
+    def test_present_but_unverified_ceiling_does_NOT_satisfy_the_gate(self, monkeypatch, tmp_path):
         # Presence alone is not enough — the gate is the enforcement point for the
         # verdict too, now that load time only computes it. A tampered or unsigned
         # ceiling that survived precedence must abort here.
@@ -1250,9 +1633,7 @@ class TestPolicySignatureAbsenceGate:
     @pytest.mark.parametrize(
         "shape", ['{ "mode": "open",  <-- typo', "[]", "null", '"a string"', "123"]
     )
-    def test_a_broken_trust_root_reads_as_no_optin_by_design(
-        self, monkeypatch, tmp_path, shape
-    ):
+    def test_a_broken_trust_root_reads_as_no_optin_by_design(self, monkeypatch, tmp_path, shape):
         """A corrupt/malformed admission file does NOT fail closed. Deliberate.
 
         An attacker who can write this file is outside the policy-signature threat
@@ -1269,6 +1650,23 @@ class TestPolicySignatureAbsenceGate:
         assert_policy_signature_satisfied(
             parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
         )
+
+    @pytest.mark.parametrize("junk", ["false", None, 0, 1, ""])
+    def test_junk_flag_in_wellformed_trust_root_fails_closed(
+        self, monkeypatch, tmp_path, junk
+    ):
+        # A well-formed trust root whose flag is PRESENT but not a boolean is a
+        # different case from a broken file: the operator wrote the key down, so
+        # it reads fail-closed as opted-in (via admission._coerce_flag) and an
+        # unsigned policy is refused. Locks the enforcement reader to the same
+        # strict read as the key store.
+        adm = tmp_path / "admission_policy.json"
+        adm.write_text(json.dumps({"require_policy_signature": junk}))
+        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
+        with pytest.raises(PlatformCompositionError):
+            assert_policy_signature_satisfied(
+                parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
+            )
 
     def test_absent_admission_file_is_a_noop(self, monkeypatch, tmp_path):
         # No trust root: nobody opted in, so an unsigned policy still loads and
@@ -1309,9 +1707,7 @@ class TestPolicySignatureAbsenceGate:
         # second bespoke file, and NOT from the security policy itself.
         adm = tmp_path / "admission_policy.json"
         adm.write_text(
-            json.dumps(
-                {"require_policy_signature": True, "trust_keys": {"fleet-control": "k"}}
-            )
+            json.dumps({"require_policy_signature": True, "trust_keys": {"fleet-control": "k"}})
         )
         monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
         from kiro_crew.platform.governance import _policy_trust_settings
@@ -1414,3 +1810,144 @@ class TestPolicyShowReporting:
     def test_show_no_policy_unchanged(self, capsys):
         out = self._show(capsys, None)
         assert "No enterprise security policy is active" in out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Capability omission — the settled contract
+# ──────────────────────────────────────────────────────────────────────────
+def _capability_scopes() -> list[str]:
+    return [name for name, spec in SCOPE_CATALOG.items() if spec.kind == CAPABILITY]
+
+
+class TestCapabilityOmissionIsUngoverned:
+    """An unnamed capability is UNGOVERNED and therefore PERMITTED. On purpose.
+
+    This class exists because the opposite is an inviting mistake. Several
+    ``SCOPE_CATALOG`` comments once described ``capability_default`` as applying
+    when a policy "governs ``capabilities.*`` but omits" a row, which does not
+    match the code. The tempting fix is to make the code match the comments by
+    filling unnamed rows with their registered defaults.
+
+    That fix was implemented, measured, and rejected. Three reasons, recorded here
+    so the next person does not repeat it:
+
+    1. It breaks the model's central invariant. Omission means
+       ungoverned-and-permitted for `mcp`, `tools`, `commands`, `filesystem.*` and
+       `network.egress`; making `capabilities` the one archetype that infers a
+       value is a per-control special case in an evaluator whose stated contract
+       is that it dispatches on archetype and never on scope name.
+    2. It requires a namespace-specific branch in ``_parse_controls``, whose
+       documented contract is that a newly ``register_scope``'d family parses with
+       NO loader edit. A companion's own capability family would not get the same
+       treatment, so the behaviour would not even be uniform.
+    3. It destroys an audit signal. ``Decision.layer == "default"`` means "nothing
+       governed this", which is what operators are told to alert on to find
+       missing controls. A row filled from a catalog default resolves at
+       ``layer="policy"`` and so becomes indistinguishable from one a human
+       actually wrote.
+
+    The real defect was documentation, and the protection is
+    ``kirocrew policy validate`` reporting a partially-governed block.
+    """
+
+    def test_unnamed_capability_is_permitted_and_reads_as_ungoverned(self):
+        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
+        for scope in _capability_scopes():
+            if scope == "capabilities.script_hooks":
+                continue
+            decision = resolve(ceiling, None, scope, "")
+            assert decision.permitted, f"{scope} must be permitted by omission"
+            # Load-bearing: `default` is the audit signal for "nobody governed
+            # this". A filled-in row would report `policy` and hide the gap.
+            assert decision.layer == "default", f"{scope} must read as ungoverned"
+
+    def test_named_row_is_still_governed(self):
+        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
+        decision = resolve(ceiling, None, "capabilities.script_hooks", "")
+        assert not decision.permitted
+        assert decision.layer == "policy"
+
+    def test_omission_behaves_identically_across_archetypes(self):
+        """The consistency argument, asserted rather than assumed."""
+        ceiling = parse_policy(_policy_body(capabilities={"cron": {"enabled": False}}))
+        for scope, item in (
+            ("mcp", "@anything/tool"),
+            ("tools", "anything"),
+            ("commands", "echo hi"),
+            ("filesystem.read", "/etc/hosts"),
+            ("network.egress", "example.com"),
+            ("capabilities.messaging", ""),
+        ):
+            decision = resolve(ceiling, None, scope, item)
+            assert decision.permitted, f"unnamed {scope} must permit"
+            assert decision.layer == "default", f"unnamed {scope} must read as ungoverned"
+
+    def test_no_capabilities_block_leaves_every_capability_ungoverned(self):
+        ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
+        for scope in _capability_scopes():
+            assert resolve(ceiling, None, scope, "").permitted
+
+    def test_present_key_without_enabled_uses_the_registered_default(self):
+        """The case ``capability_default`` DOES cover — and the only one.
+
+        Naming a capability to configure its inner scopes, without saying whether
+        it is on, resolves to the registered default: off for the exfil surfaces,
+        on for the benign ones.
+        """
+        ceiling = parse_policy(
+            _policy_body(
+                capabilities={
+                    "publish": {"scopes": {"destinations": {"mode": MODE_ALLOW, "allow": ["x"]}}},
+                    "spawn": {"scopes": {"agents": {"mode": MODE_ALLOW, "allow": ["a"]}}},
+                }
+            )
+        )
+        assert not resolve(ceiling, None, "capabilities.publish", "").permitted
+        assert SCOPE_CATALOG["capabilities.publish"].capability_default is False
+        assert resolve(ceiling, None, "capabilities.spawn", "").permitted
+        assert SCOPE_CATALOG["capabilities.spawn"].capability_default is True
+
+
+class TestValidateReportsUngovernedCapabilities:
+    """`kirocrew policy validate` must surface a partially-governed block.
+
+    Since omission cannot deny, the only protection against an author believing
+    otherwise is telling them which rows they left open.
+    """
+
+    def _validate(self, capsys, ceiling):
+        import argparse
+        from unittest.mock import patch
+
+        from kiro_crew import cli_commands
+
+        args = argparse.Namespace(policy_action="validate")
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=type("Ctx", (), {"governance": ceiling})(),
+        ):
+            cli_commands._policy(args)
+        return capsys.readouterr().out
+
+    def test_partial_block_lists_the_ungoverned_rows(self, capsys):
+        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
+        out = self._validate(capsys, ceiling)
+        assert "UNGOVERNED" in out
+        assert "Omission does not deny" in out
+        assert "capabilities.cron" in out
+        # The row the author DID name must not be reported as a gap.
+        assert "capabilities.script_hooks\n" not in out.split("UNGOVERNED", 1)[1]
+
+    def test_fully_enumerated_block_reports_no_gap(self, capsys):
+        body = {scope.split(".", 1)[1]: {"enabled": True} for scope in _capability_scopes()}
+        # agentcore requires a known inner posture when enabled.
+        body["agentcore"] = {"enabled": True, "posture": "workload"}
+        out = self._validate(capsys, parse_policy(_policy_body(capabilities=body)))
+        assert "UNGOVERNED" not in out
+        assert "✅ valid" in out
+
+    def test_policy_that_never_mentions_capabilities_reports_no_gap(self, capsys):
+        """Silence about capabilities entirely is not a partial statement."""
+        ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
+        out = self._validate(capsys, ceiling)
+        assert "UNGOVERNED" not in out

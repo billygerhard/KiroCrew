@@ -19,12 +19,15 @@ import { i18nT } from '../../i18n/t'
  *     name, and warns when `aria-describedby` points at nothing. `DialogContent`
  *     therefore defaults `aria-describedby` to `undefined`; pass a
  *     `DialogDescription` and wire it explicitly if a description is wanted.
- *   - Animations use this repo's own `scale-in`/`scale-out` + `fade-in`/
- *     `fade-out` keyframes, NOT shadcn's stock `animate-in`/`zoom-in-95`. Those
- *     stock class names come from `tailwindcss-animate`, which is not installed
- *     here — they are inert in ui/select.tsx today, and making them real would
- *     silently start animating every dropdown, popover and context menu in the
- *     app.
+ *   - Animations are `tw-animate-css`'s `animate-in` / `animate-out` pair, the
+ *     same classes shadcn ships. `DialogContent` is centred with
+ *     `-translate-x-1/2 -translate-y-1/2`, which Tailwind emits as the standalone
+ *     `translate` property, while the enter/exit keyframe animates `transform`
+ *     (a translate3d + scale3d composed from `--tw-enter-*` vars). The two
+ *     properties compose instead of competing, so the zoom plays around the
+ *     centred position with no extra slide utility. The same package backs
+ *     `ui/select.tsx`, `ui/dropdown-menu.tsx`, `ui/popover.tsx` and
+ *     `ui/context-menu.tsx`.
  */
 
 const Dialog = DialogPrimitive.Root
@@ -40,7 +43,8 @@ const DialogOverlay = React.forwardRef<
     ref={ref}
     className={cn(
       'fixed inset-0 z-[100] bg-bg/60 backdrop-blur-md',
-      'data-[state=open]:animate-fade-in data-[state=closed]:animate-fade-out',
+      'data-[state=open]:animate-in data-[state=closed]:animate-out',
+      'data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0',
       className,
     )}
     {...props}
@@ -85,8 +89,24 @@ const DialogContent = React.forwardRef<
       style={{ maxWidth, maxHeight: '90vh', ...style }}
       className={cn(
         'fixed left-1/2 top-1/2 z-[101] flex w-[calc(100%-4rem)] -translate-x-1/2 -translate-y-1/2',
-        'flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl outline-none',
-        'data-[state=open]:animate-scale-in data-[state=closed]:animate-scale-out',
+        'flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl outline-hidden',
+        // The centering is the `translate` property (from `-translate-x-1/2
+        // -translate-y-1/2` above) and the enter/exit keyframe animates
+        // `transform`, so the zoom plays around the centred position. Do NOT add
+        // a `slide-in-from-*` re-centring pair here: with `translate` already
+        // holding the -50%/-50%, a slide utility would ADD another half-width
+        // offset and the dialog would fly in from off-screen.
+        //
+        // These classes must stay on THIS element (the one the forwarded `ref`
+        // and role="dialog" land on), not on a wrapper: SketchDialog's placement
+        // gate calls `getAnimations()` on the ref'd element and holds its
+        // measurement-dependent pad back until the enter animation has finished.
+        // Moving the animation up a level makes that call return `[]`, the gate
+        // waves the pad through mid-flight, and the ~7px pointer offset returns
+        // with no CI signal beyond src/test/DialogEnterAnimation.test.tsx.
+        'duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out',
+        'data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0',
+        'data-[state=open]:zoom-in-95 data-[state=closed]:zoom-out-95',
         className,
       )}
       {...props}

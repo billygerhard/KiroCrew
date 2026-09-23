@@ -9,7 +9,7 @@ absolute paths.
 **Nothing has to be installed by hand.** ``pip install kirocrew`` is the only
 prerequisite: ``uv`` is a declared Python dependency and is resolved through the
 installed package (:func:`resolve_uv`) rather than assumed to be on ``PATH``, and
-the engine arrives over plain HTTPS, so ``git`` is no longer required at all.
+the engine arrives over plain HTTPS, so ``git`` is not required at all.
 
 Why this is a Python job and not a ``setup.onInstall`` shell script: a BUILTIN
 app's source lives read-only inside the installed Python package, and the
@@ -36,15 +36,13 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
-import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiro_crew.apps.builtins.pptx_maker.backend import engine_source, paths
+from kiro_crew.apps.builtins.pptx_maker.backend import engine, engine_source, paths
 from kiro_crew.apps.manager import app_dir
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.sandbox import cgroup_scope_argv, resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew.sandbox import cgroup_scope_argv, run_limited, sandboxed_spawn_argv
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
@@ -60,8 +58,8 @@ ENGINE_COMMIT = engine_source.ENGINE_COMMIT
 UV_SYNC_TIMEOUT = 900
 UV_INSTALL_TIMEOUT = 300
 
-# The `uv` executable name, per platform. `sysconfig`'s EXE is "" on POSIX and
-# ".exe" on Windows, which is exactly the suffix the uv wheel's own locator uses.
+# The `uv` executable basename. No platform suffix is appended: the wheel's own
+# locator returns a full path, and `shutil.which` applies Windows `PATHEXT`.
 _UV_BASENAME = "uv"
 
 # Placeholders substituted into the shipped agent configs. The engine's absolute
@@ -109,23 +107,6 @@ _uv_path_cache: str | None = None
 _uv_path_resolved = False
 
 
-def _frozen_bundle_dirs() -> list[str]:
-    """Candidate directories for a bundled ``uv`` in a frozen build.
-
-    PyInstaller's one-folder bundle has neither a scripts dir nor site-packages,
-    so the uv wheel's own locator cannot find the binary there (it walks
-    ``sysconfig`` paths only) — it raises ``UvNotFound``. ``packaging/
-    kirocrew-backend.spec`` therefore stages the binary at the bundle root, which
-    is ``sys._MEIPASS`` at runtime and, for a one-folder build, the directory
-    holding ``sys.executable``. Both are checked because the two differ for a
-    one-FILE build (``_MEIPASS`` is the extraction temp dir).
-    """
-    if not getattr(sys, "frozen", False):
-        return []
-    candidates = [getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable or "")]
-    return [c for c in candidates if c]
-
-
 def resolve_uv() -> str | None:
     """Absolute path to a usable ``uv``, or ``None`` when genuinely absent.
 
@@ -140,17 +121,15 @@ def resolve_uv() -> str | None:
     1. ``uv.find_uv_bin()`` — the wheel's own locator, the normal pip case. It
        raises ``UvNotFound`` (a ``FileNotFoundError`` subclass) when the binary
        is missing, e.g. an odd repackaging;
-    2. the frozen-bundle location — the DMG/Electron install, where there is no
-       scripts dir for the locator to walk (see :func:`_frozen_bundle_dirs`);
-    3. ``shutil.which("uv")`` — a user's own, possibly newer, uv still works;
-    4. ``None``.
+    2. ``shutil.which("uv")`` — a user's own, possibly newer, uv still works;
+    3. ``None``.
 
     Never raises: an absent uv is a reportable condition, so the caller can fail
     with an actionable message instead of a traceback in a background job.
 
     Cached process-wide: this runs on every provision and the answer cannot
-    change within a process (the interpreter's own site-packages and the frozen
-    bundle are both fixed at startup).
+    change within a process (the interpreter's own site-packages are fixed at
+    startup).
     """
     global _uv_path_cache, _uv_path_resolved
     if _uv_path_resolved:
@@ -175,12 +154,6 @@ def _resolve_uv_uncached() -> str | None:
     except (ImportError, FileNotFoundError, OSError) as exc:
         logger.debug("pptx-maker: uv.find_uv_bin() did not resolve: %s", exc)
 
-    executable = _UV_BASENAME + (sysconfig.get_config_var("EXE") or "")
-    for directory in _frozen_bundle_dirs():
-        candidate = os.path.join(directory, executable)
-        if os.path.isfile(candidate):
-            return candidate
-
     return shutil.which(_UV_BASENAME)
 
 
@@ -198,16 +171,25 @@ def mcp_tools_path() -> str:
     is no managed directory yet, so rendering never produces an empty entry (an
     empty element in ``PATH`` means "the current directory" on POSIX, which would
     make tool resolution depend on the server's cwd).
-    """
-    # Local import: `paths` imports the app manager, which imports the builtins
-    # package that owns this module.
-    from kiro_crew.apps.builtins.pptx_maker.backend import paths as _paths
 
+    A tool installed at a fixed platform install root that its installer does not put
+    on ``PATH`` — LibreOffice on Windows — is appended too, from
+    :func:`.engine.system_install_dirs`. Without that entry the engine's own
+    ``shutil.which("soffice")`` cannot see an install the app has already resolved,
+    so ``/deps`` reports LibreOffice present while every thumbnail still fails. It
+    sits before the managed directory and after the inherited ``PATH``: a system tool
+    keeps its precedence over the shim, and nothing already resolvable by name is
+    shadowed.
+    """
     inherited = os.environ.get("PATH", "")
-    managed = _paths.preview_tools_bin()
-    if not managed.is_dir():
-        return inherited
-    return f"{inherited}{os.pathsep}{managed}" if inherited else str(managed)
+    entries = [inherited] if inherited else []
+    system_dir = engine.soffice_install_dir()
+    if system_dir:
+        entries.append(system_dir)
+    managed = paths.preview_tools_bin()
+    if managed.is_dir():
+        entries.append(str(managed))
+    return os.pathsep.join(entries)
 
 
 def reset_uv_cache() -> None:
@@ -246,7 +228,7 @@ def _run(argv: list[str], *, cwd: str, timeout: int) -> tuple[int, str]:
     wrapped, env, cleanup = sandboxed_spawn_argv(argv, mode="strict", strip_python_env=True)
     wrapped = cgroup_scope_argv(wrapped)  # cgroup DoS ceiling
     try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no request-derived values
+        proc = run_limited(  # noqa: S603 - fixed argv, no request-derived values
             wrapped,
             cwd=cwd,
             env=env,
@@ -254,7 +236,6 @@ def _run(argv: list[str], *, cwd: str, timeout: int) -> tuple[int, str]:
             text=True,
             timeout=timeout,
             check=False,
-            preexec_fn=resource_limit_preexec(),
         )
     except subprocess.TimeoutExpired:
         return 1, f"{argv[0]} timed out after {timeout}s"
@@ -332,9 +313,11 @@ def _venv_ready(engine_root: Path) -> bool:
 
     Root-parameterized rather than reading ``paths.engine_python()``, so it can ask
     the same question of a STAGED tree as of the live one. Same probe
-    ``engine.engine_status`` reports to the provisioning banner.
+    ``engine.engine_status`` reports to the provisioning banner. The layout itself
+    comes from ``paths.venv_python`` so this probe cannot disagree with the
+    interpreter the install step actually writes.
     """
-    return (engine_root / "mcp-local" / ".venv" / "bin" / "python").is_file()
+    return paths.venv_python(engine_root).is_file()
 
 
 def _ensure_venv(engine_root: Path, log: list[str], uv_bin: str) -> bool:
@@ -379,7 +362,7 @@ def _relink_editable_skill(engine_root: Path, log: list[str], uv_bin: str) -> bo
     Idempotent and cheap: the dependencies are already resolved into the venv, and this
     is a local path install with no network.
     """
-    python = engine_root / "mcp-local" / ".venv" / "bin" / "python"
+    python = paths.venv_python(engine_root)
     log.append("installing the engine skill package…")
     code, out = _run(
         [
@@ -584,7 +567,7 @@ def provision() -> ProvisionOutcome:
 
     # `uv` ships as a declared Python dependency, so this only fails on a
     # genuinely broken install. Reported precisely (and only about uv — `git` is
-    # no longer used) so the message is actionable rather than a guess.
+    # not used) so the message is actionable rather than a guess.
     uv_bin = resolve_uv()
     if uv_bin is None:
         log.append(

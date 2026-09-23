@@ -43,6 +43,25 @@ def _passthrough_sandbox(monkeypatch):
     )
 
 
+def _non_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> Path:
+    """A directory ``init_workspace`` must treat as NOT a repository, on any host.
+
+    "Non-git dir" is not a property ``tmp_path`` has everywhere: a harness that
+    pins ``TMPDIR`` under the checkout gives it a real ``.git`` among its
+    ancestors, ``git rev-parse --is-inside-work-tree`` answers yes, and the run
+    then adds a REAL worktree and task branch to the enclosing repository -- the
+    very thing the non-git path exists to avoid. ``GIT_CEILING_DIRECTORIES`` is
+    git's own seam for that upward walk (discovery stops below the named
+    directory) and the spawn inherits ``os.environ``, so the state is constructed
+    here rather than assumed of the host. The directory is a CHILD of the ceiling
+    because git checks its starting directory before consulting the ceiling.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    work = tmp_path / name
+    work.mkdir()
+    return work
+
+
 # ── Helpers ──
 
 
@@ -134,7 +153,7 @@ class TestBug1CycleDetectionThreshold:
 
 
 class TestBug2RevertOnFailedStep:
-    """Fixed: revert_step is no longer called when a step fails without committing."""
+    """Fixed: revert_step is not called when a step fails without committing."""
 
     @pytest.mark.asyncio
     async def test_no_revert_when_step_never_committed(self, tmp_path: Path) -> None:
@@ -209,7 +228,7 @@ class TestBug3DoubleCommitOnReviewRetry:
 
         review_count = 0
 
-        async def _review_fail_then_pass(r, s, sessions, agent, session_key=""):
+        async def _review_fail_then_pass(r, s, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_count
             review_count += 1
             if review_count == 1:
@@ -1142,12 +1161,11 @@ class TestScenarioTokenBudgetMidExecution:
 
 class TestScenarioNonGitInitWorkspace:
     @pytest.mark.asyncio
-    async def test_init_creates_repo_and_branch(self, tmp_path: Path) -> None:
+    async def test_init_creates_repo_and_branch(self, tmp_path: Path, monkeypatch) -> None:
         """init_workspace on a plain non-git dir sets git_enabled=False and returns immediately."""
         from kiro_crew import git_coord
 
-        work_dir = tmp_path / "plain"
-        work_dir.mkdir()
+        work_dir = _non_git_dir(tmp_path, monkeypatch, "plain")
         (work_dir / "file.txt").write_text("hello")
 
         run = TaskRun(spec_path="/t.md", spec_content="s", task_id="init_test")
@@ -1199,7 +1217,7 @@ class TestBug5ReviewFailRevertBeforeRetry:
 
         review_count = 0
 
-        async def _review_fail_once(r, s, sessions, agent, session_key=""):
+        async def _review_fail_once(r, s, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_count
             review_count += 1
             return review_count > 1  # fail first, pass second
@@ -1407,7 +1425,7 @@ class TestScenarioReviewRetryNoSecondReview:
 
         review_calls = 0
 
-        async def _review_once(r, s, sessions, agent, session_key=""):
+        async def _review_once(r, s, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_calls
             review_calls += 1
             return review_calls > 1  # fail first, pass second would need 2 calls
@@ -2506,7 +2524,7 @@ class TestScenarioReviewRetrySuccessGetsReview:
 
         review_calls = 0
 
-        async def _mock_review(run, step, sessions, agent, session_key=""):
+        async def _mock_review(run, step, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_calls
             review_calls += 1
             if review_calls == 1:
@@ -2673,7 +2691,7 @@ class TestScenarioGitCommitAfterReviewRetry:
 
         review_count = 0
 
-        async def _review(run, step, sessions, agent, session_key=""):
+        async def _review(run, step, sessions, agent, session_key="", *, ctx=None):
             nonlocal review_count
             review_count += 1
             if review_count == 1:
@@ -2738,7 +2756,7 @@ class TestScenarioParallelGroupAllPass:
             Step(index=3, title="C", description="d"),
         ]
 
-        with patch.object(runner, "self_review", return_value=True):
+        with patch("kiro_crew.task_executor.self_review", return_value=True):
             await runner._execute_tasks(run, "taskrunner:run:test")
 
         assert all(s.status == StepStatus.PASSED for s in run.tasks)
@@ -2793,7 +2811,7 @@ class TestScenarioParallelGroupMiddleFails:
         ]
 
         with (
-            patch.object(runner, "self_review", return_value=True),
+            patch("kiro_crew.task_executor.self_review", return_value=True),
             patch.object(runner, "_try_replan", return_value=False),
         ):
             await runner._execute_tasks(run, "taskrunner:run:test")

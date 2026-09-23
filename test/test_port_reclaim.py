@@ -104,7 +104,7 @@ async def test_stale_kirocrew_gateway_is_reclaimed() -> None:
 
 @pytest.mark.asyncio
 async def test_pid_reuse_recheck_drops_stranger() -> None:
-    """A holder that no longer passes identity at the pre-kill re-check is dropped."""
+    """A holder that fails identity at the pre-kill re-check is dropped."""
     calls = {"n": 0}
 
     def _checker(_pid: int) -> bool:
@@ -314,4 +314,34 @@ def test_listeners_windows_tool_absent_returns_none(monkeypatch) -> None:
     caller degrades to wait/retry rather than mis-reporting no holder."""
     monkeypatch.setattr(pr.platform_compat, "IS_WINDOWS", True)
     monkeypatch.setattr(pr.platform_compat, "listening_pid_tool_available", lambda: False)
+    assert pr._listeners_on_port(5476) is None
+
+
+def test_listeners_posix_resolves_lsof_from_trusted_dirs(monkeypatch) -> None:
+    """The POSIX branch spawns the trusted-directory lsof, never a PATH-resolved
+    one: PATH can lead with a same-uid-writable dir, and this probe's output
+    decides which PIDs get signalled."""
+    monkeypatch.setattr(pr.platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(pr.platform_compat, "trusted_system_bin", lambda name: "/usr/bin/lsof")
+    argvs: list[list[str]] = []
+
+    def _check_output(argv, **_kwargs):
+        argvs.append(list(argv))
+        return "4242\n"
+
+    monkeypatch.setattr(pr.subprocess, "check_output", _check_output)
+    assert pr._listeners_on_port(5476) == [4242]
+    assert argvs and argvs[0][0] == "/usr/bin/lsof"
+
+
+def test_listeners_posix_tool_absent_returns_none(monkeypatch) -> None:
+    """No trusted lsof must read as "cannot determine" (wait/retry), never as
+    "no holder" -- and nothing may be spawned in that case."""
+    monkeypatch.setattr(pr.platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(pr.platform_compat, "trusted_system_bin", lambda name: None)
+
+    def _never(*_a, **_k):  # pragma: no cover - guards the refusal
+        raise AssertionError("spawned despite no trusted lsof")
+
+    monkeypatch.setattr(pr.subprocess, "check_output", _never)
     assert pr._listeners_on_port(5476) is None

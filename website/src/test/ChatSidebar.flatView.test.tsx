@@ -20,7 +20,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 import { safeSetItem } from '../utils/safeStorage'
-import type { ChatFolder } from '../types'
+import type { ChatFolder, ChatSlot } from '../types'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
@@ -31,21 +31,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -84,16 +84,17 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
 
 // Sessions spread across folders + one unfoldered, with distinct recency.
 // modified is epoch seconds; higher = more recent.
-const SLOTS = [
+const SLOTS: ChatSlot[] = [
   { key: 'k-old-alpha', title: 'Old in Alpha', messages: 1, running: false, folder_id: 'f1', modified: 1000 },
   { key: 'k-new-beta', title: 'Newest in Beta', messages: 1, running: false, folder_id: 'f2', modified: 3000 },
   { key: 'k-mid-root', title: 'Middle unfoldered', messages: 1, running: false, modified: 2000, pinned: true },
-]
+] as unknown as ChatSlot[]
 
-function renderSidebar(slots: any[] = SLOTS, folders: ChatFolder[] = FOLDERS) {
+function renderSidebar(slots: ChatSlot[] = SLOTS, folders: ChatFolder[] = FOLDERS) {
   mocks.folders = folders
   const store = createTestStore({
     dashboard: {
@@ -102,8 +103,8 @@ function renderSidebar(slots: any[] = SLOTS, folders: ChatFolder[] = FOLDERS) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {} } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {} } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], folders)
@@ -123,8 +124,31 @@ function renderSidebar(slots: any[] = SLOTS, folders: ChatFolder[] = FOLDERS) {
   )
 }
 
-beforeEach(() => localStorage.clear())
-afterEach(() => vi.clearAllMocks())
+// Fixtures here carry fixed old timestamps; keep the stale-session collapse
+// off so every row stays queryable (its own behavior is pinned in
+// ChatSidebar.staleCollapse.test.tsx).
+beforeEach(() => {
+  localStorage.clear()
+  localStorage.setItem('mc-session-stale-collapse-ms', '0')
+})
+afterEach(() => {
+  vi.clearAllMocks()
+  vi.useRealTimers()
+})
+
+/** Pin the clock for date-bucket tests (issue #2919). Fakes ONLY `Date` so
+ *  real timers keep driving RTL and promises, and pins the instant to LOCAL
+ *  midday — the farthest point from both midnight edges in any timezone — so
+ *  a `daysAgo(n)` fixture lands in its intended calendar bucket regardless of
+ *  timezone or time of day (a raw `now - offset` slides across local midnight
+ *  when the suite runs just after 00:00, which put the 60s-ago row under a
+ *  "Yesterday" header). Mid-January avoids DST transitions in the lookback. */
+function pinClock() {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  const pin = new Date(2026, 0, 15, 12, 0, 0) // local midday, not 12:00Z
+  vi.setSystemTime(pin)
+  return (daysAgo: number) => new Date(pin.getTime() - daysAgo * 86400_000).toISOString()
+}
 
 describe('chat sidebar — flat view (explode chats out of folders)', () => {
   it('is off by default: folder tree renders, no flat lane', () => {
@@ -146,14 +170,18 @@ describe('chat sidebar — flat view (explode chats out of folders)', () => {
     expect(rows).toEqual(['k-mid-root', 'k-new-beta', 'k-old-alpha'])
   })
 
-  it('annotates foldered rows with their folder name; unfoldered rows get none', () => {
+  it('does not annotate rows with their folder name in flat view', () => {
+    // The folder-name chip was removed from the row. Flat view therefore carries
+    // no folder annotation; ordering (asserted above) is the only thing the
+    // folder data still drives. (Untagged rows lose on-row location context in
+    // flat view as a result — a known trade-off, tracked separately.)
     const { getByTestId } = renderSidebar()
     fireEvent.click(getByTestId('flat-view-toggle'))
     const lane = getByTestId('flat-view-lane')
     const rowOf = (key: string) => lane.querySelector(`[data-slot-key="${key}"]`) as HTMLElement
-    expect(within(rowOf('k-new-beta')).getByTitle('In folder: Beta')).toBeTruthy()
-    expect(within(rowOf('k-old-alpha')).getByTitle('In folder: Alpha')).toBeTruthy()
-    expect(within(rowOf('k-mid-root')).queryByTitle(/In folder:/)).toBeNull()
+    for (const key of ['k-new-beta', 'k-old-alpha', 'k-mid-root']) {
+      expect(within(rowOf(key)).queryByTitle(/In folder:/)).toBeNull()
+    }
   })
 
   it('respects active session filters inside the flat lane', () => {
@@ -186,11 +214,11 @@ describe('chat sidebar — flat view (explode chats out of folders)', () => {
 
   it('renders date segment headers on date sorts; pinned rows stay above without a header', () => {
     safeSetItem('mc-sidebar-flat-view', '1')
-    const iso = (secsAgo: number) => new Date(Date.now() - secsAgo * 1000).toISOString()
+    const iso = pinClock()
     const slots = [
-      { key: 'k-pin', title: 'Pinned old', messages: 1, running: false, last_ts: iso(40 * 86400), pinned: true },
-      { key: 'k-today', title: 'Fresh one', messages: 1, running: false, folder_id: 'f1', last_ts: iso(60) },
-      { key: 'k-week', title: 'Three days ago', messages: 1, running: false, folder_id: 'f2', last_ts: iso(3 * 86400) },
+      { key: 'k-pin', title: 'Pinned old', messages: 1, running: false, last_ts: iso(40), pinned: true },
+      { key: 'k-today', title: 'Fresh one', messages: 1, running: false, folder_id: 'f1', last_ts: iso(0) },
+      { key: 'k-week', title: 'Three days ago', messages: 1, running: false, folder_id: 'f2', last_ts: iso(3) },
     ]
     const { getByTestId } = renderSidebar(slots)
     const lane = getByTestId('flat-view-lane')
@@ -204,10 +232,10 @@ describe('chat sidebar — flat view (explode chats out of folders)', () => {
   it('hides date segment headers on non-date sorts', () => {
     safeSetItem('mc-sidebar-flat-view', '1')
     safeSetItem('mc-session-sort', 'name-asc')
-    const iso = (secsAgo: number) => new Date(Date.now() - secsAgo * 1000).toISOString()
+    const iso = pinClock()
     const slots = [
-      { key: 'k-b', title: 'Bravo', messages: 1, running: false, folder_id: 'f1', last_ts: iso(60) },
-      { key: 'k-a', title: 'Alpha row', messages: 1, running: false, folder_id: 'f2', last_ts: iso(3 * 86400) },
+      { key: 'k-b', title: 'Bravo', messages: 1, running: false, folder_id: 'f1', last_ts: iso(0) },
+      { key: 'k-a', title: 'Alpha row', messages: 1, running: false, folder_id: 'f2', last_ts: iso(3) },
     ]
     const { getByTestId } = renderSidebar(slots)
     const lane = getByTestId('flat-view-lane')

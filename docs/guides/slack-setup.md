@@ -2,7 +2,7 @@
 
 How to create a Slack app for Kiro Crew and connect it.
 
-> **Dashboard-only mode**: If you don't need Slack, skip this entirely. Leave Slack tokens empty during `kirocrew setup` and the gateway runs the web dashboard without Slack.
+> **Slack is optional**: If you don't need Slack, skip this entirely. The default `kirocrew setup` configures no messaging channels, and the gateway runs the web dashboard without any. When you are ready to connect Slack, run `kirocrew setup --slack` to enter the tokens created below.
 
 Kiro Crew connects to Slack using **Socket Mode**, so it runs entirely from your own machine over an outbound WebSocket: no public URL, no inbound webhooks, and no hosting required. You just need a Slack workspace where you can install an app.
 
@@ -15,7 +15,7 @@ There are **two independent paths** to create a Slack app. Pick one, and do not 
 | Path | Steps | Best for |
 |------|-------|----------|
 | **[Path A: Manifest](#path-a-create-via-manifest-recommended)** (recommended) | 6 steps | Most users; auto-configures all scopes, events, and permissions in one shot |
-| **[Path B: Manual](#path-b-manual-setup)** | 10 steps | If you need to customize scopes or understand each setting individually |
+| **[Path B: Manual](#path-b-manual-setup)** | 11 steps | If you need to customize scopes or understand each setting individually |
 
 Both paths require a Slack workspace where you can install apps (see [Prerequisites](#prerequisites)).
 
@@ -24,7 +24,7 @@ Both paths require a Slack workspace where you can install apps (see [Prerequisi
 ## Prerequisites
 
 - A **Slack workspace** where you have permission to install apps. If you don't have one, create a free workspace at <https://slack.com/get-started>. You can install your own apps in a workspace you own.
-- Python and Kiro Crew installed (`pip install kirocrew`), so you can run the `kirocrew` CLI.
+- Python and Kiro Crew installed through a [supported install path](install.md#install-paths), so you can run the `kirocrew` CLI.
 
 > **Tip**: Use a personal or test workspace for your first run. You can always export the app manifest and recreate the app in another workspace later (see [Reusing the App in Another Workspace](#reusing-the-app-in-another-workspace)).
 
@@ -88,10 +88,10 @@ Then:
 
 ### Step 5. Configure Kiro Crew
 
-Run the interactive setup, which prompts for both tokens:
+Run the Slack-specific interactive setup, which prompts for both tokens:
 
 ```bash
-kirocrew setup
+kirocrew setup --slack
 ```
 
 Paste your App Token (`xapp-...`), Bot Token (`xoxb-...`), and your Slack Member ID when prompted.
@@ -104,7 +104,7 @@ To find your Slack Member ID: open your workspace in Slack → click your profil
 
 ```bash
 kirocrew doctor    # verify tokens and config
-kirocrew gateway   # start KiroCrew
+kirocrew gateway   # start Kiro Crew
 ```
 
 Open your workspace in Slack, find your app in the Apps section, and send it a DM. The app only lives in the workspace where you installed it.
@@ -139,44 +139,61 @@ Go to **Features → OAuth & Permissions → Bot Token Scopes** and add:
 | `chat:write` | Send, update, and delete messages |
 | `channels:history` | Read channel messages (for @mentions) |
 | `channels:read` | List public channels (the channel picker) and read channel metadata |
-| `groups:read` | Same, for private channels the bot is in |
+| `groups:history` | Read messages and thread replies in private channels the bot is in |
+| `groups:read` | List private channels the bot is in and read their metadata |
 | `im:history` | Read DM history |
 | `im:read` | View DM metadata |
 | `im:write` | Open DMs |
 | `reactions:write` | Add and remove emoji reactions |
 | `files:read` | Read uploaded files |
 | `files:write` | Upload screenshots |
+| `users:read` | Profile lookups (`users.info`) resolve a sender's real name. Without it the lookup fails and is caught: the display name falls back to the matching `slack.allowed_users` entry, then to the raw Slack member ID |
 | `commands` | Slash commands |
 
-Two scopes are deliberately **not** in the shipped manifest, so Path B should
-leave them out unless you want the extra behavior:
+The `emoji:read` bot scope is deliberately **not** in the shipped manifest.
+Add it only if you want custom workspace emojis to appear in the emoji picker.
 
-| Scope | What adding it buys |
-|-------|---------------------|
-| `emoji:read` | Custom workspace emojis appear in the emoji picker |
-| `users:read` | Profile lookups (`users.info`) resolve a sender's real name. Without it those calls fail and are caught: the display name falls back to the matching `slack.allowed_users` entry, then to the raw Slack member ID |
+> **Upgrading an existing app?** Adding a scope to the manifest does not
+> retroactively grant it: Slack only grants new scopes when the app is
+> **reinstalled** to the workspace. After adding scopes (or importing an
+> updated manifest), go to **Settings → Install App → Reinstall to Workspace**
+> and copy the new Bot Token.
 
-### Step 4. Subscribe to Events
+### Step 4. Add User Scopes
+
+Under **User Token Scopes**, add:
+
+`channels:history`, `channels:read`, `groups:history`, `groups:read`,
+`im:history`, `im:read`, `mpim:history`, `mpim:read`, `search:read`, and
+`users:read`.
+
+These scopes belong to the installing user's `xoxp-...` token. The Kiro Crew
+gateway itself uses the bot token; the user token is for a separately configured
+Slack MCP/search integration that lets an agent search Slack as that user. Store
+and configure that token only in the integration that consumes it.
+
+### Step 5. Subscribe to Events
 
 1. **Features → Event Subscriptions** → Toggle **ON**
 2. Under **Subscribe to bot events**, add all of these:
    - `message.im`
    - `message.channels`
+   - `message.groups`
    - `app_mention`
    - `app_home_opened`
    - `file_change`
    - `member_joined_channel`
 3. Click **Save Changes**
 
-### Step 5. Add Slash Commands
+### Step 6. Add Slash Commands
 
 **Features → Slash Commands** → **Create New Command**:
 
 | Field | Value |
 |-------|-------|
 | Command | `/kirocrew` |
-| Short Description | Dashboard access, allowlist, and channel tracking |
-| Usage Hint | `dashboard [duration] \| @user \| #channel` |
+| Short Description | Dashboard access, agent, session, and channel controls |
+| Usage Hint | `dashboard [duration] \| agent [name] \| sessions \| #channel` |
 
 The command name you choose here must match the `slack.command` value in `~/.kiro/crew/config.json` (default: `kirocrew`):
 
@@ -190,7 +207,7 @@ The command name you choose here must match the `slack.command` value in `~/.kir
 
 When creating the command, check **Escape channels, users, and links sent to your app** so mentions resolve to `<@U1234|user>` format.
 
-### Step 6. Enable Interactivity
+### Step 7. Enable Interactivity
 
 **Features → Interactivity & Shortcuts** → Toggle **ON**
 
@@ -199,7 +216,7 @@ buttons work, including tool approval (approve / trust / reject), the
 multiple-choice option buttons, the cron and subagent acknowledge buttons, and
 the session Resume / End buttons.
 
-### Step 7. Enable App Home
+### Step 8. Enable App Home
 
 **Features → App Home**:
 
@@ -207,20 +224,24 @@ the session Resume / End buttons.
 - Enable **Chat Tab**
 - Check **"Allow users to send Slash commands and messages from the chat tab"**
 
-### Step 8. Install to Workspace & Get Bot Token
+### Step 9. Install to Workspace & Get Bot Token
 
 1. **Features → OAuth & Permissions** → **Install to Workspace** → Approve
 2. Copy the `xoxb-...` token. This is your **Bot Token**
 
 > **"Install App" button greyed out?** Use **Features → OAuth & Permissions → Install to Workspace** instead (known Slack UI bug).
 
-### Step 9. Configure Kiro Crew
+### Step 10. Configure Kiro Crew
 
-Same as [Path A, Step 5](#step-5-configure-kirocrew).
+Same as [Path A, Step 5](#step-5-configure-kiro-crew).
 
-### Step 10. Verify & Run
+### Step 11. Verify & Run
 
 Same as [Path A, Step 6](#step-6-verify--run).
+
+If you add scopes to an existing app, reinstall it from **OAuth &
+Permissions** before testing. Slack does not grant newly declared scopes to
+tokens from an older installation.
 
 ---
 
@@ -228,7 +249,7 @@ Same as [Path A, Step 6](#step-6-verify--run).
 
 ### Manual Token Configuration
 
-If you prefer to configure tokens manually instead of using `kirocrew setup`:
+If you prefer to configure tokens manually instead of using `kirocrew setup --slack`:
 
 ```bash
 mkdir -p ~/.kiro/crew
@@ -247,6 +268,19 @@ Multi-user access is disabled at the authorization predicate itself, not by
 configuration: `is_allowed_user` resolves to an owner check, `is_open_channel`
 always returns false, and the channel-join allowlist prompt is a no-op. A
 `/<command> @user` invocation replies that multi-user access is disabled.
+
+> **Setting or changing `KIROCREW_OWNER_ID` invalidates existing dashboard
+> sessions.** The value is not just the Slack DM routing target — it is also the
+> dashboard's authorization principal and the subject baked into every dashboard
+> token at mint time. A dashboard session signed in before the value was set (or
+> before it changed) keeps its old subject for its whole life, so owner-only
+> actions (the Trust/YOLO switch, tool approvals, worktree creation, cloud
+> setup, and the other owner-gated surfaces) are denied for it afterwards. For a
+> session from before an owner was FIRST configured, the dashboard detects the
+> case and shows a sign-in banner; a session signed in under a PREVIOUS owner
+> value is denied with the generic response and likewise needs a fresh sign-in.
+> Either way, run `kirocrew token` and open the fresh link to re-authenticate
+> under the new owner.
 
 ### Reaction Emojis
 
@@ -288,7 +322,7 @@ To install your app in a different Slack workspace, export the manifest and recr
 1. Export your app manifest: **App Config → App Manifest → Copy to Clipboard** (YAML)
 2. Go to <https://api.slack.com/apps> → **Create New App** → **From a manifest**
 3. Select the new workspace and paste the YAML
-4. Re-generate the App Token (Socket Mode) and Bot Token, then re-run `kirocrew setup` with the new tokens and your Member ID for that workspace
+4. Re-generate the App Token (Socket Mode) and Bot Token, then re-run `kirocrew setup --slack` with the new tokens and your Member ID for that workspace
 
 ---
 
@@ -316,13 +350,19 @@ instead of a link.
 ### How It Works
 
 1. Link must be clicked within **5 minutes** (after that the URL expires)
-2. On first click: token is bound to your IP, and a session cookie is set
-   (`mc_token_<port>`, HttpOnly, SameSite=Lax, `Secure` only over HTTPS). The
-   cookie is keyed by the port your **browser** connects to, not the port the
-   gateway listens on, because browsers do not isolate cookies by port and two
-   tunnelled instances would otherwise overwrite each other's session
-3. Subsequent visits use the cookie, so there is no need to re-click the link
-4. Session cookie lasts for the requested duration (default 1h, cap 20h)
+2. On first click: token is bound to your peer and an access cookie plus a
+   refresh cookie are set (`mc_token_<port>` and `mc_refresh_<port>`, both
+   HttpOnly and SameSite=Lax; `Secure` only over HTTPS). The cookies are keyed
+   by the port your **browser** connects to, not the port the gateway listens on,
+   because browsers do not isolate cookies by port and two tunnelled instances
+   would otherwise overwrite each other's session. Behind a same-host tunnel,
+   the ordinary peer pin sees the tunnel's loopback address; see
+   [Named HTTPS tunnel (phone)](remote-and-mobile.md#named-https-tunnel-phone)
+   for that boundary
+3. Subsequent visits use the cookies, so there is no need to re-click the link
+4. The access cookie lasts for the requested duration (default 1h, cap 20h).
+   Successful refreshes rotate both cookies and extend a 30-day sliding idle
+   window; see [Session duration](remote-and-mobile.md#session-duration)
 5. **Every** request needs a valid token or cookie, including requests that
    arrive on loopback. Loopback is not an exemption: a local port forwarder
    (`socat`, `ssh -R`, a helper script) makes remote traffic appear to come from
@@ -390,7 +430,10 @@ quiet.
 Type `sessions` in any Slack DM to list recent sessions. Each entry shows a
 status dot, the session title, the agent name, a bulleted preview of recent
 messages, and a **Resume** button. The same content backs the
-`/<command> sessions` slash command and the App Home tab.
+`/<command> sessions` slash command and the App Home tab. The keyword also
+works in a DM linked to a dashboard session: it falls through link routing
+(after the unauthorized-user deny), so the picker renders instead of the
+message being forwarded to the linked session.
 
 ---
 
@@ -408,8 +451,8 @@ The slash command name is configurable via `slack.command` in config (default: `
 | `/<command> agent` | Show agent selector dropdown |
 | `/<command> agent <name>` | Switch to a named agent |
 | `/<command> voice` | Configure TTS voice settings |
-| `/<command> config` | Manage users and channels (owner-only) |
-| `/<command> users` | Manage allowed users |
+| `/<command> config` | Manage tracked channels (owner-only; multi-user access is disabled) |
+| `/<command> users` | Report that multi-user access is disabled |
 | `/<command> channels` | Open channel management modal |
 | `/<command> sessions` | List recent sessions with resume buttons |
 | `/<command> status` | Show runtime stats |
@@ -445,8 +488,8 @@ Available in DMs or @mentions.
 | Command | Purpose |
 |---------|---------|
 | `status` | Show runtime stats summary |
-| `spawn <task>` | Run a subagent (blocking) |
-| `bg <task>` | Run a subagent (fire-and-forget) |
+| `spawn <task>` | Start a background subagent |
+| `bg <task>` | Alias for `spawn <task>` |
 | `spawn list` | List active subagents |
 | `cron list` | List cron jobs |
 | `cron remove <id>` | Remove a cron job |
@@ -461,13 +504,19 @@ Dashboard tokens grant full session access, so treat them like passwords.
 | ✅ Do | ❌ Don't |
 |-------|----------|
 | Keep the dashboard behind your own tunnel or reverse proxy | Share dashboard URLs, which carry the token in `?token=` |
-| Run `kirocrew logout` or restart the gateway if a token is exposed | Paste tokens in Slack channels, shared docs, or wikis |
+| If a token is exposed, run `kirocrew logout` (ends all sessions, refresh chains included) and revoke at your tunnel or reverse-proxy auth layer | Paste tokens in Slack channels, shared docs, or wikis |
 | Avoid showing the browser URL bar during screen shares | Leave dashboard links in screen-share recordings |
 | Leave the built-in `kirocrew token` deny rules enabled | Trust an AI agent that asks to run `kirocrew token` |
 
-`kirocrew logout` revokes every issued cookie, not just in-memory state: it bumps
-a persisted revocation generation, so cookies handed out before the logout are
-rejected on their next request.
+`kirocrew logout` ends every issued session, not just in-memory state: it bumps
+a persisted revocation generation that both access cookies and
+`mc_refresh_<port>` refresh tokens embed, so cookies handed out before the
+logout — refresh chains included — are rejected on their next request. See
+[remote-and-mobile.md](remote-and-mobile.md#session-duration). Restarting the
+gateway ends nothing (the generation reloads unchanged). To cut off an exposed
+dashboard completely, also revoke at your tunnel or reverse-proxy auth layer;
+to end just one browser's session, sign out in that browser
+(`POST /api/auth/logout`), which revokes its chain alone.
 
 > ⚠️ **Prompt injection risk**: an attacker can hide instructions in a webpage or
 > document that trick your agent into running `kirocrew token` and exfiltrating
@@ -487,7 +536,7 @@ rejected on their next request.
 | App created in wrong workspace | Delete the app on api.slack.com, then recreate it in the correct workspace |
 | No events received | Verify Socket Mode is ON, events are subscribed, App Home Chat Tab is enabled. Reinstall app after changes |
 | Home tab is blank | Add `app_home_opened` event, enable Home Tab, reinstall app |
-| `missing_scope` error | Add the scope in OAuth & Permissions, reinstall app, re-run `kirocrew setup` |
+| `missing_scope` error | Add the scope in OAuth & Permissions, reinstall app, re-run `kirocrew setup --slack` |
 | Bot doesn't respond | Check `kirocrew doctor` output. Ensure gateway is running (`kirocrew gateway`) |
 | Install needs approval | Your workspace restricts app installs, so a workspace admin must approve, or use a workspace you own |
 | Dashboard shows 403 | Token expired, IP changed, or the link was opened more than 5 minutes after it was issued. Run `!dashboard` for a new link |
@@ -499,4 +548,3 @@ rejected on their next request.
 - [Slack API Docs](https://api.slack.com/)
 - [Slack Socket Mode](https://api.slack.com/apis/socket-mode)
 - [Create a free Slack workspace](https://slack.com/get-started)
-

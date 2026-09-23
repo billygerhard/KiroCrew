@@ -64,7 +64,6 @@ def _pool_key(server: str = "fake-mcp-app") -> PoolKey:
         autoapprove_set_hash="ghi789",
         approval_mode="reads",
         trust_all_tools=False,
-        user_identity="testuser",
         config_snapshot_hash="jkl012",
     )
 
@@ -133,19 +132,35 @@ async def _spawn_pooled_server() -> _LivePool:
         last_used_at=now,
     )
     pump = asyncio.get_running_loop().create_task(backend.run_stdout_pump())
-    pool = BackendPool(max_backends=4)
-    await pool.add(key, backend)
+    # Build the owner of aclose() BEFORE the first await that can fail. The
+    # handshake below can raise (asyncio.TimeoutError from the bounded
+    # inbox.get() on a loaded shard, BackendGone from forward_from_stub if the
+    # child died during startup), and every one of this file's callers only
+    # reaps through the `finally: await live.aclose()` around the value we
+    # return — so a raise from inside the helper strands the real python MCP
+    # server unless this reaps it, and that server blocks on
+    # `for line in sys.stdin` and therefore lives
+    # until the xdist worker exits and the kernel closes its pipe, plus the
+    # never-cancelled pump task and an unreaped child watcher thread.
+    live = _LivePool(BackendPool(max_backends=4), backend, process, pump)
+    try:
+        await live.pool.add(key, backend)
 
-    # Handshake once through a normal stub so _init_state is "ready" — the
-    # state a pooled backend that already served an app is guaranteed to be in.
-    inbox = await backend.attach_stub("chat-stub")
-    await backend.forward_from_stub("chat-stub", {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                   "clientInfo": {"name": "kiro-cli", "version": "0"}},
-    })
-    await asyncio.wait_for(inbox.get(), timeout=10)
-    return _LivePool(pool, backend, process, pump)
+        # Handshake once through a normal stub so _init_state is "ready" — the
+        # state a pooled backend that already served an app is guaranteed to be in.
+        inbox = await backend.attach_stub("chat-stub")
+        await backend.forward_from_stub("chat-stub", {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "kiro-cli", "version": "0"}},
+        })
+        await asyncio.wait_for(inbox.get(), timeout=10)
+    except BaseException:
+        # BaseException, not Exception: a CancelledError delivered at the
+        # wait_for (timeout teardown, worker shutdown) must reap the child too.
+        await live.aclose()
+        raise
+    return live
 
 
 # --------------------------------------------------------------------------
@@ -445,6 +460,85 @@ async def test_app_call_rejects_malformed_frames(apps_flag_on, spool_tmp):
         assert reply["reason"] == want
 
 
+async def test_app_call_allows_tool_with_no_declared_visibility(
+    apps_flag_on, spool_tmp
+):
+    """The bug this PR fixes, against the real fake server.
+
+    ``visibility`` is optional and SEP-1865 defaults it to ``["model", "app"]``,
+    so a server that declares nothing must still accept an app callback. The old
+    gate denied on absence, which broke the spec's Interactive Updates pattern
+    (a rendered app calling a tool to refresh itself) for every default-visibility
+    server — apps rendered but their controls were inert.
+    """
+    live = await _spawn_pooled_server()
+    try:
+        spool_id = _spool_record()
+        frame = {"type": "app-call", "spool_id": spool_id,
+                 "callback_secret": _cbs(spool_id),
+                 "tool": "refresh", "arguments": {}}
+        reply = await handle_app_call(live.pool, frame)
+        assert reply["type"] == "app-result", reply
+        assert reply["result"]["content"][0]["text"] == "refreshed"
+    finally:
+        await live.aclose()
+
+
+async def test_app_call_still_denies_model_only_tool(apps_flag_on, spool_tmp):
+    """Loosening the DEFAULT must not loosen an explicit exclusion."""
+    live = await _spawn_pooled_server()
+    try:
+        from kiro_crew.mcp_gateway import app_call as app_call_mod
+
+        async def _model_only(backend, **_):
+            return {"secret": {"name": "secret",
+                               "inputSchema": {"type": "object", "properties": {}},
+                               "_meta": {"ui": {"visibility": ["model"]}}}}
+
+        spool_id = _spool_record()
+        frame = {"type": "app-call", "spool_id": spool_id,
+                 "callback_secret": _cbs(spool_id),
+                 "tool": "secret", "arguments": {}}
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app_call_mod, "_tools_by_name", _model_only)
+            reply = await handle_app_call(live.pool, frame)
+        assert reply["type"] == "app-call-rejected"
+        assert reply["reason"] == "tool not app-visible"
+    finally:
+        await live.aclose()
+
+
+async def test_app_call_denies_a_malformed_declaration(apps_flag_on, spool_tmp):
+    """An unreadable declaration must deny on the APP path too.
+
+    The parser bucketed this correctly all along, but nothing drove a malformed
+    declaration through ``handle_app_call``, so the DELEGATION was unpinned: a
+    fail-open of the shape ``v.allowed or v.unreadable`` passed the whole suite.
+    A container this host cannot read may be hiding an exclusion, so admitting
+    it would authorize a call the server may have meant to refuse.
+    """
+    live = await _spawn_pooled_server()
+    try:
+        from kiro_crew.mcp_gateway import app_call as app_call_mod
+
+        async def _unreadable(backend, **_):
+            return {"secret": {"name": "secret",
+                               "inputSchema": {"type": "object", "properties": {}},
+                               "_meta": {"ui": "bad"}}}
+
+        spool_id = _spool_record()
+        frame = {"type": "app-call", "spool_id": spool_id,
+                 "callback_secret": _cbs(spool_id),
+                 "tool": "secret", "arguments": {}}
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(app_call_mod, "_tools_by_name", _unreadable)
+            reply = await handle_app_call(live.pool, frame)
+        assert reply["type"] == "app-call-rejected"
+        assert reply["reason"] == "tool not app-visible"
+    finally:
+        await live.aclose()
+
+
 async def test_app_call_tools_list_is_fetched_fresh_per_call(apps_flag_on, spool_tmp, monkeypatch):
     """Authorization input is never cached: each app call re-fetches
     tools/list, so a server-side visibility revocation takes effect on the
@@ -458,12 +552,15 @@ async def test_app_call_tools_list_is_fetched_fresh_per_call(apps_flag_on, spool
                  "tool": "save_state", "arguments": {}}
         r1 = await handle_app_call(live.pool, frame)
         assert r1["type"] == "app-result"
-        # Simulate the server revoking app visibility: the next tools/list
-        # returns save_state WITHOUT _meta.ui.visibility.
+        # Simulate the server revoking app visibility. The revocation must be an
+        # explicit declaration that EXCLUDES "app" — merely dropping the
+        # visibility key is not a revocation, because SEP-1865 defaults an
+        # undeclared tool to ["model", "app"].
 
         async def _revoked(backend, **_):
             return {"save_state": {"name": "save_state",
-                                   "inputSchema": {"type": "object", "properties": {}}}}
+                                   "inputSchema": {"type": "object", "properties": {}},
+                                   "_meta": {"ui": {"visibility": ["model"]}}}}
 
         monkeypatch.setattr(app_call_mod, "_tools_by_name", _revoked)
         r2 = await handle_app_call(live.pool, frame)

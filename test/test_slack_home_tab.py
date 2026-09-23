@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.slack import events as events_mod
 from kiro_crew.slack.events import _publish_home_tab
 
 # ---------------------------------------------------------------------------
@@ -312,6 +314,32 @@ class TestPublishHomeTabVectorStore:
         new_callable=AsyncMock,
         return_value="*SSO:* ✅ 5.0h remaining",
     )
+    async def test_mapping_row_keeps_its_not_clause(self, _mw, _fmt, _yolo):
+        """A mapping-shaped lesson renders rule AND negative, not rule-only."""
+        orch = _make_orch()
+        orch.vector_memory = MagicMock()
+        orch.vector_memory.get_lessons.return_value = [
+            {
+                "key": "lesson.1",
+                "value_json": '{"rule": "prefer X", "category": "preference",'
+                ' "negative": "never Y"}',
+            },
+        ]
+        await _publish_home_tab(orch, "U123")
+
+        view = orch.slack.views_publish.call_args[1]["view"]
+        text = str(view["blocks"])
+        assert "prefer X" in text
+        assert "never Y" in text
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch("kiro_crew.slack.events.format_schedule", return_value="every 5m")
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ✅ 5.0h remaining",
+    )
     async def test_vector_store_error_falls_back_to_jsonl(self, _mw, _fmt, _yolo):
         """When vector store raises, falls back to JSONL lessons."""
         orch = _make_orch()
@@ -533,7 +561,7 @@ class TestPublishHomeTabSessions:
         """If the collector raises, the section degrades gracefully."""
         orch = _make_orch()
         with patch(
-            "kiro_crew.slack.events._collect_recent_sessions",
+            "kiro_crew.slack.sessions_view._collect_recent_sessions",
             side_effect=RuntimeError("disk error"),
         ):
             await _publish_home_tab(orch, "U123")
@@ -557,7 +585,7 @@ class TestPublishHomeTabSessions:
     async def test_collector_failure_emits_error_sel_audit(
         self, _mw, _fmt, _yolo, monkeypatch
     ):
-        """Regression for review-bot security-controls finding on rev-after-rebase.
+        """SEL audit records the data-access attempt on the Home Tab path.
 
         SEL audit must record the data-access attempt even when the collector
         raises, so a failure mode can't silently bypass the audit trail. The
@@ -568,7 +596,7 @@ class TestPublishHomeTabSessions:
         orch = _make_orch()
         with (
             patch(
-                "kiro_crew.slack.events._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=RuntimeError("disk error"),
             ),
             patch("kiro_crew.slack.events.sel") as mock_sel,
@@ -613,7 +641,7 @@ class TestPublishHomeTabSessions:
         leaked_key = "AKIAIOSFODNN7EXAMPLE"
         with (
             patch(
-                "kiro_crew.slack.events._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=OSError(f"failed reading {leaked_key} from path"),
             ),
             patch("kiro_crew.slack.events.sel") as mock_sel,
@@ -642,7 +670,7 @@ class TestPublishHomeTabSessions:
     async def test_unauthorized_user_blocked_with_denied_audit(
         self, _mw, _fmt, _yolo, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls / authorization rule on Home Tab.
+        """Defense-in-depth authorization gate on the Home Tab path.
 
         Defense-in-depth: even though the dispatcher already gates app_home_opened
         events via is_allowed_user, the Sessions section must also enforce
@@ -692,3 +720,156 @@ class TestPublishHomeTabSessions:
         # rather than no section at all — visible signal that a section exists)
         assert "🧵 Sessions" in rendered
         assert "Sessions unavailable" in rendered
+
+
+class TestHomeTabCollectorConcurrency:
+    """The sessions collector runs on the process-wide default executor, shared
+    with history appends, cron store writes and session storage. A burst of tab
+    opens must not put N multi-MB scans in it at once."""
+
+    @staticmethod
+    def _tracking_collector(observed: list[int]):
+        """Stand in for the collector, recording how many run at once."""
+        live = 0
+
+        async def collect(*_a, **_kw):
+            nonlocal live
+            live += 1
+            observed.append(live)
+            # Yield so a second caller would interleave here if nothing gated it.
+            await asyncio.sleep(0)
+            live -= 1
+            return []
+
+        return collect
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch("kiro_crew.slack.events.format_schedule", return_value="every 5m")
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ok",
+    )
+    async def test_a_burst_of_publishes_runs_one_collector_at_a_time(
+        self, _mw, _fmt, _yolo, monkeypatch
+    ):
+        monkeypatch.setattr(events_mod, "is_owner", lambda _: True)
+        monkeypatch.setattr(events_mod, "is_allowed_user", lambda _: True)
+        monkeypatch.setattr(events_mod, "_home_tab_collect_sem", None, raising=False)
+        observed: list[int] = []
+        monkeypatch.setattr(
+            events_mod,
+            "_collect_recent_sessions_off_loop",
+            self._tracking_collector(observed),
+        )
+
+        await asyncio.gather(*(
+            _publish_home_tab(_make_orch(), f"U{i}") for i in range(6)
+        ))
+
+        assert observed, "the collector never ran"
+        assert max(observed) == 1, f"collectors overlapped: {observed}"
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch("kiro_crew.slack.events.format_schedule", return_value="every 5m")
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ok",
+    )
+    async def test_every_publish_still_completes(self, _mw, _fmt, _yolo, monkeypatch):
+        """Preservation: the gate serializes the scan, it does not drop a tab."""
+        monkeypatch.setattr(events_mod, "is_owner", lambda _: True)
+        monkeypatch.setattr(events_mod, "is_allowed_user", lambda _: True)
+        monkeypatch.setattr(events_mod, "_home_tab_collect_sem", None, raising=False)
+        observed: list[int] = []
+        monkeypatch.setattr(
+            events_mod,
+            "_collect_recent_sessions_off_loop",
+            self._tracking_collector(observed),
+        )
+        orchs = [_make_orch() for _ in range(4)]
+
+        await asyncio.gather(*(
+            _publish_home_tab(o, f"U{i}") for i, o in enumerate(orchs)
+        ))
+
+        assert len(observed) == 4
+        for o in orchs:
+            o.slack.views_publish.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    @patch("kiro_crew.slack.events.format_schedule", return_value="every 5m")
+    @patch(
+        "kiro_crew.sso_status.get_sso_status_line",
+        new_callable=AsyncMock,
+        return_value="*SSO:* ok",
+    )
+    async def test_a_failing_collector_does_not_strand_the_gate(
+        self, _mw, _fmt, _yolo, monkeypatch
+    ):
+        """A raising scan must release the gate, or the first failure wedges
+        every later Home Tab open."""
+        monkeypatch.setattr(events_mod, "is_owner", lambda _: True)
+        monkeypatch.setattr(events_mod, "is_allowed_user", lambda _: True)
+        monkeypatch.setattr(events_mod, "_home_tab_collect_sem", None, raising=False)
+
+        async def boom(*_a, **_kw):
+            raise RuntimeError("scan failed")
+
+        monkeypatch.setattr(events_mod, "_collect_recent_sessions_off_loop", boom)
+        orch = _make_orch()
+        await _publish_home_tab(orch, "U1")
+
+        observed: list[int] = []
+        monkeypatch.setattr(
+            events_mod,
+            "_collect_recent_sessions_off_loop",
+            self._tracking_collector(observed),
+        )
+        await asyncio.wait_for(_publish_home_tab(_make_orch(), "U2"), timeout=5)
+
+        assert observed == [1]
+
+    def test_the_gate_is_not_bound_at_import(self):
+        """Created lazily: a module-level Semaphore would bind to whichever loop
+        was current at import, not the gateway's."""
+        gate = getattr(events_mod, "_home_tab_collect_sem", None)
+        assert gate is None or isinstance(gate, asyncio.Semaphore)
+
+
+@pytest.mark.asyncio
+async def test_home_tab_skill_loader_and_listing_run_off_loop(tmp_path, monkeypatch):
+    import threading
+
+    from kiro_crew.skills import SkillsLoader
+
+    loop_thread = threading.get_ident()
+    threads = []
+    loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+    listing = loader.list_skills
+
+    def list_skills():
+        threads.append(threading.get_ident())
+        return listing()
+
+    def get_loader():
+        threads.append(threading.get_ident())
+        return loader
+
+    monkeypatch.setattr(loader, "list_skills", list_skills)
+    monkeypatch.setattr(events_mod, "_get_skills_loader", get_loader)
+    monkeypatch.setattr(events_mod, "list_servers", lambda: [])
+    monkeypatch.setattr(events_mod, "is_yolo_mode", lambda: False)
+    monkeypatch.setattr("kiro_crew.sso_status.get_sso_status_line", AsyncMock(return_value="ready"))
+    orch = _make_orch(slack=SimpleNamespace(views_publish=AsyncMock()))
+    try:
+        await _publish_home_tab(orch, "U123")
+        orch.slack.views_publish.assert_awaited_once()
+        assert len(threads) == 2
+        assert all(thread != loop_thread for thread in threads)
+    finally:
+        loader.close()

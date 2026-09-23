@@ -24,23 +24,23 @@ its MCP twin (``computer_list_apps``), so neither brushes the rule.
 capability and it adds no tool: it is a *harness* over the existing ten, for a
 human reproducing a failure at a terminal. The rule exists so the model gets a
 structured tool rather than being told to shell out — and the model already has
-all ten as MCP tools. ``call`` deliberately has no MCP twin, because a tool that
+all eleven as MCP tools. ``call`` deliberately has no MCP twin, because a tool that
 runs other tools would let a model launder a per-call gate decision through one
 approved invocation.
 
 **``call`` is fully gated, and that is the point of routing it through
 ``tools.dispatch_tool`` rather than reaching into ``service``.** Every call goes
-through the same ordered chokepoint as an agent call: the keystone primary enable,
-the fail-closed ``gate.require_computer_use``, the built-in app denylist, index
-freshness, the secure-target refusals, and the observation ceiling. So this
-command cannot be used to see or do anything the agent could not, which is
-exactly what makes it a faithful reproduction tool. Two consequences worth
-stating rather than discovering:
+through the same ordered chokepoint as an agent call: the fail-closed keystone
+primary enable, the audit-only ``gate.require_computer_use``, the built-in app
+denylist, index freshness, the secure-target refusals, and the observation
+ceiling. So this command cannot see or do anything the agent could
+not, which is exactly what makes it a faithful reproduction tool. Two
+consequences worth stating rather than discovering:
 
 * the session key is the attended CLI surface (:data:`_CLI_SESSION_KEY`) — a real
   surface the gate accepts, not a bypass sentinel;
-* ``approval_recorded`` is left at ``False``. The approval ceiling it used to
-  satisfy is gone, so the flag no longer changes any outcome — but it is still
+* ``approval_recorded`` is left at ``False``. There is no approval ceiling for
+  it to satisfy, so the flag changes no outcome — but it is still
   never minted here, because doing so would be the CLI asserting a prompt that
   nobody answered on this leg (asserted by an AST test over the whole package).
 
@@ -101,8 +101,8 @@ def _session_key() -> str:
 
     ``cli_chat`` is the repo's existing key for "a human at a terminal"
     (``sel._infer_source`` maps it to the ``cli`` surface). It is used
-    unconditionally now: the unattended-surface refusal that used to make this
-    decision load-bearing is gone, so there is nothing left for a stricter identity
+    unconditionally: no unattended-surface refusal makes this
+    decision load-bearing, so there is nothing for a stricter identity
     to buy. The key still matters for the SEL audit trail, which is why this is a
     named surface rather than an empty string.
     """
@@ -288,13 +288,11 @@ def _state_path() -> object:
 def _cmd_apps() -> None:
     """Print the on-screen application list, through the SAME gate as ``call``.
 
-    This used to call ``service.list_apps()`` directly, on the
-    reasoning that a diagnostic in the operator's own terminal is not the agent.
-    That reasoning does not hold, because the agent can run this command with
-    bash — so the direct call was an ungated read of every window TITLE (document
-    names, paths, and whatever a terminal put in its title) that worked even with
-    the feature disabled, in an unattended cron session, or under a policy that
-    bans computer use outright.
+    It does not call ``service.list_apps()`` directly: the agent can run this
+    command with bash, so a direct call would be an ungated read of every window
+    TITLE (document names, paths, and whatever a terminal put in its title) that
+    works even with the feature disabled, in an unattended cron session, or under
+    a policy that bans computer use outright.
 
     Routing it through ``dispatch_tool`` costs the operator nothing they should
     have had: ``computer_list_apps`` renders the same list, filtered by the app
@@ -465,7 +463,7 @@ def _coerce(raw: str) -> Any:
     """
     try:
         value = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return raw
     if isinstance(value, (bool, int, float)) and not isinstance(value, str):
         return value

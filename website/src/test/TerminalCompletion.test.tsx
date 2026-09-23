@@ -16,6 +16,7 @@ function makeTerm(line: string, cursorX: number, opts: { openTerminal?: boolean 
   let keyHandler: (e: KeyboardEvent) => boolean = () => true
   let row = line
   let wrapped = false
+  let hasSel = false
   /** Cell widths, sparse: anything unset is an ordinary single-width cell. */
   const widths = new Map<number, number>()
   /** Cell strings, sparse: anything unset is one code unit wide. */
@@ -67,9 +68,12 @@ function makeTerm(line: string, cursorX: number, opts: { openTerminal?: boolean 
       return { dispose: () => { renderCbs.splice(renderCbs.indexOf(cb), 1) } }
     },
     attachCustomKeyEventHandler: (h: (e: KeyboardEvent) => boolean) => { keyHandler = h },
+    hasSelection: () => hasSel,
   }
   return {
     term: term as unknown as Terminal,
+    /** Give (or clear) an active selection, the way a mouse drag does for real. */
+    setSelection: (v: boolean) => { hasSel = v },
     /** Rewrite the cursor's screen row (what the shell's echo does for real). */
     setLine: (next: string) => { row = next },
     /** Move the fake cursor (the shell's own echo does this for real). */
@@ -108,13 +112,25 @@ vi.mock('../utils/terminalRegistry', () => ({
   sendRawToTerminalSession: (_id: string, data: string) => { sent.push(data); return true },
 }))
 
-function mockComplete(
-  entries: { name: string; dir: boolean; at?: number }[], prefix = '', dir = '/work',
-) {
+interface MockEntry {
+  name: string
+  dir?: boolean
+  at?: number
+  kind?: 'sub' | 'flag'
+  desc?: string
+  nospace?: boolean
+}
+
+function mockComplete(entries: MockEntry[], prefix = '', dir: string | null = '/work') {
   return vi.fn().mockResolvedValue({
     ok: true,
     json: async () => ({ entries, prefix, dir, truncated: false, cwd: dir }),
   })
+}
+
+/** A command-tier reply: `dir` is null, and each entry carries a `kind`. */
+function mockCommand(entries: MockEntry[], prefix = '') {
+  return mockComplete(entries, prefix, null)
 }
 
 /** Render under a fresh QueryClient — the listing is a React Query. */
@@ -134,6 +150,18 @@ async function trigger(h: { moveCursor: () => void }) {
   // which the fake clock also owns — so draining it needs the async advance, not
   // a bare `Promise.resolve()`. Three hops: fetch resolve, notify, re-render.
   for (let i = 0; i < 3; i += 1) await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+}
+
+/**
+ * Accept the HIGHLIGHTED row with Enter. Enter only accepts once the user has
+ * arrowed onto a row (otherwise it reaches the shell and submits the typed line),
+ * so this arrows down and straight back up: the highlight lands where it
+ * started, and the menu now knows a pick was made.
+ */
+function pick(h: { key: (init: KeyboardEventInit) => { passedThrough: boolean; prevented: boolean } }) {
+  h.key({ key: 'ArrowDown' })
+  h.key({ key: 'ArrowUp' })
+  return h.key({ key: 'Enter' })
 }
 
 beforeEach(() => {
@@ -158,15 +186,37 @@ describe('TerminalCompletion', () => {
 
     expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
     expect(screen.getByText('KiroCrew/')).toBeInTheDocument()
-    // `cd` is a directory-only command, so the request narrows the listing.
+    // `cd` is a directory-only command, so the request narrows the listing. No
+    // `argv`: its ABSENCE is what selects the path tier server-side.
     const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body).toEqual({ session_id: 's1', token: '../', folders_only: true })
   })
 
-  it('does not open for a non-path command', async () => {
-    const fetchMock = mockComplete([{ name: 'x', dir: false }])
+  it('asks the command tier for a non-path command, and stays shut when it has nothing', async () => {
+    // `echo` is not a path command and `hello` cannot be a path, so this is the
+    // command tier's word — but `echo` speaks no completion protocol, so the
+    // backend answers with no entries and no menu appears.
+    const fetchMock = mockComplete([])
     vi.stubGlobal('fetch', fetchMock)
     const line = `${PROMPT}echo hello`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body).toEqual({
+      session_id: 's1', token: 'hello', folders_only: false, argv: ['echo'],
+    })
+    expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
+  })
+
+  it('asks for nothing while the command name itself is being typed', async () => {
+    // No command word yet, so neither tier applies: completing the command NAME
+    // is out of scope, and there is nothing to complete a path or a subcommand
+    // against.
+    const fetchMock = mockComplete([{ name: 'x', dir: false }])
+    vi.stubGlobal('fetch', fetchMock)
+    const line = `${PROMPT}gh`
     const h = makeTerm(line, line.length)
     renderCompletion(h.term)
     await trigger(h)
@@ -212,7 +262,7 @@ describe('TerminalCompletion', () => {
     // Only the matched span is emphasised, not the whole name.
     expect(row.querySelector('span span')).toHaveTextContent('termi')
     // The name does not extend "termi", so the fragment is erased and retyped.
-    await act(async () => { h.key({ key: 'Enter' }) })
+    await act(async () => { pick(h) })
     expect(sent).toEqual(['\x7f'.repeat(5) + 'KiroCrew-terminal-completion/'])
   })
 
@@ -273,16 +323,72 @@ describe('TerminalCompletion', () => {
       for (const key of ['ArrowDown', 'ArrowUp', 'Tab', 'Enter', 'Escape']) {
         const h = await open()
         let prevented = false
-        await act(async () => { prevented = h.key({ key }).prevented })
+        // Enter is only claimed once a row has been arrowed onto.
+        await act(async () => { prevented = (key === 'Enter' ? pick(h) : h.key({ key })).prevented })
         expect(prevented, `${key} must be prevented`).toBe(true)
         cleanup()
         sent = []
       }
     })
 
+    // The reporter's complaint (Slack, 2026-09-09): the menu opens on almost
+    // every word, and Enter accepting its top row by default rewrote commands
+    // the user had finished typing (`git status` -> `git stash`), so every submit
+    // needed an Escape first. Enter now belongs to the shell until the user has
+    // arrowed onto a row — the convention of fish, zsh-autosuggestions and VS
+    // Code's terminal alike.
+    it('hands Enter to the shell when no row has been arrowed onto, and closes', async () => {
+      const h = await open()
+      let r = { passedThrough: false, prevented: true }
+      await act(async () => { r = h.key({ key: 'Enter' }) })
+      expect(r.passedThrough).toBe(true)
+      expect(r.prevented).toBe(false)
+      expect(sent).toEqual([])
+      expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
+    })
+
+    it('accepts the highlighted row on Enter once the user has arrowed onto it', async () => {
+      const h = await open()
+      await act(async () => { h.key({ key: 'ArrowDown' }) })
+      let r = { passedThrough: true, prevented: false }
+      await act(async () => { r = h.key({ key: 'Enter' }) })
+      expect(r.passedThrough).toBe(false)
+      expect(r.prevented).toBe(true)
+      expect(sent).toEqual(['tor/'])   // second row: "doc" + "tor" → doctor/
+      expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
+    })
+
+    // Arrowing, then typing on, fetches a fresh listing whose highlight is back
+    // on the first row. The earlier pick must not carry over to it: the user
+    // has moved on to typing, so Enter is the shell's again.
+    it('forgets the pick when a new listing replaces the menu', async () => {
+      const h = await open()
+      await act(async () => { h.key({ key: 'ArrowDown' }) })
+      const typed = `${PROMPT}cd docs`
+      h.setLine(typed)
+      h.setCursor(typed.length)
+      vi.stubGlobal('fetch', mockComplete([{ name: 'docs', dir: true }], 'docs'))
+      await trigger(h)
+      expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
+      let r = { passedThrough: false, prevented: true }
+      await act(async () => { r = h.key({ key: 'Enter' }) })
+      expect(r.passedThrough).toBe(true)
+      expect(sent).toEqual([])
+    })
+
+    it('keeps Tab as the no-arrow accept key', async () => {
+      // `docs`/`doctor` share no prefix beyond the typed `doc`, so Tab commits
+      // the highlighted row rather than extending — with no arrow pressed.
+      const h = await open()
+      let r = { passedThrough: true, prevented: false }
+      await act(async () => { r = h.key({ key: 'Tab' }) })
+      expect(r.passedThrough).toBe(false)
+      expect(sent).toEqual(['s/'])
+    })
+
     it('inserts the selected entry on Enter and closes', async () => {
       const h = await open()
-      await act(async () => { expect(h.key({ key: 'Enter' }).passedThrough).toBe(false) })
+      await act(async () => { expect(pick(h).passedThrough).toBe(false) })
       expect(sent).toEqual(['s/'])   // "doc" + "s" → docs/, trailing / keeps the path open
       expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
     })
@@ -292,7 +398,7 @@ describe('TerminalCompletion', () => {
     // token — the whole point of appending the separator.
     it('re-opens on the next token after a directory is accepted', async () => {
       const h = await open()
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
       // The shell echoes "s/" — cursor advances and the row now ends in a slash.
       h.setLine(`${PROMPT}cd docs/`)
@@ -358,7 +464,7 @@ describe('TerminalCompletion', () => {
       expect(options[0]).toHaveAttribute('aria-selected', 'true')
       expect(options[1]).toHaveAttribute('aria-label', 'inner')
       // Accepting it types nothing and does not descend.
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual([])
       expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
       // Suppressed for this token: the shell's echo must not pop it back open.
@@ -407,7 +513,7 @@ describe('TerminalCompletion', () => {
       const h = makeTerm(line, line.length)
       renderCompletion(h.term)
       await trigger(h)
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual(['.json '])
       // The shell echoes the name plus the space; the next word is empty.
       const next = `${PROMPT}ls app.json `
@@ -450,6 +556,71 @@ describe('TerminalCompletion', () => {
       await trigger(h)
       expect(second).toHaveBeenCalled()
       expect(screen.getByText('child/')).toBeInTheDocument()
+    })
+  })
+
+  describe('Ctrl+Shift+C copy shortcut', () => {
+    /* The chord must work with NO menu open — that is the everyday copy case —
+     * so these tests never call trigger(). jsdom has no execCommand; the stub
+     * stands in for the native `copy` event route that xterm's own listener
+     * serialises the selection into. */
+    let execCommand: ReturnType<typeof vi.fn>
+    beforeEach(() => {
+      execCommand = vi.fn(() => true)
+      document.execCommand = execCommand as unknown as typeof document.execCommand
+    })
+    afterEach(() => {
+      delete (document as { execCommand?: unknown }).execCommand
+    })
+
+    function mount() {
+      const line = `${PROMPT}cd zzz`
+      const h = makeTerm(line, line.length)
+      renderCompletion(h.term)
+      return h
+    }
+
+    it('with a selection, fires the native copy and consumes the chord', () => {
+      const h = mount()
+      h.setSelection(true)
+      const r = h.key({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true })
+      expect(execCommand).toHaveBeenCalledExactlyOnceWith('copy')
+      expect(r.passedThrough).toBe(false)
+      expect(r.prevented).toBe(true)
+    })
+
+    it('matches the physical key on layouts whose C position types another glyph', () => {
+      const h = mount()
+      h.setSelection(true)
+      // Cyrillic layout: e.key is 'с', but the physical key still reports KeyC.
+      const r = h.key({ key: 'с', code: 'KeyC', ctrlKey: true, shiftKey: true })
+      expect(execCommand).toHaveBeenCalledExactlyOnceWith('copy')
+      expect(r.passedThrough).toBe(false)
+    })
+
+    it('with no selection, passes the chord through untouched', () => {
+      const h = mount()
+      const r = h.key({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true })
+      expect(execCommand).not.toHaveBeenCalled()
+      expect(r.passedThrough).toBe(true)
+      expect(r.prevented).toBe(false)
+    })
+
+    it('leaves plain Ctrl+C alone — that is the shell interrupt', () => {
+      const h = mount()
+      h.setSelection(true)
+      const r = h.key({ key: 'c', code: 'KeyC', ctrlKey: true })
+      expect(execCommand).not.toHaveBeenCalled()
+      expect(r.passedThrough).toBe(true)
+      expect(r.prevented).toBe(false)
+    })
+
+    it('leaves Ctrl+Alt+Shift+C and Meta+Shift+C alone', () => {
+      const h = mount()
+      h.setSelection(true)
+      expect(h.key({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true, altKey: true }).passedThrough).toBe(true)
+      expect(h.key({ key: 'C', code: 'KeyC', ctrlKey: true, shiftKey: true, metaKey: true }).passedThrough).toBe(true)
+      expect(execCommand).not.toHaveBeenCalled()
     })
   })
 
@@ -563,7 +734,7 @@ describe('TerminalCompletion', () => {
       expect(JSON.parse(fetchMock.mock.calls[0][1].body).token).toBe('my d')
       expect(screen.getByText('my dir/')).toBeInTheDocument()
       // `my\ d` is already on screen, so only the missing (escaped) tail is typed.
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual(['ir/'])
     })
 
@@ -573,7 +744,7 @@ describe('TerminalCompletion', () => {
       const h = makeTerm(line, line.length)
       renderCompletion(h.term)
       await trigger(h)
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual(['\\ dir/'])
 
       // The shell echoes the escaped name; the word on screen is now `my\ dir/`.
@@ -602,7 +773,7 @@ describe('TerminalCompletion', () => {
 
     it('types a leading-hyphen name as a path on Enter', async () => {
       const h = await openVim([{ name: '-c:!sh evil', dir: false }])
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual(['./-c:\\!sh\\ evil '])
     })
 
@@ -638,7 +809,7 @@ describe('TerminalCompletion', () => {
         const h = await openWith([{ name: 'my\nrm -rf x', dir: false }])
         // Nothing offered means nothing to accept: the menu never opened.
         expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
-        await act(async () => { h.key({ key }) })
+        await act(async () => { if (key === 'Enter') pick(h); else h.key({ key }) })
         expect(sent, `${key} must type nothing`).toEqual([])
         cleanup()
         sent = []
@@ -647,7 +818,7 @@ describe('TerminalCompletion', () => {
 
     it('escapes shell metacharacters when a name is accepted', async () => {
       const h = await openWith([{ name: 'my file;rm -rf $x.txt', dir: false }])
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       // One shell word, escape by escape — no quoting, so the word stays
       // re-triggerable and the metacharacters are inert.
       expect(sent).toEqual(['\\ file\\;rm\\ -rf\\ \\$x.txt '])
@@ -664,7 +835,7 @@ describe('TerminalCompletion', () => {
 
     it('leaves ordinary and non-ASCII names unescaped', async () => {
       const h = await openWith([{ name: 'my-项目_v2', dir: true }])
-      await act(async () => { h.key({ key: 'Enter' }) })
+      await act(async () => { pick(h) })
       expect(sent).toEqual(['-项目_v2/'])
     })
   })
@@ -685,6 +856,8 @@ describe('TerminalCompletion', () => {
     it('aborts an acceptance whose word has since changed', async () => {
       for (const key of ['Enter', 'Tab']) {
         const h = await open()
+        // Arrow first so Enter is a genuine accept attempt, not a plain submit.
+        await act(async () => { h.key({ key: 'ArrowDown' }) })
         const moved = `${PROMPT}cd docz`
         h.setLine(moved)
         h.setCursor(moved.length)
@@ -727,6 +900,9 @@ describe('TerminalCompletion', () => {
     // a path and drop the text the user just composed.
     it('passes through the Enter that commits a candidate', async () => {
       const h = await open()
+      // Arrow onto a row first: without that Enter is the shell's anyway, and
+      // the pass-through below would prove nothing about the IME guard.
+      await act(async () => { h.key({ key: 'ArrowDown' }) })
       const composing = h.key({ key: 'Enter', isComposing: true })
       expect(composing.passedThrough).toBe(true)
       expect(composing.prevented).toBe(false)
@@ -737,9 +913,22 @@ describe('TerminalCompletion', () => {
 
     it('passes through the Enter that ends composition', async () => {
       const h = await open()
+      await act(async () => { h.key({ key: 'ArrowDown' }) })
       h.compositionEnd()
       const r = h.key({ key: 'Enter' })
       expect(r.passedThrough).toBe(true)
+      expect(sent).toEqual([])
+    })
+
+    it('consumes the post-composition Tab without accepting the suggestion', async () => {
+      const h = await open()
+      h.compositionEnd()
+      const r = h.key({ key: 'Tab' })
+      // Native composition flags are already clear, so the grace latch owns
+      // both halves: the menu must not accept Tab, and xterm/browser must not
+      // pass it on to the PTY as shell completion.
+      expect(r.passedThrough).toBe(false)
+      expect(r.prevented).toBe(true)
       expect(sent).toEqual([])
     })
 
@@ -748,8 +937,17 @@ describe('TerminalCompletion', () => {
       h.compositionEnd()
       // Past the grace window: this Enter belongs to the menu again.
       vi.setSystemTime(Date.now() + 1000)
-      await act(async () => { expect(h.key({ key: 'Enter' }).passedThrough).toBe(false) })
+      await act(async () => { expect(pick(h).passedThrough).toBe(false) })
       expect(sent).toEqual(['s/'])
+    })
+
+    it('still completes on a plain Tab once composition is over', async () => {
+      const h = await open()
+      h.compositionEnd()
+      // Past the grace window: this Tab belongs to the menu again.
+      vi.setSystemTime(Date.now() + 1000)
+      await act(async () => { expect(h.key({ key: 'Tab' }).passedThrough).toBe(false) })
+      expect(sent).toEqual(['s'])
     })
 
     // Regression: this child's effects run BEFORE the parent's `term.open()`, so
@@ -762,6 +960,7 @@ describe('TerminalCompletion', () => {
       renderCompletion(h.term)
       h.openTerminal()
       await trigger(h)
+      await act(async () => { h.key({ key: 'ArrowDown' }) })
       h.compositionEnd()
       const r = h.key({ key: 'Enter' })
       expect(r.passedThrough).toBe(true)
@@ -799,5 +998,216 @@ describe('TerminalCompletion', () => {
     renderCompletion(h.term)
     await trigger(h)
     expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
+  })
+})
+
+describe('TerminalCompletion — command tier', () => {
+  it('offers subcommands with their descriptions for `gh pr `', async () => {
+    const fetchMock = mockCommand([
+      { name: 'create', kind: 'sub', desc: 'Create a pull request' },
+      { name: 'checkout', kind: 'sub', desc: 'Check out a pull request in git' },
+    ])
+    vi.stubGlobal('fetch', fetchMock)
+    const line = `${PROMPT}gh pr `
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    const menu = screen.getByTestId('terminal-completion')
+    expect(menu).toHaveAttribute('data-mode', 'command')
+    expect(screen.getByText('create')).toBeInTheDocument()
+    // The tool's own help is what answers "what does this do" — the question that
+    // would otherwise send the user to `--help`.
+    expect(screen.getAllByText('Create a pull request')).toHaveLength(2)
+    // Full argv, so the backend knows WHERE in the command tree the cursor is.
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      session_id: 's1', token: '', folders_only: false, argv: ['gh', 'pr'],
+    })
+  })
+
+  it('sends the whole argv, flag words included', async () => {
+    // Cobra's position in its own tree depends on the flags already typed, so
+    // dropping `--repo o/r` would ask about a different command.
+    const fetchMock = mockCommand([{ name: 'list', kind: 'sub', desc: '' }])
+    vi.stubGlobal('fetch', fetchMock)
+    const line = `${PROMPT}gh --repo o/r pr `
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).argv)
+      .toEqual(['gh', '--repo', 'o/r', 'pr'])
+  })
+
+  it('completes a flag word, which the path tier refuses outright', async () => {
+    const fetchMock = mockCommand([
+      { name: '--title', kind: 'flag', desc: 'Title for the pull request' },
+    ], '--ti')
+    vi.stubGlobal('fetch', fetchMock)
+    const line = `${PROMPT}gh pr create --ti`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).token).toBe('--ti')
+  })
+
+  it('types an accepted flag verbatim — no `./` path guard', async () => {
+    // The guard exists so a FILE called `--force` is typed as `./--force`. A FLAG
+    // called `--force` must be typed as `--force`; `./--force` would name a path
+    // that does not exist. Same characters, opposite correct answers.
+    vi.stubGlobal('fetch', mockCommand([{ name: '--force', kind: 'flag', desc: '' }], '--f'))
+    const line = `${PROMPT}gh pr merge --f`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    await act(async () => { pick(h) })
+    expect(sent).toEqual(['orce '])
+  })
+
+  it('appends no separator when the protocol says the value is unfinished', async () => {
+    // cobra's NoSpace directive: the cursor must land where the value goes, not one
+    // space past it. Shown on a cobra tool rather than git, because git flag
+    // completion is refused outright (its probe could execute a `!` alias).
+    vi.stubGlobal('fetch', mockCommand(
+      [{ name: '--message=', kind: 'flag', desc: '', nospace: true }], '--m',
+    ))
+    const line = `${PROMPT}gh pr create --m`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    await act(async () => { pick(h) })
+    expect(sent).toEqual(['essage='])
+  })
+
+  it('re-opens on the next word after a subcommand, to walk down the tree', async () => {
+    // The path tier suppresses the empty word after accepting a FILE (the word is
+    // finished). A subcommand is the opposite: accepting `pr` should immediately
+    // offer `create`, which is how the tree is walked without typing.
+    vi.stubGlobal('fetch', mockCommand([{ name: 'pr', kind: 'sub', desc: 'Manage PRs' }], 'p'))
+    const line = `${PROMPT}gh p`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    await act(async () => { pick(h) })
+    expect(sent).toEqual(['r '])
+
+    // The echo lands and the cursor moves on: the next word is empty and the menu
+    // is NOT suppressed, so a fresh request goes out for `gh pr `.
+    const next = `${PROMPT}gh pr `
+    h.setLine(next)
+    h.setCursor(next.length)
+    await trigger(h)
+    expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
+  })
+
+  it('shows no description bar when the protocol supplies no help text', async () => {
+    // git's `--list-cmds` returns bare names. An empty strip under the rows would
+    // read as a rendering bug.
+    vi.stubGlobal('fetch', mockCommand([
+      { name: 'commit', kind: 'sub', desc: '' },
+      { name: 'checkout', kind: 'sub', desc: '' },
+    ], 'c'))
+    const line = `${PROMPT}git c`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    const menu = screen.getByTestId('terminal-completion')
+    expect(menu).toHaveAttribute('data-mode', 'command')
+    // Two option rows and nothing else — no caption element.
+    expect(screen.getAllByRole('option')).toHaveLength(2)
+    expect(menu.querySelector('.border-t')).toBeNull()
+  })
+
+  it('does not synthesise the "use this folder" row in command mode', async () => {
+    // That row confirms a directory the user already named. A subcommand list has
+    // no such case, and offering it would be an unacceptable no-op row.
+    vi.stubGlobal('fetch', mockCommand([{ name: 'add', kind: 'sub', desc: '' }]))
+    const line = `${PROMPT}git remote `
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    const rows = screen.getAllByRole('option')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toHaveAttribute('aria-label', 'add')
+  })
+
+  it('aborts acceptance when the command word changed under the same token', async () => {
+    // The bug this pins: `gh pr c` and `git c` share the token `c`, so a
+    // token-only staleness check let a menu computed for one tool be accepted into
+    // the other's command line — silently corrupting it.
+    vi.stubGlobal('fetch', mockCommand([{ name: 'checkout', kind: 'sub', desc: '' }], 'c'))
+    const line = `${PROMPT}gh pr c`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+    expect(screen.getByTestId('terminal-completion')).toBeInTheDocument()
+    // Arrow onto the row so the pass-through below is the staleness check's
+    // doing, not the plain no-arrow default.
+    await act(async () => { h.key({ key: 'ArrowDown' }) })
+
+    // Same token, different command. Enter must go to the shell untouched.
+    const changed = `${PROMPT}git c`
+    h.setLine(changed)
+    h.setCursor(changed.length)
+    let passedThrough = false
+    await act(async () => { passedThrough = h.key({ key: 'Enter' }).passedThrough })
+    expect(passedThrough).toBe(true)
+    expect(sent).toEqual([])
+  })
+
+  it('drops an entry that does not belong to the tier that was asked for', async () => {
+    // The tier the CLIENT asked for decides how an accepted value is typed —
+    // escaped and `./`-guarded for a path, verbatim for a command token. An entry
+    // arriving without a recognised `kind` therefore cannot be reinterpreted as
+    // the other kind; it is dropped, and with nothing left the menu stays shut.
+    vi.stubGlobal('fetch', mockComplete(
+      [{ name: '--rf', kind: 'bogus' as unknown as 'sub', desc: '' }], '--r', null,
+    ))
+    const line = `${PROMPT}gh pr --r`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
+    await act(async () => { h.key({ key: 'Enter' }) })
+    expect(sent).toEqual([])
+  })
+
+  it('drops a command value that is not a protocol-shaped token', async () => {
+    // The command tier types its values WITHOUT escaping, so a value carrying
+    // shell metacharacters is refused rather than escaped — there is no such flag,
+    // and inserting `--x; rm -rf ~` verbatim would be a command injection.
+    vi.stubGlobal('fetch', mockCommand([
+      { name: '--x; rm -rf ~', kind: 'flag', desc: 'hostile' },
+      { name: '--safe', kind: 'flag', desc: 'ok' },
+    ], '--'))
+    const line = `${PROMPT}gh pr --`
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    const rows = screen.getAllByRole('option')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toHaveAttribute('aria-label', '--safe')
+  })
+
+  it('does not offer a path entry through the command tier', async () => {
+    // A path listing has no business carrying `kind`, and a command listing has no
+    // business carrying bare filesystem entries — either would mean the tiers had
+    // crossed, so each drops what is not its own.
+    vi.stubGlobal('fetch', mockCommand([{ name: 'notes', dir: true }]))
+    const line = `${PROMPT}gh pr `
+    const h = makeTerm(line, line.length)
+    renderCompletion(h.term)
+    await trigger(h)
+
+    expect(screen.queryByTestId('terminal-completion')).not.toBeInTheDocument()
   })
 })

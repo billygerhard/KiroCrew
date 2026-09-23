@@ -1,5 +1,6 @@
+import { ApiError } from '../../api/client'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent, waitFor, within, cleanup } from '@testing-library/react'
+import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { useLocation } from 'react-router-dom'
 import { renderWithProviders, createTestStore } from '../../test/helpers'
 import type { DeniedCommandsData } from '../../api/client'
@@ -11,6 +12,18 @@ import type { DeniedCommandsData } from '../../api/client'
  * Security Posture card, and `governancePolicy` feeds the ceiling viewer.
  */
 vi.mock('../../api/client', () => ({
+  // The real class, not a stub: `trustFailureMessage` branches on `instanceof
+  // ApiError` to decide whether a structured body is available to read.
+  ApiError: class ApiError extends Error {
+    status: number
+    body: string
+    constructor(status: number, message: string, body = '') {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.body = body
+    }
+  },
   api: {
     deniedCommands: vi.fn(),
     toggleBuiltinDeniedCommand: vi.fn(),
@@ -24,16 +37,105 @@ vi.mock('../../api/client', () => ({
     // YoloDurationCard, which tolerates an unresolved read.
     kirocrewConfig: vi.fn(),
     patchConfig: vi.fn(),
+    // Read by the rail on every mount to summarise the tailnet-origin section.
+    // Present here so the rail's own read is a resolved query rather than a
+    // crash on an undefined queryFn; the section's behaviour is covered in
+    // SecurityPanel.tailnet.test.tsx.
+    tailnetStatus: vi.fn(),
+    // Read by the rail on every mount to summarise the flagged-file-delivery
+    // section, for the same reason as `tailnetStatus` above. The section's own
+    // behaviour is covered in SecurityPanel.fileDelivery.test.tsx.
+    fileDeliveryConsent: vi.fn(),
+    revokeFileDeliveryConsent: vi.fn(),
+    listTrustedApps: vi.fn(),
+    trustApp: vi.fn(),
+    untrustApp: vi.fn(),
+    setTrustAllApps: vi.fn(),
   },
 }))
 
 import { api } from '../../api/client'
-import type { GovernancePolicyData, SecurityPostureData } from '../../api/client'
-import { SecurityPanel } from './SecurityPanel'
+import type { GovernanceDistributionData, GovernancePolicyData, SecurityPostureData, TrustedAppsData } from '../../api/client'
+import { SecurityPanel, trustFailureMessage, humaniseScopeLeaf } from './SecurityPanel'
+import { i18nT } from '../../i18n/t'
+
+/** Copy is asserted through `i18nT`, not literal English.
+ *
+ * The trusted-apps catalog entries are authored separately from this component,
+ * so a literal-English assertion here would be red until they land and would have
+ * to be edited again when they do. Resolving the same key the component resolves
+ * asserts the BEHAVIOUR (this control is wired to that key) and stays green
+ * across the catalog landing — while still failing loudly if the component starts
+ * rendering a different key or hardcodes English. */
+const K = 'pages.settings.securityPanel.trustedApps'
+const T = {
+  allowAllLabel: () => i18nT(`${K}.allow_all_label`),
+  empty: () => i18nT(`${K}.empty`),
+  revoke: () => i18nT(`${K}.revoke`),
+  trustedBadge: () => i18nT(`${K}.trusted_badge`),
+  revokeDisables: (name: string) => i18nT(`${K}.revoke_disables`, { name }),
+  ineffectiveLabel: () => i18nT(`${K}.ineffective_label`),
+  ineffectiveDescription: () => i18nT(`${K}.ineffective_description`),
+  allowAllAck: () => i18nT(`${K}.allow_all_confirm_ack`),
+  confirmBtn: () => i18nT('components.trustDropdown.trust'),
+  revokeConfirmBody: (name: string) => i18nT(`${K}.revoke_confirm_body`, { name }),
+  revokeConfirmOk: () => i18nT(`${K}.revoke_confirm_ok`),
+  cancel: () => i18nT('pages.settings.securityPanel.cancel'),
+}
 
 const PINNED_DESC = 'Blocks EC2 instance termination'
 const TOGGLE_DESC = 'Blocks CloudFormation stack deletion'
 const USER_PATTERN = 'rm -rf /tmp/mine'
+
+/** A second user rule, this one carrying a `note`.
+ *
+ * `note` is optional on `DeniedUserRule` — rules added before the field existed,
+ * and rules added without one, omit it. Keeping BOTH shapes in the one shared
+ * snapshot means the present and absent branches are asserted against the same
+ * render, so "renders the note" and "renders no note" cannot both pass on a row
+ * that unconditionally emits the paragraph. */
+const NOTED_PATTERN = 'curl .* \\| (ba)?sh'
+const USER_NOTE = 'Fetch it, read it, then run it — never pipe a download into a shell.'
+
+/** The note field's copy keys are authored separately from this component, so
+ *  resolve them the way the panel does instead of asserting literal English —
+ *  the same rationale as the `T` block above. The assertion then tracks the
+ *  BEHAVIOUR (this control is wired to that key) and stays green across the
+ *  catalog landing, while still failing if the panel switches keys. */
+const NOTE_LABEL = () => i18nT('pages.settings.securityPanel.custom_deny_note')
+
+/** Default payload for the rail's tailnet read.
+ *
+ * Every `beforeEach` in this file resolves `api.tailnetStatus` with this. It must
+ * RESOLVE rather than merely exist: a bare `vi.fn()` returns undefined, which
+ * react-query rejects ("Query data cannot be undefined") and reports once per
+ * test, since the rail reads it on mount in all of them. `off` is the right
+ * default here — this file covers the rest of the panel, and the section's own
+ * states are covered in SecurityPanel.tailnet.test.tsx.
+ */
+const TAILNET_OFF = {
+  enabled: false,
+  governance_pinned: false,
+  host: '',
+  origin: '',
+  resolved_at: 0,
+  state: 'off',
+} as const
+
+/**
+ * Nothing confirmed, for the same reason TAILNET_OFF exists: the rail reads the
+ * flagged-file-delivery state on mount in every test here, so the mock must
+ * RESOLVE rather than merely exist. "Not confirmed" is the right default for a
+ * file that covers the rest of the panel; the section's own states are covered in
+ * SecurityPanel.fileDelivery.test.tsx.
+ */
+const CONSENT_NONE = {
+  ok: true,
+  grantable: ['owner_dashboard'],
+  never_grantable: ['channel_upload', 'slack_upload'],
+  labels: { owner_dashboard: "This machine's outbox and my own dashboard" },
+  grants: { owner_dashboard: null },
+} as const
 
 function snapshot(overrides: Partial<DeniedCommandsData> = {}): DeniedCommandsData {
   return {
@@ -57,6 +159,7 @@ function snapshot(overrides: Partial<DeniedCommandsData> = {}): DeniedCommandsDa
     ],
     user_added: [
       { id: 'user-1', pattern: USER_PATTERN, enabled: true },
+      { id: 'user-2', pattern: NOTED_PATTERN, enabled: true, note: USER_NOTE },
     ],
     disable_all: false,
     effective_count: 129,
@@ -165,6 +268,42 @@ function govGoverned(overrides: Partial<GovernancePolicyData> = {}): GovernanceP
   }
 }
 
+/** A configured central-distribution posture.
+ *
+ * The defaults describe the state a governed fleet actually runs in — an https
+ * source, a live poller on a 15-minute interval, a warm cache, and a poll that found
+ * nothing to change — so each case below overrides only the field it is about. */
+function govDistribution(overrides: Partial<GovernanceDistributionData> = {}): GovernanceDistributionData {
+  return {
+    configured: true,
+    source_scheme: 'https',
+    refresh_interval_seconds: 900,
+    max_cache_age_seconds: 86400,
+    on_unavailable: 'fail_closed',
+    refresher_running: true,
+    cache_present: true,
+    cache_age_seconds: 120,
+    last_refresh_status: 'unchanged',
+    last_refresh_age_seconds: 30,
+    error_code: '',
+    ...overrides,
+  }
+}
+
+/** A trusted-apps snapshot: two per-app grants, blanket flag off. */
+function trusted(overrides: Partial<TrustedAppsData> = {}): TrustedAppsData {
+  return {
+    apps: ['launchdarkly', 'oncall-radar'],
+    ineffective: [],
+    allowAll: false,
+    ...overrides,
+  }
+}
+
+/** Stored names the gate IGNORES: a capital and a traversal-ish token, both
+ *  outside the app-name charset, so neither can ever admit anything. */
+const INEFFECTIVE = ['LD-App', '..']
+
 describe('SecurityPanel — denied commands', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -176,6 +315,8 @@ describe('SecurityPanel — denied commands', () => {
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   it('toggling a built-in OFF opens the confirm modal and only mutates after ack', async () => {
@@ -279,12 +420,168 @@ describe('SecurityPanel — denied commands', () => {
     await screen.findByText(/Invalid regular expression|Unterminated group|Invalid group/i)
     expect(api.addUserDeniedCommand).not.toHaveBeenCalled()
 
-    // A valid pattern clears the error and calls the API.
+    // A valid pattern clears the error and calls the API. The note is untouched
+    // here, so it arrives as the empty string the client defaults to.
     fireEvent.change(input, { target: { value: 'rm -rf /data' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() =>
-      expect(api.addUserDeniedCommand).toHaveBeenCalledWith('rm -rf /data'),
+      expect(api.addUserDeniedCommand).toHaveBeenCalledWith('rm -rf /data', ''),
     )
+  })
+
+  it('add-pattern sends the typed note through to the API and clears both drafts', async () => {
+    await renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Custom deny pattern'), {
+      target: { value: 'find / -delete' },
+    })
+    const note = screen.getByLabelText(NOTE_LABEL())
+    fireEvent.change(note, { target: { value: '  Scope it with -maxdepth first.  ' } })
+    // Enter on the NOTE field submits too — the note is the last thing typed, so
+    // requiring a trip back to the pattern input to commit would lose it.
+    fireEvent.keyDown(note, { key: 'Enter' })
+
+    // Trimmed: this prose is read back to the agent verbatim when the rule fires,
+    // so surrounding whitespace must not survive the submit.
+    await waitFor(() =>
+      expect(api.addUserDeniedCommand).toHaveBeenCalledWith(
+        'find / -delete',
+        'Scope it with -maxdepth first.',
+      ),
+    )
+    // Both drafts clear together. A note left behind would silently attach
+    // itself to the NEXT pattern the reader adds, mislabelling that refusal.
+    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('')
+    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('')
+  })
+
+  it('a REJECTED add keeps both drafts so the operator can correct them', async () => {
+    // The server rejects a note carrying the refusal prefix (400). Clearing on
+    // submit rather than on success would discard text the operator then has to
+    // retype from memory -- and the rejected note is exactly the text they need
+    // in front of them to fix.
+    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('note must not contain'),
+    )
+    await renderPanel()
+
+    const pattern = screen.getByLabelText('Custom deny pattern')
+    const note = screen.getByLabelText(NOTE_LABEL())
+    fireEvent.change(pattern, { target: { value: 'find / -delete' } })
+    fireEvent.change(note, { target: { value: 'Blocked by security policy: nope' } })
+    fireEvent.keyDown(pattern, { key: 'Enter' })
+
+    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
+    // Both survive the failure.
+    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('find / -delete')
+    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue(
+      'Blocked by security policy: nope',
+    )
+    // ...and the rejection is VISIBLE. Keeping the drafts without saying why would
+    // leave Add looking like it silently did nothing.
+    expect(await screen.findByText(/must not contain/i)).toBeInTheDocument()
+  })
+
+  it('a slow add does not erase drafts the operator typed while it was in flight', async () => {
+    // The inputs stay editable while an add is pending, so an operator can start
+    // the NEXT rule before the previous one resolves. Clearing unconditionally on
+    // success would erase that newer text.
+    let release!: (snap: DeniedCommandsData) => void
+    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise<DeniedCommandsData>(resolve => { release = resolve }),
+    )
+    await renderPanel()
+
+    const pattern = screen.getByLabelText('Custom deny pattern')
+    const note = screen.getByLabelText(NOTE_LABEL())
+    fireEvent.change(pattern, { target: { value: 'first .*' } })
+    fireEvent.change(note, { target: { value: 'first note' } })
+    fireEvent.keyDown(pattern, { key: 'Enter' })
+    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
+
+    // Operator moves on to the next rule while the first is still pending.
+    fireEvent.change(pattern, { target: { value: 'second .*' } })
+    fireEvent.change(note, { target: { value: 'second note' } })
+
+    release(snapshot())
+
+    // Flush the resolution INSIDE act: without this the assertions below can pass
+    // on the first poll, before React has processed onSuccess, and the test would
+    // be vacuous -- it would pass with or without the guard it exists to prove.
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // The in-flight add resolving must not touch the newer drafts.
+    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('second .*')
+    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('second note')
+  })
+
+  it('a note deliberately reused for the next rule is not cleared by the previous add', async () => {
+    // Partial reuse: the operator submits (A, N), then retypes only the pattern
+    // because the SAME rationale applies to the next rule. Clearing per-field
+    // would wipe N -- correct by string equality, wrong by intent. Clearing is
+    // all-or-nothing: if either field moved, neither is touched.
+    let release!: (snap: DeniedCommandsData) => void
+    ;(api.addUserDeniedCommand as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise<DeniedCommandsData>(resolve => { release = resolve }),
+    )
+    await renderPanel()
+
+    const pattern = screen.getByLabelText('Custom deny pattern')
+    const note = screen.getByLabelText(NOTE_LABEL())
+    fireEvent.change(pattern, { target: { value: 'first .*' } })
+    fireEvent.change(note, { target: { value: 'shared rationale' } })
+    fireEvent.keyDown(pattern, { key: 'Enter' })
+    await waitFor(() => expect(api.addUserDeniedCommand).toHaveBeenCalled())
+
+    // Only the pattern changes; the note is intentionally kept.
+    fireEvent.change(pattern, { target: { value: 'second .*' } })
+
+    release(snapshot())
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(screen.getByLabelText('Custom deny pattern')).toHaveValue('second .*')
+    expect(screen.getByLabelText(NOTE_LABEL())).toHaveValue('shared rationale')
+  })
+
+  it('add-pattern with an untouched note sends an empty string, not undefined', async () => {
+    await renderPanel()
+
+    const input = screen.getByLabelText('Custom deny pattern')
+    fireEvent.change(input, { target: { value: 'shutdown -h now' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    // The note is optional to the READER, but the argument is not optional on the
+    // wire: the client posts whatever it is handed, and `undefined` would drop
+    // the field from the body instead of stating "no note". Assert the exact
+    // empty string rather than an arity-free match, so a regression to
+    // `addUserDeniedCommand(pattern)` fails here.
+    await waitFor(() =>
+      expect(api.addUserDeniedCommand).toHaveBeenCalledWith('shutdown -h now', ''),
+    )
+  })
+
+  it('a user rule with a note renders it under its own pattern', async () => {
+    await renderPanel()
+
+    // Scoped to the row: the note explains one specific pattern, so "somewhere
+    // on the card" is not the claim being made.
+    const noted = screen.getByText(NOTED_PATTERN).parentElement!
+    expect(within(noted).getByText(USER_NOTE)).toBeInTheDocument()
+  })
+
+  it('a user rule without a note renders no note paragraph', async () => {
+    await renderPanel()
+
+    // `user-1` carries no note, so the optional slot must emit nothing at all —
+    // an empty <p> would still claim vertical space under the pattern.
+    expect(screen.getByText(USER_PATTERN).parentElement!.querySelector('p')).toBeNull()
+    // Paired with the noted rule from the SAME render, so this cannot pass by the
+    // panel having stopped rendering notes altogether.
+    expect(screen.getByText(NOTED_PATTERN).parentElement!.querySelector('p')).not.toBeNull()
   })
 
   it('delete is only available on user rows', async () => {
@@ -311,11 +608,30 @@ describe('SecurityPanel — denied commands', () => {
   })
 })
 
-describe('SecurityPanel — governance policy viewer', () => {
-  beforeEach(() => {
+describe('humaniseScopeLeaf', () => {
+  it('title-cases each word of a snake_case or kebab-case leaf', () => {
+    expect(humaniseScopeLeaf('external_access')).toBe('External Access')
+    expect(humaniseScopeLeaf('capability_install')).toBe('Capability Install')
+    expect(humaniseScopeLeaf('theme-persona')).toBe('Theme Persona')
+    expect(humaniseScopeLeaf('cron')).toBe('Cron')
+  })
+
+  it('does not emit stray or doubled spaces from odd separators', () => {
+    // A leading/trailing/doubled separator is an operator-authored identifier we
+    // do not control, and the panel renders the result verbatim.
+    expect(humaniseScopeLeaf('_leading')).toBe('Leading')
+    expect(humaniseScopeLeaf('trailing_')).toBe('Trailing')
+    expect(humaniseScopeLeaf('double__sep')).toBe('Double Sep')
+    expect(humaniseScopeLeaf('')).toBe('')
+  })
+})
+
+describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() => {
     vi.clearAllMocks()
     ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   it('shows the standalone "no enterprise policy" state when has_policy is false', async () => {
@@ -328,6 +644,53 @@ describe('SecurityPanel — governance policy viewer', () => {
     ).toBeInTheDocument()
     // No governed rows are rendered in standalone mode.
     expect(screen.queryByText('policy ∩ profile')).not.toBeInTheDocument()
+  })
+
+  it('humanises the label of a companion-registered scope the core has no key for', async () => {
+    // A scope registered through `register_scope` by an edition reaches this panel
+    // (the snapshot endpoint iterates SCOPE_CATALOG) but can never have an i18n
+    // key, because the core does not know it exists. Governed-scope leaves are
+    // snake_case, so the raw fallback rendered `External_access` mid-panel.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        scopes: [
+          {
+            scope: 'capabilities.external_access',
+            archetype: 'capability',
+            governed: true,
+            source: 'policy',
+            detail: { enabled: true, inner: { registry_hosts: { mode: 'allow', allow_count: 2, deny_count: 0 } } },
+          },
+        ],
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('External Access')).toBeInTheDocument()
+    expect(screen.queryByText('External_access')).not.toBeInTheDocument()
+  })
+
+  it('names a pinned social-share ceiling after the menu entry it withdraws', async () => {
+    // A user whose "Share as image" entry vanished reads THIS row to learn why;
+    // the humanised leaf ("Social Share") would not connect to the feature they
+    // lost, and would render in English in every locale.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        scopes: [
+          {
+            scope: 'capabilities.social_share',
+            archetype: 'capability',
+            governed: true,
+            source: 'policy',
+            detail: { enabled: false, inner: {} },
+          },
+        ],
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Share as image')).toBeInTheDocument()
+    expect(screen.queryByText('Social Share')).not.toBeInTheDocument()
   })
 
   it('renders governed + ungoverned rows with effective state and source', async () => {
@@ -437,6 +800,293 @@ describe('SecurityPanel — governance policy viewer', () => {
       screen.queryByText(/A surface with its own profile can allow what the host cannot/),
     ).not.toBeInTheDocument()
   })
+
+  it('shows a warning banner naming the unusable profiles', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['host'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
+    expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
+    // The remedy is only useful if it says WHERE the file is.
+    expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
+    // Causes and the restart caveat live on the demoted line, not in the body.
+    expect(screen.getByText(/extends a profile that is missing/)).toBeInTheDocument()
+  })
+
+  it('names every unusable profile, not just the host one', async () => {
+    // The reason the contract is a list: a broken sibling surface deny-alls
+    // itself just as silently, and a host-only boolean could not report it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['cron', 'subagent'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/Affected: cron, subagent\./)).toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is empty', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: [] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('lists unknown companion scopes per affected profile', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        unknown_profile_scopes: {
+          host: ['capabilities.board', 'capabilities.channels'],
+          cron: ['capabilities.board'],
+        },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    // One row per profile stem, each naming its own skipped scopes.
+    expect(screen.getByText('host')).toBeInTheDocument()
+    expect(screen.getByText('cron')).toBeInTheDocument()
+    // Joined via fmtList (Intl.ListFormat unit type), same contract as the
+    // fallback banner: en joins with ', ', zh with 、 and no spaces.
+    expect(screen.getByText('capabilities.board, capabilities.channels')).toBeInTheDocument()
+    // Rows are sorted with compareText: the fixture feeds insertion order
+    // host→cron, so an unsorted render would show host first. Node.compareDocumentPosition
+    // pins the DOM order the comparator produces.
+    const cron = screen.getByText('cron')
+    const host = screen.getByText('host')
+    expect(cron.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // The explanation is a tooltip, not body copy: it must NOT be in the
+    // document until the InfoTip is opened.
+    expect(screen.queryByText(/companion edition/)).not.toBeInTheDocument()
+  })
+
+  it('explains companion scopes in the InfoTip on demand', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    const block = (await screen.findByText('Profile scopes not in this build')).parentElement!
+    fireEvent.click(within(block).getByRole('button', { name: /more information/i }))
+    expect(
+      await screen.findByText(/this build does not register.*no effect in this build/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders unknown scopes stacked with the fallback banner they are siblings of', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        fallback_profiles: ['cron'],
+        unknown_profile_scopes: { host: ['capabilities.board'] },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // Both sibling diagnostics render together — one must not suppress the other.
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText('Profile scopes not in this build')).toBeInTheDocument()
+  })
+
+  it('shows unknown scopes even with no policy and no host profile', async () => {
+    // The payload aggregates EVERY loaded profile, so a standalone install with
+    // only a companion-edition subagent.json is a valid producer state. The
+    // no-policy card must yield to the diagnostic rather than swallow it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ unknown_profile_scopes: { subagent: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    expect(screen.getByText('subagent')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is an empty object', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: {} }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no row for a profile whose scope list is empty', async () => {
+    // The producer contract says an empty list cannot happen; the filter makes
+    // the UI true independent of it — no badge with nothing after it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: [] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+})
+
+describe('SecurityPanel — central policy distribution', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
+    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
+  })
+
+  it('reports the transport, the poller, the cache age and the last refresh', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ distribution: govDistribution() }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    // The SCHEME, never the URL: the producer withholds the endpoint, so a test that
+    // ever finds one here is reporting a leak of the fleet's control plane.
+    expect(screen.getByText('Source: https')).toBeInTheDocument()
+    // Durations go through fmtDuration, so assert the copy plus the magnitude rather
+    // than a unit spelling that is locale-owned.
+    expect(screen.getByText(/Refreshed every/).textContent).toMatch(/15/)
+    expect(screen.getByText(/Cached copy is/).textContent).toMatch(/2/)
+    expect(screen.getByText('Last refresh found no change')).toBeInTheDocument()
+    // A governed host has its ceiling, so the pending caveat must stay off.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  // The trap this block exists to close: `has_policy: false` + `profile: null` is
+  // BOTH "standalone, nothing governs this machine" and "centrally governed, the
+  // first fetch has not landed". Rendering the reassuring card for the second is
+  // telling an operator their ceiling is off when it is merely late.
+  it('does not claim "no enterprise policy" on a host whose first fetch has not landed', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        distribution: govDistribution({
+          cache_present: false,
+          cache_age_seconds: null,
+          last_refresh_status: '',
+          last_refresh_age_seconds: null,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/enterprise ceiling restricts the host surface/)).toBeInTheDocument()
+    // Not merely supplemented — the reassurance must be GONE.
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // And the scope rows render in its place, so the page still says what is enforced.
+    expect(screen.getAllByText('Not restricted').length).toBeGreaterThan(0)
+  })
+
+  it('names the cache age when the copy is days old', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({
+          cache_age_seconds: 3 * 86400,
+          last_refresh_status: 'unreachable',
+          last_refresh_age_seconds: 60,
+        }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // dropZero is what keeps three days from rendering as "3d 0h 0m".
+    const cache = await screen.findByText(/Cached copy is/)
+    expect(cache.textContent).toMatch(/3\s* ?d/)
+    expect(cache.textContent).not.toMatch(/0/)
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+  })
+
+  it('reports a misconfigured declaration even though it is not "configured"', async () => {
+    // The producer answers `configured: false` with an error code: the fleet DID
+    // point this host somewhere, the pins just do not parse. Gating the block on
+    // `configured` alone would drop the one state that most needs saying.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false, error_code: 'misconfigured' } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Distribution settings could not be read')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+    // Nothing is known about the transport or the cache, so no badge claims one.
+    expect(screen.queryByText(/Source:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Cached copy/)).not.toBeInTheDocument()
+  })
+
+  it('survives the unavailable short-circuit that hides every other governance fact', async () => {
+    // `unavailable` collapses the whole viewer to one soft notice, but the fail-safe
+    // snapshot still carries the distribution posture — and a stopped poller plus an
+    // unreachable source is exactly what an operator needs at that moment.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({
+        unavailable: true,
+        distribution: govDistribution({ refresher_running: false, last_refresh_status: 'unreachable' }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText(/Governance status is temporarily unavailable/)).toBeInTheDocument()
+    expect(screen.getByText('Central policy distribution')).toBeInTheDocument()
+    expect(screen.getByText(/Background refresh is not running/)).toBeInTheDocument()
+    expect(screen.getByText('Source was unreachable on the last refresh')).toBeInTheDocument()
+    // The pending caveat must NOT fire here: the fail-safe snapshot reports
+    // `has_policy: false` because it could not resolve the ceiling, not because there
+    // is none, so reading it as pending would announce an unrestricted host surface on
+    // a machine whose ceiling is installed and enforcing.
+    expect(screen.queryByText(/enterprise ceiling restricts the host surface/)).not.toBeInTheDocument()
+  })
+
+  it('says a boot-only fetch is boot-only rather than calling the poller stopped', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        distribution: govDistribution({ refresh_interval_seconds: 0, refresher_running: false }),
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fetched at startup only')).toBeInTheDocument()
+    expect(screen.queryByText('Background refresh is not running')).not.toBeInTheDocument()
+  })
+
+  it('renders no block, and no empty section, when the payload omits distribution', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
+  })
+
+  it('renders no block when a build without the feature reports configured: false', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ distribution: { configured: false } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('No enterprise policy in effect')).toBeInTheDocument()
+    expect(screen.queryByText('Central policy distribution')).not.toBeInTheDocument()
+  })
 })
 
 describe('SecurityPanel — posture disclosure', () => {
@@ -446,6 +1096,8 @@ describe('SecurityPanel — posture disclosure', () => {
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   it('renders a pill per control using the server-derived count and unit', async () => {
@@ -719,105 +1371,321 @@ describe('SecurityPanel — posture disclosure', () => {
  *      showing "on" for a value the gate rejects would tell the user their
  *      apps are admitted when every execution decision still denies them.
  */
-describe('SecurityPanel — third-party app execution', () => {
-  const TITLE = 'Let third-party apps run their own code'
 
+describe('SecurityPanel — trusted third-party apps', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
-    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
-    ;(api.patchConfig as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true })
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(trusted())
+    ;(api.setTrustAllApps as ReturnType<typeof vi.fn>).mockResolvedValue(trusted({ allowAll: true }))
+    ;(api.untrustApp as ReturnType<typeof vi.fn>).mockResolvedValue({
+      apps: ['oncall-radar'],
+      ineffective: [],
+      allowAll: false,
+      disabled: false,
+    })
   })
 
-  /** Render with a given `agent.apps_allow_third_party` value on the config read.
-   *
-   *  The card renders before that read resolves, and the Toggle is `disabled`
-   *  while loading — so a click landing in that window is silently swallowed by
-   *  the component's own `!disabled &&` guard. Wait for the loaded state before
-   *  handing the switch back, or every interaction test races the query.
-   */
-  async function renderWithFlag(value: unknown) {
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
-      agent: { apps_allow_third_party: value },
+  it('renders one row per granted app, each with a trusted badge and a Revoke action', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    expect(within(row).getByText('launchdarkly')).toBeInTheDocument()
+    expect(within(row).getByText(T.trustedBadge())).toBeInTheDocument()
+    expect(within(row).getByRole('button', { name: T.revoke() })).toBeInTheDocument()
+    // Both grants render — the list is not truncated to the first.
+    expect(screen.getByTestId('trusted-app-oncall-radar')).toBeInTheDocument()
+    // With grants present, the empty state must NOT also be on screen.
+    expect(screen.queryByText(T.empty())).not.toBeInTheDocument()
+  })
+
+  it('Revoke confirms BEFORE mutating — the app stops working, so say so first', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+
+    // Nothing is revoked on the first click: a first-run reviewer flagged
+    // discovering "this also disables the app" AFTER the click as a blocker.
+    expect(api.untrustApp).not.toHaveBeenCalled()
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(T.revokeConfirmBody('launchdarkly'))).toBeInTheDocument()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: T.revokeConfirmOk() }))
+    await waitFor(() => expect(api.untrustApp).toHaveBeenCalledWith('launchdarkly'))
+  })
+
+  it('Revoke needs no acknowledgement checkbox — it tightens, not weakens', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+
+    const dialog = await screen.findByRole('dialog')
+    // Demanding "I understand this weakens protection" for the SAFE direction
+    // trains people to tick without reading, which is what makes the checkbox
+    // worthless on the dangerous direction (allow-all).
+    expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: T.revokeConfirmOk() })).toBeEnabled()
+  })
+
+  it('cancelling the revoke confirm mutates nothing', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: T.cancel() }))
+
+    expect(api.untrustApp).not.toHaveBeenCalled()
+  })
+
+  it('surfaces the also-disabled notice when the revoke response says disabled', async () => {
+    ;(api.untrustApp as ReturnType<typeof vi.fn>).mockResolvedValue({
+      apps: ['oncall-radar'],
+      ineffective: [],
+      allowAll: false,
+      disabled: true,
     })
     renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
-    const sw = await screen.findByRole('switch', { name: TITLE })
-    await waitFor(() => expect(sw).not.toHaveAttribute('aria-disabled'))
-    return sw
-  }
 
-  it('is off when the flag is absent, and shows no blanket-trust warning', async () => {
-    const sw = await renderWithFlag(undefined)
-    expect(sw).toHaveAttribute('aria-checked', 'false')
-    expect(screen.queryByText(/trusts every third-party app/i)).not.toBeInTheDocument()
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    // The notice is a consequence of the response, so it is absent beforehand.
+    expect(screen.queryByText(T.revokeDisables('launchdarkly'))).not.toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: T.revokeConfirmOk() }))
+
+    expect(await screen.findByText(T.revokeDisables('launchdarkly'))).toBeInTheDocument()
   })
 
-  it('turning it on writes the literal JSON boolean, not a string', async () => {
-    const sw = await renderWithFlag(false)
-    fireEvent.click(sw)
-
-    await waitFor(() =>
-      expect(api.patchConfig).toHaveBeenCalledWith('agent.apps_allow_third_party', true),
-    )
-    // Identity, not coercion: `'true'` would satisfy a loose assertion but is
-    // rejected by the backend gate.
-    const [, written] = (api.patchConfig as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(written).toBe(true)
-    expect(typeof written).toBe('boolean')
-  })
-
-  it('renders the blanket-trust warning while it is on', async () => {
-    const sw = await renderWithFlag(true)
-    expect(sw).toHaveAttribute('aria-checked', 'true')
-    expect(screen.getByText(/trusts every third-party app/i)).toBeInTheDocument()
-  })
-
-  it('a truthy non-boolean config value renders OFF, matching the backend gate', async () => {
-    // `third_party_execution_allowed()` compares with `is True`, so a
-    // hand-edited "true" / 1 in config.json grants nothing. The UI must agree.
-    for (const value of ['true', 1, 'yes']) {
-      const sw = await renderWithFlag(value)
-      expect(sw).toHaveAttribute('aria-checked', 'false')
-      cleanup()
-    }
-  })
-
-  it('turning it back off writes false', async () => {
-    const sw = await renderWithFlag(true)
-    fireEvent.click(sw)
-
-    await waitFor(() =>
-      expect(api.patchConfig).toHaveBeenCalledWith('agent.apps_allow_third_party', false),
-    )
-  })
-
-  /* A FAILED config read must not be reported as "off".
-   *
-   * The persisted value may be `true`, in which case treating an unreadable
-   * read as false is wrong twice: the blanket-trust warning disappears while
-   * third-party code is still admitted, and the switch — sitting at OFF —
-   * would write `true` on click, so an ACTIVE grant could never be revoked
-   * from this panel.
-   *
-   * Disabling the switch fixes the write but NOT the claim: `role="switch"`
-   * carries aria-checked true/false and nothing else (ARIA has no "unknown"
-   * for it — `mixed` is checkbox-only), so a rendered switch still tells a
-   * screen-reader user "not checked". So the switch must be ABSENT here, and
-   * this test asserts absence rather than a disabled state — asserting only
-   * `aria-disabled` would pass while the false OFF assertion remained.
-   */
-  it('a failed config read renders no switch at all and says the value is unknown', async () => {
-    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
+  it('does NOT surface the also-disabled notice when disabled is false', async () => {
+    // Revoking trust on an already-disabled app changes nothing about whether it
+    // runs, so claiming "we also disabled it" would be a false statement.
     renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
 
+    const row = await screen.findByTestId('trusted-app-launchdarkly')
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: T.revokeConfirmOk() }))
+
+    await waitFor(() => expect(api.untrustApp).toHaveBeenCalledWith('launchdarkly'))
+    expect(screen.queryByText(T.revokeDisables('launchdarkly'))).not.toBeInTheDocument()
+  })
+
+  it('turning allow-all ON requires the acknowledgement before it mutates', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    // Wait for the snapshot to land before clicking: the toggle is rendered
+    // (and findable) while `listTrustedApps` is still in flight, but DISABLED
+    // until it resolves, so an early click is silently swallowed.
+    await screen.findByTestId('trusted-app-launchdarkly')
+    const toggle = screen.getByRole('switch', { name: T.allowAllLabel() })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(toggle)
+    // Widening what un-reviewed third-party code may do must not be one click.
+    expect(api.setTrustAllApps).not.toHaveBeenCalled()
+
+    const dialog = await screen.findByRole('dialog')
+    const confirmBtn = within(dialog).getByRole('button', { name: T.confirmBtn() })
+    expect(confirmBtn).toBeDisabled()
+    // Clicking while un-acked is a no-op.
+    fireEvent.click(confirmBtn)
+    expect(api.setTrustAllApps).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByLabelText(T.allowAllAck()))
+    fireEvent.click(within(dialog).getByRole('button', { name: T.confirmBtn() }))
+    await waitFor(() => expect(api.setTrustAllApps).toHaveBeenCalledWith(true))
+  })
+
+  it('turning allow-all OFF is immediate (no modal)', async () => {
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(trusted({ allowAll: true }))
+    ;(api.setTrustAllApps as ReturnType<typeof vi.fn>).mockResolvedValue(trusted({ allowAll: false }))
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    await screen.findByTestId('trusted-app-launchdarkly')
+    const toggle = screen.getByRole('switch', { name: T.allowAllLabel() })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(toggle)
+
+    await waitFor(() => expect(api.setTrustAllApps).toHaveBeenCalledWith(false))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('renders the empty state when no app is granted', async () => {
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(trusted({ apps: [] }))
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    expect(await screen.findByText(T.empty())).toBeInTheDocument()
+    expect(screen.queryByText(T.trustedBadge())).not.toBeInTheDocument()
+    // The allow-all lever is still offered with zero grants.
+    expect(screen.getByRole('switch', { name: T.allowAllLabel() })).toBeInTheDocument()
+  })
+
+  /**
+   * Stored-but-unenforced grants.
+   *
+   * `trusted_app_names` (the enforcement reader) requires the app-name charset,
+   * so a hand-edited config.json can hold entries the gate silently ignores.
+   * Folding them into the granted list claimed trust that does not exist and
+   * left the user no way to see why their app was still blocked.
+   */
+  it('renders ineffective entries in their own group, distinct from real grants', async () => {
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(
+      trusted({ ineffective: INEFFECTIVE }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const group = await screen.findByTestId('trusted-apps-ineffective')
+    // The group says what these entries are and why they do nothing.
+    expect(within(group).getByText(T.ineffectiveLabel())).toBeInTheDocument()
+    expect(within(group).getByText(T.ineffectiveDescription())).toBeInTheDocument()
+
+    for (const name of INEFFECTIVE) {
+      const row = within(group).getByTestId(`ineffective-app-${name}`)
+      expect(within(row).getByText(name)).toBeInTheDocument()
+      // Visually distinguished from an effective grant: struck through, and
+      // WITHOUT the "trusted" badge that marks an enforced grant.
+      expect(row.querySelector('code')).toHaveClass('line-through')
+      expect(within(row).queryByText(T.trustedBadge())).not.toBeInTheDocument()
+    }
+
+    // An effective grant stays in the granted list, outside this group, and keeps
+    // its badge — the two populations never merge.
+    const granted = screen.getByTestId('trusted-app-launchdarkly')
+    expect(group.contains(granted)).toBe(false)
+    expect(within(granted).getByText(T.trustedBadge())).toBeInTheDocument()
+    expect(granted.querySelector('code')).not.toHaveClass('line-through')
+  })
+
+  it('Revoke works on an ineffective entry — junk can be cleared out', async () => {
+    // The revoke endpoint deliberately does NOT validate the name being removed,
+    // precisely so an entry that can never be granted can still be deleted.
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(
+      trusted({ ineffective: INEFFECTIVE }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    const row = await screen.findByTestId('ineffective-app-LD-App')
+    fireEvent.click(within(row).getByRole('button', { name: T.revoke() }))
+
+    await waitFor(() => expect(api.untrustApp).toHaveBeenCalledWith('LD-App'))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('omits the ineffective group entirely when every stored entry is enforced', async () => {
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    await screen.findByTestId('trusted-app-launchdarkly')
+    expect(screen.queryByTestId('trusted-apps-ineffective')).not.toBeInTheDocument()
+    expect(screen.queryByText(T.ineffectiveLabel())).not.toBeInTheDocument()
+  })
+
+  it('shows the ineffective group even when no grant is effective', async () => {
+    // `apps: []` with junk stored is the exact case the split exists for: the
+    // empty state is TRUE (nothing is trusted) and the group explains the entries
+    // the user can see in their config.
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue(
+      trusted({ apps: [], ineffective: INEFFECTIVE }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    expect(await screen.findByText(T.empty())).toBeInTheDocument()
+    const group = screen.getByTestId('trusted-apps-ineffective')
+    expect(within(group).getByTestId('ineffective-app-LD-App')).toBeInTheDocument()
+  })
+
+  it('the allow-all row carries a data-setting-label so the App Store can deep-link it', async () => {
+    // `?tab=security&highlight=<id>` resolves an id to a LABEL via SETTINGS_REGISTRY
+    // and finds the row by this attribute (see hooks/useSettingHighlight.ts). Without
+    // it the link lands on the tab and highlights nothing.
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+
+    await screen.findByRole('switch', { name: T.allowAllLabel() })
+    expect(
+      document.querySelector(`[data-setting-label="${T.allowAllLabel()}"]`),
+    ).not.toBeNull()
+  })
+})
+
+describe('trustFailureMessage', () => {
+  // REGRESSION: both new 409s carry the only actionable detail in the body's
+  // `error` — which file to edit (`config.local.json` owns the setting) or which
+  // apps are still executing after trust was withdrawn. Collapsing them into a
+  // generic message would put the UI back to reporting a change that did not
+  // happen as though it had.
+  it('prefers the backend detail over the mapped status message', () => {
+    const err = new ApiError(
+      409,
+      'Conflict',
+      JSON.stringify({
+        error: 'apps_trusted is set in /home/u/.kiro/crew/config.local.json',
+        code: 'trust_setting_overlay_owned',
+      }),
+    )
+    expect(trustFailureMessage(err)).toContain('config.local.json')
+  })
+
+  it('falls back to the mapped message when the body is not JSON', () => {
+    expect(trustFailureMessage(new ApiError(500, 'Server error', '<html>502</html>')))
+      .toBe('Server error')
+  })
+
+  it('handles a non-ApiError rejection without throwing', () => {
+    expect(trustFailureMessage(new Error('network down'))).toBe('network down')
+    expect(trustFailureMessage('nope')).toBe('unknown error')
+  })
+})
+
+/* ── Properties inherited from the standalone card #1414 added ───────────────
+ * That card owned `agent.apps_allow_third_party` through the generic config
+ * PATCH, which performs no teardown — switching it off left every app it had
+ * admitted still executing. The two controls were consolidated into the one
+ * wired to `PUT /api/security/trusted-apps/allow-all`, which sweeps. These pin
+ * the properties worth carrying over, so the consolidation cannot quietly lose
+ * them.
+ */
+describe('SecurityPanel — allow-all toggle inherits #1414 semantics', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue(snapshot())
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
+    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
+  })
+
+  it('shows the blanket-trust warning only while allow-all is on', async () => {
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue({
+      apps: [], ineffective: [], allowAll: true,
+    })
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+    // The cost of the blanket flag — every third-party app, including future
+    // installs — must be stated where the switch is, not left implicit.
+    expect(await screen.findByText(/trusts every third-party app/i)).toBeInTheDocument()
+  })
+
+  it('a truthy non-boolean allowAll renders OFF, matching the backend gate', async () => {
+    // `third_party_execution_allowed()` admits ONLY the literal boolean by
+    // identity, so a hand-edited "true" grants nothing. Rendering it as ON would
+    // tell the user their apps are admitted while every decision still denies.
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockResolvedValue({
+      apps: [], ineffective: [], allowAll: 'true' as unknown as boolean,
+    })
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
+    const sw = await screen.findByRole('switch', { name: /trust every third-party app/i })
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('a FAILED trusted-apps read renders no switch and says so', async () => {
+    // UNKNOWN is not OFF. `role="switch"` has no unknown state (aria-checked
+    // `mixed` is checkbox-only), so a switch here would assert a state we could
+    // not read — and a click would write `true` onto a possibly-already-true
+    // setting instead of revoking it.
+    ;(api.listTrustedApps as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
+    renderWithProviders(<SecurityPanel />, { route: '/?section=apps' })
     expect(await screen.findByText(/could not read the current setting/i)).toBeInTheDocument()
-    // No switch => no aria-checked => no assertion about a value we never read.
-    expect(screen.queryByRole('switch', { name: TITLE })).not.toBeInTheDocument()
-    // Never claim the grant is active either.
-    expect(screen.queryByText(/trusts every third-party app/i)).not.toBeInTheDocument()
-    // And nothing can overwrite the unknown value.
-    expect(api.patchConfig).not.toHaveBeenCalled()
+    expect(screen.queryByRole('switch', { name: /trust every third-party app/i })).toBeNull()
   })
 })
 
@@ -828,6 +1696,8 @@ describe('SecurityPanel — inspector rail', () => {
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   /** Every rail row, in DOM order. */
@@ -849,7 +1719,9 @@ describe('SecurityPanel — inspector rail', () => {
       expect.stringContaining('Live Security Posture'),
       expect.stringContaining('YOLO (auto-approve)'),
       expect.stringContaining('Denied Commands'),
+      expect.stringContaining('Tailnet origin'),
       expect.stringContaining('Third-party apps'),
+      expect.stringContaining('Flagged-file delivery'),
       expect.stringContaining('Defense-in-Depth Architecture'),
       expect.stringContaining('Governance Policy'),
       expect.stringContaining('Documentation'),
@@ -883,7 +1755,7 @@ describe('SecurityPanel — inspector rail', () => {
     expect(screen.queryByText('30 credential paths')).not.toBeInTheDocument()
     // ...and the choice is a deep link, so the section survives a reload and can
     // be targeted by a command-palette result.
-    expect(screen.getByTestId('search')).toHaveTextContent('section=rules')
+    expect(screen.getByTestId('search')).toHaveTextContent('sub=rules')
   })
 
   it('an unreadable third-party-apps value gets NO rail summary, rather than reading "Off"', async () => {
@@ -901,15 +1773,89 @@ describe('SecurityPanel — inspector rail', () => {
     })
   })
 
-  it('summarises an ACTIVE auto-approve grant, not the configured duration', async () => {
-    // The state that is currently weakening the install outranks the setting.
+  it('summarises an active grant by WHEN IT ENDS, not by repeating the label', async () => {
+    // The state that is currently weakening the install outranks the setting —
+    // but echoing the section's own label made the rail's most important row
+    // read "YOLO (auto-approve)" twice, stacked. The expiry is the useful fact.
     const store = createTestStore({
-      dashboard: { status: { yolo: true } } as never,
+      dashboard: { status: { yolo: true, yolo_until_shutdown: true } } as never,
     })
     renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
 
+    const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
+    expect(row).toHaveTextContent('Until restart')
+    // The label appears once, not twice.
+    expect(row.textContent!.match(/YOLO \(auto-approve\)/g)).toHaveLength(1)
+  })
+
+  it('falls back to a bare active marker when no expiry is known', async () => {
+    const store = createTestStore({ dashboard: { status: { yolo: true } } as never })
+    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
+
     expect(screen.getByRole('option', { name: /YOLO \(auto-approve\)/ }))
-      .toHaveTextContent('YOLO (auto-approve)')
+      .toHaveTextContent('Active now')
+  })
+
+  it('falls back to the active marker rather than "Until —" for an unparseable expiry', async () => {
+    // The backend sends ISO-or-empty, so this guards the field's shape rather
+    // than a live path: formatting an unparseable value yields an em-dash
+    // placeholder, and "Until —" would assert a live grant while withholding
+    // the expiry that makes the assertion actionable.
+    const store = createTestStore({
+      dashboard: { status: { yolo: true, yolo_expires_at: 'not-a-timestamp' } } as never,
+    })
+    renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
+
+    const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
+    expect(row).toHaveTextContent('Active now')
+    expect(row).not.toHaveTextContent('—')
+  })
+
+  it('shows a same-day expiry as a bare clock time, without seconds', async () => {
+    // The row is an 11px line that truncates, so "11:40:00 AM" spends three
+    // characters on precision no reader acts on. Clock pinned so the assertion
+    // does not depend on the day the suite happens to run.
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-07T12:00:00Z'))
+    try {
+      const store = createTestStore({
+        dashboard: {
+          status: { yolo: true, yolo_expires_at: '2026-08-07T18:40:00Z' },
+        } as never,
+      })
+      renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
+
+      const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
+      expect(row).toHaveTextContent('Until 6:40 PM')
+      expect(row).not.toHaveTextContent('6:40:00')
+      // The label still appears once, not twice.
+      expect(row.textContent!.match(/YOLO \(auto-approve\)/g)).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('names the day when the expiry is not today, so it cannot read as already past', async () => {
+    // The offered durations reach 24h. A bare "Until 8:00 AM" on a grant that
+    // ends tomorrow morning reads as a time already gone by — on a security row
+    // that means believing a live grant has expired.
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-07T20:00:00Z'))
+    try {
+      const store = createTestStore({
+        dashboard: {
+          status: { yolo: true, yolo_expires_at: '2026-08-08T08:00:00Z' },
+        } as never,
+      })
+      renderWithProviders(<SecurityPanel />, { route: '/?section=posture', store })
+
+      const row = screen.getByRole('option', { name: /YOLO \(auto-approve\)/ })
+      // Saturday 2026-08-08 — the weekday disambiguates it from today.
+      expect(row).toHaveTextContent('Sat')
+      expect(row).toHaveTextContent('8:00 AM')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -920,6 +1866,8 @@ describe('SecurityPanel — rule search', () => {
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   const SEARCH = 'Search rules, patterns, categories…'
@@ -955,6 +1903,51 @@ describe('SecurityPanel — rule search', () => {
 
     expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
     expect(screen.getByLabelText(PINNED_DESC)).toBeInTheDocument()
+  })
+
+  it('the raw category KEY matches the whole category (aws-destructive)', async () => {
+    // The display label is "Aws Destructive"; the id-shaped spelling users copy
+    // from config and audit logs is `aws-destructive`. Both must land.
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive' } })
+
+    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
+    expect(screen.getByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.getByText(/2 \/ 2 rules/)).toBeInTheDocument()
+  })
+
+  it('a full rule id matches exactly that rule', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive-ec2-terminate-instances' } })
+
+    expect(await screen.findByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
+  })
+
+  it('a dotted <category>.<slug> id spelling matches the same rule', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'aws-destructive.ec2-terminate-instances' } })
+
+    expect(await screen.findByLabelText(PINNED_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(TOGGLE_DESC)).not.toBeInTheDocument()
+  })
+
+  it('an id fragment matches every rule whose id contains it', async () => {
+    // `cfn-delete-stack` appears only in the id: the description says
+    // "CloudFormation" and the pattern says "cloudformation", neither "cfn".
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'cfn-delete' } })
+
+    expect(await screen.findByLabelText(TOGGLE_DESC)).toBeInTheDocument()
+    expect(screen.queryByLabelText(PINNED_DESC)).not.toBeInTheDocument()
+  })
+
+  it('custom patterns match on their id too', async () => {
+    const box = await renderRules()
+    fireEvent.change(box, { target: { value: 'user-2' } })
+
+    expect(await screen.findByText(NOTED_PATTERN)).toBeInTheDocument()
+    expect(screen.queryByText(USER_PATTERN)).not.toBeInTheDocument()
   })
 
   it('the category badge keeps the SHIPPED denominator while filtered', async () => {
@@ -1014,6 +2007,8 @@ describe('SecurityPanel — review-round regressions', () => {
     ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govNoPolicy())
     ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue(posture())
     ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue(TAILNET_OFF)
+    ;(api.fileDeliveryConsent as ReturnType<typeof vi.fn>).mockResolvedValue(CONSENT_NONE)
   })
 
   const SEARCH = 'Search rules, patterns, categories…'

@@ -9,7 +9,7 @@ and is never stored here.
 Two persisted hints support lazy reconnect on gateway restart:
 
 * per-instance ``was_connected`` — whether the instance had an open tunnel when
-  it was last touched, used to render "disconnected — click to reconnect".
+  it was last touched; renders "disconnected — click to reconnect".
 * top-level ``last_active_id`` — the single instance to auto-revive on startup
   (startup opens *no* other tunnels, avoiding a stale-credential ssh herd).
 
@@ -39,7 +39,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import _DEFAULT_PORT, config_dir
+from kiro_crew.instances.constants import TTL_PATTERN
+from kiro_crew.instances.validation import _AWS_PROFILE_RE as _validation_aws_profile_re
+from kiro_crew.instances.validation import split_ecs_target, ssm_target_matches
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -51,44 +55,78 @@ _FILENAME = "instances.json"
 
 # Instance id: slug-like, what the URL/switcher key uses. Kept conservative so
 # it is safe as a dict key, a query param, and a filename component.
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 
 # ssh_host / remote_bin light charset guard (early reject only — the real
 # injection-safe validation lives in the tunnel manager, Stage 4). Allows
 # hostnames, FQDNs, ssh config aliases, user@host, and absolute bin paths.
-_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9._@\-]{1,255}$")
-_REMOTE_BIN_RE = re.compile(r"^[A-Za-z0-9._/~\- ]{0,512}$")
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9._@\-]{1,255}\Z")
+_REMOTE_BIN_RE = re.compile(r"^[A-Za-z0-9._/~\- ]{0,512}\Z")
 
-# ssm_target: an EC2 instance id (i-<17 hex>) or an SSM managed-instance id
-# (mi-<17 hex>); early reject only, mirroring the ssh_host guard above — the
+# ssm_target: an EC2 instance id (i-<hex>), an SSM managed-instance id
+# (mi-<hex>), or an ECS task target (ecs:<cluster>_<taskId>_<runtimeId>) for the
+# Fargate lane; early reject only, mirroring the ssh_host guard above — the
 # authoritative validation lives with the tunnel manager (validation.py).
-_SSM_TARGET_RE = re.compile(r"^(i|mi)-[a-f0-9]{8,17}$")
+#
+# The shape is NOT re-spelled here. A per-module copy of the same security charset
+# lets one lane be widened while the other goes on refusing the value, so the
+# decision lives in validation.ssm_target_matches and is imported, the same seam
+# _AWS_PROFILE_RE uses below.
 # aws_profile: named profile in ~/.aws/config; conservative charset, no shell
-# metacharacters. Empty string means "default credential chain".
-_AWS_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,128}$")
+# metacharacters ('+' is legal: IAM entity names permit it, and SSO-derived
+# profiles use "<account>+<permission-set>"). Single source of truth lives in
+# validation.py; the empty "default credential chain" value is handled by the
+# `if self.aws_profile` guard at the check site rather than by the pattern.
+_AWS_PROFILE_RE = _validation_aws_profile_re
 # aws_region: standard AWS region shape (e.g. us-east-1, eu-west-2). Empty
 # string means "use the profile's/environment's default region".
-_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}$|^$")
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}\Z|^\Z")
 # ssm_run_as: the remote POSIX user that SSM commands are wrapped in
 # (``sudo -u <user> -i``). Unix username shape, matching the charset
 # cloud.ssm.run_command validates at the chokepoint. Defaults to the
 # launcher-provisioned AL2023 user; an Ubuntu AMI needs "ubuntu".
-_SSM_RUN_AS_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+_SSM_RUN_AS_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
+# Shared with both token minters (see constants.TTL_PATTERN).
+_TTL_RE = re.compile(TTL_PATTERN)
 _DEFAULT_SSM_RUN_AS = "ec2-user"
 
-_DEFAULT_REMOTE_PORT = 7777
+# The port a stock gateway binds, so "add a remote that has not been
+# reconfigured" needs no edit. NOT a second definition of the number:
+# ``config/loader.py`` owns it per docs/system-specs/common/code-style.md, which
+# names that module as the single owner of the dashboard port and cites
+# ``dashboard/origin.py`` importing it rather than restating it. This is the same
+# re-export seam, giving the value a name that says what it means HERE (the
+# REMOTE's port, not ours).
+#
+# The local forward does not mirror this value: mirroring would pre-fill the port
+# a stock remote actually binds and land the user on a guaranteed local-port
+# collision.
+DEFAULT_REMOTE_PORT = _DEFAULT_PORT
 _DEFAULT_TTL = "20h"
 
 # Supported connection transports. "ssh" is the original/default transport
 # (ssh -N -L); "ssm" tunnels over AWS Systems Manager Session Manager
 # (aws ssm start-session --document-name AWS-StartPortForwardingSession),
 # needing no inbound SSH port and no SSH key — only IAM + the SSM agent.
-CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm")
+# "fargate" is the same SSM port-forward aimed at an ECS task
+# (``ssm_target`` = ``ecs:<cluster>_<task-id>_<runtime-id>``) whose only listener
+# is the crew container's turn API: no dashboard, no token to mint, and nothing
+# to run ``kirocrew`` on, so the tunnel manager forwards and does nothing else.
+CONNECTION_METHODS: tuple[str, ...] = ("ssh", "ssm", "fargate")
 _DEFAULT_CONNECTION_METHOD = "ssh"
+# The methods whose forwarder is ``aws ssm start-session``; they share the
+# ``ssm_target`` / ``aws_profile`` / ``aws_region`` coordinates.
+SSM_TRANSPORT_METHODS: frozenset[str] = frozenset({"ssm", "fargate"})
 
 # ``local_port == 0`` is the sentinel for "not yet allocated" — the port
 # allocator (Stage 3) assigns a real port at connect time.
 _UNALLOCATED_PORT = 0
+
+# ``forwarder_pid == 0`` is the sentinel for "no forwarder child recorded".
+# Connect records the spawned tunnel child's pid so a forwarder orphaned by a
+# gateway hard-kill can later be reclaimed by identity (its own pid) instead of
+# a process-table match; disconnect resets it together with ``local_port``.
+_NO_FORWARDER_PID = 0
 
 
 class InstancesError(Exception):
@@ -111,7 +149,23 @@ def _slugify(name: str) -> str:
     """Derive a slug-like id from a human name (lowercase, hyphen-separated)."""
     slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     slug = slug[:63]
-    return slug or "instance"
+    return slug or slug_hash_fallback(name, "instance")
+
+
+def validate_ttl(ttl: str) -> None:
+    """Reject a ttl the token minters would refuse.
+
+    Checked where a ttl is WRITTEN rather than in :meth:`Instance.validate`, so a
+    legacy record whose stored ttl predates this rule keeps working: its hint
+    writes (``was_connected`` / ``local_port`` from connect and disconnect) go
+    through ``update()`` too, and failing those would break the teardown path
+    over a field the caller never touched.
+    """
+    if not _TTL_RE.match(ttl):
+        raise InvalidInstanceError(
+            f"invalid ttl {ttl!r}: expected a positive integer of at most four "
+            f"digits followed by 'h' or 'm' (e.g. 20h, 30m)"
+        )
 
 
 @dataclass
@@ -125,21 +179,24 @@ class Instance:
     ``connection_method`` selects the transport: ``"ssh"`` (default, uses
     ``ssh_host``/``remote_bin``) or ``"ssm"`` (uses ``ssm_target`` — an EC2/SSM
     managed-instance id — plus optional ``aws_profile``/``aws_region``; no SSH
-    key or inbound port needed). Both methods share ``remote_port``/``ttl``.
+    key or inbound port needed). ``"fargate"`` is the SSM forward aimed at an ECS
+    task target; it has no dashboard, so no token is ever minted for it. All
+    methods share ``remote_port``/``ttl``.
     """
 
     id: str
     name: str
     ssh_host: str = ""
-    remote_port: int = _DEFAULT_REMOTE_PORT
+    remote_port: int = DEFAULT_REMOTE_PORT
     local_port: int = _UNALLOCATED_PORT
     ttl: str = _DEFAULT_TTL
     remote_bin: str = ""
-    # "ssh" (default) or "ssm" — see CONNECTION_METHODS.
+    # "ssh" (default), "ssm" or "fargate" -- see CONNECTION_METHODS.
     connection_method: str = _DEFAULT_CONNECTION_METHOD
-    # SSM-only fields. ssm_target is an EC2 instance id (i-...) or SSM managed
-    # instance id (mi-...); aws_profile/aws_region are optional (empty = use the
-    # default credential chain / region).
+    # SSM-transport fields. ssm_target is an EC2 instance id (i-...) or SSM
+    # managed instance id (mi-...) for "ssm", an ECS task target (ecs:...) for
+    # "fargate"; aws_profile/aws_region are optional (empty = use the default
+    # credential chain / region).
     ssm_target: str = ""
     aws_profile: str = ""
     aws_region: str = ""
@@ -148,6 +205,9 @@ class Instance:
     # launcher-provisioned AL2023 user; set "ubuntu" (or whoever runs the remote
     # gateway) on other AMIs, otherwise the tunnel comes up but the mint fails.
     ssm_run_as: str = _DEFAULT_SSM_RUN_AS
+    # Provisioner that created this crew, when known. Empty means the machine
+    # was added directly or predates source tracking.
+    provisioner_id: str = ""
     # Sticky "connection intent" — the source of truth for whether a tab should
     # exist for this instance. Set True when a tunnel is opened and cleared ONLY
     # on an explicit user disconnect; deliberately LEFT TRUE across gateway
@@ -155,6 +215,22 @@ class Instance:
     # (showing an error / click-to-reconnect state) instead of dropping it.
     # Startup uses it to decide which instances to auto-reconnect.
     was_connected: bool = False
+    # Pid of the tunnel forwarder child this manager spawned for the recorded
+    # ``local_port`` (0 = none recorded), paired with the opaque start-time
+    # identity ``platform_compat.process_start_time`` reported for it ("" =
+    # unknown). Persisted so a forwarder orphaned by a gateway hard-kill can be
+    # reclaimed by its OWN identity — pid + start time + exact argv — never by
+    # matching the process table, which cannot distinguish our child from an
+    # operator's own forward. Either half missing means the identity
+    # cannot be confirmed and no reclaim happens (fail closed).
+    forwarder_pid: int = _NO_FORWARDER_PID
+    forwarder_start: str = ""
+    # HMAC over (id, forwarder_pid, forwarder_start, local_port) under a
+    # gateway-held key ("" = unsigned). The registry file is agent-writable, so
+    # the identity above gates but cannot authorize by itself; the signature is
+    # what makes it the GATEWAY's own claim — a record an agent wrote or
+    # redirected fails verification and is never reclaimed (fail closed).
+    forwarder_sig: str = ""
 
     def validate(self) -> None:
         """Raise :class:`InvalidInstanceError` if any field is malformed."""
@@ -174,18 +250,48 @@ class Instance:
                 raise InvalidInstanceError(
                     f"invalid ssh_host {self.ssh_host!r}: must match {_SSH_HOST_RE.pattern}"
                 )
+        elif self.connection_method == "fargate":
+            # The same splitter connect_fargate reads the target with, so a
+            # target this arm stores is one that lane can open.
+            #
+            # Checked UNSTRIPPED, and what reaches here is user input, not a
+            # stored record: handlers_instances passes
+            # ``str(body.get("ssm_target", ""))`` straight into this constructor,
+            # and ``validate_ssm_target`` (the layer that strips) runs later, at
+            # connect time. An ECS target is 90-plus characters copied out of the
+            # AWS console, where a trailing space or newline rides along far more
+            # often than it does with ``i-0abc``; the splitter refuses such a
+            # paste rather than storing it. That fails closed, which is why the
+            # behaviour is left alone, but a reader should know it is the paste
+            # that lands on it.
+            if not self.ssm_target or split_ecs_target(self.ssm_target) is None:
+                raise InvalidInstanceError(
+                    f"invalid ssm_target {self.ssm_target!r}: a fargate instance needs "
+                    f"an ECS task target (ecs:<cluster>_<task-id>_<runtime-id>)"
+                )
+            self._validate_aws_coordinates()
         else:  # ssm
-            if not self.ssm_target or not _SSM_TARGET_RE.match(self.ssm_target):
+            # ``ssm_target_matches`` admits the ECS task shape too (it is the
+            # shared SSM-transport charset), but an ECS task has no SSM agent to
+            # run ``kirocrew token`` on, so a record filed here would forward and
+            # then fail at the mint. Refuse it and name the arm that stores it.
+            if split_ecs_target(self.ssm_target) is not None:
+                raise InvalidInstanceError(
+                    f"invalid ssm_target {self.ssm_target!r}: an ECS task target belongs "
+                    f"to the fargate connection method, not ssm"
+                )
+            # Checked UNSTRIPPED: what reaches here is the request body's
+            # ``ssm_target`` as typed, and ``validate_ssm_target`` (the layer that
+            # strips) runs later, at connect time. A pasted ``i-``/``mi-`` id with
+            # a trailing space or newline is refused here rather than stored.
+            if not self.ssm_target or not ssm_target_matches(self.ssm_target):
                 # No regex in the message — it reaches the Settings form verbatim.
                 raise InvalidInstanceError(
                     f"invalid ssm_target {self.ssm_target!r}: must be an EC2/SSM "
                     f"managed-instance id (i-... or mi-...) followed by 8 to 17 "
                     f"hex digits"
                 )
-            if self.aws_profile and not _AWS_PROFILE_RE.match(self.aws_profile):
-                raise InvalidInstanceError(f"invalid aws_profile {self.aws_profile!r}")
-            if self.aws_region and not _AWS_REGION_RE.match(self.aws_region):
-                raise InvalidInstanceError(f"invalid aws_region {self.aws_region!r}")
+            self._validate_aws_coordinates()
             if not _SSM_RUN_AS_RE.match(self.ssm_run_as):
                 raise InvalidInstanceError(
                     f"invalid ssm_run_as {self.ssm_run_as!r}: must be a Unix "
@@ -203,6 +309,35 @@ class Instance:
                     f"invalid {label} {port!r}: must be an int in "
                     f"[{lo}, 65535]" + (" (0 = unallocated)" if allow_zero else "")
                 )
+        if not isinstance(self.provisioner_id, str):
+            raise InvalidInstanceError(
+                f"invalid provisioner_id {self.provisioner_id!r}: must be a string"
+            )
+        if not isinstance(self.forwarder_pid, int) or self.forwarder_pid < 0:
+            raise InvalidInstanceError(
+                f"invalid forwarder_pid {self.forwarder_pid!r}: must be an int "
+                f">= 0 (0 = no forwarder recorded)"
+            )
+        if not isinstance(self.forwarder_start, str):
+            raise InvalidInstanceError(
+                f"invalid forwarder_start {self.forwarder_start!r}: must be a "
+                f"string ('' = unknown)"
+            )
+        if not isinstance(self.forwarder_sig, str):
+            raise InvalidInstanceError(
+                f"invalid forwarder_sig {self.forwarder_sig!r}: must be a "
+                f"string ('' = unsigned)"
+            )
+
+    def _validate_aws_coordinates(self) -> None:
+        """Reject a malformed ``aws_profile`` / ``aws_region`` (empty = default)."""
+        if self.aws_profile and not _AWS_PROFILE_RE.match(self.aws_profile):
+            raise InvalidInstanceError(
+                f"invalid aws_profile {self.aws_profile!r} "
+                f"(allowed: letters, digits, '.', '_', '+', '-')"
+            )
+        if self.aws_region and not _AWS_REGION_RE.match(self.aws_region):
+            raise InvalidInstanceError(f"invalid aws_region {self.aws_region!r}")
 
     def to_dict(self) -> dict:
         """Serialize to the JSON shape stored in ``instances.json``."""
@@ -219,7 +354,11 @@ class Instance:
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "ssm_run_as": self.ssm_run_as,
+            "provisioner_id": self.provisioner_id,
             "was_connected": self.was_connected,
+            "forwarder_pid": self.forwarder_pid,
+            "forwarder_start": self.forwarder_start,
+            "forwarder_sig": self.forwarder_sig,
         }
 
     @classmethod
@@ -240,7 +379,7 @@ class Instance:
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
             ssh_host=str(data.get("ssh_host", "")),
-            remote_port=_as_int(data.get("remote_port"), _DEFAULT_REMOTE_PORT),
+            remote_port=_as_int(data.get("remote_port"), DEFAULT_REMOTE_PORT),
             local_port=_as_int(data.get("local_port"), _UNALLOCATED_PORT),
             ttl=str(data.get("ttl", _DEFAULT_TTL)),
             remote_bin=str(data.get("remote_bin", "")),
@@ -252,7 +391,14 @@ class Instance:
             # by an older build has no key, and one written with an explicit
             # empty string would fail validation — both mean "use the default".
             ssm_run_as=str(data.get("ssm_run_as", "") or _DEFAULT_SSM_RUN_AS),
+            provisioner_id=str(data.get("provisioner_id", "") or ""),
             was_connected=bool(data.get("was_connected", False)),
+            # max(): a hand-edited negative pid normalizes to the sentinel
+            # rather than poisoning every later update() with a validate error
+            # — matching this loader's documented key tolerance.
+            forwarder_pid=max(_NO_FORWARDER_PID, _as_int(data.get("forwarder_pid"), 0)),
+            forwarder_start=str(data.get("forwarder_start", "") or ""),
+            forwarder_sig=str(data.get("forwarder_sig", "") or ""),
         )
 
 
@@ -262,6 +408,18 @@ class _RegistryDoc:
 
     instances: list[Instance] = field(default_factory=list)
     last_active_id: str = ""
+
+
+def _find(doc: _RegistryDoc, instance_id: str) -> Instance | None:
+    """Return the record in *doc* with *instance_id*, or ``None`` if absent.
+
+    Hands back the live object out of ``doc.instances`` (not a copy), so a caller
+    holding the lock can mutate it in place and persist *doc*.
+    """
+    for inst in doc.instances:
+        if inst.id == instance_id:
+            return inst
+    return None
 
 
 class InstancesRegistry:
@@ -330,10 +488,7 @@ class InstancesRegistry:
     def get(self, instance_id: str) -> Instance | None:
         """Return the instance with *instance_id*, or ``None`` if absent."""
         with self._lock:
-            for inst in self._read().instances:
-                if inst.id == instance_id:
-                    return inst
-            return None
+            return _find(self._read(), instance_id)
 
     def get_last_active(self) -> Instance | None:
         """Return the last-active instance to auto-revive on startup."""
@@ -341,10 +496,7 @@ class InstancesRegistry:
             doc = self._read()
             if not doc.last_active_id:
                 return None
-            for inst in doc.instances:
-                if inst.id == doc.last_active_id:
-                    return inst
-            return None
+            return _find(doc, doc.last_active_id)
 
     # ── write API ────────────────────────────────────────────────────────
 
@@ -353,7 +505,7 @@ class InstancesRegistry:
         *,
         name: str,
         ssh_host: str = "",
-        remote_port: int = _DEFAULT_REMOTE_PORT,
+        remote_port: int = DEFAULT_REMOTE_PORT,
         local_port: int = _UNALLOCATED_PORT,
         ttl: str = _DEFAULT_TTL,
         remote_bin: str = "",
@@ -362,6 +514,7 @@ class InstancesRegistry:
         aws_profile: str = "",
         aws_region: str = "",
         ssm_run_as: str = _DEFAULT_SSM_RUN_AS,
+        provisioner_id: str = "",
         instance_id: str | None = None,
     ) -> Instance:
         """Add a new instance and return it.
@@ -370,8 +523,8 @@ class InstancesRegistry:
         to disambiguate collisions. Raises :class:`DuplicateInstanceError` if an
         explicit id already exists, or :class:`InvalidInstanceError` on bad input.
 
-        *connection_method* selects the transport ("ssh" or "ssm"); the fields
-        required depend on it — see :meth:`Instance.validate`.
+        *connection_method* selects the transport ("ssh", "ssm" or "fargate"); the
+        fields required depend on it -- see :meth:`Instance.validate`.
         """
         with self._lock:
             doc = self._read()
@@ -402,9 +555,11 @@ class InstancesRegistry:
                 aws_profile=aws_profile,
                 aws_region=aws_region,
                 ssm_run_as=ssm_run_as or _DEFAULT_SSM_RUN_AS,
+                provisioner_id=provisioner_id,
                 was_connected=False,
             )
             inst.validate()
+            validate_ttl(inst.ttl)
             doc.instances.append(inst)
             self._write(doc)
             logger.info(
@@ -415,15 +570,22 @@ class InstancesRegistry:
             )
             return inst
 
-    def update(self, instance_id: str, **changes: object) -> Instance:
+    def update(
+        self, instance_id: str, *, mark_last_active: bool = False, **changes: object
+    ) -> Instance:
         """Patch fields on an existing instance and return the updated record.
 
         Accepts any of: ``name``, ``ssh_host``, ``remote_port``, ``local_port``,
         ``ttl``, ``remote_bin``, ``connection_method``, ``ssm_target``,
-        ``ssm_run_as``,
-        ``aws_profile``, ``aws_region``, ``was_connected``. The ``id`` is
-        immutable. Raises :class:`InstanceNotFoundError` /
-        :class:`InvalidInstanceError`.
+        ``ssm_run_as``, ``provisioner_id``,
+        ``aws_profile``, ``aws_region``, ``was_connected``, ``forwarder_pid``,
+        ``forwarder_start``, ``forwarder_sig``.
+        The ``id`` is
+        immutable. ``mark_last_active=True`` additionally records the instance
+        as the auto-revive target in the SAME read-modify-write, so callers that
+        need both (a connect persisting its hints) get one atomic file rewrite
+        instead of two — the pair becomes durable together. Raises
+        :class:`InstanceNotFoundError` / :class:`InvalidInstanceError`.
         """
         allowed = {
             "name",
@@ -435,25 +597,29 @@ class InstancesRegistry:
             "connection_method",
             "ssm_target",
             "ssm_run_as",
+            "provisioner_id",
             "aws_profile",
             "aws_region",
             "was_connected",
+            "forwarder_pid",
+            "forwarder_start",
+            "forwarder_sig",
         }
         unknown = set(changes) - allowed
         if unknown:
             raise InvalidInstanceError(f"unknown fields: {sorted(unknown)}")
+        if "ttl" in changes:
+            validate_ttl(str(changes["ttl"]))
         with self._lock:
             doc = self._read()
-            target: Instance | None = None
-            for inst in doc.instances:
-                if inst.id == instance_id:
-                    target = inst
-                    break
+            target = _find(doc, instance_id)
             if target is None:
                 raise InstanceNotFoundError(f"no instance with id {instance_id!r}")
             for key, value in changes.items():
                 setattr(target, key, value)
             target.validate()
+            if mark_last_active:
+                doc.last_active_id = instance_id
             self._write(doc)
             logger.info("Updated instance %s: %s", instance_id, sorted(changes))
             return target
@@ -471,29 +637,3 @@ class InstancesRegistry:
             self._write(doc)
             logger.info("Removed instance %s", instance_id)
             return True
-
-    def set_was_connected(self, instance_id: str, value: bool) -> None:
-        """Set the ``was_connected`` hint (no-op if the instance is gone)."""
-        with self._lock:
-            doc = self._read()
-            changed = False
-            for inst in doc.instances:
-                if inst.id == instance_id:
-                    inst.was_connected = bool(value)
-                    changed = True
-                    break
-            if changed:
-                self._write(doc)
-
-    def set_last_active(self, instance_id: str) -> None:
-        """Mark *instance_id* as the one to auto-revive on next startup.
-
-        Raises :class:`InstanceNotFoundError` if the id is unknown so callers
-        can't silently point ``last_active_id`` at a non-existent instance.
-        """
-        with self._lock:
-            doc = self._read()
-            if not any(i.id == instance_id for i in doc.instances):
-                raise InstanceNotFoundError(f"no instance with id {instance_id!r}")
-            doc.last_active_id = instance_id
-            self._write(doc)

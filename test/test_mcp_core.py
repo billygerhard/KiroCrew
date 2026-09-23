@@ -17,7 +17,7 @@ class TestSpawnRunSessionKeyRouting:
         ):
             mock_post.return_value = {"id": "agent1"}
 
-            _call_tool("spawn_run", {"task": "test"})
+            _call_tool("spawn_run", {"task": "test", "solo_reason": "bulk_data"})
 
             call_body = mock_post.call_args[0][1]
             assert call_body["parent_session"] == "sess-from-env"
@@ -32,12 +32,16 @@ class TestSpawnRunSessionKeyRouting:
             env.pop("KIROCREW_SESSION_KEY", None)
             env.pop("KIROCREW_HOME", None)  # ensure config_dir() uses patched Path.home()
             with patch.dict("os.environ", env, clear=True):
-                kirocrew_dir = tmp_path / "fake_home" / ".kirocrew"
+                # The gateway writes session_pid files into the data home
+                # (config_dir() -> ~/.kiro/crew), which is where the fallback
+                # reader looks; there is no legacy fallback for these per-boot
+                # runtime files.
+                kirocrew_dir = tmp_path / "fake_home" / ".kiro" / "crew"
                 kirocrew_dir.mkdir(parents=True)
                 (kirocrew_dir / f"session_pid_{os.getppid()}.txt").write_text("sess-from-pid")
 
                 mock_post.return_value = {"id": "agent1"}
-                _call_tool("spawn_run", {"task": "test"})
+                _call_tool("spawn_run", {"task": "test", "solo_reason": "bulk_data"})
 
                 assert mock_post.call_args[0][1]["parent_session"] == "sess-from-pid"
 
@@ -86,7 +90,14 @@ class TestSendMessageCronSession:
         monkeypatch.setattr("kiro_crew.mcp_core._vet_channel_governance", lambda _sk, _t: None)
 
     def test_default_notification_only(self):
-        """Non-cron bare send_message(text=...) → no session in payload, notification only."""
+        """Non-cron bare send_message(text=...) → no session in payload, notification only.
+
+        Nothing is forwarded because nothing needs to be: a bare send reaches the
+        in-process dashboard notification, not a channel. The verified identity is
+        forwarded only for a ``channel_type`` send, where it becomes the governance
+        subject at the egress chokepoint, and for a cron, whose key drives the
+        Slack-DM routing default.
+        """
         with patch("kiro_crew.mcp_core._post") as mock_post, patch.dict(
             "os.environ", {"KIROCREW_SESSION_KEY": "dashboard:chat-1"}
         ):
@@ -276,7 +287,7 @@ class TestSessionKeyHeaderError:
         with (
             patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:A — B"),
             patch.object(mcp_core, "_internal_secret", return_value="secret"),
-            patch("urllib.request.urlopen") as mock_urlopen,
+            patch("kiro_crew.mcp_core.loopback_urlopen") as mock_urlopen,
         ):
             result = mcp_core._post("/api/lessons", {"text": "x"})
         assert "error" in result
@@ -315,6 +326,29 @@ class TestDeployArtifactMCPTool:
             assert "override_scan" not in call_body
             assert "preview" in result.lower() or "confirm" in result.lower()
             assert "dashboard" in result.lower()
+
+    def test_deploy_artifact_preview_carries_public_exposure_warning(self):
+        """The preview response states the public/no-auth exposure explicitly.
+
+        Agent-mediated publishes have no UI: this hardcoded line is the only
+        way the exposure warning reaches the user before they confirm.
+        """
+        with patch("kiro_crew.mcp_core._post") as mock_post:
+            mock_post.return_value = {
+                "requires_confirm": True,
+                "public": True,
+                "bytes": 4096,
+                "scan": "clean",
+                "site_id": "my-app",
+            }
+
+            result = _call_tool("deploy_artifact", {
+                "site_id": "my-app",
+                "artifact_slug": "my-demo",
+            })
+
+            assert "WARNING: Anyone with the published link can view this content." in result
+            assert "no authentication" in result
 
     def test_deploy_artifact_rejects_confirm_param(self):
         """confirm param is rejected via schema — returns controlled error string."""
@@ -386,6 +420,9 @@ class TestDeployArtifactMCPTool:
             })
             assert "blocked by scan" in result
             assert "Pending confirmations" in result
+            # The override path commits a publish too — it must carry the
+            # same public/no-auth warning as the clean-preview return.
+            assert "WARNING: Anyone with the published link can view this content." in result
             assert mock_pending.call_count == 1
             assert mock_pending.call_args[0][0]["override_scan_required"] is True
 

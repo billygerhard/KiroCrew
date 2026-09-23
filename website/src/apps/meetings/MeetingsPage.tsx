@@ -6,18 +6,21 @@
 // URL because a builtin app resolves from a single top-level path segment (see
 // `apps/builtinRegistry.ts`), so a nested path would never route back here.
 
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useState, type MouseEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CalendarClock,
   CalendarPlus,
   CircleDot,
   FileText,
+  Loader2,
   RefreshCw,
   Settings2,
+  Trash2,
 } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
 import { fmtDateFields } from '../../i18n/format'
 import Clickable from '../../components/Clickable'
 import {
@@ -26,6 +29,7 @@ import {
   Card,
   CardTitle,
   EmptyState,
+  IconButton,
   PageHeader,
   SearchInput,
   Skeleton,
@@ -49,8 +53,17 @@ interface Row {
   title: string
   start: string
   end: string
+  allDay: boolean
   status: MeetingSummary['status'] | 'scheduled'
   touched: boolean
+}
+
+const LIVE_STATUSES = new Set<Row['status']>(['active', 'paused', 'reviewing'])
+
+function deleteFailureMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : i18nT('apps.meetings.list.deleteFailed')
 }
 
 function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
@@ -61,6 +74,7 @@ function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
       title: event.title,
       start: event.start,
       end: event.end,
+      allDay: event.all_day,
       status: 'scheduled',
       touched: false,
     })
@@ -73,6 +87,10 @@ function mergeRows(events: CalendarEvent[], meetings: MeetingSummary[]): Row[] {
       title: meeting.title || existing?.title || i18nT('apps.meetings.session.untitled'),
       start: existing?.start ?? meeting.started_at,
       end: existing?.end ?? meeting.ended_at,
+      // The flag travels with the start it describes: when the calendar event's
+      // date anchor wins above, its all-day reading must win with it. A
+      // meeting-only row's `started_at` is a real instant, never all-day.
+      allDay: existing?.allDay ?? false,
       status: meeting.status,
       touched: true,
     })
@@ -92,6 +110,18 @@ function formatWhen(row: Row): string {
   // `fmtDateFields`, not the raw `toLocale*`: a meeting row sits inside a
   // translated UI, so the weekday and the 12h/24h choice have to follow the app's
   // language rather than whatever locale the browser happens to be set to.
+  if (row.allDay) {
+    // A whole-day event's `start` is a DATE ANCHOR — the date's midnight UTC,
+    // not an instant. The fields are read back in UTC and no time is shown:
+    // converting the anchor to the browser's zone renders the previous day for
+    // everyone west of UTC, which is the wrong-day defect this branch exists for.
+    return fmtDateFields(start, {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      timeZone: 'UTC',
+    })
+  }
   const date = fmtDateFields(start, { weekday: 'short', month: 'short', day: 'numeric' })
   const time = fmtDateFields(start, { hour: '2-digit', minute: '2-digit' })
   return `${date} · ${time}`
@@ -100,13 +130,13 @@ function formatWhen(row: Row): string {
 /**
  * The notifier for this page.
  *
- * NOT the App SDK's `useNotify()`: that hook reads `AppSdkContext`, which only
- * exists inside `AppApiProvider` — the wrapper the host mounts around an
- * EXTERNALLY-loaded app bundle. An in-tree builtin page renders directly in the
- * core React tree with no such provider, so calling it throws
- * "useAppApi() must be used inside <AppApiProvider>" and the whole page renders
- * as an error boundary. `DevFleetPage` hit this first and carries the same
- * workaround; this dispatches to the notification store the header already reads.
+ * NOT the App SDK's `useNotify()`: that hook reads `AppSdkContext`, which exists
+ * only inside the SDK's scoped-API layer. A builtin page now HAS app identity
+ * (published by `BuiltinAppRoute`) but not that layer, so calling the hook still
+ * throws and the whole page renders as an error boundary. Mounting
+ * `AppScopedApiProvider` would supply it — `spec-builder` does exactly that — but
+ * this page needs no scoped client, and dispatching to the notification store the
+ * header already reads costs it nothing. `DevFleetPage` carries the same workaround.
  */
 function useNotifier(): (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => void {
   const dispatch = useDispatch()
@@ -125,6 +155,9 @@ function useNotifier(): (message: string, opts?: { type?: 'info' | 'success' | '
   )
 }
 
+/** How often the list re-reads the calendar cache and the meetings on disk. */
+const LIST_REFRESH_MS = 60_000
+
 export default function MeetingsPage() {
   const notify = useNotifier()
   const queryClient = useQueryClient()
@@ -132,8 +165,19 @@ export default function MeetingsPage() {
   const [filter, setFilter] = useState('')
 
   const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config })
-  const calendarQuery = useQuery({ queryKey: ['meetings', 'calendar'], queryFn: meetingsApi.calendar })
-  const meetingsQuery = useQuery({ queryKey: ['meetings', 'list'], queryFn: meetingsApi.meetings })
+  // The backend's calendar poller refreshes the cache and pre-creates the meeting
+  // that is about to start while this page sits open, so both lists re-read on a
+  // cadence: without it a pre-created meeting appears only after a remount.
+  const calendarQuery = useQuery({
+    queryKey: ['meetings', 'calendar'],
+    queryFn: meetingsApi.calendar,
+    refetchInterval: LIST_REFRESH_MS,
+  })
+  const meetingsQuery = useQuery({
+    queryKey: ['meetings', 'list'],
+    queryFn: meetingsApi.meetings,
+    refetchInterval: LIST_REFRESH_MS,
+  })
 
   const sync = useMutation({
     mutationFn: meetingsApi.syncCalendar,
@@ -143,6 +187,17 @@ export default function MeetingsPage() {
     },
     onError: (error: Error) =>
       notify(error.message || i18nT('apps.meetings.list.syncFailed'), { type: 'error' }),
+  })
+
+  const deleteMeeting = useMutation({
+    mutationFn: ({ eventId }: { eventId: string; title: string }) =>
+      meetingsApi.deleteMeeting(eventId),
+    onSuccess: (_response, { eventId, title }) => {
+      notify(i18nT('apps.meetings.list.deleted', { title }), { type: 'success' })
+      queryClient.removeQueries({ queryKey: ['meetings', safeMeetingId(eventId)] })
+      void queryClient.invalidateQueries({ queryKey: ['meetings', 'list'] })
+    },
+    onError: error => notify(deleteFailureMessage(error), { type: 'error' }),
   })
 
   const rows = useMemo(
@@ -184,6 +239,13 @@ export default function MeetingsPage() {
     setRoute({ view: 'meeting', eventId, title: i18nT('apps.meetings.list.adHocTitle') })
   }
 
+  const requestDelete = (event: MouseEvent<HTMLButtonElement>, row: Row) => {
+    event.stopPropagation()
+    if (window.confirm(i18nT('apps.meetings.list.deleteConfirm', { title: row.title }))) {
+      deleteMeeting.mutate({ eventId: row.eventId, title: row.title })
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -213,7 +275,18 @@ export default function MeetingsPage() {
           </>
         }
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        {/* The toast in `sync.onError` fades; this stays until the next sync or
+            a dismiss, so a failed sync is not mistaken for a quiet one. The list
+            page holds no draft, so the hand-off is offered. */}
+        {sync.isError && (
+          <ErrorNotice
+            message={sync.error.message || i18nT('apps.meetings.list.syncFailed')}
+            askAgent
+            onDismiss={() => sync.reset()}
+            className="mt-4"
+          />
+        )}
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] my-6">
           <StatCard
             label={i18nT('apps.meetings.list.statScheduled')}
@@ -274,40 +347,77 @@ export default function MeetingsPage() {
             />
           ) : (
             <div className="flex flex-col gap-2">
-              {filtered.map(row => (
-                <Clickable
-                  key={row.eventId}
-                  onClick={() =>
-                    setRoute({ view: 'meeting', eventId: row.eventId, title: row.title })
-                  }
-                  className="flex items-center gap-3 px-4 py-3 border border-border rounded-md cursor-pointer hover:border-border-strong transition-colors"
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm text-text font-medium truncate">{row.title}</div>
-                    {formatWhen(row) && (
-                      <div className="text-[12px] text-muted font-mono">{formatWhen(row)}</div>
-                    )}
+              {filtered.map(row => {
+                const rowDeleteError =
+                  deleteMeeting.isError && deleteMeeting.variables?.eventId === row.eventId
+                    ? deleteFailureMessage(deleteMeeting.error)
+                    : ''
+                return (
+                  <div key={row.eventId} className="flex flex-col gap-1">
+                    <Clickable
+                      onClick={() =>
+                        setRoute({ view: 'meeting', eventId: row.eventId, title: row.title })
+                      }
+                      className="flex items-center gap-3 px-4 py-3 border border-border rounded-md cursor-pointer hover:border-border-strong transition-colors"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-text font-medium truncate">{row.title}</div>
+                        {formatWhen(row) && (
+                          <div className="text-[12px] text-muted font-mono">{formatWhen(row)}</div>
+                        )}
+                      </div>
+                      {row.status === 'active' && (
+                        <Badge variant="ok">{i18nT('apps.meetings.meeting.live')}</Badge>
+                      )}
+                      {row.status === 'reviewing' && (
+                        <Badge variant="warn">{i18nT('apps.meetings.list.reviewing')}</Badge>
+                      )}
+                      {row.status === 'paused' && (
+                        <Badge variant="warn">{i18nT('apps.meetings.meeting.paused')}</Badge>
+                      )}
+                      {row.status === 'ended' && (
+                        <Badge variant="muted">{i18nT('apps.meetings.meeting.ended')}</Badge>
+                      )}
+                      {row.touched && (
+                        <FileText
+                          className="lucide-inline text-muted"
+                          aria-label={i18nT('apps.meetings.list.hasNotes')}
+                        />
+                      )}
+                      {row.touched && (
+                        <IconButton
+                          variant="danger"
+                          className="shrink-0 inline-flex items-center justify-center"
+                          disabled={deleteMeeting.isPending || LIVE_STATUSES.has(row.status)}
+                          title={
+                            LIVE_STATUSES.has(row.status)
+                              ? i18nT('apps.meetings.list.deleteUnavailable')
+                              : i18nT('apps.meetings.list.deleteMeeting', { title: row.title })
+                          }
+                          aria-label={
+                            LIVE_STATUSES.has(row.status)
+                              ? i18nT('apps.meetings.list.deleteUnavailable')
+                              : i18nT('apps.meetings.list.deleteMeeting', { title: row.title })
+                          }
+                          onClick={event => requestDelete(event, row)}
+                        >
+                          {deleteMeeting.isPending
+                            && deleteMeeting.variables?.eventId === row.eventId
+                            ? (
+                                <Loader2
+                                  className="lucide-inline animate-spin motion-reduce:animate-none"
+                                  aria-hidden="true"
+                                />
+                              )
+                            : <Trash2 className="lucide-inline" aria-hidden="true" />}
+                        </IconButton>
+                      )}
+                    </Clickable>
+                    {/* Delete acts on a persisted meeting; the list holds no draft. */}
+                    <ErrorNotice message={rowDeleteError} askAgent className="animate-rise" />
                   </div>
-                  {row.status === 'active' && (
-                    <Badge variant="ok">{i18nT('apps.meetings.meeting.live')}</Badge>
-                  )}
-                  {row.status === 'reviewing' && (
-                    <Badge variant="warn">{i18nT('apps.meetings.list.reviewing')}</Badge>
-                  )}
-                  {row.status === 'paused' && (
-                    <Badge variant="warn">{i18nT('apps.meetings.meeting.paused')}</Badge>
-                  )}
-                  {row.status === 'ended' && (
-                    <Badge variant="muted">{i18nT('apps.meetings.meeting.ended')}</Badge>
-                  )}
-                  {row.touched && (
-                    <FileText
-                      className="lucide-inline text-muted"
-                      aria-label={i18nT('apps.meetings.list.hasNotes')}
-                    />
-                  )}
-                </Clickable>
-              ))}
+                )
+              })}
             </div>
           )}
         </Card>

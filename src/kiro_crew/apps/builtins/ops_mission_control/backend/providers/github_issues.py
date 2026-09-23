@@ -38,7 +38,12 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import (
     ActionResult,
     TruncatedSignals,
 )
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.sandbox import (
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +70,23 @@ async def _run_gh(args: list[str]) -> tuple[int, str, str]:
 
     Routed through ``sandboxed_spawn_argv`` (OS filesystem isolation +
     credential-scrubbed environment) and given a kernel resource ceiling via
-    ``resource_limit_preexec``, because the repo, label set, and comment body all
-    come from config an agent can influence — and ``gh`` reads the repo's own
+    ``create_subprocess_limited``, because the repo, label set, and comment body
+    all come from config an agent can influence — and ``gh`` reads the repo's own
     config on the way. This is the chokepoint ``test/test_spawn_audit.py``
     requires every agent-influenced spawn to use.
 
     Never raises for a non-zero exit — the caller decides whether that is a
     source-level error or an expected condition (e.g. a repo without issues).
     """
-    argv, env, cleanup = sandboxed_spawn_argv([_GH_BINARY, *args])
+    argv, env, cleanup = await sandboxed_spawn_argv_async(
+        [_GH_BINARY, *args], _prepare=sandboxed_spawn_argv
+    )
     try:
         # `create_subprocess_limited`, NOT `preexec_fn=resource_limit_preexec()`: on an
         # ASYNC spawn a preexec_fn forces a plain fork() of the threaded gateway and runs
         # Python in the child before exec, which can wedge the event loop and leak every
         # inherited fd. The shim applies the same limits post-exec. See
-        # `test/test_spawn_preexec_guard.py` (issue #935) and the fuller note on
+        # `test/test_spawn_preexec_guard.py` and the fuller note on
         # `ledger_sync._git`.
         proc = await create_subprocess_limited(
             *argv,
@@ -90,8 +97,7 @@ async def _run_gh(args: list[str]) -> tuple[int, str, str]:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_GH_TIMEOUT_SECS)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_and_reap(proc)
             return 1, "", f"gh timed out after {_GH_TIMEOUT_SECS:.0f}s"
         return (
             proc.returncode or 0,

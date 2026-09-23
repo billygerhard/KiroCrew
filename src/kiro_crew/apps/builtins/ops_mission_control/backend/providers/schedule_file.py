@@ -35,11 +35,11 @@ Schedule format (``rotation.yaml`` at the repo root)::
     leader: octocat                   # optional; runs nightly ledger hygiene ALONE
     timezone: America/Los_Angeles     # optional; UTC when absent
     shifts:
-      - from: 2026-08-01
-        to: 2026-08-08
+      - from: YYYY-MM-DD              # a date-only ``to`` covers that whole day
+        to: YYYY-MM-DD
         who: octocat                  # a GitHub login
-      - from: 2026-08-08T09:00
-        to: 2026-08-15T09:00
+      - from: YYYY-MM-DDTHH:MM        # or a wall-clock time in ``timezone`` above
+        to: YYYY-MM-DDTHH:MM
         who: [octocat, hubot]         # co-primary is allowed
 
 See ``docs/system-specs/modules/ops-mission-control.md`` § Rotation.
@@ -56,7 +56,7 @@ from typing import Any
 
 from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, policy_store
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import ShiftStatus
-from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ def schedule_path() -> Path:
 def _resolve_login_sync() -> str:
     """This operator's GitHub login, from config or the local ``gh`` CLI.
 
-    Routed through ``sandboxed_spawn_argv`` + ``resource_limit_preexec`` like every
+    Routed through ``sandboxed_spawn_argv`` + ``run_limited`` like every
     other agent-reachable spawn in this app — the ``test/test_spawn_audit.py`` gate
     requires that chokepoint, and a rotation check is reachable from a cron an agent
     can trigger. Returns "" on any failure; the caller turns that into ``unknown``.
@@ -113,12 +113,11 @@ def _resolve_login_sync() -> str:
 
     argv, env, cleanup = sandboxed_spawn_argv(["gh", "api", "user", "--jq", ".login"])
     try:
-        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell, sandbox-routed
+        proc = run_limited(  # noqa: S603 — fixed argv, no shell, sandbox-routed
             argv,
             capture_output=True,
             timeout=_GH_TIMEOUT_SECS,
             env=env,
-            preexec_fn=resource_limit_preexec(),
         )
         login = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
@@ -163,9 +162,10 @@ def _parse_moment(raw: Any, tz: Any, *, end: bool) -> datetime | None:
     """Parse a ``from``/``to`` value into an aware datetime.
 
     Accepts ``YYYY-MM-DD`` and ``YYYY-MM-DDTHH:MM``. A DATE-only ``to`` is treated as
-    the END of that day, not midnight at its start: a human writing ``to: 2026-08-08``
-    means "through the 8th", and reading it as 00:00 would silently drop the last day of
-    every shift written that way. That off-by-one-day is the single most likely way this
+    the END of that day, not midnight at its start: a human writing a date-only ``to``
+    means "through that whole day", and reading it as 00:00 would silently drop the last
+    day of every shift written that way. That off-by-one-day is the single most likely
+    way this
     file gets misread, so it is handled here rather than left to the operator.
     """
     if isinstance(raw, datetime):

@@ -1,18 +1,14 @@
 # Foreign-Agent Import Module
 
-Previously: 2026-07-28 (initial spec: industry-consensus scope, session-import
-removal, memory-hierarchy destination mapping, dry-run contract, and
-user-selectable conflict strategies)
-
 ## Overview
 
 `onboarding_import.py` migrates a user's setup from another AI agent into
-KiroCrew. It runs from the first-run onboarding flow (after the Kiro CLI
+Kiro Crew. It runs from the first-run onboarding flow (after the Kiro CLI
 prerequisite gate, before the theme tour) and from Settings on demand.
 
 The module is a **projection**, not a mirror: it reads a foreign layout and
-writes only into KiroCrew's own containers through KiroCrew's own APIs. It never
-invents a storage format, never writes a file KiroCrew does not otherwise read,
+writes only into Kiro Crew's own containers through Kiro Crew's own APIs. It never
+invents a storage format, never writes a file Kiro Crew does not otherwise read,
 and never copies a foreign store verbatim.
 
 Three phases, always in this order:
@@ -23,7 +19,15 @@ Three phases, always in this order:
 | Dry run (preview) | `preview_import()` | **no — never touches disk** |
 | Apply | `apply_import()` | yes, merge-only |
 
-**Sources:** `codex`, `claude_code`, `meshclaw`, `openclaw`, `hermes`.
+**Sources:** `codex`, `claude_code`, `gemini`, `openclaw`, `hermes`, plus any an
+edition registers through the `ImportSourceProvider` CPP seam (see
+[Registering a source](#registering-a-source)).
+
+`gemini` covers Google's whole terminal-agent lineage under one id, because
+Antigravity CLI reuses `~/.gemini` rather than claiming a directory of its own.
+Gemini CLI stopped serving Pro/Ultra/free individual accounts on 2026-06-18 and
+Antigravity replaced it, so that one root holds both a displaced Gemini CLI
+user's config and a current Antigravity install.
 
 ## Scope: what is migrated
 
@@ -50,17 +54,17 @@ looks like a gap — reopen the decision in this spec first.
 
 | Excluded | Why |
 |----------|-----|
-| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into KiroCrew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See "Session-import removal". |
-| **Persona / `SOUL.md` as a persona** | KiroCrew's persona surface is theme-pack persona, governed by `capabilities.theme_persona`. Importing a foreign persona document *as a persona* would inject third-party text into the agent's identity through a path that bypasses that gate. The **directive content** of such a file is still migrated — as memory (below) — but its persona role is dropped. |
+| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into Kiro Crew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See "Session-import removal". |
+| **Persona / `SOUL.md` as a persona** | Kiro Crew's persona surface is theme-pack persona, governed by `capabilities.theme_persona`. Importing a foreign persona document *as a persona* would inject third-party text into the agent's identity through a path that bypasses that gate. The **directive content** of such a file is still migrated — as memory (below) — but its persona role is dropped. |
 | **Credentials of any kind** | `~/.claude/.credentials.json`, `~/.codex/auth.json`, `.env`, `auth-profiles.json`, gateway tokens, provider API keys. Never read. MCP `env`/`headers` keys matching the secret patterns are stripped and counted into `secret_count`. |
 | **Runtime state** | Subagent records, tool results, checkpoints, hook state, in-flight task state. Not user data. |
-| **Architecture-specific config** | Plugin/hook/binding/agent-list configs, memory-backend selection, provider and model mappings. KiroCrew is KiroACP-only, so provider/model translation has no destination. |
+| **Architecture-specific config** | Plugin/hook/binding/agent-list configs, memory-backend selection, provider and model mappings. Kiro Crew is KiroACP-only, so provider/model translation has no destination. |
 | **Opaque binary stores** | Foreign SQLite memory stores are reported as `unsupported_memory_database`, never parsed. |
-| **Allow-lists (as opposed to deny-lists)** | A foreign `permissions.allow` *widens* the security boundary. Importing it would let a foreign config grant tool access inside KiroCrew's own gate. Deny rules only. |
+| **Allow-lists (as opposed to deny-lists)** | A foreign `permissions.allow` *widens* the security boundary. Importing it would let a foreign config grant tool access inside Kiro Crew's own gate. Deny rules only. |
 
 ## Destination mapping: the memory hierarchy
 
-Imported instruction/knowledge content is rewritten into KiroCrew's existing
+Imported instruction/knowledge content is rewritten into Kiro Crew's existing
 memory tiers. Tier choice is driven by two properties — **context priority**
 (`context.py` per-section caps) and **durability**.
 
@@ -78,7 +82,7 @@ Durable tiers only:
 | `lessons.jsonl` (`LessonStore`) | 22.6% — highest of any tier | Append-only; pruned oldest-first at `_MAX_LESSONS_TOTAL` (200) |
 | Semantic memory (`VectorMemoryStore`) | 7.7% | Durable; key-addressed, confidence-gated |
 | Episodic memory (`VectorMemoryStore`) | 7.7% | Durable; append-only |
-| `.kiro/steering/*.md` | 10% | Durable, but **workspace-scoped** |
+| `.kiro/steering/*.md` | 10% | Durable, but **workspace-scoped** — a tier the system has, never an import destination (rule 4) |
 
 ### Mapping rules
 
@@ -137,9 +141,9 @@ Durable tiers only:
    **A row the source types as a `directive` is a rule, not a fact**, so it is
    routed to the lesson tier via `_add_db_directive` instead — it passes the same
    identity guard (`_IDENTITY_PARAGRAPH_RE`) and the same `_MAX_IMPORTED_LESSONS`
-   ceiling as a file-sourced directive. It is NOT dropped: MeshClaw stores every
-   learned lesson this way, so discarding them lost exactly the least replaceable
-   rows in the store.
+   ceiling as a file-sourced directive. It is NOT dropped: a lineage store keeps
+   every learned lesson this way, so discarding them lost exactly the least
+   replaceable rows in the store.
    **Screen the DECODED value, never the raw JSON.** A DB value arrives as JSON
    text, so `_sanitize_text`/`contains_injection` applied to `value_json` inspect
    escape sequences, not content: `"Ignore all previous\ninstructions…"` carries a
@@ -147,13 +151,16 @@ Durable tiers only:
    `json.loads` result is a real newline and does. See security invariant 3a for
    the two layers that enforce this. It applies to the plain semantic path too,
    not just directives — a `lesson.*` key reaches the same always-injected tier.
-4. **Workspace-scoped rules → `.kiro/steering/`, opt-in only.** A per-project
-   instruction file (a workspace's own `CLAUDE.md`/`AGENTS.md`) may be written
-   to `<workspace>/.kiro/steering/imported-<source>.md` **only** when the user
-   supplies an explicit workspace target. Import MUST NOT default the target to
-   the current directory, the data home, or the user's home. Absent an explicit
-   target the item is reported `skipped` with reason
-   `workspace_target_required` — a missing target is never implicit consent.
+4. **Instruction files land in the lesson tier, not in a steering file.**
+   `_add_instruction_files` turns a `CLAUDE.md`/`AGENTS.md` (and a persona
+   document's DIRECTIVE body) into `instructions` items of `kind: lesson`, and
+   `_write_instruction` writes them through `LessonStore` / `VectorMemoryStore`.
+   Import writes no `.kiro/steering/` file anywhere and takes no workspace-target
+   argument. `preferences.md` / `projects.md` are not valid destinations either:
+   the memory consolidator replaces both wholesale, so an import there is
+   destroyed on the next consolidation run. Where a workspace itself gets
+   registered is the separate `workspaces` category, which is not a
+   steering-write destination.
 
 Every imported memory item passes the existing content gates before it is
 written: `_sanitize_text` (truncate + credential redaction; a *redacted* file is
@@ -162,7 +169,7 @@ dropped, a merely *truncated* one is not) and `contains_injection` (dropped as
 
 ### Foreign workspace-scope columns: sentinel vs. real scoping
 
-A foreign memory store may carry a workspace/scope column. KiroCrew's own memory
+A foreign memory store may carry a workspace/scope column. Kiro Crew's own memory
 tables have none, so a genuinely workspace-scoped row has no faithful destination
 and is reported `scoped_memory_unsupported`.
 
@@ -170,9 +177,9 @@ and is reported `scoped_memory_unsupported`.
 with the same placeholder, so treating the column as authoritative discards the
 entire store. `_UNSCOPED_WORKSPACE_IDS` (`""`, `default`, `global`, `main`,
 `none`, `null`) enumerates the placeholders; `_row_is_workspace_scoped()` is the
-single predicate both DB scanners use. MeshClaw stamps `default` on every row, so
-before this predicate existed **100% of a real MeshClaw memory store imported
-zero rows** while the UI reported success.
+single predicate both DB scanners use. A lineage install stamps `default` on every
+row, so before this predicate existed **100% of a real memory store imported zero
+rows** while the UI reported success.
 
 Matching is exact after casefold + strip, never a prefix or substring: `default2`
 and `maintenance` are real workspace names, not sentinels. **Accepted ambiguity:** a
@@ -198,9 +205,11 @@ reports `embedding_backfill_pending: 0`.
 Why deferral and not batching: embedding cost grows steeply with text length
 (~0.4s per 2000-char chunk on CPU), and import writes hundreds of chunks, so an
 inline embed held the apply request for minutes. **`embed_batch()` is not the
-fix** — measured on real import text it is ~25% *slower* than looping `embed()`,
-because one 2000-char chunk already fills the model's micro-batch (`n_ubatch ==
-n_ctx == 2048`), so grouping adds padding with no parallelism to reclaim.
+fix** — measured on real import text it is ~25% *slower* than looping `embed()`.
+That measured workload result, rather than the physical micro-batch size, is the
+reason imports defer the work: llama.cpp now decodes each input in bounded
+512-token physical batches while retaining the full 2,048-token logical batch
+and context.
 
 `backfill_missing_embeddings()` requires numpy but **not faiss**. Faiss is an
 optional accelerator and not a declared dependency, so gating the sweep on it
@@ -221,13 +230,7 @@ The plan is per-item, not per-category: each entry carries `source_id`,
 and the **predicted** status (see status vocabulary). A category-level count
 alone is not a valid plan.
 
-**The plan is advisory, not authoritative.** `apply_import()` re-scans the
-source from disk and never trusts payloads echoed back by the client; only
-`(source_id, category_id)` pairs are read out of the submitted plan, filtered
-against `SOURCE_IDS`/`CATEGORY_IDS`. Consequently a preview status may differ
-from the applied status when the source changed in between. `apply_import()`
-returns per-item outcomes so the caller can report exactly which items diverged
-from their prediction; it MUST NOT silently present the preview as the result.
+**The plan is advisory, not authoritative.** `apply_import()` re-scans the source from disk and never writes item payloads echoed by the client. `_parse_selection()` validates the request shape and category ids, `_select_fresh_plan()` admits only `(source_id, category_id)` pairs offered by a fresh engine plan, and `_selected_pairs()` retains only source ids in that plan plus `CATEGORY_IDS`. The plan remains the identity authority when a provider fails closed between preview and apply, so a client cannot select an unplanned source. Consequently a preview status may differ from the applied status when the source changed in between. `apply_import()` returns per-item outcomes so the caller can report exactly which items diverged from their prediction; it MUST NOT silently present the preview as the result.
 
 ## Conflict strategy (user-selectable)
 
@@ -236,7 +239,7 @@ request carries a strategy; the default is the safest one.
 
 | Strategy | Behavior |
 |----------|----------|
-| `skip` (**default**) | Keep KiroCrew's existing item untouched; report the incoming one as `conflict`. |
+| `skip` (**default**) | Keep Kiro Crew's existing item untouched; report the incoming one as `conflict`. |
 | `rename` | Import alongside the existing item under a derived non-colliding name. |
 | `overwrite` | Replace the existing item, after writing a restore copy. |
 
@@ -246,7 +249,7 @@ Applicability and rename derivation per category:
 |----------|-----------|-------------|
 | `skills` | skip · rename · overwrite | `<name>-imported-<source>`, then `<name>-<fingerprint[:8]>` |
 | `mcp_servers` | skip · rename · overwrite | `<name>-<source>`, then `<name>-<fingerprint[:8]>` |
-| `workspaces` | skip · rename | `base-<source>`, then `base-<fp[:8]>`. **Behavior change:** the pre-existing three-step ladder silently suffixed on a name collision; that is a rename, so it now requires `rename`. Plain `skip` reports the collision. |
+| `workspaces` | skip · rename | `base-<source>`, then `base-<fp[:8]>`. `skip` reports a collision; suffix derivation occurs only under `rename`. |
 | `instructions`, `memories` | n/a — merge-only, never collide destructively | — |
 | `denied_commands`, `settings` | n/a — merge-missing only | — |
 | `schedules` | skip only — a duplicate schedule is matched by `_same_schedule` | — |
@@ -287,11 +290,7 @@ Rules:
 - A strategy is chosen **per apply request**, applying to every item in it. A
   finer-grained per-item choice is a UI concern layered on top: the UI may issue
   several apply requests with different strategies.
-- `rename` exists specifically to give the user a way out of an otherwise
-  terminal conflict. Before it existed, an upstream edit to an
-  already-imported skill or MCP server produced a permanent `conflict` with no
-  resolution path, because the item fingerprint covers the content digest and
-  therefore did not match the ledger.
+- `rename` lets the user resolve a collision caused by a source edit: a changed skill or MCP server has a different content-derived fingerprint, so it does not match the ledger record for the installed item.
 
 ## Idempotency and deduplication
 
@@ -378,9 +377,8 @@ This vocabulary is the frontend contract — the UI MUST NOT invent a fifth stat
 | `conflict` | `rejected` | Destination holds a different item; resolvable via strategy |
 | `rejected` | `rejected` | Refused by a safety or validity gate; not resolvable via strategy |
 
-Apply also returns `skipped` entries (source unavailable, scan diagnostics,
-`workspace_target_required`) which are **not** item outcomes — they describe
-things never attempted.
+Apply also returns `skipped` entries (source unavailable, scan diagnostics)
+which are **not** item outcomes — they describe things never attempted.
 
 ## Per-source assumptions
 
@@ -392,16 +390,97 @@ MUST be covered by a fixture-based regression test.
 |--------|------------------------------|--------------------|
 | `codex` | `CODEX_HOME` → `~/.codex` | `config.toml`; `AGENTS.md` (instructions); `memories/*.md`; `skills/` (excl. `.system`); `memories*.sqlite*` reported unsupported |
 | `claude_code` | `CLAUDE_CONFIG_DIR`/`CLAUDE_HOME` → `~/.claude`; also `~/.claude.json` | `CLAUDE.md`; `rules/*.md`; `settings.json`/`settings.local.json` (`permissions.deny`); `memory/`; `skills/`; per-workspace `.claude/` |
-| `meshclaw` | `MESHCLAW_HOME` → `~/.meshclaw` | SQLite memory DB (`memory.db`: `semantic_memory` + `episodic_memories`; `workspace_id` holds the sentinel `default`, and `kind='directive'` marks a rule — see the two sections above); skills; config; `workspace/AGENTS.md` + `workspace/CLAUDE.md` and the same two per configured workspace. Only those canonical filenames are read — the MeshClaw workspace holds arbitrary user documents, so a blind `*.md` sweep there is wrong |
+| `gemini` | `GEMINI_HOME`/`ANTIGRAVITY_HOME` → `~/.gemini` | Four probed config layouts, because Antigravity is closed-source and its subpath has moved between releases: `config/mcp_config.json` (**the live Antigravity path**, confirmed against a real install), `settings.json` (legacy Gemini CLI), `antigravity/mcp_config.json` and `antigravity-cli/settings.json` (older/absent layouts — kept as cheap hedges; `antigravity/` is runtime state, not config). `GEMINI.md` (instructions, hierarchical: root + per workspace); `skills/` only if it is a `SKILL.md` package; per-workspace `.gemini/settings.json` and `.agents/mcp_config.json`. Workspaces come from `config/projects/*.json` — one file per project, folder held as a percent-encoded `file://` URI under `projectResources.resources[].folderUri` — NOT from a `projects` map. That URI is decoded with `urllib.request.url2pathname`, not a bare `unquote`: on Windows the URI is `file:///C:/Users/...` and stripping the scheme alone leaves `/C:/Users/...`, which carries no drive and so is not absolute, which would refuse every workspace as `workspace_not_absolute`; `url2pathname` is the platform-correct inverse (plain unquoting on POSIX, drive reconstruction on Windows). **MCP shape normalization (all three verified against a real install, and required: without them a real Antigravity install imports ZERO of its servers):** `httpUrl`/`serverUrl` → canonical `url`; drop the inert `$typeName` protobuf discriminator (`exa.cascade_plugins_pb.CascadePluginCommandTemplate`) that Antigravity stamps on every stdio entry; drop `env` **only when empty** (the key name matches `_SECRET_KEY_RE`, so an empty map would otherwise score as a credential and refuse the server). A populated `env` is deliberately left untouched and still refused — stripping it would both change how the server runs and hide that secrets were present. `userSettings.themeMode` is not mapped |
 | `openclaw` | `OPENCLAW_STATE_DIR` → `OPENCLAW_HOME`/`<state>` → `~/.openclaw-<profile>` → `~/.openclaw` → `~/.clawdbot` | `openclaw.json` (+ legacy `clawdbot.json`); `SOUL.md`, `MEMORY.md`, `USER.md`, `memory/*.md` under `workspace/` \| `workspace-main/` \| `workspace-<agentId>/`; `skills/`, `.agents/skills/`; `exec-approvals.json` |
 | `hermes` | `HERMES_HOME`/`HERMES_AGENT_HOME`/`HERMES_CONFIG_DIR` → `%LOCALAPPDATA%/hermes` (Windows) → `~/.hermes` | `config.yaml`/`.yml`; `memories/MEMORY.md`, `memories/USER.md`; `SOUL.md`; `skills/` (excl. managed + re-import dirs); `cron/jobs.json`; `memory_store.db` reported unsupported |
+| a registered lineage source | whatever the descriptor declares | Kiro Crew's OWN layout, read by `_scan_lineage_install`: `config.json`, `mcp.json`, `recent_projects.json`, `workspace_dir`/`project_dir` pointers, `workspace/skills`, `workspace/memory`, `crons.json`, and `memory.db` (`semantic_memory` + `episodic_memories`; `workspace_id` holds the sentinel `default`, and `kind='directive'` marks a rule — see the two sections above). Only the canonical `workspace/AGENTS.md` + `workspace/CLAUDE.md` filenames are read, and the same two per configured workspace — that tree holds arbitrary user documents, so a blind `*.md` sweep there is wrong |
+
+## Registering a source
+
+The five builtins above are the foreign agents any user may plausibly have
+installed. An edition that supersedes a predecessor of its own registers it
+instead of the core naming it, which is what keeps an edition-specific product
+name out of this tree.
+
+`ImportSourceProvider.import_sources()` (CPP seam, public default `[]`) returns `ImportSource` descriptors. A descriptor says WHERE an install is: `id` (normalized by the engine registry), `display_name` (carried by the engine plan to the dashboard), `env_vars` + `home_dir` (where it lives), `managed_mcp_names` (that agent's own MCP servers, never imported), and `superseded` + `stale_mcp_binaries` (see below).
+
+**A descriptor does not supply reader code, and does not choose a reader.** The
+engine does all reading with its own helpers, which is what keeps credential
+redaction, prompt-injection screening, sensitive-path refusal, size caps and
+symlink rejection applying to a registered source exactly as they do to a built-in
+one — those gates live inside ten separate read helpers, so a seam that accepted a
+scanner callable would hand an edition the engine's internal accumulator and
+depend on it to re-implement every one of them. A registered source is read as an
+install of **Kiro Crew's own on-disk layout** by `_scan_lineage_install` — a
+predecessor, a rename, or a fork, which is the case an edition actually has. A
+genuinely novel foreign format needs a reader added to the core, because only the
+core can read it through the gates; when a second layout exists, naming one
+becomes an additive default-valued field on this same seam.
+
+`_sources()` unions contributions over the builtins for every scan and apply registry snapshot, read fail-closed through `safe_context_call` — a broken adapter costs the edition's sources, not the page. `_source_summary()` carries the resolved id and display name in that snapshot into the plan, so consumers do not perform a second registry lookup.
+
+**Everything questionable about a descriptor is settled at one boundary.**
+`_normalize_source` is the only place that validates and canonicalizes, and BOTH
+groups pass through it, so a builtin cannot travel a laxer path than the rule it
+models and no consumer re-derives a field. It emits an internal `_Source` record:
+ids are shape-checked, names are casefolded, and a launcher name is version-
+stripped before the shared-runtime refusal. A descriptor is DROPPED with a reason
+when it:
+
+- has no id, an id that does not match `^[a-z0-9][a-z0-9_]*$`, or an id already
+  registered (the id becomes a **path segment** — imported skills land in
+  `skills/imported/<source_id>/` — so a separator or parent reference would place
+  content outside the tree it is namespaced into, and shadowing would silently
+  change what an existing id imports);
+- declares neither `env_vars` nor `home_dir`;
+- declares a `home_dir` that is not a single directory name (absolute, nested,
+  `..`, over 255 characters, or containing a NUL);
+- claims a shared runtime in `stale_mcp_binaries` — `node`, `python3.12`,
+  `node-22.1` and any other versioned spelling all reduce to the same refusal, as
+  do letter-suffixed aliases version stripping cannot collapse (`nodejs`), shebang
+  wrappers (`env`) and multi-call binaries (`busybox`). That list drives deletion
+  from the user's global config, so claiming an interpreter would reclaim every
+  MCP server that happens to run on it. An agent's launcher is its own name,
+  never the interpreter it starts.
+
+  That list is **mistake-mitigation, not a security boundary**, and an edition
+  authoring a descriptor should read it that way. It cannot be complete — every
+  language ships an interpreter, and `lua`, `julia` and `rscript` were only added
+  after a review pointed out their absence — so a descriptor naming one that is
+  still missing is refused by review, not by this guard. What makes that
+  acceptable is the trust level of the input: descriptors are edition code,
+  shipped and reviewed like the core, never user- or network-supplied.
+  `stale_mcp_binaries` is the one field that causes **deletion** from the user's
+  config, so it is the field to scrutinise hardest when reviewing a descriptor.
+
+A source declaring only `env_vars`, with none of them set, is left **unresolved**
+rather than defaulting to the user's home root — `base_home / ""` is the entire
+home, and scanning it would walk every file the user owns. Callers treat an absent
+root as "not installed".
+
+A scanner that raises is reported as a `scanner_failed` diagnostic and its partial
+findings are discarded: one unreadable source must not deny the user the others,
+and half of a source we now know we cannot read correctly must not be offered as
+importable data.
+
+A **lineage source** — a predecessor, a rename, or a fork that writes this
+product's own on-disk layout — needs no reader of its own and names none: the
+engine reads every registered source with `_scan_lineage_install`. That is the
+shape an edition migrating its users off a predecessor of its own registers.
+
+**`superseded` is not implied by registration.** Only an agent this product
+REPLACES has its leftovers reclaimed from the user's global provider config
+(`mcp_cleanup`, by server name and by launcher basename). A live foreign agent's
+managed servers are skipped on import but never purged — OpenClaw is the shipped
+instance of that distinction, and purging its entries would delete servers the
+user is still running.
 
 ### Transitive re-import (Hermes)
 
 Hermes's own import tooling writes foreign skills into
 `skills/claude-code-imports/`, `skills/codex-imports/`, and
 `skills/openclaw-imports/`, and merges foreign `MEMORY.md`/`USER.md` into its
-own. A user who migrated Claude Code → Hermes → KiroCrew would otherwise import
+own. A user who migrated Claude Code → Hermes → Kiro Crew would otherwise import
 the same skill twice under two different `source_id`s — which **neither** the
 fingerprint (source-scoped) **nor** the destination check (different target dir)
 can catch.
@@ -423,11 +502,50 @@ evil (see the dedupe limitation above).
 All three endpoints are dashboard-owner-only and audited. `request["app"]` MUST
 be `""` — an app token is never a dashboard user.
 
+### Filesystem probes on foreign-supplied paths MUST NOT raise
+
+A scanner builds candidate config paths from workspace paths the foreign config
+named, so those paths are attacker-influenced. `Path.exists()` / `is_file()` /
+`is_dir()` re-raise any errno pathlib does not read as "absent" — its ignored set
+is ENOENT/ENOTDIR/EBADF/ELOOP and does **not** include **ENAMETOOLONG**. An
+escaping `OSError` reaches `_scan_response` and returns **HTTP 500**, breaking the
+wizard for every source rather than skipping one path.
+
+The trigger is **per-component**, not total length: `NAME_MAX` is 255 on both
+macOS and Linux, while `PATH_MAX` is 1024 / 4096, so a 301-character path is far
+below any total ceiling and still fails to stat. A total-length guard alone
+cannot close this.
+
+Two layers, both required:
+
+1. `_exists_safe` / `_is_file_safe` / `_is_dir_safe` are the only probes used on a
+   foreign-supplied path (`_walk_files`, `_named_descendant_dirs`,
+   `_add_memory_files`, `_add_instruction_files`, `_parse_configs`). They answer
+   "absent" on `OSError`, because an unprobeable candidate is exactly a candidate
+   to skip. This is what protects every source, not just the newest one.
+2. `_bounded_workspaces` rejects a path whose total exceeds
+   `_MAX_WORKSPACE_PATH_CHARS` or whose any component exceeds
+   `_MAX_WORKSPACE_COMPONENT_CHARS`, with a `workspace_path_too_long`
+   diagnostic — so the user sees a reason in "Not imported" instead of a silent
+   skip.
+
+### Source identity has one authority
+
+The engine owns source identity. `_sources()` resolves and normalizes the registry once per preview or apply operation, and `_source_summary()` carries its id and display name into the plan. The handler's `_parse_selection()` accepts bounded request shapes and known categories without maintaining a second source-id table; `_select_fresh_plan()` intersects client choices with the freshly generated plan before calling `apply_import()`. `AgentImportFlow.tsx` keeps a denylist only for the reserved `quick` setup mode, so registered sources remain visible. This prevents a registered source from being hidden or a transient registry read from turning an accepted plan into an HTTP error; `test_handler_category_tables_match_the_backend` and `test_selection_survives_a_registry_that_no_longer_lists_the_source` pin the seams.
+
 | Endpoint | Phase | Body |
 |----------|-------|------|
 | `GET /api/onboarding/import/scan` | detect + dry run | — |
 | `POST /api/onboarding/import/apply` | apply | `{sources: [{id, categories: [...]}], conflict_strategy?}` — `conflict_strategy` is one of `skip`/`rename`/`overwrite`; absent = `skip`, unrecognized = 400 |
-| `POST /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
+| `PUT /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
+
+Each endpoint is owner-only: the handlers call `require_owner_dashboard_request`
+after authentication. With no `owner_id` configured the gate accepts the signed
+local bootstrap subjects (`local-app`, `local-startup`), which is the identity
+the onboarding flow runs as; once an owner exists, a stale pre-owner session
+gets the 401 re-auth answer and every other non-owner subject gets a 403
+`owner_only` denial. `test_agent_config_owner_gate_invariant.py` walks the two
+mutating routes as part of its gated-route invariant.
 
 Concurrency: apply holds a module-level import lock. Config-writing categories
 run under the config lock; `mcp_servers` runs in a separate phase **outside**
@@ -443,32 +561,22 @@ reported independently. `embedding_backfill_pending` is **backend-only** — it
 tells the handler to schedule the embedding sweep and MUST NOT cross into the
 browser (the HTTP `summary` does not carry it).
 
-## Session-import removal
+## No session import
 
-Session/transcript import is removed. The removal deletes the categories'
-scanners, writers, and their supporting machinery:
+**Session and transcript import does not exist, and must not be added back.**
+`sessions` is not a member of `CATEGORY_IDS`; there is no session scanner, no
+session writer, no session provenance classifier, no per-session read inside
+`_scan_hermes_db` or `_scan_lineage_memory_db`, no transcript-hash branch in
+`_deduplicate_items`, and no `conversation_log` plumbing through `apply_import`
+or the handler. A reader looking for the deleted symbol names will find them in
+git history, not here.
 
-- `sessions` from `CATEGORY_IDS`; `_write_session`, `_session_destination_key`
-- `_jsonl_session_items`, `_message_from_record`, `_extract_visible_content`,
-  `_claude_record_is_excluded`, `_without_runtime_sessions`,
-  `_add_sessions_and_workspaces`, `_record_workspaces`
-- the OpenClaw session-provenance set: `_OPENCLAW_RUNTIME_NAMESPACES`,
-  `_OPENCLAW_SESSION_OWNERSHIP_FIELDS`, `_OPENCLAW_CHECKPOINT_RE`,
-  `_OPENCLAW_CREATED_VIA`, `_openclaw_session_provenance_is_user_owned`,
-  `_openclaw_session_paths`, `_openclaw_session_artifact`,
-  `_openclaw_entry_matches_file`, `_openclaw_registry_map`
-- session reads in `_scan_hermes_db` / `_scan_meshclaw_memory_db`, and
-  `_HERMES_RUNTIME_SESSION_SOURCES`
-- the `sessions` branch of `_deduplicate_items` (transcript-hash canonicalization)
-- session-only limits: `_MAX_JSONL_LINES`, `_MAX_MESSAGES_PER_SESSION`,
-  `_MAX_LINE_BYTES`, `_VISIBLE_ROLES`, `_VISIBLE_TEXT_TYPES`, `_NON_TEXT_TYPES`
-- `conversation_log` plumbing through `apply_import` and the handler
-
-**Consequence for workspace discovery.** Workspaces were partly discovered by
-reading workspace paths out of session records. After removal, workspace
-discovery comes only from explicit configuration (`_collect_project_paths` and
-each source's config-declared workspace values). This narrows coverage; it does
-not break it. Do not reintroduce a session read to widen it.
+**Consequence for workspace discovery.** Workspace discovery comes only from
+explicit configuration — `_collect_project_paths` plus each source's
+config-declared workspace values. Reading workspace paths out of session records
+would widen coverage, which is exactly why it is not done: importing another
+agent's transcripts is not something a user consented to by importing its
+config. The narrower coverage is the deliberate trade.
 
 **Ledger compatibility.** Existing ledgers may contain `category_id:
 "sessions"` records. They are inert: no scanner produces a `sessions` item, so
@@ -481,9 +589,7 @@ wrote under a previous version.
 
 These are load-bearing. Changing any of them requires a security review.
 
-1. **Apply re-scans from disk.** No payload from the HTTP client is ever
-   written. Only `(source_id, category_id)` pairs, allowlist-filtered, are read
-   from the submitted plan.
+1. **Apply re-scans from disk against a fresh engine plan.** No item payload from the HTTP client is written. `_parse_selection()` validates bounded request shape and category ids; `_select_fresh_plan()` admits only `(source_id, category_id)` pairs offered by fresh `preview_import()`, and `_selected_pairs()` keeps only source ids in that plan plus `CATEGORY_IDS`. The plan remains the identity authority even if a provider fails closed between preview and apply; a client cannot select an unplanned source.
 2. **Credentials are never read.** Known credential files are not opened;
    secret-shaped MCP `env`/`headers` keys and URL-embedded secrets are stripped
    and counted, never stored.

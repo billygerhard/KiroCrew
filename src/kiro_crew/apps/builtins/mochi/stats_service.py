@@ -179,7 +179,7 @@ def parse_stats_json(raw: str, now_ms: int) -> CompanionStats:
     """Parse persisted stats; any corruption yields defaults, never a throw."""
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return create_default_stats(now_ms)
     if not isinstance(parsed, dict):
         return create_default_stats(now_ms)
@@ -270,7 +270,7 @@ class StatsService:
 
         Dispatched off the event loop (``asyncio.to_thread``) and held under
         ``self._lock`` so it is mutually exclusive with tick()/flush(): a due
-        flush running in another worker thread can no longer rewrite a stale
+        flush running in another worker thread cannot rewrite a stale
         in-memory snapshot back over the wipe. The dirty flag, the pending flush
         deadline, and the session counter are cleared first so a tick right after
         the lock is released cannot resurrect pre-reset state. Returns True if a

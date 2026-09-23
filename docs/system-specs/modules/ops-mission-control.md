@@ -159,7 +159,7 @@ not that git resolves them for you. Two things make it work:
 Measured end to end: two divergent ledgers → real `git merge` → conflicted file → 4 raw
 entries read as **3**, shared lesson collapsed with both fingerprints preserved.
 
-#### 2a. Record format version (`LedgerEntry.v`, `LEDGER_RECORD_V1 = 1`)
+### 2a. Record format version (`LedgerEntry.v`, `LEDGER_RECORD_V1 = 1`)
 
 `ledger.jsonl` is the one artifact that **leaves the machine**: `ledger_sync` git-pushes it
 and teammates on *different Kiro Crew builds* pull it, so an older instance can be handed a
@@ -269,7 +269,7 @@ misleading rows.
 each one HALF of the bar, so neither answers "how much of this ledger would an agent
 propose without checking" — showing only those two overstated the ledger's authority.
 
-### 2a. The sync loop, and where it is driven from
+### 2c. The sync loop, and where it is driven from
 
 The daily `ledger-hygiene` pass (`POST /ledger/hygiene`) is the only caller of the git
 transport and the vector index. Order is load-bearing: **pull → hygiene → index → push**.
@@ -285,7 +285,7 @@ can be individually correct and collectively dead; only an integration caller pr
 otherwise.
 
 **Four fatal bugs were found by a real two-instance roundtrip against a bare remote,
-every one of which the mocked-git tests passed** (`tests/test_ledger_sync_git.py`):
+every one of which the mocked-git tests passed** (`test/test_omc_ledger_sync_coverage.py`):
 
 1. **The first push in a fresh process always failed.** The sandbox backend probe defers
    off the event loop on a cold cache and raises a self-described *transient* error saying
@@ -725,14 +725,21 @@ Four narrow Protocols, each with a shipped default, following the CPP pattern in
 
 | Protocol | Question | Public adapters |
 |---|---|---|
-| `SignalSource` | What is firing? | `cloudwatch`, `pagerduty`, `datadog`, `github-issues`, `webhook` |
-| `RotationSource` | Who is on shift? | `pagerduty`, `always-on` (default) |
-| `ActionSink` | Ack / resolve / comment / silence | `pagerduty`, `datadog`, `github-issues`, `noop` (default) |
+| `SignalSource` | What is firing? | `cloudwatch`, `pagerduty`, `incidentio`, `datadog`, `github-issues`, `webhook` |
+| `RotationSource` | Who is on shift? | `pagerduty`, `incidentio`, `always-on` (default) |
+| `ActionSink` | Ack / resolve / comment / silence | `pagerduty`, `incidentio`, `datadog`, `github-issues`, `noop` (default) |
 | `EvidenceSource` | Surrounding context | `cloudwatch-evidence`, `datadog-evidence` |
 
 Split four ways rather than one fat interface because real providers cover
 different subsets — CloudWatch has alarms and metrics but no rotation and nothing
 to resolve.
+
+A sink also covers only the verbs its provider actually has. `incidentio` offers
+`resolve` and `comment` and nothing else: an incident.io alert's status is a strict
+`firing`/`resolved` enum with no acknowledged state, and the API has no snooze, mute
+or suppress call for a single alert (a maintenance window is account-level config).
+Advertising a verb the provider cannot perform would pass the autonomy gate and then
+fail at execute time, after the board had recorded the action as granted.
 
 ### Evidence is brokered to the agent, never delegated
 
@@ -862,8 +869,8 @@ treating garbage as false silently disables a detection the operator believes is
 and treating it as true silently enables one they never asked for. `_FALSY` is
 therefore listed explicitly rather than inferred as "not truthy".
 
-`INSUFFICIENT_DATA` is the CloudWatch equivalent of a *table freshness*
-checks — a pipeline that silently stopped running looks healthy when you only watch
+`INSUFFICIENT_DATA` is the CloudWatch equivalent of a *table-freshness*
+check — a pipeline that silently stopped running looks healthy when you only watch
 `ALARM`. It stays opt-in (noisy on accounts with idle resources), but the provider
 `detail` now says so, because an opt-in nobody is told about is one nobody uses.
 
@@ -1121,14 +1128,45 @@ defense-in-depth on top of it, not the boundary. Two tests pin both halves: the 
 are denied, and the `chr()`/two-step forms are the acknowledged gap.
 The STDIN forms are the same escape with no operand at all: `python -` and a bare interpreter
 read the program from stdin, so `python - <<'PY' … PY` and `echo '…' | python -` reach the CLI
-with the payload nowhere in argv. When that program text is visible on the command line — a
-heredoc body (later tokens) or a pipe producer (earlier tokens) — the import is matched across
-the whole frame and denied; when it is not (a file redirect, a bare `python -` fed by an unseen
-producer) there is nothing to match and the residual is noted rather than claimed as covered.
-`_python_reads_stdin` is precise (it consumes operand-flags and heredoc tags) so `python
-script.py`, `python -c …`, and `cat kiro_crew_notes.txt | python -` do not trip it, and the
-inline-program scan bails at the interpreter's first positional so the ReDoS-resistance budget
-still holds on spam input. Found in review (GPT 5.6).
+with the payload nowhere in argv. When that program text is visible on the command line the
+import is matched in the tokens that actually CARRY it, and nowhere else in the frame. The
+carriers are enumerated from the shell grammar rather than by example: a heredoc body
+(`<<TAG` / `<<-TAG`), a here-string operand (`<<<WORD`, whose word IS the program), a redirected
+file (`<WORD`), a process substitution (`< <(cmd)`, whose command text spans tokens to its
+closing paren), and a pipe producer. A redirection may appear ANYWHERE in a simple command, the
+program name included, so the whole frame is walked in ONE pass and a redirect glued to a word is
+classified from its first `<` onward — `<<'PY' python -`, `<prog.py python3 -`, `python3<<<'…'`
+and `<<EOF python - … EOF` (marker and body straddling the program name) are all ordinary bash
+reaching the identical mint. Only redirect OPERANDS are yielded, so a neighbouring command's
+ordinary argument is still never program text. `<&N` carries no text on the
+command line and is a stated residual. A heredoc's body ends at the LAST token equal to its
+tag: bash closes a heredoc only on a line holding the delimiter ALONE, and line structure does
+not survive tokenizing, so a body line that merely CONTAINS the word (`# EOF`, an ordinary
+comment) closed it early and left the real payload unscanned. A redirect OPERAND that opens a
+substitution (`$( )`, `<( )`, `${ }`, backticks) is one shell WORD whose text carries
+whitespace, so it too spans tokens — to the LAST matching closer, because `normalize_shell_command`
+strips quoting before this code runs, so a quoted delimiter is indistinguishable from a real one
+and balancing the count is not decidable. `_python_reads_stdin` consumes redirect operands
+through the same helper, so the detector and the carrier scope agree on where an operand ends;
+it also now answers True for `python < prog.py`, which does read its program from that file.
+Scanning the whole frame was a false-positive source: a frame is not split on a newline, so a
+neighbouring command naming the package in a FILE PATH (`isort src/kiro_crew/mcp_core.py`
+followed by any harmless heredoc) read as a mint with no `token` word present (#2660). The pipe
+is detected as a CHARACTER left of or glued into the interpreter token, not as a standalone `|`
+word: the tokenizer splits on whitespace only, so `echo '…'|python -` hands the operator over
+glued to a neighbour and `_program_basename` resolves the program from the last control-operator
+segment. Any pipe to the left qualifies the whole left side — a deliberate over-block, since a
+missed producer is a bypass while an extra token is a visible refusal. When the program text is
+NOT on the command line (a bare `python -` fed by an unseen producer, or a file written earlier
+and then redirected in) there is nothing to match and the residual is noted rather than claimed
+as covered — the same residual the written-then-run script form already has.
+`_python_reads_stdin` is precise (it consumes operand-flags and skips a heredoc's marker, body
+and closing tag, and a here-string's operand, read off the raw token because the operand
+normaliser strips a redirection to the empty string; a heredoc's closing tag ENDS the command,
+so a following `echo ok` is not read as this interpreter's script) so `python script.py`,
+`python -c …`, and `cat kiro_crew_notes.txt | python -`
+do not trip it, and the inline-program scan bails at the interpreter's first positional so the
+ReDoS-resistance budget still holds on spam input. Found in review (GPT 5.6).
 
 **There is deliberately NO migration from `config.json`, and adding one is the trap.** An
 interim revision had `migrate_from_config_if_needed`: on first read, if no keystone file
@@ -1277,7 +1315,7 @@ reporting `on_shift=False` refused the write; `enabled: false` returned "granted
 cloudwatch" for the same signal.
 
 \#5 is fenced exactly like #1 (`policy_store.PAGERDUTY_USER_KEY`, dropped from `config_fields`,
-written by `PUT /settings`). Both identities are reported back on `GET /rotation` under
+written by `PUT /settings`). All three identities are reported back on `GET /rotation` under
 `identities` so Settings can render and edit them — the provider catalog no longer carries them,
 and an operator who cannot see which identity is stored cannot tell a wrong one from an unset
 one. An identity is not a credential, and `roster.me` already publishes the resolved login.
@@ -1913,9 +1951,11 @@ this is the one output a human is expected to forward by hand.
 
 ### Subprocess spawn
 
-`github_issues._run_gh` is the app's only subprocess spawn and is routed through
+`github_issues._run_gh` is the provider layer's GitHub spawn (the app also spawns
+`git` for ledger sync and `gh` for the rotation login — see "Windows
+compatibility" below) and is routed through
 **`sandboxed_spawn_argv`** (OS filesystem isolation + credential-scrubbed env) with
-a kernel resource ceiling from `resource_limit_preexec`. The repo, label set, and
+a kernel resource ceiling from `create_subprocess_limited`. The repo, label set, and
 comment body all come from agent-influenceable config, and `gh` reads the target
 repo's own config on the way — so this is an agent-influenced spawn in the sense
 `test/test_spawn_audit.py` polices, and it is routed rather than allowlisted.
@@ -2032,8 +2072,12 @@ in the adapter:
   assigned issues) so the post-filter count is not the truncation signal.
 - **PagerDuty** reads its response `more` flag — 100 is that endpoint's maximum `limit`, so a
   `limit + 1` request would be clamped and read back as a full page.
+- **incident.io** follows the `pagination_meta.after` cursor and derives the verdict after the
+  walk from the final count, because a page can both overshoot the cap and be terminal; a page
+  ceiling (`_MAX_ALERT_PAGES`) refuses a cursor walk that never terminates rather than reporting
+  a partial estate as complete.
 
-All four return `providers.base.TruncatedSignals` (a `list` subclass) when the source had more
+All five return `providers.base.TruncatedSignals` (a `list` subclass) when the source had more
 than a poll can carry, and `poll_all` marks the poll non-authoritative — the same
 `snapshot=False` channel, honoured even when a client-side filter brought the surviving count back
 under the cap. Found in review (GPT 5.6).
@@ -2439,18 +2483,16 @@ upstream of this app:
   looking card.
 - `CollapsibleToolGroup` rendered its approval buttons only when **collapsed** —
   but a group with a live pending approval auto-expands, so the one turn waiting on
-  the user was the one turn they could not answer. Pinned by
+  the user was the one turn they could not answer. Fixed in #5487: the approval
+  row (preview + buttons) now renders in both disclosure states. Pinned by
   `website/src/test/collapsibleToolGroupApproval.test.tsx`.
-- A **failed** approval rendered as "Approved". `submitDecision` optimistically flips the
-  card and relies on the promise `onApprove` returns to reject so its catch can roll that
-  back — but `ChatEmbed.handleApprove` called `approveMutation.mutate()`, which returns
-  `void` and swallows the rejection. So on a failed POST the card claimed success, the
-  buttons vanished, and the agent stayed parked on a decision that never reached it: silent
-  every time, with no way to retry. `mutateAsync` is now RETURNED, and the whole chain
-  forwards it (`ChatMessageList`'s intermediate arrow included, or the rejection dies in the
-  middle). The `onApprove` prop type widened to `void | Promise<unknown>` to say so. Two
-  tests: a rejecting handler must leave the card answerable, a resolving one must not roll
-  back — the first fails against the old fire-and-forget shape. Found in review.
+- A **failed** approval used to render as "Approved". `submitDecision` optimistically
+  flips the card and relies on the promise returned by `onApprove` to reject so its catch
+  can restore the buttons. `ChatEmbed` now returns `approveMutation.mutateAsync(...)`, and
+  `ChatMessageListProps.onApprove` requires `Promise<unknown>`, so a failed POST reaches
+  that rollback instead of leaving the agent parked behind an undelivered decision. Pinned
+  through the real message-list and tool-group chain by
+  `website/src/test/ChatEmbed.approvalRollback.test.tsx`.
 
 Layout: the embed scrolls via `h-full` + an inner `flex-1 overflow-y-auto`, so an
 ancestor MUST bound its height (`IncidentChat` owns a fixed-height flex column with
@@ -2661,8 +2703,8 @@ deep link: the page selects an incident from React state and reads no query para
 silent until an operator flips the toggle. Not a credential, so it lives in plain
 `config.json` alongside the Slack channel id.
 
-**Redacted at the producer, both passes**, matching `store.write_log` and
-`registry.gather_evidence` rather than `slack_out` (which runs core only). Measured, not
+**Redacted at the producer, both passes**, matching `store.write_log`,
+`registry.gather_evidence`, and `slack_out._safe`. Measured, not
 assumed: core `security.redact` leaves `401 from https://api.datadoghq.com?api_key=<hex>`
 untouched and `secrets.redact_tokens` catches it. `DashboardState._deliver_note` also
 redacts centrally, so this is belt-and-braces — and it is what earns the row in
@@ -2752,13 +2794,11 @@ nobody reads is the noise this app exists to avoid — so `sops/handover.md` shi
 
 ## Crons (manifest-declared)
 
-**`rotation-check` ships ENABLED; the other three ship paused.** This is a cold-start
-requirement, not an inconsistency. `dispatch` is armed by the `on_shift` tier, and the
-only thing that arms that tier is the rotation-check cron — and **nothing flips a
-manifest `enabled: false`**. Ship rotation-check paused too and a user enables the app,
-configures CloudWatch, and it never fires: the store listing's "the on-shift tier arms
-and disarms itself" was impossible. Found by asking what a stranger's install actually
-does, not by reading code.
+**`rotation-check` and `ledger-hygiene` ship ENABLED; `dispatch` and `reconcile`
+ship paused.** Only `on_shift` jobs may ship paused because `/rotation/arm` only changes
+that tier. `rotation-check` must start live to arm it; otherwise a user can enable the app
+and configure CloudWatch while dispatch never starts. `ledger-hygiene` starts live and
+is primary-gated by its route instead of by cron arming.
 
 Safe to arm because its SOP's **step 0** exits with no output when no provider reports
 `configured: true`, so a fresh install pays nothing for a 5-minute poller. Both halves
@@ -2858,13 +2898,15 @@ looking through.
 This app is portable, and the three places that could break it are pinned by tests rather
 than left to review:
 
-- **`preexec_fn` must come from `resource_limit_preexec()`.** Both external-binary spawns
-  (`git` for ledger sync, `gh` for the rotation login) pass it. The shim returns `None`
-  off POSIX, which is what makes them portable — `preexec_fn` is unsupported on Windows
-  and passing *any* callable, even a no-op, raises `ValueError`. A hand-rolled
-  `preexec_fn=lambda: ...` would work locally and fail on every Windows spawn; the test
-  asserts the shim appears on each `preexec_fn=` line (verified by temporarily swapping in
-  a raw lambda and watching it fail).
+- **Resource limits come from the shim wrappers, not a raw `preexec_fn`.** All three
+  external-binary spawn paths (`git` for ledger sync and `gh` for the rotation login or
+  GitHub Issues) route through `create_subprocess_limited` / `run_limited`, which deliver
+  the resource caps
+  after `exec` via the spawn shim and fall back to `resource_limit_preexec()` only on a
+  host with no usable shim. That fallback returns `None` off POSIX, which is what makes
+  the spawns portable — `preexec_fn` is unsupported on Windows and passing *any*
+  callable, even a no-op, raises `ValueError`. A hand-rolled `preexec_fn=lambda: ...`
+  would work locally and fail on every Windows spawn.
 - **No raw POSIX process calls** (`os.killpg`, `os.getpgid`, `os.getuid`, `fcntl.`,
   `signal.SIGKILL`), no `/bin/sh`, no `shell=True`, no hardcoded `/tmp`.
 - **Timezone lookup degrades to UTC.** `rotation.yaml` may name an IANA zone, and Windows
@@ -2908,21 +2950,23 @@ review time, not to simulate the platform.
   install, which is the only path that reaches end users. The cron prompts
   reference `~/.kiro/crew/skills/ops-mission-control/sops/<name>.md` accordingly.
 
-  **Every SOP carries the auth recipe, not just SKILL.md.** The SKILL and all six SOPs
+  **Every SOP names the credentialed tool, not a token recipe.** The SKILL and all six SOPs
   told the agent to call HTTP endpoints and never said how to authenticate. An
   unattended `rotation-check` run therefore improvised: it hardcoded a port belonging to
   a different gateway, collected `{"error": "Token required"}` **65 times**, spent **41
   tool calls** hunting for a token the cron runner *deliberately destroys* before the
   first tool call, and hit the 1800s cron timeout without ever reaching the API. That
-  reads to an operator as "the app is broken" when the fix was six lines of docs.
+  reads to an operator as "the app is broken".
 
-  The recipe derives base URL and token from one `kirocrew token` call and passes
-  `?token=`. It is repeated in each SOP because a cron agent may read **only** its own
-  SOP. Three tests guard it: every SOP mentions `kirocrew token` and `?token=`; no auth
-  code block contains a literal `host:port` (a hardcoded port was the original failure —
-  and this test caught one I had just written myself); and the block passes `bash -n`,
-  because `${URL%%\?*}` is easy to mangle in markdown and an unparseable snippet sends
-  the agent straight back to improvising.
+  A token recipe cannot fix this — the builtin security rules block agents from minting
+  gateway tokens, by design. Agent access goes through the `ops_mission_control_api`
+  MCP tool instead: the MCP server process holds the gateway's internal secret and
+  forwards only a frozen (method, path) allowlist; the agent never sees a credential
+  (the `issue_radar_record_investigation` precedent). Each SOP names the tool and its
+  paths because a cron agent may read **only** its own SOP. Tests pin the three planes
+  to one surface: the allowlist in `validation.py`, the schema rejecting off-surface
+  calls, and the gateway's mixed-internal path set admitting exactly the allowlisted
+  routes — see `apps/builtins/ops_mission_control/tests/test_agent_api_tool.py`.
 
   **The SOP→route contract scanner had silently narrowed to 4 of 10 endpoints.** It
   filtered lines on a literal `GATEWAY/api/apps/...` prefix, so rewriting the SOPs to
@@ -2969,7 +3013,7 @@ rather than real translations: that is the interim state the `i18n-translate.mjs
 is built to replace, and parity checks key sets, placeholders and non-emptiness rather than
 translation quality (only `destructiveConfirm.test.ts`'s three SchedulePage keys must
 genuinely differ). Producing real translations for ~330 keys × 9 languages remains open.
-Do NOT hand-edit `en.json` to add keys — it is generated by `scripts/i18n-codemod.mjs`.
+Do NOT hand-edit `en.json` to add keys — it is generated by `website/scripts/i18n-codemod.mjs`.
 
 **An INTERPOLATED English fragment is worse than an untranslated key**, and review found
 eight of them: a key can be translated later, but no catalog value can repair a sentence with
@@ -3068,7 +3112,8 @@ These are warnings, not errors, and `eslint` reports 0 errors for this file.
 Adapters for ticketing / on-call / pipeline systems that are not public products can
 live in a **separate companion package**, developed out of tree, reaching the core only
 through the ADD-only registry. This repo contains no reference to any such package
-beyond the neutral extension point; `scripts/scrub-lint.sh` gates the public tree.
+beyond the neutral extension point; the `internal-content-scan` check gates the
+public tree.
 
 ### The discovery seam (`backend/companion.py`)
 
@@ -3148,7 +3193,7 @@ line-anchored so a genuinely internal reference in that file is still caught.
 
 ## Tests
 
-`src/kiro_crew/apps/builtins/ops_mission_control/tests/` — 647 tests:
+`src/kiro_crew/apps/builtins/ops_mission_control/tests/` — 1,077 test methods across 22 files:
 
 - `test_models.py` — fingerprint stability, normalization fallbacks, transition
   grammar, mode algebra
@@ -3173,8 +3218,8 @@ line-anchored so a genuinely internal reference in that file is still caught.
   the MAX rather than the incoming value.
 - `test_config_routes.py` — **secret field refused on the config route**, unknown
   field/provider refused, merge preserves untouched fields, invalid mode refused,
-  and manifest-cron assertions (all four present, all paused, all silent and
-  stateless, exactly one schedule each)
+  and manifest-cron assertions (all four present, only `on_shift` jobs paused,
+  all silent and stateless, exactly one schedule each)
 
 Frontend: `website/src/test/opsMissionControl.test.ts` (route registration, panel-parity
 assertions read from the .tsx source, and the pure helpers `describeSourceHealth` /

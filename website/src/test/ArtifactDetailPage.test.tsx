@@ -1,10 +1,19 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import type { MockedFunction } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import type { Artifact } from '../types'
+
+// The sandboxed frames mint their document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
 
 vi.mock('../api/client')
 // Stub the embedded chat page (companion chat) — its rendering is covered by its
@@ -64,13 +73,13 @@ async function versionRowLabels() {
 describe('ArtifactDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    // jsdom needs URL.createObjectURL for blob iframes
-    if (!URL.createObjectURL) {
-      // @ts-expect-error stub
-      URL.createObjectURL = vi.fn().mockReturnValue('blob:test')
-      // @ts-expect-error stub
-      URL.revokeObjectURL = vi.fn()
-    }
+    // Spy rather than assign: only a spy lands in the registry that
+    // vi.restoreAllMocks() can undo. The env provides both natively.
+    // Well-formed blob: URI, not a bare 'blob:test' literal — see the note in
+    // WidgetFrame.test.tsx's beforeEach for why a malformed mock value here
+    // risks a deferred ECONNREFUSED crashing an unrelated shard.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:http://localhost:6776/test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     // Default events response so the events query never throws "undefined".
     // Individual tests can override this with .mockResolvedValueOnce when
     // they need a specific event log.
@@ -92,6 +101,10 @@ describe('ArtifactDetailPage', () => {
     vi.mocked(api).chatSlots = vi.fn().mockResolvedValue([])
   })
 
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders artifact metadata and iframe', async () => {
     vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact())
     vi.mocked(api).artifactVersions = vi
@@ -106,6 +119,76 @@ describe('ArtifactDetailPage', () => {
     // the blob URL (async); findByTitle waits for it. A synchronous getByTitle
     // races the effect under coverage instrumentation (CI-only flake).
     expect(await screen.findByTitle(/Artifact: cr-queue/)).toBeInTheDocument()
+  })
+
+  it('renders an image artifact as an <img> from the asset URL with a download control and no editor/iframe', async () => {
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png', alt: 'A bar chart' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+    // The image renders straight from the asset endpoint (no base64 in JSON).
+    const img = screen.getByAltText('A bar chart') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('/api/artifacts/cr-queue/asset')
+    // Download control points at the same URL and names the file.
+    const anchor = document.querySelector('a[download]') as HTMLAnchorElement | null
+    expect(anchor?.getAttribute('href')).toBe('/api/artifacts/cr-queue/asset')
+    expect(anchor?.getAttribute('download')).toBe('chart.png')
+    // Image is not editable: no Monaco textarea, no widget iframe body.
+    expect(document.querySelector('.monaco-editor')).toBeNull()
+    expect(document.querySelector('iframe')).toBeNull()
+    // The kind badge reads "image".
+    expect(screen.getByText('image')).toBeInTheDocument()
+  })
+
+  it('header Download for an image artifact targets the asset URL, not an empty .html blob', async () => {
+    // The header Download is the habituated spot; for images it must deliver the
+    // real bytes. `artifact.content` is empty by design for kind: 'image', so
+    // blobbing it would silently hand the user a junk `Name-v1.html`.
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+
+    const clicked: { href?: string; download?: string } = {}
+    const realCreate = document.createElement.bind(document)
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement
+      if (tag === 'a') {
+        // Capture what the synthetic anchor was pointed at instead of navigating.
+        Object.defineProperty(el, 'click', {
+          value: () => {
+            clicked.href = (el as HTMLAnchorElement).getAttribute('href') ?? undefined
+            clicked.download = (el as HTMLAnchorElement).getAttribute('download') ?? undefined
+          },
+        })
+      }
+      return el
+    })
+    try {
+      fireEvent.click(screen.getByLabelText('Download'))
+    } finally {
+      createSpy.mockRestore()
+    }
+
+    expect(clicked.href).toBe('/api/artifacts/cr-queue/asset')
+    expect(clicked.download).toBe('chart.png')
+    expect(clicked.href).not.toMatch(/^blob:/)
   })
 
   it('keeps the comment sidebar collapsed when the artifact has no comments', async () => {
@@ -159,11 +242,11 @@ describe('ArtifactDetailPage', () => {
     })
     vi.mocked(api).artifact = vi.fn((s: string) =>
       Promise.resolve(mkArtifact({ slug: s, name: s === 'art-a' ? 'Artifact A' : 'Artifact B' })),
-    ) as any
+    ) as MockedFunction<typeof api.artifact>
     vi.mocked(api).artifactVersions = vi.fn((s: string) =>
       Promise.resolve({ slug: s, versions: [1] }),
-    ) as any
-    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as any
+    ) as MockedFunction<typeof api.artifactVersions>
+    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as MockedFunction<typeof api.artifactComments>
 
     function Nav() {
       const navigate = useNavigate()
@@ -709,7 +792,7 @@ describe('ArtifactDetailPage', () => {
     fireEvent.click(screen.getByLabelText('Toggle agent chat'))
     await waitFor(() => expect(createSlotSpy).toHaveBeenCalledTimes(1))
     // The 8th positional argument is the artifact binding the backend persists.
-    expect(createSlotSpy.mock.calls[0][7]).toBe('cr-queue')
+    expect(createSlotSpy.mock.calls[0][6]).toBe('cr-queue')
   })
 
   it('description renders when artifact has one', async () => {

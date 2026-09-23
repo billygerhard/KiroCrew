@@ -17,11 +17,16 @@ import {
 } from 'lucide-react'
 import {
   api,
+  ApiError,
   type AgentImportApplyRequest,
   type AgentImportConflictStrategy,
   type AgentImportSource,
 } from '../api/client'
+import { parseErrorCode } from '../utils/errorReport'
+import { fmtList } from '../i18n/format'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
 import { Btn, SendBtn } from './ui'
+import ErrorNotice from './ErrorNotice'
 import OnboardingChapterShell, {
   OnboardingShellContext,
   type ShellAsideCopy,
@@ -58,13 +63,13 @@ export function setupChapterAside(ariaLabel: string): ShellAsideCopy {
  *  nothing rendered, which read like a label table needing translation and was
  *  not one. Typed as `Stage[]` so an id here has to be a real stage. */
 const STAGES: Stage[] = [1, 2, 3, 4]
-const SUPPORTED_SOURCE_IDS = new Set([
-  'codex',
-  'claude_code',
-  'meshclaw',
-  'openclaw',
-  'hermes',
-])
+/* A DENYLIST, not an allowlist. An allowlist of known source ids would silently
+ * hide a source an edition registered through the backend's import-source
+ * registry, which is the one thing this list must not do. What still needs
+ * naming is the inverse: Quick is a first-run setup mode, never an import
+ * source, and it must not appear as an import option even if it ever reaches
+ * this payload. The backend rejects the id too; this is the second line. */
+const NON_SOURCE_IDS = new Set(['quick'])
 const SUPPORTED_CATEGORY_IDS = new Set([
   'instructions',
   'memories',
@@ -94,12 +99,38 @@ function supportedCategories(source: AgentImportSource) {
 function eligibleSources(sources: AgentImportSource[]): AgentImportSource[] {
   return sources.filter(source =>
     source.detected
-    && SUPPORTED_SOURCE_IDS.has(source.id)
+    && !NON_SOURCE_IDS.has(source.id)
     && supportedCategories(source).length > 0,
   )
 }
 
 function errorMessage(error: unknown, fallback: string): string {
+  // The shared transport has already replaced an auth-expired denial with its
+  // actionable, localized sign-in instructions. Preserve that message before
+  // considering the route fallback: gateway auth bodies also carry a `code`,
+  // and treating every coded response alike would turn "sign in again" into a
+  // futile "try again".
+  if (error instanceof ApiError && error.authRequired && error.message) {
+    return error.message
+  }
+  if (error instanceof ApiError) {
+    const code = parseErrorCode(error.body)
+    // `_caller` is the handler's defense-in-depth owner gate. Normally the
+    // shared auth middleware refuses first; if this 401 reaches the component,
+    // retrying the import cannot add the missing identity. Use existing
+    // localized recovery copy instead of the operation's retry fallback.
+    if (code === 'auth_required') {
+      return i18nT('components.kiroPrerequisiteGate.sign_in_again_to_continue')
+    }
+    // A backend `code` means the refusal is already identified, so *fallback*
+    // -- which every call site supplies from the i18n catalog -- describes it in
+    // the reader's language. The server's own `error` prose for these routes is
+    // English produced in Python ("invalid request", "request failed") that
+    // never passes through a catalog, and it says strictly less than the
+    // fallback does. An error with no code keeps rendering its message: there
+    // it may be the only detail available.
+    if (code) return fallback
+  }
   return error instanceof Error && error.message ? error.message : fallback
 }
 
@@ -146,6 +177,12 @@ export default function AgentImportFlow({
   const previousFocusRef = useRef<HTMLElement | null>(null)
   const previousInitialOpenRef = useRef(initialOpen)
   const initializedScanGenerationRef = useRef<number | null>(null)
+  // Shared IME latch for the Tab trap below: a Tab that lands during an IME
+  // composition (or its post-`compositionend` window) is choosing a candidate,
+  // not leaving the field, so the trap must decline it instead of yanking
+  // focus and aborting the composition (`useDialogFocusTrap` is the reference
+  // consumer of the same seam).
+  const imeLatch = useDocumentImeLatch(open)
 
   const scanQuery = useQuery({
     queryKey: ['agent-import-scan', scanGeneration],
@@ -157,6 +194,19 @@ export default function AgentImportFlow({
   const sources = useMemo(
     () => eligibleSources(scanQuery.data?.sources ?? []),
     [scanQuery.data?.sources],
+  )
+
+  /* Sources the backend DETECTED but could not read. A source-level diagnostic
+   * (empty category id) means the whole source failed, not one of its categories.
+   * These must never be treated as "nothing found": with no eligible sources the
+   * auto-complete effect below would mark first-run import done and close the
+   * dialog, so a user whose only agent hits a reader bug would never learn their
+   * setup was detected and would never be re-offered the import. */
+  const unreadableSources = useMemo(
+    () => (scanQuery.data?.skipped ?? [])
+      .filter(item => item.reason === 'source_unreadable')
+      .map(item => item.source),
+    [scanQuery.data?.skipped],
   )
 
   const resetFlow = (refresh: boolean) => {
@@ -215,6 +265,7 @@ export default function AgentImportFlow({
       || !scanQuery.data
       || scanQuery.isError
       || sources.length > 0
+      || unreadableSources.length > 0
       || completionMutation.isPending
       || completionMutation.isSuccess
       || completionMutation.isError
@@ -226,6 +277,7 @@ export default function AgentImportFlow({
     scanQuery.data,
     scanQuery.isError,
     sources.length,
+    unreadableSources.length,
   ])
 
   useEffect(() => {
@@ -304,19 +356,25 @@ export default function AgentImportFlow({
       const first = focusable[0]
       const last = focusable[focusable.length - 1]
       const activeIndex = focusable.indexOf(document.activeElement as HTMLElement)
-      if (event.shiftKey && (activeIndex <= 0)) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && (activeIndex < 0 || activeIndex === focusable.length - 1)) {
-        event.preventDefault()
-        first.focus()
-      }
+      const wrapsBackward = event.shiftKey && activeIndex <= 0
+      const wrapsForward = !event.shiftKey && (activeIndex < 0 || activeIndex === focusable.length - 1)
+      // A mid-dialog Tab is the browser's to move, so it is also not the
+      // trap's to claim — claiming it would consume legitimate navigation
+      // inside the post-composition latch window.
+      if (!wrapsBackward && !wrapsForward) return
+      // A Tab the IME owns must not cycle focus — the user is choosing a
+      // candidate, not leaving the field. `claimKey` owns the whole decline;
+      // it must run before the preventDefault() and focus move so the IME
+      // keeps the key (see its contract in useImeGuard.ts).
+      if (!imeLatch.claimKey(event)) return
+      event.preventDefault()
+      ;(wrapsBackward ? last : first).focus()
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
     // `skipAll` intentionally follows the current mutation state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, completionMutation.isPending, applyMutation.isPending, skipAllMutation.isPending])
+  }, [open, completionMutation.isPending, applyMutation.isPending, skipAllMutation.isPending, imeLatch])
 
   if (!open) return null
 
@@ -449,7 +507,7 @@ export default function AgentImportFlow({
     const { title, description } = headings[stage]
     return (
       <div className="mt-6">
-        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-none">
+        <h1 ref={headingRef} tabIndex={-1} className="text-2xl font-semibold text-text-strong outline-hidden">
           {title}
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted">{description}</p>
@@ -462,7 +520,7 @@ export default function AgentImportFlow({
       return (
         <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
           <Loader2 className="lucide-inline animate-spin text-accent" />
-          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-none">
+          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-hidden">
             {i18nT('components.agentImportFlow.scanning_for_agent_setup')}
           </h1>
           <p className="mt-2 text-sm text-muted">{i18nT('components.agentImportFlow.checking_supported_tools_on_this_gateway_host')}</p>
@@ -473,15 +531,75 @@ export default function AgentImportFlow({
       return (
         <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
           <AlertTriangle className="lucide-inline text-danger" />
-          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-none">
+          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-hidden">
             {i18nT('components.agentImportFlow.we_could_not_scan_agent_setup')}
           </h1>
-          <p className="mt-2 max-w-lg text-sm text-danger" role="alert">
-            {errorMessage(scanQuery.error, i18nT('components.agentImportFlow.the_gateway_returned_an_unexpected_error'))}
-          </p>
+          {/* Scan-failed state: no selections exist yet, so the hand-off loses nothing. */}
+          <ErrorNotice
+            askAgent
+            testId="agent-import-scan-error"
+            className="mt-2 max-w-lg text-left"
+            message={errorMessage(scanQuery.error, i18nT('components.agentImportFlow.the_gateway_returned_an_unexpected_error'))}
+          />
           <SendBtn type="button" className="mt-5" onClick={() => scanQuery.refetch()}>
             <RefreshCw className="lucide-inline" /> {i18nT('components.agentImportFlow.try_again')}
           </SendBtn>
+        </div>
+      )
+    }
+    if (sources.length === 0 && unreadableSources.length > 0) {
+      /* Detected but unreadable is NOT "nothing found" — saying so would deny
+       * something the user has and offer no way forward. Name the source and
+       * give them the retry, exactly as a scan-level error does.
+       *
+       * "Try again" alone would be a dead end: `source_unreadable` means a
+       * PERSISTENT reader failure, so the retry predictably fails, and this state
+       * suppresses auto-complete so the dialog re-offers on every first run. Skip
+       * import is the escape that settles it without forfeiting the whole tour,
+       * which is what the header's "Skip all" would cost. */
+      return (
+        <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
+          <AlertTriangle className="lucide-inline text-danger" />
+          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-hidden">
+            {i18nT('components.agentImportFlow.found_setup_kirocrew_could_not_read')}
+          </h1>
+          {/* Persistent reader failure reported by the gateway — exactly what the
+              agent can diagnose. No selections exist in this full-panel state. */}
+          <ErrorNotice
+            askAgent
+            testId="agent-import-unreadable-error"
+            className="mt-2 max-w-lg text-left"
+            message={i18nT('components.agentImportFlow.found_setup_but_could_not_read_it', {
+              sources: fmtList(unreadableSources),
+            })}
+          />
+          <div className="mt-5 flex items-center gap-3">
+            {/* `isFetching`, NOT `isPending`: a refetch of already-cached data
+              * leaves `isPending` false, so without this the primary action on a
+              * PERSISTENT failure gave no spinner, no text change and no disabled
+              * state — it read as a dead button on every click. */}
+            <SendBtn
+              type="button"
+              disabled={scanQuery.isFetching}
+              onClick={() => scanQuery.refetch()}
+            >
+              {scanQuery.isFetching
+                ? <Loader2 className="lucide-inline animate-spin" />
+                : <RefreshCw className="lucide-inline" />}
+              {i18nT('components.agentImportFlow.try_again')}
+            </SendBtn>
+            <Btn type="button" disabled={isBusy} onClick={skip}>
+              {isBusy && <Loader2 className="lucide-inline animate-spin" />}
+              {i18nT('components.agentImportFlow.skip_import')}
+            </Btn>
+          </div>
+          {/* Full-panel state: nothing selected yet, so the hand-off loses nothing. */}
+          <ErrorNotice
+            askAgent
+            testId="agent-import-completion-error"
+            className="mt-4 max-w-lg text-left"
+            message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+          />
         </div>
       )
     }
@@ -489,7 +607,7 @@ export default function AgentImportFlow({
       return (
         <div className="flex min-h-[360px] flex-col items-center justify-center text-center">
           <FileSearch className="lucide-inline text-muted" />
-          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-none">
+          <h1 ref={headingRef} tabIndex={-1} className="mt-4 text-2xl font-semibold text-text-strong outline-hidden">
             {i18nT('components.agentImportFlow.no_supported_setup_found')}
           </h1>
           <p className="mt-2 max-w-lg text-sm leading-relaxed text-muted">
@@ -504,22 +622,39 @@ export default function AgentImportFlow({
             {isBusy && <Loader2 className="lucide-inline animate-spin" />}
             {i18nT('components.agentImportFlow.skip_import')}
           </SendBtn>
-          {completionError && (
-            <p className="mt-4 text-sm text-danger" role="alert">
-              {errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state'))}
-            </p>
-          )}
+          {/* Full-panel state: nothing selected yet, so the hand-off loses nothing. */}
+          <ErrorNotice
+            askAgent
+            testId="agent-import-completion-error"
+            className="mt-4 max-w-lg text-left"
+            message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+          />
         </div>
       )
     }
     if (stage === 1) {
       return (
         <>
-          {completionError && (
-            <p className="mb-4 text-sm text-danger" role="alert">
-              {errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state'))}
-            </p>
+          {/* When SOME sources are readable the full-panel state above does not
+            * fire, so an unreadable source would otherwise leave no trace at the
+            * one screen where the user decides what to import — they would read
+            * its absence as "unsupported". Name it here, next to the picker. */}
+          {/* No hand-off: the stage-1 source/category selections (selectedSources,
+              selectedCategories) are unsaved wizard state. */}
+          {unreadableSources.length > 0 && (
+            <ErrorNotice
+              testId="agent-import-stage1-unreadable-error"
+              className="mb-4"
+              message={i18nT('components.agentImportFlow.some_setup_could_not_be_read', {
+                sources: fmtList(unreadableSources),
+              })}
+            />
           )}
+          <ErrorNotice
+            testId="agent-import-completion-error"
+            className="mb-4"
+            message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+          />
           <div className="space-y-3">
             {sources.map(source => {
               const count = supportedCategories(source).reduce((sum, category) => sum + category.count, 0)
@@ -557,6 +692,14 @@ export default function AgentImportFlow({
     if (stage === 2) {
       return (
         <>
+          {/* No hand-off: the category selections (selectedCategories) are unsaved
+              wizard state. Rendered here too so a header "Skip all" failure on
+              this stage is not silent. */}
+          <ErrorNotice
+            testId="agent-import-completion-error"
+            className="mb-4"
+            message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+          />
           <div className="space-y-5">
             {sources.filter(source => selectedSources.has(source.id)).map(source => (
               <fieldset key={source.id} aria-label={`${source.name} categories`}>
@@ -605,11 +748,20 @@ export default function AgentImportFlow({
     if (stage === 3) {
       return (
         <>
+          {/* No hand-off: the stage-3 review holds the selections and the conflict
+              strategy, none of which is saved until the import applies. */}
           {applyMutation.isError && (
-            <p className="mb-4 text-sm text-danger" role="alert">
-              {errorMessage(applyMutation.error, i18nT('components.agentImportFlow.the_import_did_not_finish_please_try_again'))}
-            </p>
+            <ErrorNotice
+              testId="agent-import-apply-error"
+              className="mb-4"
+              message={errorMessage(applyMutation.error, i18nT('components.agentImportFlow.the_import_did_not_finish_please_try_again'))}
+            />
           )}
+          <ErrorNotice
+            testId="agent-import-completion-error"
+            className="mb-4"
+            message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+          />
           <section className="rounded-lg border border-ok/30 bg-ok-subtle p-4">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-text-strong">
               <ShieldCheck className="lucide-inline text-ok" /> {i18nT('components.agentImportFlow.merge_only')}
@@ -653,9 +805,13 @@ export default function AgentImportFlow({
                   <div key={`${item.source}-${item.category}-${index}`} className="flex items-start justify-between gap-4 p-3">
                     <div>
                       <p className="text-[13px] font-medium text-text">
-                        {item.source}: {item.category}
+                        {item.category ? `${item.source}: ${item.category}` : item.source}
                       </p>
-                      <p className="mt-1 text-[13px] text-muted">{item.reason}</p>
+                      <p className="mt-1 text-[13px] text-muted">
+                        {item.reason === 'source_unreadable'
+                          ? i18nT('components.agentImportFlow.files_could_not_be_read')
+                          : item.reason}
+                      </p>
                     </div>
                     {item.count !== undefined && <span className="font-mono text-[13px] text-muted">{item.count}</span>}
                   </div>
@@ -717,11 +873,14 @@ export default function AgentImportFlow({
             </div>
           </div>
         )}
-        {completionError && (
-          <div className="mt-5 rounded-lg border border-danger/20 bg-danger/10 p-3 text-sm text-danger" role="alert">
-            {errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state'))}
-          </div>
-        )}
+        {/* Import already applied; only the completed flag failed to persist, so
+            the hand-off loses nothing. */}
+        <ErrorNotice
+          askAgent
+          testId="agent-import-completion-error"
+          className="mt-5"
+          message={completionError ? errorMessage(completionError, i18nT('components.agentImportFlow.could_not_save_onboarding_state')) : ''}
+        />
       </>
     )
   })()

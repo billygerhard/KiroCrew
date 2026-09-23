@@ -26,6 +26,27 @@ from kiro_crew import webhooks
 from kiro_crew.dashboard.handlers import hooks as H
 
 
+def _as_owner(req):
+    """Give *req* the owner claims the mint route's gate reads. Returns *req*.
+
+    ``api_webhook_token_create`` is owner-gated
+    (``handlers._shared.require_owner_dashboard_request``), and the predicate
+    reads ``state.owner_id`` plus the claims the token-auth middleware publishes.
+    ``owner_id == ""`` with the signed local bootstrap subject ``local-app`` is
+    the standalone-local shape, the same one
+    ``test/dashboard_owner_helpers.NoConfiguredOwner`` encodes for the fixtures
+    that go through a ``TestClient``. The gate's own denial behaviour is covered
+    in ``test_webhooks_api.TestTokenMintIsOwnerOnly``; these tests are about
+    signing, so they present an owner and stay on their own subject.
+    """
+    state = MagicMock()
+    state.owner_id = ""
+    req.app["state"] = state
+    req["user"] = "local-app"
+    req["app"] = ""
+    return req
+
+
 @pytest.fixture(autouse=True)
 def _isolate_process_globals():
     """Reset the replay set and throttle around EVERY test in this module.
@@ -55,6 +76,7 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(H, "_HOOK_STORE_PATH", Path(tmp_path) / "hooks.json")
     monkeypatch.setattr(H, "_sel", lambda: MagicMock())
     monkeypatch.setattr(H, "_legacy_hook_token", lambda: "")
+    monkeypatch.setattr(H, "_installed_agent_names", lambda: {"kirocrew"})
     webhooks._reset_auth_throttle()
     webhooks._reset_signature_replay()
     yield Path(tmp_path)
@@ -622,9 +644,10 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_returns_the_secret_once_next_to_the_token(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
-        req.json = AsyncMock(return_value={"label": "Review Bot"})
+        req = _as_owner(make_mocked_request("POST", "/api/webhooks/tokens"))
+        req.json = AsyncMock(
+            return_value={"label": "Review Bot", "agent": "kirocrew"}
+        )
         resp = await H.api_webhook_token_create(req)
         assert resp.status == 201
         data = json.loads(resp.body.decode("utf-8"))
@@ -641,10 +664,13 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_can_opt_out_of_signing(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
+        req = _as_owner(make_mocked_request("POST", "/api/webhooks/tokens"))
         req.json = AsyncMock(
-            return_value={"label": "CI runner", "require_signature": False}
+            return_value={
+                "label": "CI runner",
+                "require_signature": False,
+                "agent": "kirocrew",
+            }
         )
         resp = await H.api_webhook_token_create(req)
         assert resp.status == 201
@@ -654,8 +680,7 @@ class TestReadEndpointNeverLeaksTheSecret:
 
     @pytest.mark.asyncio
     async def test_create_rejects_non_boolean_require_signature(self, wired):
-        req = make_mocked_request("POST", "/api/webhooks/tokens")
-        req.app["state"] = MagicMock()
+        req = _as_owner(make_mocked_request("POST", "/api/webhooks/tokens"))
         req.json = AsyncMock(
             return_value={"label": "CI runner", "require_signature": "false"}
         )

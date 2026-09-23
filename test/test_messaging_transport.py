@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import fields
 
 import pytest
 
@@ -39,18 +40,16 @@ class TestTransportCapabilities:
         d = cap.to_dict()
         assert d["streaming"] is True
         assert d["max_message_chars"] == 2000
-        assert set(d) == {
-            "streaming",
-            "edit",
-            "reactions",
-            "files_inbound",
-            "files_outbound",
-            "rich_blocks",
-            "threads",
-            "max_message_chars",
-            "max_buttons",
-            "supports_proactive_send",
-        }
+        # Compared against the DATACLASS FIELDS, not a hand-maintained list. The
+        # hardcoded set this replaces could not catch the defect it looked like it
+        # was guarding: a field added to the dataclass but forgotten in
+        # ``to_dict`` left keys == list and PASSED, while every legitimate
+        # addition failed it as pure bookkeeping. Against the fields, an omission
+        # fails and an addition wired through both places passes.
+        assert set(d) == {f.name for f in fields(TransportCapabilities)}, (
+            "to_dict() and the dataclass have diverged — a capability that is "
+            "not serialised is invisible to every consumer reading the dict form"
+        )
 
 
 class TestInboundMessage:
@@ -121,6 +120,22 @@ class TestAbstract:
         assert t.authorize(None) is False
 
 
+class TestSessionProvenanceTag:
+    def test_tag_is_stable_short_and_keyed(self):
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
+        first = session_provenance_tag("dashboard:chat-1")
+        assert first == session_provenance_tag("dashboard:chat-1")
+        assert len(first) == 12
+        assert set(first) <= set("0123456789abcdef")
+        assert first != session_provenance_tag("dashboard:chat-2")
+
+    def test_empty_key_has_no_tag(self):
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
+        assert session_provenance_tag("") == ""
+
+
 class TestChunkText:
     def test_empty(self):
         assert chunk_text("", 10) == []
@@ -149,7 +164,9 @@ class _RecordingRenderer(Renderer):
     async def on_tool_call(self, tool_call_id, title, tool_kind="", tool_purpose=""):
         self.calls.append(("tool_call", tool_call_id, title))
 
-    async def on_prompt_choice(self, options, request_id):
+    async def on_prompt_choice(
+        self, options, request_id, tool_title="", tool_purpose="", tool_input=""
+    ):
         self.calls.append(("prompt_choice", options, request_id))
 
     async def on_compaction(self, context_usage_pct):

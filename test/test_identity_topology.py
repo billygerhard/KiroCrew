@@ -1,7 +1,6 @@
 """Identity-resolution topology tests (pre-work for the pid-namespace re-raise).
 
-Background (2026-07-18 incident): the PID-namespace sandbox change (24c320f6,
-reverted; this fork ported then reverted it in ab96394b) broke
+Background: a reverted PID-namespace sandbox change broke
 subagent identity resolution in live deployments while the full unit gate
 stayed green. Session hosts ran inside a PID namespace where
 ``os.getpid()``/``os.getppid()`` return namespace-local pids renumbered from 1,
@@ -13,7 +12,7 @@ the dashboard, completion events unroutable.
 Why the gate stayed green: the ancestry walk is implemented in FOUR
 independent copies (``mcp_caller.CallerContext.from_env``,
 ``mcp_core._resolve_session_key``, the inline walk in
-``mcp_shared._resolve_excluded_tools``, ``mcp_gateway/stub.py``), each tested
+``mcp_shared._resolve_tool_policy``, ``mcp_gateway/stub.py``), each tested
 with hand-rolled per-file mocks that encode their author's topology
 assumptions. Mocks cannot detect that the assumption itself changed.
 
@@ -163,7 +162,7 @@ def _wire_common(monkeypatch: pytest.MonkeyPatch, topo: ProcessTopology, view: s
     # under test and flip the strict pidns xfails to XPASS.
     monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
     monkeypatch.setattr("os.getppid", lambda: topo.observed_ppid(MCP_SERVER, view))
-    # Reset the fork's process-lifetime from_env cache: a previously-resolved
+    # Reset the fork's process-lifetime from_env cache: an already-resolved
     # identity from an earlier test (or the host-view run of this test) would
     # otherwise short-circuit the walk and XPASS the strict pidns variants.
     monkeypatch.setattr("kiro_crew.mcp_caller._FROM_ENV_CACHE", None)
@@ -205,9 +204,9 @@ def test_mcp_core_resolves_session_key(topo, monkeypatch, view) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Walk copy 3: the inline walk in mcp_shared._resolve_excluded_tools
+# Walk copy 3: the inline walk in mcp_shared._resolve_tool_policy
 # ---------------------------------------------------------------------------
-# The policy session-key walk is inlined in ``_resolve_excluded_tools`` and
+# The policy session-key walk is inlined in ``_resolve_tool_policy`` and
 # its deep-walk step is a nested function reading the real /proc, so it
 # cannot be patched. Model the resolvable case with the file on the DIRECT
 # parent (kiro-cli): under the host view the very first ancestor matches and
@@ -228,10 +227,7 @@ def test_mcp_shared_policy_walk_reaches_gateway(topo, monkeypatch, view) -> None
     monkeypatch.setattr(mcp_shared, "_last_startup_race_time", 0.0)
     monkeypatch.setattr(mcp_shared, "_failure_count", 0)
 
-    cfg = MagicMock()
-    cfg.dashboard.url = "http://localhost:5476/"
-    monkeypatch.setattr(mcp_shared.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
-    monkeypatch.setattr(mcp_shared, "parse_dashboard_url", lambda url: ("localhost", 5476))
+    monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: topo.cfg_dir)
     (topo.cfg_dir / ".local_secret").write_text("s")
 
@@ -243,11 +239,11 @@ def test_mcp_shared_policy_walk_reaches_gateway(topo, monkeypatch, view) -> None
     response.__enter__ = MagicMock(return_value=response)
     response.__exit__ = MagicMock(return_value=False)
     urlopen = MagicMock(return_value=response)
-    monkeypatch.setattr(mcp_shared.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
 
-    assert mcp_shared._resolve_excluded_tools() == set()
+    assert mcp_shared._resolve_tool_policy().excluded == set()
     # The walk must have RESOLVED a session key and reached the gateway —
-    # under pidns it resolves empty and fail-opens without the call.
+    # under pidns it resolves empty and returns unresolved without the call.
     assert urlopen.called
     request = urlopen.call_args[0][0]
     assert request.get_header("X-session-key") == SESSION_KEY
@@ -384,10 +380,7 @@ def test_mcp_shared_refuses_symlinked_pid_file(topo, monkeypatch) -> None:
     monkeypatch.setattr(mcp_shared, "_last_startup_race_time", 0.0)
     monkeypatch.setattr(mcp_shared, "_failure_count", 0)
 
-    cfg = MagicMock()
-    cfg.dashboard.url = "http://localhost:5476/"
-    monkeypatch.setattr(mcp_shared.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
-    monkeypatch.setattr(mcp_shared, "parse_dashboard_url", lambda url: ("localhost", 5476))
+    monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: topo.cfg_dir)
     (topo.cfg_dir / ".local_secret").write_text("s")
 
@@ -399,11 +392,15 @@ def test_mcp_shared_refuses_symlinked_pid_file(topo, monkeypatch) -> None:
     _wire_common(monkeypatch, topo, "host")
 
     urlopen = MagicMock()
-    monkeypatch.setattr(mcp_shared.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
 
-    # No key resolvable -> startup-race fail-open WITHOUT a policy call and,
+    # No key resolvable -> startup-race refusal WITHOUT a policy call and,
     # crucially, WITHOUT the stolen key ever being read through the symlink.
-    assert mcp_shared._resolve_excluded_tools() == set()
+    policy = mcp_shared._resolve_tool_policy()
+    assert policy.excluded == set()
+    # Refusing to follow the symlink must not be reported as an empty
+    # exclusion list, or a stolen-key attempt would silently widen the deny.
+    assert policy.unresolved == "no_session_key"
     assert not urlopen.called
 
 
@@ -454,7 +451,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
     ),
     "mcp_caller.py": (
         "reader: client-side /proc ancestry walk — assumes HOST pids; .txt "
-        "reads via session_pid_sig.read_session_pid_txt (hardened, unsigned)"
+        "reads via session_pid_sig.read_session_pid_txt (hardened, unsigned). "
+        "Consulted only BELOW the protected member binding and the per-SESSION "
+        "token (session_token_sig.session_key_from_env_token), which from_env reads "
+        "above its own process-lifetime cache so a warm-pool rekey stays visible"
     ),
     "mcp_core.py": (
         "reader: lenient /proc ancestry walk + stale-file cleanup glob "
@@ -465,21 +465,32 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
     ),
     "mcp_shared.py": (
         "reader: policy session-key /proc ancestry walk inline in "
-        "_resolve_excluded_tools — assumes HOST pids; .txt reads via "
-        "session_pid_sig.read_session_pid_txt (hardened, unsigned)"
+        "_policy_session_key, which _resolve_tool_policy calls -- assumes HOST "
+        "pids; .txt reads via session_pid_sig.read_session_pid_txt (hardened, "
+        "unsigned). Last resort there: the gateway's per-call caller, the protected "
+        "member binding and the per-SESSION token are all consulted first, and the "
+        "session this resolves keys the tool-policy cache as well as the policy "
+        "request"
     ),
     "mcp_gateway/stub.py": "reader via CallerContext.from_env; register-time caller block — assumes HOST pids",
-    "dashboard/handlers/messaging.py": (
-        "reader (STRICT): api_browser_frame resolves the browse-mirror session "
-        "key from the posting Playwright proxy's host_pid by walking process "
-        "ancestry and calling session_pid_sig.verify_session_pid (HMAC-verified) "
-        "on each ancestor — HOST-pid-keyed, no unsigned .txt read"
+    "peer_resolve.py": (
+        "reader: the SERVER-side /proc ancestry walk (extracted from "
+        "mcp_gateway/gatewayd._resolve_peer_identity, which now delegates "
+        "here) — runs in the server's own (host) pid namespace, so it is "
+        "immune to client-side namespace divergence; returns the session key "
+        "plus the host ancestor chain (gatewayd indexes the chain for "
+        "claim-push matching); .txt reads via "
+        "session_pid_sig.read_session_pid_txt (hardened, unsigned). Consumed "
+        "by gatewayd (stub register) and dashboard/token_auth (unix-socket "
+        "peer verification)"
     ),
-    "mcp_gateway/gatewayd.py": (
-        "(_resolve_peer_identity) — runs in gatewayd's own (host) pid namespace, "
-        "so it is immune to client-side namespace divergence; also indexes the "
-        "host ancestor chain for claim-push matching; .txt reads via "
-        "session_pid_sig.read_session_pid_txt (hardened, unsigned)"
+    "dashboard/token_auth.py": (
+        "reader (via peer_resolve.resolve_peer_identity, no inline walk): "
+        "kernel-attests internal-API requests arriving on the dashboard's "
+        "AF_UNIX socket — SO_PEERCRED peer pid → host-namespace ancestry walk "
+        "→ session_pid_<pid>.txt; denies when the resolved key differs from "
+        "the client-declared X-Session-Key header, degrades to status quo "
+        "when unresolvable"
     ),
     "sandbox.py": (
         "writer-adjacent: launcher exports KIROCREW_HOST_PID (its own HOST pid — "
@@ -487,7 +498,38 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "so in-namespace readers can look the file up directly without a /proc walk"
     ),
     "mcp_gateway/claim.py": "docstring reference to the contract (no code reads)",
-    "session_pid.py": "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead processes",
+    "session_pid.py": (
+        "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead "
+        "processes, and (age-bounded) session_token_*.sig mappings, whose "
+        "token-hash filenames name no pid to probe"
+    ),
+    "session_cleanup.py": (
+        "SCHEDULER, not a reader or a resolver: the periodic cleanup tick calls "
+        "session_pid._prune_stale_session_pid_files on the maintenance executor "
+        "so the pass above runs more often than gateway startup and shutdown. It "
+        "reads no mapping, resolves no session key, and walks no /proc — the pid "
+        "view it would need is the one the pass it delegates to already uses, so "
+        "the pid-view parametrization this file requires of a new resolution path "
+        "has no new path to cover. It appears in this scan only because its "
+        "docstring names the file family it schedules the prune of, and says why "
+        "the prune is scheduled here rather than on a provider teardown, which "
+        "is synchronous on the gateway event loop"
+    ),
+    "session_token_sig.py": (
+        "SIBLING contract, NOT a session_pid reader: owns the per-SESSION "
+        "token -> session-key mapping (session_token_<sha256(token)>.sig, one "
+        "file holding MAC + body, signed with a subkey derived from the same SEL "
+        "trust root under a DIFFERENT domain label so the two sidecars cannot be "
+        "cross-replayed). It appears in this scan only because it IMPORTS "
+        "session_pid_sig's hardened reader and key loader rather than copying "
+        "them, and because its docstring contrasts the two contracts. It reads "
+        "and writes no session_pid file and does no /proc walk — deliberately: "
+        "a pid names a PROCESS, and one kiro-cli process hosts many ACP "
+        "sessions, so pid-keyed identity answers with the parent for a "
+        "spawn_run subagent. Being pid-FREE is the property that makes it "
+        "namespace-insensitive, so the pid-view parametrization this file "
+        "requires of a new resolution path has nothing to vary"
+    ),
     "mcp_computer.py": (
         "comment reference only (no code reads): the computer-use stdio shim "
         "explains why it resolves identity with mcp_core._resolve_session_key_strict "
@@ -530,7 +572,172 @@ def test_session_pid_call_sites_are_registered() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Class-level publisher guard (#232)
+# Reflexive-tool strict-gate ratchet
+# ---------------------------------------------------------------------------
+# A REFLEXIVE MCP tool is one whose semantics embed "my session": ledger
+# writes, monitor loops, session-scoped control, attributed channel sends. The
+# invariant is that every one of them resolves the caller through the single
+# fail-closed gate ``mcp_core.require_strict_session_key`` — never the lenient
+# resolver (whose /proc ancestor walk hands a subagent its PARENT slot's
+# identity) and never a private copy of the strict check. Before the gate
+# existed the fail-closed handling was re-derived by hand at every call site,
+# and nothing stopped the NEXT reflexive tool from calling the lenient
+# resolver and silently writing the parent slot's state from a subagent.
+# Same shape as the session_pid registry guard above: scan the source, fail on
+# an unregistered file, so the invariant is enforced rather than remembered.
+
+#: Call-form tokens. Prose references (docstrings without parens, ``#``
+#: comments, which are stripped per line below) do not count as calls.
+_STRICT_RESOLVER_CALL = re.compile(r"_resolve_session_key_strict\s*\(")
+_REFLEXIVE_GATE_CALL = re.compile(r"require_strict_session_key\s*\(")
+
+
+def _code_text(path: Path) -> str:
+    """File text with per-line ``#`` comments stripped (heuristic, no parser).
+
+    Good enough for these tokens: neither contains ``#``, and a call is never
+    legitimately split across a comment boundary.
+    """
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(line.split("#", 1)[0] for line in lines)
+
+
+def test_reflexive_tools_route_through_the_strict_gate() -> None:
+    from kiro_crew.mcp_core import REFLEXIVE_TOOL_MODULES
+
+    src = _src_root()
+    direct: set[str] = set()
+    gated: set[str] = set()
+    for p in src.rglob("*.py"):
+        rel = p.relative_to(src).as_posix()
+        text = _code_text(p)
+        if _STRICT_RESOLVER_CALL.search(text):
+            direct.add(rel)
+        if _REFLEXIVE_GATE_CALL.search(text):
+            gated.add(rel)
+
+    # 1. The gate is the ONLY caller of the strict resolver. mcp_core.py hosts
+    #    both, plus the resolver's own internal consumers (diagnosis, the
+    #    Slack identity classifier), so it is the single permitted file.
+    direct -= {"mcp_core.py"}
+    assert not direct, (
+        f"Direct _resolve_session_key_strict() call(s) outside mcp_core: "
+        f"{sorted(direct)}.\n"
+        "Reflexive tools must resolve identity through "
+        "mcp_core.require_strict_session_key so the fail-closed handling "
+        "stays in one place. Route the call through the gate and register "
+        "the module in mcp_core.REFLEXIVE_TOOL_MODULES."
+    )
+
+    # 2. Every module calling the gate is registered as reflexive, and every
+    #    registered module still calls it — the set is data, not lore.
+    gated -= {"mcp_core.py"}
+    registered = set(REFLEXIVE_TOOL_MODULES)
+    unregistered = gated - registered
+    stale = registered - gated
+    assert not unregistered, (
+        f"New reflexive-tool module(s) call require_strict_session_key but are "
+        f"not registered: {sorted(unregistered)}.\n"
+        "Add them to mcp_core.REFLEXIVE_TOOL_MODULES so the reflexive surface "
+        "stays enumerable."
+    )
+    assert not stale, (
+        f"Registered reflexive module(s) no longer call the gate: "
+        f"{sorted(stale)}. Either the tool regressed to a private identity "
+        "check (fix the tool) or it is gone (remove it from "
+        "mcp_core.REFLEXIVE_TOOL_MODULES)."
+    )
+
+
+@pytest.mark.parametrize("identified", [True, False])
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("kiro_cli_logs", {}),
+        ("search_chat_history", {"query": "sharedmarker"}),
+        ("get_chat_session", {"session_key": "dashboard:target"}),
+        ("list_sessions", {"summarize": True}),
+    ],
+)
+def test_session_reads_require_and_reuse_strict_identity(
+    tmp_path, monkeypatch, identified, tool_name, args
+):
+    from kiro_crew import mcp_core
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.mcp_tools import logs, sessions
+
+    caller_key = "dashboard:child"
+    refusal = "Error: session identity unavailable. Fixture diagnosis."
+    gate = MagicMock(return_value=(caller_key, "") if identified else ("", refusal))
+    monkeypatch.setattr(mcp_core, "require_strict_session_key", gate)
+    monkeypatch.setattr(
+        mcp_core,
+        "_resolve_session_key",
+        MagicMock(side_effect=AssertionError("must not fall back to parent identity")),
+    )
+    audit = MagicMock()
+    monkeypatch.setattr(mcp_core, "sel", lambda: audit)
+    gateway = MagicMock(return_value={"summaries": {}})
+    monkeypatch.setattr(mcp_core, "_post", gateway)
+
+    history = ConversationLog(base_dir=tmp_path / "sessions")
+    history.update_metadata(caller_key, {"workspace": "child"})
+    for key, workspace, body in (
+        ("dashboard:target", "child", "CHILD-HISTORY sharedmarker"),
+        ("dashboard:parent", "parent", "PARENT-HISTORY sharedmarker"),
+    ):
+        history.append(key, "user", body)
+        history.update_metadata(key, {"workspace": workspace, "title": body})
+    history_reader = MagicMock(return_value=history)
+    monkeypatch.setattr(sessions, "ConversationLog", history_reader)
+    log_reader = MagicMock(return_value="READABLE PROTOCOL")
+    monkeypatch.setattr(logs.diagnostics, "read_kiro_cli_logs", log_reader)
+
+    handler = logs.kiro_cli_logs if tool_name == "kiro_cli_logs" else getattr(sessions, tool_name)
+    result = handler(tool_name, args)
+
+    gate.assert_called_once()
+    if not identified:
+        assert result == refusal
+        history_reader.assert_not_called()
+        log_reader.assert_not_called()
+        gateway.assert_not_called()
+        return
+    assert ("READABLE PROTOCOL" if tool_name == "kiro_cli_logs" else "CHILD-HISTORY") in result
+    assert "PARENT-HISTORY" not in result
+    assert audit.log_tool_invocation.call_args.kwargs["session_key"] == caller_key
+    if tool_name == "list_sessions":
+        gateway.assert_called_once()
+        assert gateway.call_args.args[0] == "/api/sessions/summarize"
+        assert set(gateway.call_args.args[1]["keys"]) == {"dashboard_target", "dashboard_child"}
+        assert gateway.call_args.kwargs == {"timeout": 120, "session_key": caller_key}
+
+
+@pytest.mark.parametrize("identified", [True, False])
+def test_memory_recall_uses_the_shared_gate_identity_once(monkeypatch, identified):
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import learn
+
+    key = "subagent:memory-recall" if identified else ""
+    refusal = "Error: unresolved session. Fixture installation diagnosis."
+    gate = MagicMock(return_value=(key, "" if identified else refusal))
+    gateway = MagicMock(return_value={"store": "member-alice"})
+    monkeypatch.setattr(mcp_core, "require_strict_session_key", gate)
+    monkeypatch.setattr(mcp_core, "_get", gateway)
+
+    result = learn.memory_recall("memory_recall", {"query": "database"})
+
+    gate.assert_called_once_with("Error: memory recall requires an established session")
+    if identified:
+        gateway.assert_called_once_with("/api/memory/recall?q=database", session_key=key)
+        assert "member-alice" in result
+    else:
+        gateway.assert_not_called()
+        assert result == refusal
+
+
+# ---------------------------------------------------------------------------
+# Class-level publisher guard
 # ---------------------------------------------------------------------------
 # The "missing X-Session-Key" HTTP 400 was a channel-turn *publisher* gap: a
 # surface that runs an agent turn but never publishes the session_pid mapping

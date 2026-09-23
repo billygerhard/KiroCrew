@@ -4,12 +4,12 @@ Two sessions sharing a single backend MUST produce the same answers as if
 each had its own backend. Every attribute that changes backend behavior
 MUST be in :class:`PoolKey`, or two sessions can see cross-tenant state.
 
-The 13 dimensions captured below are the union of every spawn-time input
+The 12 dimensions captured below are the union of every spawn-time input
 that influences a Kiro MCP subprocess: identity (``server_name``,
 ``agent_name``), execution (``command_args_hash``, ``effective_env_hash``,
 ``work_dir``, ``binary_version``), security (``os_uid``, ``sandbox_mode``,
-``autoapprove_set_hash``, ``approval_mode``, ``trust_all_tools``,
-``user_identity``), and config drift (``config_snapshot_hash``).
+``autoapprove_set_hash``, ``approval_mode``, ``trust_all_tools``), and
+config drift (``config_snapshot_hash``).
 
 There is deliberately NO channel dimension. A channel is not a trust
 boundary and never was a usable proxy for one:
@@ -27,11 +27,16 @@ boundary and never was a usable proxy for one:
   onto every forwarded ``tools/call``, so a channel-aware backend learns the
   channel PER CALL and does not need a process to itself.
 
-The axis that genuinely expresses "a different person must not share a
-backend" is ``user_identity``. It is present above, and today it degrades to
-the OS user because nothing populates ``KIROCREW_PRINCIPAL`` — making that
-real is the prerequisite for a shared multi-principal gateway, and is
-tracked separately. Re-adding a channel dimension is not that fix.
+There is deliberately NO per-principal dimension either. Kiro Crew is
+single-operator: a Slack bot and a cron job are the same operator's
+automations, not separate principals, so a multi-principal shared gateway
+is not a supported deployment model. A ``user_identity`` key field would be
+a misleading affordance: nothing populates a ``KIROCREW_PRINCIPAL`` source,
+so such a field collapses to the OS user and isolates nothing. The
+cross-OS-user boundary that IS real is carried by ``os_uid``. If
+multi-principal isolation is ever wanted, it needs a real design (what
+counts as a principal on an unattended surface is the hard part); adding a
+key field would be the small part.
 
 Stable hashing uses SHA-256 over a JSON-serialized tuple with sorted keys.
 Python's built-in ``hash()`` is intentionally non-deterministic across
@@ -49,6 +54,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
+from kiro_crew import platform_compat
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 
 if TYPE_CHECKING:
@@ -133,45 +139,6 @@ def _resolve_spill_threshold() -> int:
 RESPONSE_SPILL_THRESHOLD_BYTES: int = _resolve_spill_threshold()
 
 
-# Upper bound on processes walked when summing a backend's subtree RSS. A
-# pooled MCP backend's real tree is tiny (parent shim + a handful of workers);
-# the cap only guards against a pathological/looping /proc graph.
-_RSS_SUBTREE_MAX_PROCS = 256
-
-
-def _single_proc_rss_kb(pid: int) -> int:
-    """RSS (KiB) of a single ``pid`` from /proc/<pid>/status, or -1."""
-    try:
-        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return -1
-
-
-def _proc_children(pid: int) -> list[int]:
-    """Direct child PIDs of ``pid`` via /proc/<pid>/task/<tid>/children.
-
-    Uses the kernel-provided children list (CONFIG_PROC_CHILDREN), so no
-    ``pgrep``/full-table scan. Returns ``[]`` if the file is unavailable.
-    """
-    kids: list[int] = []
-    task_dir = f"/proc/{pid}/task"
-    try:
-        tids = os.listdir(task_dir)
-    except OSError:
-        return kids
-    for tid in tids:
-        try:
-            with open(f"{task_dir}/{tid}/children", encoding="ascii") as fh:
-                kids.extend(int(tok) for tok in fh.read().split())
-        except (OSError, ValueError):
-            continue
-    return kids
-
-
 def _proc_rss_kb(pid: Optional[int]) -> int:
     """Resident set size (KiB) for ``pid`` **and all its descendants**.
 
@@ -180,31 +147,18 @@ def _proc_rss_kb(pid: Optional[int]) -> int:
     memory lives in a child process. Counting only ``pid``'s own ``VmRSS``
     under-reports the true footprint by ~30x, so we sum the whole subtree.
 
+    Delegates to :func:`platform_compat.proc_subtree_sample`, the one shared
+    ``/proc`` subtree walker, rather than a local copy of that BFS and of the
+    process ceiling. ``rss`` is the only reading asked for, so the pool pays no
+    ``/proc/<pid>/stat`` read per process for a CPU figure it does not surface,
+    and an unreadable root pid
+    still returns -1 without walking anything.
+
     Returns -1 if ``pid`` is falsy or its own status cannot be read; otherwise
     the summed KiB (descendants that vanish mid-walk are simply skipped, so the
     result degrades gracefully to parent-only when ``children`` is unreadable).
     """
-    if not pid:
-        return -1
-    own = _single_proc_rss_kb(pid)
-    if own < 0:
-        return -1
-    total = own
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                kb = _single_proc_rss_kb(child)
-                if kb > 0:
-                    total += kb
-                nxt.append(child)
-        frontier = nxt
-    return total
+    return platform_compat.proc_subtree_sample(pid, jiffies=False, counts=False).rss_kb
 
 
 # --- PoolKey ----------------------------------------------------------------
@@ -236,7 +190,6 @@ class PoolKey:
     autoapprove_set_hash: str
     approval_mode: str
     trust_all_tools: bool
-    user_identity: str
 
     # Config drift
     config_snapshot_hash: str
@@ -267,7 +220,9 @@ class PoolKey:
         # stub still reports it because gatewayd threads it into the per-call
         # caller identity (see ``_build_caller_block``), and an older stub
         # against a newer daemon must keep registering cleanly. It is simply
-        # not a pool dimension — see the module docstring.
+        # not a pool dimension — see the module docstring. The same applies
+        # to ``user_identity``, which older stubs still send: it was deleted
+        # as a pool dimension (it never isolated anything) and is ignored.
         # Security-boundary dims: type-check rather than coerce. bool("false")
         # is True and int() on a bool silently passes, so a stub sending a JSON
         # string/number for these could land in the wrong trust/uid partition.
@@ -292,7 +247,6 @@ class PoolKey:
                 autoapprove_set_hash=str(register["autoapprove_set_hash"]),
                 approval_mode=str(register["approval_mode"]),
                 trust_all_tools=trust_all_tools,
-                user_identity=str(register["user_identity"]),
                 config_snapshot_hash=str(register["config_snapshot_hash"]),
             )
         except (TypeError, ValueError) as exc:
@@ -338,17 +292,23 @@ class PoolKey:
 class BackendUnavailable(RuntimeError):
     """Raised by :meth:`BackendPool.get_or_create` when the circuit breaker
     is OPEN for a server, i.e. the backend has been crashing on spawn. The
-    connection handler turns this into a clean ``rejected`` reply so the stub
-    falls back to a per-session exec instead of churning the spawn loop."""
+    connection handler turns this into a classed ``capacity`` reply carrying
+    ``retry_after_secs`` and NO fallback tag: a refusal about the host or the
+    moment never authorises the stub's own exec, because concurrent fallbacks are
+    the unaccounted fan-out the daemon exists to bound."""
 
 
 class PoolAtCapacity(RuntimeError):
     """Raised by :meth:`BackendPool.add` when the pool is full and no idle
     backend can be evicted to make room (every slot is actively attached).
-    The connection handler turns this into a ``rejected`` reply tagged
-    ``fallback: true`` so the stub runs the real backend directly (unpooled)
-    for that session instead of dropping the server's tools for the whole
-    session."""
+    The connection handler turns this into a ``rejected`` reply of class
+    ``capacity`` carrying ``retry_after_secs`` and NO ``fallback`` tag: this is
+    a property of the host, not of the target, so authorising the stub's own
+    unpooled exec would add a process to a host that just refused one -- and the
+    daemon cannot even charge that exec, because a stub predating
+    ``spawn_queue`` closes its socket before exec'ing. A stub that understands
+    the class answers kiro-cli a typed error and keeps serving; one that does
+    not takes its terminal exit and that session loses this server's tools."""
 
 
 # Default deadline (seconds) for draining backends during a blue-green
@@ -385,6 +345,44 @@ class _DrainingBackend:
     backend: "Backend"
     deadline: float  # monotonic deadline
     digest: str
+
+
+class ResidentSlot:
+    """One ``max_backends`` slot claimed BEFORE its backend is spawned.
+
+    A capacity check that runs only in ``add`` runs AFTER the spawn: under
+    pressure the daemon forks a process it then has to reap, and a stub learns
+    it is refused only after paying for the fork. A slot is taken by
+    :meth:`BackendPool.reserve_resident_slot` while nothing is spawned yet,
+    counts against capacity from that moment, and is CONSUMED by ``add`` when
+    the backend lands (the slot becomes the pool entry). ``release`` gives
+    it back on any failure between the two and is idempotent; releasing a
+    consumed slot is a no-op, since the entry owns the capacity then.
+    """
+
+    __slots__ = ("_pool", "digest", "_state")
+
+    def __init__(self, pool: "BackendPool", digest: str) -> None:
+        self._pool = pool
+        self.digest = digest
+        self._state = "pending"
+
+    @property
+    def pending(self) -> bool:
+        return self._state == "pending"
+
+    @property
+    def consumed(self) -> bool:
+        return self._state == "consumed"
+
+    def _consume(self) -> None:
+        self._state = "consumed"
+
+    def release(self) -> None:
+        if self._state != "pending":
+            return
+        self._state = "released"
+        self._pool._release_resident_slot(self)
 
 
 class BackendPool:
@@ -427,6 +425,11 @@ class BackendPool:
         # the same key must not collapse, or one caller's unreserve would drop
         # another's eviction protection. A digest is reserved iff count > 0.
         self._reserved_digests: dict[str, int] = {}
+        # Resident slots claimed for spawns not yet landed in ``_backends``,
+        # keyed by digest. Counted as occupied by every capacity check so a
+        # burst of distinct keys cannot all pass ``add``'s door at once; at most
+        # one per digest because the per-key spawn lock serialises spawns.
+        self._resident_pending: dict[str, ResidentSlot] = {}
         # Strong refs to fire-and-forget LRU-eviction shutdown tasks. The
         # event loop keeps only a weak reference to a bare create_task, so
         # without this an evicted backend's shutdown task can be GC'd before
@@ -447,6 +450,16 @@ class BackendPool:
         # requests but are invisible to acquire. The heartbeat sweeper reaps
         # them on refcount==0 or deadline expiry.
         self._draining: list[_DrainingBackend] = []
+        # Backends bound to ONE connection, keyed by stub_uuid. Deliberately a
+        # separate map from ``_backends``: an entry here is never a reuse
+        # candidate (that is the point), sits at refcount 1 for its whole life,
+        # and is released when its stub disconnects rather than by the idle or
+        # LRU sweeper. Keeping it out of ``_backends`` also keeps it out of the
+        # ``_max_backends`` budget — a refcount-1 backend can never be an
+        # eviction victim, so counting these would let them accumulate as
+        # unevictable occupants until a new SHARED acquire finds nothing to
+        # evict and is rejected outright.
+        self._exclusive: dict[str, "Backend"] = {}
         # Blue-green cutover generation. Bumped on every drain so an in-flight
         # spawn that started before a credential rotation can detect that a
         # cutover landed while it was suspended and refuse to pool its
@@ -472,35 +485,21 @@ class BackendPool:
             "spawns": self._spawns,
             "capacity_rejects": self._capacity_rejects,
             "draining": len(self._draining),
+            "resident_pending": len(self._resident_pending),
+            # Reported separately because these sit outside ``max_backends`` by
+            # design: an operator reading "size" against the budget would
+            # otherwise have no way to see the per-connection processes at all.
+            "exclusive": len(self._exclusive),
         }
 
-    def _metrics_snapshot(self) -> dict[str, Any]:
-        """Sync per-backend snapshot. PRIVATE: it does a blocking /proc RSS
-        walk, so it must never run on the event loop — callers use
-        :meth:`metrics_snapshot_async`, which offloads the walk via to_thread."""
-        now = time.monotonic()
-        backends = [
-            {
-                "server": b.pool_key.server_name,
-                "agent": b.pool_key.agent_name,
-                "pid": b.pid,
-                "sessions": b.refcount,
-                "idle_s": round(max(0.0, now - b.last_used_at), 1),
-                "rss_kb": _proc_rss_kb(b.pid),
-            }
-            for b in self._backends.values()
-            if b.is_alive
-        ]
-        return {**self.stats(), "backends": backends}
-
     async def metrics_snapshot_async(self) -> dict[str, Any]:
-        """Race-free, off-loop variant of :meth:`_metrics_snapshot`.
+        """Per-backend snapshot, taken off the event loop.
 
         Snapshots per-backend identity under the pool lock (fast, on-loop),
         then performs the blocking ``/proc`` RSS walk off the event loop via
-        ``asyncio.to_thread``. A plain ``to_thread(_metrics_snapshot)`` would
-        iterate ``_backends`` in the worker thread and can race a concurrent
-        add/evict ("dict changed size during iteration").
+        ``asyncio.to_thread``. Snapshotting first is load-bearing: iterating
+        ``_backends`` in the worker thread can race a concurrent add/evict
+        ("dict changed size during iteration").
         """
         now = time.monotonic()
         async with self._lock:
@@ -567,6 +566,10 @@ class BackendPool:
         """
         pids = [b.pid for b in self._backends.values() if b.pid is not None]
         pids.extend(e.backend.pid for e in self._draining if e.backend.pid is not None)
+        # Connection-private backends are ordinary child processes; being outside
+        # the reuse index and the capacity budget does not make them any less
+        # orphanable by a SIGKILLed gatewayd.
+        pids.extend(b.pid for b in self._exclusive.values() if b.pid is not None)
         return pids
 
     async def add(
@@ -587,9 +590,10 @@ class BackendPool:
         evicted via LRU policy (lowest ``last_used_at``) before insertion.
         A backend with active refcount is NOT a valid eviction target —
         :meth:`_pick_lru_idle_locked` returns ``None`` if every entry is
-        in use, and ``add`` then raises :class:`PoolAtCapacity`. The spawn
-        path in :meth:`get_or_create` translates that into a clean
-        fallback-eligible rejection so the stub runs the backend unpooled.
+        in use, and ``add`` then raises :class:`PoolAtCapacity`. The spawn path
+        in :meth:`get_or_create` translates that into a classed ``capacity``
+        rejection the stub must WAIT on -- never an authorisation to run the
+        backend unpooled, which would put the launch outside every budget.
 
         ``spawn_epoch`` is the :attr:`_drain_epoch` value observed by the
         caller immediately before it started spawning. If a blue-green
@@ -609,7 +613,12 @@ class BackendPool:
                 raise RuntimeError(
                     f"pool key collision: {key.human_readable()} already has a backend"
                 )
-            if len(self._backends) >= self._max_backends:
+            slot = self._resident_pending.pop(digest, None)
+            if slot is not None:
+                # The capacity check already ran when the slot was reserved,
+                # before the spawn; the slot now becomes the entry.
+                slot._consume()
+            elif len(self._backends) + len(self._resident_pending) >= self._max_backends:
                 evicted = await self._evict_lru_locked()
                 if evicted is None:
                     self._capacity_rejects += 1
@@ -699,11 +708,12 @@ class BackendPool:
                     if stale is not None:
                         await stale.shutdown(timeout=2.0)
 
-                # Circuit breaker: refuse to respawn a server
-                # that is crash-looping. The stub falls back to a per-session
-                # exec instead of the gateway churning spawns against a broken
-                # binary. Checked AFTER recording the stale death above so the
-                # death that trips the breaker blocks this very respawn.
+                # Circuit breaker: refuse to respawn a server that is
+                # crash-looping, so the gateway stops churning spawns against a
+                # broken binary. The stub is told to retry, never to exec its own:
+                # a breaker-open answer is capacity-classed. Checked AFTER
+                # recording the stale death above so the death that trips the
+                # breaker blocks this very respawn.
                 if self._breaker is not None and not self._breaker.allow(key.stable_hash()):
                     raise BackendUnavailable(
                         f"circuit breaker OPEN for server {key.server_name!r}; "
@@ -721,9 +731,9 @@ class BackendPool:
                 # that spawn admit a stale-credential backend into the active pool
                 # AFTER the drain completed, defeating revocation. If the retries
                 # are exhausted (a persistent rotation storm), we discard the last
-                # backend and raise BackendUnavailable — a fallback-eligible
-                # failure the stub degrades to an unpooled per-session exec — never
-                # pooling a possibly-stale backend.
+                # backend and raise BackendUnavailable — a capacity-classed refusal
+                # the stub retries against, never an unaccounted per-session exec —
+                # rather than pooling a possibly-stale backend.
                 for _attempt in range(_MAX_SPAWN_DRAIN_RETRIES + 1):
                     spawn_epoch = self._drain_epoch
                     backend = await spawn()
@@ -765,7 +775,7 @@ class BackendPool:
                     return backend
                 # Retries exhausted under a persistent rotation storm: the last
                 # backend was already discarded by the final _DrainedDuringSpawn
-                # branch. Reject fallback-eligibly rather than pooling a stale one.
+                # branch. Refuse as capacity rather than pooling a stale one.
                 raise BackendUnavailable(
                     f"repeated blue-green cutover during spawn of "
                     f"{key.server_name!r}; refusing to pool a possibly-stale "
@@ -779,6 +789,13 @@ class BackendPool:
             # Only reap when the lock is idle (no holder, no queued waiter): a
             # queued waiter proceeds to spawn (or reaps it on its own failure).
             async with self._lock:
+                if digest not in self._backends:
+                    # A slot claimed for this spawn that never landed (retries
+                    # exhausted, spawn raised past the closure's own release)
+                    # would otherwise hold a capacity unit forever.
+                    leftover = self._resident_pending.get(digest)
+                    if leftover is not None and _lock_idle(lock):
+                        leftover.release()
                 if (
                     digest not in self._backends
                     and self._spawn_locks.get(digest) is lock
@@ -793,7 +810,7 @@ class BackendPool:
             return self._backends.get(digest)
 
     async def get_by_digest(self, digest: str) -> Optional["Backend"]:
-        """Return the ALIVE backend whose PoolKey digest is exactly ``digest``.
+        """Return the ALIVE backend whose storage digest is exactly ``digest``.
 
         Used by the MCP Apps ``app-call`` control path: the spool record binds
         the PRODUCING backend's full PoolKey digest, and the callback resolves
@@ -802,12 +819,129 @@ class BackendPool:
         (different credentials / sandbox / approval identity) — an exact-digest
         match makes cross-partition execution impossible; a dead or evicted
         backend is a plain deny, never a fallback.
+
+        A per-connection backend's storage digest carries its ``stub_uuid``, so
+        two connections to the same server under an identical PoolKey do NOT
+        share a digest. That is what preserves the exact-match guarantee here:
+        without it an app callback could resolve onto another session's private
+        backend for the same server.
         """
         async with self._lock:
             backend = self._backends.get(digest)
+            if backend is None:
+                backend = next(
+                    (b for b in self._exclusive.values() if b.storage_digest == digest),
+                    None,
+                )
         if backend is not None and backend.is_alive:
             return backend
         return None
+
+    def _spawn_shutdown(self, backend: "Backend") -> None:
+        """Reap ``backend`` on the event loop without awaiting it here.
+
+        Used where the caller may itself be cancelled: an ``await`` on a
+        cancelled task re-raises before the shutdown runs, leaking the child.
+        The task is strongly referenced until done, since the loop holds only a
+        weak reference to a bare ``create_task``.
+        """
+        task = asyncio.create_task(_safe_shutdown(backend))
+        self._shutdown_tasks.add(task)
+        task.add_done_callback(self._shutdown_tasks.discard)
+
+    async def acquire_exclusive(
+        self,
+        key: PoolKey,
+        stub_uuid: str,
+        spawn: Callable[[], Awaitable["Backend"]],
+    ) -> "Backend":
+        """Spawn a backend bound to ``stub_uuid`` alone and register it.
+
+        Never consults ``_backends``, so an identical PoolKey arriving on
+        another connection can never resolve onto this backend. Also skips the
+        ``_max_backends`` budget -- this is the process topology the host would
+        have with no gateway at all, and subjecting it to the pooling capacity
+        limit would let opted-out connections reject pooled ones.
+
+        The caller MUST call :meth:`release_exclusive` when the connection ends.
+        """
+        backend = await spawn()
+        # Before registering: ``storage_digest`` derives from this, and both the
+        # app-call resolver and the spool record read it the moment the backend
+        # is reachable.
+        backend.exclusive_token = stub_uuid
+        try:
+            async with self._lock:
+                existing = self._exclusive.pop(stub_uuid, None)
+                self._exclusive[stub_uuid] = backend
+                self._spawns += 1
+        except BaseException:
+            # Between spawn() returning and registration completing the child is
+            # reachable from NOTHING: not the connection teardown, not
+            # shutdown_all. Acquiring ``_lock`` can yield, so a cancel landing
+            # here would leak the process. Reap it on the way out, as a tracked
+            # task rather than an await — this handler may itself be cancelled,
+            # and an await would re-raise before the shutdown ran.
+            self._spawn_shutdown(backend)
+            raise
+        if existing is not None:
+            # stub_uuid is a fresh uuid4 per connection, so this means the same
+            # connection registered twice. Reap the loser rather than orphaning
+            # a live subprocess by overwriting the entry.
+            await _safe_shutdown(existing)
+        return backend
+
+    async def release_exclusive(self, stub_uuid: str) -> Optional["Backend"]:
+        """Unregister ``stub_uuid``'s private backend and return it for shutdown.
+
+        Returns ``None`` when the connection had no private backend -- the
+        normal case for a pooled stub, which makes this safe to call
+        unconditionally on every disconnect.
+        """
+        async with self._lock:
+            return self._exclusive.pop(stub_uuid, None)
+
+    async def reserve_resident_slot(self, key: PoolKey) -> ResidentSlot:
+        """Claim a ``max_backends`` slot for ``key`` BEFORE spawning into it.
+
+        Raises :class:`PoolAtCapacity` when the pool is full of attached or
+        already-claimed entries and no idle one can be LRU-evicted -- with
+        nothing spawned, so the caller has nothing to reap. Idempotent per
+        digest while a claim is pending: the per-key spawn lock means one spawn
+        per digest is in flight, and a blue-green retry inside it reuses the
+        same slot. A digest that already has a live entry gets a consumed
+        (no-op) slot, since ``get_or_create`` reuses that entry instead.
+        """
+        digest = key.stable_hash()
+        async with self._lock:
+            pending = self._resident_pending.get(digest)
+            if pending is not None:
+                return pending
+            slot = ResidentSlot(self, digest)
+            if digest in self._backends:
+                slot._consume()
+                return slot
+            if len(self._backends) + len(self._resident_pending) >= self._max_backends:
+                evicted = await self._evict_lru_locked()
+                if evicted is None:
+                    self._capacity_rejects += 1
+                    raise PoolAtCapacity(
+                        f"pool at capacity ({self._max_backends}) and no idle "
+                        f"backend to evict for {key.human_readable()}"
+                    )
+            self._resident_pending[digest] = slot
+            return slot
+
+    def _release_resident_slot(self, slot: ResidentSlot) -> None:
+        # Synchronous: a dict pop on the single event loop needs no lock, and
+        # the release runs from ``finally`` blocks that must not yield.
+        if self._resident_pending.get(slot.digest) is slot:
+            self._resident_pending.pop(slot.digest, None)
+
+    @property
+    def resident_pending(self) -> int:
+        """Slots claimed for spawns that have not landed yet."""
+        return len(self._resident_pending)
 
     def reserve(self, key: PoolKey) -> None:
         """Mark ``key`` as in-flight (handed out, not yet attached).
@@ -821,6 +955,21 @@ class BackendPool:
         """
         digest = key.stable_hash()
         self._reserved_digests[digest] = self._reserved_digests.get(digest, 0) + 1
+
+    def backends_hosting_stub(self, stub_uuid: str) -> list["Backend"]:
+        """Live backends whose inbox table names ``stub_uuid`` — normally at
+        most one; a list because a stub mid-respawn can transiently appear
+        on two. Covers BOTH pooled and exclusive (private) backends: a
+        private stub rekeys the same way a pooled one does, and omitting it
+        would leave the previous caller's subscriptions routing to the new
+        owner. Read-only snapshot for callers that must reach the backend a
+        stub is attached to (e.g. the claim rekey's subscription eviction).
+        """
+        return [
+            b
+            for b in (*self._backends.values(), *self._exclusive.values())
+            if stub_uuid in b._stub_inboxes
+        ]
 
     def unreserve(self, key: PoolKey) -> None:
         """Release the in-flight reservation for ``key``.
@@ -1079,8 +1228,19 @@ class BackendPool:
         calls until refcount-0 or the drain deadline). Omitting them would let a
         stop/abort during the drain window miss in-flight calls on the old
         backend, which would then run to completion instead of being cancelled.
+
+        Includes connection-private backends for the same reason. They are held
+        apart from ``_backends`` to keep them out of the reuse index and the
+        capacity budget — not out of the process lifecycle. Omitting them here
+        would let a shutdown decide no work is outstanding and discard a private
+        backend's pending reply, and would leave a stop/abort unable to cancel
+        its in-flight calls.
         """
-        return list(self._backends.values()) + [e.backend for e in self._draining]
+        return (
+            list(self._backends.values())
+            + [e.backend for e in self._draining]
+            + list(self._exclusive.values())
+        )
 
     async def shutdown_all(self, timeout: float = 5.0) -> None:
         """Shut down every registered backend and clear the pool.
@@ -1094,9 +1254,15 @@ class BackendPool:
             backends = list(self._backends.values())
             # Also collect draining backends so they don't leak on shutdown.
             backends.extend(entry.backend for entry in self._draining)
+            # Per-connection backends are reaped on their stub's disconnect, but
+            # a daemon teardown races that — collect them or they outlive the
+            # gateway as orphans holding their pipes open.
+            backends.extend(self._exclusive.values())
             self._backends.clear()
             self._spawn_locks.clear()
             self._draining.clear()
+            self._exclusive.clear()
+            self._resident_pending.clear()
             pending = list(self._shutdown_tasks)
         # Shutdowns are independent: fan out + join with gather.
         # ``return_exceptions=True`` keeps one slow/bad backend from

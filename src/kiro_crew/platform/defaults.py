@@ -11,15 +11,33 @@ The Amazon companion subclasses or replaces these in its composition root.
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kiro_crew.platform.interfaces import McpScope
+    from kiro_crew.publish_provider import PublishProvider
+    from kiro_crew.platform.interfaces import (
+        ImportSource,
+        InboundToken,
+        McpScope,
+        SessionPrincipal,
+        WorkloadIdentity,
+    )
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
+    from kiro_crew.tips_pool import TipsPool
 
 from kiro_crew import security, sso_status
-from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
+from kiro_crew.platform.interfaces import (
+    BUILTIN_PROVISIONER_ID,
+    CapabilityResult,
+    InterceptDecision,
+    MobileConnectMethod,
+    OtlpDestination,
+    RemoteProvisioner,
+)
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
 # import ``kiro_crew.platform`` at module-load time, so importing them at the top
@@ -36,28 +54,91 @@ from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
 
 
 class DefaultProviderRegistry:
-    """Kiro-CLI-ACP only.  Leaves the dormant ACP_BACKEND_CLAUDE seam untouched."""
+    """Registers the operator's ``harnesses.json`` descriptors; nothing else.
+
+    Every BUILTIN backend is already in the baseline, so the only thing this
+    seam has to register in the public edition is what the operator declared.
+    """
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # The public edition registers no extra ACP backends.  The companion
-        # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam.
-        return None
+        # The operator's descriptors enter through THIS seam so harness support
+        # stays additive at ``ProviderRegistry`` (harness-parity H13): the Kiro
+        # construction path in ``bootstrap_context`` gains no second registration
+        # call, and an edition that overrides this method decides for itself
+        # whether operator descriptors are honoured (it calls this base method or
+        # it does not). The builtin ids need no call: the baseline already covers
+        # every id in ``ACP_BACKENDS_KNOWN``.
+        #
+        # Best-effort, like the seam's caller: a ``harnesses.json`` that cannot be
+        # read leaves the builtin harnesses serving, which is a startable
+        # deployment. The loader reports per-descriptor problems through the
+        # registry's ``invalid`` view rather than raising, so an exception here is
+        # an unexpected fault, not a bad descriptor.
+        from kiro_crew.agent_sdk.operator_harnesses import (
+            load_and_register_operator_descriptors,
+        )
+
+        load_and_register_operator_descriptors()
 
 
 class DefaultPublishRegistry:
-    """Registers no publish provider — the public edition has no artifact-publish
-    destination.  The ``publish_provider`` registry stays empty, so
-    ``get_provider`` raises ``PublishUnavailableError`` (→ 503) and
-    ``list_providers`` returns ``[]`` (dashboard shows "publishing unavailable")
-    with no core branching.  A companion registers its concrete providers here
-    via the ``publish_provider.register_provider`` side effect — the structural
-    twin of ``DefaultProviderRegistry.register_acp_backends``."""
+    """Registers the personal cloud drive as an OPT-IN publish destination.
+
+    The seam itself stays destination-agnostic: this registry is the ONLY place the
+    public edition names a concrete provider, and ``publish_sync`` reaches it through
+    the neutral ``publish_provider`` registry, so a companion edition that registers a
+    different destination never loads this code.  The structural twin of
+    ``DefaultProviderRegistry.register_acp_backends``.
+
+    The drive registers under its OWN key, not ``DEFAULT_PROVIDER``, so it is available
+    and selectable without being the edition's default: ``publish_sync`` resolves an
+    unnamed destination through the default key, which stays unregistered here, so a
+    publish that names nothing still gets a 503.  What holds the default back is a
+    cross-store contract for whether a publication exists, which is being built
+    separately -- see ``personal_drive.PERSONAL_DRIVE_PROVIDER``.  Whether a publish is
+    PERMITTED remains the orthogonal decision of the governance ceiling
+    (``capabilities.publish``) and the operator's ``publish.allowed_destinations``
+    narrowing knob; this seam only decides who implements the transfer.
+    """
+
+    #: The key the drive registers under, spelled here so bootstrap does not have to
+    #: import the provider module to learn it. It is deliberately duplicated rather than
+    #: imported, and `test_boot_does_not_import_the_publish_stack` pins that this literal
+    #: still equals `personal_drive.PERSONAL_DRIVE_PROVIDER`, so the copy cannot drift.
+    _PERSONAL_DRIVE_KEY = "personal-drive"
 
     def register_publish_providers(self) -> None:
+        """Register the drive's FACTORY without importing the provider module.
+
+        `no-new-work-on-gateway-boot-path`: this runs inside platform bootstrap, before
+        the socket is bound, so anything imported here is added to every gateway's
+        time-to-ready. Importing the provider eagerly costs ~0.5s of cumulative import
+        (it reaches the deploy engine's profile registry, the artifact store and the
+        validation stack), for a destination most installs never select -- the drive is
+        opt-in, so a publish that does not name it never touches this code at all.
+
+        The registry is already factory-based and instantiates lazily, so only the IMPORT
+        needed moving: it now happens on first selection, inside the closure. The import
+        also has to stay deferred for the original reason, which is unchanged -- the
+        provider reaches config-resolving code that installs this very platform context.
+        """
+        from kiro_crew.publish_provider import register_provider
+
+        def _build() -> PublishProvider:
+            from kiro_crew.publish import personal_drive
+
+            return personal_drive.PersonalDriveProvider()
+
+        register_provider(self._PERSONAL_DRIVE_KEY, _build)
+
+
+class DefaultGatewayLifecycleProvider:
+    """Keep the core's interpreter and managed-venv restart resolution."""
+
+    def restart_launcher(self) -> str | None:
         return None
 
 
@@ -123,7 +204,13 @@ class DefaultCredentialPolicy:
 
 
 class DefaultSlackEnterpriseGate:
-    """Default-open gate delegating to ``slack/enterprise.py``."""
+    """Default-open gate delegating to ``slack/enterprise.py``.
+
+    ``extra_ids`` is accepted for protocol compatibility and IGNORED: the module
+    re-reads ``slack.allowed_enterprise_ids`` itself, which is the same key the
+    callers derive this value from, so a passed set is at best a duplicate and
+    at worst an older copy naming ids the operator removed.
+    """
 
     def validate_enterprise(self, bot_token: str, *, extra_ids: "set[str] | None" = None) -> bool:
         # deferred: defaults.py loads at platform-init (bootstrap imports it);
@@ -192,6 +279,41 @@ class DefaultIdentityProvider:
         return []
 
 
+class DefaultAgentIdentityProvider:
+    """Disabled agent-identity seam — standalone has no workload or Gateway.
+
+    ``enabled()`` is False so every public call site is a no-op. Other methods
+    return the disabled answer (``None`` / ``{}`` / the input principal) so a
+    ``safe_context_call`` fallback that degrades to the same values cannot
+    flip the seam on.
+    """
+
+    def enabled(self) -> bool:
+        return False
+
+    def workload_identity(self) -> "WorkloadIdentity | None":
+        return None
+
+    def status(self) -> Dict[str, object]:
+        # Display-only. Never token material — a token-like key here would
+        # leak bearer into the dashboard status payload.
+        return {}
+
+    def gateway_mcp_spec(self) -> Dict[str, object] | None:
+        return None
+
+    async def annotate_principal(self, principal: "SessionPrincipal") -> "SessionPrincipal":
+        return principal
+
+    async def vend_workload_access_token(self, principal: "SessionPrincipal") -> str | None:
+        return None
+
+    async def vend_gateway_inbound_token(
+        self, principal: "SessionPrincipal"
+    ) -> "InboundToken | None":
+        return None
+
+
 class DefaultEmbeddingSource:
     """Bundled in-process model (vendored llama.cpp), unsigned local inference.
 
@@ -245,6 +367,38 @@ class DefaultPromptSourceProvider:
         return []
 
 
+class DefaultSkillDiscoveryProvider:
+    """No edition skill discovery providers — the built-in catalog only."""
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        return []
+
+
+class DefaultTipsProvider:
+    """No edition tip pool — the public curated file + docs-scan catalog.
+
+    ``None`` is the "public pool unchanged" answer, so the standalone edition is
+    behaviorally identical to before the seam existed.
+    """
+
+    def tips_pool(self) -> "Optional[TipsPool]":
+        return None
+
+
+class DefaultDeniedRuleProvider:
+    """No edition denied-command rules — the built-in catalog only."""
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
+        return []
+
+
+class DefaultImportSourceProvider:
+    """No edition import sources — the onboarding importer offers the builtins only."""
+
+    def import_sources(self) -> List["ImportSource"]:
+        return []
+
+
 class DefaultCapabilityManager:
     """Unavailable capability manager — the public edition ships no external
     package manager, so ``/api/capability/*`` report 503. Every operation is a
@@ -262,7 +416,7 @@ class DefaultCapabilityManager:
     async def uninstall_mcp(self, server_id: str) -> "CapabilityResult":
         return CapabilityResult(ok=False, message="capability manager not available")
 
-    async def registry(self) -> List[Dict[str, Any]]:
+    async def registry(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
     async def list_skills(self) -> List[Dict[str, Any]]:
@@ -293,6 +447,22 @@ class DefaultCapabilityManager:
 
     async def sync_plugins(self) -> "CapabilityResult":
         return CapabilityResult(ok=False, message="capability manager not available")
+
+
+class DefaultExternalAccessPolicy:
+    """Admits every external service — today's open-source behaviour.
+
+    The public build queries skills.sh and the official MCP registry and offers
+    cloud deployment, so the default must stay permissive or an ordinary install
+    would lose both browsers and the deploy page. A managed edition overrides this
+    to allowlist its own registry and to withhold cloud deployment.
+    """
+
+    def admits_registry(self, kind: str, name: str, api_base: str) -> bool:
+        return True
+
+    def admits_cloud_deployment(self, target: str) -> bool:
+        return True
 
 
 class DefaultAppRegistryPolicy:
@@ -330,6 +500,14 @@ class DefaultAppsLoader:
     def registry_rows(self) -> List[Dict[str, Any]]:
         # The public edition bundles no extra App-Store rows beyond
         # apps/app-registry.json. A companion returns its internal catalog rows.
+        return []
+
+    def default_registries(self) -> List[Dict[str, Any]]:
+        # The public edition pins no external registry: the only registries are
+        # the ones the operator typed into config.registries. A companion returns
+        # its organisation's official registry, optionally with the display-only
+        # `label` (a human name shown instead of the `name` id) and `review`
+        # (`""` / `"curated"` / `"community"`, which badge the dashboard shows).
         return []
 
 
@@ -396,6 +574,24 @@ class DefaultTelemetryProvider:
     def frontend_rum_config(self) -> Optional[dict]:
         return None
 
+    def otlp_destinations(self, cfg: Any) -> "tuple[OtlpDestination, ...]":
+        # Byte-identical to the endpoint-only OTLP exporter this seam replaced:
+        # ONE destination when telemetry.otlp_endpoint is a non-empty string,
+        # NONE otherwise — so egress stays off by default and the standalone
+        # build reaches exactly the collector it reached before. Read with
+        # getattr so any telemetry-config shape works, and never logged here:
+        # the value can carry credentials in userinfo or query parameters.
+        endpoint = str(getattr(cfg, "otlp_endpoint", "") or "").strip()
+        if not endpoint:
+            return ()
+        return (
+            OtlpDestination(
+                name="telemetry.otlp_endpoint",
+                endpoint=endpoint,
+                signals=frozenset({"metrics"}),
+            ),
+        )
+
 
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
@@ -419,6 +615,12 @@ class DefaultDashboardContributor:
     def sso_login_handler(self) -> Optional[Callable[..., Any]]:
         # None → the dashboard keeps its built-in /api/sso-login stub handler.
         return None
+
+    def mixed_internal_api_paths(self) -> "frozenset[str]":
+        # The public edition mounts no routes, so it has none to make reachable
+        # by an internal loopback caller. Empty keeps the middleware's admitted
+        # set byte-identical to the core's own.
+        return frozenset()
 
     def on_user_message(self, app: Any, message: str) -> None:
         # The public edition observes no chat messages. A companion uses this to
@@ -453,3 +655,189 @@ class DefaultJailProvider:
     def maybe_reexec_into_jail(self, argv: List[str], mode: str) -> Optional[int]:
         # None → no re-exec; the command runs in-process exactly as today.
         return None
+
+
+class DefaultMobileConnectProvider:
+    """The personal-install phone-connection pair.
+
+    ``tailnet_qr`` rides the existing tailnet publish + QR mint surface
+    (``/api/tailnet/mobile/*``); ``login_link`` rides the one-time mobile
+    sign-in link (``/api/auth/mobile-link``).  Descriptors only — each method's
+    own endpoint keeps its full guard stack.  An enterprise companion replaces
+    this list via ``dataclasses.replace(ctx, mobile_connect=...)``.
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        return [
+            MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
+            MobileConnectMethod(id="login_link", kind="login_link"),
+        ]
+
+
+#: The descriptor the public build ships. Module-level so the handler's
+#: degraded-seam fallback and the Default adapter cannot drift apart.
+BUILTIN_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=BUILTIN_PROVISIONER_ID,
+    kind=BUILTIN_PROVISIONER_ID,
+    label="AWS EC2 in your own account",
+    posix_only=True,
+)
+
+#: The id a launch request names as ``provider_id`` for the Fargate lane.
+FARGATE_PROVISIONER_ID = "aws_fargate"
+
+#: The Fargate descriptor. ``kind`` equals the id, so the dashboard looks for a
+#: renderer registered under that kind and skips the row when none is, rather than
+#: handing the EC2 form a lane that takes no instance type.
+FARGATE_REMOTE_PROVISIONER = RemoteProvisioner(
+    id=FARGATE_PROVISIONER_ID,
+    kind=FARGATE_PROVISIONER_ID,
+    label="AWS Fargate in your own account",
+    posix_only=True,
+)
+
+
+class DefaultRemoteProvisionerProvider:
+    """The provisioners the core ships: EC2 always, Fargate when it is configured.
+
+    ``provisioners()`` always returns the ``aws_ec2`` descriptor and ``engine_for``
+    hands out ``RealLaunchEngine`` for it, so the stock Set-up tab and its launch
+    path are unchanged. A companion still replaces this whole object via
+    ``dataclasses.replace(ctx, remote_provisioners=...)`` to add a lane of its own
+    (or withdraw the AWS one on a fleet whose users have no AWS account).
+
+    **The Fargate lane is offered only when ``cloud.json`` configures it, and that
+    is deliberate.** ``FargateLaunchEngine`` refuses to guess a placement, an image
+    or a secret ARN -- an unnamed subnet is the same class of error as deleting a
+    task on a guess -- so a lane offered without those fields is a lane that
+    rejects every launch made through it, spending an operator's attention at
+    launch time on a mistake that was visible when they saved the file.
+    ``FargateConfig`` is the judge: complete means the lane exists, anything else
+    means it does not.
+
+    Registering it does NOT put a row in the Set-up selector on its own.
+    ``RemoteProvisioner.kind`` names a frontend form and the dashboard skips a kind
+    it cannot draw; no ``registerRemoteProvisionerRenderer`` claims this kind today,
+    so the lane is reachable through the API and absent from the selector until one
+    does -- absent rather than broken, which is what that skip exists for.
+
+    Every cloud import here is DEFERRED, and not only for weight.
+    ``kiro_crew.cloud`` reaches ``kiro_crew.sandbox``, which imports
+    ``kiro_crew.platform.current_context``, so a module-level import raises
+    ``ImportError: cannot import name 'current_context' from partially initialized
+    module`` -- this module is loaded during ``platform`` init. Measured after
+    bootstrap, ``kiro_crew.cloud.config`` alone is 105 ms and 122 modules against a
+    126 ms init, so deferring is also what keeps a lane most deployments have not
+    configured from doubling startup.
+    """
+
+    def provisioners(self) -> List[RemoteProvisioner]:
+        rows = [BUILTIN_REMOTE_PROVISIONER]
+        config = self._fargate_config()
+        if config is not None:
+            # The row carries the resolved credential recipient, so the operator READS it
+            # where they choose the lane instead of discovering it in a refusal. This is the
+            # display half of the confirmation: without it "confirm the recipient" is a
+            # copy-paste of a string the operator never had a chance to judge.
+            rows.append(
+                dataclasses.replace(
+                    FARGATE_REMOTE_PROVISIONER,
+                    confirm_before_launch=config.credential_recipient(),
+                )
+            )
+        return rows
+
+    def engine_for(self, provisioner_id: str, *, confirmed_recipient: str = "") -> Any:
+        if provisioner_id == BUILTIN_PROVISIONER_ID:
+            # circular import: ``cloud.launch_engine`` reaches this module through its own
+            # graph, so a module-scope import here closes the loop. Deferring also keeps
+            # platform init off the cloud module graph entirely.
+            from kiro_crew.cloud.launch_engine import RealLaunchEngine
+
+            # No credential recipient to confirm: this lane creates an instance from a
+            # CloudFormation template shipped with the product, and nothing in
+            # ``cloud.json`` chooses what receives a credential. A value passed for it
+            # is ignored rather than refused, so a caller may confirm uniformly.
+            return RealLaunchEngine()
+        if provisioner_id != FARGATE_PROVISIONER_ID:
+            raise KeyError(provisioner_id)
+        config = self._fargate_config()
+        if config is None:
+            # The same KeyError an unknown id raises. A caller naming an
+            # unconfigured lane and one naming a nonexistent lane are in the same
+            # position -- there is no engine -- and a second failure mode would ask
+            # every caller to learn a distinction that changes nothing they can do.
+            raise KeyError(provisioner_id)
+        # circular import: each of these reaches ``kiro_crew.platform.defaults`` through its
+        # own module graph, so a module-scope import here closes the loop -- importing any one
+        # of them alone already pulls this module in. Deferring is also what keeps platform
+        # init light, per the class note above.
+        from kiro_crew.cloud.fargate.identity import SecretRef
+        from kiro_crew.cloud.fargate.runtask import Placement
+        from kiro_crew.cloud.fargate_engine import FargateLaunchEngine, FargateLaunchSpec
+        from kiro_crew.sandbox import require_unaliased_cloud_config
+
+        # The strict no-alias refusal lives HERE, at the point the saved block becomes a
+        # launch, and not on the universal spawn path. An alias on this file lets a write
+        # reach the inode by a name no seal covers, and the field it would reach chooses the
+        # container the model credential is delivered to -- so the launch is refused. On the
+        # spawn path the same refusal refused every sandboxed spawn on a host whose files
+        # legitimately carry a second name (stow, chezmoi, `rsync --link-dest`), which is the
+        # whole box for one lane's exposure.
+        require_unaliased_cloud_config()
+
+        return FargateLaunchEngine(
+            FargateLaunchSpec(
+                placement=Placement(
+                    cluster=config.cluster,
+                    subnets=tuple(config.subnets),
+                    security_groups=tuple(config.security_groups),
+                    assign_public_ip=config.assign_public_ip,
+                ),
+                image=config.image,
+                secrets=tuple(SecretRef(name=name, arn=arn) for name, arn in config.secrets),
+                cpu_architecture=config.cpu_architecture,
+                # Carried through UNCHECKED and UNRESOLVED. This is the operator's
+                # confirmation, so it must reach the engine as they gave it: comparing it
+                # here, against the same read of ``cloud.json`` that built the spec, would
+                # be the file confirming itself. ``provision`` resolves the recipient from
+                # the spec and compares, and it refuses an empty value.
+                confirmed_recipient=confirmed_recipient,
+            ),
+            # What bounds the task's cost. Passed rather than left to default, which is
+            # the whole point: the engine defaults to six hours, and until this argument
+            # existed that default was reachable only by editing Python -- so a task the
+            # RFC itself says may run for hours was stopped by its owner's next launch
+            # with no operator-reachable way to ask for longer.
+            #
+            # ``config`` is complete here (``_fargate_config`` yields only complete
+            # blocks), and ``is_complete`` already called this same method, so the numbers
+            # are ones ``TaskBounds`` accepts and this cannot raise. A block that omits
+            # the key produces exactly the engine's own defaults, so the lane's
+            # behaviour is unchanged for every operator who does not set it. The
+            # population cap has no key at all and always stays the engine's.
+            bounds=config.task_bounds(),
+        )
+
+    @staticmethod
+    def _fargate_config() -> Any:
+        """The configured Fargate block, or ``None``. A read failure is ``None``.
+
+        Read PER CALL, so an operator who edits ``cloud.json`` gets the new answer
+        from the next request rather than the next gateway restart, and a lane
+        removed from the file leaves the selector for the same reason.
+
+        A failure returns ``None`` rather than raising because this runs while the
+        selector is being built: raising would take the whole provisioner list down
+        over one malformed block and hide the ``aws_ec2`` lane too, turning one
+        lane's misconfiguration into a Set-up tab that shows nothing.
+        """
+        try:
+            # circular import: ``cloud.config`` reaches this module through its own graph, so a
+            # module-scope import here closes the loop; the class note above carries the
+            # measured startup cost that makes deferring worth it on its own.
+            from kiro_crew.cloud.config import CloudConfig
+
+            return CloudConfig.load().fargate_config()
+        except Exception:  # noqa: BLE001 - a config read must not break the selector
+            return None

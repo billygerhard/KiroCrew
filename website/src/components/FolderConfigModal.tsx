@@ -1,25 +1,38 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, FolderOpen, ChevronRight, TriangleAlert } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, Check } from 'lucide-react'
 import Modal from './Modal'
+import ErrorNotice from './ErrorNotice'
 import { Input, Btn } from './ui'
+import FolderGlyph from './FolderGlyph'
 import ProjectPicker from './ProjectPicker'
 import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
-import FolderGlyph from './FolderGlyph'
 import { useImeGuard } from '../hooks/useImeGuard'
-import { resolveFolderProjectDir } from '../utils/folderAgent'
-import { ChatFolder } from '../types'
+import { ApiError } from '../api/apiError'
+import { parseErrorCode } from '../utils/errorReport'
+import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
+import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
 /** The folder fields this modal owns. */
-export type FolderConfigField = 'name' | 'color' | 'projectDir' | 'defaultAgent'
+export type FolderConfigField = 'name' | 'color' | 'icon' | 'projectDir' | 'defaultAgent' | 'tags'
 
 export interface FolderConfigDraft {
   name: string
   /** Palette hex for the folder glyph tint; '' = default gray. */
   color: string
+  /** Emoji icon replacing the default glyph; '' = default glyph. */
+  icon: string
+  /** True when the user asked for a fresh auto-generated icon ("reset to
+   *  auto"). Mutually exclusive with a manual `icon` edit — the backend
+   *  rejects the two in one request, so the modal never sends both: typing an
+   *  emoji clears this flag, and pressing Auto-generate restores the seeded
+   *  icon value. */
+  regenerateIcon: boolean
   projectDir: string
   defaultAgent: string
+  /** Tag ids the folder carries; copied onto new chats filed into it. */
+  tags: string[]
   /** Fields the USER actually edited, measured against what the modal opened
    *  with. The caller must build its PATCH from this rather than diffing the
    *  draft against live cache: a field another client changed while the modal
@@ -42,6 +55,16 @@ interface Props {
   installedAgents: { name: string }[]
   /** Global default agent, shown as what an empty agent choice falls back to. */
   globalDefaultAgent?: string
+  /** The tag vocabulary, powering the folder-tag picker. Empty/absent hides the
+   *  picker entirely — a folder can only carry tags that already exist. */
+  availableTags?: ChatTag[]
+  /** True when the chat-tags query FAILED (vs still loading) — renders an
+   *  error line instead of asserting an in-progress state indefinitely. */
+  availableTagsFailed?: boolean
+  /** Retries the failed tag-vocabulary query in place — rendered as an inline
+   *  Retry action on the error line so recovery never requires dismissing the
+   *  modal (closing would discard a mid-draft form). */
+  onRetryTags: () => void
   /** Resolves on a persisted save; REJECTS on failure so the modal can stay
    *  open with the draft intact and surface the reason. */
   onSubmit: (draft: FolderConfigDraft) => Promise<void>
@@ -61,7 +84,15 @@ function ancestorChain(folders: ChatFolder[], id: string | undefined): ChatFolde
   return out
 }
 
-const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultAgent: '', touched: [] }
+const EMPTY: FolderConfigDraft = { name: '', color: '', icon: '', regenerateIcon: false, projectDir: '', defaultAgent: '', tags: [], touched: [] }
+
+/** Set-equality on two tag-id lists (order-insensitive): the picker toggles
+ *  membership, so "changed?" is about which ids are present, not their order. */
+function sameTags(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false
+  const s = new Set(a)
+  return b.every(id => s.has(id))
+}
 
 /**
  * One modal for both "New folder" and "Folder settings".
@@ -77,18 +108,21 @@ const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultA
  * spatial cue the inline input got for free from its own indentation.
  */
 export default function FolderConfigModal({
-  open, onClose, mode, parentId, folder, folders, installedAgents, globalDefaultAgent, onSubmit,
+  open, onClose, mode, parentId, folder, folders, installedAgents, globalDefaultAgent, availableTags, availableTagsFailed, onRetryTags, onSubmit,
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
   const [pickerOpen, setPickerOpen] = useState(false)
-  // Open/closed state of the live folder preview — pure visual, never saved.
-  const [previewOpen, setPreviewOpen] = useState(false)
   // The backend rejects a free-typed project_dir (not absolute / not an existing
   // directory / sensitive path) with a 400. Submit used to be fire-and-forget,
   // so a rejection closed the modal and threw the whole draft away with no
   // feedback. Hold the modal open until the save actually lands.
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState('')
+  // A rejected icon (`icon_invalid` / `regenerate_icon_invalid` from the
+  // server) renders AT the Icon field, localized — not as the raw English
+  // server message in the modal's top alert, which names no field. Only the
+  // icon codes route here; every other failure keeps the top alert.
+  const [iconErr, setIconErr] = useState(false)
   // What the draft looked like when the modal opened — the baseline for
   // "has the user actually typed something worth protecting?".
   const seedRef = useRef<FolderConfigDraft>(EMPTY)
@@ -111,23 +145,41 @@ export default function FolderConfigModal({
   // keep-open-on-error fix exists to preserve.
   const folderRef = useRef(folder)
   folderRef.current = folder
+  // Read through a ref for the same reason as `folderRef`: the vocabulary must
+  // not be an effect dependency, or a tag edit elsewhere would re-seed and
+  // erase an open draft.
+  const availableTagsRef = useRef(availableTags)
+  availableTagsRef.current = availableTags
   const seedKey = mode === 'edit' ? folder?.id : ''
   useEffect(() => {
     if (!open) return
     const f = folderRef.current
+    // Seed only ids that exist in the current vocabulary — but ONLY when the
+    // vocabulary is actually known. `availableTags` is undefined while the
+    // tags query is unresolved; filtering against that as if it were an empty
+    // vocabulary would seed a partial list on a cold load, and the next save
+    // would silently delete the folder's existing tags. Unknown vocabulary
+    // keeps the raw ids; the submit-time prune below (which runs once the
+    // vocabulary has resolved) still clears genuinely dangling ids, so a save
+    // never 400s over a reference the picker cannot display.
+    const known = Array.isArray(availableTagsRef.current)
+    const vocab = new Set((availableTagsRef.current ?? []).map(t => t.id))
     const seeded: FolderConfigDraft = mode === 'edit' && f
       ? {
         name: f.name ?? '',
         color: f.color ?? '',
+        icon: f.icon ?? '',
+        regenerateIcon: false,
         projectDir: f.project_dir ?? '',
         defaultAgent: f.default_agent ?? '',
+        tags: Array.isArray(f.tags) ? (known ? f.tags.filter(t => vocab.has(t)) : [...f.tags]) : [],
         touched: [],
       }
       : EMPTY
     setDraft(seeded)
     seedRef.current = seeded
     setPickerOpen(false)
-    setSaving(false); setSaveErr('')
+    setSaving(false); setSaveErr(''); setIconErr(false)
   }, [open, mode, seedKey])
 
   // Focus the name field on open. rAF + preventScroll for the same reason the
@@ -155,6 +207,18 @@ export default function FolderConfigModal({
     return from ? resolveFolderProjectDir(folders, from) : undefined
   }, [folders, mode, folder?.parent_id, parentId])
 
+  // The default agent inherits the same way, so the empty option has to name the
+  // agent an empty selection would ACTUALLY run: the nearest ancestor that pins
+  // one, and only then the global default. Naming the global default
+  // unconditionally reads "Inherit (kirocrew)" on a subfolder of an
+  // agent-pinned folder whose chats will in fact run that ancestor's agent.
+  const inheritedAgent = useMemo(() => {
+    const from = mode === 'edit' ? folder?.parent_id : parentId
+    return from
+      ? resolveFolderAgent(folders, from, globalDefaultAgent || '')
+      : globalDefaultAgent || undefined
+  }, [folders, mode, folder?.parent_id, parentId, globalDefaultAgent])
+
   const trimmedName = draft.name.trim()
   const canSubmit = trimmedName.length > 0
 
@@ -179,17 +243,41 @@ export default function FolderConfigModal({
   const submit = useCallback(async () => {
     if (!canSubmit || saving) return
     const seeded = seedRef.current
+    // THE tag-payload invariant: `tags` enters the PATCH only when the user
+    // actually toggled a chip (draft differs from what this modal seeded).
+    // A rename-only save must omit `tags` entirely — sending any list would
+    // overwrite tags another client added to the folder while this modal sat
+    // open. No client-side dangling-id prune is needed: the folder endpoint
+    // silently filters unknown ids exactly like the slot-tags endpoint it
+    // mirrors, so a stale reference is shed by the server on save and can
+    // never 400 the folder.
+    const tagsEdited = !sameTags(draft.tags, seeded.tags)
     const edited: FolderConfigField[] = []
     if (trimmedName !== seeded.name) edited.push('name')
     if (draft.color !== seeded.color) edited.push('color')
+    // An armed regenerate is an icon edit too — the value looks unchanged
+    // (Auto-generate restores the seeded emoji) but the user asked for a new
+    // one, and the caller branches on regenerateIcon before touched('icon').
+    if (draft.icon !== seeded.icon || draft.regenerateIcon) edited.push('icon')
     if (draft.projectDir !== seeded.projectDir) edited.push('projectDir')
     if (draft.defaultAgent !== seeded.defaultAgent) edited.push('defaultAgent')
-    setSaving(true); setSaveErr('')
+    if (tagsEdited) edited.push('tags')
+    setSaving(true); setSaveErr(''); setIconErr(false)
     try {
       await onSubmit({ ...draft, name: trimmedName, touched: edited })
     } catch (e) {
-      // Stay open, keep every field, and say why.
-      setSaveErr(e instanceof Error && e.message ? e.message : i18nT('components.folderConfigModal.save_failed'))
+      // Stay open, keep every field, and say why. An icon rejection is the one
+      // failure with a field to point at: anchor it there, localized, instead
+      // of echoing the server's English text in the top alert. Only
+      // `icon_invalid` routes here — `regenerate_icon_invalid` is a request-
+      // SHAPE error (non-boolean `regenerate_icon`, which this modal can never
+      // send), and the field hint would misdescribe it.
+      const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
+      if (code === 'icon_invalid') {
+        setIconErr(true)
+      } else {
+        setSaveErr(e instanceof Error && e.message ? e.message : i18nT('components.folderConfigModal.save_failed'))
+      }
     } finally {
       setSaving(false)
     }
@@ -203,8 +291,10 @@ export default function FolderConfigModal({
   const touched: FolderConfigField[] = []
   if (draft.name !== seed.name) touched.push('name')
   if (draft.color !== seed.color) touched.push('color')
+  if (draft.icon !== seed.icon || draft.regenerateIcon) touched.push('icon')
   if (draft.projectDir !== seed.projectDir) touched.push('projectDir')
   if (draft.defaultAgent !== seed.defaultAgent) touched.push('defaultAgent')
+  if (!sameTags(draft.tags, seed.tags)) touched.push('tags')
   const isDirty = touched.length > 0
 
   return (
@@ -226,13 +316,10 @@ export default function FolderConfigModal({
         }
       >
         <div className="flex flex-col gap-4">
-          {saveErr && (
-            <div data-testid="folder-config-error" role="alert"
-              className="flex items-start gap-2 text-[11.5px] text-text bg-danger-subtle border border-danger rounded-lg px-3 py-2">
-              <TriangleAlert size={13} className="shrink-0 mt-[1px] text-danger" />
-              <span className="min-w-0 break-words">{saveErr}</span>
-            </div>
-          )}
+          {/* No hand-off: the folder name / color / project dir / default agent /
+              tags form is unsaved — the save that failed is exactly what the
+              draft was about, and the navigation would discard it. */}
+          <ErrorNotice message={saveErr} testId="folder-config-error" />
 
           {/* Read-only destination. Not an input: the entry point already fixed it. */}
           <div data-testid="folder-config-destination" className="flex items-center gap-1.5 flex-wrap text-[11.5px] text-muted bg-bg-accent border border-border rounded-lg px-3 py-2">
@@ -251,39 +338,23 @@ export default function FolderConfigModal({
             </span>
           </div>
 
-          {/* Preview + name. Centre-aligned so the glyph's optical centre
-           *  lines up with the input's. */}
-          <div className="flex items-center gap-3">
-            {/* Live preview: renders the actual sidebar FolderGlyph with the
-             *  draft color, and clicking toggles the open/closed state so the
-             *  user can try both while picking. Presentational toy plus
-             *  preview — no draft state rides on the open flag. */}
-            <button
-              type="button"
-              data-testid="folder-config-preview"
-              title={i18nT('components.folderConfigModal.folder_preview')}
-              aria-label={i18nT('components.folderConfigModal.folder_preview')}
-              aria-pressed={previewOpen}
-              onClick={() => setPreviewOpen(o => !o)}
-              className="shrink-0 w-14 h-14 grid place-items-center rounded-[10px] bg-bg-elevated border border-border cursor-pointer transition-colors hover:border-accent"
-            >
-              <FolderGlyph color={draft.color || undefined} size={34} open={previewOpen} className="shrink-0 text-muted" />
-            </button>
-            <label htmlFor="folder-config-name-input" className="flex-1 min-w-0 flex flex-col gap-1.5">
-              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
-              <Input
-                ref={nameRef}
-                id="folder-config-name-input"
-                className="w-full"
-                data-testid="folder-config-name"
-                placeholder={i18nT('components.folderConfigModal.name_placeholder')}
-                value={draft.name}
-                onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
-                {...ime.composition}
-                onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
-              />
-            </label>
-          </div>
+          {/* Name. The folder's identity mark is a palette color, applied to
+           *  the swatch row below — there is no per-folder icon to preview,
+           *  so the name input owns the full width. */}
+          <label htmlFor="folder-config-name-input" className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
+            <Input
+              ref={nameRef}
+              id="folder-config-name-input"
+              className="w-full"
+              data-testid="folder-config-name"
+              placeholder={i18nT('components.folderConfigModal.name_placeholder')}
+              value={draft.name}
+              onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+              {...ime.bindComposition()}
+              onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
+            />
+          </label>
 
           {/* Color — always visible, compact. Leading "no color" swatch
            *  doubles as the remove affordance, so there is no separate reset
@@ -313,13 +384,174 @@ export default function FolderConfigModal({
                     aria-label={i18nT('components.folderConfigModal.set_color_to_name', { name })}
                     aria-pressed={draft.color === value}
                     onClick={() => setDraft(d => ({ ...d, color: value }))}
-                    className={`w-5 h-5 rounded-full cursor-pointer border transition-transform hover:scale-110 ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                    className={`w-5 h-5 rounded-full cursor-pointer border hover:brightness-125 swatch-cue ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                     style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
                   />
                 )
               })}
             </div>
           </div>
+
+          {/* Icon — an emoji replacing the default folder glyph. Left empty,
+           *  the folder keeps the default glyph — generation never runs
+           *  implicitly; in edit mode "Auto-generate" asks for a fresh pick
+           *  (regenerate_icon) while clearing the field falls back to the
+           *  default glyph. Typing
+           *  clears a pending regenerate and vice versa: the backend rejects
+           *  icon + regenerate_icon in one request, so the two stay exclusive
+           *  here. No client-side emoji validation — the server 400s on
+           *  anything but a single emoji and the error renders above. */}
+          <label htmlFor="folder-config-icon-input" className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.icon')}</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <FolderGlyph
+                color={draft.color || undefined}
+                icon={draft.regenerateIcon ? '' : draft.icon || undefined}
+                size={20}
+                className="shrink-0 text-muted"
+                testId="folder-config-icon-preview"
+              />
+              <Input
+                id="folder-config-icon-input"
+                className="w-24"
+                data-testid="folder-config-icon"
+                placeholder={i18nT('components.folderConfigModal.icon_placeholder')}
+                maxLength={16}
+                value={draft.regenerateIcon ? '' : draft.icon}
+                onChange={e => { setIconErr(false); setDraft(d => ({ ...d, icon: e.target.value, regenerateIcon: false })) }}
+              />
+              {mode === 'edit' && (
+                <Btn
+                  data-testid="folder-config-icon-regenerate"
+                  onClick={() => { setIconErr(false); setDraft(d => ({ ...d, icon: seedRef.current.icon, regenerateIcon: true })) }}
+                >
+                  {i18nT('components.folderConfigModal.icon_regenerate')}
+                </Btn>
+              )}
+            </div>
+            {iconErr ? (
+              /* No hand-off: the rejected icon sits inside the same unsaved
+                 folder form — navigating away would discard the whole draft
+                 the keep-open-on-error path exists to preserve. The fix is a
+                 one-field edit right here (type a single emoji or clear it). */
+              <ErrorNotice
+                variant="inline"
+                className="text-[11px]"
+                message={i18nT('components.folderConfigModal.icon_invalid_hint')}
+                testId="folder-config-icon-error"
+              />
+            ) : (
+              <span className="text-[11px] text-muted-strong">
+                {draft.regenerateIcon
+                  ? i18nT('components.folderConfigModal.icon_regenerate_pending')
+                  : mode === 'create'
+                    ? draft.icon
+                      ? ''
+                      : i18nT('components.folderConfigModal.icon_default_hint')
+                    : draft.icon
+                      ? ''
+                      : i18nT('components.folderConfigModal.icon_cleared_hint')}
+              </span>
+            )}
+          </label>
+
+          {/* Tags — chips from the tag vocabulary, copied onto every new chat
+           *  filed into this folder. Three vocabulary states, three renders:
+           *  UNKNOWN (undefined, query unresolved/failed) renders nothing —
+           *  showing the "create tags" hint would falsely tell a user who HAS
+           *  tags that none exist; KNOWN-EMPTY shows the onboarding hint
+           *  rather than vanishing — a hidden section makes the feature
+           *  undiscoverable from the one place it lives; KNOWN-NON-EMPTY
+           *  renders the picker. UNRESOLVED (query still loading) keeps the
+           *  section heading with a muted placeholder instead of nothing, so
+           *  the feature never silently vanishes and the layout does not
+           *  shift when the vocabulary resolves after open. FAILED renders an
+           *  error line, not the loading hint — a dead query must not assert
+           *  an in-progress state indefinitely. */}
+          {availableTags === undefined ? (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              {availableTagsFailed ? (
+                <span className="flex items-center gap-1.5 flex-wrap">
+                  {/* No hand-off: the same unsaved folder form (see the save
+                      notice above) — a read failure, but it sits inside it. */}
+                  <ErrorNotice
+                    variant="inline"
+                    className="text-[11px]"
+                    message={i18nT('components.folderConfigModal.tags_error_hint')}
+                    testId="folder-config-tags-error"
+                  />
+                  <button
+                    type="button"
+                    data-testid="folder-config-tags-retry"
+                    onClick={onRetryTags}
+                    className="text-[11px] underline underline-offset-2 text-danger hover:opacity-80 bg-transparent border-none p-0 cursor-pointer"
+                  >
+                    {i18nT('components.folderConfigModal.tags_retry')}
+                  </button>
+                </span>
+              ) : (
+                <span data-testid="folder-config-tags-loading" className="text-[11px] text-muted-strong">
+                  {i18nT('components.folderConfigModal.tags_loading_hint')}
+                </span>
+              )}
+            </div>
+          ) : availableTags.length > 0 ? (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              <div data-testid="folder-config-tags" className="flex items-center gap-1.5 flex-wrap">
+                {availableTags.map(tag => {
+                  const selected = draft.tags.includes(tag.id)
+                  return (
+                    <label
+                      key={tag.id}
+                      htmlFor={`folder-config-tag-input-${tag.id}`}
+                      data-testid={`folder-config-tag-${tag.id}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer hover:brightness-110 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      style={{
+                        background: selected
+                          ? `color-mix(in srgb, ${tag.color} 30%, var(--bg-elevated))`
+                          : 'var(--bg-elevated)',
+                        borderColor: tag.color,
+                        color: 'var(--text)',
+                      }}
+                    >
+                      {/* A hidden checkbox, not a <button>: the chips are a
+                       *  multi-select choice control, and rendering them as
+                       *  sibling buttons would read as an unbounded action row
+                       *  (AUTOSDE max-two-buttons-per-row). The label supplies
+                       *  the accessible name; checked state carries selection. */}
+                      <input
+                        type="checkbox"
+                        id={`folder-config-tag-input-${tag.id}`}
+                        aria-label={tag.name}
+                        className="sr-only"
+                        checked={selected}
+                        onChange={() => setDraft(d => ({
+                          ...d,
+                          tags: selected ? d.tags.filter(t => t !== tag.id) : [...d.tags, tag.id],
+                        }))}
+                      />
+                      <span aria-hidden className="w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
+                      <span className="truncate max-w-[140px]">{tag.name}</span>
+                      {/* Same "tag is on" glyph SlotTagPopover uses: selection
+                       *  must not hinge on a 1px ring-width difference from the
+                       *  keyboard-focus ring of the same accent color. */}
+                      {selected && <span aria-hidden className="text-accent"><Check size={11} /></span>}
+                    </label>
+                  )
+                })}
+              </div>
+              <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.tags_hint')}</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              <span data-testid="folder-config-tags-empty" className="text-[11px] text-muted-strong">
+                {i18nT('components.folderConfigModal.tags_empty_hint')}
+              </span>
+            </div>
+          )}
 
           {/* Project directory */}
           <div className="flex flex-col gap-1.5">
@@ -334,8 +566,8 @@ export default function FolderConfigModal({
                   : i18nT('components.folderConfigModal.project_dir_placeholder')}
                 value={draft.projectDir}
                 onChange={e => setDraft(d => ({ ...d, projectDir: e.target.value }))}
-                {...ime.composition}
-                onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
+                {...ime.bindComposition()}
+                onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
               />
               <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => setPickerOpen(true)}>
                 <FolderOpen size={13} /> {i18nT('components.folderConfigModal.browse')}
@@ -360,15 +592,37 @@ export default function FolderConfigModal({
             </span>
             <SimpleSelect
               aria-label={i18nT('components.folderConfigModal.default_agent')}
+              // Bind the orphan notice to the control so a screen reader reaches
+              // the reason WITH the field, not as text that merely sits near it:
+              // a control whose state has a cause the user cannot hear is the
+              // same defect as a disabled button that never says why. Only while
+              // an orphan is selected — an ordinary selection has nothing to
+              // describe, and a dangling id here would drop the description.
+              aria-describedby={orphanAgent ? 'folder-config-agent-notice' : undefined}
               options={agentOptions}
               optionLabels={agentOptionLabels}
-              clearLabel={globalDefaultAgent
-                ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
+              clearLabel={inheritedAgent
+                ? i18nT('components.folderConfigModal.inherit_named', { agent: inheritedAgent })
                 : i18nT('components.folderConfigModal.none')}
               value={draft.defaultAgent}
               onChange={v => setDraft(d => ({ ...d, defaultAgent: v }))}
             />
-            <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            {orphanAgent ? (
+              // The orphan is round-tripped, not blocked — Save stays enabled so
+              // a rename of the folder never wipes a temporarily-uninstalled
+              // agent (the round-trip guarantee this picker was built on). The
+              // notice therefore explains why the SELECTED AGENT will not run and
+              // names the fix. Its id is what `aria-describedby` above targets.
+              <span
+                id="folder-config-agent-notice"
+                data-testid="folder-config-agent-notice"
+                className="text-[11px] text-warn"
+              >
+                {i18nT('components.folderConfigModal.agent_not_installed_notice')}
+              </span>
+            ) : (
+              <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
+            )}
           </div>
         </div>
       </Modal>

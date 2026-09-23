@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import socketsec
@@ -189,7 +190,7 @@ def test_check_peer_is_self_dispatches_to_the_macos_mechanism(
 ) -> None:
     """With SO_PEERCRED absent, macOS now has a mechanism and other POSIX does not.
 
-    This test previously asserted UNVERIFIABLE unconditionally, with the
+    A prior version asserted UNVERIFIABLE unconditionally, with the
     rationale "there is no macOS CI job to catch a wrong implementation". The
     macOS job added in this change removes that premise, and LOCAL_PEERCRED is
     now wired -- so on a Mac this socketpair peer IS us and the answer is MATCH.
@@ -643,7 +644,7 @@ def test_macos_check_matches_a_socket_we_connected_to_ourselves(
     # Removed at the end: `mkdtemp` registers no finalizer, so this otherwise left a
     # directory in /tmp for good. /tmp (not tmp_path) because an AF_UNIX sun_path is
     # capped at 104 bytes on macOS and a tmp_path under xdist exceeds it.
-    sock_base = Path(tempfile.mkdtemp(dir="/tmp"))
+    sock_base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "sock-", dir=short_tmp_base()))
     sock = sock_base / "gw.sock"
     transport.prepare_dir(sock)
     outcome: list[PeerCredResult] = []

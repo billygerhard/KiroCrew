@@ -15,15 +15,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import members as members_mod
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.context import _neutralize_structural_markers
 from kiro_crew.dashboard.chat_runner import _run_chat
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
+from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -42,11 +47,38 @@ def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
 
+# The dashed fences this module emits to separate context from the current turn.
+# Scrubbed from CALLER content only, and deliberately NOT added to
+# ``context._STRUCTURAL_MARKER_RES``: ``ContextBuilder.build_message`` neutralizes
+# the whole turn with that global set, so a global entry would strip the fences
+# added below and collapse the separation it is meant to create.
+_CALLER_FENCE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[-]{3,}\s*CONTEXT\s*ENTRY\s*(?:BEGIN|END)\s*[-]{3,}", re.IGNORECASE),
+    re.compile(r"[-]{3,}\s*USER\s*MESSAGE\s*(?:BEGIN|END)\s*[-]{3,}", re.IGNORECASE),
+)
+_FENCE_NEUTRALIZED = "[marker-removed]"
+
+
+def _scrub_caller_fences(text: str) -> str:
+    """Remove this module's own framing fences from caller-supplied content."""
+    for pattern in _CALLER_FENCE_RES:
+        text = pattern.sub(_FENCE_NEUTRALIZED, text)
+    return text
+
+
 def _flatten_messages(messages: list[dict[str, Any]]) -> str:
     """Flatten OpenAI messages array into a single prompt string.
 
     Preserves the last user message as primary. System and prior messages
     are prepended as context block.
+
+    Every caller-supplied ``content`` is scrubbed of the bracket boundary markers
+    (via :func:`_neutralize_structural_markers`) and of this module's own dashed
+    fences (via :func:`_scrub_caller_fences`). Collapsing distinct role channels
+    into one string means the role labels and the fences below become the only
+    signal of where caller content starts and stops, so content that replicates
+    one could otherwise close its own region and forge a ``[SYSTEM]`` block the
+    agent treats as authoritative.
     """
     if not messages:
         return ""
@@ -62,6 +94,11 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> str:
                 for p in content
                 if isinstance(p, dict) and p.get("type") == "text"
             )
+        elif not isinstance(content, str):
+            # A scalar (or null) content is off-spec but must not 500: coerce
+            # before the scrubbers, which are string-only.
+            content = "" if content is None else str(content)
+        content = _scrub_caller_fences(_neutralize_structural_markers(content))
         if role == "user":
             if last_user:
                 context_parts.append(f"[Previous user message] {last_user}")
@@ -231,13 +268,92 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
     completion_id = _make_id()
 
     if slot_id:
+        # App tokens get ONE uniform answer for the whole member-* space,
+        # BEFORE any existence check: an app can never own a member slot, so
+        # the reservation 409 for a missing key next to the ownership 404
+        # for an existing one would let an app enumerate member threads.
+        if request.get("app", "") and _normalize_slot_key(slot_id).startswith(
+            members_mod.DM_SLOT_KEY_PREFIX
+        ):
+            sel().log_api_access(
+                caller=request.get("app", ""),
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={slot_id}",
+                error="app cannot access member slots",
+            )
+            return web.json_response(
+                {
+                    "error": {"message": "not found", "type": "invalid_request_error"},
+                    "code": "not_found",
+                },
+                status=404,
+            )
         # Membership must be checked on the canonical (filename-charset) key —
         # get_or_create_slot folds unsafe chars, so a raw slot_id may map to an
         # existing slot even when the raw string is absent from _slots.
         freshly_created = _normalize_slot_key(slot_id) not in state._slots
-        slot = state.get_or_create_slot(slot_id)
-        # Busy check — prevent concurrent writes to same slot
-        if slot.task is not None and not slot.task.done():
+        try:
+            slot = state.get_or_create_slot(slot_id)
+        except ValueError as exc:
+            # The constructor's refusals (member-* key reservation,
+            # memory-mode mismatch) map to a 409 in the OpenAI error shape —
+            # the same translation the send and slot-create paths perform.
+            return web.json_response(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "code": "member_slot_reserved",
+                    },
+                    # The OpenAI wire shape nests code inside `error`; the
+                    # top-level duplicate is the dashboard/i18n contract
+                    # (test_error_code_contract reads the top-level dict).
+                    "code": "member_slot_reserved",
+                },
+                status=409,
+            )
+        # A remote-bound slot runs its turn on a connected peer and streams the
+        # reply over the dashboard WebSocket; this endpoint has no such channel —
+        # its collectors read only local `chunk`/`assistant` rows. Reaching the
+        # local dispatch chokepoint (`_run_chat`, keyed on `executor == "remote"`)
+        # would append the prompt and emit a WS-only `chat_done`, leaving this HTTP
+        # caller waiting forever on a turn the peer never received and history
+        # holding an unsent turn. Refuse BEFORE any mutation — keyed on
+        # `executor` (not `is_remote`) so a half-open binding is refused too,
+        # matching the chokepoint and the `api_chat` incomplete-binding guard. A
+        # freshly-created slot is always local, so this only rejects an existing
+        # remote-bound target.
+        if getattr(slot, "executor", "") == "remote":
+            sel().log_api_access(
+                caller=request.remote or "",
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="openai_compat",
+                resources=f"slot={slot_id}",
+                error="remote-bound slot not supported on OpenAI-compat endpoint",
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": (
+                            "this session is bound to a remote crew; the "
+                            "OpenAI-compatible endpoint cannot relay remote turns"
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "remote_slot_unsupported",
+                    },
+                    "code": "remote_slot_unsupported",
+                },
+                status=409,
+            )
+        # Busy check — prevent concurrent writes to the same slot. ``running``
+        # includes the outer Autopilot controller while no child turn occupies
+        # ``slot.task``; the pending marker keeps the same isolation after an
+        # authentication pause has ended that controller but before Stage N is
+        # settled and captured.
+        if slot.running is True:
             sel().log_api_access(
                 caller=request.remote or "",
                 operation="openai_compat.chat",
@@ -246,10 +362,119 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 resources=f"slot={slot_id}",
                 error="slot busy",
             )
+            if (
+                slot.stage_boundary.stage is not None
+                and not slot.turn_running
+                and not slot._plan_cancelled
+            ):
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": (
+                                f"slot {slot_id!r} is paused at an Autopilot stage gate; "
+                                "continue from the dashboard (Go)"
+                            ),
+                            "type": "slot_busy",
+                            "code": "stage_gate_paused",
+                        },
+                        "code": "stage_gate_paused",
+                    },
+                    status=409,
+                )
             return web.json_response(
-                {"error": {"message": f"slot {slot_id!r} is busy", "type": "slot_busy"}},
+                {
+                    "error": {
+                        "message": f"slot {slot_id!r} is busy",
+                        "type": "slot_busy",
+                        "code": "slot_busy",
+                    },
+                    "code": "slot_busy",
+                },
                 status=409,
             )
+        # Member DM threads are pinned to their crew — the specific refusal
+        # (with its machine-readable code) must fire BEFORE the generic
+        # mismatch below, or a member mismatch surfaces as an ordinary
+        # conflict and the pin is invisible to the caller.
+        if slot.mode == "member" and agent and agent != slot.agent:
+            sel().log_api_access(
+                caller=request.remote or "",
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="member_pin",
+                resources=f"slot={slot_id} agent={agent}",
+                error=f"member thread pinned to {slot.agent}",
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "member thread agent is pinned",
+                        "type": "invalid_request_error",
+                        "code": "member_thread_agent_pinned",
+                    },
+                    # Top-level duplicate: the dashboard/i18n error-code
+                    # contract reads the top-level dict; OpenAI clients read
+                    # error.code.
+                    "code": "member_thread_agent_pinned",
+                },
+                status=409,
+            )
+        if slot.mode == "member":
+            # Registry-drift fail-closed, mirroring the chat_send path: a
+            # deleted crew's thread must not dispatch — the resolver would
+            # fall back to the default agent and reply under the deleted
+            # member's identity (a caller sending the matching stale agent
+            # name passes the pin check above but still hits this).
+            _member_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+            if slot.agent not in _member_cfg.agents:
+                sel().log_api_access(
+                    caller=request.remote or "",
+                    operation="openai_compat.chat",
+                    outcome="denied",
+                    source="member_pin",
+                    resources=f"slot={slot_id}",
+                    error=f"registry no longer names {slot.agent}",
+                )
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": "this thread's crew no longer exists",
+                            "type": "invalid_request_error",
+                            "code": "member_pin_mismatch",
+                        },
+                        "code": "member_pin_mismatch",
+                    },
+                    status=409,
+                )
+            # Binding-drift fail-closed, also mirroring chat_send: a live
+            # member slot whose dm.json was deleted or corrupted must refuse
+            # the send — dispatching would persist a transcript that restore
+            # skips and thread-open refuses (orphaned the moment the slot
+            # dies). Same rare-send thread-IO budget as the registry check.
+            if slot.key.startswith(members_mod.DM_SLOT_KEY_PREFIX):
+                _send_binding = await asyncio.to_thread(
+                    members_mod.read_dm_binding_for_slot, slot.key
+                )
+                if _send_binding is None or _send_binding.get("member", "") != slot.agent:
+                    sel().log_api_access(
+                        caller=request.remote or "",
+                        operation="openai_compat.chat",
+                        outcome="denied",
+                        source="member_pin",
+                        resources=f"slot={slot_id}",
+                        error="member binding missing or mismatched",
+                    )
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": "this thread's binding is missing or no longer matches",
+                                "type": "invalid_request_error",
+                                "code": "member_binding_missing",
+                            },
+                            "code": "member_binding_missing",
+                        },
+                        status=409,
+                    )
         # Agent mismatch — deny when slot has an agent and caller supplies a different one
         if slot.agent and slot.agent != agent:
             sel().log_api_access(
@@ -329,6 +554,32 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
     slot.drain()
 
     if agent:
+        if slot.mode == "member" and agent != slot.agent:
+            # Member DM threads are pinned to their crew. Only an EXISTING slot
+            # can be in member mode (a slot this request just created carries
+            # the caller's own mode), so no freshly_created cleanup applies.
+            sel().log_api_access(
+                caller=request.remote or "",
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="member_pin",
+                resources=f"slot={slot.key} agent={agent}",
+                error=f"member thread pinned to {slot.agent}",
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "member thread agent is pinned",
+                        "type": "invalid_request_error",
+                        "code": "member_thread_agent_pinned",
+                    },
+                    # Top-level duplicate: the dashboard/i18n error-code
+                    # contract reads the top-level dict; OpenAI clients read
+                    # error.code.
+                    "code": "member_thread_agent_pinned",
+                },
+                status=409,
+            )
         slot.agent = agent
     slot.append("user", prompt, "msg msg-u")
 
@@ -341,21 +592,50 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
         resources=f"slot={slot.key} agent={agent}",
     )
 
-    # Launch the chat
-    task = asyncio.create_task(asyncio.wait_for(_run_chat(state, slot, prompt), timeout=300))
-    slot.task = task
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
-
-    created = int(time.time())
-    ephemeral = not slot_id
-
-    if stream:
-        return await _stream_response(
-            request, state, slot, completion_id, model, created, ephemeral
+    # Both response shapes below consume `slot._pending` as their delivery
+    # queue, and neither sets `_has_reader` (that flag also suppresses the
+    # global message broadcast, which an app-owned slot still wants). Claim the
+    # queue BEFORE the turn is dispatched: the first `await` inside the response
+    # helpers lets the turn run, so a scope opened there would leave a window in
+    # which a turn-end release could discard tokens this reader owes its client.
+    with slot.pending_consumer():
+        # Launch the chat, bounded by the standard chat-turn ceiling. A fixed
+        # 300s cap here would race COMPACT_WAIT_TIMEOUT_SECS: a /compact prompt
+        # phase plus the full compaction wait always exceeds it, so the outer
+        # cancel would surface as an HTTP 500 instead of the graceful
+        # compaction-timeout result.
+        task = asyncio.create_task(
+            asyncio.wait_for(
+                _run_chat(
+                    state,
+                    slot,
+                    prompt,
+                    _directive_user_origin=is_dashboard_caller,
+                    # Named for the same reason ``api_chat`` names it: the actor
+                    # resolver's fallback is ``user``, so a dispatch that OBSERVED
+                    # an app and stayed silent records a person who never typed
+                    # anything -- and every consumer that asks "is a human
+                    # watching this turn" then gets the wrong answer. ``""`` is the
+                    # parameter's own default and reads as "not named", so a
+                    # dashboard caller is unchanged.
+                    _turn_actor="app" if request_app else "",
+                ),
+                timeout=chat_turn_timeout_secs(),
+            )
         )
-    else:
-        return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
+        slot.task = task
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+
+        created = int(time.time())
+        ephemeral = not slot_id
+
+        if stream:
+            return await _stream_response(
+                request, state, slot, completion_id, model, created, ephemeral
+            )
+        else:
+            return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
 
 
 async def _stream_response(

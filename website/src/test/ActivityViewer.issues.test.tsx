@@ -29,6 +29,7 @@ import type { PullRequestLink } from '../utils/pullRequestLinks'
 
 vi.mock('../api/client', () => ({
   api: {
+    workflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
     browseFiles: vi.fn().mockResolvedValue({ path: '/p', parent: '/', dirs: [], files: [] }),
     pullRequestSource: vi.fn().mockImplementation(() => new Promise(() => {})),
     // The Issues view is render-tested here; its payload never resolves so the
@@ -121,12 +122,12 @@ describe('ActivityViewer – issues view', () => {
       <ActivityViewer {...baseProps} issues={issues} selectedIssueUrl={ISSUE_URL} files={[]} />,
       { wrapper },
     )
-    fireEvent.click(screen.getByRole('button', { name: /Files/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Links/ }))
     expect(screen.getByText('Issues')).toBeInTheDocument()
     unmount()
 
     render(<ActivityViewer {...baseProps} issues={[]} files={[]} />, { wrapper })
-    fireEvent.click(screen.getByRole('button', { name: /Files/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Links/ }))
     expect(screen.queryByText('Issues')).toBeNull()
   })
 
@@ -134,8 +135,7 @@ describe('ActivityViewer – issues view', () => {
     render(
       <ActivityViewer
         {...baseProps}
-        view="files"
-        files={[]}
+        view="links"
         sources={sources}
         selectedSourceUrl={PR_URL}
         issues={issues}

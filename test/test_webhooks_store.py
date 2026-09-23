@@ -39,9 +39,41 @@ class TestTokenPersistence:
         assert entry["last4"] == raw[-4:]
 
     def test_public_entry_from_create_has_no_hash(self, store):
-        _, _secret, entry = store.create("Review Bot")
+        _, _secret, entry = store.create("Review Bot", agent="code-reviewer")
         assert "token_hash" not in entry
         assert entry["legacy"] is False
+        assert entry["agent"] == "code-reviewer"
+        assert entry["enabled"] is True
+
+    def test_historical_rows_default_to_unmapped_and_enabled(self, store):
+        raw, _secret, entry = store.create("Historical")
+        stored = store.list_entries()[0]
+        stored.pop("agent")
+        stored.pop("enabled")
+        with webhooks.locked(store.path):
+            store._write_tokens([stored])
+
+        public = store.public_entries()[0]
+        assert public["agent"] == ""
+        assert public["enabled"] is True
+        assert store.verify(raw) == entry["id"]
+
+    def test_update_only_changes_source_owned_fields(self, store):
+        _raw, secret, entry = store.create("Review Bot", agent="code-reviewer")
+        updated = store.update(
+            entry["id"], label="CI callback", agent="oncall", enabled=False
+        )
+        assert updated is not None
+        assert updated["label"] == "CI callback"
+        assert updated["agent"] == "oncall"
+        assert updated["enabled"] is False
+        assert "token_hash" not in updated
+        assert "signing_secret" not in updated
+        stored = store.entry_for(entry["id"])
+        assert stored is not None
+        assert stored["signing_secret"] == secret
+        assert stored["require_signature"] is True
+        assert store.update("wht_missing", enabled=False) is None
 
     def test_raw_secret_shape(self, store):
         raw, _secret, _ = store.create("Review Bot")
@@ -87,8 +119,8 @@ class TestTokenPersistence:
 
         The parse guard only covers bytes that will not decode. A file that
         decodes cleanly but holds a mapping where the list belongs, or a row
-        with no hash, used to be filtered to nothing — and every mutating call
-        writes the loaded list back, so the filtered rows were deleted on the
+        with no hash, must not be filtered to nothing — every mutating call
+        writes the loaded list back, so filtered rows would be deleted on the
         next create. The kill switch shares this file, so the disabled state
         could go with them.
         """
@@ -415,7 +447,7 @@ class TestCrossOsPermissions:
         the moment the lockdown is applied — zero means no payload byte existed
         yet. That is observable on every OS and does not depend on which write
         API the writer uses, which is what earlier attempts at this test got
-        wrong (they watched ``os.write``, no longer on this path, and the POSIX
+        wrong (they watched ``os.write``, not on this path, and the POSIX
         mode, which ``mkstemp`` already sets to 0600).
         """
         sizes: list[int] = []

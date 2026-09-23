@@ -27,14 +27,15 @@ from kiro_crew.acp.client import (
     _rejected_model_from_error,
     advertised_model_ids,
     model_is_unusable,
+    resolve_pin_spelling,
     resolve_usable_model,
 )
 
 # Representative advertised sets for the scenarios below.
 _ENTITLED = ["claude-opus-4.8", "claude-sonnet-4.6", "auto"]  # serves auto
-_FREE_TIER = ["claude-sonnet-4.6"]                            # subset, no auto
-_NO_AUTO_PARTITION = ["gpt-5.6-terra", "gpt-5.6-luna"]        # serves models, not auto
-_UNKNOWN: list = []                                           # no session yet
+_FREE_TIER = ["claude-sonnet-4.6"]  # subset, no auto
+_NO_AUTO_PARTITION = ["gpt-5.6-terra", "gpt-5.6-luna"]  # serves models, not auto
+_UNKNOWN: list = []  # no session yet
 
 
 class TestBackgroundResolution:
@@ -74,6 +75,31 @@ class TestBackgroundResolution:
             "claude-sonnet-4.6"
         )
 
+    def test_namespaced_pin_resolves_to_the_advertised_spelling(self):
+        # A persisted pin can carry a stale `<namespace>::<bare-id>` qualifier
+        # from the catalog that named it, while the session advertises the BARE
+        # id. The substitute path must resolve it — returning the ADVERTISED
+        # spelling for the wire — not silently inherit the backend default.
+        assert (
+            resolve_usable_model("openrouter::z-ai/glm-5.3-flash", ["z-ai/glm-5.3-flash"])
+            == "z-ai/glm-5.3-flash"
+        )
+
+    def test_namespaced_pin_absent_under_both_spellings_inherits_default(self):
+        # The fold can only clear a false withhold, never create entitlement: a
+        # model the backend serves under neither spelling still resolves to "".
+        assert resolve_usable_model("openrouter::not-served", ["z-ai/glm-5.3-flash"]) == ""
+
+    def test_verbatim_advertised_qualified_id_is_not_peeled(self):
+        # An id advertised WITH its qualifier matches literally and is returned
+        # as given — the peel only runs on a literal miss.
+        assert (
+            resolve_usable_model(
+                "openrouter::z-ai/glm-5.3-flash", ["openrouter::z-ai/glm-5.3-flash"]
+            )
+            == "openrouter::z-ai/glm-5.3-flash"
+        )
+
 
 class TestEntitlementPredicate:
     """`model_is_unusable` — the one shared membership check."""
@@ -96,6 +122,138 @@ class TestEntitlementPredicate:
         entries = [{"modelId": "a"}, {"value": "b"}, {"nope": "c"}, "junk", None]
         assert advertised_model_ids(entries) == ["a", "b"]
         assert advertised_model_ids("not-a-list") == []
+
+
+class TestPinSpellingResolver:
+    """`resolve_pin_spelling` — the shared namespace fold.
+
+    Display verdict (`_pinned_model_verdict`) and the wire withhold sites
+    (`_apply_startup_model`, the runtime path in `providers.acp`) all resolve a
+    persisted pin through this one fold, so the chip and the wire cannot
+    disagree about what "usable" means.
+    """
+
+    _BARE = ["auto", "z-ai/glm-5.3-flash"]
+
+    def test_empty_advertised_resolves_nothing(self):
+        # "" here means "nothing to resolve against", NOT "withheld" — the
+        # withhold decision stays with model_is_unusable's empty-set-means-
+        # allow contract (harness-parity H12).
+        assert resolve_pin_spelling("z-ai/glm-5.3-flash", []) == ""
+        assert resolve_pin_spelling("z-ai/glm-5.3-flash", None) == ""
+
+    def test_full_id_resolves_to_advertised_spelling(self):
+        # The ADVERTISED spelling comes back (it is what goes on the wire),
+        # not the caller's case/whitespace variant.
+        assert resolve_pin_spelling("  Z-AI/GLM-5.3-FLASH ", self._BARE) == "z-ai/glm-5.3-flash"
+
+    def test_namespaced_pin_resolves_to_bare_advertised_spelling(self):
+        got = resolve_pin_spelling("openrouter::z-ai/glm-5.3-flash", self._BARE)
+        assert got == "z-ai/glm-5.3-flash"
+
+    def test_namespaced_resolution_returns_the_advertised_case(self):
+        # Mutation guard: a fold that returns the peeled PIN instead of the
+        # advertised row would hand the wire a spelling the backend may not
+        # accept verbatim.
+        got = resolve_pin_spelling("openrouter::z-ai/glm-5.3-flash", ["Z-AI/GLM-5.3-Flash"])
+        assert got == "Z-AI/GLM-5.3-Flash"
+
+    def test_absent_under_both_spellings_resolves_nothing(self):
+        assert resolve_pin_spelling("openrouter::no-such-model", self._BARE) == ""
+
+    def test_only_one_qualifier_level_is_peeled(self):
+        # Unbounded stripping would rubber-stamp arbitrary junk around any
+        # advertised id; one level matches "a qualifier the catalog added".
+        assert resolve_pin_spelling("a::b::z-ai/glm-5.3-flash", self._BARE) == ""
+        # ...but a pin whose single peel lands on an advertised qualified id
+        # still resolves (the tail is compared verbatim, not re-peeled).
+        assert (
+            resolve_pin_spelling("a::b::z-ai/glm-5.3-flash", ["b::z-ai/glm-5.3-flash"])
+            == "b::z-ai/glm-5.3-flash"
+        )
+
+    def test_empty_namespace_is_not_a_qualifier(self):
+        assert resolve_pin_spelling("::z-ai/glm-5.3-flash", self._BARE) == ""
+
+    def test_qualified_advertised_id_matches_verbatim_without_peel(self):
+        qualified = ["openrouter::z-ai/glm-5.3-flash"]
+        got = resolve_pin_spelling("openrouter::z-ai/glm-5.3-flash", qualified)
+        assert got == "openrouter::z-ai/glm-5.3-flash"
+
+    # What kiro-cli advertises, in ITS spelling: bare, dotted, no prefix.
+    _KIRO = ["auto", "claude-opus-4.8", "claude-sonnet-4.6", "gpt-5.6-terra"]
+
+    def test_foreign_provider_id_spelling_folds_onto_the_advertised_id(self):
+        # `namespace_vocabulary` judges this pin native to kiro through
+        # `catalog_key` (prefix and [1m] folded). The spelling fold must reach
+        # the same model with the same function, or the cold start reports an
+        # entitlement problem for what is a spelling one.
+        got = resolve_pin_spelling("global.anthropic.claude-opus-4-8[1m]", self._KIRO)
+        assert got == "claude-opus-4.8"
+
+    def test_fold_answers_with_the_advertised_spelling_not_the_pin(self):
+        # Mutation guard: returning the folded KEY or the caller's spelling
+        # would hand session/set_model an id kiro never advertised.
+        got = resolve_pin_spelling("global.anthropic.claude-sonnet-4-6", ["Claude-Sonnet-4.6"])
+        assert got == "Claude-Sonnet-4.6"
+
+    def test_a_genuinely_unserved_id_still_resolves_nothing(self):
+        # The fold widens spelling, never entitlement: a model kiro does not
+        # list stays "" under the prefixed, the bracketed and the bare spelling.
+        assert resolve_pin_spelling("global.anthropic.claude-haiku-9[1m]", self._KIRO) == ""
+        assert resolve_pin_spelling("claude-haiku-9", self._KIRO) == ""
+
+    def test_fold_does_not_rescue_a_multi_level_qualifier(self):
+        # `catalog_key` keeps the `::` qualifier, so the one-level peel rule
+        # above still holds after the fold was added.
+        assert resolve_pin_spelling("a::b::z-ai/glm-5.3-flash", self._BARE) == ""
+        assert resolve_pin_spelling("::z-ai/glm-5.3-flash", self._BARE) == ""
+
+    def test_fold_prefers_the_window_variant_like_the_wire_fold(self):
+        # Several advertised spellings of one model fold to one key; the
+        # tie-break is the one `resolve_wire_model_id` applies ([1m] first,
+        # then shortest), so the display fold and the wire fold cannot prefer
+        # different spellings.
+        both = ["claude-opus-4.8", "claude-opus-4.8-1m"]
+        assert (
+            resolve_pin_spelling("global.anthropic.claude-opus-4-8[1m]", both)
+            == "claude-opus-4.8-1m"
+        )
+        # A literal match still wins outright: no fold runs for a pin that is
+        # already an advertised spelling.
+        assert resolve_pin_spelling("claude-opus-4.8", both) == "claude-opus-4.8"
+
+    def test_fold_never_conflates_two_registered_models(self):
+        # `catalog_key` folds the window marker away, so the 200K
+        # `claude-opus-4-8` and kiro's 1M `claude-opus-4.8` share a key -- but
+        # the registry lists them as two canonical models. A spelling fold that
+        # let one stand in for the other would send a pin's neighbour with a
+        # different context window; the fold refuses, and the pin takes the
+        # withhold path instead of a silent capacity change.
+        assert resolve_pin_spelling("claude-opus-4.8", ["claude-opus-4-8"]) == ""
+        assert resolve_pin_spelling("global.anthropic.claude-opus-4-8", ["claude-opus-4.8"]) == ""
+        # The guard reads the pin case-insensitively, like the literal match does.
+        assert resolve_pin_spelling("CLAUDE-OPUS-4-8", ["claude-opus-4.8"]) == ""
+        # The same model under two spellings still folds.
+        assert (
+            resolve_pin_spelling("global.anthropic.claude-opus-4-8[1m]", ["claude-opus-4.8"])
+            == "claude-opus-4.8"
+        )
+
+    def test_fold_keeps_its_answer_for_ids_the_registry_does_not_know(self):
+        # Unknown is not different: a model newer than the shipped registry
+        # folds on spelling alone, which is the case the fold exists for.
+        assert (
+            resolve_pin_spelling("us.anthropic.claude-zeta-9[1m]", ["claude-zeta-9"])
+            == "claude-zeta-9"
+        )
+
+    def test_the_auto_sentinel_names_no_model_to_fold(self):
+        # `catalog_key("auto")` is "", so the fold cannot match `auto` to an
+        # advertised id whose key happens to be empty; `auto` resolves only
+        # when advertised verbatim.
+        assert resolve_pin_spelling("auto", ["claude-opus-4.8"]) == ""
+        assert resolve_pin_spelling("auto", self._KIRO) == "auto"
 
 
 class TestExplicitPickRefusal:

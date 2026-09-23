@@ -49,6 +49,41 @@ describe('MicSourceMenu', () => {
     expect(screen.queryByText('FaceTime HD')).toBeNull()
   })
 
+  it('remeasures the open menu when the visual viewport changes', async () => {
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport')
+    const viewport = new EventTarget()
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: viewport as unknown as VisualViewport,
+    })
+
+    try {
+      render(<MicSourceMenu onSelect={() => {}} />)
+      const trigger = screen.getByRole('button')
+      const wrap = trigger.parentElement
+      expect(wrap).toBeInstanceOf(HTMLElement)
+
+      let anchor = DOMRect.fromRect({ x: 100, y: 600, width: 120, height: 20 })
+      vi.spyOn(wrap as HTMLElement, 'getBoundingClientRect').mockImplementation(() => anchor)
+
+      fireEvent.click(trigger)
+      const menu = await screen.findByRole('menu')
+      expect(menu.style.bottom).toBe(`${window.innerHeight - anchor.top + 4}px`)
+
+      // The mobile keyboard closing moves the anchor and announces itself only
+      // on window.visualViewport -- window resize/scroll never fire.
+      anchor = DOMRect.fromRect({ x: 100, y: 700, width: 120, height: 20 })
+      fireEvent(viewport, new Event('resize'))
+
+      await waitFor(() => {
+        expect(menu.style.bottom).toBe(`${window.innerHeight - anchor.top + 4}px`)
+      })
+    } finally {
+      if (originalViewport) Object.defineProperty(window, 'visualViewport', originalViewport)
+      else delete (window as { visualViewport?: VisualViewport }).visualViewport
+    }
+  })
+
   it('reports the chosen deviceId and closes', async () => {
     const onSelect = vi.fn()
     render(<MicSourceMenu onSelect={onSelect} />)
@@ -60,7 +95,7 @@ describe('MicSourceMenu', () => {
 
   it('always reports the pick, so re-selecting can retry a silent fallback', async () => {
     // The menu is presentational: it only knows the SAVED preference, so it must
-    // not decide whether a pick is redundant. When the `ideal` constraint silently
+    // not decide whether a pick is redundant. When session-start acquisition
     // fell back, the live track is not on the preferred device and re-tapping the
     // checked entry IS the user's retry — swallowing it here would make the
     // fallback uncorrectable. The genuine no-op case is decided in `switchDevice`,
@@ -99,12 +134,63 @@ describe('MicSourceMenu', () => {
   })
 
   it('says the saved device is unavailable instead of faking a checkmark', async () => {
-    // getUserMedia's `ideal` constraint falls back to the default WITHOUT
-    // raising, so a stale saved id would otherwise render as a happy selection.
+    // Session-start acquisition falls back to the default when the saved id is
+    // stale, so a stale saved id would otherwise render as a happy selection.
     setPreferredMicId('unplugged-interface')
     render(<MicSourceMenu onSelect={() => {}} />)
     fireEvent.click(screen.getByRole('button'))
     expect(await screen.findByText(/unavailable/)).toBeTruthy()
+  })
+
+  it('while recording, the checkmark follows the LIVE device, not the preference', async () => {
+    // The reported bug: pick AirPods → dropdown moves, audio stays on the
+    // built-in mic. The mark must report what is actually capturing, so a
+    // switch that did not land is visible instead of papered over.
+    setPreferredMicId('airpods')
+    render(<MicSourceMenu onSelect={() => {}} recording liveSwitch activeDeviceId="builtin" />)
+    fireEvent.click(screen.getByRole('button'))
+    const menu = await screen.findByRole('menu')
+    const rows = Array.from(menu.querySelectorAll('[role="menuitemradio"]'))
+    const builtin = rows.find(r => r.textContent?.includes('MacBook Pro Microphone'))!
+    const airpods = rows.find(r => r.textContent?.includes('AirPods Pro'))!
+    expect(builtin.querySelector('svg')).toBeTruthy()
+    expect(airpods.querySelector('svg')).toBeNull()
+    // The icon is aria-hidden and the rest is colour, so the programmatic state
+    // is the only thing assistive tech can perceive — assert it, not just pixels.
+    expect(builtin.getAttribute('aria-checked')).toBe('true')
+    expect(airpods.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('falls back to label identity when the live id is permission-redacted', async () => {
+    setPreferredMicId('airpods')
+    render(<MicSourceMenu onSelect={() => {}} recording liveSwitch deviceLabel="MacBook Pro Microphone" />)
+    fireEvent.click(screen.getByRole('button'))
+    const menu = await screen.findByRole('menu')
+    const rows = Array.from(menu.querySelectorAll('[role="menuitemradio"]'))
+    const builtin = rows.find(r => r.textContent?.includes('MacBook Pro Microphone'))!
+    const airpods = rows.find(r => r.textContent?.includes('AirPods Pro'))!
+    expect(builtin.querySelector('svg')).toBeTruthy()
+    expect(airpods.querySelector('svg')).toBeNull()
+  })
+
+  it('marks NO row while recording when the live device is unknowable', async () => {
+    // No id and no label: marking the preference would be a guess dressed as a
+    // fact — the honest render is no checkmark at all (including the default row).
+    setPreferredMicId('airpods')
+    render(<MicSourceMenu onSelect={() => {}} recording liveSwitch />)
+    fireEvent.click(screen.getByRole('button'))
+    const menu = await screen.findByRole('menu')
+    expect(menu.querySelectorAll('[role="menuitemradio"] svg').length).toBe(0)
+  })
+
+  it('idle, the checkmark shows the intent: what the next capture will request', async () => {
+    setPreferredMicId('airpods')
+    render(<MicSourceMenu onSelect={() => {}} />)
+    fireEvent.click(screen.getByRole('button'))
+    const menu = await screen.findByRole('menu')
+    const rows = Array.from(menu.querySelectorAll('[role="menuitemradio"]'))
+    const airpods = rows.find(r => r.textContent?.includes('AirPods Pro'))!
+    expect(airpods.querySelector('svg')).toBeTruthy()
   })
 
   it('closes on Escape and on an outside pointerdown', async () => {
@@ -153,6 +239,134 @@ describe('MicSourceMenu', () => {
     fireEvent.click(screen.getByRole('button'))
     const menu = await screen.findByRole('menu')
     expect(menu.className).toContain('z-[9999]')
+  })
+})
+
+describe('MicSourceMenu keyboard navigation', () => {
+  // The dropdown declares role="menu", which promises the WAI-ARIA menu
+  // keyboard contract (arrows move focus between rows and wrap, Home/End jump
+  // to the boundaries, Tab is contained while the menu is open). None of that
+  // existed here: the rows were reachable only by mouse or by Tabbing blindly
+  // out of the trigger, and a screen-reader user who was just told "menu" got
+  // nothing from the arrow keys they reach for first (#6231).
+  beforeEach(() => {
+    localStorage.clear()
+    mockDevices()
+  })
+  afterEach(() => vi.restoreAllMocks())
+
+  /** The menu is PORTALLED to <body>, so it lives outside the RTL container. */
+  const menuEl = () => document.querySelector('[role="menu"]') as HTMLElement | null
+  /** Rows in document order: one per device, then "System default". */
+  const rowsOf = () => Array.from(menuEl()!.querySelectorAll<HTMLButtonElement>('button'))
+
+  /**
+   * Open the menu and wait for enumeration to land, so the row list under test
+   * is the full one (devices are fetched when the menu opens, not on mount).
+   * Returns the trigger, which must be grabbed BEFORE opening: once the menu is
+   * up, `getByRole('button')` is ambiguous.
+   */
+  async function openWithDevices() {
+    render(<MicSourceMenu onSelect={() => {}} />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+    await screen.findByText('AirPods Pro')
+    return trigger
+  }
+
+  it('moves focus into the menu when it opens', async () => {
+    await openWithDevices()
+    // role="menu" tells assistive tech that focus is managed inside the menu,
+    // so opening must land the user there rather than leaving focus on the
+    // trigger with the menu an unreachable island.
+    expect(menuEl()!.contains(document.activeElement)).toBe(true)
+    expect(rowsOf()).toContain(document.activeElement)
+  })
+
+  it('lands on the first device row when the device list is already known', async () => {
+    // Second open: `devices` state survived the first one, so the first row at
+    // focus-entry time is a real device row (the case a keyboard user hits for
+    // every open after the first).
+    const trigger = await openWithDevices()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.click(trigger)
+    await screen.findByRole('menu')
+    const rows = rowsOf()
+    expect(rows[0].textContent).toContain('MacBook Pro Microphone')
+    expect(rows[0]).toHaveFocus()
+  })
+
+  it('walks the rows with ArrowDown and wraps past the last one', async () => {
+    await openWithDevices()
+    const rows = rowsOf()
+    expect(rows).toHaveLength(3) // two audio inputs + "System default"
+    rows[0].focus()
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    expect(rows[1]).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    // The action row is part of the same cycle as the device rows — a user
+    // arrowing down must be able to reach "System default".
+    expect(rows[2].textContent).toContain('System default')
+    expect(rows[2]).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    expect(rows[0]).toHaveFocus() // wraps, rather than dead-ending
+  })
+
+  it('walks the rows with ArrowUp and wraps past the first one', async () => {
+    await openWithDevices()
+    const rows = rowsOf()
+    rows[0].focus()
+    fireEvent.keyDown(document, { key: 'ArrowUp' })
+    expect(rows[2]).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'ArrowUp' })
+    expect(rows[1]).toHaveFocus()
+  })
+
+  it('jumps to the boundary rows with Home and End', async () => {
+    await openWithDevices()
+    const rows = rowsOf()
+    rows[1].focus()
+    fireEvent.keyDown(document, { key: 'End' })
+    expect(rows[2]).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Home' })
+    expect(rows[0]).toHaveFocus()
+  })
+
+  it('contains Tab and Shift-Tab inside the open menu', async () => {
+    // #2533: a Tab out of a still-open menu drops a keyboard user behind it
+    // with no obvious way back — the menu is portalled to <body>, so the next
+    // tab stop is nowhere near the composer they came from.
+    await openWithDevices()
+    const rows = rowsOf()
+    rows[2].focus()
+    fireEvent.keyDown(document, { key: 'Tab' })
+    expect(rows[0]).toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(rows[2]).toHaveFocus()
+  })
+
+  it('closes on Escape and hands focus back to the trigger', async () => {
+    // "Escape closes" is a pin on existing behaviour; the focus restore is the
+    // new part. Focus now ENTERS the menu on open, so closing without a restore
+    // would orphan focus on <body> and lose the user's place entirely.
+    const trigger = await openWithDevices()
+    expect(trigger).not.toHaveFocus()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(menuEl()).toBeNull()
+    expect(trigger).toHaveFocus()
+  })
+
+  it('hands focus back to the trigger after picking a row', async () => {
+    const onSelect = vi.fn()
+    render(<MicSourceMenu onSelect={onSelect} />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByText('AirPods Pro'))
+    expect(onSelect).toHaveBeenCalledWith('airpods') // pin: the pick still reports
+    expect(menuEl()).toBeNull()
+    // The focused row is unmounted by the close, so without a restore focus
+    // falls to <body> and the next Tab restarts from the top of the document.
+    expect(trigger).toHaveFocus()
   })
 })
 

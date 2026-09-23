@@ -1,48 +1,47 @@
-"""CLI setup subcommand — interactive credential and config wizard."""
+"""CLI setup subcommand — interactive config wizard (channel credentials are opt-in)."""
 
 from __future__ import annotations
 
 import json
 import os
 import platform
-import re
 import shutil
 import socket
 import subprocess
 import sys
-from importlib.resources import files as _pkg_files
+from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from kiro_crew import platform_compat
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web import WebClient
+
+from kiro_crew import platform_compat, slack_manifest
 from kiro_crew.acp.client import KIRO_CLI_BIN
-from kiro_crew.browser.setup import (
-    ensure_playwright_installed,
-    generate_playwright_config,
-    is_playwright_installed,
-    refresh_storage_state,
-    register_playwright_proxy,
-)
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_chat import _ensure_default_agent_in_config
-from kiro_crew.conductor_skill import generate_conductor_skill
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     _WORKSPACE_DIR_NAME,
     CRED_OWNER_ID,
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
+    ConfigReadError,
     _default_workspace_base,
     _workspace_dir_file,
-    config_local_path,
     config_path,
     env_path,
-    write_config_atomically,
+    unsandboxed_exec_declared,
+    unsandboxed_exec_platform_default,
+    update_config_locked,
 )
-from kiro_crew.constants import DATA_WARNING
+from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
+from kiro_crew.dashboard.urls import _resolve_hostname_bounded
 from kiro_crew.sandbox import unavailable_kind
+from kiro_crew.secrets.migrate import _env_lock_path
 from kiro_crew.sel import sel
-from kiro_crew.skills import SkillsLoader
+from kiro_crew.skills import remove_retired_conductor_skill
+from kiro_crew.validation import USER_ID_RE
 
 
 def _get_alias() -> str:
@@ -69,26 +68,21 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
     """Render slack-manifest.yaml with the user's alias substituted."""
 
     alias = alias or _get_alias()
-    if not re.fullmatch(r"[a-zA-Z0-9_-]+", alias):
+    if not slack_manifest.valid_alias(alias):
         print(
-            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only.",
+            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only, "
+            f"at most {slack_manifest.ALIAS_MAX} characters.",
             file=sys.stderr,
         )
         sys.exit(1)
     try:
-        template_text = (
-            _pkg_files("kiro_crew").joinpath("slack-manifest.yaml").read_text(encoding="utf-8")
-        )
+        rendered = slack_manifest.render(alias)
     except FileNotFoundError:
         print("❌ Cannot find slack-manifest.yaml", file=sys.stderr)
         sys.exit(1)
-    rendered = template_text.replace("{{ALIAS}}", alias)
     if url:
-        # Strip comment lines to shorten the URL
-        lines = [ln for ln in rendered.splitlines() if not ln.lstrip().startswith("#")]
-        encoded = quote("\n".join(lines).strip() + "\n", safe="")
         print("\n🔗 Click to create your Slack app:\n")
-        print(f"https://api.slack.com/apps?new_app=1&manifest_yaml={encoded}\n")
+        print(f"{slack_manifest.deep_link(alias)}\n")
     elif output:
         out = Path(output)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +147,9 @@ def _ensure_prerequisites() -> bool:
     # npm packages, e.g. the Playwright browser MCP).
     if not shutil.which("node"):
         _header()
-        print("  ⚠️  node not found on PATH — install Node.js >= 16 from https://nodejs.org\n")
+        print(
+            f"  ⚠️  node not found on PATH — install Node.js >= {MIN_NODE_MAJOR} from https://nodejs.org\n"
+        )
 
     # kiro-cli is the agent backend. Note its absence so the user can install it.
     if not shutil.which(KIRO_CLI_BIN):
@@ -254,10 +250,22 @@ def _setup_electron() -> None:
     print("     Launch via Spotlight (⌘+Space → KiroCrew) or Finder → ~/Applications")
 
 
-def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = False) -> None:
+def _setup(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+    whatsapp: bool = False,
+) -> None:
     """Install agent config and optionally configure credentials."""
     try:
-        _setup_impl(agent_only=agent_only, electron_only=electron_only, clean=clean)
+        _setup_impl(
+            agent_only=agent_only,
+            electron_only=electron_only,
+            clean=clean,
+            slack=slack,
+            whatsapp=whatsapp,
+        )
     except _SetupAborted as exc:
         # A closed/piped stdin mid-wizard. One clean line instead of a stack
         # trace at whichever prompt hit it first — every guarded prompt raises,
@@ -267,7 +275,13 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
         print(f"\n⏭  Setup aborted: {exc}. Re-run interactively to finish.")
 
 
-def _setup_impl(agent_only: bool = False, electron_only: bool = False, clean: bool = False) -> None:
+def _setup_impl(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+    whatsapp: bool = False,
+) -> None:
     from kiro_crew.agent import install_agent  # circular import: agent imports cli
     from kiro_crew.cli import _project_dir_file  # circular import: cli -> cli_setup -> cli
 
@@ -305,7 +319,11 @@ def _setup_impl(agent_only: bool = False, electron_only: bool = False, clean: bo
     from kiro_crew.agent import ensure_kirocrew_on_path
     from kiro_crew.mcp_cleanup import clean_stale_managed_mcp
 
-    shim = ensure_kirocrew_on_path()
+    # `claim_existing`: this is the explicit setup path, so the user has named
+    # THIS install as the one they want `kirocrew` to mean. Gateway startup
+    # deliberately does not, so a background start never takes the command away
+    # from a working install (see ensure_kirocrew_on_path).
+    shim = ensure_kirocrew_on_path(claim_existing=True)
     if shim:
         print(f"  ✅ Linked kirocrew on PATH: {shim}")
     removed_mcp = clean_stale_managed_mcp()
@@ -315,19 +333,10 @@ def _setup_impl(agent_only: bool = False, electron_only: bool = False, clean: bo
     # 2b. Ensure config.json has default KiroCrew agent for fresh installs
     _ensure_default_agent_in_config()
 
-    # 2c. Generate conductor skill if enabled (agent delegation).
-    try:
-        cfg = KiroCrewConfig.load()
-        if cfg.agent.conductor_skill:
-            generate_conductor_skill(SkillsLoader())
-            print("  ✅ Conductor skill generated")
-        else:
-            # Clean up stale skill if previously enabled then disabled.
-            skill_path = SkillsLoader()._dir / "conductor" / "SKILL.md"
-            if skill_path.exists():
-                skill_path.unlink()
-    except Exception as exc:
-        print(f"  ⚠️  Conductor skill generation failed: {exc}")
+    # 2c. Remove the delegation skill the retired `agent.conductor_skill` flag
+    #     generated. Only bytes that generator itself wrote are removed, so a
+    #     user skill that happens to share the directory name is left alone.
+    _remove_retired_conductor_skill()
 
     # 2d. Offer the unconfined-exec opt-in on a host with no sandbox backend.
     #     Runs BEFORE the agent-only early return: the servers this unblocks are
@@ -335,14 +344,40 @@ def _setup_impl(agent_only: bool = False, electron_only: bool = False, clean: bo
     _setup_sandbox_consent()
 
     if agent_only:
+        # --agent-only returns before the channel steps below, so an explicit
+        # channel flag has nothing to act on. Say so instead of dropping it
+        # silently, and name each flag the caller actually passed.
+        requested = (("--slack", slack), ("--whatsapp", whatsapp))
+        for flag in [name for name, on in requested if on]:
+            print(
+                f"\n  ⚠️  {flag} is ignored with --agent-only. Run "
+                f"'kirocrew setup {flag}' for its guided setup."
+            )
         print("\n👻 Done! Try: kirocrew gateway")
         return
 
-    # 3. Slack credentials
-    _setup_slack_tokens()
+    # 3. Messaging channels (optional, configured after setup by default).
+    #    Channel prompts run only on explicit opt-in (`kirocrew setup --slack`,
+    #    `kirocrew setup --whatsapp`); the dashboard and CLI need no channel
+    #    credentials, and every channel (Slack, Discord, Telegram, Teams, Webex,
+    #    WeCom, WeChat, WhatsApp, iMessage) can be connected later from the
+    #    dashboard or its setup guide.
+    if slack or whatsapp:
+        if slack:
+            _setup_slack_tokens()
 
-    # 3b. Slash command name
-    _setup_slash_command()
+            # 3b. Slash command name (Slack-only concept)
+            _setup_slash_command()
+        if whatsapp:
+            _setup_whatsapp()
+    else:
+        print("── Messaging Channels ──\n")
+        print("  The dashboard works without any messaging credentials.")
+        print("  Connect Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat,")
+        print("  WhatsApp, or iMessage (macOS only)")
+        print("  later from the dashboard (Settings → Messaging Channels) or run")
+        print("  'kirocrew setup --slack' or 'kirocrew setup --whatsapp' for a")
+        print("  guided setup.\n")
 
     # 4. Timezone
     _setup_timezone()
@@ -351,35 +386,6 @@ def _setup_impl(agent_only: bool = False, electron_only: bool = False, clean: bo
     _maybe_setup_dashboard_url()
 
     _maybe_setup_custom_domain()
-
-    # ── Browser (Playwright MCP) ──
-    print("\n── Browser (Playwright MCP) ──")
-
-    if is_playwright_installed():
-        print("  Playwright MCP already installed")
-    else:
-        print("  Installing Playwright MCP...")
-        try:
-            ensure_playwright_installed()
-            print("  Playwright MCP installed")
-        except Exception as exc:
-            print(f"  Playwright install failed: {exc}")
-            print("  Browser features will be unavailable until Playwright is installed")
-
-    # Always regenerate config and register proxy in mcp.json (preserve extension mode)
-    try:
-        generate_playwright_config()
-        refresh_storage_state()
-        # register_playwright_proxy owns the shared mcp.json lock, the
-        # user-entry guard, and the create-when-absent path — the patch
-        # primitives have none of those.
-        _, status = register_playwright_proxy()
-        if status == "kept-user-entry":
-            print("  Kept your existing playwright-mcp entry in mcp.json (left untouched)")
-        else:
-            print("  Browser proxy registered in mcp.json")
-    except Exception:
-        pass  # Non-fatal: browser still works without pre-loaded cookies
 
     # 6. Desktop app (macOS only)
     if platform.system() == "Darwin":
@@ -408,8 +414,11 @@ def _maybe_setup_cloud() -> None:
     print("  AWS account; credentials stay in the aws CLI — never stored here).")
     try:
         answer = input("  Launch KiroCrew on AWS now? [y/N]: ").strip().lower()
-    except EOFError:
-        # Piped/non-interactive setup — take the default (skip).
+    except (EOFError, UnicodeDecodeError):
+        # Piped/non-interactive setup or a non-UTF-8 locale (e.g. C/POSIX on
+        # Amazon Linux Cloud Desktop) — input() decodes stdin with the locale
+        # encoding and can raise UnicodeDecodeError before it ever returns a
+        # string. Treat it like EOF: no usable answer, so take the default.
         answer = ""
     if answer not in ("y", "yes"):
         print("  ⏭  Skipped. Launch later: kirocrew cloud launch\n")
@@ -428,6 +437,14 @@ def _maybe_setup_cloud() -> None:
             size="",
             yes=False,
             hold_tunnel=False,
+            # Same identity behaviour as `kirocrew cloud launch` with no flags:
+            # inherit this machine's kiro-cli sign-in (Identity Center users get
+            # their organization's sign-in, not the Builder ID portal). The wizard
+            # asks for the Identity Center region interactively when needed.
+            identity_provider="",
+            license="",
+            idp_region="",
+            no_inherit_identity=False,
         )
         handle_cloud(args)
     except Exception as exc:  # pragma: no cover - non-fatal, informative
@@ -463,6 +480,156 @@ def _setup_workspace_dir() -> None:
         print(f"  Falling back to platform default: {platform_default}\n")
 
 
+#: Per-call timeout, in seconds, for the Slack API round-trips that check a
+#: pasted credential. Mirrors the dashboard credential handler's
+#: ``_TOKEN_VERIFY_TIMEOUT``: long enough for a slow corporate proxy, short
+#: enough that an unreachable Slack does not read as a hung wizard.
+_SLACK_VERIFY_TIMEOUT = 8
+
+#: How many times a value Slack REJECTED is re-asked before the save is
+#: abandoned. Only ever more than one at a terminal (see
+#: :func:`_stdio_is_interactive`).
+_SLACK_VERIFY_ATTEMPTS = 3
+
+#: The only ``users.info`` errors that indict the pasted member ID itself.
+#: Every other Slack error indicts the CHECK — a missing ``users:read`` scope,
+#: a rate limit, a bot token that has since been revoked — and must degrade to
+#: "unverifiable", because refusing an operator's own member ID over a scope
+#: they never granted is worse than not checking it.
+_SLACK_OWNER_REJECTIONS = frozenset({"user_not_found", "users_not_found"})
+
+
+def _stdio_is_interactive() -> bool:
+    """True when both ends of stdio are a real terminal.
+
+    The wizard may only stop to re-ask a question, or to ask for consent, when
+    a human is there to see it: ``kirocrew update`` re-runs setup with its
+    output captured and stdin on ``/dev/null``, and a question asked there is a
+    hang, not a correction. Same two conditions as ``cli_chat._can_prompt``.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _slack_error_code(exc: Exception) -> str:
+    """Slack's own error code from a ``SlackApiError``, bounded and safe.
+
+    Slack's codes (``invalid_auth``, ``not_allowed_token_type``, …) are the
+    actionable half of a rejection, so they are surfaced verbatim; anything
+    unexpected in the response degrades to a generic label rather than raising
+    out of the check.
+    """
+    try:
+        return str(getattr(exc, "response", {}).get("error", "") or "rejected")[:60]
+    except Exception:
+        return "rejected"
+
+
+def _verify_slack_secret(key: str, token: str) -> tuple[bool | None, str]:
+    """Ask Slack whether it accepts a pasted token, BEFORE it is stored.
+
+    Returns ``(True, detail)`` when Slack accepts it — ``detail`` is the
+    workspace name for a bot token and ``""`` otherwise; ``(False, error)``
+    when Slack rejects it, carrying Slack's own code; and ``(None, reason)``
+    when Slack could not be reached at all. Unverifiable is NOT invalid: being
+    offline must never cost the operator the credentials they just typed, so
+    callers keep the value on that verdict.
+
+    Same two calls, and the same contract, as the dashboard's credential save
+    (``dashboard/handlers/messaging.py::_validate_slack_token``): app-level
+    tokens are checked with ``apps.connections.open`` — the call the gateway
+    itself makes at startup, so a token that passes here will connect at boot —
+    and everything else with ``auth.test``.
+
+    """
+    client = WebClient(token=token, timeout=_SLACK_VERIFY_TIMEOUT)
+    try:
+        if key == CRED_SLACK_APP_TOKEN:
+            client.apps_connections_open(app_token=token)
+            return True, ""
+        resp = client.auth_test()
+    except SlackApiError as exc:
+        return False, _slack_error_code(exc)
+    except Exception as exc:
+        # Transport, DNS, proxy, TLS — Slack never answered, so the token is
+        # unjudged rather than invalid.
+        return None, type(exc).__name__
+    return True, str(resp.get("team") or resp.get("team_id") or "")
+
+
+def _verify_slack_owner_id(bot_token: str, owner_id: str) -> tuple[bool | None, str]:
+    """Check a pasted Slack member ID, with the same verdict triple.
+
+    Two independent checks. The FORMAT check catches the common paste error and
+    needs no network: a channel ID (``C…``) or a bot ID (``B…``) is not a member
+    ID. It uses ``validation.USER_ID_RE``, the same regex the dashboard's Slack
+    save enforces, so the two surfaces cannot disagree about what a member ID
+    is — and it admits the ``W…`` ids Enterprise Grid issues. Then
+    ``users.info`` confirms the ID exists in the workspace the bot token belongs
+    to and names its owner, so a well-formed but WRONG id is visible too.
+
+    Only :data:`_SLACK_OWNER_REJECTIONS` indicts the id; every other Slack error
+    degrades to unverifiable.
+    """
+    if not USER_ID_RE.match(owner_id):
+        return False, (
+            "not a member ID — 'C…' is a channel and 'B…' is a bot; yours starts "
+            "with U (or W on Enterprise Grid), from your profile → ⋯ More → Copy member ID"
+        )
+    client = WebClient(token=bot_token, timeout=_SLACK_VERIFY_TIMEOUT)
+    try:
+        resp = client.users_info(user=owner_id)
+    except SlackApiError as exc:
+        code = _slack_error_code(exc)
+        if code in _SLACK_OWNER_REJECTIONS:
+            return False, f"{code} — no such member in this workspace"
+        return None, code
+    except Exception as exc:
+        return None, type(exc).__name__
+    user = resp.get("user") or {}
+    return True, str(user.get("real_name") or user.get("name") or "")
+
+
+def _prompt_verified_slack_value(
+    prompt: str,
+    current: str,
+    noun: str,
+    check: Callable[[str], tuple[bool | None, str]],
+) -> tuple[str | None, str]:
+    """Prompt for one Slack value and hand back Slack's verdict on it.
+
+    Returns ``(value, detail)`` for a value the caller should save — accepted or
+    unverifiable — and ``(None, "")`` when Slack rejected every attempt, which the
+    caller turns into "nothing was saved". No detail on that leg: each rejection
+    code was already printed to the operator as it happened.
+
+    The check runs ONLY at a terminal. Its whole purpose is to put a verdict in
+    front of the person who just pasted the value so they can retype it, and
+    off a terminal there is neither: nobody sees the verdict, and re-asking
+    would consume the NEXT line of a piped answer file and misassign every
+    remaining answer in the wizard. So a non-interactive run — ``kirocrew
+    update`` re-runs setup with its output captured and stdin on ``/dev/null``
+    — stays exactly as it was before this check existed, rather than paying a
+    Slack round-trip (and an 8s stall on a host with no egress) for an outcome
+    that cannot change. ``kirocrew doctor`` reports on the stored tokens.
+    """
+    if not _stdio_is_interactive():
+        return input(prompt).strip() or current, ""
+    for _attempt in range(_SLACK_VERIFY_ATTEMPTS):
+        value = input(prompt).strip() or current
+        if not value:
+            # Nothing typed and nothing configured — the caller reports the
+            # missing credential; there is no value to judge.
+            return "", ""
+        verdict, detail = check(value)
+        if verdict is None:
+            print(f"  ⚠️  Could not reach Slack to check the {noun} ({detail}) — saved as typed.")
+            return value, ""
+        if verdict:
+            return value, detail
+        print(f"  ❌ Slack rejected the {noun}: {detail}")
+    return None, ""
+
+
 def _setup_slack_tokens() -> None:
     """Prompt for Slack tokens and owner ID, write to config_dir/.env."""
     cred_path = env_path()
@@ -492,25 +659,259 @@ def _setup_slack_tokens() -> None:
     hint_bot = f" [{_mask(cur_bot)}]" if cur_bot else ""
     hint_owner = f" [{cur_owner}]" if cur_owner else ""
 
-    app_token = input(f"  App Token (xapp-...){hint_app}: ").strip() or cur_app
-    bot_token = input(f"  Bot Token (xoxb-...){hint_bot}: ").strip() or cur_bot
-    owner_id = input(f"  Your Slack Member ID{hint_owner}: ").strip() or cur_owner
+    def _abort_rejected(noun: str) -> None:
+        print(
+            f"  ⚠️  Slack rejected the {noun} {_SLACK_VERIFY_ATTEMPTS} times — nothing "
+            f"was saved. Re-run 'kirocrew setup --slack' once you have a working value.\n"
+        )
+
+    # Each value is checked against Slack as it is typed, so a typo, a revoked
+    # token, or a channel ID pasted where a member ID belongs is reported HERE —
+    # instead of being written as typed and surfacing hours later as a "Slack
+    # disabled" line in the gateway log. All of it happens BEFORE the .env lock
+    # below is taken: these prompts can block on the user for minutes, and the
+    # lock covers only the read-merge-write.
+    app_token, _detail = _prompt_verified_slack_value(
+        f"  App Token (xapp-...){hint_app}: ",
+        cur_app,
+        "app token",
+        lambda value: _verify_slack_secret(CRED_SLACK_APP_TOKEN, value),
+    )
+    if app_token is None:
+        _abort_rejected("app token")
+        return
+
+    bot_token, team = _prompt_verified_slack_value(
+        f"  Bot Token (xoxb-...){hint_bot}: ",
+        cur_bot,
+        "bot token",
+        lambda value: _verify_slack_secret(CRED_SLACK_BOT_TOKEN, value),
+    )
+    if bot_token is None:
+        _abort_rejected("bot token")
+        return
+    if team:
+        print(f"  ✅ Bot token verified — workspace: {team}")
+
+    owner_rejected = False
+    owner_id, owner_name = _prompt_verified_slack_value(
+        f"  Your Slack Member ID{hint_owner}: ",
+        cur_owner,
+        "member ID",
+        lambda value: _verify_slack_owner_id(bot_token or "", value),
+    )
+    if owner_id is None:
+        # NOT an abort. The member ID is optional at write time (see the
+        # `if owner_id:` guard below), and the tokens above are already verified —
+        # discarding them over an optional field would cost the operator the
+        # credentials they just typed, which is the one thing this whole
+        # verify-as-you-type flow promises not to do. The full abort stays for a
+        # rejected REQUIRED token.
+        print(
+            f"  ⚠️  Slack rejected the member ID {_SLACK_VERIFY_ATTEMPTS} times — saving "
+            "the verified tokens without it. Set it later with "
+            "'kirocrew setup --slack'.\n"
+        )
+        owner_id = ""
+        owner_rejected = True
+    if owner_name:
+        print(f"  ✅ Owner verified: {owner_name} ({owner_id})")
 
     if not app_token or not bot_token:
         print("  ⚠️  Missing tokens — Slack integration will be disabled.\n")
         return
 
-    # Preserve any extra keys already in .env
-    existing[CRED_SLACK_APP_TOKEN] = app_token
-    existing[CRED_SLACK_BOT_TOKEN] = bot_token
-    if owner_id:
-        existing[CRED_OWNER_ID] = owner_id
-
+    # Serialize the read-modify-write against every OTHER .env writer (the
+    # `kirocrew secrets import` migrator, the WeChat/Weixin QR handler, and the
+    # dashboard channel-credential handlers) on the SAME advisory lock, derived
+    # from the shared helper. Without this, a concurrent importer commit (its
+    # final CAS + atomic_write) could interleave with this write and clobber the
+    # freshly-typed Slack tokens. The prompts above run OUTSIDE the lock (they
+    # can block on the user for minutes); the lock wraps only the short
+    # re-read → merge → atomic-rename critical section, and we RE-READ .env
+    # fresh under the lock so we merge onto the latest on-disk state rather than
+    # the possibly-stale snapshot read before the prompts.
     cred_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{k}={v}" for k, v in existing.items()]
-    cred_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    cred_path.chmod(0o600)
+    lock_path = _env_lock_path(cred_path)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+        os.close(lock_fd)
+        print(
+            "  ⚠️  .env is locked by another process (a secrets import or "
+            "credential save is in progress); tokens not saved. Retry once the "
+            "other operation finishes.\n",
+            file=sys.stderr,
+        )
+        return
+    try:
+        # Re-read fresh under the lock, then merge the just-collected tokens on
+        # top so a concurrent write that landed during the prompts is preserved.
+        merged: dict[str, str] = {}
+        if cred_path.exists():
+            for line in cred_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    merged[k.strip()] = v.strip()
+        merged[CRED_SLACK_APP_TOKEN] = app_token
+        merged[CRED_SLACK_BOT_TOKEN] = bot_token
+        if owner_id:
+            merged[CRED_OWNER_ID] = owner_id
+        elif owner_rejected and merged.get(CRED_OWNER_ID):
+            # The operator's member ID was rejected, so `merged` still holds the
+            # PREVIOUS one, re-read from disk — and the tokens above are brand new.
+            # Keeping it blind would pair a stale owner with fresh workspace
+            # credentials, which is exactly wrong when the tokens point at a
+            # DIFFERENT workspace than the one that owner belongs to.
+            #
+            # Deleting it blind is not right either: an operator who simply
+            # mistyped, on the same workspace, would silently lose a good owner ID.
+            # So the stale value is re-checked against the NEW bot token and only
+            # dropped when Slack INDICTS it (wrong workspace / not a member ID).
+            # `None` means unverifiable (a network or scope error), where deleting
+            # would be data loss on a transient failure, so it is kept.
+            stale_owner = merged[CRED_OWNER_ID]
+            stale_ok, stale_detail = _verify_slack_owner_id(bot_token or "", stale_owner)
+            if stale_ok is False:
+                del merged[CRED_OWNER_ID]
+                print(
+                    f"  ⚠️  Also dropped the saved member ID {stale_owner} — it is not "
+                    f"valid for these tokens ({stale_detail}). Set it with "
+                    "'kirocrew setup --slack'.\n"
+                )
+            else:
+                print(f"  ℹ️  Keeping the saved member ID {stale_owner}.\n")
+        lines = [f"{k}={v}" for k, v in merged.items()]
+        # atomic_write with restrict_to_owner, not write_text + chmod(0o600): a
+        # bare chmod is a silent no-op for Windows ACLs, and applying any lockdown
+        # only AFTER the tokens are on disk leaves them readable through the
+        # directory's inherited DACL in the failure window. The helper locks its
+        # unique temp file down before any content reaches it and renames only on
+        # success, so the tokens never exist under a wider mode and a failure
+        # leaves the previous .env untouched. restrict_on_error="warn" matches the
+        # .env doctrine (enforce the lockdown, log a warning if it fails) and the
+        # dashboard credential writers: an ACL-refusing host still completes the
+        # wizard instead of aborting after the user typed their tokens.
+        atomic_write(
+            cred_path,
+            "\n".join(lines) + "\n",
+            restrict_to_owner=True,
+            restrict_on_error="warn",
+        )
+    finally:
+        platform_compat.release_lock(lock_fd)
+        os.close(lock_fd)
     print(f"  ✅ Credentials saved to {cred_path}\n")
+    # Slack credentials are read once, at gateway startup, so tokens written by
+    # this step stay inert until it restarts -- and the bug the operator then
+    # reports is "I fixed the token and Slack is still silent". Naming the command
+    # removes that surprise; OFFERING to run it was ~80 lines and 8 tests to save
+    # one command, and it could drop every in-flight session or spawn a gateway
+    # nobody asked this wizard to start.
+    print("  Restart the gateway to pick them up: kirocrew restart\n")
+
+
+def _setup_whatsapp() -> None:
+    """Guided WhatsApp opt-in: report the prerequisites, then enable the channel.
+
+    There is no token to collect: WhatsApp pairs as a linked device on the
+    operator's own account, and pairing is a QR scan served by the RUNNING gateway.
+    So this step's whole job is the three things an operator cannot discover from
+    anywhere else: that automating a personal account carries a ban risk, whether
+    the optional wheel the channel needs is installed, and that enabling the
+    channel is a config flag separate from pairing it.
+
+    ``neonize_available()`` is a ``find_spec`` check, so nothing here imports
+    neonize or opens the session store: the wizard reports on the credential's
+    path, never through it.
+    """
+    from kiro_crew.config.paths import data_home
+    from kiro_crew.whatsapp.client import (
+        MISSING_EXTRA_HINT,
+        default_db_path,
+        neonize_available,
+    )
+
+    print("── WhatsApp ──\n")
+    print("  WhatsApp links as a device on your OWN account. There is no bot")
+    print("  identity, so the agent sends as you.")
+    print("  Automating a personal account is against WhatsApp's Terms of Service")
+    print("  and carries a small risk of the linked number being banned. Keep")
+    print("  volumes personal-scale.\n")
+
+    if neonize_available():
+        print("  ✅ The 'whatsapp' dependency extra is installed")
+    else:
+        print("  ⚠️  The 'whatsapp' extra is NOT installed, so the channel cannot start")
+        print(f"     {MISSING_EXTRA_HINT}")
+
+    store = default_db_path(data_home())
+    if store.exists():
+        print(f"  ✅ A paired session store already exists: {store}")
+    else:
+        print("  ℹ️  Not paired yet. Pairing is a QR scan from the dashboard:")
+        print("     Settings → Messaging Channels → WhatsApp, with the gateway running.")
+    print()
+
+    answer = _input_or_skip("  Enable the WhatsApp channel? [y/N]: ")
+    if not answer or answer.lower() not in ("y", "yes"):
+        print("  ⏭  Left disabled. Enable it later from Settings → Messaging Channels.\n")
+        return
+
+    cfg_file = config_path()
+    cfg: dict = {}
+    if cfg_file.exists():
+        try:
+            loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"  ⚠️  Could not read {cfg_file}: {exc}\n")
+            return
+        # A top-level non-object is not something this step may repair: writing our
+        # own object over it would destroy whatever the operator meant. Mirrors
+        # _setup_sandbox_consent.
+        if not isinstance(loaded, dict):
+            print(f"  ⚠️  {cfg_file} does not contain a JSON object; skipping.\n")
+            return
+        cfg = loaded
+    if not isinstance(cfg.get("whatsapp"), dict) and "whatsapp" in cfg:
+        print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
+        return
+
+    # The read above answered "may this step run"; it is NOT the read the write
+    # is derived from. That one happens inside ``update_config_locked``'s hold on
+    # the ``<config>.lock`` sidecar, so a dashboard settings write or a
+    # ``kirocrew config set`` landing between the two is carried forward instead
+    # of being replaced by this older snapshot.
+    section_clash: list[str] = []
+
+    def _enable(data: dict) -> dict | None:
+        section = data.get("whatsapp")
+        if not isinstance(section, dict):
+            if "whatsapp" in data:
+                # Re-checked under the lock: another writer may have replaced the
+                # section since the read above. Skip the write, report outside.
+                section_clash.append("whatsapp")
+                return None
+            section = {}
+            data["whatsapp"] = section
+        section["enabled"] = True
+        return data
+
+    try:
+        update_config_locked(cfg_file, mutate=_enable, stamp_meta=False)
+    except ConfigReadError as exc:
+        # Does not inherit OSError, so it needs naming next to the write failure.
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}\n")
+        return
+    except OSError as exc:
+        print(f"  ⚠️  Could not write {cfg_file}: {exc}")
+        print("     Nothing was enabled. Enable it from Settings → Messaging Channels instead.\n")
+        return
+    if section_clash:
+        print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
+        return
+    print("  ✅ Recorded: whatsapp.enabled = true")
+    print("     Next: start the gateway, then scan the QR from")
+    print("     Settings → Messaging Channels → WhatsApp.\n")
 
 
 _CUSTOM_DOMAIN = "kirocrew.localhost"
@@ -581,14 +982,16 @@ def _input_or_skip(prompt: str) -> str | None:
 
     Returns ``None`` when the user hit Enter with no input, which callers treat
     as "keep the default / skip this step". A closed/piped stdin is a different
-    condition and must not be silently coerced to ``""`` (that used to admit an
-    empty default and cascade the failure into the NEXT step's bare
-    ``input()``) — see ``_SetupAborted``.
+    condition and must not be silently coerced to ``""`` (coercing it admits an
+    empty default and cascades the failure into the NEXT step's bare
+    ``input()``) — see ``_SetupAborted``. A non-UTF-8 locale (e.g. C/POSIX)
+    makes ``input()`` raise ``UnicodeDecodeError`` the same way, so it is
+    treated identically.
     """
 
     try:
         answer = input(prompt).strip()
-    except EOFError as exc:
+    except (EOFError, UnicodeDecodeError) as exc:
         raise _SetupAborted("stdin closed; setup cannot continue") from exc
     return answer or None
 
@@ -605,7 +1008,16 @@ def _setup_slash_command() -> None:
             return
 
     print("── Slash Command ──\n")
-    current = cfg.get("slack", {}).get("command", "kirocrew")
+    # A non-object ``slack`` is an operator value this step cannot merge into.
+    # Guarded HERE as well as in the write below, because this read is what runs
+    # first: ``.get("slack", {}).get(...)`` raised AttributeError on a scalar and
+    # took the whole wizard down with a traceback. Refusing the step is the same
+    # answer the whatsapp and sandbox steps give for their own sections.
+    slack_section = cfg.get("slack")
+    if slack_section is not None and not isinstance(slack_section, dict):
+        print("  ⚠️  'slack' section is not an object; leaving config untouched.\n")
+        return
+    current = (slack_section or {}).get("command", "kirocrew")
     # EOF keeps the current value (same reasoning as the workspace step).
     raw = _input_or_skip(f"  Slash command name [{current}]: ") or ""
     if raw:
@@ -619,44 +1031,100 @@ def _setup_slash_command() -> None:
         print("  ⚠️  Command name too long (max 32 chars).")
         raw = current
 
-    cfg.setdefault("slack", {})["command"] = raw
-    write_config_atomically(cfg_file, cfg)
+    # Re-checked under the lock, and it must ABORT rather than replace: a
+    # non-dict ``slack`` is an operator value this step did not write and cannot
+    # merge into, so overwriting it with a fresh object would destroy it while
+    # reporting success. Absent is the only case that may be created. Same rule
+    # as the whatsapp and sandbox steps above.
+    section_clash: list[str] = []
+
+    def _apply(data: dict) -> dict | None:
+        section = data.get("slack")
+        if not isinstance(section, dict):
+            if "slack" in data:
+                section_clash.append("slack")
+                return None
+            section = {}
+            data["slack"] = section
+        section["command"] = raw
+        return data
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
+    except ConfigReadError as exc:
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        return
+    if section_clash:
+        print("  ⚠️  'slack' section is not an object; leaving config untouched.\n")
+        return
     print(f"  ✅ Slash command: /{raw}\n")
 
 
+def _remove_retired_conductor_skill() -> None:
+    """Run retired conductor skill cleanup without interrupting setup."""
+    try:
+        if remove_retired_conductor_skill():
+            print("  ✅ Removed retired conductor skill")
+    except Exception as exc:
+        print(f"  ⚠️  Retired conductor skill cleanup failed: {exc}")
+
+
 def _setup_sandbox_consent() -> None:
-    """Offer the unconfined-exec opt-in when this host has NO sandbox backend.
+    """Surface the unconfined-exec decision when this host has NO sandbox backend.
 
-    Fail-closed is the shipped posture: with no backend ``wrap_argv`` refuses
-    every agent subprocess, so a fresh install on such a host — any Windows host,
-    or a Linux kernel that refuses user namespaces — has no working MCP tooling
-    until an operator declares the opt-in. Leaving them to discover that from a
-    probe error is a bad first run, but defaulting the opt-in ON by platform
-    would delete a deny-by-default authorization and put nothing in its place:
-    an agent-selected repo's ``include.path`` reaches ``~/.aws/credentials``, and
-    a crafted ``.tex`` typesets a secret into a PDF.
+    Which WAY this step asks depends on what an undeclared key resolves to here,
+    via :func:`~kiro_crew.sandbox.unsandboxed_exec_platform_default`.
 
-    So the wizard ASKS, and writes the key only on an explicit yes. That keeps
-    the decision operator-declared exactly as
-    ``docs/system-specs/modules/security.md`` requires while making it
-    discoverable instead of hidden behind a spawn failure.
+    On a platform where a backend is BROKEN or missing but installable — a Linux
+    kernel refusing user namespaces, a macOS host — fail-closed remains the
+    shipped posture and this step offers the opt-IN, writing the key only on an
+    explicit yes. The reasoning is unchanged and the threat is concrete: an
+    agent-selected repo's ``include.path`` reaches ``~/.aws/credentials``, and a
+    crafted ``.tex`` typesets a secret into a PDF. Such a host also has a remedy
+    that RESTORES isolation, so pointing at the profile beats disabling the check.
 
-    Only a genuine ``"no_backend"`` classification reaches the prompt.
+    On a platform with no backend to install at all — Windows, where there is
+    neither a user namespace nor ``sandbox-exec`` — the effective default is now
+    ALLOW, and this step offers the opt-OUT instead. This is a deliberate product
+    decision with a real cost, recorded here rather than glossed: it removes a
+    deny-by-default authorization, and the attack above is exactly as available
+    afterwards as it was before. It was taken because fail-closed there is not a
+    security posture anyone can act on — no operator action produces a backend, so
+    the check refused every MCP server, app backend and provider CLI on the
+    platform in perpetuity, and the practical outcome was users hand-editing the
+    same flag from an error message with no risk statement attached at all.
+
+    What stands in the deny-by-default's place, none of it equivalent to it:
+
+    * this step, which STATES the exposure in the same words the opt-in used and
+      offers the lockdown, including a printed notice on a non-interactive run;
+    * a per-spawn SEL ``outcome="unconfined"`` event naming whether an operator or
+      the platform permitted it, so an unconfined spawn is never unrecorded;
+    * the loud once-per-process ``SECURITY`` log line from ``_warn_no_isolation``;
+    * a governance ``sandbox.min_level`` floor, which still OVERRIDES the default
+      fleet-wide and keeps a managed host fail-closed;
+    * a declared ``false``, which still outranks the platform default — an
+      operator who locked this host down stays locked down.
+
+    Only a genuine ``"no_backend"`` classification reaches either prompt.
     ``detect_backend() == "none"`` alone is not sufficient: it also covers a
     momentary fork/resource failure, which self-heals on the next spawn and must
     never buy a permanent bypass, and a foreign outer sandbox, where this host's
     sandbox works and the remedy hands isolation back to Kiro Crew rather than
-    disabling it. The prompt is also skipped when stdin/stdout are not both a
-    terminal, because an unseen question is a hang rather than consent.
+    disabling it. Neither prompt is shown when stdin/stdout are not both a
+    terminal, because an unseen question is a hang rather than consent — but on a
+    default-allow platform the notice is printed there anyway, since that run is
+    otherwise told nothing.
 
     Silent no-op when a backend exists (the Linux/macOS norm) or when the key is
     already declared in either state, in ``config.json`` OR the
     ``config.local.json`` overlay that deep-merges over it — the overlay wins at
     load time, so ignoring it would let this step prompt a user who already
-    decided and then report a grant the effective config contradicts. Declining —
+    decided and then report a state the effective config contradicts. Declining —
     including a non-interactive EOF, which :func:`_input_or_skip` reports as
-    ``None`` — leaves the config untouched, so the effective default stays
-    fail-closed.
+    ``None`` — leaves the config untouched in BOTH directions, so the host keeps
+    this platform's default AND stays undeclared, and a later change to that
+    default still reaches it.
     """
     try:
         kind = unavailable_kind()
@@ -677,25 +1145,41 @@ def _setup_sandbox_consent() -> None:
         # where this host's sandbox works and the remedy hands isolation back to
         # Kiro Crew rather than disabling it. Neither warrants this opt-in.
         return
-    # A prompt nobody can see is a hang, not consent: `kirocrew update` runs
-    # setup with its output captured while stdin is still inherited, so an
-    # invisible question would block until that path's timeout aborts the update.
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        print("  ⚠️  No sandbox backend on this host, so agent subprocesses are")
-        print("     refused. Run `kirocrew setup` from a terminal to decide, or set")
-        print("     agent.sandbox_allow_unsandboxed_exec=true by hand to opt in.\n")
+    # Which way this step ASKS depends on what an undeclared key now resolves to
+    # on this platform. Resolved once, up front, because the non-interactive
+    # notice, the question and the value written must all describe the same
+    # default -- and on a platform whose default is "allowed" the old wording
+    # ("subprocesses are refused") would be simply false.
+    unconfined_by_default = unsandboxed_exec_platform_default()
+    # Nothing to surface once the operator DECLARED the key, in either state, in
+    # config.json OR the config.local.json overlay that deep-merges over it — the
+    # overlay wins at load time, so ignoring it would let this step address a user
+    # who already decided. This check comes BEFORE the non-TTY notice on purpose:
+    # that notice describes the PLATFORM DEFAULT, so printing it to a host that
+    # declared the opposite would tell an operator who locked the host down that it
+    # runs unconfined.
+    if unsandboxed_exec_declared():
         return
-
-    def _declared(path: Path) -> bool:
-        """Whether *path* explicitly sets the key, in either state."""
-        if not path.exists():
-            return False
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        agent = doc.get("agent") if isinstance(doc, dict) else None
-        return isinstance(agent, dict) and "sandbox_allow_unsandboxed_exec" in agent
+    # A prompt nobody can see is a hang, not consent: `kirocrew update` runs
+    # setup with its output captured and stdin on DEVNULL, so a question asked
+    # there is invisible and reads EOF. This guard keeps the decision at a real
+    # terminal rather than letting a non-interactive run answer it.
+    if not _stdio_is_interactive():
+        if unconfined_by_default:
+            # Still printed, not skipped: this is the only notice a non-interactive
+            # install gets that its agent subprocesses run unconfined, and the
+            # whole point of a platform default is that nobody had to consent to
+            # it. Saying nothing here is what would make the change silent.
+            print("  ⚠️  This platform offers no OS-level sandbox backend, so agent")
+            print("     subprocesses run WITHOUT credential isolation by default.")
+            print("     Run `kirocrew setup` from a terminal to review that, or set")
+            print("     agent.sandbox_allow_unsandboxed_exec=false by hand to refuse")
+            print("     them instead.\n")
+        else:
+            print("  ⚠️  No sandbox backend on this host, so agent subprocesses are")
+            print("     refused. Run `kirocrew setup` from a terminal to decide, or set")
+            print("     agent.sandbox_allow_unsandboxed_exec=true by hand to opt in.\n")
+        return
 
     cfg_file = config_path()
     cfg: dict = {}
@@ -713,43 +1197,79 @@ def _setup_sandbox_consent() -> None:
             print(f"  ⚠️  {cfg_file} does not contain a JSON object; skipping.\n")
             return
         cfg = loaded
-    if _declared(cfg_file) or _declared(config_local_path()):
-        return
 
     print("── Sandbox ──\n")
-    print("  This host offers no OS-level sandbox backend (Linux user namespaces")
-    print("  or macOS sandbox-exec), so Kiro Crew currently REFUSES to run agent")
-    print("  subprocesses at all — MCP servers, Dev Fleet and the Papyrus")
-    print("  compiler will report a sandbox error until you decide.")
-    print()
-    print("  Allowing them to run unconfined means an agent-driven subprocess can")
-    print("  read your home directory, including ~/.aws and ~/.ssh, with no OS")
-    print("  confinement. Kiro Crew still scrubs credential environment variables,")
-    print("  but it cannot stop a hostile repo or document from reading files.")
-    print()
-    answer = _input_or_skip("  Allow unsandboxed execution? [y/N]: ")
+    if unconfined_by_default:
+        # INFORM, then offer the restriction. The risk paragraph is identical to
+        # the opt-in branch's on purpose: what changed is who has to act, not how
+        # dangerous it is, and a default that describes itself in softer words
+        # than the opt-in did would be the silent change this branch exists to
+        # avoid.
+        print("  This platform offers no OS-level sandbox backend for Kiro Crew to")
+        print("  apply — there is no Linux user namespace and no macOS sandbox-exec,")
+        print("  and unlike a misconfigured Linux host there is no profile to")
+        print("  install that would produce one.")
+        print()
+        print("  Agent subprocesses therefore run unconfined here BY DEFAULT: an")
+        print("  agent-driven subprocess can read your home directory, including")
+        print("  ~/.aws and ~/.ssh, with no OS confinement. Kiro Crew still scrubs")
+        print("  credential environment variables and audits every such spawn, but")
+        print("  it cannot stop a hostile repo or document from reading files.")
+        print()
+        print("  Refusing them instead disables MCP servers, Dev Fleet and the")
+        print("  Papyrus compiler on this host — they will report a sandbox error.")
+        print()
+        answer = _input_or_skip("  Refuse unsandboxed execution on this host? [y/N]: ")
+        granting = False
+    else:
+        print("  This host offers no OS-level sandbox backend (Linux user namespaces")
+        print("  or macOS sandbox-exec), so Kiro Crew currently REFUSES to run agent")
+        print("  subprocesses at all — MCP servers, Dev Fleet and the Papyrus")
+        print("  compiler will report a sandbox error until you decide.")
+        print()
+        print("  Allowing them to run unconfined means an agent-driven subprocess can")
+        print("  read your home directory, including ~/.aws and ~/.ssh, with no OS")
+        print("  confinement. Kiro Crew still scrubs credential environment variables,")
+        print("  but it cannot stop a hostile repo or document from reading files.")
+        print()
+        answer = _input_or_skip("  Allow unsandboxed execution? [y/N]: ")
+        granting = True
     if not answer or answer.lower() not in ("y", "yes"):
-        print("  ⏭  Left fail-closed — MCP tooling stays disabled on this host.")
-        print("     To opt in later, set agent.sandbox_allow_unsandboxed_exec=true")
-        print(f"     in {cfg_file}\n")
+        # Declining writes nothing in BOTH directions, so the effective state
+        # stays whatever this platform's default is -- and stays undeclared, so a
+        # later change to that default still reaches this host. Writing the
+        # current default on a decline would freeze it silently.
+        if unconfined_by_default:
+            print("  ⏭  Left as-is — agent subprocesses keep running unconfined here.")
+            print("     To refuse them later, set")
+            print("     agent.sandbox_allow_unsandboxed_exec=false")
+            print(f"     in {cfg_file}\n")
+        else:
+            print("  ⏭  Left fail-closed — MCP tooling stays disabled on this host.")
+            print("     To opt in later, set agent.sandbox_allow_unsandboxed_exec=true")
+            print(f"     in {cfg_file}\n")
         return
 
-    if not isinstance(cfg.get("agent"), dict):
-        if "agent" in cfg:
-            print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
-            return
-        cfg["agent"] = {}
+    if not isinstance(cfg.get("agent"), dict) and "agent" in cfg:
+        print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
+        return
 
-    # Audit-or-deny, BEFORE the write: this persists an execution permission, so
-    # it belongs in the tamper-evident log next to the ``denied`` event
-    # ``wrap_argv`` emits when it refuses a spawn — otherwise the refusals are
-    # recorded and the grant that silences them is not. ``critical=True`` makes
-    # SEL write synchronously and re-raise on a filesystem failure, and the grant
-    # is refused rather than persisted unaudited. Audit-then-write is the safe
-    # ordering: a failure between the two leaves a record without a grant, never
-    # a grant without a record. The documented manual ``config.json`` edit remains
-    # available; it is outside this wizard's control and is not a bypass this
-    # step introduces.
+    # Audit BEFORE the write: this persists an execution permission, so it belongs
+    # in the tamper-evident log next to the ``denied`` event ``wrap_argv`` emits
+    # when it refuses a spawn — otherwise the refusals are recorded and the grant
+    # that silences them is not. Audit-then-write is the safe ordering: a failure
+    # between the two leaves a record without a grant, never a grant without a
+    # record. The documented manual ``config.json`` edit remains available; it is
+    # outside this wizard's control and is not a bypass this step introduces.
+    #
+    # ``critical`` — and whether an audit failure ABORTS — depends on the
+    # direction, because the two directions fail unsafe in opposite ways. A GRANT
+    # is audit-or-deny: ``critical=True`` makes SEL write synchronously and
+    # re-raise, and the grant is refused rather than persisted unaudited. A
+    # RESTRICTION is best-effort: refusing to record "keep this host fail-closed"
+    # because the audit log is broken would LEAVE THE HOST UNCONFINED, which is
+    # the more dangerous of the two outcomes, so the write proceeds and the audit
+    # gap is reported instead.
     try:
         sel().log_tool_invocation(
             session_key="setup",
@@ -757,30 +1277,71 @@ def _setup_sandbox_consent() -> None:
             source="cli_setup._setup_sandbox_consent",
             tool_name="sandbox_allow_unsandboxed_exec",
             tool_kind="config",
-            outcome="allowed",
+            outcome="allowed" if granting else "denied",
             resources=str(cfg_file),
-            metadata={"reason": "operator_consent_at_setup", "probe_kind": kind},
-            critical=True,
+            metadata={
+                "reason": (
+                    "operator_consent_at_setup" if granting else "operator_lockdown_at_setup"
+                ),
+                "probe_kind": kind,
+            },
+            critical=granting,
         )
     except Exception as exc:
         print(f"  ⚠️  Could not record the security audit event: {exc}")
-        print("     Refusing to grant unsandboxed execution unaudited —")
-        print("     left fail-closed. Fix the audit log, then re-run setup.\n")
-        return
+        if granting:
+            print("     Refusing to grant unsandboxed execution unaudited —")
+            print("     left fail-closed. Fix the audit log, then re-run setup.\n")
+            return
+        print("     Recording the restriction anyway: refusing to fail-close this")
+        print("     host because the audit log is broken would leave it unconfined.\n")
 
-    cfg["agent"]["sandbox_allow_unsandboxed_exec"] = True
+    # Under the sidecar lock, and the grant is applied to the document as it
+    # stands there -- the snapshot read before the prompt is only what decided
+    # whether to ask. The audit above stays ahead of the acquire, so the
+    # audit-then-write ordering is unchanged.
+    section_clash: list[str] = []
+
+    def _grant(data: dict) -> dict | None:
+        section = data.get("agent")
+        if not isinstance(section, dict):
+            if "agent" in data:
+                section_clash.append("agent")
+                return None
+            section = {}
+            data["agent"] = section
+        section["sandbox_allow_unsandboxed_exec"] = granting
+        return data
+
+    # A failed write left the key UNDECLARED, so the host keeps this platform's
+    # default -- which is not "fail-closed" everywhere. Naming the wrong outcome
+    # here would tell an operator their host is protected when nothing confines
+    # it, so both messages state the default that actually now applies.
+    unchanged = (
+        "agent subprocesses keep running unconfined here"
+        if unconfined_by_default
+        else "the host stays fail-closed"
+    )
+    byhand = "false" if unconfined_by_default else "true"
     try:
-        write_config_atomically(cfg_file, cfg)
+        update_config_locked(cfg_file, mutate=_grant, stamp_meta=False)
+    except ConfigReadError as exc:
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        print(f"     Nothing was recorded — {unchanged}.\n")
+        return
     except OSError as exc:
         # A locked or read-only config (common on Windows when another process
         # holds it) must not abort the whole wizard after the user has already
-        # answered. Report it and continue: nothing was granted, so the host
-        # stays fail-closed.
+        # answered. Report it and continue: nothing was written, so the host keeps
+        # whatever this platform's default is.
         print(f"  ⚠️  Could not write {cfg_file}: {exc}")
-        print("     Nothing was granted — the host stays fail-closed. Set")
-        print("     agent.sandbox_allow_unsandboxed_exec=true by hand to opt in.\n")
+        print(f"     Nothing was recorded — {unchanged}. Set")
+        print(f"     agent.sandbox_allow_unsandboxed_exec={byhand} by hand instead.\n")
         return
-    print("  ✅ Recorded: agent.sandbox_allow_unsandboxed_exec = true\n")
+    if section_clash:
+        print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
+        return
+    print(f"  ✅ Recorded: agent.sandbox_allow_unsandboxed_exec = {str(granting).lower()}\n")
 
 
 def _setup_timezone() -> None:
@@ -863,8 +1424,18 @@ def _setup_timezone() -> None:
                 print("  ⏭  Skipped after too many attempts.\n")
                 return
 
-    data["timezone"] = tz_val
-    write_config_atomically(cfg_file, data)
+    def _apply(existing: dict) -> dict:
+        existing["timezone"] = tz_val
+        return existing
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
+    except ConfigReadError as exc:
+        # The pre-prompt read already refuses a corrupt config; this covers a
+        # file that went bad while the operator was answering, and refuses the
+        # same way rather than surfacing a traceback out of the wizard.
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        return
     print(f"  ✅ Timezone saved: {tz_val}\n")
 
 
@@ -879,12 +1450,16 @@ def _maybe_setup_dashboard_url() -> None:
     if not has_slack:
         return  # No Slack → local-only, no URL needed
 
-    # Detect if this looks like a remote host
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        is_remote = not ip.startswith("127.")
-    except OSError:
-        is_remote = False
+    # Detect if this looks like a remote host. Bounded, because
+    # `socket.gethostbyname` has no timeout of its own: on a host whose own name
+    # does not resolve (an mDNS `*.local` with no responder) the bare call sits
+    # for 15+ seconds, which here stalls an INTERACTIVE prompt the operator is
+    # waiting on. Same resolver, same hazard and same remedy as the dashboard's
+    # startup path, so it reads through the one helper rather than growing a
+    # second bounded copy. `None` means unresolved, which is the same answer as
+    # a raised OSError: treat the host as local.
+    ip = _resolve_hostname_bounded(socket.gethostname())
+    is_remote = ip is not None and not ip.startswith("127.")
 
     if not is_remote and not cfg.dashboard.url:
         return  # Localhost machine with no existing URL config — skip
@@ -911,14 +1486,26 @@ def _maybe_setup_dashboard_url() -> None:
         print("  ⏭  Skipped. Dashboard will bind to localhost only.\n")
         return
 
-    # Persist to config.json
-    try:
-        data: dict = {}
-        if cfg_file.exists():
-            data = json.loads(cfg_file.read_text(encoding="utf-8"))
-        dashboard = data.setdefault("dashboard", {})
+    # Persist to config.json. The read is inside the lock hold, so the URL
+    # cannot be written over a document that predates another writer's change.
+    #
+    # A non-dict ``dashboard`` RAISES rather than being replaced: it is an
+    # operator value this step cannot merge into, and the broad handler below
+    # already reports exactly that as "Failed to save" and writes nothing --
+    # which is what this step did before it took the lock, when the same shape
+    # raised out of ``setdefault``.
+    def _apply(data: dict) -> dict:
+        dashboard = data.get("dashboard")
+        if dashboard is None and "dashboard" not in data:
+            dashboard = {}
+            data["dashboard"] = dashboard
+        elif not isinstance(dashboard, dict):
+            raise TypeError(f"'dashboard' in {cfg_file} is not an object; refusing to replace it")
         dashboard["url"] = answer
-        write_config_atomically(cfg_file, data)
+        return data
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
         print(f"  ✅ Dashboard URL saved: {answer}")
         print("  Token auth will be required for all requests.\n")
     except Exception as e:

@@ -2,8 +2,8 @@
 
 Each test here maps to an acceptance criterion for making a channel-born
 conversation's dashboard tab BE that conversation rather than a copy of it.
-Every one fails before the change: the tab used to run a separate session and
-write a separate transcript.
+The tab runs the same session and transcript as the conversation, never a
+separate copy.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from kiro_crew.dashboard.chat_utils import (
     dashboard_slot_key,
     effective_session_key,
     slot_transcript_key,
+    subagent_event_slot,
 )
 from kiro_crew.history import ConversationLog, _safe_key
 from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
@@ -182,6 +183,7 @@ class TestA4TheTabStaysCurrent:
             session_key=SLACK_KEY,
         )
         assert slot is not None and len(slot.messages) == 4
+        assert all(not (message.get("meta") or {}).get("mid") for message in slot.messages)
 
         # The channel writes two more turns straight to the shared file.
         log.append(SLACK_KEY, "user", "after the tab opened")
@@ -193,6 +195,7 @@ class TestA4TheTabStaysCurrent:
             "after the tab opened",
             "reply to that",
         ]
+        assert all(not (message.get("meta") or {}).get("mid") for message in slot.messages)
 
     def test_a_refresh_is_idempotent(self, state, log):
         _write_transcript(Path(log._dir), SLACK_STEM, _turns(4))
@@ -337,11 +340,77 @@ class TestSurfaceRegistry:
         assert has_dashboard_surface("cron:nightly") is False
         assert dashboard_slot_key("cron:nightly") == ""
 
+    def test_a_cron_session_resolves_to_its_actual_slot_name(self):
+        """A cron-born tab is named ``cron-<id>`` (cron_inject.py), NOT the
+        session key folded (``cron_<id>``). Resolving the fold sent sub-agent
+        completions to a slot that never existed — "parent slot cron_<id>
+        gone, notification only" — so results reached the bell icon but never
+        the open conversation."""
+        set_dashboard_surfaced({"cron:188f71e5"})
+        assert dashboard_slot_key("cron:188f71e5") == "cron-188f71e5"
+
+    def test_a_cron_per_run_key_resolves_to_the_job_tab(self):
+        """Stateless jobs run under ``cron:<job_id>:<run_id>`` and agent
+        sequences under ``cron:<job_id>:<agent>``, but the surface registry
+        only ever holds the slot's linked key (``cron:<job_id>``) — the base
+        key must be retried or those runs stay invisible."""
+        set_dashboard_surfaced({"cron:188f71e5"})
+        assert dashboard_slot_key("cron:188f71e5:a1b2c3") == "cron-188f71e5"
+        assert dashboard_slot_key("cron:188f71e5:worker") == "cron-188f71e5"
+
+    def test_a_cron_session_with_no_tab_still_resolves_to_nothing(self):
+        set_dashboard_surfaced(())
+        assert dashboard_slot_key("cron:188f71e5") == ""
+        assert dashboard_slot_key("cron:188f71e5:a1b2c3") == ""
+
     def test_an_empty_registry_degrades_to_the_prefix_test(self):
         """Fail-safe: no worse than the behaviour it replaced."""
         set_dashboard_surfaced(())
         assert has_dashboard_surface("dashboard:chat-1-99") is True
         assert has_dashboard_surface(SLACK_KEY) is False
+
+
+class TestSubagentEventSlotRouting:
+    """The ``slot`` a per-slot WS event carries must be the TAB's key.
+
+    The frontend routes ``subagent_spawn/tool/done`` (and the reconnect
+    replay) by exact string match against the tab's slot key. A raw
+    ``removeprefix("dashboard:")`` tags frames from cron/channel-born parents
+    with the raw session key, which no tab uses — the Subagents panel then
+    reads "No subagents running" for the entire life of every agent those
+    sessions spawn.
+    """
+
+    def setup_method(self):
+        set_dashboard_surfaced(())
+
+    def teardown_method(self):
+        set_dashboard_surfaced(())
+
+    def test_dashboard_born_parent_keeps_its_slot_key(self):
+        assert subagent_event_slot("dashboard:chat-3-1754") == "chat-3-1754"
+
+    def test_cron_born_parent_routes_to_the_cron_tab(self):
+        """Regression: agents spawned from a cron-born session were invisible
+        in the panel (events carried ``cron:<id>``, the tab is ``cron-<id>``)."""
+        set_dashboard_surfaced({"cron:188f71e5"})
+        assert subagent_event_slot("cron:188f71e5") == "cron-188f71e5"
+
+    def test_cron_per_run_parent_routes_to_the_job_tab(self):
+        """A stateless run's ``cron:<job_id>:<run_id>`` parent must reach the
+        job's tab too — only the linked ``cron:<job_id>`` is ever surfaced."""
+        set_dashboard_surfaced({"cron:188f71e5"})
+        assert subagent_event_slot("cron:188f71e5:a1b2c3") == "cron-188f71e5"
+
+    def test_channel_born_parent_routes_to_its_transcript_stem_tab(self):
+        set_dashboard_surfaced({SLACK_KEY})
+        assert subagent_event_slot(SLACK_KEY) == SLACK_STEM
+
+    def test_no_tab_falls_back_to_the_legacy_raw_key(self):
+        """No tab open: nothing can route anywhere, but external WS consumers
+        and log lines keep the historical payload shape."""
+        assert subagent_event_slot("cron:188f71e5") == "cron:188f71e5"
+        assert subagent_event_slot(SLACK_KEY) == SLACK_KEY
 
 
 class TestA6NoLostOrOutOfOrderTurn:
@@ -411,8 +480,8 @@ class TestForeignAppendsInterleaveChronologically:
     """A channel turn that lands mid-window is filed where it happened.
 
     The save rewrites ``meta + frozen prefix + window``. Foreign lines (another
-    writer's acknowledged appends) used to be concatenated after the window,
-    which parked a channel reply that arrived BEFORE the user's next dashboard
+    writer's acknowledged appends) must not be concatenated after the window,
+    which would park a channel reply that arrived BEFORE the user's next dashboard
     message after it. Once the tab and the thread share one transcript that
     reordering is the conversation the next turn reads back.
     """

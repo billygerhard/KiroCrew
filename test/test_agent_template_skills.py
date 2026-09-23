@@ -3,8 +3,7 @@
 Three layers, matching the three holes this feature closes:
 
 * READ — ``agent_discovery`` derives an agent's skills from its ``skill://``
-  resources (previously only ``builder-mcp --skill-name-filter`` was parsed, so
-  every ordinary agent reported zero skills).
+  resources.
 * WRITE — ``_shared.apply_skill_mapping`` turns catalog keys into ``skill://``
   resources without disturbing ``file://`` steering globs or hand-authored URIs.
 * RUNTIME — ``SkillsLoader.get_context(only=…)`` and the ``build_session_context``
@@ -20,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.agent_discovery import (
     _extract_skills,
     agent_skill_globs,
@@ -43,6 +43,18 @@ from kiro_crew.skills import SkillsLoader
 
 
 @pytest.fixture(autouse=True)
+def _owner_caller(monkeypatch):
+    """Run as the dashboard owner: these tests exercise handler behavior PAST
+    the owner boundary on the agents module's mutating endpoints, which has
+    its own enumerate-the-invariant coverage in
+    test_agents_endpoints_owner_auth.py."""
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
+        lambda request: True,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_agent_cache():
     clear_list_agents_cache()
     yield
@@ -56,9 +68,7 @@ def fake_home(tmp_path, monkeypatch):
     # ``_KIRO_AGENTS_DIR`` is computed at import time from the real home, so the
     # Path.home patch alone does not redirect the default-argument lookups that
     # agent_skill_globs / list_agents use.
-    monkeypatch.setattr(
-        "kiro_crew.agent_discovery._KIRO_AGENTS_DIR", tmp_path / ".kiro" / "agents"
-    )
+    monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", tmp_path / ".kiro" / "agents")
     return tmp_path
 
 
@@ -146,10 +156,17 @@ class TestExtractSkills:
 
 
 class TestExpandSkillUri:
-    def test_home_relative(self, fake_home):
+    def test_global_spec_relative_resource_uses_the_session_working_directory(self, tmp_path):
+        path = tmp_path / "home" / ".kiro" / "agents" / "custom.json"
+        project = tmp_path / "project"
         assert expand_skill_uri(
-            "skill://~/.kiro/skills/foo/SKILL.md", fake_home / "a.json"
-        ) == str(fake_home / ".kiro/skills/foo/SKILL.md")
+            "skill://.kiro/skills/*/SKILL.md", path, project_dir=project
+        ) == str(project / ".kiro/skills/*/SKILL.md")
+
+    def test_home_relative(self, fake_home):
+        assert expand_skill_uri("skill://~/.kiro/skills/foo/SKILL.md", fake_home / "a.json") == str(
+            fake_home / ".kiro/skills/foo/SKILL.md"
+        )
 
     def test_absolute(self, tmp_path):
         assert (
@@ -167,6 +184,10 @@ class TestExpandSkillUri:
 
 
 class TestAgentSkillGlobs:
+    def test_missing_custom_template_cannot_fall_back_to_global_skills(self, fake_home):
+        with pytest.raises(ValueError, match="Cannot resolve skill scope"):
+            agent_skill_globs("removed", agents_dir=_agents_dir(fake_home), strict=True)
+
     def test_returns_expanded_globs_for_mapped_agent(self, fake_home):
         d = _agents_dir(fake_home)
         (d / "mapped.json").write_text(
@@ -236,6 +257,7 @@ class TestSkillKeyRoundTrip:
             == "kiro-user/utils/tiny-url"
         )
 
+    @requires_symlinks
     def test_symlinked_skill_dir_inverts_to_the_same_key(self, fake_home):
         """An AIM ``--local`` install symlinks ``~/.kiro/skills/<name>`` to a
         directory elsewhere. The written URI and its inversion must agree, or the
@@ -293,7 +315,7 @@ class TestEnumerateSkillCatalog:
         _make_skill(creds, "looks-legit")
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers._shared._skill_key_roots",
-            lambda state: [("kiro-user/", creds)],
+            lambda state, session_key="": [("kiro-user/", creds)],
         )
         assert enumerate_skill_catalog(_State()) == {}
 
@@ -388,9 +410,7 @@ class TestApplySkillMapping:
         agent = _agents_dir(fake_home) / "a.json"
         data: dict = {}
 
-        applied, _ = apply_skill_mapping(
-            data, agent, state, ["kiro-user/one", "kiro-user/one"]
-        )
+        applied, _ = apply_skill_mapping(data, agent, state, ["kiro-user/one", "kiro-user/one"])
 
         assert applied == ["kiro-user/one"]
         assert data["resources"] == ["skill://~/.kiro/skills/one/SKILL.md"]
@@ -486,6 +506,9 @@ class _FakeRequest:
         self._body = body
         self.app = {"state": state}
         self.query: dict[str, str] = {}
+        # api_agent_detail reads X-Session-Key via _read_session_key(request)
+        # to scope the skill catalog to the requesting slot.
+        self.headers: dict[str, str] = {}
 
     async def json(self):
         return self._body
@@ -545,9 +568,8 @@ class TestSessionContextGate:
         )
 
     def test_mapped_custom_agent_gets_its_skills_on_cc(self, fake_home):
-        """Previously a custom agent got NO skills at all. With a mapping it now
-        gets exactly the mapped set on the CC backend (which does not read agent
-        ``resources``)."""
+        """A custom agent with a mapping gets exactly the mapped set on the CC
+        backend (which does not read agent ``resources``)."""
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         _make_skill(skills_root, "beta")
@@ -568,9 +590,8 @@ class TestSessionContextGate:
         assert "alpha" in ctx
         assert "beta" not in ctx
 
-    def test_mapped_agent_on_kiro_defers_to_native_resource_load(self, fake_home):
-        """kiro-cli loads ``skill://`` resources itself when spawned with
-        ``--agent``, so injecting them again would duplicate every SKILL.md."""
+    def test_mapped_agent_on_kiro_gets_scoped_discovery(self, fake_home):
+        """Native startup uses the Crew directory and loads bodies on demand."""
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         d = _agents_dir(fake_home)
@@ -587,7 +608,9 @@ class TestSessionContextGate:
         ctx = self._builder(fake_home, skills_root).build_session_context(
             agent="specialist", provider_type="acp"
         )
-        assert "[Skills:]" not in ctx
+        assert "skill_search" in ctx
+        assert "alpha" in ctx
+        assert "Body of alpha" not in ctx
 
     def test_unmapped_custom_agent_still_gets_nothing(self, fake_home):
         skills_root = fake_home / "skills"
@@ -599,6 +622,10 @@ class TestSessionContextGate:
             agent="plain", provider_type="claude_code"
         )
         assert "[Skills:]" not in ctx
+        from kiro_crew.agent_discovery import session_skill_globs
+
+        assert session_skill_globs("", "plain") == []
+        assert session_skill_globs("", "kirocrew") is None
 
     def test_mapped_kirocrew_is_scoped_not_full_catalog(self, fake_home):
         """The mapping bounds the kirocrew agent too: before this feature it
@@ -623,9 +650,8 @@ class TestSessionContextGate:
         assert "alpha" in ctx
         assert "beta" not in ctx
 
-    def test_mapped_kirocrew_on_kiro_defers_to_native_load(self, fake_home):
-        """On the kiro backend the mapped SKILL.md files are loaded by kiro-cli
-        from ``resources``, so KiroCrew must not inject them a second time."""
+    def test_mapped_kirocrew_on_kiro_gets_scoped_discovery(self, fake_home):
+        """A mapped default agent gets only its scoped discovery directory."""
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         _make_skill(skills_root, "beta")
@@ -643,9 +669,11 @@ class TestSessionContextGate:
         ctx = self._builder(fake_home, skills_root).build_session_context(
             agent="kirocrew", provider_type="acp"
         )
-        assert "[Skills:]" not in ctx
+        assert "skill_search" in ctx
+        assert "alpha" in ctx and "beta" not in ctx
+        assert "Body of alpha" not in ctx
 
-    def test_unmapped_kirocrew_still_gets_everything(self, fake_home):
+    def test_unmapped_kirocrew_gets_short_discovery(self, fake_home):
         skills_root = fake_home / "skills"
         _make_skill(skills_root, "alpha")
         _make_skill(skills_root, "beta")
@@ -654,4 +682,7 @@ class TestSessionContextGate:
         ctx = self._builder(fake_home, skills_root).build_session_context(
             agent="kirocrew", provider_type="claude_code"
         )
+        # The default entry is the bounded usage-ranked index; an unmapped agent
+        # gets it rather than a full catalog dump.
+        assert "## Available Skills" in ctx
         assert "alpha" in ctx and "beta" in ctx

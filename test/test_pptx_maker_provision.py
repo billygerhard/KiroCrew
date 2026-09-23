@@ -266,59 +266,15 @@ class TestResolveUv:
         ):
             assert provision.resolve_uv() == "/usr/bin/uv"
 
-    def test_finds_the_binary_staged_next_to_a_frozen_executable(self, tmp_path: Path):
-        """The DMG path. PyInstaller's bundle has no scripts dir, so
-        `find_uv_bin()` raises there; the spec stages uv at the bundle root."""
-        bundled = tmp_path / ("uv" + (provision.sysconfig.get_config_var("EXE") or ""))
-        bundled.write_text("#!/bin/sh", encoding="utf-8")
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
+    def test_falls_through_to_path_when_find_uv_bin_raises(self, tmp_path: Path):
+        """`find_uv_bin()` raises `UvNotFound` on an install repackaged without the
+        binary — a system uv must still be used rather than reporting none."""
+        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("no binary")))
         with (
             mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "_MEIPASS", str(tmp_path), create=True),
-            mock.patch.object(provision.shutil, "which") as which,
-        ):
-            assert provision.resolve_uv() == str(bundled)
-        assert not which.called, "the bundled binary must win over PATH"
-
-    def test_finds_the_binary_beside_sys_executable_in_a_one_folder_build(self, tmp_path: Path):
-        """`_MEIPASS` and `dirname(sys.executable)` differ for a one-FILE build,
-        so both are probed."""
-        bundled = tmp_path / ("uv" + (provision.sysconfig.get_config_var("EXE") or ""))
-        bundled.write_text("#!/bin/sh", encoding="utf-8")
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
-        with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "executable", str(tmp_path / "kirocrew-backend")),
-            mock.patch.object(provision.shutil, "which"),
-        ):
-            assert provision.resolve_uv() == str(bundled)
-
-    def test_falls_through_to_path_when_the_frozen_location_is_empty(self, tmp_path: Path):
-        """A frozen build whose bundle did NOT stage uv still uses a system one."""
-        empty = tmp_path / "bundle"
-        empty.mkdir()
-        fake_uv = mock.Mock(find_uv_bin=mock.Mock(side_effect=FileNotFoundError("frozen")))
-        with (
-            mock.patch.dict(sys.modules, {"uv": fake_uv}),
-            mock.patch.object(sys, "frozen", True, create=True),
-            mock.patch.object(sys, "_MEIPASS", str(empty), create=True),
-            mock.patch.object(
-                # Both frozen candidates must be empty, or the interpreter's own
-                # scripts dir (which really does hold a uv here) satisfies the probe.
-                sys,
-                "executable",
-                str(empty / "kirocrew-backend"),
-            ),
             mock.patch.object(provision.shutil, "which", return_value="/opt/homebrew/bin/uv"),
         ):
             assert provision.resolve_uv() == "/opt/homebrew/bin/uv"
-
-    def test_the_frozen_location_is_ignored_when_not_frozen(self, tmp_path: Path):
-        """A stray `uv` next to a normal interpreter must not be picked up as if
-        it were a bundled one — only `sys.frozen` opens that door."""
-        assert provision._frozen_bundle_dirs() == []
 
     def test_returns_none_when_uv_is_absent_everywhere_and_never_raises(self):
         """The contract `provision()` depends on: an absent uv is a reportable
@@ -360,7 +316,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv", "x"], scrubbed, None)
             ) as chokepoint,
-            mock.patch.object(provision.subprocess, "run") as run,
+            mock.patch.object(provision, "run_limited") as run,
         ):
             run.return_value = mock.Mock(returncode=0, stdout="out", stderr="")
             provision._run(["/opt/uv", "x"], cwd=str(tmp_path), timeout=5)
@@ -419,8 +375,8 @@ class TestRunSandboxing:
         with (
             mock.patch.object(provision, "sandboxed_spawn_argv", return_value=(["uv"], {}, None)),
             mock.patch.object(
-                provision.subprocess,
-                "run",
+                provision,
+                "run_limited",
                 side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=7),
             ),
         ):
@@ -431,7 +387,7 @@ class TestRunSandboxing:
     def test_a_missing_binary_is_reported_not_raised(self, tmp_path: Path):
         with (
             mock.patch.object(provision, "sandboxed_spawn_argv", return_value=(["uv"], {}, None)),
-            mock.patch.object(provision.subprocess, "run", side_effect=OSError("No such file")),
+            mock.patch.object(provision, "run_limited", side_effect=OSError("No such file")),
         ):
             code, out = provision._run(["uv", "sync"], cwd=str(tmp_path), timeout=7)
         assert code == 1
@@ -446,7 +402,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv"], {}, str(profile))
             ),
-            mock.patch.object(provision.subprocess, "run", side_effect=OSError("boom")),
+            mock.patch.object(provision, "run_limited", side_effect=OSError("boom")),
         ):
             provision._run(["/opt/uv"], cwd=str(tmp_path), timeout=5)
         assert not profile.exists()
@@ -458,7 +414,7 @@ class TestRunSandboxing:
             mock.patch.object(
                 provision, "sandboxed_spawn_argv", return_value=(["/opt/uv"], {}, None)
             ),
-            mock.patch.object(provision.subprocess, "run") as run,
+            mock.patch.object(provision, "run_limited") as run,
         ):
             run.return_value = mock.Mock(returncode=2, stdout="on-out\n", stderr="on-err")
             code, out = provision._run(["/opt/uv"], cwd=str(tmp_path), timeout=5)
@@ -1046,3 +1002,74 @@ class TestShippedAgentsDoNotPreAuthorizeTools:
                 raw = raw.replace(placeholder, "/rendered")
             data = json.loads(raw)
             assert data.get("tools"), f"{path} lost its tools entirely"
+
+    def test_every_at_server_grant_resolves_to_a_declared_server(self) -> None:
+        """Every ``@server``/``@server/tool`` grant names a server something declares.
+
+        kiro-cli drops an unresolvable ``@`` reference SILENTLY at mount time:
+        the agent registers, mounts without the tool, and no exception or
+        warning appears anywhere — so a typo in a spec edit degrades an agent
+        with zero signal. This gate makes that failure loud in CI.
+
+        A shipped spec's ``@`` grant is resolvable when its server part names
+        one of the three sources registration actually merges (see
+        ``bridges._register_agents``):
+
+        - the spec's OWN ``mcpServers`` block (e.g. pptx-maker's ``sdpm``);
+        - a HOST-MANAGED server — read from ``agent._MANAGED_MCP_SERVERS``
+          itself, the registry ``bridges._materialize_managed_refs`` consults,
+          so a renamed managed server fails here instead of un-mounting. The
+          materializer resolves the server portion of both ``@server`` and
+          ``@server/tool``, preserving the original tool grants;
+        - the owning app's NAMESPACED servers, ``<app>:<server>`` for every
+          key in the manifest's ``mcpServers`` (``bridges._own_mcp_servers``
+          injects these by prefix after ``_register_mcp_servers`` writes them).
+
+        Deliberately NOT validated: bare builtin names (kiro-cli checks those
+        at registration — re-listing its vocabulary here would rot) and the
+        ``/tool`` half of a reference (only the live server can enumerate its
+        tools; the server lookup is the part that fails silently).
+        """
+        import io
+
+        from kiro_crew.agent import _MANAGED_MCP_SERVERS
+
+        builtins_dir = provision._PACKAGE_ROOT.parent
+        templates = sorted(builtins_dir.glob("*/agents/*.json"))
+        assert templates, "no shipped agent templates found — did the path change?"
+        offenders: list[str] = []
+        grants_seen = 0
+        for path in templates:
+            raw = io.open(path, encoding="utf-8").read()
+            for placeholder in _declared_placeholders():
+                raw = raw.replace(placeholder, "/rendered")
+            data = json.loads(raw)
+            resolvable = set(data.get("mcpServers") or {})
+            manifest = json.loads(
+                (path.parent.parent / "app.json").read_text(encoding="utf-8")
+            )
+            app_name = manifest.get("name")
+            if isinstance(app_name, str) and app_name:
+                resolvable.update(
+                    f"{app_name}:{server}" for server in (manifest.get("mcpServers") or {})
+                )
+            for entry in data.get("tools") or []:
+                if not isinstance(entry, str) or not entry.startswith("@"):
+                    continue
+                grants_seen += 1
+                remainder = entry[1:]
+                server = remainder.split("/", 1)[0]
+                # Match the materializer's server lookup without widening the
+                # original per-tool grant.
+                if server in _MANAGED_MCP_SERVERS:
+                    continue
+                if server not in resolvable:
+                    offenders.append(f"{path}: {entry!r} (server {server!r})")
+        # The gate must not pass vacuously: shipped specs DO carry @ grants
+        # today, so finding none means the traversal or the spec format moved.
+        assert grants_seen, "no @server grants found in any shipped spec — did the format change?"
+        assert offenders == [], (
+            "these shipped agent specs grant tools on a server that nothing "
+            "declares — kiro-cli will silently drop them at mount time:\n  "
+            + "\n  ".join(offenders)
+        )

@@ -31,23 +31,25 @@ from typing import Any
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.history import INCOGNITO_MEMORY_MODES
+from kiro_crew.history import is_incognito_transcript
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger(__name__)
 
 # No model override. Picking one folder from a short list is a trivial
 # classification, and the shared background session this runs on is already the
 # cheap one: the ``kirocrew-lite`` spec's model is ``_background_agent_model()``,
-# which resolves ``agent.role_models['background']`` -> ``agent.model`` ->
-# ``"auto"`` (AGENTS.md → Model selection). Pinning a concrete id here would both
+# which resolves ``agent.role_models['background']`` -> ``"auto"`` and deliberately
+# does NOT inherit ``agent.model``
+# (docs/system-specs/common/model-selection.md). Pinning a concrete id here would both
 # duplicate that resolution and break accounts not entitled to the pinned model,
 # so an operator who wants this on a specific cheap model sets the background
 # role instead.
 
 # Serialized the way generate_emoji_for_name is: several tabs taking their first
 # turn at once must not interleave streams on the shared background session.
-_suggest_lock = asyncio.Lock()
+_suggest_lock = LoopBoundLock()
 
 # Prompt bounds. Every list below scales with the user's workspace, so each is
 # capped rather than trusted — a workspace with 300 folders must not grow the
@@ -118,7 +120,7 @@ def _folder_sample_titles(state: DashboardState) -> dict[str, list[str]]:
         # A temporary session CAN be filed (api_chat_slot_folder does not gate on
         # memory_mode, and the folder id is persisted to its metadata line), so
         # the folder filter below is not enough on its own.
-        if str(session.get("memory_mode") or "persistent") in INCOGNITO_MEMORY_MODES:
+        if is_incognito_transcript(session.get("memory_mode")):
             continue
         fid = str(session.get("folder_id") or "")
         if not fid:
@@ -145,7 +147,7 @@ def _live_slot_titles(state: DashboardState, exclude_key: str) -> dict[str, list
             continue
         # Same privacy rule as the archived scan: a LIVE temporary/incognito slot
         # can be filed too, and its title must not reach the prompt either.
-        if slot.memory_mode in INCOGNITO_MEMORY_MODES:
+        if is_incognito_transcript(slot.memory_mode):
             continue
         title = " ".join(str(slot.title or "").split())[:_MAX_SAMPLE_CHARS]
         if not title:

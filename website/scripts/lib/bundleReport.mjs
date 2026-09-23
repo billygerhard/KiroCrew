@@ -8,6 +8,13 @@
 //
 // Split out from the Vite plugin so the arithmetic and formatting are testable
 // without running a build.
+//
+// One deliberate exception to side-effect-free: `loadBundleSummary` reads the
+// report file from disk. It lives here because it is the single shared
+// implementation of the report's on-disk contract (existence, JSON shape,
+// version) for every consumer -- it returns errors rather than exiting, so each
+// caller keeps its own exit-code mapping.
+import { readFileSync, existsSync } from 'fs'
 
 /** Bytes-to-human, fixed-width friendly. */
 export function formatBytes(bytes) {
@@ -97,6 +104,14 @@ export function summarizeBundle(bundle, options = {}) {
       moduleCount,
       isEntry: Boolean(output.isEntry),
       isDynamicEntry: Boolean(output.isDynamicEntry),
+      // STATIC imports only, as the bundler itself resolved them -- the edge set
+      // an initialization cycle can form on. `dynamicImports` is deliberately
+      // excluded: a dynamic edge defers execution, so it cannot make a chunk
+      // body run before something it references has initialized. Recorded as an
+      // additive field on version 1: a consumer that does not know about it is
+      // unaffected, and findChunkCycles refuses a report that lacks it rather
+      // than reading "no imports" as "no cycles".
+      imports: Array.isArray(output.imports) ? [...output.imports] : [],
     })
   }
 
@@ -164,6 +179,172 @@ export function renderReport(summary, options = {}) {
 }
 
 /**
+ * Strip the output prefix and content hash from a chunk file name, leaving the
+ * chunk's logical name.
+ *
+ * Budgets must be keyed by something stable across builds, and the emitted file
+ * name is not: `assets/main-CZ3WY91T.js` carries a content hash that changes on
+ * every edit. The logical name (`main`) is what Rollup derived from the entry,
+ * the dynamic-import source, or a `codeSplitting` group name, and only changes
+ * when the chunk graph itself changes.
+ */
+export function logicalChunkName(fileName) {
+  if (typeof fileName !== 'string' || !fileName) return ''
+  const base = fileName.replace(/\\/g, '/').split('/').pop() || ''
+  // Vite/Rollup content hashes are 8 chars of [A-Za-z0-9_-] before the
+  // extension. An unhashed build (or a name whose tail is not a hash) falls
+  // through to the plain basename, so the helper never returns a surprise.
+  const m = base.match(/^(.+)-[A-Za-z0-9_-]{8}\.js$/)
+  if (m) return m[1]
+  return base.replace(/\.js$/, '')
+}
+
+/**
+ * Check every JS chunk in a summary against a per-chunk byte budget.
+ *
+ * `budgets` maps a LOGICAL chunk name (see `logicalChunkName`) to an explicit
+ * byte ceiling; every chunk without an entry gets `defaultBudget`. Assets
+ * (css, images, the report itself) are not gated: the regression class this
+ * catches is "a new eager JS chunk slipped past the global warning limit", and
+ * assets have different, format-specific size stories.
+ *
+ * Returns the verdict as data rather than printing or exiting, so the
+ * arithmetic is testable without spawning a process:
+ *   - `breaches`: chunks over their budget, largest overage first, each with
+ *     the resolved budget and the overage in bytes.
+ *   - `unusedBudgets`: allowlist entries no emitted chunk matched. Not a
+ *     failure -- a renamed chunk already fails against the default budget --
+ *     but reported so stale entries get cleaned up rather than accreting.
+ */
+export function checkChunkBudgets(summary, { budgets = {}, defaultBudget } = {}) {
+  const chunks = summary && Array.isArray(summary.chunks) ? summary.chunks : []
+  const seen = new Set()
+  const breaches = []
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk.fileName !== 'string') continue
+    const logicalName = logicalChunkName(chunk.fileName)
+    const hasOverride = Object.prototype.hasOwnProperty.call(budgets, logicalName)
+    if (hasOverride) seen.add(logicalName)
+    const budget = hasOverride ? budgets[logicalName] : defaultBudget
+    const size = typeof chunk.size === 'number' && Number.isFinite(chunk.size) ? chunk.size : 0
+    if (size > budget) {
+      breaches.push({ fileName: chunk.fileName, logicalName, size, budget, overage: size - budget })
+    }
+  }
+  breaches.sort(
+    (a, b) => b.overage - a.overage || (a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0)
+  )
+  const unusedBudgets = Object.keys(budgets).filter((name) => !seen.has(name)).sort()
+  return { breaches, unusedBudgets, checkedCount: chunks.length }
+}
+
+/**
+ * Find static-import cycles between the emitted JS chunks.
+ *
+ * The failure this catches is not a size regression, it is a blank page. When
+ * two chunks statically import each other, one body runs before the other has
+ * finished initializing, so a binding it reads is still uninitialized -- in this
+ * app that surfaces as `new QueryClient(...)` throwing before React mounts, and
+ * the user sees the shell's dark skeleton and nothing else. No existing gate can
+ * see it: the per-chunk budget above measures bytes, and the unit suite never
+ * loads a built bundle.
+ *
+ * It is reachable from ordinary config edits rather than from application code.
+ * Setting rolldown's `includeDependenciesRecursively: false` produced two cycles
+ * on a tree that had none -- a 71-chunk one spanning App, client, vendor-react
+ * and vendor-icons, and a 3-chunk one across the graph chunks -- while every
+ * other gate stayed green.
+ *
+ * Returns the verdict as data rather than printing or exiting, matching
+ * `checkChunkBudgets`: `cycles` is a list of strongly connected components with
+ * more than one chunk (plus any self-loop), each sorted for stable output, and
+ * `edgeCount` / `checkedCount` describe what was actually measured.
+ *
+ * `imports` is required. A summary whose chunks carry no `imports` key measured
+ * no edges at all, and reading that as "no cycles" would be a green gate over an
+ * unmeasured graph, so it is reported through `missingImports` for the caller to
+ * fail on.
+ */
+export function findChunkCycles(summary) {
+  const chunks = summary && Array.isArray(summary.chunks) ? summary.chunks : []
+  const known = new Set()
+  for (const chunk of chunks) {
+    if (chunk && typeof chunk.fileName === 'string') known.add(chunk.fileName)
+  }
+
+  let withImports = 0
+  const graph = new Map()
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk.fileName !== 'string') continue
+    if (Array.isArray(chunk.imports)) withImports += 1
+    const targets = new Set()
+    for (const target of Array.isArray(chunk.imports) ? chunk.imports : []) {
+      // Only edges between chunks this report describes. An import of something
+      // outside the emitted set cannot participate in a cycle within it.
+      if (typeof target === 'string' && known.has(target)) targets.add(target)
+    }
+    graph.set(chunk.fileName, targets)
+  }
+
+  const edgeCount = [...graph.values()].reduce((total, set) => total + set.size, 0)
+  const missingImports = graph.size > 0 && withImports === 0
+
+  // Tarjan, iterated rather than recursive: this graph runs to hundreds of
+  // chunks and a recursive walk would risk the stack on a deep dependency path.
+  const index = new Map()
+  const low = new Map()
+  const onStack = new Set()
+  const stack = []
+  const cycles = []
+  let counter = 0
+
+  for (const root of graph.keys()) {
+    if (index.has(root)) continue
+    index.set(root, counter)
+    low.set(root, counter)
+    counter += 1
+    stack.push(root)
+    onStack.add(root)
+    const work = [{ node: root, children: [...graph.get(root)].sort()[Symbol.iterator]() }]
+    while (work.length > 0) {
+      const frame = work[work.length - 1]
+      let descended = false
+      for (const child of frame.children) {
+        if (!index.has(child)) {
+          index.set(child, counter)
+          low.set(child, counter)
+          counter += 1
+          stack.push(child)
+          onStack.add(child)
+          work.push({ node: child, children: [...(graph.get(child) || [])].sort()[Symbol.iterator]() })
+          descended = true
+          break
+        }
+        if (onStack.has(child)) low.set(frame.node, Math.min(low.get(frame.node), index.get(child)))
+      }
+      if (descended) continue
+      work.pop()
+      const parent = work.length > 0 ? work[work.length - 1].node : null
+      if (parent !== null) low.set(parent, Math.min(low.get(parent), low.get(frame.node)))
+      if (low.get(frame.node) === index.get(frame.node)) {
+        const component = []
+        for (;;) {
+          const top = stack.pop()
+          onStack.delete(top)
+          component.push(top)
+          if (top === frame.node) break
+        }
+        const selfLoop = graph.get(frame.node).has(frame.node)
+        if (component.length > 1 || selfLoop) cycles.push(component.sort())
+      }
+    }
+  }
+
+  cycles.sort((a, b) => b.length - a.length || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  return { cycles, edgeCount, checkedCount: graph.size, missingImports }
+}
+
+/**
  * Compare two summaries. Used to answer "did my change make it bigger", which is
  * the question a report is usually opened to settle.
  */
@@ -188,4 +369,81 @@ export function diffSummaries(before, after) {
     assetBytesDelta: (a.assetBytes || 0) - (b.assetBytes || 0),
     owners: changed,
   }
+}
+
+/**
+ * Load and validate a bundle-report.json written by the analyze-mode build.
+ *
+ * The single implementation of the report's on-disk contract, shared by the
+ * bundle-size gate (check-bundle-size.mjs) and the report renderer
+ * (bundle-report.mjs) so a report-format change (e.g. a version bump) is made
+ * in exactly one place. Returns `{ summary }` on success or
+ * `{ error: { code, message } }` -- it never exits or prints, so each caller
+ * maps codes to its own exit behavior. Codes: 'missing' (no file at `file`),
+ * 'invalid' (unparseable / not a report object / unsupported version).
+ *
+ * `hint` is appended to the missing-file message so each caller can name the
+ * command that produces the report in ITS context (`npm run analyze` for the
+ * renderer, the CI analyze build for the gate).
+ */
+export function loadBundleSummary(file, { hint = '' } = {}) {
+  if (!existsSync(file)) {
+    const suffix = hint ? `\n${hint}` : ''
+    return { error: { code: 'missing', message: `No bundle report at ${file}.${suffix}` } }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf-8'))
+  } catch (e) {
+    return { error: { code: 'invalid', message: `${file} is not valid JSON: ${e && e.message}` } }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { error: { code: 'invalid', message: `${file} does not contain a report object.` } }
+  }
+  if (parsed.version !== 1) {
+    // Refuse rather than misread a future shape as v1.
+    return {
+      error: {
+        code: 'invalid',
+        message: `${file} has version ${JSON.stringify(parsed.version)}; this reader understands 1.`,
+      },
+    }
+  }
+  return { summary: parsed }
+}
+
+/** What produces the report in a gate's context. Module-private: the only reader
+ * is loadSummaryOrExit's default below, and the renderer passes its own text. */
+const ANALYZE_BUILD_HINT =
+  'Run `vite build --mode analyze` first -- a plain `npm run build` deliberately ' +
+  'does not write one, so the normal build stays unaffected.'
+
+/**
+ * Write a gate failure to stderr and exit with `code`.
+ *
+ * Lives here because all three report consumers -- both gates and the renderer --
+ * had a byte-identical private copy of this, so a change to the message channel
+ * or the default code silently applied to one and not the others.
+ */
+export function failGate(message, code = 1) {
+  process.stderr.write(`${message}\n`)
+  process.exit(code)
+}
+
+/**
+ * Load a report or exit: 2 = missing, 3 = malformed or an unsupported version.
+ *
+ * That mapping and the accompanying hint were duplicated verbatim in
+ * check-bundle-size.mjs and check-chunk-cycles.mjs, so the two would have drifted
+ * the moment either message was reworded. The renderer passes its own `hint`
+ * because it names a different command (`npm run analyze`), which is a real
+ * difference rather than drift -- everything else about the contract is shared.
+ *
+ * Exit codes beyond 3 stay with each caller: they describe what THAT gate could
+ * not measure, not what the report failed to be.
+ */
+export function loadSummaryOrExit(file, { hint = ANALYZE_BUILD_HINT } = {}) {
+  const { summary, error } = loadBundleSummary(file, { hint })
+  if (error) failGate(error.message, error.code === 'missing' ? 2 : 3)
+  return summary
 }

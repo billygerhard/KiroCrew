@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
@@ -9,12 +10,14 @@ import notificationsReducer from '../store/notificationsSlice'
 vi.mock('../api/client', () => ({
   api: {
     spawnDelete: vi.fn().mockResolvedValue({}),
+    spawnStopAll: vi.fn().mockResolvedValue({}),
     spawnList: vi.fn().mockResolvedValue({ agents: [] }),
   },
 }))
 
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import { api } from '../api/client'
+import { OVERLAY_Z_MAX } from '../lib/themeDecorLayer'
 
 const SLOT = 'test-slot'
 
@@ -30,10 +33,13 @@ function makeStore(running: string[], pending?: string) {
 }
 
 function renderBar(store: ReturnType<typeof makeStore>) {
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
   return render(
-    <Provider store={store}>
-      <SubagentProgressBar slot={SLOT} />
-    </Provider>,
+    <QueryClientProvider client={queryClient}>
+      <Provider store={store}>
+        <SubagentProgressBar slot={SLOT} />
+      </Provider>
+    </QueryClientProvider>,
   )
 }
 
@@ -52,13 +58,12 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     expect(api.spawnDelete).toHaveBeenCalledWith('a1')
   })
 
-  it('"Stop all" cancels every running agent but never a pending one', () => {
+  it('"Stop all" sends one session-scoped bulk stop for running work', async () => {
     renderBar(makeStore(['a1', 'a2'], 'p1'))
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
-    expect(api.spawnDelete).toHaveBeenCalledWith('a1')
-    expect(api.spawnDelete).toHaveBeenCalledWith('a2')
-    expect(api.spawnDelete).not.toHaveBeenCalledWith('p1')
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+    expect(api.spawnDelete).not.toHaveBeenCalled()
   })
 
   it('labels the header stop control "Stop" (not "Stop all") when exactly one agent is stoppable', () => {
@@ -67,7 +72,7 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     expect(screen.queryByLabelText('Stop all running subagents')).not.toBeInTheDocument()
   })
 
-  it('excludes native (nested) kiro-cli subagents from the count and rows so it matches "spawned N"', () => {
+  it('excludes native (nested) kiro-cli subagents from the count and rows so it matches "spawned N"', async () => {
     // 2 top-level managed agents + 2 native:* nested agents surfaced from the
     // kiro-cli list_update. The chip must show only the 2 managed ones.
     renderBar(makeStore(['a1', 'a2', 'native:sess-x', 'native:sess-y']))
@@ -76,12 +81,12 @@ describe('SubagentProgressBar — in-chat stop controls', () => {
     // Exactly two rows, both managed; no native task rows.
     const rows = screen.getAllByTestId('subagent-row')
     expect(rows).toHaveLength(2)
-    // "Stop all" acts on the 2 managed agents, never the native ones.
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
-    expect(api.spawnDelete).toHaveBeenCalledWith('a1')
-    expect(api.spawnDelete).toHaveBeenCalledWith('a2')
-    expect(api.spawnDelete).not.toHaveBeenCalledWith('native:sess-x')
+    // "Stop all" delegates the managed running/queue scope to the backend;
+    // native nested cards are not part of SubagentManager.
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+    expect(api.spawnDelete).not.toHaveBeenCalled()
   })
 
   it('renders no stop controls when every active agent is pending (stoppableCount === 0)', () => {
@@ -119,6 +124,15 @@ describe('SubagentProgressBar — queued / waiting count', () => {
     expect(screen.getByTestId('subagent-queued-count').textContent).toContain('3')
   })
 
+  it('offers Stop all for a queued-only wave and stops the queue by slot', async () => {
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 3 }))
+    renderBar(store)
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+  })
+
   it('hides the waiting segment once the queue drains to zero', () => {
     const store = makeStore(['a1'])
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
@@ -137,14 +151,18 @@ describe('SubagentProgressBar — queued / waiting count', () => {
 describe('SubagentProgressBar — overlay stacking', () => {
   beforeEach(() => vi.clearAllMocks())
 
-  // Theme-experience overlays are clamped to OVERLAY_Z_MAX=45 (ThemeExperienceLayer).
-  // The chip wrapper must sit strictly above that band so no theme can paint over
-  // an active wave; z-[46] is the minimal clearance (below mute z=50 / consent z=120).
+  // Theme-experience overlays portal into the shell's decor slot, pinned at
+  // OVERLAY_Z_MAX (lib/themeDecorLayer.ts) — the chip shares that stacking
+  // context, so its z must sit strictly above the ceiling for no theme to paint
+  // over an active wave. Read the constant rather than restating it: a restated
+  // number is exactly the drift #7377 was about.
   it('elevates the wave chip above the theme-overlay ceiling (relative + z-[46])', () => {
     const { container } = renderBar(makeStore(['a1']))
     const wrapper = container.firstChild as HTMLElement
     expect(wrapper).toHaveClass('relative')
-    expect(wrapper).toHaveClass('z-[46]')
+    const z = Number(/\bz-\[(\d+)\]/.exec(wrapper.className)?.[1])
+    expect(z).toBe(46)
+    expect(z).toBeGreaterThan(OVERLAY_Z_MAX)
   })
 })
 
@@ -229,8 +247,12 @@ describe('SubagentProgressBar — chrome follows the Font Family setting', () =>
     store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true }))
     const { container } = renderBar(store)
 
+    // The tool name is now its OWN span, interpolated into a single translated
+    // sentence rather than glued together with a hardcoded English " at " --
+    // so the fragment holds the bare value, not the value plus its preposition.
+    // The requirement being guarded is unchanged: this value renders mono.
     const toolFragment = [...container.querySelectorAll('span')]
-      .find(s => s.textContent === ' at npx vitest run')
+      .find(s => s.textContent === 'npx vitest run')
     expect(toolFragment).toBeTruthy()
     expect(toolFragment!.className).toContain('font-mono')
 
@@ -239,6 +261,69 @@ describe('SubagentProgressBar — chrome follows the Font Family setting', () =>
     // And the sanitised value is still what gets rendered — the whole line reads
     // as one sentence with exactly one space before `at`.
     expect(toolFragment!.parentElement!.textContent).toContain('at npx vitest run')
+  })
+
+  it('hedges the stalled copy and shows the IDLE span, not total elapsed', () => {
+    // The watchdog observes an ABSENCE of stream events, which a slow silent
+    // tool also produces — so the row must not assert a stall, and the number
+    // beside the warning must be the idle span that justifies it (the row's
+    // other figure, `elapsed`, is total runtime and is a different number).
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentTool({ slot: SLOT, id: 'a1', tool: 'Reading retrieval.py:1', tool_count: 7 }))
+    store.dispatch(sseSubagentStalled({
+      slot: SLOT, id: 'a1', stalled: true, idle_secs: 196,
+    }))
+    const { container } = renderBar(store)
+
+    const warn = [...container.querySelectorAll('span.text-warn')]
+      .find(s => s.textContent?.includes('possibly stalled'))
+    expect(warn).toBeTruthy()
+    expect(warn!.textContent).toContain('no activity for 196s')
+    // Hedged, not asserted: the bare "stalled ... — no activity" wording is gone.
+    expect(warn!.textContent).not.toMatch(/(^|[^y] )stalled at/)
+  })
+
+  it('advances the idle figure while stalled instead of freezing it', async () => {
+    // The backend emits `idle_secs` ONCE on the stalled transition. Rendering it
+    // verbatim would freeze at that value beside the live elapsed counter, so a
+    // subagent wedged for 20 minutes would still read "no activity for 196s" —
+    // a milder form of the contradiction this row exists to remove.
+    vi.useFakeTimers()
+    try {
+      const store = makeStore(['a1'])
+      store.dispatch(sseSubagentTool({ slot: SLOT, id: 'a1', tool: 'sleep 600', tool_count: 1 }))
+      store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true, idle_secs: 196 }))
+      const { container } = renderBar(store)
+
+      const idleText = () => [...container.querySelectorAll('span.text-warn')]
+        .find(s => s.textContent?.includes('possibly stalled'))?.textContent ?? ''
+      expect(idleText()).toContain('no activity for 196s')
+
+      // Two 1Hz ticks later the figure has moved with the clock.
+      // Advance ONE tick per act() flush. The component's 1Hz tick is a toggle
+      // (`setTick(n => 1 - n)`), so jumping two intervals inside a single flush
+      // lands back on the original value and React bails out of the re-render —
+      // an artifact of batching, not a product bug (real ticks arrive singly).
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(idleText()).toContain('no activity for 197s')
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(idleText()).toContain('no activity for 198s')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to the plain no-activity wording when no idle span was sent', () => {
+    // Reconnect replays from a pre-upgrade gateway carry no idle_secs; the row
+    // must still render hedged copy rather than a bare "196s"-shaped gap.
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentStalled({ slot: SLOT, id: 'a1', stalled: true }))
+    const { container } = renderBar(store)
+    const warn = [...container.querySelectorAll('span.text-warn')]
+      .find(s => s.textContent?.includes('possibly stalled'))
+    expect(warn).toBeTruthy()
+    expect(warn!.textContent).toContain('no activity')
+    expect(warn!.textContent).not.toContain('no activity for')
   })
 })
 
@@ -264,13 +349,14 @@ describe('SubagentProgressBar — collapse toggle', () => {
     expect(listContainer.className).toContain('hidden')
     // Header still carries the running count and the stop-all control.
     expect(screen.getByTestId('subagent-running-count')).toHaveTextContent('2')
-    expect(screen.getByLabelText('Stop all running subagents')).toBeInTheDocument()
+    expect(screen.getByLabelText('Stop all')).toBeInTheDocument()
   })
 
-  it('lets "Stop all" work while collapsed', () => {
+  it('lets "Stop all" work while collapsed', async () => {
     renderBar(makeStore(['a1', 'a2']))
     fireEvent.click(screen.getByLabelText('Collapse subagent list'))
-    fireEvent.click(screen.getByLabelText('Stop all running subagents'))
-    expect(api.spawnDelete).toHaveBeenCalledTimes(2)
+    fireEvent.click(screen.getByLabelText('Stop all'))
+    await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
+    expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
   })
 })

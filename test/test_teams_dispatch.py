@@ -4,11 +4,15 @@ sessions/provider/context."""
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.messaging.session_resume import RoutingDecision
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.transport_dispatch import TeamsDispatcher
 
@@ -60,12 +64,66 @@ class FakeSessions:
         self.channels: list = []
         self.last_agent = None
         self._busy = False
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
+        # Mid-turn queue + dashboard-mirror surface the dispatcher now uses.
+        self.queues: dict[str, list] = {}
+        self.cleared: list = []
+        self.mirror_links: dict = {}
+        self.opt_outs: dict = {}
+        self.locked = False
+        self.reserved_generations: list[str] = []
+
+    # -- dashboard mirror -------------------------------------------------
+    def mirror_opt_out(self, key) -> bool:
+        return bool(self.opt_outs.get(key))
+
+    def set_mirror_opt_out(self, key, value) -> None:
+        self.opt_outs[key] = value
+
+    def get_mirror_link(self, key):
+        return self.mirror_links.get(key)
+
+    def set_mirror_link(self, key, link, *, reason="") -> None:
+        self.mirror_links[key] = link
+
+    def clear_mirror_link(self, key, *, reason="") -> bool:
+        return self.mirror_links.pop(key, None) is not None
+
+    def is_mirror_paused(self, key, *, origin=False) -> bool:
+        return False
+
+    def batched_save(self):
+        return contextlib.nullcontext()
+
+    # -- mid-turn queue ---------------------------------------------------
+    def enqueue(self, key, msg_ts, text, *, force=False, **kwargs) -> bool:
+        if not force and not self._busy:
+            return False
+        self.queues.setdefault(key, []).append((msg_ts, text, kwargs))
+        return True
+
+    def dequeue(self, key):
+        queue = self.queues.get(key) or []
+        return queue.pop(0) if queue else None
+
+    def clear_queue(self, key) -> None:
+        self.cleared.append(key)
+        self.queues.pop(key, None)
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))
@@ -92,8 +150,24 @@ class FakeSessions:
     def has_session(self, key) -> bool:
         return self._p is not None
 
+    async def aflush(self) -> None:
+        # The resume release flushes the session map before it reports success; a
+        # double without this correctly surfaces as a release FAILURE.
+        return None
+
+    def clear_mirror_links_at(self, link, *, reason: str = "") -> list:
+        return []
+
+    def find_mirror_sessions(self, link, *, inbound_only: bool = False) -> list:
+        # No resumed dashboard session in these tests, so routing is a no-op. Present
+        # because Teams routes EVERY message through the resume resolver.
+        return []
+
     def is_busy(self, key) -> bool:
         return self._busy
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
 
     def max_generation(self, bucket: str) -> int:
         return -1
@@ -115,7 +189,11 @@ class FakeCtx:
     def __init__(self) -> None:
         self.hooks = FakeHooks()
 
-    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source):
+    # Names only the kwargs it asserts on and takes ``**kw`` for the rest: the
+    # shared pipeline owns the call shape, so a fake that pins every kwarg
+    # breaks on any field the pipeline later forwards, without that field
+    # having anything to do with this channel. Mirrors the pipeline's own fake.
+    def build_message(self, text, is_new, key, *, channel_id, agent, resumed, runtime_source, **kw):
         assert runtime_source == "teams"
         return (text, None)
 
@@ -140,7 +218,7 @@ class FakeConvLog:
         self.appended: list[tuple[str, str, str]] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text) -> None:
+    def append(self, key, role, text, agent=None, mid=None) -> None:
         self.appended.append((key, role, text))
 
     def set_title(self, key, title) -> None:
@@ -174,7 +252,7 @@ def _dispatcher(sessions, ctx, client, *, conv_log=None, agent=None, cfg=None):
 
 
 _EMAIL = "kyle@example.com"
-_SVC = "https://smba.example.com/"
+_SVC = "https://smba.trafficmanager.net/"
 
 
 def _inbound(text: str = "hello", email: str = _EMAIL) -> TeamsInbound:
@@ -260,8 +338,80 @@ class TestTurn:
         assert provider.compacted is True
         assert any("compacted" in content for (_, content, _) in client.sent)
 
+    @pytest.mark.asyncio
+    async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
+        # No /compact to dispatch and no notice: the backend compacts on its
+        # own as context fills.
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=96.0)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert provider.compacted is False
+        assert not any("compacted" in content for (_, content, _) in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
+        # The nudge advises /compact, which this backend refuses — it compacts
+        # on its own, so there is nothing for the user to act on.
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=85.0)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert not any("/compact" in content for (_, content, _) in client.sent)
+
 
 class TestCommands:
+    @pytest.mark.asyncio
+    async def test_closed_admission_spools_new_before_reset(self, monkeypatch) -> None:
+        sessions = FakeSessions(FakeProvider([]))
+        sessions.reserve_inbound_callback = lambda: None  # type: ignore[attr-defined]
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+        spool = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.spool_refused_turn", spool)
+
+        await d.handle_message(_inbound("/new"))
+
+        assert client.sent == []
+        assert d._conv.current_gen(_EMAIL) == 0
+        route = spool.await_args.kwargs["route"]
+        assert spool.await_args.kwargs["channel_type"] == "teams"
+        assert route.conversation_id == "CONV"
+        assert route.text == "/new"
+        assert route.user_id == _EMAIL
+        assert route.message_id == "act-1"
+
+    @pytest.mark.asyncio
+    async def test_closed_admission_never_spools_a_restricted_resumed_session(
+        self, monkeypatch
+    ) -> None:
+        sessions = FakeSessions(FakeProvider([]))
+        sessions.reserve_inbound_callback = lambda: None  # type: ignore[attr-defined]
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        d._session_resume.route = AsyncMock(
+            return_value=RoutingDecision(resumed_key="dashboard:restricted")
+        )
+        d._session_restricted = AsyncMock(side_effect=lambda key: key == "dashboard:restricted")
+        spool = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.spool_refused_turn", spool)
+
+        await d.handle_message(_inbound("keep this private"))
+
+        spool.assert_not_awaited()
+        d._session_restricted.assert_awaited()
+
     @pytest.mark.asyncio
     async def test_new_bumps_gen_and_acks(self) -> None:
         sessions = FakeSessions(FakeProvider([]))
@@ -272,6 +422,7 @@ class TestCommands:
 
         assert client.sent == [("CONV", "✅ Started a fresh conversation.", _SVC)]
         assert d._conv.current_gen(_EMAIL) == 1
+        assert sessions.reserved_generations == [d._session_key(_EMAIL)]
         assert sessions.successes == []
 
     @pytest.mark.asyncio
@@ -302,6 +453,36 @@ class TestCommands:
         assert client.sent == [("CONV", "🗜️ Context compacted.", _SVC)]
 
     @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        key = d._session_key(_EMAIL)
+        assert provider.compacted is False
+        assert sessions.released == [key]  # the acquired semaphore is handed back
+        assert any("manages compaction automatically" in content for (_, content, _) in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = None
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is True
+
+    @pytest.mark.asyncio
     async def test_stable_session_key_per_user(self) -> None:
         sessions = FakeSessions(FakeProvider([]))
         d = _dispatcher(sessions, FakeCtx(), FakeClient())
@@ -323,9 +504,7 @@ class TestInboundGovernance:
         # ``inbound_permitted`` wrapper, which resolves
         # ``channel_inbound_permitted`` from dispatch's globals at call time --
         # so this one patch covers both the channel-side and pipeline gates.
-        monkeypatch.setattr(
-            "kiro_crew.messaging.dispatch.channel_inbound_permitted", _deny
-        )
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.channel_inbound_permitted", _deny)
         provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
         sessions = FakeSessions(provider)
         client = FakeClient()

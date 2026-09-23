@@ -67,6 +67,10 @@ class ConfigEntry:
     enum_values: list | None
     default_value: object  # JSON-serializable or None
     nullable: bool = False  # True when the underlying JSON Schema type allows null
+    # True when a running gateway cannot adopt a new value (a bound socket, a
+    # re-exec jail). Declared per field with ``_meta(..., restart=True)``; every
+    # other field is hot-applied by the config watcher (``config.live``).
+    requires_restart: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -159,24 +163,34 @@ def _build_field_schema(
     tags: list[str] = meta.get("tags", [])
     sensitive: bool = meta.get("sensitive", False)
     deprecated: bool = meta.get("deprecated", False)
+    requires_restart: bool = bool(meta.get("restart", False))
     enum_values: list | None = meta.get("enum", None)
 
     tp: type = resolved_type if resolved_type is not None else str
+    # A field annotated ``X | None`` / ``Optional[X]`` maps to its base type
+    # plus ``"null"``. Without the unwrap, the union itself reaches
+    # ``_python_type_to_json`` and falls through to ``"string"`` with
+    # ``nullable=False`` — making "unset means inherit the downstream default"
+    # unexpressible for numeric fields. The ``nullable`` metadata flag remains
+    # the way to allow ``null`` on a field whose annotation is non-optional
+    # (disable-sentinel fields the loader normalizes, e.g.
+    # session.archive_retention_days: null → "disable cleanup").
+    tp, annotation_nullable = _optional_inner(tp)
+    nullable = annotation_nullable or bool(meta.get("nullable"))
     schema: dict = {}
 
     if _is_dataclass_type(tp):
         # Nested dataclass → recurse
         schema = _build_object_schema(tp)
+        if nullable:
+            schema["type"] = ["object", "null"]
     else:
         json_type = _python_type_to_json(tp)
-        # A field marked ``nullable`` in its metadata accepts JSON ``null`` in
-        # addition to its base type. Needed for disable-sentinel fields where
-        # ``null`` is a meaningful value the loader normalizes (e.g.
-        # session.archive_retention_days: null → "disable cleanup").
-        # Without this the generated schema is ``{"type": "integer"}`` and
-        # jsonschema strips the null on any host where jsonschema is installed
-        # (incl. prod), silently reverting to the default — the opposite intent.
-        if meta.get("nullable"):
+        # Emitting the plain single-type form when the field is not nullable
+        # matters: a ``["integer", "null"]`` schema lets jsonschema accept a
+        # null the loader would otherwise strip, silently reverting the field
+        # to its default — the opposite of the sentinel intent.
+        if nullable:
             schema["type"] = [json_type, "null"]
         else:
             schema["type"] = json_type
@@ -200,6 +214,16 @@ def _build_field_schema(
                 }
             else:
                 schema["additionalProperties"] = True
+            # A plain-dict field may DECLARE known sub-keys via
+            # ``_meta(..., properties={...})`` (JSON-Schema property nodes with
+            # their own x-meta). They flatten into first-class ConfigEntry
+            # paths — which is what lets a Settings control carry a configKey
+            # for a key inside a dict field — while additionalProperties above
+            # keeps every undeclared key valid, so declaring some keys never
+            # invalidates the rest of the dict.
+            declared_props = meta.get("properties")
+            if isinstance(declared_props, dict) and declared_props:
+                schema["properties"] = declared_props
 
     default = _default_for_field(f)
     if default is not None:
@@ -215,6 +239,10 @@ def _build_field_schema(
         "sensitive": sensitive,
         "deprecated": deprecated,
     }
+    if requires_restart:
+        # Emitted only when set so the schema baseline of every hot field is
+        # byte-identical to before the flag existed.
+        schema["x-meta"]["restart"] = True
 
     return schema
 
@@ -323,6 +351,7 @@ def _flatten_recurse(
     tags: list[str] = x_meta.get("tags", [])
     sensitive: bool = x_meta.get("sensitive", False)
     deprecated: bool = x_meta.get("deprecated", False)
+    requires_restart: bool = bool(x_meta.get("restart", False))
     enum_values: list | None = node.get("enum", None)
     default_value: object = node.get("default", None)
 
@@ -344,6 +373,7 @@ def _flatten_recurse(
             enum_values=list(enum_values) if enum_values is not None else None,
             default_value=default_value,
             nullable=nullable,
+            requires_restart=requires_restart,
         )
         out.append(entries_entry)
 
@@ -391,6 +421,7 @@ def config_entry_to_dict(entry: ConfigEntry) -> dict:
         "enumValues": entry.enum_values,
         "defaultValue": entry.default_value,
         **({"nullable": True} if entry.nullable else {}),
+        **({"requiresRestart": True} if entry.requires_restart else {}),
     }
 
 
@@ -403,3 +434,21 @@ JSON_SCHEMA: dict = build_json_schema(KiroCrewConfig)
 
 SCHEMA_REGISTRY: list[ConfigEntry] = flatten_to_entries(JSON_SCHEMA)
 """Flat list of ``ConfigEntry`` records for all config paths."""
+
+_RESTART_PATHS: frozenset[str] = frozenset(e.path for e in SCHEMA_REGISTRY if e.requires_restart)
+
+
+def requires_restart(path: str) -> bool:
+    """Whether a write to dotted *path* needs a gateway restart to take effect.
+
+    Resolves the exact registry entry or, for a path the registry does not
+    name (a key inside a free-form dict, a whole section), its nearest ancestor
+    that does: a ``restart=True`` section marks everything beneath it. A path
+    with no marked entry on its chain is hot -- the config watcher applies it.
+    """
+    p = path.strip(".")
+    while p:
+        if p in _RESTART_PATHS:
+            return True
+        p = p.rpartition(".")[0]
+    return False

@@ -23,7 +23,7 @@
      [data-role="assistant"]           — AssistantMessage root (added by us)
      .msg-content                      — message text container (already in tree)
      [data-testid="input-wrapper"]     — chat-input rounded card wrapper
-     textarea[aria-label="Message input"] — chat input
+     textarea[data-composer-input]      — chat input
      [style*="--mc-content-width"]     — chat pane root (scope anchor)
      [style*="var(--mc-content-width"] — per-message row wrappers
    ───────────────────────────────────────────────────────────────────────── */
@@ -77,6 +77,28 @@
   padding-left: 10px;
   margin: 8px 0 6px 0;
   position: relative;
+}
+
+/* The steer animation wrapper sits between the root and the bubble and
+   carries the bubble's own 550px cap (the shrink-wrap chain invariant in
+   UserMessage). CLI mode lifts the cap on the root and on `.msg-content`
+   above, so this middle box must be lifted too or a long steered message
+   stays capped at 550px while normal ones run full-width. */
+[data-ui="cli"] [style*="--mc-content-width"] [data-role="user"]:has(.msg-content) > .relative {
+  max-width: none !important;
+  width: auto !important;
+}
+
+/* Steer badges ("Steering…" / "Steered into the running turn" / requeued)
+   are inline-flex boxes ABOVE the bubble in the normal theme's flex-col
+   root. CLI mode flattens that root to display:block and the bubble's
+   .msg-content to inline-block, so an inline-level badge flows onto the
+   SAME line as the message text. Promote each badge to a block-level flex
+   row so it keeps its own line. Direct-child only: the badge's inner
+   animate-pulse span and the InfoTip stay untouched, and the hover footer
+   uses `flex` (not `inline-flex`) so it never matches. */
+[data-ui="cli"] [style*="--mc-content-width"] [data-role="user"]:has(.msg-content) > .inline-flex {
+  display: flex !important;
 }
 
 /* The user-message card chrome: drop bg, border, rounding. Keep a faint
@@ -173,7 +195,7 @@
   user-select: none;
 }
 
-[data-ui="cli"] [style*="--mc-content-width"] textarea[aria-label="Message input"] {
+[data-ui="cli"] [style*="--mc-content-width"] textarea[data-composer-input] {
   padding-left: 24px !important;
   caret-color: var(--accent);
   /* font-family + font-size inherit from body; useZoom auto-resolves

@@ -83,7 +83,10 @@ class TestCronServiceCancel:
         assert "run1" not in svc._job_start_times
         assert "run1" not in svc._running_tasks
         task.cancel.assert_called_once()
-        sessions.reset.assert_awaited_once_with("cron:run1")
+        # ``ends_conversation``: cancelling the job ends its conversation, so its
+        # sub-agent runs go with it. Asserting the whole call keeps a later edit from
+        # dropping that and leaving the children of a cancelled cron running.
+        sessions.reset.assert_awaited_once_with("cron:run1", ends_conversation=True)
         assert "cron_history" in refresh_calls and "crons" in refresh_calls
         runs, total = await svc._history.get_job_history("run1")
         assert total == 1
@@ -192,7 +195,7 @@ class TestSubprocessRegistry:
     def test_kill_unknown_job_returns_false(self) -> None:
         assert kill_running_process("no-such-job") is False
 
-    def test_run_command_sandboxed_can_be_cancelled_mid_run(self) -> None:
+    def test_run_command_sandboxed_can_be_cancelled_mid_run(self, tmp_path, monkeypatch) -> None:
         """Real end-to-end: a sleeping command is SIGTERMed mid-run.
 
         Sandbox wrapping is patched to identity: builder-fleet hosts don't
@@ -201,6 +204,11 @@ class TestSubprocessRegistry:
         flaked the Dry Run Build on Py3.10). The registry/kill mechanics are
         what's under test here; the real sandboxed path is covered by pod e2e.
         """
+        # ``run_command_sandboxed`` has no cwd parameter -- the command runs
+        # where the gateway runs -- so the child inherits this process's CWD.
+        # Under pytest that is the checkout; pin it to the test's own directory
+        # for the spawn (restored by the fixture after the thread is joined).
+        monkeypatch.chdir(tmp_path)
         result: dict = {}
 
         def _run() -> None:
@@ -210,6 +218,14 @@ class TestSubprocessRegistry:
             "kiro_crew.cron_script.wrap_argv", side_effect=lambda argv, mode: (argv, None)
         ), patch(
             "kiro_crew.cron_script.cgroup_scope_argv", side_effect=lambda argv: argv
+        ), patch(
+            # The shell probe (_resolve_command_shell) also calls wrap_argv to
+            # sandbox-route its POSIX-strict test. On macOS where /bin/sh is bash
+            # the probe fails (SandboxUnavailableError or brace-expansion detected)
+            # and returns None, aborting before the subprocess is spawned. Patch
+            # the resolver to return a known-good shell so the registry/cancel
+            # mechanics under test can actually run.
+            "kiro_crew.cron_script._resolve_command_shell", return_value="/bin/sh"
         ):
             t = threading.Thread(target=_run)
             t.start()
@@ -220,19 +236,33 @@ class TestSubprocessRegistry:
             assert "cancelme" in _RUNNING_PROCS
             started = time.time()
             assert kill_running_process("cancelme") is True
-            t.join(timeout=10)
-        assert not t.is_alive()
-        assert time.time() - started < 10  # died well before the 30s sleep
+            # Poll for thread death (same pattern as the registration wait
+            # above) instead of one fixed-budget join: an instantaneous
+            # is_alive() read behind a single join can report a still-dying
+            # thread on a loaded runner even when SIGTERM worked. The 20s
+            # deadline stays comfortably below the child's 30s sleep, so
+            # passing still proves death-by-cancellation, not natural expiry.
+            deadline = started + 20
+            while time.time() < deadline and t.is_alive():
+                t.join(timeout=0.1)
+        assert not t.is_alive(), "thread still alive 20s after SIGTERM"
+        # 25, not 20: the final join may return ~0.1s past the poll deadline
+        # with the thread already dead; the headroom keeps that success from
+        # failing here while staying well below the 30s natural expiry.
+        assert time.time() - started < 25  # died well before the 30s sleep
         assert result["status"] == "cancelled"
         assert "cancelme" not in _RUNNING_PROCS
         assert "cancelme" not in _CANCELLED_PROC_JOBS  # flag consumed
 
-    def test_run_command_without_job_id_not_registered(self) -> None:
+    def test_run_command_without_job_id_not_registered(
+        self, posix_test_shell, tmp_path, monkeypatch
+    ) -> None:
         # Patch the sandbox wrap to identity for the same reason as the mid-run
         # test above: GH Actions blocks the namespace sandbox (unshare NEWNS),
         # so the real launcher aborts with status "error". What's under test is
         # that a job_id-less run is NOT added to the registry — mechanics that
         # don't need the sandbox.
+        monkeypatch.chdir(tmp_path)  # the spawn inherits CWD; see the test above
         with patch(
             "kiro_crew.cron_script.wrap_argv", side_effect=lambda argv, mode: (argv, None)
         ), patch(
@@ -240,7 +270,7 @@ class TestSubprocessRegistry:
         ), patch(
             # Bypass the runtime shell probe (which itself spawns a child) — the
             # test is about the registry, not shell fingerprinting.
-            "kiro_crew.cron_script._resolve_command_shell", return_value="sh"
+            "kiro_crew.cron_script._resolve_command_shell", return_value=posix_test_shell
         ):
             result = run_command_sandboxed("echo hi", timeout=10)
         assert result["status"] == "ok"

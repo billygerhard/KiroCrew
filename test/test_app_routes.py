@@ -242,6 +242,59 @@ async def test_uninstall_aborts_409_when_cron_cleanup_busy(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_uninstall_aborts_non_retryable_when_cron_store_unreadable(tmp_path, monkeypatch):
+    """Same abort as the busy case, but reported NON-retryable and never retried.
+
+    An unreadable store degrades the owned-job set to empty, so cleanup reports
+    zero removed for a reason unrelated to ownership. Continuing deletes the app
+    while its still-ENABLED jobs remain on disk to resume once the store parses.
+
+    Two things differ from `CronStoreBusy` and both come from the code, not from
+    symmetry. `handlers/cron.py` documents unreadable as `retryable: False` --
+    "an unreadable file does not heal on its own, so a client that retries on busy
+    must NOT retry on this" -- so the abort must not tell the caller to retry. And
+    `_deregister_crons_with_retry` catches busy IN ORDER TO retry, so unreadable
+    must pass through it untouched rather than burn every attempt on a store that
+    cannot heal. The call count below is what pins that.
+    """
+    _setup_env(tmp_path, monkeypatch)
+    src = _make_app_source(tmp_path)
+    install_app(src)
+
+    import kiro_crew.apps.routes as routes_mod
+    from kiro_crew.cron import CronStoreUnreadable
+
+    calls = {"n": 0}
+
+    async def _unreadable(name, cron_service):
+        calls["n"] += 1
+        raise CronStoreUnreadable("refusing to write cron store: Move the unreadable file aside.")
+
+    monkeypatch.setattr(routes_mod, "deregister_app_crons_from_service", _unreadable)
+    monkeypatch.setattr(routes_mod, "_CRON_CLEANUP_BACKOFF_SECS", 0)
+
+    app = _make_app()
+    app["state"] = SimpleNamespace(crons=object())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/api/apps/api-test-app/uninstall")
+        assert resp.status == 409
+        body = await resp.json()
+        # The distinction handlers/cron.py keeps deliberately.
+        assert body["retryable"] is False, body
+        assert "Move the unreadable file aside" in body["error"], body
+
+        # THE HARM: the app must still be installed. A test that only asserted
+        # the log line or the 409 would pass under the defect too, because the
+        # generic catch logs and then deletes the app anyway.
+        resp = await client.get("/api/apps/api-test-app")
+        assert resp.status == 200
+
+    # NOT retried: an unreadable store does not heal, so burning all three
+    # attempts on it would be wrong. This is why the retry wrapper is left alone.
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_uninstall_retries_then_succeeds_on_transient_cron_busy(
     tmp_path, monkeypatch
 ):
@@ -374,7 +427,7 @@ async def test_ui_file_no_cache_revalidation(tmp_path, monkeypatch):
         assert resp.headers.get("Cache-Control") == "no-cache"
         assert "max-age" not in resp.headers.get("Cache-Control", "")
         last_modified = resp.headers.get("Last-Modified")
-        assert last_modified  # FileResponse provides the validator
+        assert last_modified  # descriptor-derived validator (see _read_ui_file)
 
         # A revalidation request with the validator must yield 304 (no body).
         resp304 = await client.get(
@@ -382,3 +435,85 @@ async def test_ui_file_no_cache_revalidation(tmp_path, monkeypatch):
             headers={"If-Modified-Since": last_modified},
         )
         assert resp304.status == 304
+
+
+# ---------------------------------------------------------------------------
+# Registration must run off the event loop (blocking KIROCREW_HOME filesystem
+# work — manifest reads, skill symlink walks, mcp.json atomic writes — would
+# otherwise freeze the gateway on a stalled mount).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_helper_dispatches_off_loop(monkeypatch):
+    """_register_app_off_loop runs register_app on an executor thread and
+    passes its return value through to the caller."""
+    import threading
+
+    import kiro_crew.apps.routes as routes_mod
+
+    loop_thread = threading.current_thread()
+    seen: dict[str, object] = {}
+    sentinel = SimpleNamespace(ok=True)
+
+    def _spy(name):
+        seen["name"] = name
+        seen["thread"] = threading.current_thread()
+        return sentinel
+
+    monkeypatch.setattr(routes_mod, "register_app", _spy)
+    result = await routes_mod._register_app_off_loop("some-app")
+    assert result is sentinel  # return value reaches the awaiting caller
+    assert seen["name"] == "some-app"
+    assert seen["thread"] is not loop_thread  # executor thread, not the loop
+
+
+@pytest.mark.asyncio
+async def test_deregister_helper_dispatches_off_loop(monkeypatch):
+    """_deregister_app_off_loop runs deregister_app on an executor thread."""
+    import threading
+
+    import kiro_crew.apps.routes as routes_mod
+
+    loop_thread = threading.current_thread()
+    seen: dict[str, object] = {}
+    sentinel = SimpleNamespace(ok=True)
+
+    def _spy(name):
+        seen["name"] = name
+        seen["thread"] = threading.current_thread()
+        return sentinel
+
+    monkeypatch.setattr(routes_mod, "deregister_app", _spy)
+    result = await routes_mod._deregister_app_off_loop("some-app")
+    assert result is sentinel
+    assert seen["name"] == "some-app"
+    assert seen["thread"] is not loop_thread
+
+
+@pytest.mark.asyncio
+async def test_install_route_registers_off_loop(tmp_path, monkeypatch):
+    """The install handler reaches register_app via the executor: the real
+    registration call must not execute on the event-loop thread."""
+    import threading
+
+    import kiro_crew.apps.routes as routes_mod
+
+    _setup_env(tmp_path, monkeypatch)
+    src = _make_app_source(tmp_path)
+    loop_thread = threading.current_thread()
+    seen: dict[str, object] = {}
+    real_register = routes_mod.register_app
+
+    def _spy(name):
+        seen["thread"] = threading.current_thread()
+        return real_register(name)
+
+    monkeypatch.setattr(routes_mod, "register_app", _spy)
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.post("/api/apps/install", json={"source": str(src)})
+        assert resp.status == 201
+        data = await resp.json()
+        assert data["ok"] is True
+        assert "registration" in data  # helper's return value still surfaces
+    assert seen["thread"] is not loop_thread

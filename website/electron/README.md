@@ -1,6 +1,6 @@
-# KiroCrew Desktop (Electron)
+# Kiro Crew Desktop (Electron)
 
-Desktop shell for the Kiro Crew web dashboard on macOS and Linux. It
+Desktop shell for the Kiro Crew web dashboard on macOS, Linux, and Windows. It
 automatically starts `kirocrew gateway` and connects to `localhost:5476`.
 
 ## Quick Start
@@ -13,9 +13,14 @@ npx electron .
 
 The app will:
 
-1. Reuse an existing gateway if one is already reachable
+1. Reuse an existing gateway if one is already reachable and actually serving
+   (`/api/ready` 200) — a gateway draining after `/api/shutdown` still answers
+   `/api/status`, so it is never adopted; the app waits for the port to clear
+   and spawns fresh instead
 2. Launch `kirocrew gateway` when needed
-3. Show a loading screen while the backend boots
+3. Show a loading screen while the backend boots. A live bundled backend gets an
+   extended Windows cold-start window; a child that actually exits still fails
+   immediately with its launch-log cause.
 4. Load the dashboard
 5. Point the user at Kiro CLI installation and sign-in on the gateway host when
    either prerequisite is missing
@@ -55,7 +60,64 @@ Right-click the Dock icon → Options → Keep in Dock to pin it.
 npm run dist
 ```
 
-Output goes to `electron/dist/`.
+Output goes to `electron/dist/`. The DMG opens to a branded 660×420 logical-size
+drag-to-Applications layout on a flat light-purple ground carrying the opening
+animation's white ghost cast, with one chevron pointing from the app to
+`/Applications`.
+Its background is a multi-resolution TIFF with 1× and Retina 2× representations.
+The release workflow uses this Electron-built DMG as a layout template, removes
+its unsigned app, and inserts the signed/stapled app before the DMG itself is
+signed and notarized. That keeps local previews and shipped downloads aligned.
+
+## Build Windows Installer (NSIS)
+
+The Windows desktop build is wired end to end: `package.json` declares an
+`nsis` target under `build.win`, and `packaging/build-desktop.sh` has a full
+Windows branch. Run it from Git Bash (or MSYS/Cygwin — the script normalizes
+those to `windows`) at the repo root:
+
+```bash
+bash packaging/build-desktop.sh
+```
+
+Notes:
+
+- **The build must run natively on Windows**, not cross-built from macOS or
+  Linux: the script provisions a Windows python-build-standalone interpreter
+  via `uv` and executes its `python.exe` to install and verify the bundled
+  backend, then runs `electron-builder --win` to produce the NSIS installer.
+- **Signing is optional for a local build.** The `signtoolOptions.sign` hook
+  (`scripts/sign-windows.js`) skips cleanly when none of the
+  `WINDOWS_SIGNING_*` environment variables are set, so a credential-less
+  build produces a working unsigned installer. (Setting only some of the five
+  variables is treated as a misconfiguration and fails the build.)
+- The result is an assisted (non-one-click, per-user) NSIS installer,
+  `KiroCrew Setup <version>.exe` (nightly builds:
+  `KiroCrew Nightly Setup <version>.exe`), in `website/electron/dist/`.
+- The pinned electron-builder NSIS template is patched during `npm install` to
+  expose Kiro Crew's staged-payload publish hook. On a normal same-volume
+  per-user install it renames the large `resources` / `locales` trees into place
+  and copies only the small root remainder; per-machine installs keep the
+  upstream copy path so files inherit the Program Files ACL. Cross-volume or
+  occupied destinations also retain the upstream copy-and-retry fallback. The
+  Windows backend ships hash-based (unchecked)
+  bytecode for the measured gateway import closure, so first launch consumes
+  build-time caches rather than generating thousands of files under Defender.
+  Unchecked rather than checked so the loader does not also re-read and re-hash
+  every `.py` it imports, which cost a median 12.5 s per cold boot; macOS's
+  whole-tree caches stay checked-hash.
+- The native welcome/finish sidebar and the header used on intermediate pages
+  carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
+  localized instructions remain native. Page boundaries use a short Win32
+  alpha-blended cross-fade that follows the system client-area animation setting;
+  extraction itself stays on the native progress page without timer-driven art.
+- A fresh install's native Finish page discloses that the default Kiro agent
+  needs a separately installed and authenticated Kiro CLI, names `kiro-cli
+  login`, and links to <https://kiro.dev/cli/>. It never runs either step.
+  Auto-updates skip the Finish page and keep their existing automatic relaunch.
+
+See `../../docs/guides/windows-install.md` for the CI-built installer and the
+current Windows support status.
 
 ## Updating
 
@@ -68,9 +130,8 @@ APP_DIR=$([ "$(uname -m)" = "arm64" ] && echo "dist/mac-arm64" || echo "dist/mac
 sudo rm -rf /Applications/KiroCrew.app
 sudo cp -R "$APP_DIR/KiroCrew.app" /Applications/KiroCrew.app
 
-# Restart the gateway (if using Launch Agent)
-launchctl stop dev.kirocrew.gateway
-launchctl start dev.kirocrew.gateway
+# Restart the gateway (service-aware)
+kirocrew restart
 ```
 
 ## Uninstall
@@ -79,9 +140,8 @@ launchctl start dev.kirocrew.gateway
 # Remove the desktop app
 sudo rm -rf /Applications/KiroCrew.app
 
-# Remove the Launch Agent (if configured from main README)
-launchctl unload ~/Library/LaunchAgents/dev.kirocrew.gateway.plist 2>/dev/null
-rm -f ~/Library/LaunchAgents/dev.kirocrew.gateway.plist
+# Stop and remove the managed gateway service, if installed
+kirocrew service uninstall
 ```
 
 ## Remote Tunnel Mode (Headless CDE)
@@ -130,8 +190,9 @@ each launch to get a fresh JWT — no manual paste required.
 ### Token flow (per tab)
 
 ```
-1. Try local ~/.kiro/crew/.local_secret → /api/token/local on the tab's port
-   (with a temporary ~/.kirocrew read fallback during one-time migration)
+1. Read `$KIROCREW_HOME/.local_secret` when a valid override is set; otherwise read
+   `~/.kiro/crew/.local_secret`, then call `/api/token/local` on the tab's port.
+   Only the authoritative home is read; there is no legacy-directory fallback.
 2. If remote host configured for this port:
    SSH: export PATH=<remotePath> KIROCREW_PORT=<port>; <bin> token
 3. Fallback: show manual token prompt
@@ -141,6 +202,7 @@ each launch to get a fresh JWT — no manual paste required.
 
 | Location | Item | Action |
 |----------|------|--------|
+| Connection menu (macOS) | New Window (⌘⇧N) | Open another dashboard window with a new blank session on the existing local gateway |
 | Tab menu / tab bar right-click | Set Remote Host… | Configure hostname for the **focused tab's** port |
 | Tab menu / tab bar right-click | Refresh Token (⌘⇧T) | Fetch a fresh token for the **focused tab** |
 | Tab menu / tray | Open Config File | Open `config.json` in default editor |
@@ -153,8 +215,9 @@ automatically. Names are stored in `remoteHosts[port].defaultName`.
 
 ### Config file
 
-Settings are persisted via `electron-store` in
-`~/Library/Application Support/KiroCrew/config.json`:
+Settings are persisted via `electron-store`. On macOS the file is
+`~/Library/Application Support/KiroCrew/config.json`; on Linux and Windows, use
+**Open Config File** to reveal the platform-specific application-data path:
 
 ```json
 {
@@ -178,15 +241,29 @@ Open via **Tab menu → Open Config File** or tray menu.
 | Issue | Fix |
 |-------|-----|
 | "SSH token fetch failed" | Check `ssh YOUR_HOST` works from Terminal |
-| "kirocrew binary not found in any of …" | Install kirocrew (`pip install kirocrew`), or set a custom path |
+| "kirocrew binary not found in any of …" | Install Kiro Crew through a [supported install path](../../docs/guides/install.md#install-paths), or set a custom path |
 | "command not found: kiro-cli" | Set Remote PATH to include `~/.toolbox/bin` (default does this) |
 | "command not found: dirname" | Remote PATH missing `/usr/bin` — reset to default or add it |
-| Token fetched but 403 | Gateway may need restart — `ssh host systemctl --user restart kirocrew` |
+| Token fetched but 403 | Restart the remote gateway — `ssh host kirocrew restart` |
 | Wrong tab refreshed | Focus the target tab first (use Tab menu, not tray) |
 
 ## Notes
 
+- On macOS, **Connection → New Window** (⌘⇧N) opens an independent
+  dashboard window and creates a blank session. It shares the running local
+  gateway and authentication origin, but does not copy the current session,
+  project, draft, or context.
 - Closing the window hides to tray — right-click the tray icon or Cmd+Q to quit
+- **GPU rendering.** Hardware acceleration is on by default.
+  `KIROCREW_DISABLE_GPU=1` or `--disable-gpu` turns it off for a launch
+  (`disable-gpu.js`). On Windows, if the GPU process dies before the dashboard
+  has loaded, the app relaunches itself once with software rendering
+  (`--in-process-gpu --use-angle=swiftshader`, never `--no-sandbox`) and keeps
+  that setting for the current app version under `gpuSoftwareFallback` in
+  `config.json`; a new version tries hardware rendering again once
+  (`gpu-crash-fallback.js`). The software-mode boot drops the opt-in's
+  `--disable-software-rasterizer` so `KIROCREW_DISABLE_GPU=1` cannot veto
+  SwiftShader. Remove the key to retry hardware rendering sooner.
 - External links open in your default browser
 - Desktop leaves the child `PATH` unchanged; the gateway-side prerequisite
   service independently probes Kiro CLI's supported user-local, Homebrew,

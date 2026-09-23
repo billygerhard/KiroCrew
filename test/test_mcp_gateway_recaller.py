@@ -12,6 +12,7 @@ audit events), so we verify actual loop behaviour AND the audit trail:
 * an empty/malformed recaller is ignored (``denied`` audit) — all recaller
   outcomes land on the SEL trail.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,7 +43,6 @@ def _register(session_key: str) -> dict[str, Any]:
         "autoapprove_set_hash": "2" * 64,
         "approval_mode": "interactive",
         "trust_all_tools": False,
-        "user_identity": "rc",
         "channel_id": "C_RC",
         "config_snapshot_hash": "3" * 64,
         "session_key": session_key,
@@ -65,8 +65,11 @@ class _FakeReader:
 
 
 class _FakeWriter:
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+
     def write(self, _b: bytes) -> None:
-        pass
+        self.frames.extend(json.loads(line) for line in _b.decode().splitlines() if line)
 
     async def drain(self) -> None:
         pass
@@ -86,6 +89,7 @@ class _FakeWriter:
 
 class _FakeBackend:
     supports_caller_identity = True
+    control_plane = False
     quarantined = False
 
     def __init__(self) -> None:
@@ -104,7 +108,9 @@ class _FakeBackend:
     async def recycle_if_idle(self) -> bool:
         return False
 
-    async def forward_from_stub(self, _uuid: str, _msg: dict, caller: Any = None) -> None:
+    async def forward_from_stub(
+        self, _uuid: str, _msg: dict, caller: Any = None, tenant_nonce: str = ""
+    ) -> None:
         self.callers.append(caller)
 
 
@@ -125,11 +131,15 @@ def _rekey_events(sel_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _run(
-    frames: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+    frames: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    writer: _FakeWriter | None = None,
 ) -> tuple[_FakeBackend, list[dict[str, Any]]]:
     monkeypatch.setattr(socketsec, "PEER_IDENTITY_SUPPORTED", True)
     monkeypatch.setattr(
-        socketsec, "check_peer_is_self",
+        socketsec,
+        "check_peer_is_self",
         lambda _w: socketsec.PeerCredResult.MATCH,
     )
     monkeypatch.setattr(socketsec, "socket_owner_only", lambda _path: True)
@@ -140,7 +150,7 @@ async def _run(
         def log_api_access(self, **kwargs: Any) -> None:
             sel_calls.append(kwargs)
 
-    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any):
+    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any, **_kw: Any):
         return fake_backend, True
 
     async def _fake_drain(_inbox: Any, _writer: Any, _stub_uuid: str = "") -> None:
@@ -152,12 +162,26 @@ async def _run(
 
     await asyncio.wait_for(
         gw._handle_connection(
-            _FakeReader(frames), _FakeWriter(), pool=_FakePool(),
-            resolver=object(), socket_path=Path("/tmp/rc.sock"), hot_keys=None,
+            _FakeReader(frames),
+            writer or _FakeWriter(),
+            pool=_FakePool(),
+            resolver=object(),
+            socket_path=Path("/tmp/rc.sock"),
+            hot_keys=None,
         ),
         timeout=5.0,
     )
     return fake_backend, sel_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["tools/list", "tools/call"])
+async def test_an_unowned_legacy_v1_caller_keeps_working_without_a_proof(monkeypatch, method):
+    monkeypatch.setattr(socketsec, "get_peer_pid", lambda _writer: 8001)
+    backend, _audit = await _run(
+        [_register("dashboard:global"), {**_CALL, "method": method}], monkeypatch
+    )
+    assert backend.callers[0].session_key == "dashboard:global"
 
 
 @pytest.mark.asyncio
@@ -168,8 +192,13 @@ async def test_recaller_flips_injected_caller(monkeypatch: pytest.MonkeyPatch) -
         [
             _register(""),
             _CALL,
-            {"type": "recaller", "session_key": "dashboard:chat-RC-1",
-             "session_type": "dashboard", "principal_id": "rc", "channel_id": "C_RC"},
+            {
+                "type": "recaller",
+                "session_key": "dashboard:chat-RC-1",
+                "session_type": "dashboard",
+                "principal_id": "rc",
+                "channel_id": "C_RC",
+            },
             _CALL,
             {"type": "unregister"},
         ],
@@ -193,8 +222,13 @@ async def test_recaller_denied_when_caller_already_set(monkeypatch: pytest.Monke
         [
             _register("dashboard:orig-1"),
             _CALL,
-            {"type": "recaller", "session_key": "dashboard:evil-2",
-             "session_type": "dashboard", "principal_id": "x", "channel_id": "C_RC"},
+            {
+                "type": "recaller",
+                "session_key": "dashboard:evil-2",
+                "session_type": "dashboard",
+                "principal_id": "x",
+                "channel_id": "C_RC",
+            },
             _CALL,
             {"type": "unregister"},
         ],
@@ -311,7 +345,8 @@ def test_recaller_rejected_emits_denied_sel_audit_event(monkeypatch: "pytest.Mon
 
     monkeypatch.setattr(gw, "SecurityEventLog", _FakeSEL)
     gw._audit_recaller_rejected(
-        "dashboard:orig-1", "kirocrew:kirocrew-core",
+        "dashboard:orig-1",
+        "kirocrew:kirocrew-core",
         "recaller pivot attempt to session_key=dashboard:evil-2",
     )
 

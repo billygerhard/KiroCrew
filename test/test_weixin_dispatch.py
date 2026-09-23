@@ -10,13 +10,16 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.weixin.client import ContextTokenStore, TypingTicketCache
 from kiro_crew.weixin.commands import parse_command
 from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
 from kiro_crew.weixin.transport_dispatch import WeixinDispatcher
-from kiro_crew.weixin.turn_renderer import WeixinRenderer, _strip_options
+from kiro_crew.weixin.turn_renderer import WeixinRenderer
 
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -68,6 +71,7 @@ class FakeProvider:
         self.reply = reply
         self.prompts: list[str] = []
         self.compacted = False
+        self.cancelled: list = []
 
     async def stream(self, message):
         self.prompts.append(message)
@@ -78,6 +82,13 @@ class FakeProvider:
 
     def has_active_turn(self):
         return False
+
+    async def cancel(self, *, wait_ack_timeout: float = 0.0) -> str:
+        # Returns a CancelOutcome, like the real provider. A fake that returned
+        # None modelled the SHAPE of the call but not its contract, which is how
+        # "did it raise" passed for "did it work".
+        self.cancelled.append(wait_ack_timeout)
+        return "acked"
 
     async def compact(self):
         self.compacted = True
@@ -90,17 +101,30 @@ class FakeSessions:
     def __init__(self, provider=None, busy=False):
         self.provider = provider or FakeProvider()
         self._busy = busy
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.released = 0
         self.successes = 0
         self.failures = 0
         self.channels: dict[str, str] = {}
         self.acquired = False
+        self.mirror_links: dict[str, object] = {}
+        self.opted_out = False
+        self.reserved_generations: list[str] = []
 
     def is_busy(self, key):
         return self._busy
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id
@@ -127,10 +151,26 @@ class FakeSessions:
     def has_session(self, key):
         return True
 
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
+
     def max_generation(self, *a, **kw):
         # seed_generation() probes for the highest existing generation; a fresh
         # fake has none.
         return 0
+
+    # ── outbound mirror binding (drive_turn binds the conversation to itself) ──
+    def mirror_opt_out(self, key):
+        return self.opted_out
+
+    def get_mirror_link(self, key):
+        return self.mirror_links.get(key)
+
+    def set_mirror_link(self, key, location):
+        self.mirror_links[key] = location
 
 
 class FakeHooks:
@@ -183,16 +223,10 @@ def _make(tmp_path, provider=None, busy=False):
 
 
 def _msg(text="hi", user="userA"):
-    return InboundMessage(
-        channel_type="weixin", user_id=user, conversation_id=user, text=text
-    )
+    return InboundMessage(channel_type="weixin", user_id=user, conversation_id=user, text=text)
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────
-def test_strip_options_removes_dashboard_only_affordance():
-    assert _strip_options("answer\n[OPTIONS: a | b]") == "answer"
-
-
 def test_renderer_buffers_and_sends_once_on_done(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
@@ -218,8 +252,11 @@ def test_renderer_buffers_and_sends_once_on_done(tmp_path):
 def test_renderer_on_done_is_idempotent(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES,
-        ctx_store=ContextTokenStore(str(tmp_path)), account_id="acct1",
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
     )
 
     async def go():
@@ -235,19 +272,25 @@ def test_renderer_on_done_is_idempotent(tmp_path):
 def test_renderer_close_without_done_emits_error_text(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES,
-        ctx_store=ContextTokenStore(str(tmp_path)), account_id="acct1",
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
     )
     asyncio.run(r.close())
     assert len(client.sent) == 1
     assert "出错" in client.sent[0]["text"]
 
 
-def test_renderer_strips_options_from_the_reply(tmp_path):
+def test_renderer_renders_options_as_numbered_text_in_the_reply(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES,
-        ctx_store=ContextTokenStore(str(tmp_path)), account_id="acct1",
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
     )
 
     async def go():
@@ -255,16 +298,14 @@ def test_renderer_strips_options_from_the_reply(tmp_path):
         await r.on_done()
 
     asyncio.run(go())
-    assert client.sent[0]["text"] == "answer"
+    assert client.sent[0]["text"] == "answer\n\n1. a\n2. b"
 
 
 def test_renderer_echoes_the_stored_context_token(tmp_path):
     client = FakeClient()
     store = ContextTokenStore(str(tmp_path))
     store.set("acct1", "userA", "ctx-42")
-    r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES, ctx_store=store, account_id="acct1"
-    )
+    r = WeixinRenderer(client, "userA", WEIXIN_CAPABILITIES, ctx_store=store, account_id="acct1")
 
     async def go():
         await r.on_text_chunk("hi")
@@ -277,8 +318,11 @@ def test_renderer_echoes_the_stored_context_token(tmp_path):
 def test_renderer_chunks_an_oversized_answer(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES,
-        ctx_store=ContextTokenStore(str(tmp_path)), account_id="acct1",
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
     )
 
     async def go():
@@ -293,8 +337,11 @@ def test_renderer_chunks_an_oversized_answer(tmp_path):
 def test_renderer_tool_and_thinking_events_emit_nothing(tmp_path):
     client = FakeClient()
     r = WeixinRenderer(
-        client, "userA", WEIXIN_CAPABILITIES,
-        ctx_store=ContextTokenStore(str(tmp_path)), account_id="acct1",
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
     )
 
     async def go():
@@ -347,7 +394,55 @@ def test_new_command_starts_a_fresh_session_without_a_turn(tmp_path):
 
     assert provider.prompts == []  # no LLM turn for a command
     assert before != after  # generation advanced
+    assert sessions.reserved_generations == [after]
     assert "新对话" in client.sent[0]["text"]
+
+
+def test_inline_callback_reservation_releases_before_poll_task_continues(tmp_path):
+    class Reservation:
+        def __init__(self):
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    d, _client, sessions = _make(tmp_path)
+    reservation = Reservation()
+    sessions.reserve_inbound_callback = lambda: reservation
+
+    async def run():
+        await d.handle_message(_msg("/help"))
+        # The caller is still the long-lived poll task here. A task-done lease
+        # would remain held until disconnect and defer every future update.
+        assert reservation.releases == 1
+
+    asyncio.run(run())
+
+
+def test_update_pause_spools_new_before_generation_side_effects(tmp_path, monkeypatch):
+    import kiro_crew.messaging.dispatch as dispatch
+
+    d, client, sessions = _make(tmp_path)
+    sessions.reserve_inbound_callback = lambda: None
+    spooled: list[tuple[str, Any]] = []
+
+    async def capture(*, channel_type, route):
+        spooled.append((channel_type, route))
+
+    monkeypatch.setattr(dispatch, "spool_refused_turn", capture)
+    before = d._session_key("userA")
+
+    asyncio.run(d.handle_message(_msg("/new")))
+
+    assert d._session_key("userA") == before
+    assert sessions.reserved_generations == []
+    assert client.sent == []
+    assert len(spooled) == 1
+    channel_type, refused = spooled[0]
+    assert channel_type == "weixin"
+    assert refused is not None
+    assert refused.conversation_id == "userA"
+    assert refused.text == "/new"
 
 
 def test_compact_command_compacts_without_a_turn(tmp_path):
@@ -359,6 +454,50 @@ def test_compact_command_compacts_without_a_turn(tmp_path):
     assert sessions.released == 1  # acquired for compaction, then released
 
 
+def test_compact_command_declined_on_auto_managed_backend(tmp_path):
+    # A backend that cannot serve /compact gets the informational reply and
+    # compact() is NEVER dispatched.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert provider.compacted is False
+    assert sessions.released == 1  # the acquired semaphore is handed back
+    assert any("自动压缩上下文" in s["text"] for s in client.sent)
+
+
+def test_compact_none_capability_preserves_dispatch(tmp_path):
+    # The ABC's None (supported) default keeps the existing dispatch.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = None
+    d, client, sessions = _make(tmp_path, provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert provider.compacted is True
+
+
+def test_hard_threshold_declines_silently_on_auto_managed_backend(tmp_path):
+    # No /compact to dispatch and no notice: the backend compacts on its own
+    # as context fills.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    sessions.check_context_usage = lambda k, p: 99.0  # type: ignore[assignment]
+    asyncio.run(d.handle_message(_msg("long convo")))
+    assert provider.compacted is False
+    assert not any("已自动压缩" in s["text"] for s in client.sent)
+
+
+def test_soft_nudge_suppressed_on_auto_managed_backend(tmp_path):
+    # The nudge advises /compact, which this backend refuses — it compacts on
+    # its own, so there is nothing for the user to act on.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    sessions.check_context_usage = lambda k, p: 85.0  # type: ignore[assignment]
+    asyncio.run(d.handle_message(_msg("one")))
+    assert not any("上下文已较长" in s["text"] for s in client.sent)
+
+
 def test_busy_session_does_not_start_a_second_turn(tmp_path):
     provider = FakeProvider()
     d, client, _ = _make(tmp_path, provider=provider, busy=True)
@@ -366,6 +505,184 @@ def test_busy_session_does_not_start_a_second_turn(tmp_path):
     # No turn ran; the user was told to wait (provider can't steer).
     assert provider.prompts == []
     assert any("稍后" in s["text"] for s in client.sent)
+
+
+# ── mid-turn attachments ──────────────────────────────────────────────────────
+
+
+def _media_msg(text="look at this", user="userA"):
+    msg = _msg(text=text, user=user)
+    msg.attachments = [{"type": 2, "image_item": {"media": {"encrypt_query_param": "p1"}}}]
+    return msg
+
+
+def test_a_mid_turn_attachment_is_refused_instead_of_ingested(tmp_path, monkeypatch):
+    """Ingesting mid-turn would hand the model a path to a deleted file.
+
+    ``steer()`` sends raw text and returns before the running turn consumes it,
+    so this frame's cleanup deletes the temp file first. Refusing up front and
+    asking for a resend is the only shape that never lies to the model.
+    """
+    import kiro_crew.weixin.transport_dispatch as td
+
+    async def _must_not_run(*_a, **_kw):
+        raise AssertionError("attachments must not be ingested while a turn is live")
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _must_not_run)
+    d, client, _ = _make(tmp_path, busy=True)
+    msg = _media_msg()
+    asyncio.run(d.handle_message(msg))
+
+    assert msg.attachments == []
+    assert any("重新发送" in s["text"] for s in client.sent)
+
+
+def test_a_mid_turn_caption_still_reaches_the_running_turn(tmp_path, monkeypatch):
+    """Refusing the attachment must not also swallow the text beside it."""
+    import kiro_crew.weixin.transport_dispatch as td
+
+    async def _must_not_run(*_a, **_kw):
+        raise AssertionError("attachments must not be ingested while a turn is live")
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _must_not_run)
+
+    class Steering(FakeProvider):
+        supports_steer = True
+
+        def __init__(self):
+            super().__init__()
+            self.steered: list[str] = []
+
+        def has_active_turn(self):
+            return True
+
+        async def steer(self, text):
+            self.steered.append(text)
+            return True
+
+    provider = Steering()
+    d, client, _ = _make(tmp_path, provider=provider, busy=True)
+    asyncio.run(d.handle_message(_media_msg(text="what is this error")))
+
+    assert provider.steered == ["what is this error"]
+    assert any("重新发送" in s["text"] for s in client.sent)
+
+
+def test_a_media_only_mid_turn_message_ends_after_the_refusal(tmp_path, monkeypatch):
+    """With no caption there is nothing to steer, so no turn is touched."""
+    import kiro_crew.weixin.transport_dispatch as td
+
+    async def _must_not_run(*_a, **_kw):
+        raise AssertionError("attachments must not be ingested while a turn is live")
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _must_not_run)
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=True)
+    asyncio.run(d.handle_message(_media_msg(text="")))
+
+    assert provider.prompts == []
+    assert sessions.acquired is False
+    assert [s["text"] for s in client.sent] == [
+        s["text"] for s in client.sent if "重新发送" in s["text"]
+    ]
+
+
+def test_a_turn_starting_during_the_download_still_refuses_the_attachment(tmp_path, monkeypatch):
+    """A CDN download takes real time, so busy can flip while it is in flight.
+
+    Without the recheck the already-downloaded path is inlined into a steer whose
+    file this frame then deletes — the failure the first check exists to prevent.
+    """
+    import kiro_crew.weixin.transport_dispatch as td
+    from kiro_crew.messaging.attachments import IngestResult
+
+    shot = tmp_path / "shot.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    class Steering(FakeProvider):
+        supports_steer = True
+
+        def __init__(self):
+            super().__init__()
+            self.steered: list[str] = []
+
+        def has_active_turn(self):
+            return True
+
+        async def steer(self, text):
+            self.steered.append(text)
+            return True
+
+    provider = Steering()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=False)
+
+    async def _slow_ingest(items, **_kw):
+        # The turn starts while the download is in flight.
+        sessions._busy = True
+        result = IngestResult()
+        result.text_blocks.append(f"[Image] {shot}")
+        result.image_paths.append(str(shot))
+        return result
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _slow_ingest)
+    asyncio.run(d.handle_message(_media_msg(text="what is this error")))
+
+    # Only the original caption was steered — no path to a file we then deleted.
+    assert provider.steered == ["what is this error"]
+    assert str(shot) not in "".join(provider.steered)
+    # And the download was discarded rather than left behind.
+    assert not shot.exists()
+    assert any("重新发送" in s["text"] for s in client.sent)
+
+
+def test_an_attachment_riding_a_command_is_named_not_dropped(tmp_path, monkeypatch):
+    """`/new` with an image attached still resets, but says the image was skipped.
+
+    The command path runs no turn, so the object is not downloaded — but silence
+    here would be the same failure this channel's media support removes.
+    """
+    import kiro_crew.weixin.transport_dispatch as td
+
+    async def _must_not_run(*_a, **_kw):
+        raise AssertionError("a command message must not spend a CDN round trip")
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _must_not_run)
+    provider = FakeProvider()
+    d, client, _ = _make(tmp_path, provider=provider)
+    asyncio.run(d.handle_message(_media_msg(text="/new")))
+
+    assert provider.prompts == []
+    assert any("附件未读取" in s["text"] for s in client.sent)
+    assert any("已开始新对话" in s["text"] for s in client.sent)
+
+
+def test_a_plain_command_says_nothing_about_attachments(tmp_path):
+    """The notice is scoped to messages that actually carried media."""
+    d, client, _ = _make(tmp_path)
+    asyncio.run(d.handle_message(_msg("/new")))
+    assert not any("附件" in s["text"] for s in client.sent)
+
+
+def test_an_idle_session_still_ingests_the_attachment(tmp_path, monkeypatch):
+    """The refusal is scoped to the busy path; the normal path is unchanged."""
+    import kiro_crew.weixin.transport_dispatch as td
+    from kiro_crew.messaging.attachments import IngestResult
+
+    calls: list[list] = []
+
+    async def _fake_ingest(items, **_kw):
+        calls.append(list(items))
+        result = IngestResult()
+        result.text_blocks.append("[Image] /tmp/shot.png")
+        return result
+
+    monkeypatch.setattr(td, "process_weixin_attachments", _fake_ingest)
+    provider = FakeProvider()
+    d, _client, _sessions = _make(tmp_path, provider=provider, busy=False)
+    asyncio.run(d.handle_message(_media_msg(text="explain")))
+
+    assert len(calls) == 1
+    assert provider.prompts and "/tmp/shot.png" in provider.prompts[0]
 
 
 def test_turn_failure_records_failure_and_still_releases(tmp_path):
@@ -387,7 +704,7 @@ def test_turn_failure_records_failure_and_still_releases(tmp_path):
 def test_delivery_failure_is_not_recorded_as_success(tmp_path):
     """An undelivered reply must fail the turn, not persist as a success.
 
-    Regression: the renderer used to swallow send errors, so a send timeout left
+    The renderer must not swallow send errors, or a send timeout leaves
     the dispatcher recording + persisting a reply the user never received.
     """
     rows: list[tuple[str, str]] = []
@@ -397,7 +714,7 @@ def test_delivery_failure_is_not_recorded_as_success(tmp_path):
             raise RuntimeError("ilink send timeout")
 
     class Log:
-        def append(self, key, role, text):
+        def append(self, key, role, text, agent=None, mid=None):
             rows.append((role, text))
 
         def set_title(self, key, title):
@@ -421,7 +738,7 @@ def test_persist_turn_writes_user_and_assistant_rows(tmp_path):
             self.rows: list[tuple[str, str]] = []
             self.title = ""
 
-        def append(self, key, role, text):
+        def append(self, key, role, text, agent=None, mid=None):
             self.rows.append((role, text))
 
         def set_title(self, key, title):
@@ -589,3 +906,228 @@ def test_tool_gate_denies_when_hooks_deny(tmp_path):
     gate = captured.get("tool_gate")
     assert gate is not None
     assert gate(FakeEvent("permission")) == "deny"
+
+
+# ── command vocabulary ────────────────────────────────────────────────────────
+def test_every_alias_in_the_weixin_spec_is_reachable():
+    """A command that parses but is missing from help is a feature nobody finds;
+    one listed but unreachable is a lie. Both derive from COMMANDS."""
+    from kiro_crew.weixin.commands import COMMANDS
+
+    for spec in COMMANDS:
+        assert parse_command(f"/{spec.name}") == spec.name
+        for alias in spec.aliases:
+            assert parse_command(alias) == spec.name, f"{alias} unreachable"
+
+
+def test_every_visible_weixin_command_appears_in_help():
+    from kiro_crew.weixin.commands import COMMANDS, build_help
+
+    body = build_help()
+    for spec in COMMANDS:
+        assert f"/{spec.name}" in body
+        for alias in spec.aliases:
+            assert alias in body
+
+
+def test_weixin_help_lists_no_link_command():
+    """iLink is DM-only with no dashboard-mirror command, so advertising one
+    would promise a capability this channel does not have."""
+    from kiro_crew.weixin.commands import build_help
+
+    assert "/link" not in build_help()
+
+
+def test_help_replies_with_the_card_and_runs_no_turn(tmp_path):
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider)
+
+    asyncio.run(d.handle_message(_msg("/help")))
+
+    assert provider.prompts == [], "help must not spend a turn"
+    assert any("/stop" in m["text"] for m in client.sent)
+
+
+def test_stop_cancels_a_live_turn_cooperatively(tmp_path):
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=True)
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    # Fire-and-forget: waiting for the ack would hold the reply behind the very
+    # turn being stopped.
+    assert provider.cancelled == [0]
+    assert any("正在停止" in m["text"] for m in client.sent)
+
+
+def test_stop_with_nothing_running_says_so(tmp_path):
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=False)
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    assert provider.cancelled == []
+    assert any("没有正在生成" in m["text"] for m in client.sent)
+
+
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        ("acked", "正在停止"),
+        # The cancel WAS written; only the ack is outstanding, which is what
+        # "stopping" already describes.
+        ("timeout", "正在停止"),
+        # The provider disagrees with is_busy -- the turn finished in between --
+        # so "nothing running" is the accurate answer, not a failure.
+        ("no_turn", "没有正在生成"),
+        # AcpRuntimeDead and any other internal failure come back as "error"
+        # rather than raising, so a try/except alone would have reported
+        # "stopping" for a cancel that never happened.
+        ("error", "停止失败"),
+    ],
+)
+def test_stop_reports_the_cancel_OUTCOME_not_merely_that_the_call_returned(
+    tmp_path, outcome, expected
+):
+    """``cancel`` is typed ``CancelOutcome`` and swallows its own failures.
+
+    It returns ``"error"`` for ``AcpRuntimeDead`` and for any unexpected
+    exception, so branching on "did the call raise" reports success for a cancel
+    that did not happen -- the same class of lie as telling someone watching a
+    live reply that nothing is running.
+    """
+
+    class Outcome(FakeProvider):
+        async def cancel(self, *, wait_ack_timeout: float = 0.0):
+            self.cancelled.append(wait_ack_timeout)
+            return outcome
+
+    d, client, sessions = _make(tmp_path, provider=Outcome(), busy=True)
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    assert any(expected in m["text"] for m in client.sent), [m["text"] for m in client.sent]
+
+
+def test_stop_reports_failure_when_the_provider_raises(tmp_path):
+    # The other shape the contract allows to reach here: a provider that raises
+    # instead of returning an outcome must still not read as success.
+    class Raising(FakeProvider):
+        async def cancel(self, *, wait_ack_timeout: float = 0.0):
+            raise RuntimeError("transport gone")
+
+    d, client, sessions = _make(tmp_path, provider=Raising(), busy=True)
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    assert any("停止失败" in m["text"] for m in client.sent)
+
+
+def test_stop_never_releases_a_semaphore_it_did_not_acquire(tmp_path):
+    provider = FakeProvider()
+    d, client, sessions = _make(tmp_path, provider=provider, busy=True)
+
+    asyncio.run(d.handle_message(_msg("/stop")))
+
+    assert sessions.released == 0, "drive_turn's finally owns the release"
+
+
+# ── origin-mirror binding: deliberately NOT automatic ─────────────────────────
+def test_a_turn_does_not_auto_bind_the_conversation_as_a_mirror(tmp_path):
+    """An inbound turn must NOT bind its conversation as the session's mirror.
+
+    Binding it would be convenient -- a cron result or subagent reply for a
+    channel-born session reaches nobody unless the user ran ``/link`` -- but the
+    mirror is PERSISTED and the outbound path never re-checks the channel's
+    allow-list. ``chat_runner._resolve_channel_target`` gates on governance, a
+    registered transport and ``supports_proactive_send``, and none of those answers
+    "is this recipient still allowed?". A user removed from ``weixin.allowed_users``
+    would keep receiving session content through a binding their first message
+    created.
+
+    The gap is not created by an auto-bind -- it is a property of mirror bindings,
+    and ``/link`` and Discord's own auto-bind share it -- but auto-binding WIDENS
+    who is exposed from "users who linked" to "everyone who ever sent a message",
+    and that is not a widening to ship without the recipient check.
+
+    Pinned as a test rather than left as an absence, so re-adding the bind is a
+    deliberate act: the fix is an authorization re-check at the outbound send
+    boundary, alongside the other channels that share the gap.
+    """
+    d, client, sessions = _make(tmp_path, provider=FakeProvider())
+    asyncio.run(d.handle_message(_msg("hi", "userA")))
+    assert sessions.mirror_links == {}, (
+        "an inbound turn bound a mirror; see this test's docstring -- the outbound "
+        "path does not re-check the allow-list, so a revoked user would keep "
+        "receiving session content"
+    )
+
+
+def test_renderer_follows_a_redacted_answer_with_one_notice(tmp_path):
+    from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
+
+    client = FakeClient()
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        # The TurnDriver's stream arrives already redacted, so the placeholder
+        # tag is what this channel delivers and what the tally counts.
+        await r.on_text_chunk(f"Run: psql {CREDENTIAL_REDACTION_TAGS[0]}")
+        await r.on_done()
+
+    asyncio.run(go())
+    notices = [m["text"] for m in client.sent if "Security notice" in m["text"]]
+    assert len(notices) == 1
+    assert client.sent[-1]["text"] == notices[0]  # below the answer
+
+
+def test_renderer_sends_no_notice_for_a_clean_answer(tmp_path):
+    client = FakeClient()
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        await r.on_text_chunk("All green, deploy finished.")
+        await r.on_done()
+
+    asyncio.run(go())
+    assert not any("Security notice" in m["text"] for m in client.sent)
+
+
+def test_a_failed_notice_send_does_not_fail_a_delivered_turn(tmp_path):
+    from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
+
+    client = FakeClient()
+    real_send = client.send_message
+
+    async def send_but_fail_the_notice(*, to, text, context_token, client_id):
+        if "Security notice" in text:
+            raise RuntimeError("weixin down after the answer")
+        return await real_send(to=to, text=text, context_token=context_token, client_id=client_id)
+
+    client.send_message = send_but_fail_the_notice  # type: ignore[method-assign]
+    r = WeixinRenderer(
+        client,
+        "userA",
+        WEIXIN_CAPABILITIES,
+        ctx_store=ContextTokenStore(str(tmp_path)),
+        account_id="acct1",
+    )
+
+    async def go():
+        await r.on_text_chunk(f"Run: psql {CREDENTIAL_REDACTION_TAGS[0]}")
+        await r.on_done()  # must not raise: the answer above already landed
+
+    asyncio.run(go())
+    assert any(CREDENTIAL_REDACTION_TAGS[0] in m["text"] for m in client.sent)

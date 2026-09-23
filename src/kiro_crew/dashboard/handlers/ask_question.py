@@ -1,17 +1,30 @@
-"""Agent-question HTTP API — render a question card and block for the answer.
+"""Agent-question HTTP API — question-card state, and a blocking ask round-trip.
 
-Two endpoints form one blocking round-trip:
+Cards come in two kinds and these routes serve both. A card carrying an
+``ask_id`` has a server-side wait behind it; a card carrying a ``card_id`` is
+stateless and blocks nothing. The MCP ``ask_question`` tool produces the
+stateless kind — it returns a session directive and the agent ends its turn (see
+:func:`kiro_crew.mcp_tools.control.ask_question`), so it does NOT call the POST
+below.
 
 ``POST /api/ask-question``
-    Called by the ``ask_question`` MCP tool. Validates the question payload,
-    broadcasts a ``question_card`` to the owning slot's dashboard clients, and
-    holds the request open until the user answers (or the window elapses).
+    Opens a blocking ask: validates the payload, broadcasts a ``question_card``
+    with an ``ask_id`` to the owning slot's dashboard clients, and holds the
+    request open until the user answers or the window elapses. No in-tree caller
+    uses it now that the MCP tool is directive-based; it remains supported.
 
 ``POST /api/ask-question/{ask_id}/answer``
-    Called by the dashboard when the user submits (or dismisses) the card.
-    Resolves the blocked request above.
+    Called by the dashboard when the user submits or dismisses such a card.
+    Resolves the wait above.
 
-This mirrors the tool-approval round-trip in
+``GET /api/ask-question/pending``
+    Read-only rehydration after a reload or websocket reconnect, since
+    ``question_card`` is a one-shot broadcast. Returns both kinds.
+
+``POST /api/ask-question/dismiss``
+    Retires a STATELESS card's pending state. It cannot resolve a blocking wait.
+
+The blocking half mirrors the tool-approval round-trip in
 :meth:`kiro_crew.dashboard.state.DashboardState.request_approval` — the
 difference is that the resolution value is the user's answer map rather than an
 allow/deny boolean, and the card is addressed to a single slot.
@@ -87,7 +100,11 @@ def _deny_app_token(request: web.Request, operation: str) -> web.Response | None
     except Exception:
         logger.warning("SEL audit failed for app-token denial", exc_info=True)
     return web.json_response(
-        {"error": "app token not permitted for this endpoint"}, status=403
+        {
+            "error": "app token not permitted for this endpoint",
+            "code": "app_token_forbidden",
+        },
+        status=403,
     )
 
 
@@ -108,8 +125,15 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
     is configured. That matches the identity the ``ask_question`` MCP tool
     itself carries, since its token is minted as ``owner_id or "local-app"``.
     """
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+
     if is_owner_dashboard_request(request):
         return None
+    # Domain-specific audit kept here rather than delegated to
+    # ``require_owner_dashboard_request``: this record carries the endpoint as
+    # ``resources`` plus an ``error`` reason, which the shared helper's generic
+    # ``non_owner_block`` record does not. Only the denial TAIL (stale-session
+    # relabel + 403) is shared -- see ``_owner_denial_response``.
     try:
         sel().log_api_access(
             caller=str(request.get("user") or "anonymous"),
@@ -121,7 +145,9 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
         )
     except Exception:
         logger.warning("SEL audit failed for non-owner denial", exc_info=True)
-    return web.json_response({"error": "forbidden"}, status=403)
+    # Deny decision made above; only the response label changes for a signed
+    # pre-owner bootstrap subject (see stale_owner_session_response).
+    return _owner_denial_response(request, "forbidden", "owner_only")
 
 
 async def api_ask_question(request: web.Request) -> web.Response:
@@ -142,34 +168,49 @@ async def api_ask_question(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     if not isinstance(body, dict):
         # Valid JSON is not necessarily an object: `[]`, `null` and bare scalars
         # all parse, then blow up on `.get()` as a 500 instead of a 400.
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
 
     session_key = str(body.get("session_key") or "")
     if not session_key:
-        return web.json_response({"error": "session_key is required"}, status=400)
+        return web.json_response(
+            {"error": "session_key is required", "code": "missing_session_key"},
+            status=400,
+        )
     slot_key = _slot_key_from_session(session_key)
     # Refuse to address a slot that does not exist: otherwise the caller blocks
     # for the full window on a card no client will ever render. An empty slot key
     # is the same dead end — the conversation has no open tab to render into.
     if not slot_key or slot_key not in state._slots:
         return web.json_response(
-            {"error": f"unknown slot for {session_key!r} — no dashboard session to ask"},
+            {
+                "error": f"unknown slot for {session_key!r} — no dashboard session to ask",
+                "code": "slot_not_found",
+            },
             status=404,
         )
 
     try:
         questions = validate_ask_user_question(body)
     except ValidationError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {"error": str(exc), "code": "invalid_questions"}, status=400
+        )
 
     try:
         timeout_secs = int(body.get("timeout_secs") or state._QUESTION_TIMEOUT_DEFAULT)
     except (TypeError, ValueError):
-        return web.json_response({"error": "timeout_secs must be an integer"}, status=400)
+        return web.json_response(
+            {"error": "timeout_secs must be an integer", "code": "invalid_field_type"},
+            status=400,
+        )
 
     ask_id = uuid.uuid4().hex
     try:
@@ -194,23 +235,35 @@ async def api_ask_question(request: web.Request) -> web.Response:
         # Raised when redaction collapses two questions into the same key, which
         # is only detectable after the redaction pass — so it surfaces here as a
         # 400 rather than from validate_ask_user_question.
-        return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {"error": str(exc), "code": "duplicate_question_key"}, status=400
+        )
     if answers is None:
         return web.json_response({"status": "timeout", "ask_id": ask_id})
     return web.json_response({"status": "answered", "ask_id": ask_id, "answers": answers})
 
 
 async def api_ask_question_pending(request: web.Request) -> web.Response:
-    """GET /api/ask-question/pending — list question cards still awaiting an answer.
+    """GET /api/ask-question/pending — question cards still awaiting an answer.
 
-    The ``question_card`` websocket event is a one-shot broadcast, so a client
-    that reloads or reconnects after it fired has no card on screen while the
-    agent is still blocked — the question is invisible until the wait elapses.
-    This is the rehydration source, mirroring ``GET /api/approvals`` for tool
-    approvals (the frontend re-syncs both on websocket open).
+    ``question_card`` is a one-shot broadcast, so a client that reloads or
+    reconnects after it fired has no card on screen while the agent is still
+    waiting — the question is invisible. This is the rehydration source,
+    mirroring ``GET /api/approvals`` for tool approvals (the frontend re-syncs
+    both on websocket open).
 
-    Owner-only on the same grounds as the other two endpoints: the payload is
-    the question text addressed to the owner.
+    Both kinds are listed, distinguished by which identity they carry:
+
+    * a BLOCKING ask carries ``ask_id`` — its payload lives in
+      ``_pending_questions`` for as long as the parked wait does;
+    * a STATELESS card carries ``card_id`` — its redacted payload is kept on the
+      slot's needs-input record. Without it a reloaded tab would show the
+      session's "needs your answer" status with no card to answer, and no way to
+      dismiss it (the client no longer knows the ``card_id``) — a stuck state
+      that only sending a message could clear.
+
+    Owner-only on the same grounds as the other endpoints: the payload is the
+    question text addressed to the owner.
     """
     state: DashboardState = request.app["state"]
     deny = _deny_app_token(request, "ask_question_pending")
@@ -219,17 +272,93 @@ async def api_ask_question_pending(request: web.Request) -> web.Response:
     deny = _deny_non_owner(request, "ask_question_pending")
     if deny is not None:
         return deny
-    return web.json_response(
-        [
+    out: list[dict] = [
+        {
+            "ask_id": ask_id,
+            "slot": p.get("slot", ""),
+            "questions": p.get("questions", []),
+            "ts": p.get("ts", 0),
+        }
+        for ask_id, p in state._pending_questions.items()
+    ]
+    for slot_key, slot in list((getattr(state, "_slots", None) or {}).items()):
+        for card_id, rec in list((getattr(slot, "_question_pending", None) or {}).items()):
+            # Blocking entries are already listed above, from the authoritative
+            # wait registry; a record with no stored questions predates nothing
+            # renderable, so it is a status-only marker and is skipped rather
+            # than emitted as an empty card.
+            if rec.get("blocking") or not rec.get("questions"):
+                continue
+            out.append(
+                {
+                    "card_id": card_id,
+                    "slot": slot_key,
+                    "questions": rec.get("questions", []),
+                    "ts": rec.get("ts", 0),
+                }
+            )
+    return web.json_response(out)
+
+
+async def api_ask_question_dismiss(request: web.Request) -> web.Response:
+    """POST /api/ask-question/dismiss — retire a stateless card's status.
+
+    Body: ``{slot, card_id}`` — the slot key and the card identity the
+    ``question_card`` payload carries. Deliberately not a session key: a
+    channel-born conversation's session key and its slot key differ, and the
+    client holds only the slot. ``card_id`` is required because a dismissal is a
+    round-trip: the card can be replaced by a newer ask before the request lands,
+    and a slot-only clear would retire the NEW card's status, leaving it
+    unanswered with nothing to say so.
+
+    A stateless card (no ``ask_id``) blocks nothing, so dismissing it was purely
+    a client-side removal — and the slot's ``needs_input`` status, which the
+    sidebar and the sessions board read, would go on claiming the agent is
+    waiting on an answer until the next message landed. This is the dismiss half
+    of that record; the answer half retires through the ordinary user message the
+    card's submit sends.
+
+    Owner-only on the same grounds as the other endpoints: it mutates the
+    owner's own session status.
+    """
+    state: DashboardState = request.app["state"]
+    deny = _deny_app_token(request, "ask_question_dismiss")
+    if deny is not None:
+        return deny
+    deny = _deny_non_owner(request, "ask_question_dismiss")
+    if deny is not None:
+        return deny
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
+    slot_key = str(body.get("slot") or "")
+    if not slot_key:
+        return web.json_response({"error": "slot is required", "code": "missing_slot"}, status=400)
+    card_id = str(body.get("card_id") or "")
+    if not card_id:
+        return web.json_response(
+            {"error": "card_id is required", "code": "missing_card_id"}, status=400
+        )
+    # Only the stateless record is dismissible here. A blocking ask owns its own
+    # lifecycle through the answer endpoint, and clearing its status from this
+    # route would report a session as unblocked while its tool call is still
+    # parked on the wait. A stale card_id, an unknown slot and an already-retired
+    # record all land here too: from this route's point of view they are one
+    # answer — there is nothing of yours left to dismiss.
+    if not state.clear_question_pending(slot_key, blocking=False, card_id=card_id):
+        return web.json_response(
             {
-                "ask_id": ask_id,
-                "slot": p.get("slot", ""),
-                "questions": p.get("questions", []),
-                "ts": p.get("ts", 0),
-            }
-            for ask_id, p in state._pending_questions.items()
-        ]
-    )
+                "error": "no pending question card for that slot and card_id",
+                "code": "question_card_not_found",
+            },
+            status=404,
+        )
+    return web.json_response({"ok": True})
 
 
 async def api_ask_question_answer(request: web.Request) -> web.Response:
@@ -249,9 +378,13 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
 
     if body.get("dismissed"):
         answers: dict[str, str] | None = None
@@ -259,11 +392,16 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
         raw = body.get("answers")
         if not isinstance(raw, dict) or not raw:
             return web.json_response(
-                {"error": "answers must be a non-empty object"}, status=400
+                {"error": "answers must be a non-empty object", "code": "invalid_answers"},
+                status=400,
             )
         if len(raw) > _ASK_MAX_QUESTIONS:
             return web.json_response(
-                {"error": f"at most {_ASK_MAX_QUESTIONS} answers"}, status=400
+                {
+                    "error": f"at most {_ASK_MAX_QUESTIONS} answers",
+                    "code": "too_many_answers",
+                },
+                status=400,
             )
         # Keys and values are echoed back to the agent as tool output, so they
         # are coerced to str (a nested object cannot smuggle structure into the
@@ -278,7 +416,10 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
         for k, v in answers.items():
             if len(k) > _ASK_MAX_QUESTION_LEN:
                 return web.json_response(
-                    {"error": f"question key exceeds {_ASK_MAX_QUESTION_LEN} characters"},
+                    {
+                        "error": f"question key exceeds {_ASK_MAX_QUESTION_LEN} characters",
+                        "code": "question_key_too_long",
+                    },
                     status=400,
                 )
             if len(v) > _ASK_MAX_ANSWER_LEN:
@@ -287,14 +428,18 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
                         "error": (
                             f"answer exceeds {_ASK_MAX_ANSWER_LEN} characters "
                             "— shorten it and submit again"
-                        )
+                        ),
+                        "code": "answer_too_long",
                     },
                     status=400,
                 )
 
     if not state.resolve_question(ask_id, answers):
         return web.json_response(
-            {"error": "no pending question with that id (already answered or expired)"},
+            {
+                "error": "no pending question with that id (already answered or expired)",
+                "code": "question_not_found",
+            },
             status=404,
         )
     return web.json_response({"ok": True})

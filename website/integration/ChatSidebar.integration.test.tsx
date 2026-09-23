@@ -34,6 +34,7 @@ describe('ChatSidebar Folder Grouping', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
     mockConfirm.mockReturnValue(true)
     // Hermetic focus baseline. api/client.ts shows a session-expired banner on an
     // unhandled auth 403 and its token input grabs focus on a rAF (client.ts
@@ -89,11 +90,12 @@ describe('ChatSidebar Folder Grouping', () => {
     expect(screen.queryByText('UNGROUPED')).not.toBeInTheDocument()
   })
 
-  it('shortens the primary create action label to New', () => {
+  it('labels the primary create action New chat', () => {
     renderWithProviders(<ChatSidebar {...defaultProps} />)
     const createButton = screen.getByRole('button', { name: 'New chat session' })
-    expect(createButton).toHaveTextContent('New')
-    expect(createButton).not.toHaveTextContent('New chat')
+    // Anchored, not a substring: the point of the key swap is that the visible
+    // label reads as a whole action, so a longer label must fail here too.
+    expect(createButton).toHaveTextContent(/^New chat$/)
   })
 
   it('shows provider logos on pull request chips', async () => {
@@ -101,8 +103,8 @@ describe('ChatSidebar Folder Grouping', () => {
       {
         ...baseSlots[0],
         source_links: [
-          { provider: 'github' as const, number: 113, url: 'https://github.com/kirodotdev/KiroCrew/pull/113', state: 'merged' as const },
-          { provider: 'gitlab' as const, number: 7, url: 'https://gitlab.com/acme/service/-/merge_requests/7' },
+          { provider: 'github' as const, number: 113, label: '#113', url: 'https://github.com/kirodotdev/KiroCrew/pull/113', state: 'merged' as const },
+          { provider: 'gitlab' as const, number: 7, label: '!7', url: 'https://gitlab.com/acme/service/-/merge_requests/7' },
         ],
       },
     ]
@@ -121,8 +123,8 @@ describe('ChatSidebar Folder Grouping', () => {
       {
         ...baseSlots[0],
         source_links: [
-          { provider: 'github' as const, number: 284, url: 'https://github.com/kirodotdev/KiroCrew/pull/284', state: 'merged' as const, ci: 'passed' as const },
-          { provider: 'github' as const, number: 285, url: 'https://github.com/kirodotdev/KiroCrew/pull/285', state: 'open' as const, ci: 'passed' as const },
+          { provider: 'github' as const, number: 284, label: '#284', url: 'https://github.com/kirodotdev/KiroCrew/pull/284', state: 'merged' as const, ci: 'passed' as const },
+          { provider: 'github' as const, number: 285, label: '#285', url: 'https://github.com/kirodotdev/KiroCrew/pull/285', state: 'open' as const, ci: 'passed' as const },
         ],
       },
     ]

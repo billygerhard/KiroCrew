@@ -20,12 +20,12 @@ import os
 import shutil
 import socket
 import stat
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import transport
@@ -214,12 +214,16 @@ def sock_dir(tmp_path: Path) -> Iterator[Path]:
     total to 132 bytes and failed on every macOS checkout while passing on Linux,
     where the shorter ``/tmp`` and the 108-byte cap both help.
 
-    ``/tmp`` directly, with a short unique leaf: the path stays ~25 bytes, so it
-    fits on either platform regardless of how the test is named. Only the tests
-    that actually bind a socket need this; the ones asserting path arithmetic
+    The short base comes from ``tmpdir_helpers.short_tmp_base()`` -- the ONE seam
+    the suite has for "a temp dir short enough for ``sun_path``" -- rather than a
+    literal ``/tmp`` spelled here: a second spelling of the same platform rule is
+    what let the two drift, and whatever root that helper hands out (today the
+    system temp root; a run-owned short root once the floor grows one) applies to
+    this module's binds without a per-site edit. Only the tests that actually
+    bind a socket need this; the ones asserting path arithmetic
     (``lock_path_for``, ``resolve_address``) are unaffected and keep ``tmp_path``.
     """
-    base = Path(tempfile.mkdtemp(prefix="kcs-", dir="/tmp"))
+    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "gwsock-", dir=short_tmp_base()))
     try:
         yield base
     finally:
@@ -494,6 +498,51 @@ def test_create_server_pipe_raises_on_a_name_the_os_rejects() -> None:
         transport._create_server_pipe("not-a-pipe-name", first=True)
 
 
+@pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows pipe creation")
+def test_create_server_pipe_closes_the_handle_when_the_read_mode_flip_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raise between create and hand-off must not orphan a kernel handle.
+
+    The handle has no Python owner until the caller wraps it in a PipeHandle, and
+    ``PipeServer.close()`` only walks ``_free_instances``, which it has not
+    entered yet. So nothing would ever reclaim it: the named-pipe instance would
+    leak once per failed accept for the life of the gateway.
+    """
+    import _winapi
+
+    real_close = _winapi.CloseHandle
+    closed: list[int] = []
+    failed_handle: int | None = None
+    address = transport.resolve_address(tmp_path / "gateway.sock")
+
+    def _boom(handle: int, *_args: object) -> None:
+        nonlocal failed_handle
+        failed_handle = int(handle)
+        raise OSError("read-mode flip failed")
+
+    def _spy_close(handle: int) -> None:
+        closed.append(int(handle))
+        real_close(handle)
+
+    with monkeypatch.context() as m:
+        m.setattr(transport._winapi, "SetNamedPipeHandleState", _boom)
+        m.setattr(transport._winapi, "CloseHandle", _spy_close)
+        with pytest.raises(OSError, match="read-mode flip"):
+            transport._create_server_pipe(address, first=True)
+
+    assert failed_handle is not None
+    assert failed_handle in closed, "the orphaned pipe handle was not closed"
+    # Proof the instance is really gone: FILE_FLAG_FIRST_PIPE_INSTANCE refuses a
+    # second first-instance while any handle to the name is still open, so this
+    # only succeeds if the failed attempt released it.
+    handle = transport._create_server_pipe(address, first=True)
+    try:
+        assert handle
+    finally:
+        real_close(handle)
+
+
 @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows path separators")
 def test_windows_address_is_separator_insensitive(tmp_path: Path) -> None:
     """The stub and gatewayd receive --socket as text and may disagree on the
@@ -714,15 +763,11 @@ async def test_wait_closed_returns_once_connections_are_cancelled(
     await asyncio.wait_for(started.wait(), timeout=5)
 
     server.close()
-    if sys.version_info >= (3, 12):
-        # Awaiting here first is the bug: prove it would block. Gated because
-        # the semantics are version-dependent -- measured blocking on 3.12.13,
-        # and CI showed 3.10 returning immediately, which matches the CPython
-        # change that made wait_closed() await accepted connections landing in
-        # 3.12.0. On 3.10 the reordering is a harmless no-op, so only the
-        # positive assertion below applies there.
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(server.wait_closed()), timeout=0.5)
+    # Awaiting here first is the bug: prove it would block. CPython 3.12.0 made
+    # wait_closed() await accepted connections, so with a stub still attached
+    # this cannot return -- which is why the daemon drains and cancels first.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(server.wait_closed()), timeout=0.5)
 
     for task in handlers:
         task.cancel()
@@ -843,8 +888,9 @@ def test_installing_the_pipe_factory_twice_is_a_noop(
 
 # --- prepare_dir must not run on the event loop -------------------------------
 
-# ``prepare_dir`` -> ``platform_compat.make_owner_only_dir`` shells out to
-# ``icacls`` on Windows with a multi-second timeout. Both call sites are
+# ``prepare_dir`` -> ``platform_compat.make_owner_only_dir`` is blocking file
+# IO whose Windows DACL write can block on a network volume round-trip. Both
+# call sites are
 # coroutines, so an inline call stalls the loop it runs on -- for the manager
 # that is the live gateway's loop (a dashboard toggle freezes chat turns and the
 # liveness heartbeat), and for the daemon it is the loop already serving its
@@ -907,10 +953,18 @@ async def test_manager_offloads_prepare_dir_from_the_event_loop(
 async def test_gatewayd_offloads_prepare_dir_from_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from unittest.mock import AsyncMock
+
     from kiro_crew.mcp_gateway import gatewayd as gw
 
     probe = _LoopProbe()
     monkeypatch.setattr(gw.transport, "prepare_dir", probe)
+    # ``run_gatewayd`` warms the code fingerprint before ``prepare_dir``, and a
+    # cold fingerprint runs the host's real ``git`` against the checkout (the
+    # value is process-cached, so whether THIS test spawns it depends on which
+    # test ran first in the worker). Pin the seam the daemon reads: this test
+    # is about where ``prepare_dir`` runs, not about what the code is.
+    monkeypatch.setattr(gw, "warm_code_fingerprint", AsyncMock(return_value="fp-test"))
     # Lose the singleton election immediately after prepare_dir so the daemon
     # returns without binding anything.
     monkeypatch.setattr(gw.transport, "acquire_singleton_lock", lambda _p: None)

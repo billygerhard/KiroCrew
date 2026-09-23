@@ -12,8 +12,10 @@ Layout::
     <data>/calendar-cache.json               # last calendar sync
     <data>/meetings/<safe_id>/session.json   # per-meeting metadata
     <data>/meetings/<safe_id>/tasks.json     # extracted tasks
+    <data>/meetings/<safe_id>/transcript.jsonl # finalized speech + typed lines
     <data>/meetings/<safe_id>/<agent>.md     # per-agent output (markdown)
     <data>/meetings/<safe_id>/<agent>.html   # per-agent output (html widget)
+    <data>/edits/<safe_id>/<agent>.md        # owner-authored output edit
 
 Security posture (AUTOSDE ``backend-security-controls``):
 
@@ -32,15 +34,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.sel import sel
 
 logger = logging.getLogger("kirocrew.app.meetings")
@@ -261,11 +267,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "meeting_agents": DEFAULT_MEETING_AGENTS,
     "stt_provider": k.DEFAULT_STT_PROVIDER,
     "task_provider": k.DEFAULT_TASK_PROVIDER,
-    "calendar": {"provider": k.DEFAULT_CALENDAR_PROVIDER, "source": ""},
+    "calendar": {
+        "provider": k.DEFAULT_CALENDAR_PROVIDER,
+        "source": "",
+        # The background poller (calendar_poller.py). It only ever runs against a
+        # configured provider, so leaving it on by default costs nothing for the
+        # default `none`.
+        "auto_sync": True,
+        "poll_interval_secs": k.CALENDAR_POLL_INTERVAL_SECS,
+        "precreate_lead_minutes": k.CALENDAR_PRECREATE_LEAD_MINUTES,
+    },
     "presets": {},
     "default_preset": "",
     "poll_interval_active": 5000,
     "poll_interval_idle": 30000,
+    # "" = off. Live translation costs one model call per spoken line.
+    "translation_language": k.DEFAULT_TRANSLATION_LANG,
 }
 
 
@@ -299,7 +316,7 @@ def _repair_builtin_agent_refs(agents: Any) -> Any:
             and isinstance(ref, str)
             and ref.startswith(k.LEGACY_AGENT_NAMESPACE)
         ):
-            entry = {**entry, "agent": ref[len(k.LEGACY_AGENT_NAMESPACE):]}
+            entry = {**entry, "agent": ref[len(k.LEGACY_AGENT_NAMESPACE) :]}
         repaired.append(entry)
     return repaired
 
@@ -322,6 +339,10 @@ def read_config(root: Path | None = None) -> dict[str, Any]:
         config["meeting_agents"] = _repair_builtin_agent_refs(config["meeting_agents"])
     if not isinstance(config.get("calendar"), dict):
         config["calendar"] = dict(DEFAULT_CONFIG["calendar"])
+    else:
+        # The top-level merge does not reach nested keys, so a `calendar` block
+        # written before the poller's settings existed is filled the same way.
+        config["calendar"] = {**DEFAULT_CONFIG["calendar"], **config["calendar"]}
     return config
 
 
@@ -417,6 +438,183 @@ def list_meetings(root: Path | None = None) -> list[dict[str, Any]]:
     return results
 
 
+def delete_meeting(meeting_id: str, root: Path | None = None) -> bool:
+    """Permanently remove one meeting's app-owned data and edit directories.
+
+    The meeting id passes through the same containment barrier as every read and
+    write. A directory link is rejected before resolving the deletion target: an
+    in-root link to another meeting is still the wrong identity and must never
+    turn deleting one row into deleting another meeting's notes.
+
+    Returns ``False`` when no meeting metadata exists, so the route can preserve
+    the list/get contract's 404 for an unknown id.
+    """
+    safe_id = safe_meeting_id(meeting_id)
+    entry = meetings_root(root) / safe_id
+    resolved = contain(entry, operation="meetings.delete", root=root)
+    # One spelling of the edits-path derivation: ``agent_edits_dir`` applies the
+    # same ``contain`` + ``_refuse_linked`` barrier at both the edits ROOT and
+    # the per-meeting entry, so a linked entry anywhere on the chain is refused
+    # before this rmtree could follow it.
+    edit_resolved = agent_edits_dir(safe_id, root)
+
+    # ``contain`` deliberately follows links to detect an escape. For deletion,
+    # following an in-root link would still select the wrong meeting directory.
+    if is_link_or_junction(entry):
+        _audit("meetings.delete", safe_id, outcome="denied")
+        raise MeetingsPathError("meeting directory must not be a link", status=403)
+
+    with meta_transaction():
+        meta = contain(
+            resolved / k.SESSION_META_FILE,
+            operation="meetings.delete_meta",
+            root=root,
+        )
+        if not meta.is_file():
+            return False
+        shutil.rmtree(resolved)
+        if edit_resolved.is_dir():
+            shutil.rmtree(edit_resolved)
+        elif edit_resolved.exists():
+            edit_resolved.unlink()
+    return True
+
+
+# ── durable transcript ──────────────────────────────────────────────────────────────
+
+
+def transcript_path(meeting_id: str, root: Path | None = None) -> Path:
+    """The append-only transcript file for one meeting, containment-checked."""
+    return contain(
+        meeting_dir(meeting_id, root) / k.TRANSCRIPT_FILE,
+        operation="meetings.transcript",
+        root=root,
+    )
+
+
+# Final STT callbacks and typed broadcasts can land on worker threads at the same
+# time. A single lock keeps each JSONL record whole and makes the capacity check
+# plus append one transaction. The critical section contains local file IO only.
+_TRANSCRIPT_LOCK = threading.Lock()
+
+
+def append_transcript(
+    meeting_id: str,
+    text: str,
+    source: str,
+    root: Path | None = None,
+) -> dict[str, str] | None:
+    """Durably append one finalized transcript segment.
+
+    Returns the stored wire record, or ``None`` when the explicit file-size
+    ceiling would be exceeded. The caller turns that result into a 413 before
+    dispatching the line to agents, so any accepted agent input also has a
+    durable transcript record.
+    """
+    entry = {
+        "id": uuid.uuid4().hex,
+        "timestamp": utc_now_iso(),
+        "source": source,
+        "text": text,
+    }
+    encoded = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    path = transcript_path(meeting_id, root)
+    with _TRANSCRIPT_LOCK:
+        current_size = path.stat().st_size if path.is_file() else 0
+        separator = b""
+        if current_size:
+            with path.open("rb") as transcript:
+                transcript.seek(-1, os.SEEK_END)
+                if transcript.read(1) != b"\n":
+                    # A process loss can leave the last JSON object incomplete. A
+                    # separator quarantines that tail as one malformed row instead
+                    # of joining it to, and thereby corrupting, the next valid one.
+                    separator = b"\n"
+        payload = separator + encoded
+        if current_size + len(payload) > k.MAX_TRANSCRIPT_BYTES:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as transcript:
+            transcript.write(payload)
+            transcript.flush()
+            os.fsync(transcript.fileno())
+    return entry
+
+
+def read_transcript_page(
+    meeting_id: str,
+    cursor: int = 0,
+    root: Path | None = None,
+) -> tuple[list[dict[str, str]], int]:
+    """Read valid transcript records at or after an opaque byte cursor.
+
+    A process loss can leave one partial tail record even though each accepted
+    append is flushed and synced. Ignore only malformed rows so earlier durable
+    speech remains available instead of treating the whole meeting as corrupt.
+    A cursor beyond the current file restarts from zero, which makes a stale
+    browser cursor recover if the meeting data is replaced between requests.
+    """
+    path = transcript_path(meeting_id, root)
+    if not path.is_file():
+        return [], 0
+
+    entries: list[dict[str, str]] = []
+    with _TRANSCRIPT_LOCK:
+        try:
+            with path.open("rb") as transcript:
+                transcript.seek(0, os.SEEK_END)
+                size = transcript.tell()
+                start = cursor if 0 <= cursor <= size else 0
+                transcript.seek(start)
+                lines = transcript.read().splitlines()
+                next_cursor = transcript.tell()
+        except OSError:
+            logger.warning("meetings: unreadable transcript at %s", path)
+            return [], cursor
+
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            raw = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning(
+                "meetings: malformed transcript row %d at %s — skipping",
+                line_number,
+                path,
+            )
+            continue
+        if not isinstance(raw, dict):
+            continue
+        entry_id = raw.get("id")
+        timestamp = raw.get("timestamp")
+        source = raw.get("source")
+        text = raw.get("text")
+        if not isinstance(entry_id, str) or not entry_id:
+            continue
+        if not isinstance(timestamp, str) or not timestamp:
+            continue
+        if not isinstance(source, str) or not source:
+            continue
+        if not isinstance(text, str) or not text:
+            continue
+        if source not in k.VALID_TRANSCRIPT_SOURCES:
+            continue
+        entries.append(
+            {
+                "id": entry_id,
+                "timestamp": timestamp,
+                "source": source,
+                "text": text,
+            }
+        )
+    return entries, next_cursor
+
+
+def read_transcript(meeting_id: str, root: Path | None = None) -> list[dict[str, str]]:
+    """Read every valid transcript record in append order."""
+    entries, _cursor = read_transcript_page(meeting_id, root=root)
+    return entries
+
+
 # ── tasks ───────────────────────────────────────────────────────────────────
 
 
@@ -442,6 +640,85 @@ def write_tasks(meeting_id: str, tasks: list[dict[str, Any]], root: Path | None 
     doc = {"meeting_id": meeting_id, "tasks": tasks, "updated_at": utc_now_iso()}
     _write_json(tasks_path(meeting_id, root), doc)
     return doc
+
+
+# ── live translation ────────────────────────────────────────────────────────
+
+
+def translations_path(meeting_id: str, root: Path | None = None) -> Path:
+    return contain(
+        meeting_dir(meeting_id, root) / k.TRANSLATIONS_FILE,
+        operation="meetings.translations",
+        root=root,
+    )
+
+
+def read_translations(meeting_id: str, root: Path | None = None) -> dict[str, Any]:
+    """The meeting's translated lines, or an empty document. BLOCKING.
+
+    Tolerates a missing or malformed file the same way :func:`read_tasks` does:
+    this feeds a live panel, and a half-written file must degrade to "nothing
+    translated yet" rather than break the meeting view.
+    """
+    doc = _read_json(translations_path(meeting_id, root), None)
+    if not isinstance(doc, dict):
+        return {"meeting_id": meeting_id, "language": "", "lines": [], "next_n": 0}
+    lines = doc.get("lines")
+    if not isinstance(lines, list):
+        doc["lines"] = []
+    if not isinstance(doc.get("next_n"), int):
+        doc["next_n"] = len(doc["lines"])
+    if not isinstance(doc.get("language"), str):
+        doc["language"] = ""
+    return doc
+
+
+def append_translation(
+    meeting_id: str,
+    *,
+    language: str,
+    source: str,
+    text: str,
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Append one translated line and return the stored entry. BLOCKING.
+
+    Takes :func:`meta_transaction` for the same reason every other
+    read-modify-write here does: the translation worker and a language change can
+    both be writing, and ``atomic_write`` makes the WRITE atomic, not the
+    read-modify-write around it.
+
+    Returns ``None`` without writing when the meeting does not exist: the
+    worker's persistence runs on a thread and can lose a race with
+    ``delete_meeting`` — without this guard, ``_write_json``'s ``mkdir`` would
+    silently recreate the deleted meeting's directory. Both sides take
+    ``meta_transaction``, so the check cannot interleave with the ``rmtree``.
+
+    Switching target language RESETS the document. Interleaving two languages in
+    one list would leave the panel showing a mix with no way to tell which line is
+    in which, and the old lines are cheap to lose — they are a live aid, not a
+    record. (The transcript itself is kept by the agents, unaffected.)
+
+    ``n`` is monotonic and is NOT reindexed by trimming, so a client polling with
+    ``since`` never re-reads or skips a line.
+    """
+    with meta_transaction():
+        if not meeting_meta_path(meeting_id, root).is_file():
+            return None
+        doc = read_translations(meeting_id, root)
+        if doc.get("language") != language:
+            doc = {"meeting_id": meeting_id, "language": language, "lines": [], "next_n": 0}
+        n = int(doc["next_n"])
+        entry = {"n": n, "source": source, "text": text, "at": utc_now_iso()}
+        lines = list(doc["lines"])
+        lines.append(entry)
+        if len(lines) > k.MAX_TRANSLATION_LINES:
+            lines = lines[-k.MAX_TRANSLATION_LINES :]
+        doc["lines"] = lines
+        doc["next_n"] = n + 1
+        doc["updated_at"] = utc_now_iso()
+        _write_json(translations_path(meeting_id, root), doc)
+    return entry
 
 
 # ── agent output files ──────────────────────────────────────────────────────
@@ -514,6 +791,189 @@ def write_agent_output(
     path = agent_output_path(meeting_id, fname, root)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, content)
+
+
+# ── editable minutes: user edits of agent output, as sidecars ───────────────
+#
+# The one place this app's agent-ownership model bends, so the bargain is written
+# down rather than implied:
+#
+#   The agent keeps sole ownership of its OWN file. A user edit is a SEPARATE file
+#   that takes precedence when the output is read. So the agent's next rewrite
+#   cannot destroy the user's correction, the user's correction cannot destroy the
+#   agent's work, and reverting is a delete rather than a restore.
+#
+# The cost of that, and it is a real one: while an edit exists the user stops seeing
+# what the agent writes. During a LIVE meeting that matters, so an edit records
+# nothing but its own mtime and :func:`read_agent_edit` compares it against the
+# generated file's — which is what lets the dashboard say "the agent has written
+# more since you edited this" instead of quietly freezing the panel.
+#
+# The sidecars live under a fixed app-owned root rather than the per-meeting agent
+# workspace. That root is registered with the shared sensitive-path gate; keeping
+# it outside the directory named in agent prompts is the durable ownership boundary.
+
+
+def _refuse_linked(path: Path, *, operation: str) -> Path:
+    """*path*, after confirming no component of it is a symlink or junction.
+
+    The class-closing invariant for the edits tree: ``contain`` anchors at the
+    whole data dir, so a link ANYWHERE in the sidecar chain — the edits root,
+    the per-meeting directory, or the sidecar file — can resolve to a generated
+    output file while still passing containment, redirecting every sidecar
+    operation onto the agent's own document. Point checks on one component keep
+    leaving the sibling open (the file was refused in one round, the directory
+    surfaced the next), so this refuses the whole family at once: a path whose
+    ``resolve()`` differs from its lexical spelling has a link somewhere in it.
+    The lexical spelling is built from the resolved data root plus validated
+    components only, so on a link-free chain the two are always equal.
+    """
+    if path.resolve() != path:
+        _audit(operation, str(path), outcome="denied")
+        raise MeetingsPathError("edit path must not traverse a link", status=403)
+    return path
+
+
+def agent_edits_root(root: Path | None = None) -> Path:
+    """App-owned root for all user edits, outside agent-writable meeting dirs.
+
+    Built lexically from the RESOLVED data dir so :func:`_refuse_linked` can
+    compare against the unresolved spelling — a linked ``edits/`` entry itself
+    is refused, not followed.
+    """
+    candidate = data_dir(root).resolve() / k.AGENT_EDITS_DIR
+    contain(candidate, operation="meetings.agent_edits_root", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edits_root")
+
+
+def agent_edits_dir(meeting_id: str, root: Path | None = None) -> Path:
+    """One meeting's containment-checked, link-free user-edit directory."""
+    candidate = agent_edits_root(root) / safe_meeting_id(meeting_id)
+    contain(candidate, operation="meetings.agent_edits", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edits")
+
+
+def agent_edit_path(
+    meeting_id: str, agent_def: dict[str, Any], root: Path | None = None
+) -> Path | None:
+    """Path of one agent's edit sidecar, or None for an agent with no output file.
+
+    The filename is :func:`agent_output_filename`'s, so it is derived from the
+    agent's VALIDATED id plus the fixed extension for its widget type — never from a
+    request. Reusing that derivation rather than accepting an id here is deliberate:
+    it means this function adds no new place a client string could become a path.
+
+    The sidecar keeps the output's extension so an edit renders through the same
+    widget path as the text it replaces.
+    """
+    fname = agent_output_filename(agent_def)
+    if not fname:
+        return None
+    # The directory chain is link-free (each builder above enforces
+    # ``_refuse_linked``), and ``fname`` is derived from the validated agent id,
+    # so the same invariant on the joined path refuses a linked SIDECAR FILE —
+    # the last remaining component a link could occupy.
+    candidate = agent_edits_dir(meeting_id, root) / fname
+    contain(candidate, operation="meetings.agent_edit", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edit")
+
+
+def _mtime(path: Path) -> float:
+    """*path*'s mtime, or 0.0 when it cannot be stat'd (missing, raced, denied)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def read_agent_edit(
+    meeting_id: str, agent_def: dict[str, Any], root: Path | None = None
+) -> dict[str, Any] | None:
+    """One agent's edit, or None when the user has not edited it. BLOCKING.
+
+    ``stale`` is True when the agent has rewritten its own output SINCE the edit was
+    saved. Derived from the two mtimes rather than stored, so there is no second
+    piece of state that can drift out of true — and the sidecar stays a plain
+    markdown file a person can open in an editor.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None or not path.is_file():
+        return None
+    try:
+        # ``newline=""`` disables universal-newline translation: the promise is
+        # byte-for-byte, and the default mode would silently rewrite a saved
+        # ``\r\n`` document as ``\n`` on every read.
+        with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+            content = fh.read()
+    except OSError:  # pragma: no cover — raced with a revert
+        return None
+    edited_at = _mtime(path)
+    fname = agent_output_filename(agent_def)
+    generated_at = _mtime(agent_output_path(meeting_id, fname, root)) if fname else 0.0
+    return {
+        "content": content,
+        "stale": generated_at > edited_at,
+    }
+
+
+def read_agent_edits(
+    meeting_id: str, agents: list[dict[str, Any]], root: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    """Every agent's edit, keyed by agent id. BLOCKING.
+
+    Agents the user has not edited are ABSENT rather than present-and-empty, so the
+    dashboard can treat "has an edit" as a key check. An unusable agent definition
+    is skipped for the same reason :func:`read_agent_outputs` skips one — one bad
+    config entry must not blank the whole poll.
+    """
+    edits: dict[str, dict[str, Any]] = {}
+    for agent_def in agents:
+        try:
+            agent_id = safe_agent_id(agent_def.get("id"))
+            edit = read_agent_edit(meeting_id, agent_def, root)
+        except MeetingsPathError:
+            continue
+        if edit is not None:
+            edits[agent_id] = edit
+    return edits
+
+
+def write_agent_edit(
+    meeting_id: str, agent_def: dict[str, Any], content: str, root: Path | None = None
+) -> None:
+    """Persist the user's edit of one agent's output. BLOCKING.
+
+    Writes the SIDECAR and never the agent's file — the whole point of the design.
+
+    This is a whole-file replace with no read-modify-write to protect, so
+    ``atomic_write`` alone makes it all-or-nothing and a lock would buy nothing.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None:
+        raise MeetingsPathError(
+            "this agent has no output file to edit", status=409, code="agent_has_no_output"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # ``newline=""`` — the byte-for-byte promise again: the default translation
+    # rewrites ``\n`` to ``\r\n`` on Windows, and a document that is read back,
+    # edited and saved would accumulate carriage returns on every round trip.
+    atomic_write(path, content, newline="")
+
+
+def revert_agent_edit(meeting_id: str, agent_def: dict[str, Any], root: Path | None = None) -> bool:
+    """Delete an edit sidecar so the agent's own output is served again. BLOCKING.
+
+    Returns whether one existed. Reverting is a delete and nothing else, which is
+    exactly what makes it always safe — the generated file was never touched.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None or not path.is_file():
+        return False
+    try:
+        path.unlink()
+    except OSError:  # pragma: no cover — raced with another revert
+        return False
+    return True
 
 
 # ── calendar cache ──────────────────────────────────────────────────────────

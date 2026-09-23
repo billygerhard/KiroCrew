@@ -23,10 +23,11 @@ widen anything else.
 
 from __future__ import annotations
 
-import time
-
+from conftest import assert_rejected_without_backtracking
 from kiro_crew.constants import (
     MARKER_CLOSERS,
+    MARKER_OPENERS,
+    MARKER_WRAPPERS,
     OPTIONS_RE_LINE,
     OPTIONS_RE_TRAILER,
     split_trailing_protocol_suffix,
@@ -39,7 +40,7 @@ class TestLookalikeClosersAccepted:
             text = f"body prose\n\n[OPTIONS: Alpha | Beta{close}"
             match = OPTIONS_RE_LINE.search(text)
             assert match is not None, f"U+{ord(close):04X} not accepted by LINE"
-            labels = [s.strip() for s in match.group(1).split("|")]
+            labels = [s.strip() for s in match.group("labels").split("|")]
             assert labels == ["Alpha", "Beta"], f"U+{ord(close):04X} -> {labels}"
 
     def test_trailer_grammar_agrees_with_line_grammar(self):
@@ -51,7 +52,7 @@ class TestLookalikeClosersAccepted:
         assert MARKER_CLOSERS[0] == "]"
         match = OPTIONS_RE_LINE.search("[OPTIONS: A | B]")
         assert match is not None
-        assert [s.strip() for s in match.group(1).split("|")] == ["A", "B"]
+        assert [s.strip() for s in match.group("labels").split("|")] == ["A", "B"]
 
 
 class TestClosersNotOverlyBroad:
@@ -70,11 +71,16 @@ class TestClosersNotOverlyBroad:
         assert OPTIONS_RE_LINE.search("[OPTIONS: A | B\u3011 and then more") is None
 
     def test_label_may_contain_a_closer_block_ends_at_the_last_one(self):
-        # Tempered-body property: the block ends at the LAST closer that ends the
-        # line, not the first, so a label may itself contain one.
+        # Tempered-body property: a label may itself contain a closer, so the block
+        # does not necessarily end at the FIRST one. It ends at the last closer
+        # reachable through closers that are MATCHED by an earlier ``[`` or that
+        # CONTINUE the label list -- here the ``]`` after ``a`` is followed by ``|``,
+        # so it stays inside the label. An UNMATCHED closer followed by ordinary
+        # words ends the block instead; see
+        # ``test_options_marker_label_closers.py``.
         match = OPTIONS_RE_LINE.search("[OPTIONS: a] | b\u3011")
         assert match is not None
-        assert [s.strip() for s in match.group(1).split("|")] == ["a]", "b"]
+        assert [s.strip() for s in match.group("labels").split("|")] == ["a]", "b"]
 
 
 class TestStreamingAgreesWithTheRegexes:
@@ -94,9 +100,13 @@ class TestStreamingAgreesWithTheRegexes:
         what makes it a real regression guard rather than a restatement.
         """
         for close in MARKER_CLOSERS:
-            visible, suffix = split_trailing_protocol_suffix(f"body [OPTIONS: A | B{close} [STEERING")
+            visible, suffix = split_trailing_protocol_suffix(
+                f"body [OPTIONS: A | B{close} [STEERING"
+            )
             assert visible == "body ", f"U+{ord(close):04X} -> {visible!r}"
-            assert suffix == f"[OPTIONS: A | B{close} [STEERING", f"U+{ord(close):04X} -> {suffix!r}"
+            assert (
+                suffix == f"[OPTIONS: A | B{close} [STEERING"
+            ), f"U+{ord(close):04X} -> {suffix!r}"
 
     def test_lookalike_closed_marker_reads_as_finished(self):
         """Contract guard, NOT a fix-discriminator.
@@ -106,7 +116,9 @@ class TestStreamingAgreesWithTheRegexes:
         it pins the intended split point for a complete lookalike-closed tail.
         """
         for close in MARKER_CLOSERS:
-            visible, suffix = split_trailing_protocol_suffix(f"visible text\n\n[OPTIONS: A | B{close}")
+            visible, suffix = split_trailing_protocol_suffix(
+                f"visible text\n\n[OPTIONS: A | B{close}"
+            )
             assert visible == "visible text\n\n", f"U+{ord(close):04X} -> {visible!r}"
             assert suffix == f"[OPTIONS: A | B{close}", f"U+{ord(close):04X} -> {suffix!r}"
 
@@ -125,7 +137,9 @@ class TestStreamingAgreesWithTheRegexes:
             text = f"body prose [OPTIONS: Use {close} the bracket"
             visible, suffix = split_trailing_protocol_suffix(text)
             assert visible == "body prose ", f"U+{ord(close):04X} -> {visible!r}"
-            assert suffix == f"[OPTIONS: Use {close} the bracket", f"U+{ord(close):04X} -> {suffix!r}"
+            assert (
+                suffix == f"[OPTIONS: Use {close} the bracket"
+            ), f"U+{ord(close):04X} -> {suffix!r}"
 
     def test_genuinely_unfinished_marker_is_still_detached(self):
         visible, suffix = split_trailing_protocol_suffix("visible\n\n[OPTIONS: A | B")
@@ -134,13 +148,29 @@ class TestStreamingAgreesWithTheRegexes:
 
 
 class TestNoRedosRegression:
+    def test_bracket_classes_share_nothing_with_the_whitespace_runs(self):
+        """The property the grammar's linearity argument rests on, asserted
+        directly: widening ``\\]`` to a character class must not introduce
+        ambiguity with the trailing ``[ \\t]*`` / ``\\s*`` or the separators
+        (CWE-1333). A closer, opener or wrapper that IS whitespace makes the
+        body exponential (measured: doubling per pumped character)."""
+        for name, chars in (
+            ("MARKER_CLOSERS", MARKER_CLOSERS),
+            ("MARKER_OPENERS", MARKER_OPENERS),
+            ("MARKER_WRAPPERS", MARKER_WRAPPERS),
+        ):
+            for ch in chars:
+                assert not ch.isspace(), f"{name} contains whitespace {ch!r}"
+                assert ch not in "|,", f"{name} contains a label separator {ch!r}"
+
     def test_unterminated_marker_with_long_run_stays_linear(self):
-        """Widening ``\\]`` to a character class must not introduce ambiguity with
-        the trailing ``[ \\t]*`` / ``\\s*`` (CWE-1333). No closer shares a
-        character with either, so the body stays unambiguous."""
-        evil = "[OPTIONS:" + ("\t" * 200_000) + "x"
-        start = time.perf_counter()
-        assert OPTIONS_RE_LINE.search(evil) is None
-        assert OPTIONS_RE_TRAILER.search(evil) is None
-        elapsed = time.perf_counter() - start
-        assert elapsed < 1.0, f"marker match too slow ({elapsed:.2f}s) — may backtrack"
+        """The same property, observed: an unterminated head followed by a run
+        of tabs is rejected in CPU time linear in the run. See
+        ``conftest.assert_rejected_without_backtracking`` for why the probe is
+        small-first and on thread CPU rather than a 1.0 s wall clock."""
+
+        def reject(text: str) -> None:
+            assert OPTIONS_RE_LINE.search(text) is None
+            assert OPTIONS_RE_TRAILER.search(text) is None
+
+        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" + ("\t" * n) + "x")

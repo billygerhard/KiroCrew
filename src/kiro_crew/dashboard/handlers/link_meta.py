@@ -25,18 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, AsyncIterator, Dict, Mapping, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from aiohttp import web
-
-if TYPE_CHECKING:  # `ResolveResult` only exists from aiohttp 3.10; see resolve() below.
-    from aiohttp.abc import ResolveResult
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.link_unfurl import (
@@ -51,7 +47,9 @@ from kiro_crew.link_unfurl import (
     build_icon_data_uri,
     decode_html,
     extract_meta,
+    is_login_page_title,
     normalize_cache_key,
+    pinned_connector,
     vet_unfurl_url,
 )
 
@@ -73,6 +71,12 @@ _MAX_CONCURRENT_FETCHES = 4
 #: attempt is a separate vetted request, so this is a request budget, not a
 #: parsing detail.
 _MAX_ICON_ATTEMPTS = 2
+#: Attempts for the ``prefers-color-scheme: dark`` variant, when a page declares
+#: one at all. One, not two: the fallback chain that justifies a second attempt
+#: for the default icon (``/favicon.ico``) has no dark equivalent, and this lane
+#: buys a nicety — the icon the site drew for a dark surface, instead of a
+#: readable-but-plated light one — so it must not cost a second request.
+_MAX_DARK_ICON_ATTEMPTS = 1
 
 _USER_AGENT = "KiroCrew-LinkPreview/1"
 #: Redirect statuses followed. 300 (multiple choices) is excluded: it has no
@@ -131,53 +135,6 @@ class _RawResponse:
     chunks: AsyncIterator[bytes]
 
 
-class _PinnedResolver(aiohttp.abc.AbstractResolver):
-    """Resolver that answers with the address the vet already approved.
-
-    This is the mechanism that makes the vet meaningful. aiohttp would otherwise
-    resolve the hostname itself when opening the connection — a second lookup,
-    which an attacker-controlled DNS server is free to answer differently from
-    the first (DNS rebinding). Pinning means the TCP connection goes to the exact
-    address that was checked, while the hostname still drives SNI and the
-    ``Host`` header so virtual hosting and certificate validation keep working.
-    """
-
-    def __init__(self, host: str, ip: str, port: int) -> None:
-        self._host = host
-        self._ip = ip
-        self._port = port
-
-    async def resolve(
-        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
-    ) -> "List[ResolveResult]":
-        if host != self._host:
-            # Cannot happen on the current call path (one session per vetted
-            # URL), but a future caller reusing the session for a second host
-            # would silently get the first host's address. Refuse instead.
-            raise OSError(f"resolver pinned to {self._host}, refusing {host}")
-        return [
-            # Built as a plain dict, and `ResolveResult` imported only under
-            # TYPE_CHECKING: that name landed in aiohttp 3.10, while setup.cfg
-            # allows `aiohttp>=3.9`, so importing it at runtime would make this
-            # handler — and therefore the whole gateway — fail to import on an
-            # allowed install. 3.9 annotates `AbstractResolver.resolve` as
-            # `List[Dict[str, Any]]` and every version since reads the same six
-            # keys, so one dict satisfies both while the quoted annotation still
-            # gives the type checker the real TypedDict.
-            {
-                "hostname": self._host,
-                "host": self._ip,
-                "port": port or self._port,
-                "family": socket.AF_INET6 if ":" in self._ip else socket.AF_INET,
-                "proto": 0,
-                "flags": 0,
-            }
-        ]
-
-    async def close(self) -> None:
-        return None
-
-
 class _AiohttpTransport:
     """Real transport: one session per request, pinned to the vetted address."""
 
@@ -189,17 +146,8 @@ class _AiohttpTransport:
         Redirects are NOT followed here — the caller re-vets each hop, which it
         cannot do if aiohttp has already connected to the next one.
         """
-        connector = aiohttp.TCPConnector(
-            resolver=_PinnedResolver(vetted.wire_host, vetted.ip, vetted.port),
-            limit=1,
-            # The pinned resolver already returns a literal with its family, so
-            # aiohttp must not narrow or re-derive it: constraining the family
-            # here would either drop a valid IPv6 target or re-open the door to
-            # a second lookup.
-            family=socket.AF_UNSPEC,
-        )
         session = aiohttp.ClientSession(
-            connector=connector,
+            connector=pinned_connector(vetted),
             timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS),
             headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "identity"},
             auto_decompress=False,
@@ -231,8 +179,8 @@ async def _read_capped(raw: _RawResponse, limit: int, *, truncate: bool) -> Tupl
     field a preview needs (``<title>``, the ``og:*`` tags, the icon ``<link>``) is
     declared in ``<head>``, and :class:`_HeadParser` stops parsing there, so a
     document that merely *continues* past the cap has already delivered the whole
-    preview. Rejecting it discarded a payload that was in hand: at the 256 KiB cap
-    that lost every heavyweight page on the web — a major retailer's home page
+    preview. Rejecting it would discard a payload that is in hand: at the 256 KiB
+    cap that loses every heavyweight page on the web — a major retailer's home page
     measures ~730 KB with its ``<title>`` at byte ~36 000 — while looking, in chat,
     exactly like the feature being switched off.
 
@@ -332,14 +280,14 @@ async def _fetch_html(url: str) -> Tuple[VettedUrl, str, bool]:
     raise _UnfurlFailed("too many redirects")
 
 
-async def _fetch_icon(candidates: Tuple[str, ...]) -> str:
+async def _fetch_icon(candidates: Tuple[str, ...], *, budget: int = _MAX_ICON_ATTEMPTS) -> str:
     """Try the icon candidates in order; return a data URI or ``""``.
 
     Every failure mode is non-fatal: a card with no favicon is complete, so a
     404, a wrong type, an oversized image or a blocked host all just mean "no
     icon" rather than failing the whole preview.
     """
-    for candidate in candidates[:_MAX_ICON_ATTEMPTS]:
+    for candidate in candidates[:budget]:
         try:
             vetted = await _vet(candidate)
             status, headers, body, _cut = await _fetch(vetted, MAX_ICON_BYTES, truncate=False)
@@ -369,13 +317,43 @@ async def _build_payload(url: str) -> Dict[str, Any]:
         # untouched: `cut` is False there, so a genuinely titleless page still gets
         # its domain-only preview.
         raise _UnfurlFailed("title did not survive the read cap")
+    if is_login_page_title(meta.title):
+        # An auth-gated page answered this ANONYMOUS fetch with its sign-in
+        # interstitial, so every text field describes the gate, not the page the
+        # link names ("Sign in to Amazon | Slack" for a Slack thread). Blank
+        # them and the client falls back to the domain — the one label that is
+        # still true. Deliberately left a POSITIVE cache entry: the fetcher
+        # never carries credentials, so retrying on the negative TTL would
+        # re-fetch the same gate every 10 minutes for no gain. The icon fetch
+        # below still runs — a gate serves the site's own favicon, which keeps
+        # identifying the chip.
+        meta = replace(meta, title="", description="", site_name="")
+    icon = await _fetch_icon(meta.icon_candidates)
+    # Fetched only when the page actually declares a dark variant, and after the
+    # default icon rather than beside it: concurrent icon fetches would double
+    # the sockets one unfurl can hold open, and `_MAX_CONCURRENT_FETCHES` bounds
+    # unfurls, not sockets.
+    dark_icon = ""
+    if meta.dark_icon_candidates:
+        dark_icon = await _fetch_icon(meta.dark_icon_candidates, budget=_MAX_DARK_ICON_ATTEMPTS)
+        if dark_icon == icon:
+            # Same bytes carry no information and would double the payload for a
+            # picture the client already has.
+            dark_icon = ""
     return {
         "url": vetted.url,
         "title": meta.title,
         "description": meta.description,
         "site_name": meta.site_name,
         "domain": vetted.domain,
-        "icon": await _fetch_icon(meta.icon_candidates),
+        "icon": icon,
+        # The variant for a dark surface, or "" when the site ships one icon for
+        # every surface. Both are sent because the CLIENT owns the choice: the
+        # theme is a per-tab, runtime-switchable property, while this payload is
+        # cached for 6 h and shared by every tab, so keying the cache on a colour
+        # scheme would double its entries and still need a round trip to repaint
+        # a theme switch.
+        "icon_dark": dark_icon,
         "fetched_at": int(time.time()),
     }
 
@@ -422,8 +400,8 @@ def _response_for(entry: _CacheEntry) -> web.Response:
     # Each status is a literal rather than a forwarded `status=entry.status`. A
     # computed status is unverifiable to the static error-code ratchet
     # (test_error_code_contract.py counts it as `dynamic_status`), and that
-    # bucket is capped precisely so hoisting a status into a variable cannot be
-    # used to slip an un-coded error past the gate.
+    # bucket is capped precisely so hoisting a status into a variable cannot
+    # slip an un-coded error past the gate.
     #
     # Only 400 and 502 reach here: a cached negative is either a rejected URL
     # or a failed fetch. `link_previews_disabled` (403) is answered before the
@@ -502,8 +480,8 @@ async def link_meta_get(request: web.Request) -> web.Response:
     """GET /api/link-meta?url=... — title/description/favicon for one link.
 
     Non-2xx bodies carry only a machine-readable ``code`` (no English prose):
-    the dashboard ships in 10 languages and translates these client-side, per
-    AGENTS.md on backend-owned strings.
+    the dashboard is translated client-side, per
+    docs/system-specs/common/code-style.md on backend-owned strings.
     """
     # Offloaded: KiroCrewConfig.load() stats, reads and validates config files,
     # and this endpoint is hit once per distinct link in a transcript.

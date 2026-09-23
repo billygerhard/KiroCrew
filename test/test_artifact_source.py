@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import cap_project_root_walk, requires_symlinks
 from kiro_crew import artifact_source
 from kiro_crew.artifact_source import (
     COPY,
@@ -33,11 +34,16 @@ def narrow_tempdir(tmp_path: Path, monkeypatch) -> Path:
     """Point the disposable temp root at ``tmp_path/tmp`` only.
 
     Lets the rest of ``tmp_path`` act as ordinary (non-disposable) filesystem
-    so the link branches are reachable in a test.
+    so the link branches are reachable in a test. Ordinary also means UNMARKED:
+    the project-root walk is capped at ``tmp_path`` (see
+    ``conftest.cap_project_root_walk``), so a checkout or ``.kiro`` workspace
+    above the host's temp root cannot turn every "plain directory" here into a
+    project.
     """
     tmp = tmp_path / "tmp"
     tmp.mkdir()
     monkeypatch.setattr(artifact_source, "_tempdir", lambda: str(tmp))
+    cap_project_root_walk(monkeypatch, tmp_path)
     return tmp
 
 
@@ -87,6 +93,7 @@ class TestClassifySourceGuards:
         )
         assert classify_source(target) == (COPY, "")
 
+    @requires_symlinks
     def test_symlink_into_sensitive_is_copy(
         self, narrow_tempdir, tmp_path: Path, monkeypatch
     ) -> None:
@@ -130,7 +137,7 @@ class TestClassifySourceDisposableFirst:
 class TestNoExternalRootNomination:
     """Nothing outside the filesystem itself can nominate an authorizing root.
 
-    A caller-supplied project-root branch used to live here. It was removed: the
+    No caller-supplied project-root branch lives here, by design: the
     recents list it drew on lives in the agent-writable data home, so an agent
     could write ["/"] into it and then forge an artifact naming source_root="/",
     turning re-verification into a rubber stamp for its own input. A LINK is now
@@ -259,8 +266,10 @@ class TestNonGitProjectsLink:
         ``.vscode``. Keying the rule to one accessor let the other real home be
         walked into and authorize a link across the whole profile.
         """
+        original_home = str(Path.home())
         other_home = tmp_path / "otherhome"
         (other_home / ".vscode").mkdir(parents=True)
+        monkeypatch.setenv("HOME", original_home)
         monkeypatch.setenv("USERPROFILE", str(other_home))
         assert project_root_marker(str(other_home)) is None
         assert classify_source(_file(other_home / "notes.md")) == (COPY, "")

@@ -17,10 +17,12 @@ check fails it prints a specific fix command.
 
 ## Common Issues
 
-### "kiro-cli not found in PATH"
+### The default kiro-cli backend is not on PATH
 
-`kiro-cli` is the agent backend and is required: `agent.provider` is fixed to
-`acp`, and the gateway spawns `kiro-cli acp --agent <name>` for every session.
+`agent.provider` is fixed to ACP, while `agent.acp_backend` selects the ACP
+harness. With the default blank backend, `kiro-cli` is required and the gateway
+spawns `kiro-cli acp --agent <name>`. If you selected another ACP backend,
+`kirocrew doctor` reports that backend's executable and setup instead.
 
 ```bash
 which kiro-cli   # should print a path; empty means it is not on PATH
@@ -36,6 +38,46 @@ kiro-cli login
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
 
+**macOS desktop app:** if a command resolves in Terminal but not inside the
+app, the cause is usually launchd's minimal `PATH`, which a shell rc file
+never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
+relaunch — see the
+[macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
+for the recipe and how to persist it across reboots.
+
+### Dashboard asks for sign-in but `kiro-cli` is already authenticated
+
+Typical on a headless host that authenticates `kiro-cli` with an API key rather
+than `kiro-cli login`. `kirocrew doctor` prints a signed-in state while the
+dashboard's setup gate still asks for a device login, and `/api/models` plus
+usage polling answer 503.
+
+The readiness probe forwards `KIRO_API_KEY` to `kiro-cli whoami`, but only from
+the **gateway's own** environment. Exporting it in a shell after the gateway is
+running does not reach it, and neither launchd nor systemd passes the installing
+shell's environment to the service. Put it where the gateway reads it at boot:
+
+```bash
+P=~/.kiro/crew/.env
+touch "$P" && chmod 600 "$P"
+printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
+kirocrew restart           # or restart however you run the gateway
+```
+
+The `chmod` comes first on purpose: under a standard `022` umask a file created
+by the append alone is `0644`, and the gateway only forces `0600` the next time
+it reads it — so the key would be readable by other local users until then. The
+quoting matters for the same reason if your crew home contains a space. Every
+key in `~/.kiro/crew/.env` is loaded into the gateway's environment at startup;
+a bare `KIRO_API_KEY=` with no value does not count, because falsy values are
+skipped. Do not put the key in the systemd unit or in
+`/etc/kirocrew/kirocrew.env` — both are readable by any local user.
+`kirocrew service install` warns when it sees a key in your shell that the
+service will not inherit.
+
+Releases before 0.3.0 filtered `KIRO_API_KEY` out of the probe entirely, so no
+placement works on those; use `kiro-cli login` or upgrade.
+
 ### Agent config missing or stale
 
 ```bash
@@ -45,14 +87,59 @@ kirocrew setup --agent-only
 This regenerates `~/.kiro/agents/kirocrew.json` while preserving your own
 customizations in it.
 
+### Pod commands report Permission denied on the user bus
+
+`kirocrew pod` uses per-user service-manager units. On Linux it must connect to
+`$XDG_RUNTIME_DIR/bus`. Pod verb entry and the Pods row in `kirocrew doctor` run
+`systemctl --user is-system-running` once to test that connection. Low-level unit
+queries do not repeat the probe before each command.
+
+If doctor reports the bus as `sandboxed away`, the socket exists but an outer
+sandbox, such as a container or launcher shim, blocks the current process:
+
+```text
+Failed to connect to bus: Permission denied
+```
+
+Run pod commands from a host shell instead of that sandboxed process:
+
+```bash
+kirocrew doctor
+kirocrew pod status <worktree>
+kirocrew pod up <worktree>
+```
+
+If doctor reports `no user session bus`, or reports the address as stale because
+the socket it names holds nothing, no per-user systemd instance is running for
+this uid, and pods are `systemd --user` units. Start it with the
+`loginctl enable-linger <user>` command doctor prints. That command talks to the
+**system** bus, so it is not self-service on a host that cannot reach a bus at
+all: if it answers `Failed to create bus connection: Permission denied`, run it
+from a host shell, or have an administrator run
+`sudo loginctl enable-linger <uid>` — the numeric uid resolves where a name
+lookup answers `Failed to look up user <user>: No such process`. A Cloud Dev
+Desktop reaches the stale case by exporting `DBUS_SESSION_BUS_ADDRESS` from a
+login session whose manager has since stopped. To preview a worktree with no
+systemd at all, use `./dev-backend.sh`.
+
+Probe and unit operations resolve
+`systemctl` only from trusted system directories and ignore same-named PATH entries. A
+missing trusted executable, missing interpreter, or other failure while executing the
+resolved command is reported as an operational error, not as an absent backend.
+Destructive Dev Fleet cleanup then refuses to remove the worktree. Other Kiro Crew
+features do not depend on the pod service manager.
+
 ### MCP tools not working
 
-`kirocrew doctor` auto-appends missing `tools` / `allowedTools` entries for the
-managed servers and rewrites the file. It cannot auto-add a missing `mcpServers`
-entry, because the command path is install-specific. If tools still fail:
+`kirocrew doctor` auto-appends missing `tools` entries for managed servers and
+rewrites the file. It may also repair `allowedTools` for always-on servers, but
+it deliberately does not blanket-auto-approve `kirocrew-computer` or other
+opt-in servers. It cannot auto-add a missing `mcpServers` entry, because the
+command path is install-specific. If tools still fail:
 
-1. Check `~/.kiro/agents/kirocrew.json` for `kirocrew-core`, `kirocrew-cron`,
-   and `kirocrew-computer` under `mcpServers`, and for the matching `@`-prefixed
+1. Check `~/.kiro/agents/kirocrew.json` for `kirocrew-core` and
+   `kirocrew-cron` under `mcpServers`, plus `kirocrew-computer` only when
+   Computer Use is enabled and supported; check for matching `@`-prefixed
    entries under `tools`
 2. Check `~/.kiro/settings/mcp.json` for globally configured servers
 3. Re-run `kirocrew setup --agent-only`
@@ -60,6 +147,50 @@ entry, because the command path is install-specific. If tools still fail:
 The doctor also runs a live handshake probe against each managed server and
 prints the child's stderr tail on failure, which is usually where the real cause
 (an import error, a bad path) shows up.
+
+### MCP tools missing on an enterprise (work) account
+
+If the probe above reports every server healthy but the tools are still absent in
+sessions — no `spawn_run`, no `cron_add`, no `learn_add` — and your Kiro account
+is a work account signed in through IAM Identity Center, your administrator has
+almost certainly allow-listed MCP servers through an MCP registry. In that mode
+kiro-cli connects only to servers marked `"type": "registry"`, and it drops the
+rest without an error. The local probe cannot see this because it spawns the
+servers directly.
+
+```bash
+kirocrew config set agent.mcp_registry_mode true
+kirocrew restart
+```
+
+Your administrator also has to add `kirocrew-core`, `kirocrew-cron` and
+`kirocrew-computer` to the registry under those exact names. `kirocrew doctor`
+prints an `MCP Governance (enterprise)` section on Identity Center hosts with the
+current state. Full walkthrough, including the registry JSON your administrator
+needs: `docs/guides/enterprise-mcp-governance.md`.
+
+### A remote MCP server shows "Not verified"
+
+Remote MCP servers that authenticate with OAuth — Atlassian, for example — can
+show **Not verified** under Connections → MCP Servers while working perfectly in
+chat. Nothing is wrong with the server. The badge describes what the dashboard
+can see, not what the server can do.
+
+The Kiro CLI runs the OAuth flow and keeps the token in its own credential store;
+Kiro Crew never holds it. The dashboard's status probe therefore connects without a
+token, and the server answers `401`. That single answer covers two situations the
+dashboard cannot tell apart: a server nobody has authorized, and a server already
+authorized through the Kiro CLI. So it reports only what it knows.
+
+To find out which one you have:
+
+- If an agent can call that server's tools in chat, it is authorized and working.
+- If tool calls fail, use the server in chat once. The Kiro CLI starts the OAuth
+  flow on the `401` and Kiro Crew shows the consent link as a banner; approve it
+  there and the calls succeed.
+
+A server that is genuinely broken reads **Error** with the reason next to it, not
+**Not verified**.
 
 ### Dashboard not loading
 
@@ -83,12 +214,15 @@ on another port with `KIROCREW_PORT`.
 
 ### Context window filling up
 
-Kiro Crew auto-compacts at `session.autocompact_pct` context usage (90% by
-default). If compaction fires often:
+Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
+default for a new install — an existing `config.json` keeps whatever value it
+already stores, which for installs created before this default changed is
+`90.0`; check with `kirocrew config get session.autocompact_pct`). If
+compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
-- Enable `skills.lazy_load` so a large skills set injects only a ranked top-K
+- Keep `skills.lazy_load` on (the default) so a large skills set injects only a ranked top-K
   instead of the whole catalog
 - Lower `session.timeout_secs` to recycle sessions more often
 
@@ -106,8 +240,9 @@ Frontend:
 cd website && npm install && npm run build 2>&1 | tail -20
 ```
 
-Node must be `20` or `>= 22`; an older Node fails the Vite build. Python must be
-`>= 3.10`.
+Node must be `>= 22.12`, the floor Vite and Rolldown declare in
+`website/package-lock.json`; an older Node fails the Vite build. Python must be
+`>= 3.12`.
 
 ### Embedding model download failed
 
@@ -184,20 +319,47 @@ Common problems:
   model: doing so would silently swap your vector space and re-embed your whole
   corpus because of a typo. Embeddings stay unavailable (keyword search still
   works) until the path is fixed.
-- **A log line says the model produces N-dim vectors but `embedding_dim` is M,
-  and refuses to load.** Set `memory.embedding_dim` to the number in the message.
-  The width is checked at load precisely so a mismatch is a loud refusal rather
-  than an unexplained loss of semantic search.
-- **You swapped models but nothing re-embedded.** The default vector-space
-  identity is derived from the file's name and size, so two different models of
-  identical byte size look the same. Set `memory.embed_model_id` explicitly to
-  distinguish them.
+- **Embedding-model dimension mismatch.** Set `memory.embedding_dim` to the output width named in the error. The width is checked at load so a mismatch is a loud refusal rather than an unexplained loss of semantic search.
+- **You swapped models but nothing re-embedded.** The vector-space identity
+  is `<label>:sha256:<digest>` of the model file's bytes, so a different model
+  under the same name and size is detected on its own; `memory.embed_model_id`
+  is only the label and cannot pin the old space. Applying the model from the
+  dashboard (Memory → Embedding Model) records the new digest together with
+  `memory.embed_model_stamp`, and an unchanged file reuses that digest at
+  startup without re-reading the weights. A file replaced behind a stale stamp
+  is re-hashed off the event loop. Status reports the model as unverified while
+  that check runs and recovers automatically after it succeeds; applying the
+  model again is not required.
+- **Status warns about inherited legacy vectors.** Older model identities used
+  the file name and size, so they cannot prove which weights produced the
+  vectors. If you changed weights before upgrading, reapply the same file in
+  Memory settings to rebuild inherited vectors while keeping memory text.
 
 ### High memory usage with embeddings
 
 About 700 MB of RSS is expected while the embedding model is loaded. One copy is
 shared by vector memory and the Knowledge Library. The model loads lazily on
 first use and stays resident afterwards.
+
+### `~/.kiro/crew/scratch/` is using a lot of disk
+
+Every agent process gets a directory under `~/.kiro/crew/scratch/` for its
+temp files and its `$KIROCREW_SCRATCH` work products (clones, build logs,
+screenshots). A directory is reclaimed automatically once every process
+recorded in its `.owner` file has exited and nothing in it has been touched for
+an hour, so short-lived sessions clean up on their own.
+
+One directory does not: the background runtime's tree (`runtime-*`) is shared by
+every dashboard session and is handed on from one runtime to its replacement, so
+it lives as long as the gateway does and is never pruned while a session might
+still need it. If it grows large, the fix is a gateway restart (a fresh tree is
+started and the old one is reclaimed by the hourly sweep once its processes are
+gone), or deleting large work products inside it that you know are finished.
+Do not delete a directory whose `.owner` names a live process.
+
+```bash
+du -sh ~/.kiro/crew/scratch/*/ | sort -h | tail
+```
 
 ### Subagent completion event seems cut off
 

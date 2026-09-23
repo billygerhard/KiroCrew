@@ -8,8 +8,8 @@ The official registry is a public, no-auth REST API (v0.1):
 Entries follow the server.json schema: ``name`` (reverse-DNS, e.g.
 ``io.github.owner/repo``), ``description``, ``version``, ``status``
 (active|deprecated|deleted), ``repository.url``, ``packages[]``,
-``remotes[]``. The schema has shipped in both camelCase (2025-09-29)
-and snake_case (earlier drafts) field spellings, and list items may be
+``remotes[]``. The schema has shipped in both camelCase
+and snake_case field spellings, and list items may be
 wrapped as ``{"server": {...}, "_meta": {...}}`` — parsing is defensive
 against all of these: malformed entries are skipped, deleted entries are
 dropped, deprecated entries are badged.
@@ -49,6 +49,9 @@ _USER_AGENT = "KiroCrew/1.0 (mcp-discovery)"
 # is a few KB; anything bigger is malformed or hostile.
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
+# Per-chunk read size while streaming a response to EOF (64 KiB).
+_HTTP_READ_CHUNK_BYTES = 64 * 1024
+
 # _meta key under which the registry reports official status metadata.
 _META_OFFICIAL = "io.modelcontextprotocol.registry/official"
 
@@ -87,11 +90,21 @@ async def _fetch_json(url: str) -> Any | None:
                     return None
                 if resp.status != 200:
                     raise ProviderUnavailableError(f"registry returned HTTP {resp.status}")
-                # Bound the read — resp.text() would buffer unbounded.
-                body = await resp.content.read(_MAX_RESPONSE_BYTES + 1)
-                if len(body) > _MAX_RESPONSE_BYTES:
-                    raise ProviderUnavailableError("registry response too large")
-                return json.loads(body.decode("utf-8"))
+                # Stream to EOF in bounded chunks. The registry sends search
+                # pages with no Content-Length, and a single
+                # StreamReader.read(n) returns only the bytes already
+                # buffered, so a multi-chunk document would reach json.loads
+                # truncated. The size cap is checked against the accumulated
+                # total, so an oversized body is refused mid-stream rather
+                # than buffered whole.
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(_HTTP_READ_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > _MAX_RESPONSE_BYTES:
+                        raise ProviderUnavailableError("registry response too large")
+                    chunks.append(chunk)
+                return json.loads(b"".join(chunks).decode("utf-8"))
     except ProviderUnavailableError:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, OSError) as exc:
@@ -302,6 +315,16 @@ class OfficialRegistryProvider:
 
     def __init__(self, api_base: str = _API_BASE) -> None:
         self._api_base = api_base
+
+    @property
+    def api_base(self) -> str:
+        """The registry base URL this provider fetches from.
+
+        Public because the platform ``discovery`` policy allowlists a registry by
+        URL rather than by name: the name is a self-chosen label, while the base
+        URL is what determines where installable server metadata comes from.
+        """
+        return self._api_base
 
     @property
     def name(self) -> str:

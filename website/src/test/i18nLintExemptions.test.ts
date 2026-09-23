@@ -175,6 +175,115 @@ describe('paths, routes and URLs are exempt', () => {
   })
 })
 
+describe('the autolink template placeholder is exempt', () => {
+  it('stays quiet on the substitution token', async () => {
+    expect(await lint(`export const MATCH_TOKEN = '{match}'`)).toEqual([])
+  })
+
+  it('still reports copy that merely contains the word match', async () => {
+    const messages = await lint(`export const PROBE = ['No match found', '{matches}']`)
+    expect(messages).toHaveLength(2)
+  })
+})
+
+describe('the goal loop kill-switch placeholder is exempt', () => {
+  it('stays quiet on the exact wire token', async () => {
+    expect(await lint(`export const STOP_FILE_TOKEN = '{{STOP_FILE}}'`)).toEqual([])
+  })
+
+  it('still reports prose that carries the token, and any other double-braced word', async () => {
+    const messages = await lint(`export const PROBE = ['To halt the loop, create {{STOP_FILE}}', '{{OTHER_FILE}}']`)
+    expect(messages).toHaveLength(2)
+  })
+})
+
+describe('diagnostic log sentinels are exempt', () => {
+  it('stays quiet on the bare sentinels', async () => {
+    // Real site: lib/paneLog.ts. The reader is whoever greps gateway-launch.log
+    // after a pane failed to load, so a translated `<redacted>` would make the
+    // journal unsearchable in the one incident it exists for.
+    expect(
+      await lint(`export const PROBE = ['<redacted>', '<empty>', '<unserializable>']`),
+    ).toEqual([])
+  })
+
+  it('stays quiet on a sentinel standing in for a query', async () => {
+    // The two values `safePaneUrl` substitutes for a query it will not journal.
+    expect(await lint(`export const PROBE = ['?token=<redacted>', '?<query>']`)).toEqual([])
+  })
+
+  it('still reports copy that merely contains a bracketed word', async () => {
+    // The anchors are the whole tightness argument: a placeholder inside a
+    // sentence is copy, and the surrounding words are what must stay reportable.
+    const messages = await lint(`export const PROBE = ['Enter <name> here', 'Token <redacted>']`)
+    expect(messages).toHaveLength(2)
+  })
+
+  it('still reports a server-contract query that carries no sentinel', async () => {
+    // `?<query>` must not have widened the `^[?&][a-z_]+=…$` shapes into "anything
+    // after a question mark" — a query whose VALUE is prose is still copy.
+    expect(await lint(`export const PROBE = ['?label=Save changes']`)).toHaveLength(1)
+  })
+})
+
+describe('Tailwind arbitrary-variant clusters are exempt', () => {
+  it('stays quiet on the touch-target override clusters', async () => {
+    // Real site: HOVER_NONE_ACTIONS_ROW_CLS / HOVER_NONE_ACTION_BTN_CLS in
+    // utils/touchActions.ts — ALL-CAPS module constants, so `i18n-strict`
+    // looks inside them, and the general class shape cannot admit them (its
+    // char class forbids `@`, `&` and `_`).
+    expect(await lint(
+      "export const PROBE = ['[@media(hover:none)]:opacity-100 [@media(hover:none)]:flex-wrap [@media(hover:none)]:[&_button]:p-2.5 [@media(hover:none)]:[&_svg]:h-5 [@media(hover:none)]:[&_svg]:w-5']",
+    )).toEqual([])
+    expect(await lint(
+      "export const PROBE = ['[@media(hover:none)]:opacity-100 [@media(hover:none)]:p-2.5']",
+    )).toEqual([])
+  })
+
+  it('still reports a cluster that smuggles a plain word', async () => {
+    // Every token must match end to end — prose alongside a variant token is
+    // still copy.
+    expect(await lint(
+      "export const PROBE = ['[@media(hover:none)]:opacity-100 saved']",
+    )).toHaveLength(1)
+  })
+
+  it('still reports prose that merely mentions a media query', async () => {
+    expect(await lint(
+      "export const PROBE = ['Enable [@media(hover:none)] support now']",
+    )).toHaveLength(1)
+  })
+})
+
+describe('CSS selector lists are exempt', () => {
+  it('stays quiet on a list mixing type and attribute selectors', async () => {
+    // Real site: `INTERACTIVE_SEL` in lib/dragGaps.ts, handed to
+    // `header.querySelectorAll`. Translating it would stop the drag-gap
+    // measurement finding any control, which silently widens a drag region over
+    // a button and swallows its clicks.
+    expect(await lint(
+      `export const PROBE = ['a,button,input,select,textarea,[role="button"],[tabindex]']`,
+    )).toEqual([])
+  })
+
+  it('stays quiet on an all-bracketed list', async () => {
+    // The narrower form this shape grew out of; it must keep matching.
+    expect(await lint(`export const PROBE = ['[role="dialog"],[data-x]']`)).toEqual([])
+  })
+
+  it('still reports comma-joined words with no bracket', async () => {
+    // The bracket requirement is the whole tightness argument: without it this
+    // entry would become a general "lowercase words joined by commas" exemption.
+    expect(await lint(`export const PROBE = ['save,delete']`)).toHaveLength(1)
+  })
+
+  it('still reports a sentence that merely contains a bracket', async () => {
+    // Every member must match end to end, and a prose member carries spaces.
+    const messages = await lint(`export const PROBE = ['Select an item [optional]']`)
+    expect(messages).toHaveLength(1)
+  })
+})
+
 describe('string comparison is a position exemption', () => {
   it('stays quiet on a literal compared with startsWith', async () => {
     // The argument is the value being compared AGAINST, so the call cannot
@@ -267,5 +376,52 @@ describe('string comparison is a position exemption', () => {
   it('still reports snake_case-shaped copy that is really a sentence', async () => {
     // The snake exemption is narrow: one lowercase run per underscore, no spaces.
     expect(await lint(`export const LABEL = 'save changes_now'`)).toHaveLength(1)
+  })
+})
+
+describe('Gateway wire markers with a bracketed ALL-CAPS tag are exempt', () => {
+  it('stays quiet on the sub-agent synthesis marker', async () => {
+    // Real site: the PREFIXES table in pages/chat/RecoveryCard.tsx, an ALL-CAPS
+    // module constant, so i18n-strict looks inside it. The value is matched
+    // byte-for-byte against SUBAGENT_SYNTHESIS_PREFIX and then sliced off.
+    expect(await lint("export const PROBE = ['[SYSTEM] Sub-agent synthesis:']")).toEqual([])
+  })
+
+  it('stays quiet on a bare bracketed ALL-CAPS tag with a colon', async () => {
+    expect(await lint("export const PROBE = ['[SYSTEM]:']")).toEqual([])
+  })
+
+  it('still reports copy that opens with an ALL-CAPS tag but is not a marker', async () => {
+    // The trailing colon is what separates a wire marker from real copy. Without
+    // it these would all have been exempt, which is why the pattern requires it.
+    expect(await lint("export const PROBE = ['[BETA] Experimental — expect changes']")).toHaveLength(1)
+    expect(await lint("export const PROBE = ['[ERROR] Unable to load session']")).toHaveLength(1)
+  })
+
+  it('leaves the wholly-bracketed mixed-case siblings exempt too', async () => {
+    // NOT via the pattern added here (which requires an ALL-CAPS tag) — measured:
+    // an existing shape already covers a string that is entirely one bracketed
+    // token. Asserted so that if that other exemption is ever narrowed, the
+    // sibling markers in the same PREFIXES table fail loudly here rather than
+    // silently becoming "untranslated copy" on the next line anyone touches.
+    expect(await lint("export const PROBE = ['[Tool refusal — automatic recovery]']")).toEqual([])
+  })
+
+  it('still reports prose that merely contains a bracketed all-caps word', async () => {
+    // The marker must OPEN the string — a tag mid-sentence is prose.
+    expect(await lint("export const PROBE = ['Turn ended [SYSTEM] unexpectedly']")).toHaveLength(1)
+  })
+
+  it('still reports a string carrying a second bracket', async () => {
+    // No second `[` may follow: that shape is a selector or a class cluster,
+    // both of which have their own narrower exemptions.
+    expect(await lint("export const PROBE = ['[SYSTEM] see [details] here']")).toHaveLength(1)
+  })
+})
+
+describe('capability retention protocol sentinel', () => {
+  it('allows the exact wire mask but still reports prose around it', async () => {
+    expect(await lint("export const mask = '[REDACTED]'" )).toEqual([])
+    expect(await lint("export const label = 'Keep [REDACTED] value'" )).not.toEqual([])
   })
 })

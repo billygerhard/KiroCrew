@@ -18,11 +18,11 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.acp.client import (
-    _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
     AcpAuthRequired,
     AcpError,
@@ -30,12 +30,31 @@ from kiro_crew.acp.client import (
     AcpProcessDied,
     advertised_model_ids,
     model_is_unusable,
+    registration_rate_limited_error,
+    registration_throttle_line,
 )
+from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
-from kiro_crew.acp.types import STOP_REASON_END_TURN
+from kiro_crew.acp.session_handle import WatchdogSettings
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_CONTEXT_RECYCLE,
+)
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION as ACP_BACKENDS_HARNESS_MANAGED,
+)
+from kiro_crew.acp.types import (
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
+    ACP_BACKENDS_SESSION_EVICTION,
+    STOP_REASON_END_TURN,
+)
+from kiro_crew.agent_sdk import host_auth
 from kiro_crew.config.paths import kiro_sessions_dir
+from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.providers.base import CancelOutcome, LLMEvent, LLMProvider
+from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.session_token_sig import schedule_session_token_publish
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +79,8 @@ class AcpSessionProvider(LLMProvider):
         runtime: AcpRuntime,
         *,
         owns_runtime: bool = False,
+        session_key: str = "",
+        channel_id: str | None = None,
     ) -> None:
         self._handle = handle
         self._runtime = runtime
@@ -68,9 +89,17 @@ class AcpSessionProvider(LLMProvider):
         self._owns_runtime = owns_runtime
         self._resumed_flag: bool = False
         self._resume_session_id: str = ""
-        # Warm-pool correlation keys (parity with AcpClient); set by rekey().
-        self._session_key: str = ""
-        self._channel_id: str | None = None
+        # The session this provider serves. ``rekey()`` sets it on a warm-pool
+        # claim, but a COLD start reaches no rekey at all (pool miss, pooling
+        # off, a subagent's own session), so the creating caller — which knows
+        # the key, having just used it to name this session's stub token — hands
+        # it in here. Left empty it is not merely cosmetic: ``reclaim()`` would
+        # push a claim with an empty ``session_key``, which gatewayd rejects as
+        # malformed BEFORE it records the token binding, so a token could never
+        # be re-bound after a daemon respawn and the session would stay
+        # identity-less for the rest of its life.
+        self._session_key: str = session_key
+        self._channel_id: str | None = channel_id
 
     # ── LLMProvider interface ──
 
@@ -92,7 +121,35 @@ class AcpSessionProvider(LLMProvider):
         detects that via ``is_alive()``/``is_process_alive()`` and replaces the
         worker, so this raises rather than silently respawning a new process here
         (the runtime is owned by this provider's lifecycle, not recreated in place).
+
+        Reuse is only cheap where the old session actually GOES AWAY, so this is
+        gated on ``ACP_BACKENDS_SESSION_EVICTION``. The whole primitive rests on
+        the ``old.destroy()`` below reclaiming the previous session's context and
+        MCP children on the shared process; on a backend whose teardown does not
+        evict, that call returns having freed nothing and each reset leaves one
+        more resident session behind. Nothing downstream collects them: such a
+        backend is off the eviction path by construction, and a recycle rule that
+        measures a narrower scope than where the sessions live never sees the
+        growth, so only the age ceiling ever reaps it. Refusing BEFORE creating
+        anything is what makes this safe --
+        ``WorkerPool.reset`` already treats an exception here as "no cheap path"
+        and falls back to a hard ``SessionManager.reset``, which is slower but
+        correct for every backend.
         """
+        # A plain membership test, with no sentinel handling: kiro's own backend
+        # id IS the empty string (``ACP_BACKEND_KIRO = ""``), so an unset
+        # ``acp_backend`` is not a value awaiting resolution -- it already reads as
+        # the member this set admits. Every other value, including one no harness
+        # registered, is refused, which is the fail-closed direction.
+        if self.backend not in ACP_BACKENDS_SESSION_EVICTION:
+            # Raise before the fresh session/new: the caller's hard-reset
+            # fallback is the correct path, and creating a session first would
+            # leak the very session this refusal exists to prevent.
+            raise AcpError(
+                f"backend {self.backend!r} does not evict sessions on teardown, so "
+                "warm conversation reuse would accumulate resident sessions -- "
+                "use the hard-reset path instead"
+            )
         if not self._runtime.is_alive():
             raise AcpProcessDied("Runtime is not alive — cannot start a new conversation")
         old = self._handle
@@ -102,6 +159,7 @@ class AcpSessionProvider(LLMProvider):
         new_handle = await self._runtime.create_session(
             cwd=self._runtime._work_dir,
             agent=self._runtime._agent or None,
+            memory_mode=self.memory_mode,
         )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
@@ -136,12 +194,31 @@ class AcpSessionProvider(LLMProvider):
                     )
                 raise AcpError(f"failed to re-apply model {prior_model} to fresh session") from exc
         self._handle = new_handle
+        # The fresh session launched fresh stubs carrying a fresh token, and
+        # nothing has named it: an unnamed token is refused, not resolved from
+        # the shared runtime's tree. Claim it now, against the session this
+        # provider already serves (empty on a worker no session has claimed yet,
+        # where rekey() does the naming instead).
+        self.reclaim()
         # Best-effort teardown of the old session on the shared process so its
         # context doesn't linger (RSS growth). Never let cleanup mask success.
         try:
             await old.destroy()
         except Exception:
             logger.debug("new_conversation: old session destroy failed", exc_info=True)
+
+    @property
+    def memory_mode(self) -> str:
+        return self._handle.memory_mode
+
+    @memory_mode.setter
+    def memory_mode(self, value: str) -> None:
+        from kiro_crew.execution_context import stricter_memory_mode
+
+        self._handle.memory_mode = stricter_memory_mode(self._handle.memory_mode, value)
+        if self.memory_mode != "persistent":
+            self._handle.keep_transcript = False
+            self._runtime.recording_allowed = False
 
     def set_keep_transcript(self, value: bool) -> None:
         """Mark the underlying session handle to keep (or delete) its
@@ -150,9 +227,24 @@ class AcpSessionProvider(LLMProvider):
         material; the tombstone pruner / conversation TTL sweep owns its
         eventual deletion."""
         try:
-            self._handle.keep_transcript = value
+            self._handle.keep_transcript = value and self.memory_mode == "persistent"
         except Exception:  # pragma: no cover - handle types without the attr
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
+
+    @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's ``$KIROCREW_SCRATCH`` directory (see ``AcpRuntime.work_scratch_dir``)."""
+        return self._runtime.work_scratch_dir
+
+    @property
+    def child_fidelity_aware(self) -> bool:
+        """See AcpSessionHandle.child_fidelity_aware."""
+        return getattr(self._handle, "child_fidelity_aware", False)
+
+    @child_fidelity_aware.setter
+    def child_fidelity_aware(self, value: bool) -> None:
+        if hasattr(self._handle, "child_fidelity_aware"):
+            self._handle.child_fidelity_aware = value
 
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
@@ -163,7 +255,15 @@ class AcpSessionProvider(LLMProvider):
         """
         if self._owns_runtime:
             try:
-                await self._runtime.kill()
+                if self.memory_mode != "persistent":
+                    try:
+                        await self._handle.destroy()
+                    finally:
+                        await self._runtime.kill(
+                            expected=True, reason="provider shutdown (non-persistent)"
+                        )
+                else:
+                    await self._runtime.kill(expected=True, reason="provider shutdown")
             except Exception:
                 logger.debug("AcpSessionProvider.shutdown: runtime kill failed", exc_info=True)
         else:
@@ -177,17 +277,35 @@ class AcpSessionProvider(LLMProvider):
             # prompt on that sessionId with "already in progress". So cancel the
             # session's turn first (best-effort, bounded so an unresponsive
             # runtime can't turn shutdown into a hang), then destroy the handle.
-            if self._handle.is_turn_active:
-                try:
-                    await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
-                except Exception:
-                    logger.debug(
-                        "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
-                    )
+            # The destroy is in a `finally` because the cancel above can be
+            # left through a door `except Exception` does not cover:
+            # `asyncio.CancelledError` is a `BaseException`. That is not a
+            # theoretical exit — the session-restart path runs
+            # `asyncio.wait_for(p.shutdown(), timeout=_SHUTDOWN_TIMEOUT_SECS)`
+            # inside an `asyncio.gather`, so both a shutdown that outruns the
+            # budget and a cancelled restart task deliver a cancellation into
+            # this coroutine, at whatever await it is sitting on.
+            #
+            # Sequentially, that skipped the destroy entirely — and the destroy
+            # is where this arm's two invariants live: `terminate_session`
+            # evicts the session from the SHARED kiro-cli process (it is the
+            # only RSS reclaim on a runtime nothing here is allowed to kill),
+            # and the transcript unlink is the only thing that removes
+            # `~/.kiro/sessions/cli/{sid}.json(+.jsonl)`, as the comment below
+            # says. Nothing retries: every caller drops the provider afterwards.
             try:
-                await self._handle.destroy()
-            except Exception:
-                logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
+                if self._handle.is_turn_active:
+                    try:
+                        await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
+                    except Exception:
+                        logger.debug(
+                            "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
+                        )
+            finally:
+                try:
+                    await self._handle.destroy()
+                except Exception:
+                    logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
             # destroy() deletes the shared-subagent session transcript
             # (~/.kiro/sessions/cli/{sid}.json+.jsonl); no separate cleanup call
             # needed. cleanup_session() below remains for the LLMProvider API.
@@ -214,21 +332,62 @@ class AcpSessionProvider(LLMProvider):
             except OSError:
                 logger.warning("cleanup_session: failed to delete %s", target, exc_info=True)
 
+    @property
+    def context_incarnation(self) -> object:
+        return (id(self._handle), self.session_id, self.process_instance)
+
+    @property
+    def context_provider_type(self) -> str:
+        from kiro_crew.providers.acp import provider_label
+
+        return provider_label(self)
+
+    @property
+    def native_context_documents(self) -> dict[str, str]:
+        return dict(self._handle.native_context_documents)
+
+    @property
+    def native_steering(self) -> bool:
+        from kiro_crew.acp.types import ACP_BACKEND_KAS
+
+        return self.backend == ACP_BACKEND_KAS
+
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""
+        # Re-establish this session's gateway claim before the turn can call a
+        # tool. The shared identity publisher does the same at every surface that
+        # drives a USER turn, and this is the boundary the sessions it cannot see
+        # cross — a subagent's, which no dispatch surface publishes for, and
+        # which is the session type the token exists to protect. Without it a
+        # daemon respawn mid-run leaves a subagent's stubs refused for the whole
+        # remaining run rather than for one turn. Idempotent and
+        # fire-and-forget: gatewayd skips a connection already carrying this
+        # session, so the steady-state effect is refreshing the token binding.
+        #
+        # Guarded, like the identity publisher's own call: a turn must never fail
+        # because a claim could not be pushed, and the worst case of not pushing
+        # is a session that stays fail-closed for one more turn. The guard is
+        # here rather than inside ``reclaim``, which reads its state directly so
+        # a wiring break surfaces where it is asserted.
         try:
-            async for event in self._handle.prompt(message):
-                yield event
+            self.reclaim()
+        except Exception:
+            logger.debug("stream: stub re-claim failed", exc_info=True)
+        try:
+            async with aclosing(
+                self.essential_delivery.stream(
+                    message, self._handle.prompt, lambda: self.context_incarnation
+                )
+            ) as events:
+                async for event in events:
+                    yield event
         except AcpRuntimeDead as exc:
             # Translate the shared-runtime death into the exception types
-            # chat_runner handles (parity with AcpClient): auth-expiry ->
-            # AcpAuthRequired (non-retryable login prompt); otherwise
-            # AcpProcessDied. Without this, AcpRuntimeDead (an AcpRuntimeError,
-            # NOT an AcpError) escapes both the AcpProcessDied and AcpError
-            # handlers and surfaces as an unhandled crash.
-            if self._runtime.saw_not_logged_in():
-                raise AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE) from exc
-            raise AcpProcessDied(str(exc)) from exc
+            # chat_runner handles (parity with AcpClient) — see _translate_dead.
+            # Without this, AcpRuntimeDead (an AcpRuntimeError, NOT an AcpError)
+            # escapes both the AcpProcessDied and AcpError handlers and surfaces
+            # as an unhandled crash.
+            raise self._translate_dead(exc) from exc
         except AcpRuntimeError as exc:
             # Base AcpRuntimeError (e.g. prompt()'s "turn already active"
             # concurrent-prompt guard) is also OUTSIDE the AcpError hierarchy;
@@ -241,25 +400,76 @@ class AcpSessionProvider(LLMProvider):
         return await self._guarded(self._handle.steer(message))
 
     @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the handle's last steer (0.0 if never steered)."""
+        return float(getattr(self._handle, "last_steer_monotonic", 0.0) or 0.0)
+
+    @property
     def supports_steer(self) -> bool:
         """True when the backing handle supports mid-turn steer (kiro-cli)."""
         return self._handle.supports_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
-        """Execute a slash command via prompt (kiro handles commands in-prompt)."""
-        async for event in self.stream(command):
-            yield event
+        """Execute a slash command natively via ``_kiro.dev/commands/execute``.
+
+        Routes through AcpSessionHandle.stream_command so kiro-cli executes the
+        command itself and returns its structured output deterministically —
+        no LLM round-trip. Routing it through ``session/prompt`` instead would be
+        a full model turn that summarized the output rather than returning it.
+        The handle keeps /compact, /help, and
+        non-kiro backends (KAS) on the prompt transport — see its docstring.
+        Same exception translation as stream(): everything leaving this
+        surface stays within AcpError.
+        """
+        # /compact and /clear discard native history; invalidate before dispatch
+        # so the next warm turn resends the complete snapshot even when the
+        # status receipt is missing or arrives late.
+        self.essential_delivery.prepare_command(command)
+        try:
+            async with aclosing(
+                self.essential_delivery.stream(
+                    command, self._handle.stream_command, lambda: self.context_incarnation
+                )
+            ) as events:
+                async for event in events:
+                    yield event
+        except AcpRuntimeDead as exc:
+            raise self._translate_dead(exc) from exc
+        except AcpRuntimeError as exc:
+            raise AcpError(str(exc)) from exc
 
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
         the AcpError hierarchy) to the AcpError-hierarchy exception every caller
-        expects: AcpAuthRequired on auth-expiry, else AcpProcessDied. Keeps the
-        ENTIRE AcpSessionProvider surface within AcpError (+ asyncio.TimeoutError)
+        expects: AcpAuthRequired on auth-expiry, the typed transient
+        AcpRegistrationRateLimited when the retained stderr shows a throttled
+        dynamic registration, else AcpProcessDied. Keeps the ENTIRE
+        AcpSessionProvider surface within AcpError (+ asyncio.TimeoutError)
         so a runtime.send_* failure never escapes to a caller that only catches
         AcpError (e.g. chat_runner) and lands on its generic `except Exception`
-        (raw error card, no retry/reset). Mirrors stream()'s translation."""
+        (raw error card, no retry/reset). Mirrors stream()'s translation.
+
+        Auth is asked FIRST: a rejected credential is terminal and actionable,
+        so it must never be downgraded to a retryable throttle by a stray
+        throttle line in the same tail. The throttle branch is additionally
+        gated on the handle's ``prompt_or_tool_seen`` latch — a session that
+        already produced output or ran a tool must fail generically, because
+        the transient verdict would license a replay that can repeat side
+        effects. ``getattr`` fails CLOSED (seen=True) so a handle double
+        without the latch never widens the retry surface."""
         if self._runtime.saw_not_logged_in():
-            return AcpAuthRequired(_NOT_LOGGED_IN_MESSAGE)
+            # Same per-harness remedy as stream(): this translation is shared by
+            # every runtime-touching call, so a literal here would misinform an
+            # operator on any harness that does not sign in through kiro-cli.
+            return AcpAuthRequired(
+                host_auth.signed_out_message(self._runtime.acp_backend),
+                backend=self._runtime.acp_backend,
+            )
+        if not getattr(getattr(self, "_handle", None), "prompt_or_tool_seen", True):
+            tail = getattr(self._runtime, "redacted_stderr_tail", lambda: "")()
+            cause = registration_throttle_line(tail) if tail else None
+            if cause is not None:
+                return registration_rate_limited_error(str(exc), cause)
         return AcpProcessDied(str(exc))
 
     async def _guarded(self, awaitable: Any) -> Any:
@@ -291,6 +501,7 @@ class AcpSessionProvider(LLMProvider):
         """Cancel the current turn."""
         if not self._handle.is_turn_active:
             return "no_turn"
+        self.essential_delivery.invalidate()
         try:
             await self._handle.cancel(grace_secs=wait_ack_timeout)
             if wait_ack_timeout > 0:
@@ -307,6 +518,11 @@ class AcpSessionProvider(LLMProvider):
         """Return last known context usage percentage."""
         return self._handle.last_prompt_stats.context_pct
 
+    def context_usage_unknown(self) -> bool:
+        """True when the 0% reading is a post-compaction unknown, not an empty
+        transcript."""
+        return self._handle.last_prompt_stats.context_pct_unknown
+
     def context_window_tokens(self) -> int:
         """Return the context window size in tokens."""
         return self._handle.last_prompt_stats.context_window_tokens
@@ -314,6 +530,17 @@ class AcpSessionProvider(LLMProvider):
     def context_used_tokens(self) -> int:
         """Return tokens used in the current context."""
         return self._handle.last_prompt_stats.context_used_tokens
+
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        The same object ``last_prompt_stats`` exposes and the context accessors
+        above read; declaring it here is what makes the accounting path's read a
+        stated capability instead of a search for that attribute name. The handle
+        installs a fresh object as each turn begins, which is the identity the
+        accounting path compares against.
+        """
+        return self._handle.last_prompt_stats
 
     @property
     def session_id(self) -> str:
@@ -329,6 +556,32 @@ class AcpSessionProvider(LLMProvider):
         return self._runtime.is_alive()
 
     @property
+    def process_instance(self) -> str:
+        """Per-spawn identity of the shared runtime's current process (see base).
+
+        A direct read on purpose: a `getattr` hedge would convert a future
+        wiring break into "no banner is ever live", indistinguishable from
+        correct expiry.
+        """
+        return self._runtime.process_instance
+
+    @property
+    def member_capabilities_supported(self) -> bool:
+        """Full saved member-spec loading is opt-in (harness-parity H6)."""
+        return self._runtime.acp_backend in ACP_BACKENDS_MEMBER_CAPABILITIES
+
+    @property
+    def loaded_capability_template(self) -> str:
+        if (
+            self.member_capabilities_supported
+            and self._owns_runtime
+            and self._runtime.is_alive()
+            and self._handle.active_agent == self._runtime._agent
+        ):
+            return self._handle.active_agent
+        return ""
+
+    @property
     def exit_code(self) -> int | None:
         """Runtime process exit code (None if still running)."""
         proc = getattr(self._runtime, "_process", None)
@@ -338,25 +591,92 @@ class AcpSessionProvider(LLMProvider):
         """Refresh activity timestamp on the runtime."""
         self._runtime._last_activity = time.monotonic()
 
-    def rekey(self, session_key: str, channel_id: str | None = None) -> None:
+    def rekey(
+        self,
+        session_key: str,
+        channel_id: str | None = None,
+        crew_agent: str = "",
+        watchdog: WatchdogSettings | None = None,
+    ) -> None:
         """Re-key for a different session on warm-pool claim (parity with
         AcpClient.rekey). session.py:1309 calls provider.client.rekey(...); when
         the pooled provider is kiro-shared, provider.client is THIS class, so a
         missing rekey() would AttributeError on claim. Stores the correlation
         keys and refreshes runtime activity so the just-claimed process is not
-        idle-reaped."""
+        idle-reaped.
+
+        ``crew_agent`` is the claiming session's canonical crew identity: the
+        pooled runtime was spawned before any crew claimed it, so both the
+        runtime default (future sessions, e.g. new_conversation) and the live
+        handle's watchdog snapshot are rebound here — the identity travels
+        with the session, not the pool key. Empty means "no crew" and rebinds
+        to the globals, so a recycled runtime never carries a previous crew's
+        windows. ``watchdog`` is the pre-resolved snapshot from the async
+        caller (resolved off-loop); None makes rebind load it synchronously."""
         self._session_key = session_key
         self._channel_id = channel_id
+        self._runtime._crew_agent = crew_agent
+        self._handle.rebind_watchdog(crew_agent, settings=watchdog)
         self._runtime._last_activity = time.monotonic()
-        # Claim-push: re-target every MCP stub connection under the shared
-        # runtime's PID to the claiming session (see AcpClient.rekey for the
-        # rationale). Fire-and-forget; no-ops without a gateway socket.
+        # Parity with AcpClient.rekey: the handle's prompt stats describe the
+        # session this runtime served BEFORE the handoff; leaking them lets
+        # check_context_usage() compact the new, empty session.
+        self._handle.last_prompt_stats.reset_context_state()
+        # Claim-push: re-target this session's MCP stub connections under the
+        # shared runtime's PID to the claiming session (see AcpClient.rekey for
+        # the rationale). Fire-and-forget; no-ops without a gateway socket.
+        #
+        # Named by the handle's stub token, so the claim reaches THIS session's
+        # stubs and leaves every sibling session on the same runtime alone — a
+        # subagent's stubs must not be re-pointed at the slot that claimed the
+        # runtime. Empty (the gateway injected no stubs, or an older session)
+        # falls back to the PID-wide re-target this always did.
         schedule_claim(
             self._runtime._mcp_gateway_socket,
             self._runtime.pid,
             session_key,
             channel_id,
+            getattr(self._handle, "stub_session_token", ""),
         )
+        # Re-point this session's SIGNED token mapping at the claiming session, for
+        # the reason AcpClient.rekey states: the token survives the rekey so the
+        # file is what moves. It matters more here — this runtime hosts several
+        # sessions at once, so the mapping is the only channel that can tell them
+        # apart without a daemon. Fire-and-forget; offloads its own file I/O.
+        schedule_session_token_publish(getattr(self._handle, "stub_session_token", ""), session_key)
+
+    def reclaim(self) -> None:
+        """Re-push this session's claim (parity with AcpClient.reclaim).
+
+        The shared runtime makes this the case that matters: its stubs belong to
+        several sessions at once, so the claim must name THIS session's token —
+        and after a gatewayd respawn every one of those tokens is unbound, which
+        gatewayd refuses rather than resolving from the shared process tree.
+        Called at the start of every turn by the shared identity publisher.
+        """
+        token = getattr(self._handle, "stub_session_token", "")
+        if not token:
+            return
+        schedule_claim(
+            self._runtime._mcp_gateway_socket,
+            self._runtime.pid,
+            self._session_key,
+            self._channel_id,
+            token,
+        )
+
+    @property
+    def session_identity_token(self) -> str:
+        """This session's per-session identity token, or ``""``.
+
+        The uniform name the shared per-turn publisher reads
+        (``messaging.identity._publish_session_token``), parity with
+        :attr:`AcpClient.session_identity_token`. On this provider the token lives
+        on the session HANDLE rather than on the runtime, because the runtime is
+        shared by every session on it and the token names exactly one.
+        """
+        token = getattr(self._handle, "stub_session_token", "")
+        return token if isinstance(token, str) else ""
 
     @property
     def _agent(self) -> str:
@@ -379,8 +699,64 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def backend(self) -> str:
-        """ACP backend identifier. Always empty string for kiro-cli."""
-        return ""
+        """ACP backend identifier, delegated to the runtime that serves it.
+
+        Not a constant: this provider fronts whichever backend ``AcpRuntime``
+        spawned, and it replaces the placeholder ``AcpClient`` on
+        ``AcpProvider._client`` once startup completes — so it is the only
+        remaining place a consumer can read the backend back off a started
+        provider. Reporting kiro unconditionally would persist every KAS
+        session under the kiro label.
+        """
+        return self._runtime.acp_backend
+
+    @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when a manual ``/compact`` cannot be served, else ``None``.
+
+        Same ``ACP_BACKENDS_COMPACT`` membership answer as
+        ``AcpProvider.manual_compact_unsupported_backend``, for the
+        bare shared-subagent shape that is handed out without the
+        ``AcpProvider`` wrapper.
+        """
+        backend = self.backend
+        if not isinstance(backend, str) or backend in ACP_BACKENDS_COMPACT:
+            return None
+        return backend
+
+    @property
+    def compaction_self_managed(self) -> bool:
+        """Same membership answer as ``AcpProvider.compaction_self_managed``, for
+        the bare shared-subagent shape handed out without the wrapper."""
+        backend = self.backend
+        if not isinstance(backend, str):
+            return True
+        return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
+
+    @property
+    def compaction_unmanaged_backend(self) -> str | None:
+        """Backend id when neither Crew nor the harness compacts, else ``None``.
+
+        Same ``ACP_BACKENDS_CONTEXT_RECYCLE`` membership answer as
+        ``AcpProvider.compaction_unmanaged_backend``, for the bare
+        shared-subagent shape that is handed out without the ``AcpProvider``
+        wrapper.
+        """
+        backend = self.backend
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_CONTEXT_RECYCLE:
+            return None
+        return backend
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child signs in from kiro-cli's own store.
+
+        Membership in ``backends_retired_by_host_logout()`` (harness-parity
+        H5/H14), read off the runtime's backend for the same reason
+        :attr:`backend` is: this provider fronts whichever backend the runtime
+        spawned.
+        """
+        return self._runtime.acp_backend in host_auth.backends_retired_by_host_logout()
 
     def has_active_turn(self) -> bool:
         """True if a prompt turn is currently in progress.
@@ -465,9 +841,12 @@ class AcpSessionProvider(LLMProvider):
 
     async def compact(self, context: str = "") -> None:
         """Trigger context compaction."""
+        self.essential_delivery.invalidate()
         await self._guarded(self._handle.compact(context))
 
-    async def wait_for_compaction(self, timeout: float = 120.0) -> dict[str, str]:
+    async def wait_for_compaction(
+        self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS
+    ) -> dict[str, str]:
         """Wait for compaction completed/failed event."""
         return await self._guarded(self._handle.wait_for_compaction(timeout))
 
@@ -489,10 +868,23 @@ class AcpSessionProvider(LLMProvider):
         Raises :class:`AcpModelUnavailable` so the caller surfaces it as a user
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
+
+        A refusal is never issued on the session-init snapshot alone. That
+        snapshot is one answer, captured at one instant, and a lookup racing a
+        token refresh can answer with the default tier — freezing a
+        false "not entitled" verdict into the session for its whole life. So a
+        would-be refusal first revalidates against a fresh backend probe
+        (:meth:`AcpSessionHandle.refresh_available_models`) and only stands if
+        the fresh answer ALSO lacks the model. A failed probe keeps the stale
+        verdict (fail-safe: no evidence, no entitlement granted).
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
-            raise AcpModelUnavailable(model_id, advertised)
+            fresh = advertised_model_ids(
+                await self._guarded(self._handle.refresh_available_models())
+            )
+            if model_is_unusable(model_id, fresh or advertised):
+                raise AcpModelUnavailable(model_id, fresh or advertised)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:
@@ -510,6 +902,22 @@ class AcpSessionProvider(LLMProvider):
     def _model(self, value: str) -> None:
         """Set model name (AcpClient-compatible attribute)."""
         self._handle._model = value
+
+    @property
+    def served_model(self) -> str:
+        """Backend-resolved model id serving this session (``""`` until known).
+
+        Public delegation to :attr:`AcpSessionHandle.served_model` — covers
+        both the explicit ``set_model`` path and the backend-default path
+        (``currentModelId``), unlike ``_model`` which only reflects the
+        former.
+        """
+        return self._handle.served_model
+
+    @property
+    def agent_version(self) -> str:
+        """The version the backing process runs — see :attr:`AcpSessionHandle.agent_version`."""
+        return self._handle.agent_version
 
     @property
     def _session_id(self) -> str:
@@ -543,6 +951,10 @@ class AcpSessionProvider(LLMProvider):
         """Drain OAuth requests captured while the shared session initialized."""
         return self._handle.pop_pending_oauth_requests()
 
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report."""
+        return self._handle.mcp_session_report()
+
     def get_valid_effort_levels(self) -> list[str]:
         """Valid effort levels from config options."""
         return self._handle.get_valid_effort_levels()
@@ -562,6 +974,32 @@ class AcpSessionProvider(LLMProvider):
     def last_prompt_stats(self):
         """Per-turn statistics (context usage, credits, etc.)."""
         return self._handle.last_prompt_stats
+
+    @property
+    def last_compaction_transient(self) -> bool:
+        """Whether that failure is worth retrying (from the live session handle).
+
+        Coerced to a real ``bool`` because the consumer compares against
+        ``True`` — a truthy stand-in must not read as a verdict.
+        """
+        return getattr(self._handle, "last_compaction_transient", False) is True
+
+    @property
+    def last_infra_error(self) -> InfraError | None:
+        """The live session handle's L1 verdict — read THROUGH, never cached.
+
+        The handle clears it at turn start and overwrites it on every later tool
+        result, so a copy stored here would keep serving a spent verdict after a
+        success or an empty output. Deliberately NOT the
+        ``child_fidelity_aware`` shape (stored then re-applied): that one exists
+        only because the placeholder client is discarded, and an InfraError
+        belongs to one tool result and cannot be re-applied to another.
+
+        ``isinstance``, not truthiness: a stand-in handle that auto-creates
+        attributes must not read as a verdict.
+        """
+        err = getattr(self._handle, "last_infra_error", None)
+        return err if isinstance(err, InfraError) else None
 
     # ── Streaming (AcpClient-compatible method name) ──
 

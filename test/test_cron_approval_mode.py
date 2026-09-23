@@ -13,8 +13,22 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from kiro_crew.cron import CronJob, CronSchedule
+from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
 from kiro_crew.llm_helpers import ToolApprovalPolicy
+from kiro_crew.subagent_persistence import create_agent_folder
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestCronApprovalModeField:
@@ -40,6 +54,7 @@ class TestCronApprovalModeGateway:
         gw.sessions = MagicMock()
         gw.sessions.get_pid = MagicMock(return_value=None)
         gw.ctx_builder = MagicMock()
+        gw.ctx_builder.conversation_log.get_metadata_status.return_value = ({}, True)
         gw.slack = MagicMock()
         gw.conv_log = None
         gw.dashboard_state = None
@@ -221,7 +236,7 @@ class TestCronApprovalModeValidation:
     """Validation schema accepts valid values, rejects invalid."""
 
     def _simulate_tool_call(self, tool_name: str, arguments: dict) -> str:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         return _call_tool(tool_name, arguments)
 
@@ -315,6 +330,7 @@ class TestSubagentInheritsPolicy:
         # Parent session has the given policy
         sessions.get_approval_policy = MagicMock(return_value=parent_policy)
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
 
         captured = {}
         mock_client = MagicMock()
@@ -334,8 +350,14 @@ class TestSubagentInheritsPolicy:
         mock_client.stream = fake_stream
 
         runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder)
-        info = SubagentInfo(id="sub1", task="test", parent_session_key=parent_session_key)
+        info = SubagentInfo(
+            id="sub1",
+            task="test",
+            parent_session_key=parent_session_key,
+            execution_context=ExecutionContext(None, MemoryStoreRef("default"), "template", ""),
+        )
 
+        create_agent_folder(info.id, task=info.task, execution_context=info.execution_context)
         asyncio.run(runner._run_inner(info, "subagent:sub1"))
         return captured
 
@@ -364,6 +386,7 @@ class TestSubagentInheritsPolicy:
         ctx_builder = MagicMock()
         sessions.get_approval_policy = MagicMock(return_value=parent_policy)
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
 
         mock_client = MagicMock()
         mock_client.approve_tool = AsyncMock()
@@ -390,8 +413,14 @@ class TestSubagentInheritsPolicy:
         runner = SubagentManager(
             sessions=sessions, ctx_builder=ctx_builder, on_tool_approval=on_tool_approval
         )
-        info = SubagentInfo(id="sub1", task="test", parent_session_key=parent_session_key)
+        info = SubagentInfo(
+            id="sub1",
+            task="test",
+            parent_session_key=parent_session_key,
+            execution_context=ExecutionContext(None, MemoryStoreRef("default"), "template", ""),
+        )
 
+        create_agent_folder(info.id, task=info.task, execution_context=info.execution_context)
         with patch("kiro_crew.subagent.sel"):
             asyncio.run(runner._run_inner(info, "subagent:sub1"))
         return mock_client
@@ -444,6 +473,7 @@ class TestCronSubagentInjection:
         gw.sessions = MagicMock()
         gw.sessions.get_pid = MagicMock(return_value=None)
         gw.ctx_builder = MagicMock()
+        gw.ctx_builder.conversation_log.get_metadata_status.return_value = ({}, True)
         gw.slack = None
         gw.conv_log = None
         gw.dashboard_state = None
@@ -471,6 +501,7 @@ class TestCronSubagentInjection:
                 mgr = MagicMock()
                 mgr.running = []
                 mgr.queued_count_for = MagicMock(return_value=0)
+                mgr.queued_count_for_async = AsyncMock(return_value=0)
                 return mgr
 
             mock_cls.side_effect = capture_mgr
@@ -589,6 +620,7 @@ class TestCronSubagentInjection:
         # .running is empty, but another subagent is mid-injection
         gw.subagent_mgr.running = []
         gw.subagent_mgr.queued_count_for = MagicMock(return_value=0)
+        gw.subagent_mgr.queued_count_for_async = AsyncMock(return_value=0)
         gw._cron_injecting["cron:daily-prep"] = 1
 
         info = SubagentInfo(
@@ -731,7 +763,12 @@ class TestNoCronsFlag:
         from kiro_crew.slack.gateway import run_gateway
 
         cfg = MagicMock()
-        with patch("kiro_crew.slack.gateway.GatewayOrchestrator") as mock_cls:
+        with (
+            # The aggregate-cgroup-ceiling apply shells out to systemctl —
+            # a host-service mutation the rootdir guard refuses; stub it.
+            patch("kiro_crew.slack.gateway.ensure_agents_slice_limits", return_value=True),
+            patch("kiro_crew.slack.gateway.GatewayOrchestrator") as mock_cls,
+        ):
             mock_orch = MagicMock()
             mock_orch.run = AsyncMock()
             mock_cls.return_value = mock_orch
@@ -747,13 +784,24 @@ class TestNoCronsFlag:
                 test_mode=False,
             )
 
-    def test_cli_gateway_passes_no_crons(self) -> None:
+    def test_cli_gateway_passes_no_crons(self, monkeypatch, tmp_path) -> None:
         """CLI _gateway function forwards no_crons to run_gateway."""
+        from kiro_crew import cli_server
         from kiro_crew.cli_server import _gateway
 
+        # ``_gateway`` runs the gateway-boot toolchain probes before it reaches
+        # ``run_gateway``: ``activate_mise`` merges the host's mise environment
+        # INTO ``os.environ`` (a PATH leak past the test) and ``_node_ok`` resolves
+        # and spawns the host's real ``node``. Neither is what this test is about,
+        # so both seams are pinned, as are the dist-symlink and launchd reconcile
+        # steps that would otherwise touch the install tree.
+        monkeypatch.setattr(cli_server, "activate_mise", lambda: [])
+        monkeypatch.setattr("kiro_crew.cli._node_ok", lambda: True)
+        monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", lambda: tmp_path / "dist")
+        monkeypatch.setattr(cli_server, "_should_reconcile_launchd_launcher", lambda: False)
         with patch("kiro_crew.cli_server.config_path") as mock_cp, patch(
             "kiro_crew.cli_server.KiroCrewConfig"
-        ) as mock_cfg_cls, patch("kiro_crew.cli_chat._ensure_config_key"), patch(
+        ) as mock_cfg_cls, patch(
             "kiro_crew.cli_server.run_gateway", new_callable=AsyncMock
         ) as mock_run:
             mock_cp.return_value.exists.return_value = True
@@ -769,7 +817,7 @@ class TestNoCronsFlag:
         with patch.object(sys, "argv", ["kirocrew", "gateway", "--no-crons"]):
             from kiro_crew.cli import main
 
-            with patch("kiro_crew.cli._gateway", new_callable=AsyncMock) as mock_gw, patch(
+            with patch("kiro_crew.cli_server._gateway", new_callable=AsyncMock) as mock_gw, patch(
                 "kiro_crew.cli.asyncio"
             ) as mock_asyncio:
                 mock_asyncio.run = MagicMock()
@@ -793,6 +841,7 @@ class TestSubagentRoleModelForcesDedicatedPath:
         sessions.get_pid = MagicMock(return_value=None)
         sessions.get_approval_policy = MagicMock(return_value="")
         sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         ctx_builder = MagicMock()
         ctx_builder.build_message = MagicMock(return_value=("msg", None))
         ctx_builder.hooks.auto_approve_subagent_tools = False
@@ -818,10 +867,18 @@ class TestSubagentRoleModelForcesDedicatedPath:
         shared = AsyncMock(
             side_effect=AssertionError("shared path taken despite a per-role override")
         )
-        info = SubagentInfo(id="sub1", task="test", parent_session_key="parent-key")
-        with patch.object(runner, "_create_shared_session", shared), patch.object(
-            runner, "_should_use_session_sharing", return_value=True
-        ), patch("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda c: cfg)):
+        info = SubagentInfo(
+            id="sub1",
+            task="test",
+            parent_session_key="parent-key",
+            execution_context=ExecutionContext(None, MemoryStoreRef("default"), "template", ""),
+        )
+        create_agent_folder(info.id, task=info.task, execution_context=info.execution_context)
+        with (
+            patch.object(runner, "_create_shared_session", shared),
+            patch.object(runner, "_should_use_session_sharing", return_value=True),
+            patch("kiro_crew.config.loader.KiroCrewConfig.load", classmethod(lambda c: cfg)),
+        ):
             asyncio.run(runner._run_inner(info, "subagent:sub1"))
         return captured, shared
 

@@ -19,6 +19,7 @@ from typing import Any
 
 from kiro_crew.config.loader import config_dir
 from kiro_crew.hooks import safe_read_file_bytes_nolink
+from kiro_crew.slugs import slug_hash_fallback
 
 # ── Custom Themes — validation & parsing core ──
 
@@ -46,25 +47,36 @@ _THEME_CSS_VARS = (
     "--text-strong",
     "--muted",
     "--muted-strong",
+    "--muted-fg",
     "--border",
     "--border-strong",
     "--border-hover",
     "--accent",
+    "--accent-fg",
     "--accent-hover",
     "--accent-subtle",
     "--accent-glow",
     "--ring",
     "--ok",
+    "--ok-fg",
     "--ok-subtle",
     "--warn",
+    "--warn-fg",
     "--warn-subtle",
     "--danger",
+    "--danger-fg",
     "--danger-subtle",
     "--info",
+    "--info-fg",
     "--aim",
+    "--aim-fg",
     "--aim-subtle",
     "--clarify",
     "--clarify-subtle",
+    "--json-key",
+    "--json-str",
+    "--json-num",
+    "--json-bool",
     "--diff-add",
     "--diff-add-text",
     "--diff-del",
@@ -75,6 +87,12 @@ _THEME_CSS_VARS = (
     "--shadow-sm",
     "--shadow-md",
     "--shadow-lg",
+    # Terminal ANSI hues. The other fourteen entries the built-in terminal needs
+    # are derived from --bg / --text / --danger / --ok / --warn / --info above;
+    # magenta and cyan carry no semantic meaning elsewhere in the UI, so a pack
+    # that wants its own terminal palette sets these two.
+    "--term-magenta",
+    "--term-cyan",
 )
 
 
@@ -169,11 +187,45 @@ def _strip_to_allowed_vars(mode_data: dict[str, str]) -> dict[str, str]:
     return result
 
 
-def _slugify_theme_name(name: str) -> str:
-    """Convert a theme name to a filesystem-safe slug."""
+# The prefix the hash fallback builds on, and the constant slug carried by an
+# installed pack whose name filters to nothing: such a pack sits at
+# ``_themes_dir()/custom/`` whatever its name is.
+_THEME_LEGACY_SLUG = "custom"
+
+
+def _theme_slug_ascii_part(name: str) -> str:
+    """The ASCII-filtered slug for *name*, empty when nothing survives.
+
+    Split out of :func:`_slugify_theme_name` so a caller can ask whether a slug
+    came from the hash fallback WITHOUT pattern-matching the result: a theme
+    named ``"Custom 0123456789abcdef"`` filters to ``custom-0123456789abcdef``,
+    which is indistinguishable by shape from a ``custom-<16 hex>`` fallback.
+    Emptiness here is the exact condition the fallback keys on.
+    """
     slug = re.sub(r"[^a-z0-9\-]", "-", name.lower()).strip("-")
     slug = re.sub(r"-+", "-", slug)
-    return slug[:_THEME_SLUG_MAX_LEN] or "custom"
+    return slug[:_THEME_SLUG_MAX_LEN]
+
+
+def _slugify_theme_name(name: str) -> str:
+    """Convert a theme name to a filesystem-safe slug."""
+    return _theme_slug_ascii_part(name) or slug_hash_fallback(
+        name, _THEME_LEGACY_SLUG
+    )
+
+
+def _theme_identity_source(manifest: dict[str, Any]) -> str:
+    """The exact string this manifest's slug derives from.
+
+    ``theme.json`` may declare its own ``slug``; otherwise the display ``name``
+    is used. Two packs agreeing on this string derive the same slug, which is
+    what makes it usable as a pack identity by the install path.
+    """
+    raw = manifest.get("slug")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    name = manifest.get("name", "")
+    return name if isinstance(name, str) else ""
 
 
 def _safe_theme_slug(slug: str) -> str | None:
@@ -234,14 +286,51 @@ _THEME_ALLOWED_DIRS = {
     "overlays": 2,
     "topbar": 2,
     "audio": 2,
+    "loader": 1,
 }
 # Per-level ceilings (entry count + total uncompressed bytes, §6.2).
 _THEME_ENTRIES_BY_LEVEL = {0: 32, 1: 64, 2: 160}
 _THEME_TOTAL_BYTES_BY_LEVEL = {0: 256 * 1024, 1: 2 * 1024 * 1024, 2: 5 * 1024 * 1024}
-_THEME_MAX_FONTS = 3
+# A pack may ship faces for two ROLES (proportional + monospace), so the cap
+# covers both: three sans weights plus a mono pair is a realistic set. The
+# binding limit stays the per-level total-byte ceiling, not this count.
+_THEME_MAX_FONTS = 6
+# Which Font Family option a face feeds. An entry with no (or an unknown) role
+# is proportional.
+_THEME_FONT_ROLES = frozenset({"sans", "mono"})
+_THEME_FONT_DEFAULT_ROLE = "sans"
+# Font tokens a pack must NOT declare in overrides.css. Declaring them there
+# lands the font on <body>, below where the Font Family preference is applied,
+# which silently swallows the user's Mono/System choice. The supported route is
+# the role-tagged ``fonts`` list in theme.json, which the preference respects.
+_THEME_FONT_PIN_PROPS = frozenset(
+    {"--font-body", "--mono", "--theme-font-sans", "--theme-font-mono"}
+)
+# Selectors broad enough that a font-family on them shadows the whole UI, so a
+# font-family declaration on one is a pin. Narrower surfaces (.topbar, a
+# .code-block, button.primary) stay free to set their own face.
+_THEME_FONT_PIN_SELECTORS = frozenset({"body", "html", "*", ":root"})
 _THEME_MAX_OVERLAYS = 5
 _THEME_PERSONA_MAX_CHARS = 2000
 _THEME_BOTNAME_MAX = 48  # branding bot-name display cap (plain text)
+# Installed themes may select only these bundled Lucide symbols. Names cross the
+# manifest/API boundary; executable components and arbitrary SVG never do.
+_THEME_LOADER_ICONS = frozenset(
+    {"cloud", "flower", "heart", "moon", "sparkles", "star", "sun", "zap"}
+)
+_THEME_LOADER_ICONS_MIN = 4
+_THEME_LOADER_ICONS_MAX = len(_THEME_LOADER_ICONS)
+# Custom loader artwork an installed pack ships itself (Level 1): the pack's own
+# images, served with a strict Content-Type + nosniff and the sandboxed asset CSP
+# like any other pack asset (logo/favicon). One image renders on its own; 2..8
+# are cycled by the stock carousel. Animated WebP/APNG/GIF and animated SVG all
+# self-animate inside the <img>, so a pack can ship a single fully-authored loop.
+# SVG is safe here for the same reason logo.svg is: an <img>-referenced SVG runs
+# in the browser's secure static/animated mode — no scripts, no external loads —
+# and is served under _THEME_ASSET_CSP (default-src 'none'; sandbox), never as a
+# top-level document.
+_THEME_LOADER_IMAGE_MAX = 8
+_THEME_LOADER_IMAGE_EXTS = ("png", "webp", "gif", "svg")
 # Per-file size caps by category (bytes), §4.1.
 _THEME_FILE_CAPS = {
     "manifest": 16 * 1024,
@@ -255,6 +344,8 @@ _THEME_FILE_CAPS = {
     "preview": 512 * 1024,
     "overlay": 200 * 1024,
     "topbar": 100 * 1024,
+    # Custom loader: a pack's own image for the carousel / single loader.
+    "loader_icon": 256 * 1024,
     "audio_manifest": 16 * 1024,
     "audio": 512 * 1024,
     "audio_ambient": 2 * 1024 * 1024,
@@ -314,9 +405,9 @@ _THEME_HTML_DENY_RE = re.compile(
 
 # ── Overlay / topbar theme.json declarations (§3.1) ──
 # Declarations are OPTIONAL: a theme.json with no ``overlays``/``topbar`` keys
-# still validates and behaves exactly as before (filesystem-derived placement).
-# When present, they let a pack pin placement/behaviour instead of inheriting
-# the hardcoded defaults below.
+# still validates and falls back to filesystem-derived placement. When present,
+# they let a pack pin placement/behaviour instead of inheriting the hardcoded
+# defaults below.
 _THEME_OVERLAY_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 # Closed position enum (LOCKED — doc gives examples only).
 _THEME_OVERLAY_POSITIONS = frozenset(
@@ -453,6 +544,9 @@ def _classify_theme_file(rel: str) -> tuple[str | None, int]:
         return "overlay", 2
     if top == "topbar" and len(parts) == 2 and parts[1] in ("dark.html", "light.html"):
         return "topbar", 2
+    if top == "loader" and len(parts) == 2:
+        if ext in _THEME_LOADER_IMAGE_EXTS:
+            return "loader_icon", 1
     if top == "audio" and len(parts) == 2 and ext in ("mp3", "ogg", "wav"):
         stem = parts[1].rsplit(".", 1)[0]
         return ("audio_ambient" if stem == "ambient" else "audio"), 2
@@ -645,11 +739,11 @@ def _iter_css_rules(text: str):
 
     The tokenizer is a string-aware state machine: it splits on real top-level
     braces only, treating ``{``/``}``/``;`` inside quoted strings and ``url()``
-    (e.g. data-URIs) as opaque — so a value like ``content:"}"`` no longer
-    truncates a rule, and legit values containing braces are not false-rejected.
+    (e.g. data-URIs) as opaque — so a value like ``content:"}"`` does not
+    truncate a rule, and legit values containing braces are not false-rejected.
     At-rule groups whose body contains nested rules (``@media``) are flattened:
-    their inner rules are yielded and the group prelude itself is not (matching
-    the prior naive parser, which only ever surfaced leaf rules).
+    their inner rules are yielded and the group prelude itself is not, so a
+    consumer only ever sees leaf rules.
     """
     stripped = _CSS_COMMENT_RE.sub(" ", text)
     yield from _iter_css_rules_level(stripped)
@@ -659,7 +753,7 @@ def _iter_css_rules_level(text: str):
     for prelude, body in _scan_css_blocks(text):
         if _css_has_top_level_brace(body):
             # At-rule group (e.g. @media): recurse into its nested rules and do
-            # not emit the group prelude, mirroring the old flat parser.
+            # not emit the group prelude, so a consumer only sees leaf rules.
             yield from _iter_css_rules_level(body)
             continue
         selectors = [s.strip().lower() for s in _css_split_top_level(prelude, ",") if s.strip()]
@@ -727,16 +821,76 @@ def _overrides_layout_violation(
     return None
 
 
-def _validate_overrides_css(text: str) -> str | None:
-    """Install-time denylist for ``overrides.css`` (§4.2).
+def _overrides_font_violation(
+    selectors: list[str], decls: list[tuple[str, str]]
+) -> str | None:
+    """Return an error if an overrides.css rule pins the UI font.
 
-    Two layers: (1) the injection denylist (@import / external url() /
+    Fonts are declared in theme.json's role-tagged ``fonts`` list, which routes a
+    face to the matching Font Family option (Sans / Mono) and leaves System on the
+    OS face. A pin here would instead land the font on a surface *below* where the
+    preference is applied, so the user's Mono/System choice would stop working with
+    nothing on screen explaining why. Rejecting it keeps the manifest the single
+    route, so the preference holds for every pack.
+    """
+    # Decode CSS escapes, THEN lowercase. A browser resolves `--font-b\6f dy` to
+    # `--font-body` while tokenizing, and property names are ASCII
+    # case-insensitive, so `f\4F nt` is `font` to the browser too. Lowercasing
+    # only before the decode leaves `fOnt` unmatched and the pin walks through.
+    names = [_decode_css_escapes(prop).lower() for prop, _val in decls]
+    for name in names:
+        if name in _THEME_FONT_PIN_PROPS:
+            return (
+                f"overrides.css declares {name}; declare fonts in theme.json's "
+                "'fonts' list (with a role of sans or mono) so the user's Font "
+                "Family preference keeps working"
+            )
+    # The `font` shorthand sets the family too, so gating only the longhand would
+    # leave the whole guarantee one keyword away from being bypassed.
+    if any(name in ("font-family", "font") for name in names):
+        for sel in selectors:
+            # Decode the selector for the same reason as the property name: a
+            # browser resolves `b\6f dy` to `body`, so comparing the raw text
+            # would accept at install a pin the runtime layer then drops — the
+            # author gets no error and the two layers disagree.
+            sel_decoded = _decode_css_escapes(sel).lower()
+            # Strip one leading [data-theme=…] scoping prefix and any pseudo tail
+            # so `[data-theme="custom-x-dark"] body` and `body:lang(ja)` are both
+            # recognized as the broad surface they are. The pseudo strip only
+            # applies when something remains in front of it — otherwise it would
+            # consume a bare `:root`, which IS one of the broad surfaces.
+            base = re.sub(r'^(?:html)?\s*\[data-theme[^\]]*\]\s*', "", sel_decoded).strip()
+            without_pseudo = re.sub(r"::?[a-z-]+(?:\([^)]*\))?$", "", base).strip()
+            if without_pseudo:
+                base = without_pseudo
+            if base in _THEME_FONT_PIN_SELECTORS:
+                return (
+                    f"overrides.css sets a font on '{sel}'; declare fonts in "
+                    "theme.json's 'fonts' list so the user's Font Family preference "
+                    "keeps working (a narrower surface such as .topbar is still fine)"
+                )
+    return None
+
+
+def _validate_overrides_css(text: str, *, enforce_font_pins: bool = False) -> str | None:
+    """Content denylist for ``overrides.css`` (§4.2) — install and read paths.
+
+    Three layers: (1) the injection denylist (@import / external url() /
     expression() / javascript: / -moz-binding) and forbidden selectors, then
     (2) a per-rule *layout* denylist (§4.2/§5.1) that rejects rules which could
     hijack the viewport or block interaction — z-index>9999, display:none,
     pointer-events:none, and viewport-covering position:fixed — with an
     exemption for purely decorative ``body::before``/``body::after`` pseudo-
-    elements (the decorative-scanline idiom).
+    elements (the decorative-scanline idiom), and (3) a font-pin denylist that
+    keeps theme.json's role-tagged ``fonts`` list the only route to the UI font.
+
+    ``enforce_font_pins`` gates layer 3 alone, and defaults to OFF because this
+    function also runs when an ALREADY-INSTALLED pack is re-read: a pack that
+    predates the font-pin rule installed legitimately, and failing it here would
+    turn the theme-detail route into a 500, dropping that pack out of the theme
+    map — losing its colours as well as its font. The runtime scoper still drops
+    the pin, so the preference is protected either way; refusing the *install* is
+    what keeps the manifest the single route for new packs.
     """
     if _THEME_CSS_DENY_RE.search(text) or _THEME_CSS_DENY_RE.search(
         _css_denylist_normalize(text)
@@ -753,6 +907,10 @@ def _validate_overrides_css(text: str) -> str | None:
         violation = _overrides_layout_violation(selectors, decls)
         if violation:
             return violation
+        if enforce_font_pins:
+            violation = _overrides_font_violation(selectors, decls)
+            if violation:
+                return violation
     return None
 
 
@@ -1005,7 +1163,61 @@ def _validate_audio_manifest(theme_dir: Path) -> tuple[dict[str, Any] | None, st
     return out, None
 
 
-def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_loader_icons(manifest: dict[str, Any], level: int) -> str | None:
+    """Validate optional stock loader artwork selected by an installed theme."""
+    if "loaderIcons" not in manifest:
+        return None
+    icons = manifest["loaderIcons"]
+    if level < 1:
+        return "theme.json 'loaderIcons' requires level 1"
+    if not isinstance(icons, list):
+        return "theme.json 'loaderIcons' must be an array of stock symbol names"
+    if not (_THEME_LOADER_ICONS_MIN <= len(icons) <= _THEME_LOADER_ICONS_MAX):
+        return (
+            "theme.json 'loaderIcons' must contain "
+            f"{_THEME_LOADER_ICONS_MIN}..{_THEME_LOADER_ICONS_MAX} symbols"
+        )
+    if any(not isinstance(icon, str) for icon in icons):
+        return "theme.json 'loaderIcons' entries must be strings"
+    unknown = sorted(set(icons) - _THEME_LOADER_ICONS)
+    if unknown:
+        return f"theme.json 'loaderIcons' contains unknown symbol: {unknown[0]!r}"
+    if len(set(icons)) != len(icons):
+        return "theme.json 'loaderIcons' entries must be unique"
+    return None
+
+
+def _loader_image_names(theme_dir: Path) -> list[str]:
+    """Sorted file names of the pack's own loader images (png/webp/gif/svg)."""
+    d = theme_dir / "loader"
+    if not d.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in d.iterdir()
+        if p.is_file() and p.suffix.lower().lstrip(".") in _THEME_LOADER_IMAGE_EXTS
+    )
+
+
+def _validate_loader_images(theme_dir: Path) -> str | None:
+    """A pack shipping its own loader art may ship at most 8 images.
+
+    Presence-based (like topbar dark/light) — no manifest key. One image renders
+    on its own; 2..8 are cycled by the carousel. Too many fails install so the
+    loader always has a bounded pool.
+    """
+    names = _loader_image_names(theme_dir)
+    if len(names) > _THEME_LOADER_IMAGE_MAX:
+        return (
+            f"loader/ must contain at most {_THEME_LOADER_IMAGE_MAX} "
+            ".png/.webp/.gif/.svg images"
+        )
+    return None
+
+
+def _validate_theme_dir(
+    path: Path, *, installing: bool = False
+) -> tuple[dict[str, Any] | None, str | None]:
     """Validate an installed theme **directory** (structure + data) for L0/L1/L2.
 
     On success returns ``(summary, None)`` where ``summary`` is the record to
@@ -1015,6 +1227,14 @@ def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     the actual payload (no higher-tier asset than the declared level). Reuses
     ``_validate_theme_data`` for the colour values so the 43-var allowlist and
     per-value CSS sanitisation match editor-created themes.
+
+    ``installing`` marks the install path, where a pack may still be REFUSED
+    for pinning the UI font in ``overrides.css``, or for a ``fonts`` entry
+    declaring an unrecognised ``role``. This function also runs when an
+    already-installed pack is re-read (the theme-detail route), and a pack
+    that predates either rule must keep loading there — so both layers are
+    opt-in rather than applied to every read. See ``_validate_overrides_css``
+    and ``_theme_asset_descriptor``.
     """
     if not path.is_dir() or path.is_symlink():
         return None, "theme path is not a directory"
@@ -1059,6 +1279,44 @@ def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     emoji = manifest.get("emoji", _THEME_DEFAULT_EMOJI)
     if not isinstance(emoji, str):
         return None, "theme.json 'emoji' must be a string"
+    loader_err = _validate_loader_icons(manifest, level)
+    if loader_err:
+        return None, loader_err
+
+    # Font role: reject an unrecognised value at INSTALL time only. The read
+    # path (`_theme_asset_descriptor`, which this function also feeds when an
+    # already-installed pack is re-read by the theme-detail route) stays
+    # lenient and coerces an unknown role to "sans" -- only an absent `role`
+    # is the deliberate default case; an explicit ``null`` is rejected.
+    # Rejecting it only at install keeps an already-installed pack loading,
+    # matching the font-pin check below. "monospace" (the CSS keyword) is the
+    # likeliest typo for exactly the role most likely to be mistyped, and the
+    # failure is otherwise silent: the mono face quietly renders as Sans while
+    # Mono keeps the built-in JetBrains Mono.
+    if installing:
+        fonts_manifest = manifest.get("fonts")
+        if isinstance(fonts_manifest, list):
+            for f in fonts_manifest:
+                if not isinstance(f, dict):
+                    continue
+                # Skip only a genuinely ABSENT role (the deliberate
+                # default case). An explicit JSON `null` is a present,
+                # non-string value and falls through to rejection like any
+                # other bad role, instead of silently coercing to "sans".
+                if "role" not in f:
+                    continue
+                role = f["role"]
+                # isinstance FIRST, same as the read path: `role in
+                # _THEME_FONT_ROLES` against an unhashable value (a list, a
+                # dict) raises TypeError before the membership test runs.
+                if isinstance(role, str) and role in _THEME_FONT_ROLES:
+                    continue
+                fam = f.get("family")
+                fam_label = fam if isinstance(fam, str) and fam else "<unnamed>"
+                return None, (
+                    f"font entry '{fam_label}' has role {role!r}; "
+                    "valid roles are 'sans' and 'mono'"
+                )
 
     max_entries = _THEME_ENTRIES_BY_LEVEL.get(level, 160)
     max_total = _THEME_TOTAL_BYTES_BY_LEVEL.get(level, 5 * 1024 * 1024)
@@ -1116,7 +1374,10 @@ def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
                 return None, f"too many overlays (max {_THEME_MAX_OVERLAYS})"
         # Security-sensitive content checks.
         if category == "overrides":
-            c_err = _validate_overrides_css(entry.read_text(encoding="utf-8", errors="replace"))
+            c_err = _validate_overrides_css(
+                entry.read_text(encoding="utf-8", errors="replace"),
+                enforce_font_pins=installing,
+            )
             if c_err:
                 return None, c_err
         elif category in ("overlay", "topbar"):
@@ -1149,6 +1410,9 @@ def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     tb_err = _validate_topbar_decls(manifest, path)
     if tb_err:
         return None, tb_err
+    li_err = _validate_loader_images(path)
+    if li_err:
+        return None, li_err
     _audio_desc, au_err = _validate_audio_manifest(path)
     if au_err:
         return None, au_err
@@ -1177,12 +1441,14 @@ def _validate_theme_dir(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if data_err:
         return None, data_err
 
-    raw_slug = manifest.get("slug")
-    slug = _slugify_theme_name(
-        raw_slug if isinstance(raw_slug, str) and raw_slug.strip() else name
-    )
+    identity = _theme_identity_source(manifest)
+    slug = _slugify_theme_name(identity)
     return {
         "slug": slug,
+        # The string ``slug`` derives from, carried so the install path can ask
+        # whether an already-installed pack is THIS pack without re-parsing the
+        # manifest. Consumers read named fields, so this key reaches no response.
+        "identity": identity,
         "name": theme_data["name"],
         "emoji": emoji.strip()[:_THEME_EMOJI_MAX_LEN] or _THEME_DEFAULT_EMOJI,
         "level": level,
@@ -1254,15 +1520,45 @@ def _theme_asset_descriptor(
             if not isinstance(weight, int) or isinstance(weight, bool) or not (100 <= weight <= 900):
                 weight = 400
             style = f.get("style") if f.get("style") in ("normal", "italic") else "normal"
+            font_role = f.get("role")
+            # Guard the type before the membership test: `role` is untrusted
+            # manifest JSON, and an unhashable value (a list, a dict) raises
+            # TypeError against a frozenset, which would fail the theme-detail
+            # route for EVERY installed pack, not just the malformed one.
+            if not isinstance(font_role, str) or font_role not in _THEME_FONT_ROLES:
+                font_role = _THEME_FONT_DEFAULT_ROLE
             fmt = "truetype" if file_l.endswith(".ttf") else "woff2"
             out_fonts.append(
-                {"family": fam, "src": rel, "weight": weight, "style": style, "format": fmt}
+                {
+                    "family": fam,
+                    "src": rel,
+                    "weight": weight,
+                    "style": style,
+                    "format": fmt,
+                    "role": font_role,
+                }
             )
     if out_fonts:
         desc["fonts"] = out_fonts
 
     if (theme_dir / "styles" / "overrides.css").is_file():
         desc["hasOverrides"] = True
+
+    loader_icons = manifest.get("loaderIcons")
+    if isinstance(loader_icons, list):
+        resolved_loader_icons = [
+            icon for icon in loader_icons
+            if isinstance(icon, str) and icon in _THEME_LOADER_ICONS
+        ]
+        if len(resolved_loader_icons) >= _THEME_LOADER_ICONS_MIN:
+            desc["loaderIcons"] = resolved_loader_icons[:_THEME_LOADER_ICONS_MAX]
+
+    # Pack-supplied loader artwork (Level 1): the pack's own images, as relative
+    # asset paths the frontend resolves against the theme's asset route. One
+    # image renders on its own; 2..8 are cycled by the carousel.
+    loader_images = _loader_image_names(theme_dir)
+    if loader_images and len(loader_images) <= _THEME_LOADER_IMAGE_MAX:
+        desc["loaderImages"] = [f"loader/{name}" for name in loader_images]
 
     if level >= 2:
         overlays_dir = theme_dir / "overlays"
@@ -1393,6 +1689,7 @@ _THEME_ASSET_CT = {
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".webp": "image/webp",
+    ".gif": "image/gif",
     ".ico": "image/x-icon",
     ".mp3": "audio/mpeg",
     ".ogg": "audio/ogg",
@@ -1444,7 +1741,3 @@ def _resolve_theme_asset(slug: str, subpath: str) -> tuple[Path | None, str | No
     if not target.is_file() or target.is_symlink():
         return None, "not found"
     return target, None
-
-
-def _read_theme_text(target: Path) -> str:
-    return target.read_text(encoding="utf-8", errors="replace")

@@ -14,6 +14,12 @@
 #   --mise    Use mise (https://mise.jdx.dev) for Python and Node.js
 #             instead of system package managers. Does not modify your
 #             global mise config.
+#
+# Env:
+#   KIROCREW_ALLOW_SOURCE_BUILDS=1
+#             Let pip compile a dependency that has no prebuilt wheel for this
+#             host (needs a C toolchain and -dev headers). By default the
+#             install uses prebuilt wheels only and refuses instead of building.
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -39,9 +45,13 @@ done
 # Repo root = directory containing this script (run from a local clone).
 KIROCREW_APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Data home: honor KIROCREW_HOME, else the current default ~/.kiro/crew (NOT the
-# pre-move ~/.kirocrew, which the one-time data-home migration deletes).
+# pre-move ~/.kirocrew, which is not the data home).
 KIROCREW_DATA_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}"
-NODE_VERSION="20"
+NODE_VERSION="24"
+# Minimum Node major the frontend build actually supports. Defined here
+# (not just at the post-install check) because DETECTION consults it: a
+# pre-existing but too-old node must not short-circuit the install ladder.
+NODE_MIN_MAJOR=22
 PYTHON_VERSION="3.12"
 KIROCREW_PORT="${KIROCREW_PORT:-5476}"
 ACP_NPM_PKG="@agentclientprotocol/claude-agent-acp"
@@ -70,10 +80,10 @@ banner() {
     echo ""
     echo "${MAGENTA}${BOLD}"
     cat << 'BANNER'
-   _  ___           ___ _
-  | |/ (_)_ _ ___  / __| |__ ___ __ __
-  | ' <| | '_/ _ \| (__| / _` \ V  V /
-  |_|\_\_|_| \___/ \___|_\__,_|\_/\_/
+   _  ___            ___
+  | |/ (_)_ _ ___   / __|_ _ _____ __ __
+  | ' <| | '_/ _ \ | (__| '_/ -_) V  V /
+  |_|\_\_|_| \___/  \___|_| \___|\_/\_/
 BANNER
     echo "${RESET}"
     echo "  ${DIM}Your personal AI agent${RESET}"
@@ -116,6 +126,18 @@ spinner() {
 }
 
 has() { command -v "$1" >/dev/null 2>&1; }
+
+# True only when a usable node is on PATH: present AND at or above the build's
+# supported floor. `has node` alone was not enough -- Amazon Linux 2023 ships
+# node 18, so the "already installed" branch matched, every install branch
+# (including nvm) was skipped, and the frontend build then ran under an
+# unsupported node and produced no usable dist. A broken binary reports v0 and
+# fails the comparison, which is the intended answer.
+node_supported() {
+    has node || return 1
+    _n="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
+    [ -n "$_n" ] && [ "$_n" -ge "$NODE_MIN_MAJOR" ] 2>/dev/null
+}
 
 # ── Pre-flight ──
 
@@ -179,9 +201,9 @@ if [ "$USE_MISE" -eq 0 ]; then
 info "Checking Python…"
 _py=""
 _find_python() {
-    for _candidate in python3.12 python3.11 python3.10 python3 python; do
+    for _candidate in python3.12 python3.13 python3 python; do
         if has "$_candidate"; then
-            _ok=$("$_candidate" -c "import sys; print(int(sys.version_info >= (3, 10)))" 2>/dev/null || echo "0")
+            _ok=$("$_candidate" -c "import sys; print(int(sys.version_info >= (3, 12)))" 2>/dev/null || echo "0")
             if [ "$_ok" = "1" ]; then
                 _ver=$("$_candidate" -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}')" 2>/dev/null)
                 _py="$_candidate"
@@ -193,37 +215,87 @@ _find_python() {
     return 1
 }
 
+# Provision Python $PYTHON_VERSION without a package manager, for hosts whose
+# archive carries no python3.12 (Ubuntu 22.04, Debian 12, RHEL/CentOS 7). mise
+# ships python-build-standalone builds, which run on old glibc. Every probe
+# below tries this before giving up: without it the >= 3.12 floor turns a host
+# the package manager cannot satisfy into a hard abort, where the >= 3.10 floor
+# had simply accepted the distro's own python3.
+_bootstrap_python() {
+    # Deliberately does NOT install mise itself. Fetching an installer script over
+    # the network and piping it to a shell executes unverified remote content as
+    # the user, and unlike the `--mise` block below this path runs WITHOUT the user
+    # asking for it -- so an automatic fallback must not introduce that. Use mise
+    # only when the host already has it; otherwise the caller stops with guidance.
+    if [ -x "$HOME/.local/bin/mise" ]; then
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    has mise || return 1
+    info "Provisioning Python $PYTHON_VERSION via the installed mise…"
+    mise install "python@$PYTHON_VERSION" -y >/dev/null 2>&1 || return 1
+    _bootstrap_prefix="$(mise where "python@$PYTHON_VERSION" 2>/dev/null)" || return 1
+    [ -n "$_bootstrap_prefix" ] || return 1
+    [ -x "$_bootstrap_prefix/bin/python3" ] || return 1
+    # Prepend rather than assigning _py directly, so _find_python stays the one
+    # place that decides which candidate name is used and records its version.
+    export PATH="$_bootstrap_prefix/bin:$PATH"
+    _find_python
+}
+
 if ! _find_python; then
     # Try to install automatically
     if [ "$(uname)" = "Darwin" ]; then
         info "Installing Python via Xcode Command Line Tools…"
         xcode-select --install 2>/dev/null || true
         sleep 2
-        if ! _find_python; then
+        if ! _find_python && ! _bootstrap_python; then
             warn "Xcode CLT install may be in progress (check the popup)"
             detail "After it finishes, re-run this installer"
-            die "Python 3.10+ required. Waiting for Xcode CLT to finish installing."
+            die "Python 3.12+ required. Waiting for Xcode CLT to finish installing."
         fi
     elif has apt-get; then
-        info "Installing Python 3 via apt…"
+        # python3.12 explicitly where the archive carries it (Ubuntu 24.04+,
+        # Debian 13+). On Ubuntu 22.04 the bare `python3` is 3.10 — below the
+        # >= 3.12 floor — so the fallback package cannot satisfy the probe and
+        # _bootstrap_python provisions 3.12 instead of the install aborting.
+        info "Installing Python 3.12 via apt…"
         sudo apt-get update -qq >/dev/null 2>&1
-        sudo apt-get install -y python3 python3-pip python3-venv >/dev/null 2>&1
-        _find_python || die "Python install failed. Run: sudo apt-get install -y python3 python3-venv"
+        sudo apt-get install -y python3.12 python3.12-venv >/dev/null 2>&1 \
+            || sudo apt-get install -y python3 python3-pip python3-venv >/dev/null 2>&1
+        _find_python || _bootstrap_python \
+            || die "Python 3.12+ is required and this host's apt archive has none.
+     Either: sudo apt-get install -y python3.12 python3.12-venv
+     or install mise (https://mise.jdx.dev/installing-mise.html) and re-run — this
+     installer will then provision Python $PYTHON_VERSION through it."
     elif has dnf; then
-        info "Installing Python 3 via dnf…"
-        sudo dnf install -y python3 python3-pip >/dev/null 2>&1
-        _find_python || die "Python install failed. Run: sudo dnf install -y python3"
+        # python3.12 explicitly: on Amazon Linux 2023 and RHEL 9 the bare
+        # `python3` is 3.9, which no longer satisfies the >= 3.12 floor.
+        info "Installing Python 3.12 via dnf…"
+        sudo dnf install -y python3.12 python3.12-pip >/dev/null 2>&1 \
+            || sudo dnf install -y python3 python3-pip >/dev/null 2>&1
+        _find_python || _bootstrap_python \
+            || die "Python 3.12+ is required and this host's dnf repos have none.
+     Either: sudo dnf install -y python3.12
+     or install mise (https://mise.jdx.dev/installing-mise.html) and re-run."
     elif has yum; then
+        # CentOS/RHEL 7 base repos top out at 3.6, so the bootstrap is the
+        # normal path here rather than the exception.
         info "Installing Python 3 via yum…"
         sudo yum install -y python3 python3-pip >/dev/null 2>&1
-        _find_python || die "Python install failed. Run: sudo yum install -y python3"
+        _find_python || _bootstrap_python \
+            || die "Python 3.12+ is required and yum's base repos cannot supply it.
+     Install mise (https://mise.jdx.dev/installing-mise.html) and re-run, or install
+     Python 3.12+ yourself."
     elif has brew; then
         info "Installing Python 3 via Homebrew…"
         brew install python@3.12 >/dev/null 2>&1 || true
-        _find_python || die "Python install failed. Run: brew install python@3.12"
+        _find_python || _bootstrap_python \
+            || die "Python install failed. Run: brew install python@3.12"
     else
-        die "Python 3.10+ required but not found and no package manager detected.
-     Install Python 3.10+ manually (https://www.python.org/downloads/) and re-run."
+        _bootstrap_python \
+            || die "Python 3.12+ required but not found and no package manager detected.
+     Install Python 3.12+ manually (https://www.python.org/downloads/), or install
+     mise (https://mise.jdx.dev/installing-mise.html) and re-run."
     fi
 fi
 fi # USE_MISE -eq 0 (Python)
@@ -238,9 +310,36 @@ fi
 # ── Node.js ──
 if [ "$USE_MISE" -eq 0 ]; then
 info "Checking Node.js…"
-if has node; then
+if node_supported; then
     _node_ver=$(node --version 2>/dev/null || echo "v0")
     ok "Node.js $_node_ver ($( which node ))"
+elif has node; then
+    # Present but below the floor: say so, then fall through to the install
+    # ladder below rather than building against it.
+    info "Node.js $(node --version 2>/dev/null || echo v0) is below the supported floor (>= $NODE_MIN_MAJOR) — installing a supported Node…"
+    if has apt-get; then
+        sudo apt-get install -y nodejs npm >/dev/null 2>&1 || true
+    elif has dnf; then
+        sudo dnf install -y nodejs >/dev/null 2>&1 || true
+    elif has brew; then
+        brew install node >/dev/null 2>&1 || true
+    fi
+    if ! node_supported; then
+        # Distro package still too old (the common case on AL2023/Debian):
+        # nvm is the only channel that reliably provides a current Node.
+        info "Installing Node.js $NODE_VERSION via nvm…"
+        if [ ! -d "$HOME/.nvm" ]; then
+            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash 2>/dev/null
+        fi
+        export NVM_DIR="$HOME/.nvm"
+        # shellcheck disable=SC1091
+        [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+        nvm install "$NODE_VERSION" >/dev/null 2>&1
+        nvm alias default "$NODE_VERSION" >/dev/null 2>&1
+    fi
+    node_supported \
+        && ok "Node.js $(node --version) now active" \
+        || warn "Node.js is still below v$NODE_MIN_MAJOR — the frontend build will fail"
 elif has apt-get; then
     info "Installing nodejs via apt…"
     sudo apt-get install -y nodejs npm >/dev/null 2>&1
@@ -272,13 +371,26 @@ else
 fi
 fi # USE_MISE -eq 0 (Node.js)
 
-# ══════════════════════════════════════════════════════════════════════
-# Step 2: Agent Backend (claude-agent-acp)
-# ══════════════════════════════════════════════════════════════════════
-step "Agent Backend"
+# The apt/dnf/brew branches above accept whatever Node the distro ships, which
+# can be older than the supported floor (Debian/Ubuntu in particular). Catch
+# that here rather than as a confusing frontend-build failure later.
+if has node; then
+    # `|| echo v0` keeps a broken node binary (loader error) from killing the
+    # installer under `set -e`; v0 then trips the floor warning below.
+    _node_major="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
+    if [ -n "$_node_major" ] && [ "$_node_major" -lt "$NODE_MIN_MAJOR" ] 2>/dev/null; then
+        warn "Node.js v$_node_major is below the supported floor (>= $NODE_MIN_MAJOR) — the frontend build will fail"
+        detail "Install Node.js $NODE_VERSION (LTS): https://nodejs.org or 'nvm install $NODE_VERSION'"
+    fi
+fi
 
-# The default agent backend is the public ACP adapter, run via Node.
-# kiro-cli is optional and not installed here.
+# ══════════════════════════════════════════════════════════════════════
+# Step 2: Optional alternate agent backend (claude-agent-acp)
+# ══════════════════════════════════════════════════════════════════════
+step "Optional Agent Backend"
+
+# A fresh configuration defaults to Kiro CLI. Keep installing the public ACP
+# adapter as an available alternative, but do not misrepresent it as selected.
 if has claude-agent-acp; then
     ok "claude-agent-acp ($( which claude-agent-acp ))"
 elif has npm; then
@@ -293,7 +405,8 @@ else
     warn "npm not available — install the agent backend later:"
     detail "npm i -g $ACP_NPM_PKG"
 fi
-detail "kiro-cli is an optional alternative backend (https://kiro.dev/docs/cli/installation)"
+warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
+detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 3: Build
@@ -315,9 +428,14 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
         else
             npm install --no-audit --no-fund --loglevel=error 2>"$_fe_log"
         fi &&
-        npm run build 2>>"$_fe_log"
+        # Raise V8's heap ceiling for the bundle build. The default (~2 GB on
+        # 64-bit) is not enough for this app's 6k+ module graph, and the OOM
+        # surfaces as a build that dies without a clear cause -- leaving no
+        # dist/ and a "Dashboard HTML not found" page at first launch.
+        NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" npm run build 2>>"$_fe_log"
     ) &
     spinner $! "Installing npm packages & building React app…"
+    _fe_ok=0
     if wait $!; then
         _dist_src="$KIROCREW_APP_DIR/website/dist"
         _dist_dst="$KIROCREW_APP_DIR/src/kiro_crew/static/dist"
@@ -326,25 +444,65 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
             mkdir -p "$(dirname "$_dist_dst")"
             cp -R "$_dist_src" "$_dist_dst"
             ok "Frontend built and staged → src/kiro_crew/static/dist"
-        else
-            warn "website/dist not found after build — dashboard will use legacy fallback"
+            _fe_ok=1
         fi
-    else
-        warn "Frontend build failed — dashboard will use legacy fallback"
-        [ -s "$_fe_log" ] && tail -5 "$_fe_log" | while IFS= read -r _line; do detail "$_line"; done
     fi
-    rm -f "$_fe_log"
+    if [ "$_fe_ok" != "1" ]; then
+        # The build did not produce a usable bundle. For a local CLI install this is
+        # non-fatal — the dashboard falls back to a legacy page and the CLI still
+        # works. For a cloud crew the dashboard IS the product, so
+        # KIROCREW_REQUIRE_FRONTEND=1 makes it FATAL: dump the build log and exit
+        # non-zero. That lets the cloud bootstrap RETRY the whole install on the warm
+        # box (first-boot contention — the common cause — self-heals), and if it still
+        # fails the real npm/vite error reaches the failure reason instead of being
+        # swallowed behind a "legacy fallback" warning.
+        if [ -s "$_fe_log" ]; then
+            echo "----- frontend build log (tail) -----"
+            tail -n 20 "$_fe_log"
+            echo "-------------------------------------"
+        fi
+        rm -f "$_fe_log"
+        if [ "${KIROCREW_REQUIRE_FRONTEND:-0}" = "1" ]; then
+            die "Frontend build failed and KIROCREW_REQUIRE_FRONTEND=1 — no static/dist produced (see the build log above)"
+        fi
+        warn "Frontend build failed — dashboard will use legacy fallback"
+    else
+        rm -f "$_fe_log"
+    fi
 else
     warn "Skipping frontend build (Node.js or website/ not available)"
-    detail "Install Node.js 18+ for the full React dashboard experience"
+    detail "Install Node.js 22+ (24 LTS recommended) for the full React dashboard experience"
 fi
 
 # ── Python virtual environment & package ──
 info "Creating virtual environment…"
 _venv="$KIROCREW_APP_DIR/.venv"
-if [ -d "$_venv" ] && [ -x "$_venv/bin/python" ]; then
+# Build the venv under a umask that masks group/other WRITE so bin/kirocrew
+# and its dirs are born non-group-writable -- `kirocrew service install`
+# refuses to attach its AppArmor profile to a group/world-writable launcher
+# (see the matching block in cli.sh for the full rationale). OR-ing with 022
+# only ADDS write-mask bits, so a stricter caller umask is preserved.
+_KC_PREV_UMASK="$(umask)"
+umask "$(printf '%03o' "$(( $(umask) | 022 ))")"
+# A reused venv keeps the perms it was born with: one built by an older installer
+# under a permissive umask still has a group/world-writable root or bin/, so the
+# AppArmor profile would keep refusing. Rebuild it under the tightened umask.
+if [ -d "$_venv" ] && [ -n "$(find "$_venv" "$_venv/bin" -prune \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null)" ]; then
+    warn "Existing venv is group/world-writable — recreating it"
+    rm -rf "$_venv"
+fi
+# An existing venv is reusable only while its interpreter still satisfies the
+# package's requires-python. On an upgrade from a pre-3.12 install, reusing a
+# 3.10/3.11 venv makes the `pip install -e .` below refuse the package outright
+# ("Requires-Python >=3.12") and the upgrade dead-ends, so rebuild it instead.
+if [ -d "$_venv" ] && [ -x "$_venv/bin/python" ] \
+    && "$_venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
     ok "Existing venv found"
 else
+    if [ -d "$_venv" ]; then
+        warn "Existing venv predates the Python 3.12 floor — recreating it"
+        rm -rf "$_venv"
+    fi
     "$_py" -m venv "$_venv" || die "Failed to create venv. You may need: $_py -m pip install virtualenv"
     ok "venv created at $_venv"
 fi
@@ -357,12 +515,25 @@ if [ "$WITH_VOICE" -eq 1 ]; then
     detail "Including voice extras (.[voice])"
 fi
 
+# Dependencies come from prebuilt wheels only, as in cli.sh: without this pip
+# builds any dependency that lacks a wheel for this host from its sdist, and a
+# native one (numpy, Pillow) then needs a compiler and -dev headers the host
+# was never required to have. The editable kirocrew install itself is a local
+# source tree, which pip builds regardless of the flag; only the dependency
+# resolution is restricted. KIROCREW_ALLOW_SOURCE_BUILDS=1 opts back in for a
+# host that has the toolchain.
+_pip_binary_only="--only-binary=:all:"
+if [ "${KIROCREW_ALLOW_SOURCE_BUILDS:-0}" = "1" ]; then
+    _pip_binary_only=""
+fi
+
 _pip_log="$(mktemp)"
 (
     "$_venv/bin/pip" install --upgrade pip setuptools wheel 2>&1 | tail -5 > "$_pip_log"
     cd "$KIROCREW_APP_DIR"
     # Frontend already built and staged above; skip rebuild in setup.py.
-    KIROCREW_SKIP_FRONTEND=1 "$_venv/bin/pip" install -e "$_pip_target" 2>&1 | tail -20 >> "$_pip_log"
+    # shellcheck disable=SC2086
+    KIROCREW_SKIP_FRONTEND=1 "$_venv/bin/pip" install $_pip_binary_only -e "$_pip_target" 2>&1 | tail -20 >> "$_pip_log"
 ) &
 spinner $! "Installing kirocrew and dependencies…"
 if wait $!; then
@@ -372,15 +543,41 @@ if wait $!; then
         die "Package installed but dependencies missing (aiohttp not importable).
      Try manually: $_venv/bin/pip install -e $KIROCREW_APP_DIR"
     fi
+    if [ ! -x "$_venv/bin/kirocrew" ]; then
+        die "Install incomplete: entry point $_venv/bin/kirocrew missing or not executable."
+    fi
+    if ! "$_venv/bin/python" -I -c "import kiro_crew" 2>/dev/null; then
+        die "Install incomplete: kiro_crew not importable."
+    fi
 else
     if [ -s "$_pip_log" ]; then
         echo ""
         tail -10 "$_pip_log" | while IFS= read -r _line; do detail "$_line"; done
         echo ""
     fi
+    # Under binary-only resolution this pip error means no release pip may
+    # install has a wheel this host can run. Its "(from versions: ...)" list
+    # cannot separate the causes (wheels for a newer libc or another arch are
+    # dropped before the list is built, so they read "none" exactly like a
+    # missing or unreachable index), so name the platform, the usual cause and
+    # the way out, and say the index is the other possibility.
+    if [ -n "$_pip_binary_only" ] && grep -q 'No matching distribution found for' "$_pip_log" 2>/dev/null; then
+        _missing="$(grep 'No matching distribution found for' "$_pip_log" \
+            | sed 's/.*No matching distribution found for //' | head -n 5 | tr '\n' ' ')"
+        _libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+        die "pip found no prebuilt wheel it may install on this platform ($(uname -s) $(uname -m)${_libc:+, $_libc}) for: ${_missing}
+     Kiro Crew installs prebuilt wheels only and never compiles a dependency. Usually this
+     means the host is older than the wheels' floor: use a newer Linux (Amazon Linux 2023,
+     RHEL/Rocky 8+, Ubuntu 22.04+, Debian 12+) or macOS. It can also mean the package index
+     could not be reached or does not carry these releases (see pip's output above). To
+     compile on this host instead, install a C/C++ toolchain plus the -dev headers those
+     packages need and re-run with KIROCREW_ALLOW_SOURCE_BUILDS=1."
+    fi
     die "pip install failed. Check: $_venv/bin/pip --version"
 fi
 rm -f "$_pip_log"
+# Venv fully built and born non-group-writable; restore the caller's umask.
+umask "$_KC_PREV_UMASK"
 
 # Record install method so `kirocrew update` uses the right rebuild strategy
 echo "pip" > "$KIROCREW_APP_DIR/.install-method"
@@ -553,13 +750,17 @@ case "$(basename "${SHELL:-}")" in
     *) echo "       ${GREEN}Restart your terminal${RESET}" ;;
 esac
 echo ""
-echo "    ${CYAN}2.${RESET} Run the setup wizard:"
+echo "    ${CYAN}2.${RESET} Set up the default Kiro agent (skip if you selected another ACP backend):"
+echo "       ${GREEN}Install Kiro CLI from https://kiro.dev/cli/${RESET}"
+echo "       ${GREEN}kiro-cli login${RESET}"
+echo ""
+echo "    ${CYAN}3.${RESET} Run the setup wizard:"
 echo "       ${GREEN}kirocrew setup${RESET}"
 echo ""
-echo "    ${CYAN}3.${RESET} Start the dashboard:"
+echo "    ${CYAN}4.${RESET} Start the dashboard:"
 echo "       ${GREEN}kirocrew gateway${RESET}"
 echo ""
-echo "    ${CYAN}4.${RESET} Open ${CYAN}http://localhost:${KIROCREW_PORT}${RESET} in your browser"
+echo "    ${CYAN}5.${RESET} Open ${CYAN}http://localhost:${KIROCREW_PORT}${RESET} in your browser"
 echo ""
 # SSH tunnel tip for remote Linux users
 if [ "$(uname)" != "Darwin" ]; then

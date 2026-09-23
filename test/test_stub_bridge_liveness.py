@@ -2,24 +2,56 @@
 
 Covers:
 * A silent peer (accepts, never answers) causes the stub to emit a JSON-RPC
-  error and return a BridgeLivenessFailure — not park forever.
+  error and report ``peer_dead`` on the session -- not park forever.
 * A legitimately slow call (peer still answers pings) is NOT killed.
-* Normal bridge teardown (stdin EOF) returns None (no liveness failure).
+* The ping RATE stays one per interval against a peer that answers instantly,
+  rather than one per round-trip.
+* A missed pong still declares the peer dead inside the advertised grace, so
+  bounding the rate did not lengthen detection.
+* Normal bridge teardown (stdin EOF, or a stop) is reported as itself, so a
+  reconnect is never attempted on a shutdown.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
 from kiro_crew.mcp_gateway.stub import (
     _BRIDGE_PING_TYPE,
     _BRIDGE_PONG_TYPE,
-    BridgeLivenessFailure,
+    StubSession,
     run_bridge,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _strip_comments(source: str) -> str:
+    """``source`` with every comment removed, for source-text ratchets.
+
+    A ratchet that greps raw text cannot tell a call from a comment explaining
+    why that call is absent, so a well-documented invariant trips the very
+    assertion documenting it. Tokenizing is exact where a ``#`` split would also
+    cut string literals.
+    """
+    import io
+    import tokenize
+
+    kept: list[str] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type != tokenize.COMMENT:
+                kept.append(tok.string)
+    except (tokenize.TokenError, IndentationError):
+        # A partial tail need not be valid Python on its own; fall back to a
+        # line-wise cut, which is coarser but never blind.
+        return "\n".join(ln.split("#", 1)[0] for ln in source.splitlines())
+    return "\n".join(kept)
+
 
 # Pin to one xdist worker (requires --dist loadgroup) alongside the other
 # mcp_gateway suites.
@@ -43,7 +75,7 @@ def _jsonrpc_response(req_id: str = "req-1") -> bytes:
 @pytest.mark.asyncio
 async def test_silent_peer_triggers_liveness_failure() -> None:
     """A gateway that accepts connections but never replies to pings or
-    requests must trigger a BridgeLivenessFailure within a bounded time,
+    requests must be reported as ``peer_dead`` within a bounded time,
     not park the stub forever."""
     # Socket-side reader: gateway never sends anything.
     gw_reader = asyncio.StreamReader()
@@ -85,7 +117,8 @@ async def test_silent_peer_triggers_liveness_failure() -> None:
 
     # Use very short intervals so the test completes quickly.
     # 3 misses × 0.05s interval = 0.15s wait per ping + response wait.
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -95,13 +128,13 @@ async def test_silent_peer_triggers_liveness_failure() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
 
-    assert result is not None
-    assert isinstance(result, BridgeLivenessFailure)
-    assert "call-42" in result.outstanding_ids
+    assert session.reason == "peer_dead"
+    assert "call-42" in session.outstanding_ids
 
     # Verify pings were sent to the gateway.
     ping_frames = [
@@ -139,7 +172,7 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
                 if isinstance(msg, dict) and msg.get("type") == _BRIDGE_PING_TYPE:
                     pong = json.dumps({"type": _BRIDGE_PONG_TYPE}) + "\n"
                     self._feed.feed_data(pong.encode())
-            except (json.JSONDecodeError, ValueError):
+            except ValueError:
                 pass
 
         async def drain(self) -> None:
@@ -172,7 +205,8 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
 
     stop_task = asyncio.create_task(_stop_after_pings())
 
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             fake_writer,  # type: ignore[arg-type]
@@ -182,13 +216,15 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
     await stop_task
 
-    # No liveness failure: the peer answered pings.
-    assert result is None
+    # No liveness failure: the peer answered pings, so the bridge ended on the
+    # stop event rather than on a dead peer.
+    assert session.reason == "stop"
 
     # Verify pings were sent AND pongs were received (at least 2 cycles).
     ping_frames = [
@@ -196,6 +232,168 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
         if b.strip() and json.loads(b).get("type") == _BRIDGE_PING_TYPE
     ]
     assert len(ping_frames) >= 2
+
+
+@pytest.mark.asyncio
+async def test_ping_rate_is_bounded_by_the_interval() -> None:
+    """A peer that answers instantly must NOT be pinged at socket speed.
+
+    The pong wait is not the cycle's interval when the peer is healthy: the
+    gateway answers a ping inline in its connection handler, so the reply is
+    back in microseconds. If the monitor returns straight to the next ping, the
+    ping count scales with socket round-trip time instead of with elapsed time,
+    and one stub with a request outstanding pegs both itself and the
+    single-event-loop daemon that has to answer every ping.
+
+    So the assertion is on the RATE, derived from the elapsed time this run
+    actually took rather than from a hardcoded count: at most one ping per
+    interval, plus the one sent at cycle zero. A lower bound comes with it,
+    because a monitor that stopped pinging altogether would satisfy any ceiling.
+    """
+    gw_reader = asyncio.StreamReader()
+    stdin_reader = asyncio.StreamReader()
+    stdin_reader.feed_data(_jsonrpc_request("tools/call", "busy-1"))
+
+    gw_written: list[bytes] = []
+
+    class _InstantPongWriter:
+        """Answers every ping synchronously, as a healthy daemon does."""
+
+        _mc_write_lock = asyncio.Lock()
+
+        def __init__(self, feed_reader: asyncio.StreamReader) -> None:
+            self._feed = feed_reader
+
+        def write(self, data: bytes) -> None:
+            gw_written.append(data)
+            if _safe_json_get_type(data) == _BRIDGE_PING_TYPE:
+                pong = json.dumps({"type": _BRIDGE_PONG_TYPE}) + "\n"
+                self._feed.feed_data(pong.encode())
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    stdout_writer_transport = asyncio.StreamReader()
+    stdout_proto = asyncio.StreamReaderProtocol(stdout_writer_transport)
+    loop = asyncio.get_running_loop()
+    stdout_writer = asyncio.StreamWriter(
+        _FakeTransport(), stdout_proto, stdout_writer_transport, loop
+    )
+
+    stop_event = asyncio.Event()
+    ping_interval = 0.05
+    window = 0.6
+
+    async def _stop_after_window() -> None:
+        await asyncio.sleep(window)
+        stop_event.set()
+
+    stop_task = asyncio.create_task(_stop_after_window())
+    started = loop.time()
+
+    session = StubSession()
+    await asyncio.wait_for(
+        run_bridge(
+            gw_reader,
+            _InstantPongWriter(gw_reader),  # type: ignore[arg-type]
+            stop_event,
+            stdin=stdin_reader,
+            stdout_writer=stdout_writer,
+            ping_interval=ping_interval,
+            ping_max_misses=3,
+            peer_supports_ping=True,
+            session=session,
+        ),
+        timeout=30,
+    )
+    elapsed = loop.time() - started
+    await stop_task
+
+    assert session.reason == "stop"
+    pings = [b for b in gw_written if _safe_json_get_type(b) == _BRIDGE_PING_TYPE]
+    ceiling = elapsed / ping_interval + 1
+    assert len(pings) <= ceiling, (
+        f"{len(pings)} pings in {elapsed:.3f}s at interval {ping_interval}s "
+        f"exceeds the one-per-interval ceiling of {ceiling:.1f}: the monitor is "
+        "pinging per round-trip, not per interval"
+    )
+    # The monitor really ran: a socket-speed loop would be in the thousands
+    # here, and a broken one would be at zero.
+    assert len(pings) >= 2
+
+
+@pytest.mark.asyncio
+async def test_missed_pong_still_declares_peer_dead_within_the_grace() -> None:
+    """Bounding the ping rate must not lengthen dead-peer detection.
+
+    The remainder sleep belongs to the ANSWERED path only. Adding it to the
+    missed path as well would make each miss cycle cost two intervals and
+    silently double the advertised ``ping_interval × ping_max_misses`` grace, so
+    this pins the wall-clock ceiling, not just the verdict.
+    """
+    gw_reader = asyncio.StreamReader()
+    stdin_reader = asyncio.StreamReader()
+    stdin_reader.feed_data(_jsonrpc_request("tools/call", "silent-1"))
+
+    class _SilentWriter:
+        """Accepts frames and never answers -- a wedged daemon."""
+
+        _mc_write_lock = asyncio.Lock()
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    stdout_writer_transport = asyncio.StreamReader()
+    stdout_proto = asyncio.StreamReaderProtocol(stdout_writer_transport)
+    loop = asyncio.get_running_loop()
+    stdout_writer = asyncio.StreamWriter(
+        _FakeTransport(), stdout_proto, stdout_writer_transport, loop
+    )
+
+    ping_interval = 0.5
+    ping_max_misses = 3
+    grace = ping_interval * ping_max_misses
+    started = loop.time()
+
+    session = StubSession()
+    await asyncio.wait_for(
+        run_bridge(
+            gw_reader,
+            _SilentWriter(),  # type: ignore[arg-type]
+            asyncio.Event(),
+            stdin=stdin_reader,
+            stdout_writer=stdout_writer,
+            ping_interval=ping_interval,
+            ping_max_misses=ping_max_misses,
+            peer_supports_ping=True,
+            session=session,
+        ),
+        timeout=30,
+    )
+    elapsed = loop.time() - started
+
+    assert session.reason == "peer_dead"
+    # Generous absolute slack for a loaded host, but far below the 2x that a
+    # remainder sleep on the missed path would cost.
+    assert elapsed < grace + 1.0, (
+        f"peer declared dead after {elapsed:.3f}s, well past the advertised "
+        f"{grace:.3f}s grace: a miss cycle is costing more than one interval"
+    )
 
 
 @pytest.mark.asyncio
@@ -236,7 +434,8 @@ async def test_normal_teardown_returns_none() -> None:
     )
 
     stop_event = asyncio.Event()
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -246,11 +445,12 @@ async def test_normal_teardown_returns_none() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
 
-    assert result is None
+    assert session.reason != "peer_dead"
 
 
 @pytest.mark.asyncio
@@ -294,7 +494,8 @@ async def test_no_pings_when_idle() -> None:
 
     stop_task = asyncio.create_task(_stop_after())
 
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -304,12 +505,13 @@ async def test_no_pings_when_idle() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
     await stop_task
 
-    assert result is None
+    assert session.reason != "peer_dead"
     # No pings should have been sent (only an unregister on clean close, if any).
     ping_frames = [
         b for b in gw_written
@@ -348,7 +550,7 @@ def _safe_json_get_type(data: bytes) -> str:
         msg = json.loads(data)
         if isinstance(msg, dict):
             return msg.get("type", "")
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         pass
     return ""
 
@@ -374,25 +576,46 @@ class TestLivenessIsNegotiated:
         ].default is False
 
     def test_gatewayd_advertises_the_capability(self) -> None:
-        """The stub's gate is only reachable if the daemon actually offers it."""
-        from pathlib import Path
+        """The stub's gate is only reachable if the daemon actually offers it.
 
-        src = Path("src/kiro_crew/mcp_gateway/gatewayd.py").read_text(encoding="utf-8")
-        assert '"capabilities": ["ensure_backend", "bridge_ping"]' in src
+        Asserted against the advertised set rather than gatewayd's source text:
+        a grep for one literal breaks whenever an unrelated capability is added,
+        and passes if the list is built but never sent.
+        """
+        from kiro_crew.mcp_gateway.gatewayd import REGISTERED_CAPABILITIES
+
+        assert "bridge_ping" in REGISTERED_CAPABILITIES
 
     def test_liveness_path_does_not_exec(self) -> None:
-        """The degrade path must fail fast, not exec a fresh server.
+        """The degrade path must reconnect or fail fast, never exec a server.
 
         Pre-flight fallbacks work because kiro-cli's `initialize` is still unread
         in fd0. Mid-bridge it has already been consumed and kiro-cli never
-        re-sends it, so an exec'd server would reject every later call — the
-        session's tools are lost either way, and exec would additionally discard
-        the socket a future reconnect could reuse.
+        re-sends it, so an exec'd server would reject every later call. What
+        recovers the session instead is re-attaching to the restarted gateway and
+        replaying the captured handshake, so this pins both halves: from the
+        point the stub owns state that outlives one connection there is no
+        ``fallback_exec``, and a reconnect is actually attempted rather than the
+        outage being merely reported.
         """
-        from pathlib import Path
-
-        src = Path("src/kiro_crew/mcp_gateway/stub.py").read_text(encoding="utf-8")
-        marker = "if liveness_failure is not None:"
+        src = (_REPO_ROOT / "src/kiro_crew/mcp_gateway/stub.py").read_text(encoding="utf-8")
+        # Anchor where the stub starts owning cross-connection state: every
+        # pre-flight fallback site sits above it.
+        marker = "    session = StubSession()"
         assert marker in src
         tail = src[src.index(marker):]
-        assert "fallback_exec" not in tail
+        # Judge CODE, not prose. The tail deliberately explains at length why it
+        # does not exec, and a text search would read those very words as the
+        # violation -- so comments are tokenized away before the check.
+        assert "fallback_exec" not in _strip_comments(tail)
+        assert "_reconnect_while_draining(" in tail, (
+            "the mid-bridge degrade path no longer attempts a reconnect, so a "
+            "broker restart again strips an attached session's servers for good"
+        )
+        # Through the PAIRED entry point specifically: reconnecting with nothing
+        # reading kiro-cli's stream leaves a request issued in that window unread
+        # for the whole budget (see test_stub_reconnect_queued_calls.py).
+        assert "_reconnect(" not in _strip_comments(tail), (
+            "the reconnect must be reached through _reconnect_while_draining so "
+            "queued calls are answered rather than held"
+        )

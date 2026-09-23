@@ -9,18 +9,19 @@ from __future__ import annotations
 import http.client
 import importlib
 import json
+import re
 import socket
 import ssl
 import subprocess
 import tempfile
 import threading
-import time
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import beacon, platform_compat
 from kiro_crew.apps import install_receipt
 
@@ -352,6 +353,58 @@ class TestDistributionStamp:
         assert "src/kiro_crew/_build_info.py" in (root / ".gitignore").read_text()
 
 
+class TestDesktopStampPerOS:
+    """``packaging/build-desktop.sh`` must stamp a desktop value on every OS.
+
+    Source-level, so it runs on Windows CI too, where bash is unavailable.
+
+    The stamp is not only a beacon field: ``platform/update_capability.py`` keys
+    the externally-managed classes on it, so a desktop artifact stamped with a
+    feed-checkable value is offered the CLI release feed and the POSIX
+    ``curl … | sh`` installer command instead of the app's own updater.
+    """
+
+    _SCRIPT = Path(__file__).resolve().parents[1] / "packaging" / "build-desktop.sh"
+
+    def _os_stamps(self) -> dict[str, str]:
+        """``{OS branch: stamped value}`` read out of the shipped script."""
+        text = self._SCRIPT.read_text(encoding="utf-8")
+        block = re.search(
+            r'case "\$OS" in\n((?:\s*\S+\)\s*KC_DISTRIBUTION="[^"]+"\s*;;\n)+)\s*esac',
+            text,
+        )
+        assert block, "no KC_DISTRIBUTION case found in packaging/build-desktop.sh"
+        found = dict(
+            re.findall(r'(\S+)\)\s*KC_DISTRIBUTION="([^"]+)"', block.group(1))
+        )
+        assert found, "KC_DISTRIBUTION case matched no branches"
+        return found
+
+    def test_every_branch_stamps_a_known_distribution(self):
+        for branch, dist in self._os_stamps().items():
+            assert dist in beacon.KNOWN_DISTRIBUTIONS, (
+                f"{branch}) stamps {dist!r}, which the clamp rejects — "
+                "the artifact would silently report 'source'"
+            )
+
+    def test_every_branch_stamps_an_externally_managed_value(self):
+        """The script only ever packages the desktop app, on every OS.
+
+        A branch stamping a feed-checkable value is the defect, not a variant:
+        the artifact then advertises an update path that cannot replace its
+        bytes.
+        """
+        from kiro_crew.platform.update_capability import EXTERNALLY_MANAGED_STAMPS
+
+        for branch, dist in self._os_stamps().items():
+            assert dist in EXTERNALLY_MANAGED_STAMPS, (
+                f"{branch}) stamps {dist!r}, which is not externally managed"
+            )
+
+    def test_the_windows_branch_stamps_nsis(self):
+        assert self._os_stamps().get("windows") == "nsis"
+
+
 class TestVersionClamp:
     """`v` must stay low-cardinality however the build stamped __version__.
 
@@ -615,6 +668,7 @@ class TestThrottle:
         assert beacon.send("https://example.invalid", "1.2.3", enabled=True, acked=True) is False
         assert len(calls) == 1, "at most one request per day"
 
+    @requires_symlinks
     def test_stamp_does_not_follow_a_symlink(self, _isolated_home, monkeypatch):
         """A symlink planted at the stamp path must not have its target clobbered.
 
@@ -686,9 +740,9 @@ class TestUrlAndTransport:
         """An unwritable data home must not propagate out of send()/status().
 
         Regression test: should_send() and payload() probe the filesystem, and
-        they used to run OUTSIDE send()'s try, so a PermissionError from
-        config_dir() escaped into the gateway's daemon thread (traceback on every
-        boot) and made `kirocrew telemetry status` crash — while the module
+        they must run INSIDE send()'s try, or a PermissionError from
+        config_dir() escapes into the gateway's daemon thread (traceback on every
+        boot) and makes `kirocrew telemetry status` crash — while the module
         documents an in-memory fallback for exactly this case.
         """
 
@@ -725,9 +779,9 @@ class TestUrlAndTransport:
         """A host with a space passes the https:// check but breaks urlopen.
 
         Regression test: http.client.InvalidURL is not an OSError or ValueError,
-        so it used to escape send() into the gateway's detached daemon thread,
-        where threading.excepthook printed a traceback on every boot — violating
-        this function's documented silent-on-failure contract. Drives the REAL
+        so without a broad enough except it escapes send() into the gateway's
+        detached daemon thread, where threading.excepthook prints a traceback on
+        every boot — violating this function's silent-on-failure contract. Drives the REAL
         urlopen (no stub), because the bug was in the except tuple itself.
         """
         assert beacon.send("https://exa mple.invalid", "1.2.3", enabled=True, acked=True) is False
@@ -779,7 +833,7 @@ class TestFailOpen:
         """The gateway starts the beacon on a thread and never joins it.
 
         Pins the boot-path contract: even a beacon that hangs far past its own
-        timeout costs the caller only the thread spawn.
+        timeout leaves the caller waiting only for the thread to start.
 
         The hang is RELEASED at the end rather than left running. ``beacon.send``
         resolves state through the module-global ``config_dir``, which
@@ -799,7 +853,6 @@ class TestFailOpen:
             raise OSError("released")
 
         monkeypatch.setattr(beacon.urllib.request, "urlopen", hang)
-        start = time.monotonic()
         thread = threading.Thread(
             target=beacon.send,
             args=("https://e.invalid", "1.2.3"),
@@ -807,8 +860,7 @@ class TestFailOpen:
             daemon=True,
         )
         thread.start()
-        elapsed = time.monotonic() - start
-        assert elapsed < 1.0, f"spawning the beacon cost {elapsed:.2f}s"
+        assert thread.is_alive(), "the caller waited for the blocked beacon"
         assert thread.daemon, "must not pin interpreter exit"
         released.set()
         thread.join(timeout=10)
@@ -851,7 +903,22 @@ class TestStatusOutput:
         text = beacon.format_status(
             beacon.status("https://e.invalid", enabled=True, app_version="1.2.3", acked=True)
         )
-        assert beacon.DISABLE_ENV in text
+        expected_optout = f"""  To opt out, choose one:
+
+    1. Kiro Crew CLI (recommended)
+       kirocrew telemetry disable
+
+    2. Environment variable (choose your shell)
+       macOS / Linux
+         export {beacon.DISABLE_ENV}=1
+       Windows PowerShell
+         $env:{beacon.DISABLE_ENV} = '1'
+       Windows Command Prompt
+         set {beacon.DISABLE_ENV}=1
+
+    3. Configuration file
+       Set telemetry.beacon_enabled to false"""
+        assert text.endswith(expected_optout)
         for claim in ("prompts", "credentials", "hostname", "IP address"):
             assert claim in text
 
@@ -885,8 +952,8 @@ class TestTelemetryCliWrite:
     def test_non_object_config_is_never_overwritten(self, _isolated_home, monkeypatch, raw):
         """A config.json that is valid JSON but not an object must not be replaced.
 
-        Regression test: the toggle used to coerce non-dict data to ``{}``, then
-        write — silently destroying the file's contents AND printing success. A
+        Regression test: the toggle must not coerce non-dict data to ``{}`` and
+        write — that silently destroys the file's contents AND prints success. A
         privacy toggle must never be a data-loss path.
         """
         from kiro_crew.cli_commands import _telemetry
@@ -978,13 +1045,15 @@ class TestTelemetryCliWrite:
         assert not _stat.S_IMODE(cfg.stat().st_mode) & 0o077
 
     def test_uses_atomic_write_not_write_text(self, _isolated_home, monkeypatch):
-        """The toggle must route through atomic_write, never path.write_text.
+        """The toggle must route through update_config_locked (atomic + locked).
 
-        Regression test: it used to call ``path.write_text``, which truncates in
-        place — a disk-full or interrupted write mid-rewrite of the user's WHOLE
-        config.json would leave a partial file and every later load would
-        silently discard their configuration. ``atomic_write`` writes a temp file
-        and renames, so a failure leaves the original untouched.
+        Regression test: ``path.write_text`` (which the toggle must not call)
+        truncates in place — a disk-full or interrupted write mid-rewrite of the
+        user's WHOLE config.json would leave a partial file and every later load
+        would silently discard their configuration. The current path goes through
+        ``update_config_locked`` → ``write_config_atomically`` → ``atomic_write``
+        (temp + rename), so a failure leaves the original untouched and concurrent
+        writers are serialized by an advisory lock.
 
         Asserted at the call site rather than by simulating a failed write,
         because ``KiroCrewConfig.load()`` performs its own migration write-back
@@ -998,18 +1067,18 @@ class TestTelemetryCliWrite:
 
         calls: list[dict] = []
 
-        def spy(path, content, **kwargs):
-            calls.append({"path": str(path), **kwargs})
-            from kiro_crew.atomic_write import atomic_write as real
+        real_update = cli_commands.update_config_locked
 
-            real(path, content, **kwargs)
+        def spy(path=None, **kwargs):
+            calls.append({"path": str(path) if path else None, **kwargs})
+            return real_update(path, **kwargs)
 
-        monkeypatch.setattr(cli_commands, "atomic_write", spy)
+        monkeypatch.setattr(cli_commands, "update_config_locked", spy)
         cli_commands._telemetry(self._args("disable"))
 
-        assert calls, "toggle must write through atomic_write"
+        assert calls, "toggle must write through update_config_locked"
         assert calls[0]["path"] == str(cfg)
-        assert calls[0].get("fsync") is True, "rename must be durable"
+        assert calls[0].get("fsync") is True, "write must be durable"
         assert json.loads(cfg.read_text())["telemetry"]["beacon_enabled"] is False
 
     @pytest.mark.parametrize("section", ["telemetry", "dashboard"])

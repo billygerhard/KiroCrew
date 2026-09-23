@@ -3,8 +3,21 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
+
+import pytest
 
 from kiro_crew.mcp_cron import _call_tool_inner
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestCronAddChannelCapture:
@@ -306,3 +319,180 @@ class TestCronAddPersistenceOwner:
         assert job.agent_id == ""
         assert job.command == ""
         assert job.script == ""
+
+
+class TestCronRemoveAudit:
+    """Single-job ``cron_remove`` must be SEL-audited like its neighbours.
+
+    ``cron.create`` / ``cron.update`` / ``cron.trigger`` and the plural
+    ``cron_remove_all`` all leave audit records; a single delete without one
+    makes a deliberate removal indistinguishable from data loss in the trail.
+    """
+
+    @pytest.fixture()
+    def sel_events(self, monkeypatch):
+        events: list[dict] = []
+
+        class _FakeSel:
+            def log_api_access(self, **kw):
+                events.append(kw)
+
+            def log_tool_invocation(self, **kw):
+                events.append(kw)
+
+        import kiro_crew.cron as cron_mod
+        import kiro_crew.mcp_cron as mcp_cron_mod
+
+        monkeypatch.setattr(mcp_cron_mod, "sel", lambda: _FakeSel())
+        monkeypatch.setattr(cron_mod, "sel", SimpleNamespace(sel=lambda: _FakeSel()))
+        return events
+
+    def test_cron_remove_emits_sel_audit(self, monkeypatch, tmp_path, sel_events):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+
+        job_name = f"audit-rm-{uuid.uuid4().hex[:8]}"
+        result = _call_tool_inner("cron_add", {"name": job_name, "message": "hello", "every": 120})
+        assert "Added job" in result
+
+        from kiro_crew.cron import CronService
+
+        jobs = [j for j in CronService(base_dir=tmp_path).list_jobs() if j.name == job_name]
+        assert len(jobs) == 1
+        jid = jobs[0].id
+
+        result = _call_tool_inner("cron_remove", {"job_id": jid})
+        assert result == f"Removed job: {jid}"
+
+        removes = [e for e in sel_events if e.get("operation") == "cron.remove"]
+        assert len(removes) == 1
+        assert removes[0]["caller"] == "mcp"
+        assert removes[0]["outcome"] == "allowed"
+        assert removes[0]["source"] == "mcp"
+        assert f"job_id={jid}" in removes[0]["resources"]
+
+    def test_cron_remove_missing_job_is_not_audited_as_removed(
+        self, monkeypatch, tmp_path, sel_events
+    ):
+        # An unknown id never reaches the store mutation: the ownership gate
+        # answers its anti-enumeration refusal first, so no cron.remove event
+        # (with any outcome) may claim a delete that did not happen.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+
+        result = _call_tool_inner("cron_remove", {"job_id": "no-such-job"})
+        assert "Removed job" not in result
+
+        removes = [e for e in sel_events if e.get("operation") == "cron.remove"]
+        assert not [e for e in removes if e.get("outcome") == "allowed"]
+
+    def test_cron_remove_succeeds_when_audit_raises(self, monkeypatch, tmp_path):
+        # The first sel() of a process constructs the log and can raise; the
+        # job is already removed by then, so the tool must still report the
+        # completed delete instead of surfacing an error.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+
+        job_name = f"audit-raise-{uuid.uuid4().hex[:8]}"
+        result = _call_tool_inner("cron_add", {"name": job_name, "message": "hello", "every": 120})
+        assert "Added job" in result
+
+        from kiro_crew.cron import CronService
+
+        jobs = [j for j in CronService(base_dir=tmp_path).list_jobs() if j.name == job_name]
+        assert len(jobs) == 1
+        jid = jobs[0].id
+
+        import kiro_crew.cron as cron_mod
+        import kiro_crew.mcp_cron as mcp_cron_mod
+
+        def _raising_sel():
+            raise RuntimeError("SEL trust root unavailable")
+
+        monkeypatch.setattr(mcp_cron_mod, "sel", _raising_sel)
+        monkeypatch.setattr(cron_mod, "sel", SimpleNamespace(sel=_raising_sel))
+        result = _call_tool_inner("cron_remove", {"job_id": jid})
+        assert result == f"Removed job: {jid}"
+        assert not [j for j in CronService(base_dir=tmp_path).list_jobs() if j.id == jid]
+
+
+class TestCronSubFloorTimeoutWarning:
+    """A ``timeout_secs`` below the reaper floor is accepted and enforced by the
+    primary guard, but the reaper force-kill backstop still floors at
+    ``_JOB_TIMEOUT_SECS``. ``cron_add``/``cron_update`` surface that gap so the
+    caller is not surprised by a job that outruns its configured budget.
+    """
+
+    def _reload(self, tmp_path, name):
+        from kiro_crew.cron import CronService
+
+        matching = [j for j in CronService(base_dir=tmp_path).list_jobs() if j.name == name]
+        assert len(matching) == 1, f"expected exactly one job named {name}"
+        return matching[0]
+
+    def test_cron_add_sub_floor_timeout_secs_warns(self, monkeypatch, tmp_path):
+        """A sub-floor timeout_secs is stored verbatim and flagged in the reply."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"low-{uuid.uuid4().hex[:8]}"
+        result = _call_tool_inner(
+            "cron_add",
+            {"name": name, "message": "go", "every": 300, "timeout_secs": 60},
+        )
+        assert "Added job" in result
+        assert "Note:" in result
+        assert str(_JOB_TIMEOUT_SECS) in result
+        assert self._reload(tmp_path, name).timeout_secs == 60
+
+    def test_cron_add_at_floor_timeout_secs_no_warn(self, monkeypatch, tmp_path):
+        """A timeout_secs at the floor is honored without the caveat note."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"atfloor-{uuid.uuid4().hex[:8]}"
+        result = _call_tool_inner(
+            "cron_add",
+            {"name": name, "message": "go", "every": 300, "timeout_secs": _JOB_TIMEOUT_SECS},
+        )
+        assert "Added job" in result
+        assert "Note:" not in result
+
+    def test_cron_add_without_timeout_secs_no_warn(self, monkeypatch, tmp_path):
+        """The note only appears when timeout_secs is explicitly set sub-floor."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"none-{uuid.uuid4().hex[:8]}"
+        result = _call_tool_inner("cron_add", {"name": name, "message": "go", "every": 300})
+        assert "Added job" in result
+        assert "Note:" not in result
+
+    def test_cron_update_sub_floor_timeout_secs_warns(self, monkeypatch, tmp_path):
+        """Lowering timeout_secs below the floor via cron_update also warns."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"upd-low-{uuid.uuid4().hex[:8]}"
+        _call_tool_inner("cron_add", {"name": name, "message": "go", "every": 300})
+        jid = self._reload(tmp_path, name).id
+        result = _call_tool_inner("cron_update", {"job_id": jid, "timeout_secs": 90})
+        assert "Updated job" in result
+        assert "Note:" in result
+        assert str(_JOB_TIMEOUT_SECS) in result
+        assert self._reload(tmp_path, name).timeout_secs == 90
+
+    def test_cron_update_at_floor_timeout_secs_no_warn(self, monkeypatch, tmp_path):
+        """A cron_update at the floor updates without the caveat note."""
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+        name = f"upd-floor-{uuid.uuid4().hex[:8]}"
+        _call_tool_inner("cron_add", {"name": name, "message": "go", "every": 300})
+        jid = self._reload(tmp_path, name).id
+        result = _call_tool_inner("cron_update", {"job_id": jid, "timeout_secs": _JOB_TIMEOUT_SECS})
+        assert "Updated job" in result
+        assert "Note:" not in result

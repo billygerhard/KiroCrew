@@ -296,3 +296,111 @@ describe('SubagentRunCard rendering', () => {
     expect(screen.queryByTestId('subagent-card-queued')).toBeNull()
   })
 })
+
+describe('SubagentRunCard — opening from a background pane retargets the panel first', () => {
+  // The Subagents panel is mounted for `activeSlot`, and split view never moves
+  // activeSlot with pane focus. Without the retarget the click opens ANOTHER
+  // session's panel — usually "No subagents running" — while the card's own
+  // label promises this wave's detail.
+  const launch = { ids: ['a1'], announced: 1 }
+
+  it('activates the card\u2019s own session, then opens the panel on this wave', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'some-other-slot',
+        subagents: {},
+        slotActivity: { [SLOT]: { subagents: { a1: agent('a1', 'running') } } },
+        subagentQueued: {},
+        // switchSlot.pending reads these, so a partial state would throw
+        // inside the reducer rather than exercise the retarget.
+        slotHistory: [], slotMessages: {}, messages: [], toolLog: [],
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    fireEvent.click(screen.getByTestId('subagent-run-card'))
+    // switchSlot.pending assigns activeSlot synchronously as it is dispatched,
+    // so the panel is already pointed at this card's session by the time the
+    // tab opens.
+    expect(store.getState().chat.activeSlot).toBe(SLOT)
+    expect(store.getState().chat.activityOpen).toBe(true)
+    expect(store.getState().chat.activityTab).toBe('subagents')
+  })
+
+  it('keeps the affordance in a background pane rather than going quiet', () => {
+    // The alternative — dropping the button when the pane is not active — leaves
+    // a dead end in the one surface split view exists for: a failed wave with no
+    // route to its detail and no cue that one exists.
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'some-other-slot',
+        subagents: {},
+        slotActivity: { [SLOT]: { subagents: { a1: agent('a1', 'failed') } } },
+        subagentQueued: {},
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    const card = screen.getByTestId('subagent-run-card')
+    expect(card.tagName).toBe('BUTTON')
+    expect(card.getAttribute('title')).toBeTruthy()
+  })
+
+  it('does not retarget when the card already belongs to the active session', () => {
+    const store = createTestStore({
+      chat: { activeSlot: SLOT, subagents: { a1: agent('a1', 'running') }, subagentQueued: {} } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    fireEvent.click(screen.getByTestId('subagent-run-card'))
+    expect(store.getState().chat.activeSlot).toBe(SLOT)
+    expect(store.getState().chat.activityTab).toBe('subagents')
+  })
+})
+
+/**
+ * A run parked on an unanswered spawn approval launched no process, so this card
+ * must not report it as running (#7318). It used to be folded into the running
+ * tally, which put a spinning loader and the words "1 agent running" in
+ * scrollback for a wave that was in fact waiting on the user -- and the card is
+ * the surface that OUTLIVES the transient chip above the composer, so the false
+ * claim is the one that persists.
+ */
+describe('SubagentRunCard — a run parked on a spawn approval is not running', () => {
+  const launch = { ids: ['a1', 'a2'], announced: 2 }
+
+  /** A 'pending' entry as `sseSubagentPending` writes it: approval_id included. */
+  const parked = (id: string): SubagentActivity =>
+    ({ ...agent(id, 'pending'), approval_id: `spawn:${id}` }) as SubagentActivity
+
+  const storeWith = (subagents: Record<string, SubagentActivity>) => createTestStore({
+    chat: { activeSlot: SLOT, subagents, subagentQueued: {} } as unknown as ChatState,
+  })
+
+  it('does not claim a wholly parked wave is running', () => {
+    const store = storeWith({ a1: parked('a1'), a2: parked('a2') })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.queryByText('2 agents running')).toBeNull()
+    expect(screen.getByTestId('subagent-card-awaiting').textContent).toContain('2')
+  })
+
+  it('counts only the members that actually started', () => {
+    const store = storeWith({ a1: parked('a1'), a2: agent('a2', 'running') })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('1 agent running')).toBeTruthy()
+    expect(screen.getByTestId('subagent-card-awaiting').textContent).toContain('1')
+  })
+
+  it('shows no awaiting chip when nothing is parked', () => {
+    const store = storeWith({ a1: agent('a1', 'running'), a2: agent('a2', 'done') })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('1 agent running')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-card-awaiting')).toBeNull()
+  })
+
+  it('leaves a pending entry with no approval_id in the running tally', () => {
+    // `approval_id` is the discriminator, not `status` alone: with no approval to
+    // point at, the entry cannot be reported as blocked on the user.
+    const store = storeWith({ a1: agent('a1', 'pending'), a2: agent('a2', 'running') })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('2 agents running')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-card-awaiting')).toBeNull()
+  })
+})

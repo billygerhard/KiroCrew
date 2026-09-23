@@ -1,29 +1,37 @@
 /**
- * ChatMessageList — shared message rendering for ChatPage and ChatEmbed.
+ * ChatMessageList — shared message rendering for every chat surface but the
+ * main page: the split/DM pane, the side panel, and the app-SDK embed.
  *
  * Renders messages with the same turn grouping, collapsible tool groups,
  * and component hierarchy as ChatPage. No Redux, no React Router.
  *
- * ChatPage wraps this in Virtuoso for virtualized scrolling.
- * ChatEmbed wraps this in a simple scrollable div.
+ * Two mounting modes, chosen by the `transcript` prop:
+ * - With `transcript`, the list OWNS its scroller: rows go through
+ *   `VirtualTranscript` (chat-core P5-e), so only the viewport window is in the
+ *   DOM and stick-to-bottom follow, row identity, and the earlier-history bar
+ *   come with it. This is what the dashboard hosts mount.
+ * - Without it, the list is a bare fragment of rows inside a scroller the
+ *   host supplies — the original SDK shape, kept for embeds that own their
+ *   own scroll container.
+ * ChatPage keeps its inline virtualizer wiring for now (P5-f).
  */
-import React, { useMemo, useCallback, memo } from 'react'
-import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
-import { i18nT } from '../i18n/t'
-import { extractToolFilePath } from '../utils/toolFilePath'
-import { isSafePath } from '../utils/safePath'
-import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
-import UserMessage from '../pages/chat/UserMessage'
+import React, { useMemo, useCallback, useLayoutEffect, memo, forwardRef } from 'react'
+import VirtualTranscript, {
+  type TranscriptEarlierPaging,
+  type VirtualTranscriptHandle,
+} from '../chat-core/transcript/VirtualTranscript'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
-import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
-import MarkdownRenderer from '../components/MarkdownRenderer'
-import MessageErrorBoundary from '../components/MessageErrorBoundary'
-import PastedChip from '../components/PastedChip'
-import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pasteTokens'
+import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
+import {
+  type MessageRenderer,
+  type MessageRenderContext,
+  GROUPED_ROLES,
+  mergeRenderers,
+  resolveRenderer,
+} from './messageRenderers'
 import type { ChatMessage } from '../types'
 import type { TurnItem, DisplayItem } from '../pages/chat/types'
-import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 
 // ── Types ──
 
@@ -31,163 +39,137 @@ export interface ChatMessageListProps {
   messages: ChatMessage[]
   running: boolean
   contentWidth?: string
-  onApprove?: (approvalId: string, decision: string) => void
+  /** Resolve a pending approval. MUST return the request's promise: rejection
+   *  reaches the approval row's rollback and the buttons come back. The type
+   *  deliberately has no `void` arm so a fire-and-forget handler — the exact
+   *  shape behind #5524 — cannot compile against this boundary. */
+  onApprove?: (approvalId: string, decision: string) => Promise<unknown>
+  /** Resolve EVERY pending approval in a permission group with one decision
+   *  (batch multi-select, Req 4.1-4.4). The host receives all pending approval
+   *  ids and MUST route each through the SLOT-scoped approve endpoint (the same
+   *  path `onApprove` uses when it records trust) — never the bare id-scoped
+   *  one-shot resolve, which matches slot futures by bare id with no session
+   *  check. Like `onApprove`, MUST return the settle promise so the row's
+   *  rollback restores the buttons; it settles per id and surfaces any excluded
+   *  call rather than aborting the whole batch. Wired only by hosts whose
+   *  approve path is slot-scoped; left unset elsewhere. */
+  onApproveBatch?: (approvalIds: string[], decision: string) => Promise<unknown>
+  /** Offer the standing-trust tier on pending-approval rows. FAIL-CLOSED: set it
+   *  only when `onApprove` routes to an endpoint that RECORDS standing trust
+   *  (the slot approve endpoint carries the decision verbatim). Hosts resolving
+   *  through the one-shot `resolveApproval` endpoint must leave it unset — that
+   *  path has no trust verb, so a Trust offer there overstates the grant
+   *  (#5400, #5434). */
+  canTrust?: boolean
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Selection actions offered on assistant text, next to Copy. Host
+   *  capabilities, not list behaviour: Quote needs the host's composer, Ask
+   *  needs a Side Chat surface the host can bring on screen. Either absent
+   *  hides its action (see chat-core/composer/selectionActions). */
+  onQuote?: (text: string, rect: DOMRect) => void
+  onAsk?: (text: string) => void
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
    *  dependency-free for the embed SDK. When omitted, the bare ToolCallPill is used. */
   renderTool?: (message: ChatMessage) => React.ReactNode
+  /** Drop mcp_oauth messages a Connections card owns (`meta.card_owned`). A prop
+   *  rather than a config read so this component stays query-free for the embed
+   *  SDK; the dashboard host passes its `connections_ui` flag. Default renders
+   *  every banner, which is correct for any surface with no cards. */
+  hideCardOwnedOAuth?: boolean
+  /** Extra renderer entries, searched before the built-ins. An entry reusing a
+   *  built-in id replaces it; one claiming an undrawn role adds a row type. */
+  renderers?: readonly MessageRenderer[]
+  /** Reports the grouped display items this component computed, in the order
+   *  the rows' `data-display-index` numbers them — what the pinned-prompt
+   *  banner (`usePinnedPrompt`) reads to find the prompt above the fold.
+   *  Supplying it (or `hiddenRow`) is what turns row indexing ON: every display
+   *  item is then wrapped in a `data-display-index` block. Off otherwise —
+   *  the wrapper is one extra div per row, and a host that does not read the
+   *  indices should not pay for it (the embed SDK's DOM stays byte-identical).
+   *  Fired from a layout effect, so by the time the host reads it the rows
+   *  carrying those indices are in the DOM — a scroll rAF between commit and a
+   *  passive effect could otherwise read fresh DOM indices against a stale
+   *  list (the same ordering ChatPage keeps for its own `displayItemsRef`). */
+  onDisplayItems?: (items: DisplayItem[]) => void
+  /** The one indexed row to hide: the row whose bubble the pinned-prompt
+   *  banner is currently standing in for. Hidden by `visibility`, not
+   *  `display` — the row must keep its height or the transcript reflows under
+   *  the reader. Matched by message IDENTITY (`ts`) when the row has one, and
+   *  by display index only as the fallback for a message with no ts: the
+   *  index is computed in a scroll frame against a list that a streaming
+   *  append or a turn regroup can shift before this render, so matching on it
+   *  first hid the wrong row (the "two stacked boxes" bug the main chat fixed).
+   *  Deliberately a single hidden-row key, not a per-row style hook: one
+   *  consumer needs exactly this, and the ts-vs-index rule lives here once
+   *  instead of in every host. */
+  hiddenRow?: { ts?: string | null; index: number }
+  /** Mount the rows inside the list's own virtualized scroller. Supplying it
+   *  is what makes this component the scroll container: the host drops its
+   *  `overflow-y-auto` div and its follow hook, and reaches the scroller
+   *  through `ref` (a `VirtualTranscriptHandle`) or `transcript.scrollerRef`.
+   *  Without it the component has no scroller, so `ref` stays null. */
+  transcript?: TranscriptMount
 }
+
+/** The host-side wiring of a virtualized mount — everything about the scroller
+ *  that is not "which rows": identity for the height/anchor caches, what is
+ *  live, what sits above and below the rows, and how earlier history loads. */
+export interface TranscriptMount {
+  /** Partitions the persisted height cache and scroll anchor; prefix per host. */
+  sessionId: string
+  /** Share the scroll container with a host hook (usePinnedPrompt). */
+  scrollerRef?: React.MutableRefObject<HTMLDivElement | null>
+  onScroll?: () => void
+  onAtBottomChange?: (atBottom: boolean) => void
+  scrollerStyle?: React.CSSProperties
+  aboveRows?: React.ReactNode
+  belowRows?: React.ReactNode
+  earlier?: TranscriptEarlierPaging
+  /** Level-triggered older-history walk (an alternative to `earlier` for a host
+   *  that drives an automatic walk). Supply one older-history model, not both. */
+  onTopReached?: () => void
+  /** Prefetch lead for the older-history walk; only meaningful with `onTopReached`. */
+  prefetchStartIndex?: number
+  /** Pin to the bottom on appends. Default true. */
+  followOutput?: boolean
+  /** Where the list opens with no saved anchor. Default 'bottom'. */
+  initialPlacement?: 'top' | 'bottom'
+}
+
+export type { TranscriptEarlierPaging, VirtualTranscriptHandle }
 
 // ── Stable helpers (outside component) ──
-
-function renderUserContent(content: string, meta: Record<string, unknown> | undefined): React.ReactNode {
-  // History load re-serves the fully-EXPANDED paste content alongside
-  // meta.pastes. Handing a large paste (hundreds of KB / tens of thousands of
-  // lines) straight to MarkdownRenderer parses + lays it out on the main thread
-  // and freezes the tab. Re-collapse the message's own blocks back to
-  // `[ Paste #N ]` chips so only the small token text is rendered. Mirrors
-  // ChatPage.renderUserContentInner; kept minimal here to stay Redux-free.
-  const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
-  if (pastes.length) {
-    let text = content
-    let ranges = findTokenRanges(text, pastes)
-    if (!ranges.length) {
-      const collapsed = recollapsePastes(content, pastes)
-      if (collapsed !== content) { text = collapsed; ranges = findTokenRanges(text, pastes) }
-    }
-    if (ranges.length) {
-      const out: React.ReactNode[] = []
-      let last = 0
-      ranges.forEach((r, i) => {
-        const trimStart = text[r.start - 1] === '\n' ? r.start - 1 : r.start
-        const trimEnd = text[r.end] === '\n' ? r.end + 1 : r.end
-        if (trimStart > last) {
-          const seg = text.slice(last, trimStart)
-          if (seg) out.push(<span key={`t${i}`} style={{ whiteSpace: 'pre-wrap' }}>{seg}</span>)
-        }
-        out.push(<PastedChip key={`p${i}-${r.block.id}`} block={r.block} />)
-        last = trimEnd
-      })
-      if (last < text.length) {
-        const seg = text.slice(last)
-        if (seg) out.push(<span key="tend" style={{ whiteSpace: 'pre-wrap' }}>{seg}</span>)
-      }
-      return <MessageErrorBoundary rawContent={text}>{out}</MessageErrorBoundary>
-    }
-  }
-  return <MessageErrorBoundary rawContent={content}><MarkdownRenderer content={content} /></MessageErrorBoundary>
-}
-
-const GROUPABLE = new Set(['thinking', 'permission'])
-
-/**
- * Delegates to the shared footer formatter so an embedded app's transcript reads
- * IDENTICALLY to the main chat's. This was a second, hardcoded copy that never
- * printed a year at all — so an app showing a message from a previous year dated
- * it to the current one. `fmtMessageTime` elides the year only when it is safe.
- */
-function formatTs(ts?: string): string | undefined {
-  if (!ts) return undefined
-  return fmtMessageTime(ts) || undefined
-}
 
 function msgKey(m: ChatMessage, i: number): string {
   return (m.ts || '') + '-' + i + '-' + m.role
 }
 
-// ── ToolCallPill (prop-driven, no Redux) ──
-
-const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
-  const [expanded, setExpanded] = React.useState(false)
-  const isDone = message.role === 'tool_result'
-  const isRejected = message.meta?.resolved === 'rejected'
-  const hasPendingPerm = message.role === 'permission' && !message.meta?.resolved
-
-  // Prefer the backend-stamped purpose ("Add teams_data dict guard…") over the
-  // raw command, matching the main chat. The raw label is the fallback, and is
-  // no longer hard-truncated to 80 chars — CSS truncation keeps one line without
-  // destroying the text for the expanded panel or the file probe.
-  const rawLabel = (message.content || '').replace(/^🔧\s*/, '').split('\n')[0]
-  const purpose = typeof message.meta?.purpose === 'string' ? message.meta.purpose : ''
-  const label = purpose || rawLabel || message.role
-
-  // Status icon + colour mirror ToolCallLine so an embedded transcript reads
-  // with the same visual grammar as a main session: spinner while running,
-  // green dot when done, amber alert for auto-denied (policy/hook block —
-  // detected by the HOST from the hidden 🚫 sibling message and passed in,
-  // since this pill only ever renders the visible 🔧 message), red slash when
-  // user-rejected, amber lock when awaiting approval. Previously EVERY state
-  // showed one accent-purple spinning wrench, so a finished call was
-  // indistinguishable from an in-flight one.
-  const isAutoDenied = !isRejected && !!autoDenied
-  // Auto-denied is TERMINAL even though the 🔧 message never becomes a
-  // tool_result (isDone) — the gate blocked the call, nothing further runs —
-  // so it must escape both the loader icon and the spin animation.
-  const Icon = isRejected ? CircleSlash : isAutoDenied ? CircleAlert : isDone ? CircleDot : hasPendingPerm ? Lock : LoaderCircle
-  const tone = isRejected
-    ? 'text-danger bg-danger-subtle'
-    : isAutoDenied
-      ? 'text-warn bg-warn-subtle'
-      : isDone
-        ? 'text-ok bg-ok/5'
-        : hasPendingPerm
-          ? 'text-warn bg-warn-subtle'
-          : 'text-accent bg-accent/5'
-  // Animate ONLY while the session is actually running. A tool call left
-  // un-terminated by a dropped turn used to spin forever, so an idle transcript
-  // still looked busy — the loading state has to reflect the session, not just
-  // the message role.
-  const iconClass = !isDone && !hasPendingPerm && !isRejected && !isAutoDenied && running ? 'animate-spin' : ''
-
-  // File affordance: same pure helpers the main chat uses (no store needed).
-  const filePath = React.useMemo(() => {
-    const src = typeof message.meta?.input_preview === 'string' ? message.meta.input_preview : rawLabel
-    const p = extractToolFilePath(src)
-    return p && isSafePath(p) ? p : null
-  }, [message.meta?.input_preview, rawLabel])
-
-  return (
-    <div className="animate-scale-in flex items-center gap-1.5 flex-wrap">
-      <button
-        onClick={() => setExpanded(e => !e)}
-        aria-expanded={expanded}
-        className={`inline-flex items-center gap-1 text-[13px] font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
-      >
-        <Icon size={12} className={iconClass} />
-        <span className="truncate">{label}</span>
-      </button>
-      {filePath && onFileOpen && (
-        <button
-          onClick={() => onFileOpen(filePath)}
-          title={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
-          aria-label={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
-          className="inline-flex items-center gap-1 text-[12px] font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
-        >
-          {filePath.split('/').pop()}
-          <PanelRight size={11} />
-        </button>
-      )}
-      {expanded && message.content && (
-        <pre className="w-full text-[11px] font-mono text-muted bg-bg-elevated rounded-md p-2 mt-1 ml-4 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-border">
-          {purpose && rawLabel && purpose !== rawLabel ? rawLabel + '\n\n' + message.content : message.content}
-        </pre>
-      )}
-    </div>
-  )
-})
-
 // ── Main component ──
 
-const ChatMessageList = memo(function ChatMessageList({
+const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageListProps>(function ChatMessageList({
   messages,
   running,
   contentWidth = '900px',
   onApprove,
+  onApproveBatch,
+  canTrust,
   onFileOpen,
+  onQuote,
+  onAsk,
   renderTool,
-}: ChatMessageListProps) {
+  hideCardOwnedOAuth = false,
+  renderers,
+  onDisplayItems,
+  hiddenRow,
+  transcript,
+}: ChatMessageListProps, ref) {
+  // Row indexing is inferred from the props that consume it, not a separate
+  // flag: a host that reads indices supplies onDisplayItems (and hides through
+  // hiddenRow); one that supplies neither gets the unwrapped DOM. A virtualized
+  // mount always indexes: its measured wrapper is the indexed block.
+  const indexRows = onDisplayItems != null || hiddenRow != null
 
   // Phase 1: Build raw items — skip permissions, group thinking
   const displayItems = useMemo<DisplayItem[]>(() => {
@@ -196,7 +178,10 @@ const ChatMessageList = memo(function ChatMessageList({
     let groupStart = 0
 
     for (let i = 0; i < messages.length; i++) {
-      if (GROUPABLE.has(messages[i].role)) {
+      // A sub-agent completion the card cannot parse stays internal — the model
+      // sees it, the reader does not.
+      if (messages[i].role === 'subagent' && !isSubagentCompletionMessage(messages[i])) continue
+      if (GROUPED_ROLES.includes(messages[i].role)) {
         if (!group.length) groupStart = i
         group.push(messages[i])
       } else {
@@ -227,7 +212,9 @@ const ChatMessageList = memo(function ChatMessageList({
     }
 
     for (const item of raw) {
-      if (item.kind === 'single' && item.msg.role === 'user') {
+      // A sub-agent completion is the next turn's input, so it opens a turn the
+      // same way a user message does — the agent's reply belongs below the card.
+      if (item.kind === 'single' && (item.msg.role === 'user' || item.msg.role === 'subagent')) {
         flushTurn(true)
         turns.push(item)
       } else {
@@ -254,132 +241,47 @@ const ChatMessageList = memo(function ChatMessageList({
     return ids
   }, [messages])
 
-  // Render a single message by role
+  // Resolve each row through the registry. Host entries are searched first, so
+  // the same lookup serves a plain embed and a store-connected dashboard.
+  const activeRenderers = useMemo(() => mergeRenderers(renderers), [renderers])
+
   const renderMessage = useCallback((m: ChatMessage, i: number) => {
     const key = msgKey(m, i)
     const wrapper = (children: React.ReactNode, isUser = false) => (
-      <div key={key} className="px-5 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={key} className="px-4 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <div className={`group flex flex-col min-w-0 ${isUser ? 'items-end' : ''}`}>
-          <div className={`flex flex-col gap-0.5 min-w-0 overflow-hidden ${isUser ? 'items-end' : ''}`}>
+          <div className={`flex flex-col gap-0.5 min-w-0 overflow-hidden max-w-full ${isUser ? 'items-end' : ''}`}>
             {children}
           </div>
         </div>
       </div>
     )
+    const row = (children: React.ReactNode, tight = false) => (
+      <div key={key} className={`px-4 mx-auto w-full ${tight ? 'py-0' : 'py-1'}`} style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+        {children}
+      </div>
+    )
 
-    if (m.kind === 'stop_event' || m.meta?.kind === 'stop_event') {
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          <div className="text-danger text-[13px] font-mono px-3 py-2 rounded-md bg-danger-subtle inline-flex items-center gap-1.5">
-            {m.content}
-          </div>
-        </div>
-      )
+    const entry = resolveRenderer(m, activeRenderers)
+    if (!entry) return null
+
+    const ctx: MessageRenderContext = {
+      index: i,
+      messages,
+      running,
+      key,
+      onFileOpen,
+      onQuote,
+      onAsk,
+      hideCardOwnedOAuth,
+      autoDeniedIds,
+      renderTool,
+      wrapper,
+      row,
     }
+    return entry.render(m, ctx)
+  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
 
-    if (m.role === 'user') {
-      return wrapper(
-        <UserMessage content={m.content} meta={m.meta} timestamp={formatTs(m.ts)} timestampTitle={fmtMessageTimeFull(m.ts)} renderContent={renderUserContent} />,
-        true
-      )
-    }
-
-    if (m.role === 'assistant' || m.role === 'streaming') {
-      const isStreaming = m.role === 'streaming'
-      let showFooter = false
-      if (!isStreaming) {
-        let nextRelevant = false
-        for (let j = i + 1; j < messages.length; j++) {
-          if (messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
-          if (messages[j].role === 'assistant' || messages[j].role === 'streaming') { nextRelevant = true; break }
-        }
-        if (!nextRelevant) showFooter = !running
-      }
-      return wrapper(
-        <div className="flex flex-col gap-0">
-          <AssistantMessage
-            content={m.content}
-            isStreaming={isStreaming}
-            timestamp={formatTs(m.ts)}
-            timestampTitle={fmtMessageTimeFull(m.ts)}
-            showFooter={showFooter}
-            slotRunning={running}
-            onFileOpen={onFileOpen}
-            variants={m.variants}
-            variantIdx={m.variant_idx}
-            turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
-          />
-        </div>
-      )
-    }
-
-    if (m.role === 'tool' && m.content?.startsWith('🔧')) {
-      const tcid = m.meta?.tool_call_id as string | undefined
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          {renderTool ? renderTool(m) : <ToolCallPill message={m} running={running} onFileOpen={onFileOpen} autoDenied={!!tcid && autoDeniedIds.has(tcid)} />}
-        </div>
-      )
-    }
-
-    if (m.role === 'tool_call' || m.role === 'tool_result') {
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          {renderTool ? renderTool(m) : <ToolCallPill message={m} running={running} onFileOpen={onFileOpen} />}
-        </div>
-      )
-    }
-
-    if (m.role === 'inject') {
-      const cronLabel = (m.meta?.cronLabel as string) || ''
-      const cleanContent = cronLabel
-        ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
-        : m.content
-      return wrapper(
-        <>
-          {cronLabel && <span className="text-muted text-[11px] font-medium px-1 mb-0.5"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg border border-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-            <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
-          </div>
-        </>
-      )
-    }
-
-    if (m.role === 'error') {
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          <div className="bg-danger-subtle text-danger text-[13px] px-3 py-2 rounded-md border border-danger/15 self-center animate-scale-in">
-            {m.content}
-          </div>
-        </div>
-      )
-    }
-
-    if (m.role === 'notice') {
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          <div className="bg-card text-muted text-[13px] px-3 py-2 rounded-md border border-border self-center animate-scale-in">
-            {m.content}
-          </div>
-        </div>
-      )
-    }
-
-    if (m.role === 'thinking' || m.role === 'system' || m.role === 'done' || m.role === 'queued') return null
-    if (m.role === 'file') return null // TODO: file download links
-
-    if (m.role === 'mcp_oauth') {
-      const banner = renderMcpOAuthMessage(m)
-      if (!banner) return null
-      return (
-        <div key={key} className="px-5 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
-          {banner}
-        </div>
-      )
-    }
-
-    return null
-  }, [messages, running, contentWidth, onFileOpen, renderTool, autoDeniedIds])
 
   // Render a TurnItem (single or group)
   const renderItem = useCallback((item: TurnItem, _i: number) => {
@@ -390,22 +292,57 @@ const ChatMessageList = memo(function ChatMessageList({
     const nonPerm = item.msgs.filter(m => m.role !== 'permission')
     const perms = item.msgs.filter(m => m.role === 'permission')
     const unresolvedPerms = perms.filter(m => !m.meta?.resolved)
+    // A group of only RESOLVED permissions has nothing to show: its pill would
+    // claim "0 tool calls" over an empty expansion (permission rows render
+    // null), which after a stop cancels a call sits right under the turn
+    // summary's own count — two disagreeing counts for one stopped call
+    // (#9556). ChatPage's renderTurnItem already skips all-permission groups;
+    // this host keeps a group with a PENDING permission because, with no
+    // pinned ApprovalBar in the embed, the group IS the approval surface.
+    if (nonPerm.length === 0 && unresolvedPerms.length === 0) return null
     const lastPerm = unresolvedPerms[unresolvedPerms.length - 1]
 
     const handleApprove = onApprove && lastPerm?.meta?.approval_id
       ? (decision: string) => onApprove(lastPerm.meta!.approval_id as string, decision)
       : undefined
 
+    // Batch resolver over EVERY pending id in this group (Req 4.1-4.4). Only
+    // offered when the host supplied onApproveBatch AND there is MORE THAN ONE
+    // pending approval — a single-id "batch" is never invoked (CollapsibleToolGroup
+    // batches only when pendingPermCount > 1) yet a > 0 handler still flips the
+    // (onApprove || onApproveBatch) render gates, so the gate matches its one
+    // real trigger by requiring > 1 here. TOOL_DENY calls never surface as
+    // pending permissions (backend gate; locked by the T5-guard test), so this
+    // id list is deny-free.
+    const batchIds = unresolvedPerms
+      .map(m => m.meta?.approval_id as string | undefined)
+      .filter((x): x is string => !!x)
+    const handleApproveBatch = onApproveBatch && batchIds.length > 1
+      ? (decision: string) => onApproveBatch(batchIds, decision)
+      : undefined
+    // Every pending call's meta, so the batch row can preview ALL N commands the
+    // one click will approve — not just the newest (permissionMeta). The human
+    // gate against an untrusted agent must show each command being approved.
+    // Map 1:1 over unresolvedPerms (NO filter): a meta-less pending perm becomes
+    // an empty {} so CollapsibleToolGroup renders its "No preview available"
+    // placeholder row for it. Filtering here would make permissionMetas.length <
+    // pendingPermCount, so the "Review all N" note would promise more rows than
+    // render — the silent-row gap the placeholder exists to prevent.
+    const batchMetas = unresolvedPerms.map(m => m.meta ?? {})
+
     return (
-      <div key={'grp-' + item.startIdx} className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <CollapsibleToolGroup
           count={nonPerm.length}
-          autoExpand={running && item.startIdx >= messages.length - 5}
+          autoExpand={(running && item.startIdx >= messages.length - 5) || !!handleApproveBatch}
           hasPermission={unresolvedPerms.length > 0}
           isRunning={running}
           permissionMeta={lastPerm?.meta}
+          permissionMetas={batchMetas}
           pendingPermCount={unresolvedPerms.length}
           onApprove={handleApprove}
+          onApproveBatch={handleApproveBatch}
+          canTrust={canTrust}
         >
           {/* Grouped messages (thinking, permission) return null from renderMessage
               intentionally — CollapsibleToolGroup handles their display via its
@@ -414,21 +351,86 @@ const ChatMessageList = memo(function ChatMessageList({
         </CollapsibleToolGroup>
       </div>
     )
-  }, [renderMessage, running, messages.length, contentWidth, onApprove])
+  }, [renderMessage, running, messages.length, contentWidth, onApprove, onApproveBatch, canTrust])
 
   // Render a DisplayItem (single, group, or turn)
   const renderDisplayItem = useCallback((item: DisplayItem, i: number) => {
-    if (item.kind === 'turn') {
-      return <TurnBlock key={'turn-' + i} turn={item} renderItem={renderItem} />
-    }
-    return renderItem(item, i)
-  }, [renderItem])
+    const node = item.kind === 'turn'
+      ? <TurnBlock key={'turn-' + i} turn={item} renderItem={renderItem} />
+      : renderItem(item, i)
+    if (!indexRows) return node
+    const hidden = hiddenRow != null && (hiddenRow.ts != null
+      ? (item.kind === 'single' && item.msg.ts === hiddenRow.ts)
+      : hiddenRow.index === i)
+    // A plain block wrapper: it takes the row's own box (padding included), so
+    // its rect IS the row's rect for the geometry that reads it, and it adds no
+    // class of its own so the theming contract on the inner row is untouched.
+    return (
+      <div key={'row-' + i} data-display-index={i} style={hidden ? { visibility: 'hidden' } : undefined}>
+        {node}
+      </div>
+    )
+  }, [renderItem, indexRows, hiddenRow])
+
+  // Layout effect, not passive: see `onDisplayItems`.
+  useLayoutEffect(() => { onDisplayItems?.(displayItems) }, [displayItems, onDisplayItems])
+
+  // The row's content alone: the virtualized mount supplies the measured,
+  // indexed wrapper, so the fragment path's wrapper must not stack under it.
+  const renderRowContent = useCallback((item: DisplayItem, i: number) => (
+    item.kind === 'turn'
+      ? <TurnBlock turn={item} renderItem={renderItem} />
+      : renderItem(item, i)
+  ), [renderItem])
+  const isRowHidden = useCallback((item: DisplayItem, i: number) => (
+    hiddenRow != null && (hiddenRow.ts != null
+      ? (item.kind === 'single' && item.msg.ts === hiddenRow.ts)
+      : hiddenRow.index === i)
+  ), [hiddenRow])
+
+  // The row whose tail message is streaming (only ever the last one): its
+  // growth applies to the offset math immediately instead of through the
+  // debounced sync. Gated on the streaming ROLE, not the run flag — a tool
+  // phase or an auto-height widget in the last row must keep the debounce.
+  const streamingIndex = useMemo(() => {
+    const last = displayItems[displayItems.length - 1]
+    if (!last) return undefined
+    const tailOf = (t: TurnItem): ChatMessage | undefined =>
+      t.kind === 'single' ? t.msg : t.msgs[t.msgs.length - 1]
+    const tail = last.kind === 'turn' ? (last.items.length ? tailOf(last.items[last.items.length - 1]) : undefined) : tailOf(last)
+    return tail?.role === 'streaming' ? displayItems.length - 1 : undefined
+  }, [displayItems])
+
+  if (transcript) {
+    return (
+      <VirtualTranscript
+        ref={ref}
+        items={displayItems}
+        renderRow={renderRowContent}
+        sessionId={transcript.sessionId}
+        running={running}
+        streamingIndex={streamingIndex}
+        followOutput={transcript.followOutput}
+        initialPlacement={transcript.initialPlacement}
+        scrollerRef={transcript.scrollerRef}
+        onScroll={transcript.onScroll}
+        onAtBottomChange={transcript.onAtBottomChange}
+        scrollerStyle={transcript.scrollerStyle}
+        aboveRows={transcript.aboveRows}
+        belowRows={transcript.belowRows}
+        earlier={transcript.earlier}
+        onTopReached={transcript.onTopReached}
+        prefetchStartIndex={transcript.prefetchStartIndex}
+        isRowHidden={hiddenRow != null ? isRowHidden : undefined}
+      />
+    )
+  }
 
   return (
     <>
       {displayItems.map(renderDisplayItem)}
     </>
   )
-})
+}))
 
 export default ChatMessageList

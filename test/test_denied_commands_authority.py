@@ -93,12 +93,15 @@ class TestIsDeniedForwarding:
     def test_is_denied_forwards_denied_regexes(self) -> None:
         calls: list[dict] = []
 
-        def _fake_is_denied(tool_name, extra_patterns=None, *, denied_regexes=None):
+        def _fake_is_denied(
+            tool_name, extra_patterns=None, *, denied_regexes=None, reason_notes=None
+        ):
             calls.append(
                 {
                     "tool_name": tool_name,
                     "extra_patterns": extra_patterns,
                     "denied_regexes": denied_regexes,
+                    "reason_notes": reason_notes,
                 }
             )
             return None
@@ -116,8 +119,32 @@ class TestIsDeniedForwarding:
                 "tool_name": "some cmd",
                 "extra_patterns": None,
                 "denied_regexes": ["aws.*terminate.*"],
+                "reason_notes": None,
             }
         ]
+
+    def test_is_denied_forwards_reason_notes(self) -> None:
+        """The operator-note map must reach the gate, or an annotated rule would
+        silently fall back to showing its raw regex."""
+        calls: list[dict] = []
+
+        def _fake_is_denied(
+            tool_name, extra_patterns=None, *, denied_regexes=None, reason_notes=None
+        ):
+            calls.append({"reason_notes": reason_notes})
+            return None
+
+        notes = {"find .*": "use -maxdepth, or rg/fd"}
+        orig = security.is_denied
+        security.is_denied = _fake_is_denied  # type: ignore[assignment]
+        try:
+            PolicyAuthority().is_denied(
+                "some cmd", denied_regexes=["find .*"], reason_notes=notes
+            )
+        finally:
+            security.is_denied = orig  # type: ignore[assignment]
+
+        assert calls == [{"reason_notes": notes}]
 
     def test_default_denied_regexes_fails_closed_to_builtins(self) -> None:
         # With no denied_regexes the fail-closed default (all built-ins) applies.
@@ -125,11 +152,23 @@ class TestIsDeniedForwarding:
         assert authority.is_denied("aws ec2 terminate-instances i-x") is not None
         assert authority.is_denied("ls -la") is None
 
-    def test_empty_denied_regexes_still_blocks_git_publish(self) -> None:
-        # git-publish is an always-on floor inside security.is_denied, so an
-        # empty regex tier (disable_all + no pins) does not weaken it.
+    def test_empty_denied_regexes_honours_the_git_publish_opt_out(self) -> None:
+        # The git-publish floor's GATED branches are consulted against the
+        # effective set, so an empty regex tier (disable_all + no pins) disables
+        # them too — a toggle the UI offers must not be a silent no-op.
         authority = PolicyAuthority()
-        assert authority.is_denied("git push origin main", denied_regexes=[]) is not None
+        assert authority.is_denied("git push origin main", denied_regexes=[]) is None
+        # ``None`` fails closed to all built-ins enabled, so the default denies.
+        assert authority.is_denied("git push origin main") is not None
+
+    def test_empty_denied_regexes_still_blocks_unverifiable_push(self) -> None:
+        # The anti-obfuscation branch carries no per-rule gate: a push target the
+        # shell fuses together cannot be checked against a branch name at all, so
+        # no opt-out may reach it.
+        authority = PolicyAuthority()
+        assert (
+            authority.is_denied("git push origin ma$(echo)in", denied_regexes=[]) is not None
+        )
 
     def test_overlay_never_filtered_by_denied_regexes(self) -> None:
         # The ADD-only overlay flows through extra_patterns and is applied even
@@ -140,3 +179,54 @@ class TestIsDeniedForwarding:
 
         authority = PolicyAuthority(overlay=_AddOverlay())
         assert authority.is_denied("please launch_missiles now", denied_regexes=[]) is not None
+
+
+class TestSynthesizedTargetOverlayFloor:
+    """The ADD-only overlay keeps its command semantics for a synthesized target.
+
+    An overlay pattern is opaque enterprise policy, and one restricting a filesystem
+    SCOPE is spelled as bare path text, so it is evaluated through the unscoped
+    ``is_denied`` rather than travelling into the synthesized tier.
+    """
+
+    TARGET = "file-search path=/mnt/forbidden-share max_depth=3"
+
+    class _ScopeOverlay:
+        def extra_deny_patterns(self):
+            return ("*forbidden-share*",)
+
+    def test_a_path_only_overlay_pattern_still_denies_a_search(self) -> None:
+        authority = PolicyAuthority(overlay=self._ScopeOverlay())
+        assert authority.is_denied_synthesized_target(self.TARGET) is not None
+
+    def test_the_overlay_applies_with_no_participating_patterns(self) -> None:
+        # Its ADD-only property: nothing the operator does or omits reaches the overlay.
+        authority = PolicyAuthority(overlay=self._ScopeOverlay())
+        assert authority.is_denied_synthesized_target(self.TARGET, []) is not None
+
+    def test_an_unrelated_overlay_does_not_reinstate_the_collision(self) -> None:
+        # The overlay pass must forward an EMPTY regex tier, not `None`: `None` fails
+        # closed to every built-in, which would evaluate the whole shipped catalogue
+        # against the synthesized target and undo the tier.
+        class _UnrelatedOverlay:
+            def extra_deny_patterns(self):
+                return ("*launch_missiles*",)
+
+        authority = PolicyAuthority(overlay=_UnrelatedOverlay())
+        effective = list(
+            security.compute_effective_denied(security.BUILTIN_DENIED_RULES, (), False, (), ())
+        )
+        assert "mkfs.*" in effective  # premise
+        assert authority.is_denied_synthesized_target("file-search path=/srv/mkfs-tests") is None
+
+    def test_the_boot_guard_rejects_overriding_the_synthesized_decision(self) -> None:
+        # `is_denied` is not the only decision path; a subclass always-allowing every
+        # file-search call must not pass boot either.
+        class _WeakeningAuthority(PolicyAuthority):
+            def is_denied_synthesized_target(  # type: ignore[override]
+                self, target, patterns=None, *, extra_patterns=None, reason_notes=None
+            ):
+                return None
+
+        with pytest.raises(PlatformCompositionError):
+            assert_security_floor(_WeakeningAuthority())

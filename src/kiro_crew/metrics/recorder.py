@@ -3,9 +3,15 @@
 Every core or app metric flows through this facade so KiroCrew's namespace and
 privacy guardrails (``validate_name`` / ``validate_attrs`` / ``redact`` from
 ``kiro_crew.metrics.schema``) run *before* the value reaches an OTEL instrument.
-That makes it structurally impossible for a call site to emit an out-of-namespace
-metric or to leak a secret / PII into an attribute (security event logging:
-never log secrets or user PII).
+Namespace validation is exhaustive: ``validate_name`` rejects anything outside
+the caller's namespace, so an out-of-namespace metric cannot be emitted.
+
+Attribute redaction is defence in depth, not a guarantee. ``redact`` matches
+known credential shapes and falls back to a Shannon-entropy heuristic whose
+reach is bounded (see ``schema.py``), so a call site remains responsible for
+passing only the declared low-cardinality constants the CARDINALITY note in
+``schema.py`` requires. Do not treat this facade as a licence to hand it raw
+values (security event logging: never log secrets or user PII).
 
 Design:
   * OTEL instrument objects are created once per metric name and cached under a
@@ -14,8 +20,7 @@ Design:
     Slack + cron sessions all calling ensure_ready() at boot) creates exactly one
     instrument, never a duplicate. The caches are keyed by metric NAME and are
     not evicted, so callers MUST use low-cardinality constant names (see the
-    cardinality note in ``schema.py``); bounded eviction is deferred to a later
-    wave.
+    cardinality note in ``schema.py``); bounded eviction is not implemented.
   * Every public method is best-effort: a telemetry failure NEVER propagates to
     the caller -- it is logged at WARNING and swallowed.
   * A recorder built with ``meter=None`` is a no-op recorder, used when telemetry

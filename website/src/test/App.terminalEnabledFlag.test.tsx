@@ -3,7 +3,7 @@
  * /api/terminal/sessions config.
  *
  * The "Run in Terminal" button on shell code blocks is gated in
- * MonacoCodeBlock behind `useTerminalEnabled()`, which reads a module-level
+ * EditableCodeBlock behind `useTerminalEnabled()`, which reads a module-level
  * flag in terminalRegistry (`_enabled`, initialised to false). App is the ONE
  * place that flips that flag on, via:
  *
@@ -11,7 +11,7 @@
  *   useEffect(() => { setTerminalEnabledFlag(terminalEnabled) }, [terminalEnabled])
  *
  * This wiring is easy to drop silently in an App.tsx rewrite: existing
- * MonacoCodeBlock / terminalRegistry tests exercise the gate GIVEN the flag --
+ * EditableCodeBlock / terminalRegistry tests exercise the gate GIVEN the flag --
  * none assert that App actually sets it, so such a regression slips through
  * green tests. These tests pin the App-to-registry contract directly so a
  * future App.tsx refactor can't silently drop it:
@@ -34,7 +34,6 @@ import { isTerminalEnabled, setTerminalEnabledFlag } from '../utils/terminalRegi
 // /api/terminal/sessions endpoint this test cares about.
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => null }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
@@ -76,7 +75,7 @@ Object.defineProperty(window, 'matchMedia', {
     removeEventListener: vi.fn(),
   })),
 })
-globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as any
+globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver
 
 describe('App terminal-enabled registry flag sync', () => {
   beforeEach(() => {

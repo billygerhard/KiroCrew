@@ -1,12 +1,20 @@
-import { useState, useRef, useEffect, useMemo, useCallback, type ReactNode } from 'react'
+import { memo, useState, useRef, useEffect, useMemo, useCallback, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ChevronRight } from 'lucide-react'
 import type { DisplayItem, TurnItem } from './types'
+import { uniqueRowKeys } from '../../chat-core/transcript/rowKeys'
+import { useStableMessageKey } from '../../chat-core/transcript/useStableMessageKey'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { useSearchHighlight } from '../../hooks/SearchHighlightContext'
 import { isWorkflowRunTool } from './WorkflowRunCard'
 import { isSpawnRunTool } from './SubagentRunCard'
 import { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
-import { OPTION_MARKER_RE } from '../../utils/optionsMarker'
+import { isSubagentCompletionMessage } from './subagentCompletion'
+import { isReasoningBurst } from './groupDisplayItems'
+import { isDiffToolMessage } from './toolDiff'
+import { findOptionMarkers, stripOptionMarkers } from '../../app-sdk/protocol/optionMarker'
+import { hasKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
+import { i18nT } from '../../i18n/t'
 
 // A workflow_run launch renders as its own always-visible inline card
 // (WorkflowRunCard), so it must never be folded into the collapsible tool-call
@@ -22,6 +30,11 @@ const isSpawnRunItem = (it: TurnItem) =>
 // visible even when a turn's reasoning is collapsed (collapseAll mode).
 const isWorkflowCompletionItem = (it: TurnItem) =>
   it.kind === 'single' && isWorkflowCompletionMessage(it.msg)
+// Same for a sub-agent completion event. The delivery-timeout variant arrives
+// under the `assistant` role, which lands mid-turn — collapsing it would hide
+// the only notice that a result never made it into the session.
+const isSubagentCompletionItem = (it: TurnItem) =>
+  it.kind === 'single' && isSubagentCompletionMessage(it.msg)
 // An MCP App (SEP-1865) render is anchored to its tool-call row (ToolCallLine
 // mounts the sandboxed iframe below the row). Folding that row into a
 // collapsed pane hides the interactive app — and re-expanding REMOUNTS the
@@ -33,9 +46,18 @@ const isMcpAppItem = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   it.kind === 'single' && it.msg.role === 'tool' &&
   typeof it.msg.meta?.tool_call_id === 'string' &&
   appToolCallIds.has(it.msg.meta.tool_call_id)
+// An edit-tool row promoting an inline diff presentation (ToolCallLine
+// renders a DiffBlock card or summary chip below the pill). It stays out of
+// BOTH folds — a file change is a result, not a working step: the same class
+// as the prose ```diff the final summary used to carry, which neither fold
+// ever hid. Density relief is per-card (ToolCallLine's fold chip) plus the
+// size caps in presentToolDiff, so an edit-heavy turn is N foldable cards,
+// not an immovable wall (see rfc-tool-derived-diff-cards.md).
+const isDiffCardItem = (it: TurnItem) =>
+  it.kind === 'single' && isDiffToolMessage(it.msg)
 const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   it.kind === 'single' && it.msg.role === 'tool' && !isWorkflowRunItem(it) &&
-  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds)
+  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it)
 const isHiddenTool = (it: TurnItem) => it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')
 const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming' || it.msg.role === 'file')
 /**
@@ -72,25 +94,96 @@ const isRenderable = (it: TurnItem) =>
  * hand-back would otherwise be buried in the collapse pane. Surfacing each one
  * inline fixes that.
  *
- * OPTION_MARKER_RE is g-flagged and optionsMarker.ts forbids .test()/.exec() on
- * it (the lastIndex hazard); probe it via .replace(), exactly like
- * substantiveLength() below.
+ * Asks the marker module rather than probing a regex: a candidate whose terminator
+ * belongs to an unmatched opener is NOT a marker, and only that module can tell.
  */
 function hasOptionsMarker(text: string): boolean {
-  return text.replace(OPTION_MARKER_RE, '') !== text
+  return findOptionMarkers(text).length > 0
 }
 const isHandBack = (it: TurnItem) =>
   it.kind === 'single' && isConclusion(it) && hasOptionsMarker(it.msg.content)
 
+/**
+ * A message the agent explicitly marked to survive the collapse: a substantive
+ * mid-turn deliverable (a report or synthesis followed by more tool calls or a
+ * short sign-off) carrying the invisible `<!-- keep-visible -->` marker (#7948).
+ * Without it, findConclusionIdx keeps only the LAST substantive message and a
+ * deliverable emitted before a terminal tool call folds into the collapse pane.
+ * Same design rule as isHandBack above: gate on an explicit intent marker, not
+ * on size — the collapse setting is a user preference, so only a direct signal
+ * of agent intent may exempt a message from it. The marker is an HTML comment,
+ * so the rendered message shows nothing extra (rehypeRaw emits a comment node,
+ * which the react renderer skips).
+ */
+const isKeepVisible = (it: TurnItem) =>
+  it.kind === 'single' && isConclusion(it) && hasKeepVisibleMarker(it.msg.content)
+
+/**
+ * READ-ONLY COMPAT for transcripts written by the retired Crew Mode: a
+ * forwarded topic result, a meta render, or a question back to the user. That
+ * mode broke this component's central assumption — that the LAST assistant
+ * message of a turn is the conclusion and the earlier ones are reasoning —
+ * because each forward was the FINAL answer for a different topic, so
+ * collapsing all but the last hides answers the user asked for. Nothing writes
+ * these rows any more (the dispatcher is gone), but the sessions it wrote are
+ * still the user's record, so the persisted marker keeps rendering them open.
+ * Keyed on the persisted `meta.crew_reply` (the durable signal — the periodic
+ * slot flush keeps `meta` for every role but `cls` only for role === 'system'),
+ * with the older `crew-reply` class as a fallback for rows written before the
+ * marker moved.
+ */
+const isCrewReply = (it: TurnItem) =>
+  it.kind === 'single' && isConclusion(it) &&
+  (it.msg.meta?.crew_reply === true || /(^|\s)crew-reply(\s|$)/.test(it.msg.cls || ''))
+
 /** A renderable assistant message (widget/image), a mid-turn hand-back
- *  ([OPTIONS:] marker), a role that must surface inline (mcp_oauth, error), a
- *  workflow_run / spawn_run / workflow-completion card, or an MCP App-bearing
- *  tool call (interactive iframe anchored to the row). All bypass the collapse
- *  pane. */
+ *  ([OPTIONS:] marker), a keep-visible-marked deliverable (#7948), a legacy
+ *  crew-mode answer, a role that must surface inline (mcp_oauth, error), a
+ *  workflow_run / spawn_run / workflow-completion / sub-agent-completion card,
+ *  or an MCP App-bearing tool call (interactive iframe anchored to the row).
+ *  All bypass the collapse pane. */
 const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
-  isRenderable(it) || isHandBack(it) || isAlwaysVisible(it) ||
+  isRenderable(it) || isHandBack(it) || isKeepVisible(it) || isAlwaysVisible(it) || isCrewReply(it) ||
   isWorkflowRunItem(it) || isSpawnRunItem(it) ||
-  isWorkflowCompletionItem(it) || isMcpAppItem(it, appToolCallIds)
+  isSubagentCompletionItem(it) ||
+  isWorkflowCompletionItem(it) || isMcpAppItem(it, appToolCallIds) ||
+  isDiffCardItem(it)
+
+/** One ordered run of the collapse split: a contiguous run of items that hide
+ *  behind the toggle, or a single item that must render in place. */
+type Seg =
+  | { type: 'collapsed'; items: { it: TurnItem; idx: number }[] }
+  | { type: 'visible'; it: TurnItem; idx: number }
+
+/**
+ * Split items into ordered segments: contiguous "collapsed" runs interleaved
+ * with items that must render in place (widgets/images, hand-backs, crew
+ * replies, mcp_oauth/error rows, workflow_run / spawn_run / completion cards,
+ * MCP-App tool rows, diff cards — see isVisibleInline).
+ *
+ * ONE definition, shared by the collapseAll split and the interim-fan-out fold,
+ * so "what may never be hidden behind a toggle" cannot drift between them.
+ * `idx` is the item's index in the caller's list, offset by `offset` when the
+ * caller passes a slice.
+ */
+function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, offset = 0): Seg[] {
+  const segs: Seg[] = []
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
+    if (isVisibleInline(it, appToolCallIds)) {
+      segs.push({ type: 'visible', it, idx: offset + i })
+    } else {
+      const last = segs[segs.length - 1]
+      if (last?.type === 'collapsed') last.items.push({ it, idx: offset + i })
+      else segs.push({ type: 'collapsed', items: [{ it, idx: offset + i }] })
+    }
+  }
+  return segs
+}
+
+/** Steps a collapse toggle can honestly claim to be hiding. */
+const countCollapsedSteps = (segs: Seg[]): number =>
+  segs.flatMap(s => s.type === 'collapsed' ? s.items : []).filter(({ it }) => !isHiddenTool(it)).length
 
 /** Stable empty set so the mcpApps selector returns a referentially-equal
  *  value when the slot has no app renders (avoids useless re-renders). */
@@ -98,7 +191,7 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set()
 
 /** Strip OPTIONS/markdown formatting and return plain text content length */
 function substantiveLength(text: string): number {
-  return text.replace(OPTION_MARKER_RE, '').replace(/[#*_`>\-|]/g, '').trim().length
+  return stripOptionMarkers(text).replace(/[#*_`>\-|]/g, '').trim().length
 }
 
 /**
@@ -122,6 +215,97 @@ function findConclusionIdx(items: TurnItem[]): number {
   return conclusionIdx === -1 ? fallbackIdx : conclusionIdx
 }
 
+/**
+ * Fold a turn's reasoning bursts into ONE `thinking` row, hoisted to the TURN
+ * TOP.
+ *
+ * chatSlice opens a fresh `thinking` message per burst — one above every tool
+ * step it explains (#4178). That keeps the live stream anchored correctly, but
+ * a long agentic turn (a prepare-pr round, a monitor cycle) settles into a WALL
+ * of a dozen-plus collapsed "Thought process" rows once the interleaved tool
+ * calls fold away. This merges every content-bearing burst of the turn into a
+ * single synthetic row.
+ *
+ * WHY TOP, not the first burst's slot: reasoning is client-only and never
+ * persisted, so the `chat_done` slot refresh rebuilds the turn from server
+ * history (which has no reasoning) and `mergePreservedThinking` re-inserts the
+ * saved bursts. It anchors each burst on its FOLLOWING tool call (#4578/#4218),
+ * which keeps the burst↔tool 1:1 case interleaved — but history holds ONE
+ * assistant answer row for ALL bursts (segment flush is gated on pending text),
+ * so any burst NOT followed by a distinct tool (trailing reasoning, or several
+ * bursts collapsing onto that one answer row) falls back to the answer-text
+ * anchor and lands at the TAIL, below the answer and its footer. Anchoring the
+ * merged row at the first burst's position would therefore drop it below the
+ * answer for exactly those turns. Pinning it to the turn top instead makes the
+ * folded row's position independent of where the refresh parked the bursts:
+ * live (interleaved) and reloaded (piled at the tail) both render one reasoning
+ * row above the turn's output, matching the pre-#4178 single-block placement.
+ *
+ * The merge is render-only: the per-burst messages in the store are untouched,
+ * so nothing downstream of the transcript (persistence, search idx, the live
+ * accumulation in sseThinkingChunk) changes. The synthetic row reuses the first
+ * burst's message object (and therefore its `clientTs`, so `messageRowKey` is
+ * stable across renders) with the concatenated content, and keeps that burst's
+ * `idx` so `renderItem`'s `renderMessage(idx, msg)` still keys it.
+ *
+ * Because the content GROWS as later bursts arrive (and as the open burst
+ * streams), ThinkingBlock's content-growth liveness fires on the merged row too
+ * — so a running turn shows ONE live "Thinking" line with the streaming tail
+ * rather than sprouting a new row per burst, and it settles to a single
+ * "Thought process" when the turn goes quiet. Empty placeholder `thinking` rows
+ * (no content) are left in place, so a bare "Thinking…" placeholder is
+ * unaffected; a single burst already sitting at the top is returned untouched.
+ */
+function mergeTurnThinking(items: TurnItem[]): TurnItem[] {
+  const thinkingPositions: number[] = []
+  const bursts: Extract<TurnItem, { kind: 'single' }>[] = []
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
+    // Shared with the wrap gate that routes multi-burst batches here — see
+    // isReasoningBurst in groupDisplayItems.ts for why there is ONE definition.
+    if (isReasoningBurst(it)) { thinkingPositions.push(i); bursts.push(it) }
+  }
+  if (thinkingPositions.length === 0) return items
+  // A single burst already at the top is the settled, correct shape (the live
+  // path and a 1:1 reload both produce it) — leave it, so a plain reasoning
+  // turn is not needlessly rewritten.
+  if (thinkingPositions.length === 1 && thinkingPositions[0] === 0) return items
+  const first = bursts[0]
+  const merged = bursts.map(b => b.msg.content).join('\n\n')
+  const mergedItem: TurnItem = { kind: 'single', msg: { ...first.msg, content: merged }, idx: first.idx }
+  const drop = new Set(thinkingPositions)
+  // Hoist the merged reasoning to the turn top; every other item keeps its order.
+  const out: TurnItem[] = [mergedItem]
+  for (let i = 0; i < items.length; i++) {
+    if (!drop.has(i)) out.push(items[i])
+  }
+  return out
+}
+
+/* Row keys, by message identity.
+ *
+ * The keys for a turn's rows come from `uniqueRowKeys` — the transcript's own
+ * `row-<identity>` / `grp-<identity>` scheme with its collision tie-break — fed
+ * by `useStableMessageKey`, the ONE spelling of the per-message identity rule
+ * (`clientTs` → `ts` → a minted id) every virtualized host keys rows with. So a
+ * turn's rows are keyed exactly as the transcript keys the turn, and a change to
+ * that rule cannot de-sync the two.
+ *
+ * Why identity and not an index: a `single`'s `idx` and a `group`'s `startIdx`
+ * are array positions in the transcript, and a history backfill (older page
+ * landing) renumbers every one of them while leaving message identities intact
+ * — so an index-keyed wrapper would remount every row below the prepend, an
+ * inline MCP App iframe among them. The mapped position is worse still:
+ * `mergeTurnThinking` hoists a later reasoning burst above earlier rows on the
+ * next flush. Every render path keys visible rows through these, in the
+ * streaming and the folded render alike (#11083).
+ *
+ * The minted-id fallback only ever applies to a message with neither timestamp.
+ * `mergeTurnThinking`'s merged row spreads its first burst, so it carries that
+ * burst's `ts` and keys on it; a timestamp-less burst would mint a new id per
+ * flush (a fresh object each time) and re-key that one collapsed row, never an
+ * app row, which is always a tool message with a `ts`. */
+
 /** Collapsible agent turn. collapseAll=false (default): only tool calls collapse. collapseAll=true: all working steps collapse, only final assistant text visible.
  *
  *  ``appToolCallIds``: tool_call_ids in THIS pane's slot that have a live MCP
@@ -131,7 +315,11 @@ function findConclusionIdx(items: TurnItem[]): number {
  *  renders it for ChatEmbed with no Provider mounted, and a pane must scope the
  *  set to its OWN session key, not the globally-active slot.
  */
-export default function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMPTY_ID_SET, disclosure, onDisclosureChange }: { turn: Extract<DisplayItem, {kind:'turn'}>; renderItem: (item: TurnItem, i: number) => ReactNode; collapseAll?: boolean; appToolCallIds?: ReadonlySet<string>; disclosure?: boolean; onDisclosureChange?: (expanded: boolean) => void }) {
+function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMPTY_ID_SET, disclosure, disclosureKey, onDisclosureChange }: { turn: Extract<DisplayItem, {kind:'turn'}>; renderItem: (item: TurnItem, i: number) => ReactNode; collapseAll?: boolean; appToolCallIds?: ReadonlySet<string>; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void }) {
+  // memo() bails out of the provider-level language repaint, so this component
+  // subscribes to language generation itself: its i18nT() strings must
+  // re-translate even when no prop moves.
+  useLanguageGeneration()
   const [localExpanded, setLocalExpanded] = useState(!turn.complete)
   // Disclosure is HOST-OWNED when `disclosure` is supplied, and that is what
   // makes an explicit choice durable: the transcript is virtualised, so this
@@ -150,14 +338,26 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
   const toggle = useCallback(() => {
     userToggled.current = true
     const next = !expanded
-    if (onDisclosureChange) onDisclosureChange(next)
+    if (onDisclosureChange && disclosureKey !== undefined) onDisclosureChange(disclosureKey, next)
     else setLocalExpanded(next)
-  }, [expanded, onDisclosureChange])
+  }, [expanded, onDisclosureChange, disclosureKey])
   const wasComplete = useRef(turn.complete)
   useEffect(() => {
     if (turn.complete && !wasComplete.current && !userToggled.current) setLocalExpanded(false)
     wasComplete.current = turn.complete
   }, [turn.complete])
+
+  // Fold the turn's reasoning bursts into ONE `thinking` row (see
+  // mergeTurnThinking). Every render path below reads THIS list, not
+  // turn.items, so a running turn shows one live reasoning line and a settled
+  // turn shows one collapsed "Thought process" instead of a per-burst wall.
+  const items = useMemo(() => mergeTurnThinking(turn.items), [turn.items])
+  // One React key per row of `items`, by message identity (see the block
+  // comment above); `rowKey(i)` indexes THIS list, so every render path below
+  // must pass the item's position in `items`, never a segment index.
+  const msgKey = useStableMessageKey()
+  const keys = useMemo(() => uniqueRowKeys(items, msgKey), [items, msgKey])
+  const rowKey = (i: number): string => keys[i] ?? `pos-${i}`
 
   // Auto-expand only when the active search match lives inside a COLLAPSED
   // segment of this turn — collapsed reasoning is mounted but height-0, so the
@@ -167,8 +367,10 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
   const { term, currentMessageIdx } = useSearchHighlight()
   const matchInCollapsedSegment = useMemo(() => {
     if (!term || currentMessageIdx < 0) return false
-    // Default mode only collapses tool calls, which are never search matches.
-    if (!collapseAll) return false
+    // Default mode only collapses tool calls, which are never search matches —
+    // but an interim fan-out turn folds its prose in BOTH modes, so it has to be
+    // checked before that bail-out or a match inside it stays height-0.
+    if (!collapseAll && !turn.interim) return false
     const msgIdxs = (it: TurnItem): number[] =>
       it.kind === 'single'
         ? [it.idx]
@@ -177,85 +379,136 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
           : []
     // Mirror the render's conclusion-finding so we know which items are the
     // (always-visible) conclusion vs the collapsible pre-conclusion reasoning.
-    const conclusionIdx = findConclusionIdx(turn.items)
-    const beforeItems = conclusionIdx > 0 ? turn.items.slice(0, conclusionIdx) : []
+    // An interim turn has no conclusion carve-out: every non-visible-inline
+    // item of it is collapsed.
+    const conclusionIdx = turn.interim ? -1 : findConclusionIdx(items)
+    const beforeItems = turn.interim ? items : (conclusionIdx > 0 ? items.slice(0, conclusionIdx) : [])
     // Only the non-visible-inline pre-conclusion items are actually collapsed.
     return beforeItems.some(it => !isVisibleInline(it, appToolCallIds) && msgIdxs(it).includes(currentMessageIdx))
-  }, [turn.items, term, currentMessageIdx, collapseAll, appToolCallIds])
+  }, [items, term, currentMessageIdx, collapseAll, appToolCallIds, turn.interim])
   // Revealing a search match must win over the current disclosure state, and it
   // has to travel the SAME channel the host owns, or a controlled row would
   // stay collapsed and hide the <mark>. Held in a ref so an inline parent
   // callback cannot re-fire this effect on every render.
   const onDisclosureChangeRef = useRef(onDisclosureChange)
   onDisclosureChangeRef.current = onDisclosureChange
+  const disclosureKeyRef = useRef(disclosureKey)
+  disclosureKeyRef.current = disclosureKey
   useEffect(() => {
     if (!matchInCollapsedSegment) return
     const notify = onDisclosureChangeRef.current
-    if (notify) notify(true)
+    if (notify && disclosureKeyRef.current !== undefined) notify(disclosureKeyRef.current, true)
     else setLocalExpanded(true)
   }, [matchInCollapsedSegment])
+
+  // Interim fan-out region: everything the agent emitted between the user's
+  // prompt and the synthesis turn that restates it (see `interim` in types.ts).
+  // Folded in BOTH modes and with no conclusion carve-out — the region's last
+  // assistant message is a per-completion summary, which is exactly the row the
+  // conclusion rule would have kept visible. `isVisibleInline` still holds, so
+  // the spawn_run card, the completion cards and any error stay in place: the
+  // reader keeps the record that a wave ran, without the prose.
+  if (turn.interim) {
+    const segs = splitSegments(items, appToolCallIds)
+    const stepCount = countCollapsedSteps(segs)
+    if (!turn.complete || stepCount === 0) {
+      // Each always-visible row is wrapped in `<div key={rowKey(i)}>` — its
+      // message-identity key (see "Row keys" above), the same element type, parent and
+      // key the folded render below gives it — and emitted as ONE keyed array
+      // (the fragment's single child slot) so adding the toggle in the folded
+      // render does not shift the array into a different slot. Neither the
+      // completion flip (turn.complete flips ~2.5s after a turn ends via
+      // ChatPage's running latch), a mid-turn reorder (mergeTurnThinking hoisting
+      // a later burst) nor a history backfill renumbering indices may change a
+      // visible row's React identity, or React unmounts and remounts it —
+      // harmless for text, but it re-creates an inline MCP App iframe and loses
+      // in-canvas state (#11083).
+      return <>{items.map((it, i) => <div key={rowKey(i)}>{renderItem(it, i)}</div>)}</>
+    }
+    const children: ReactNode[] = [
+      <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle}
+        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
+    ]
+    for (const seg of segs) {
+      if (seg.type === 'visible') {
+        children.push(<div key={rowKey(seg.idx)}>{renderItem(seg.it, seg.idx)}</div>)
+      } else {
+        children.push(
+          <CollapsibleSection key={`c-${rowKey(seg.items[0].idx)}`} expanded={expanded}>
+            {seg.items.map(({ it, idx }) => renderItem(it, idx))}
+          </CollapsibleSection>,
+        )
+      }
+    }
+    return <>{children}</>
+  }
 
   // collapseAll mode: collapse everything except the last assistant message (original behavior)
   if (collapseAll) {
     // Find last substantive assistant message as conclusion (skip weak ones like bare OPTIONS)
-    const conclusionIdx = findConclusionIdx(turn.items)
-    const conclusion = conclusionIdx >= 0 ? turn.items[conclusionIdx] : null
-    const after = conclusionIdx >= 0 ? turn.items.slice(conclusionIdx + 1) : turn.items
-    const beforeItems = conclusionIdx > 0 ? turn.items.slice(0, conclusionIdx) : []
+    const conclusionIdx = findConclusionIdx(items)
+    const conclusion = conclusionIdx >= 0 ? items[conclusionIdx] : null
+    const after = conclusionIdx >= 0 ? items.slice(conclusionIdx + 1) : items
+    const beforeItems = conclusionIdx > 0 ? items.slice(0, conclusionIdx) : []
 
-    // Split pre-conclusion items into ordered segments: contiguous "collapsed"
-    // runs (tool calls + non-renderable assistant text) interleaved with
-    // "visible" items (assistant text containing widgets/images, plus
-    // mcp_oauth/error rows). Visible items render in place; collapsed runs
-    // hide behind the reasoning toggle.
-    type Seg = { type: 'collapsed'; items: { it: TurnItem; idx: number }[] } | { type: 'visible'; it: TurnItem; idx: number }
-    const segs: Seg[] = []
-    for (let i = 0; i < beforeItems.length; i++) {
-      const it = beforeItems[i]
-      if (isVisibleInline(it, appToolCallIds)) {
-        segs.push({ type: 'visible', it, idx: i })
-      } else {
-        const last = segs[segs.length - 1]
-        if (last?.type === 'collapsed') last.items.push({ it, idx: i })
-        else segs.push({ type: 'collapsed', items: [{ it, idx: i }] })
-      }
-    }
-    const stepCount = segs
-      .flatMap(s => s.type === 'collapsed' ? s.items : [])
-      .filter(({ it }) => !isHiddenTool(it))
-      .length
+    // Split pre-conclusion items into ordered segments (see splitSegments):
+    // visible items render in place; collapsed runs hide behind the reasoning
+    // toggle.
+    const segs = splitSegments(beforeItems, appToolCallIds)
+    const stepCount = countCollapsedSteps(segs)
 
     if (!turn.complete || stepCount === 0) {
-      return <>{turn.items.map((it, i) => renderItem(it, i))}</>
+      // Wrap every row as `<div key={rowKey(i)}>` (message identity) so the
+      // completion flip, mid-turn reorders and history backfills preserve each
+      // visible row's React identity — see the #11083 comment on the interim
+      // flat render above.
+      return <>{items.map((it, i) => <div key={rowKey(i)}>{renderItem(it, i)}</div>)}</>
     }
 
-    return (
-      <>
-        <CollapseToggle expanded={expanded} onToggle={toggle}
-          label={expanded ? 'Hide reasoning' : `Worked through ${stepCount} step${stepCount !== 1 ? 's' : ''}`} />
-        {segs.map((seg, si) => seg.type === 'visible' ? (
-          <div key={`v-${si}`}>{renderItem(seg.it, seg.idx)}</div>
-        ) : (
-          <CollapsibleSection key={`c-${si}`} expanded={expanded}>
+    const children: ReactNode[] = [
+      <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle}
+        label={expanded ? i18nT('pages.chat.thinkingBlock.hide_reasoning') : i18nT('pages.chat.turnBlock.worked_through_step', { count: stepCount })} />,
+    ]
+    for (const seg of segs) {
+      if (seg.type === 'visible') {
+        children.push(<div key={rowKey(seg.idx)}>{renderItem(seg.it, seg.idx)}</div>)
+      } else {
+        children.push(
+          <CollapsibleSection key={`c-${rowKey(seg.items[0].idx)}`} expanded={expanded}>
             {seg.items.map(({ it, idx }) => renderItem(it, idx))}
-          </CollapsibleSection>
-        ))}
-        {conclusion && renderItem(conclusion, conclusionIdx)}
-        {after.map((it, i) => renderItem(it, conclusionIdx + 1 + i))}
-      </>
-    )
+          </CollapsibleSection>,
+        )
+      }
+    }
+    if (conclusion) children.push(<div key={rowKey(conclusionIdx)}>{renderItem(conclusion, conclusionIdx)}</div>)
+    after.forEach((it, i) => children.push(<div key={rowKey(conclusionIdx + 1 + i)}>{renderItem(it, conclusionIdx + 1 + i)}</div>))
+    return <>{children}</>
   }
 
   // Default: only collapse tool calls
-  const toolCount = turn.items.filter(it => isTool(it, appToolCallIds)).length
+  //
+  // The toggle's count is DISTINCT calls, not tool ROWS: a stopped or
+  // auto-approved call produces TWO rows (the visible 🔧 request pill plus a
+  // hidden ✅/🚫 completion), and counting rows told the reader "2 tool calls"
+  // for one call, right above a group pill counting calls. Counting the
+  // VISIBLE request rows — `isHiddenTool` is the classifier the neighboring
+  // countCollapsedSteps already applies — gives one count per call on modern
+  // and legacy (id-less) transcripts alike, because every call has exactly
+  // one 🔧 row. The FOLD is unchanged — every tool row still collapses; only
+  // the claim about how many calls it hides moved.
+  const toolCount = items.filter(it => isTool(it, appToolCallIds) && !isHiddenTool(it)).length
   if (!turn.complete || toolCount === 0) {
-    return <>{turn.items.map((it, i) => renderItem(it, i))}</>
+    // Wrap every row as `<div key={rowKey(i)}>` (message identity) so the
+    // completion flip, mid-turn reorders and history backfills preserve each
+    // visible row's React identity — see the #11083 comment on the interim
+    // flat render above.
+    return <>{items.map((it, i) => <div key={rowKey(i)}>{renderItem(it, i)}</div>)}</>
   }
 
   type Segment = { type: 'tools'; items: { it: TurnItem; idx: number }[] } | { type: 'visible'; it: TurnItem; idx: number }
   const segments: Segment[] = []
-  for (let i = 0; i < turn.items.length; i++) {
-    const it = turn.items[i]
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]
     if (isTool(it, appToolCallIds)) {
       const last = segments[segments.length - 1]
       if (last?.type === 'tools') last.items.push({ it, idx: i })
@@ -265,29 +518,32 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
     }
   }
 
-  return (
-    <>
-      <CollapseToggle expanded={expanded} onToggle={toggle}
-        label={expanded ? 'Hide tool calls' : `${toolCount} tool call${toolCount !== 1 ? 's' : ''}`} />
-      {segments.map((seg, si) => seg.type === 'visible' ? (
-        <div key={si}>{renderItem(seg.it, seg.idx)}</div>
-      ) : (
-        <AnimatePresence key={si} initial={false}>
+  const children: ReactNode[] = [
+    <CollapseToggle key="toggle" expanded={expanded} onToggle={toggle}
+      label={expanded ? i18nT('pages.chat.turnBlock.hide_tool_calls') : i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: toolCount })} />,
+  ]
+  for (const seg of segments) {
+    if (seg.type === 'visible') {
+      children.push(<div key={rowKey(seg.idx)}>{renderItem(seg.it, seg.idx)}</div>)
+    } else {
+      children.push(
+        <AnimatePresence key={`c-${rowKey(seg.items[0].idx)}`} initial={false}>
           {expanded && (
             <CollapsibleSection expanded={true}>
               {seg.items.map(({ it, idx }) => renderItem(it, idx))}
             </CollapsibleSection>
           )}
-        </AnimatePresence>
-      ))}
-    </>
-  )
+        </AnimatePresence>,
+      )
+    }
+  }
+  return <>{children}</>
 }
 
 function CollapseToggle({ expanded, onToggle, label }: { expanded: boolean; onToggle: () => void; label: string }) {
   return (
-    <div className="px-5 py-0 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <button className="flex items-center gap-1.5 text-[12px] text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
+    <div className="px-4 py-0 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+      <button className="flex items-center gap-2 text-[12px] leading-5 text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
         <ChevronRight size={12} className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
         {label}
       </button>
@@ -298,15 +554,31 @@ function CollapseToggle({ expanded, onToggle, label }: { expanded: boolean; onTo
 function CollapsibleSection({ expanded, children }: { expanded: boolean; children: ReactNode }) {
   return (
     <motion.div
+      // Collapse marker for the bubble-vanish probe (useBubbleVanishProbe):
+      // rows inside stay MOUNTED while the height animates to 0, so without
+      // this attribute a collapse is indistinguishable from a windowing bug.
+      // Present exactly while this section hides its mounted children, i.e.
+      // when the interim / collapseAll folds pass expanded={false}. The
+      // default-mode tool fold is different: it hard-codes expanded={true}
+      // and collapses by UNMOUNTING under AnimatePresence, so it never sets
+      // this marker — and moves no probe counter either, because tool items
+      // carry no [data-display-index] of their own.
+      data-collapsed={expanded ? undefined : 'true'}
       initial={{ height: 0, opacity: 0 }}
       animate={expanded ? { height: 'auto', opacity: 1 } : { height: 0, opacity: 0 }}
       exit={{ height: 0, opacity: 0 }}
       transition={{ height: { duration: 0.3, ease: [0.4, 0, 0.2, 1] }, opacity: { duration: 0.2 } }}
       style={{ overflow: 'hidden' }}
     >
-      <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-        <div className="border-l-2 border-l-border opacity-60">{children}</div>
+      <div className="mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+        <div className="shadow-[inset_2px_0_0_0_var(--border)] forced-colors:border-l-2 opacity-60">{children}</div>
       </div>
     </motion.div>
   )
 }
+
+// Memoized so settled turns bail out entirely when the grouping's structural
+// sharing (createTurnGrouper) hands back identical `turn` references across
+// streaming flushes. The bail-out only holds when the host also passes stable
+// renderItem/onDisclosureChange props — ChatPage hoists both for exactly this.
+export default memo(TurnBlock)

@@ -2,7 +2,9 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight } from 'lucide-react'
 import { Badge } from './ui'
+import ErrorNotice from './ErrorNotice'
 import { api } from '../api/client'
+import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateTimeNumeric, fmtDuration as fmtDurationParts, fmtUnit } from '../i18n/format'
@@ -26,7 +28,7 @@ function fmtDuration(ms?: number | null) {
 export default function LogEntry({ entry, jobId }: { entry: LogEntryData; jobId: string }) {
   const [open, setOpen] = useState(false)
 
-  const { data: trace, isLoading } = useQuery({
+  const { data: trace, isLoading, error: traceError } = useQuery({
     queryKey: ['cron-trace', jobId, entry.run_id],
     queryFn: async () => {
       const res = await api.cronRunDetail(jobId, entry.run_id)
@@ -42,7 +44,7 @@ export default function LogEntry({ entry, jobId }: { entry: LogEntryData; jobId:
 
   const triggerPill = (
     <span className={`px-1.5 py-[1px] rounded-full text-[11px] font-medium ${
-      entry.trigger === 'manual' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-bg-elevated text-muted border border-border'
+      entry.trigger === 'manual' ? 'bg-accent-subtle text-accent' : 'bg-bg-elevated text-muted border border-border'
     }`}>{entry.trigger}</span>
   )
 
@@ -63,6 +65,16 @@ export default function LogEntry({ entry, jobId }: { entry: LogEntryData; jobId:
         <div className="px-3 pb-3 pl-9">
           {isLoading ? (
             <div className="text-[12px] text-muted animate-pulse">{i18nT('components.logEntry.loading_trace')}</div>
+          ) : traceError ? (
+            // A failed cronRunDetail used to render an EMPTY <pre> — indistinguishable
+            // from a run that produced no output. askAgent on: a history row holds
+            // no draft, and a trace the gateway cannot read is agent-diagnosable.
+            <ErrorNotice
+              title={errMessage(traceError) ? i18nT('components.logEntry.trace_load_failed') : undefined}
+              message={errMessage(traceError) || i18nT('components.logEntry.trace_load_failed')}
+              askAgent
+              testId="log-entry-trace-error"
+            />
           ) : (
             <pre className="p-2.5 bg-bg-elevated border border-border rounded-md text-[12px] font-mono whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto leading-relaxed">{trace}</pre>
           )}

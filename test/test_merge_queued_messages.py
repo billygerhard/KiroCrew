@@ -8,8 +8,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.chat import _dequeue_next_message
+from kiro_crew.dashboard.chat_utils import (
+    CRON_NOTIFICATION_KIND,
+    SUBAGENT_COMPLETION_KIND,
+)
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
@@ -141,7 +146,7 @@ class TestDequeueNextMessage:
         """Cron-prefixed messages are never merged — popped individually."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}daily-check]: run report"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": cron_msg}, {"id": "c", "content": "another user msg"}]
+        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "c", "content": "another user msg"}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -156,7 +161,7 @@ class TestDequeueNextMessage:
         """Multiple user messages before a cron are merged; cron and later messages stay."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}daily]: run report"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "msg1"}, {"id": "b", "content": "msg2"}, {"id": "c", "content": cron_msg}, {"id": "d", "content": "msg3"}]
+        slot._queue = [{"id": "a", "content": "msg1"}, {"id": "b", "content": "msg2"}, {"id": "c", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "d", "content": "msg3"}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -170,7 +175,7 @@ class TestDequeueNextMessage:
         """If cron message is first, it pops as single (no merge)."""
         cron_msg = f"{CRON_NOTIFY_PREFIX}hourly]: check status"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": cron_msg}, {"id": "b", "content": "user follow-up"}]
+        slot._queue = [{"id": "a", "content": cron_msg, "kind": CRON_NOTIFICATION_KIND}, {"id": "b", "content": "user follow-up"}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -184,7 +189,7 @@ class TestDequeueNextMessage:
         """Subagent completions are never merged — popped individually like crons."""
         subagent_msg = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `abc123` completed ✅\nResult text"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": subagent_msg}]
+        slot._queue = [{"id": "a", "content": "user msg"}, {"id": "b", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -198,7 +203,7 @@ class TestDequeueNextMessage:
         """If subagent completion is first, it pops as single (no merge)."""
         subagent_msg = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `xyz` completed ✅\nDone"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": subagent_msg}, {"id": "b", "content": "user follow-up"}]
+        slot._queue = [{"id": "a", "content": subagent_msg, "kind": SUBAGENT_COMPLETION_KIND}, {"id": "b", "content": "user follow-up"}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -213,7 +218,7 @@ class TestDequeueNextMessage:
         sa1 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nResult 1"
         sa2 = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a2` completed ✅\nResult 2"
         slot = _ChatSlot("s1")
-        slot._queue = [{"id": "a", "content": sa1}, {"id": "b", "content": sa2}]
+        slot._queue = [{"id": "a", "content": sa1, "kind": SUBAGENT_COMPLETION_KIND}, {"id": "b", "content": sa2, "kind": SUBAGENT_COMPLETION_KIND}]
         for item in slot._queue:
             slot.append("queued", item["content"], "msg msg-queued")
 
@@ -251,7 +256,7 @@ def _make_config_app(tmp_path):
     app["state"] = state
     app.router.add_get("/api/dashboard/config", api_dashboard_config)
     app.router.add_put("/api/dashboard/config", api_dashboard_config)
-    return app
+    return as_owner(app)
 
 
 class TestDashboardConfigMergeQueued:

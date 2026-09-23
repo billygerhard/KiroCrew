@@ -10,6 +10,12 @@ from kiro_crew.cloud import aws
 
 
 class TestBuildArgv:
+    @pytest.fixture(autouse=True)
+    def _bare_resolver(self, monkeypatch):
+        """Pin the shared resolver to the bare name so argv-shape assertions
+        stay deterministic across hosts (with/without an installed CLI)."""
+        monkeypatch.setattr(aws, "resolve_aws_bin", lambda: "aws")
+
     def test_bare(self):
         assert aws._build_argv(["sts", "get-caller-identity"], "", "") == [
             "aws",
@@ -25,6 +31,32 @@ class TestBuildArgv:
         argv = aws._build_argv(["s3", "ls"], "prod", "")
         assert argv == ["aws", "s3", "ls", "--profile", "prod"]
 
+    def test_argv_head_resolved_absolutely_under_minimal_path(self, monkeypatch, tmp_path):
+        """A GUI-launched gateway's minimal PATH must not yield a bare 'aws'
+        head that fails execvp: the builder routes through the deploy engine's
+        well-known-dirs resolver."""
+        import os as _os
+
+        if _os.name == "nt":
+            pytest.skip("fallback install dirs are POSIX literals; dead on Windows by design")
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+        # Undo this class's bare-name pin: this test exercises the real resolver.
+        monkeypatch.setattr(aws, "resolve_aws_bin", engine.resolve_aws_bin)
+
+        argv = aws._build_argv(["sts", "get-caller-identity"], "dev", "")
+        assert argv[0] == str(fake_aws)
+        assert argv[1:] == ["sts", "get-caller-identity", "--profile", "dev"]
+
 
 class TestRunAws:
     def test_success_returns_process_output(self, monkeypatch):
@@ -35,7 +67,7 @@ class TestRunAws:
                 return "out", "err"
 
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
 
         assert aws.run_aws(["sts", "get-caller-identity"]) == (0, "out", "err")
 
@@ -45,7 +77,7 @@ class TestRunAws:
         def raise_fnf(*a, **k):
             raise FileNotFoundError("aws not found")
 
-        monkeypatch.setattr(aws.subprocess, "Popen", raise_fnf)
+        monkeypatch.setattr(aws, "popen_limited", raise_fnf)
         rc, out, err = aws.run_aws(["sts", "get-caller-identity"])
         assert rc == 127
         assert "aws CLI not found" in err
@@ -84,7 +116,7 @@ class TestRunAws:
 
         proc = FakeProc()
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: proc)
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: proc)
 
         with pytest.raises(KeyboardInterrupt):
             aws.run_aws(["cloudformation", "deploy"])
@@ -188,7 +220,7 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "out", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         for readonly in (
             ["sts", "get-caller-identity"],
             ["ec2", "describe-instances"],
@@ -201,9 +233,7 @@ class TestChokepointHumanActionGuard:
 
     def test_mutations_and_token_mint_refused_under_agent_session(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "sess-1")
-        monkeypatch.setattr(
-            aws.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn aws")
-        )
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: pytest.fail("must not spawn aws"))
         for sensitive in (
             ["cloudformation", "delete-stack", "--stack-name", "kirocrew-x"],
             ["cloudformation", "deploy"],
@@ -220,9 +250,7 @@ class TestChokepointHumanActionGuard:
         # An EXACT allowlist (not a get-*/list-* prefix) must deny secret-bearing
         # reads even though they start with get-/list-.
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "sess-1")
-        monkeypatch.setattr(
-            aws.subprocess, "Popen", lambda *a, **k: pytest.fail("must not spawn aws")
-        )
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: pytest.fail("must not spawn aws"))
         for secret_read in (
             ["secretsmanager", "get-secret-value", "--secret-id", "x"],
             ["ssm", "get-parameter", "--name", "x", "--with-decryption"],
@@ -243,7 +271,7 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         # A human terminal (no session key) can run a mutation.
         rc, _o, _e = aws.run_aws(["cloudformation", "delete-stack", "--stack-name", "x"])
         assert rc == 0

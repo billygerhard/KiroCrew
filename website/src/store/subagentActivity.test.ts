@@ -1,6 +1,6 @@
 /**
- * `selectSubagentActivityCount` — the cross-page "agents are working" signal
- * behind the Sessions rail dot. It must sum STARTED agents across every slot
+ * `selectSubagentActivityCount` — the cross-page "agents are working" count
+ * shown in the expanded Sessions rail. It must sum STARTED agents across every slot
  * (active map + slotActivity for background slots, without double-counting the
  * aliased active slot) PLUS accepted-but-queued agents, which have no per-agent
  * entry at all and were therefore invisible everywhere outside the composer chip.
@@ -11,6 +11,7 @@ import chatReducer, {
   setActiveSlot,
   switchSlot,
   sseSubagentSpawn,
+  sseSubagentSnapshot,
   sseSubagentDone,
   sseSubagentQueued,
   selectSubagentActivityCount,
@@ -113,5 +114,38 @@ describe('sseSubagentQueued on partial preloaded state', () => {
     store.dispatch(setActiveSlot('a'))
     expect(() => store.dispatch(sseSubagentQueued({ slot: 'a', queued: 2 }))).not.toThrow()
     expect(count(store)).toBe(2)
+  })
+})
+
+describe('subagent snapshot ownership', () => {
+  const snapshot = (slot: string) => sseSubagentSnapshot({
+    slot,
+    id: 'orphan-1',
+    task: 'read-only audit',
+    agent: 'kirocrew',
+    streaming: '',
+    last_tool: 'WorkspaceSearch',
+    started: 1000,
+  })
+
+  it('does not attach an ownerless replay snapshot to the active session', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('new-session'))
+
+    store.dispatch(snapshot(''))
+
+    expect(store.getState().chat.subagents).toEqual({})
+    expect(store.getState().chat.slotActivity['']).toBeUndefined()
+    expect(count(store)).toBe(0)
+  })
+
+  it('still routes a snapshot whose owner is the active session', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('owned-session'))
+
+    store.dispatch(snapshot('owned-session'))
+
+    expect(store.getState().chat.subagents['orphan-1']?.task).toBe('read-only audit')
+    expect(count(store)).toBe(1)
   })
 })

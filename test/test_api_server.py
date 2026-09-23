@@ -6,11 +6,13 @@ crons, taskrunner, send-message, notifications).
 
 from __future__ import annotations
 
+import json
+import socket
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from kiro_crew.dashboard.server import _register_mcp_routes
 from kiro_crew.dashboard.state import DashboardState
@@ -49,6 +51,126 @@ def _make_api_app(state: DashboardState) -> web.Application:
     return app
 
 
+def _local_mint_request(*, family: int, peer_host: str | None) -> tuple[web.Request, object]:
+    """Build a local-bootstrap request on a TCP or AF_UNIX transport."""
+    sock = MagicMock()
+    sock.family = family
+    peername = (peer_host, 43123) if peer_host is not None else None
+    transport = MagicMock()
+    transport.get_extra_info.side_effect = lambda key, default=None: {
+        "socket": sock,
+        "peername": peername,
+    }.get(key, default)
+    app = web.Application()
+    app["local_secret"] = "right"
+    app["state"] = MagicMock(owner_id="owner-1")
+    request = make_mocked_request(
+        "GET",
+        "/api/token/local?ttl=2m",
+        headers={"X-Local-Secret": "right"},
+        app=app,
+        transport=transport,
+    )
+    return request, sock
+
+
+class TestLocalTokenTransportAdmission:
+    """The local mint accepts only loopback TCP or verified owner Unix peers."""
+
+    @staticmethod
+    def _allow_owner_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.member_memory_auth.local_owner_bootstrap_allowed",
+            lambda _request: True,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets only")
+    async def test_unix_same_principal_with_correct_secret_mints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard.handlers import core
+        from kiro_crew.mcp_gateway import socketsec
+
+        self._allow_owner_bootstrap(monkeypatch)
+        request, sock = _local_mint_request(family=socket.AF_UNIX, peer_host=None)
+        check = MagicMock(return_value=socketsec.PeerCredResult.MATCH)
+        monkeypatch.setattr(core, "check_peer_is_self", check)
+        monkeypatch.setattr(core, "generate_token", lambda *_a, **_kw: "issued-value")
+
+        response = await core.api_token_local(request)
+
+        assert response.status == 200
+        assert _response_json(response)["token"] == "issued-value"
+        check.assert_called_once_with(sock)
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets only")
+    @pytest.mark.parametrize("verdict_name", ["MISMATCH", "UNVERIFIABLE"])
+    async def test_unix_nonmatching_or_unverifiable_peer_is_loopback_only(
+        self, monkeypatch: pytest.MonkeyPatch, verdict_name: str
+    ) -> None:
+        from kiro_crew.dashboard.handlers import core
+        from kiro_crew.mcp_gateway import socketsec
+
+        request, sock = _local_mint_request(family=socket.AF_UNIX, peer_host=None)
+        verdict = getattr(socketsec.PeerCredResult, verdict_name)
+        check = MagicMock(return_value=verdict)
+        monkeypatch.setattr(core, "check_peer_is_self", check)
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+
+        response = await core.api_token_local(request)
+
+        assert response.status == 403
+        assert _response_json(response)["error"] == "loopback only"
+        check.assert_called_once_with(sock)
+
+    @pytest.mark.asyncio
+    async def test_tcp_loopback_with_correct_secret_still_mints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard.handlers import core
+        from kiro_crew.mcp_gateway import socketsec
+
+        self._allow_owner_bootstrap(monkeypatch)
+        request, _sock = _local_mint_request(family=socket.AF_INET, peer_host="127.0.0.1")
+        check = MagicMock(return_value=socketsec.PeerCredResult.MISMATCH)
+        monkeypatch.setattr(core, "check_peer_is_self", check)
+        monkeypatch.setattr(core, "generate_token", lambda *_a, **_kw: "issued-value")
+
+        response = await core.api_token_local(request)
+
+        assert response.status == 200
+        assert _response_json(response)["token"] == "issued-value"
+        check.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_loopback_tcp_with_correct_secret_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard.handlers import core
+        from kiro_crew.mcp_gateway import socketsec
+
+        request, _sock = _local_mint_request(family=socket.AF_INET, peer_host="203.0.113.9")
+        check = MagicMock(return_value=socketsec.PeerCredResult.MATCH)
+        monkeypatch.setattr(core, "check_peer_is_self", check)
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+
+        response = await core.api_token_local(request)
+
+        assert response.status == 403
+        assert _response_json(response)["error"] == "loopback only"
+        check.assert_not_called()
+
+
+def _response_json(response: web.Response) -> dict:
+    """Decode a direct-handler JSON response."""
+    import json
+
+    return json.loads(response.body)
+
+
 class TestRegisterMcpRoutes:
     """Verify _register_mcp_routes registers all expected endpoints."""
 
@@ -61,7 +183,6 @@ class TestRegisterMcpRoutes:
             ("GET", "/api/spawn"),
             ("GET", "/api/spawn/{agent_id}"),
             ("DELETE", "/api/spawn/{agent_id}"),
-            ("DELETE", "/api/spawn"),
             ("GET", "/api/lessons"),
             ("POST", "/api/lessons"),
             ("DELETE", "/api/lessons"),
@@ -113,6 +234,130 @@ class TestApiServerSpawn:
             resp = await client.post("/api/spawn", json={"task": "hi", "max_turns": 50})
             assert resp.status == 200
             assert mock_mgr.spawn.call_args.kwargs.get("max_turns") == 50
+
+    @pytest.mark.asyncio
+    async def test_spawn_with_agent_warms_project_cache_first(self, tmp_path, monkeypatch):
+        """An agent-targeted spawn warms the project agent-name cache BEFORE spawn().
+
+        _validate_agent runs on the loop, so it reads only
+        cached_project_agent_names(); without the warm in this (async) handler, a
+        spawn_run naming a project agent is refused until some unrelated session
+        happens to warm that project's cache — a nondeterministic refusal of an
+        agent that verifiably exists.
+        """
+        order: list[str] = []
+        # The stub takes **kw because the warm forwards keyword-only SEL
+        # attribution labels that this ordering test does not care about.
+        warm = AsyncMock(side_effect=lambda _d, **kw: order.append("warm"))
+        monkeypatch.setattr("kiro_crew.spawn_warm.warm_project_agent_names", warm)
+        # The warm only ever touches an ALLOWLISTED cwd; stand in for a config
+        # whose allowed_roots admit tmp_path.
+        monkeypatch.setattr(
+            "kiro_crew.spawn_warm.validate_cwd",
+            lambda cwd, roots: (cwd, ""),
+        )
+        mock_mgr = MagicMock()
+
+        def _spawn(*a, **kw):
+            order.append("spawn")
+            return MagicMock(id="test-789", done=False, error="")
+
+        mock_mgr.spawn.side_effect = _spawn
+        state = _make_state(tmp_path, subagents=mock_mgr)
+        async with TestClient(TestServer(_make_api_app(state))) as client:
+            resp = await client.post(
+                "/api/spawn",
+                json={"task": "hi", "agent": "proj-agent", "cwd": str(tmp_path)},
+            )
+            assert resp.status == 200
+        warm.assert_awaited_once_with(str(tmp_path), operation="spawn_warm", source="unknown")
+        assert order == ["warm", "spawn"], f"warm did not precede spawn: {order}"
+
+    @pytest.mark.asyncio
+    async def test_spawn_never_warms_a_cwd_the_allowlist_rejects(self, tmp_path, monkeypatch):
+        """A caller cwd that fails validate_cwd is NOT warmed.
+
+        Regression: the warm read <cwd>/.kiro BEFORE spawn() validated the path
+        against subagent_cwd_allowed_roots — an unauthorized discovery read on a
+        path spawn() itself was about to refuse.
+        """
+        warm = AsyncMock()
+        monkeypatch.setattr("kiro_crew.spawn_warm.warm_project_agent_names", warm)
+        monkeypatch.setattr(
+            "kiro_crew.spawn_warm.validate_cwd",
+            lambda cwd, roots: ("", "cwd not under an allowed root"),
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.spawn.return_value = MagicMock(id="test-791", done=False, error="")
+        state = _make_state(tmp_path, subagents=mock_mgr)
+        async with TestClient(TestServer(_make_api_app(state))) as client:
+            resp = await client.post(
+                "/api/spawn",
+                json={"task": "hi", "agent": "proj-agent", "cwd": "/etc"},
+            )
+            assert resp.status == 200
+        warm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_revalidates_stored_cwd_before_warming(self, tmp_path, monkeypatch):
+        """A retry re-checks old.cwd against the CURRENT allowlist before warming.
+
+        Regression: retry warmed the stored cwd unconditionally, so a root
+        removed from subagent_cwd_allowed_roots since the original spawn still
+        had its agent files read before spawn() rejected the stale path.
+        """
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        warm = AsyncMock()
+        monkeypatch.setattr("kiro_crew.spawn_warm.warm_project_agent_names", warm)
+        monkeypatch.setattr(
+            "kiro_crew.spawn_warm.validate_cwd",
+            lambda cwd, roots: ("", "root no longer allowed"),
+        )
+        old = MagicMock(
+            execution_context=ExecutionContext(
+                None, MemoryStoreRef("default"), "template", "proj-agent"
+            ),
+            done=True,
+            outcome="failed",
+            agent="proj-agent",
+            cwd="/was/allowed/repo",
+            _raw_task="t",
+            task="t",
+            parent_session_key="",
+            max_turns=0,
+            model="",
+            approval_mode="",
+            silent=False,
+            include_memory=True,
+            include_lessons=True,
+            include_project=True,
+        )
+        mock_mgr = MagicMock()
+        mock_mgr.get.return_value = old
+        mock_mgr.spawn.return_value = MagicMock(id="retry-1", done=False, error="")
+        state = _make_state(tmp_path, subagents=mock_mgr)
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/spawn/{agent_id}/retry", api_spawn_retry)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/spawn/abc123/retry")
+            assert resp.status == 200
+        warm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_spawn_without_agent_skips_the_warm(self, tmp_path, monkeypatch):
+        """No agent name -> nothing to validate -> no warm round-trip added."""
+        warm = AsyncMock()
+        monkeypatch.setattr("kiro_crew.spawn_warm.warm_project_agent_names", warm)
+        mock_mgr = MagicMock()
+        mock_mgr.spawn.return_value = MagicMock(id="test-790", done=False, error="")
+        state = _make_state(tmp_path, subagents=mock_mgr)
+        async with TestClient(TestServer(_make_api_app(state))) as client:
+            resp = await client.post("/api/spawn", json={"task": "hi"})
+            assert resp.status == 200
+        warm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_spawn_list_empty(self, tmp_path):
@@ -197,6 +442,51 @@ class TestStartApiServerWiring:
     """Integration test: start_api_server installs middleware and hook store."""
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_headless_state_carries_the_conversation_log(self, tmp_path, monkeypatch):
+        """Headless mode still runs Slack turns, so it needs the transcript.
+
+        Anything that judges how far a conversation has got reads it through
+        ``state.conversation_log``. Leaving it unset here left those readers on
+        their can't-tell branch, so an OPTIONS control posted under
+        ``--slack-only`` carried no position and every click on it was honoured
+        however stale -- the validation was inert for the whole mode.
+        """
+        import kiro_crew.config.loader as _loader
+        import kiro_crew.dashboard.server as _srv
+        import kiro_crew.dashboard.state as _st
+        import kiro_crew.kiro_prerequisite as _prerequisite
+
+        monkeypatch.setattr(_st, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(_srv, "data_home", lambda: tmp_path)
+        monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
+        service = MagicMock()
+        service.close = AsyncMock()
+        monkeypatch.setattr(
+            _prerequisite, "KiroPrerequisiteService", MagicMock(return_value=service)
+        )
+
+        from kiro_crew.dashboard.server import start_api_server
+
+        _log = MagicMock(name="conversation_log")
+        runner, state = await start_api_server(
+            sessions=MagicMock(count=0),
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]),
+                list_jobs_async=AsyncMock(return_value=[]),
+                status=MagicMock(return_value={}),
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            port=0,
+            assume_kiro_ready=True,
+            conversation_log=_log,
+        )
+        try:
+            assert state.conversation_log is _log
+        finally:
+            await runner.cleanup()
+
+    @pytest.mark.asyncio
     async def test_server_has_audit_middleware_and_hook_store(self, tmp_path, monkeypatch):
         import kiro_crew.config.loader as _loader
         import kiro_crew.dashboard.server as _srv
@@ -250,8 +540,7 @@ class TestStartApiServerWiring:
                 getattr(mw, "_is_token_auth", False) for mw in runner.app.middlewares
             ), "start_api_server must mount token_auth_middleware"
             routes = {
-                (route.method, route.resource.canonical)
-                for route in runner.app.router.routes()
+                (route.method, route.resource.canonical) for route in runner.app.router.routes()
             }
             for probe in ("/api/health", "/api/live", "/api/ready"):
                 assert ("GET", probe) in routes
@@ -565,6 +854,133 @@ class TestApiKirocrewConfig:
 
             saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
             assert saved["agent"]["subagent_auto_max"] == 32
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"max_subagents": 8},
+            {"subagent_max_turns": 50},
+            {"subagent_auto_max": 32},
+        ],
+    )
+    async def test_put_does_not_flag_restart_for_live_subagent_caps(
+        self, settings, tmp_path, monkeypatch
+    ):
+        # SubagentManager re-derives these caps from every config reload, so a
+        # save that changes one is applied to the running gateway and must NOT
+        # ask the user to restart. Each parametrized value differs from the
+        # persisted one below, so each is a real change and the answer is still
+        # False -- restart is decided by the schema's restart=True marks alone.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text('{"agent": {"subagent_auto_max": 16}}')
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put("/api/config/kirocrew", json={"agent": settings})
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_no_restart_when_startup_key_resent_unchanged(self, tmp_path, monkeypatch):
+        # The dashboard sends all three settings on every save and enables Save
+        # whenever ANY one is dirty, so a save re-sends the other caps at their
+        # existing values. Nothing changed and nothing is boot-only here, so it
+        # must NOT ask the user to restart.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text(
+            '{"agent": {"max_subagents": 8, "subagent_max_turns": 50, "subagent_auto_max": 32}}'
+        )
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put(
+                "/api/config/kirocrew",
+                json={
+                    "agent": {
+                        "max_subagents": 8,
+                        "subagent_max_turns": 50,
+                        "subagent_auto_max": 32,
+                    }
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_no_restart_when_one_subagent_cap_actually_changes(
+        self, tmp_path, monkeypatch
+    ):
+        # Same all-three payload with max_subagents genuinely different: a real
+        # change to a live cap is applied by SubagentManager.reconfigure on the
+        # next reload, so even a real change must not raise the hint.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text(
+            '{"agent": {"max_subagents": 8, "subagent_max_turns": 50, ' '"subagent_auto_max": 32}}'
+        )
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put(
+                "/api/config/kirocrew",
+                json={
+                    "agent": {
+                        "max_subagents": 12,
+                        "subagent_max_turns": 50,
+                        "subagent_auto_max": 32,
+                    }
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_no_restart_when_subagent_cap_set_for_the_first_time(
+        self, tmp_path, monkeypatch
+    ):
+        # Absent-then-set is a real change; it is still a live cap, so no hint.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text('{"agent": {}}')
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put("/api/config/kirocrew", json={"agent": {"subagent_max_turns": 40}})
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_retired_conductor_skill_alone_is_not_a_recognized_setting(
+        self, tmp_path, monkeypatch
+    ):
+        # agent.conductor_skill (the "Orchestrator Mode" toggle) is retired: the
+        # endpoint does not know the key, so a payload carrying nothing else is
+        # the same 400 any unknown key gets, and nothing is written.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text('{"agent": {}}')
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put("/api/config/kirocrew", json={"agent": {"conductor_skill": True}})
+            assert resp.status == 400
+            assert (await resp.json())["error"] == "no recognized settings provided"
+        saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        assert "conductor_skill" not in saved["agent"]
+
+    @pytest.mark.asyncio
+    async def test_put_retired_conductor_skill_is_ignored_beside_a_live_key(
+        self, tmp_path, monkeypatch
+    ):
+        # A stale dashboard build still sending the retired key alongside a live
+        # cap must not break the save: the cap is applied, the retired key is
+        # dropped rather than persisted, and no restart is asked for.
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
+        (tmp_path / "config.json").write_text('{"agent": {}}')
+        async with TestClient(TestServer(self._make_app(tmp_path))) as c:
+            resp = await c.put(
+                "/api/config/kirocrew",
+                json={"agent": {"conductor_skill": True, "subagent_max_turns": 40}},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is False
+        saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        assert saved["agent"]["subagent_max_turns"] == 40
+        assert "conductor_skill" not in saved["agent"]
 
     @pytest.mark.asyncio
     async def test_put_rejects_subagent_auto_max_above_ceiling(self, tmp_path, monkeypatch):

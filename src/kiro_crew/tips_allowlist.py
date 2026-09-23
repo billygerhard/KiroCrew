@@ -16,6 +16,11 @@ dashboard session. Anyone who can see a tip has already installed, started,
 and opened Kiro Crew, so a product-overview tip like "Getting Started" can
 only ever be redundant there.
 
+Reference tables are excluded for the same reason as onboarding docs: they answer a
+question a user already has rather than announcing a feature to try.
+``channel-capabilities.md`` is the current example — its first paragraph describes a
+lookup table, which makes a poor "have you tried" tip.
+
 Deliberately dependency-free so the maintainer script can import it without
 pulling in the full kiro_crew runtime.
 """
@@ -25,17 +30,28 @@ from __future__ import annotations
 TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
     {
         "agents.md",
+        "apps.md",
+        "artifacts.md",
+        "browser-control.md",
+        "computer-use.md",
         "configuration.md",
+        "connections.md",
         "cron-and-scheduling.md",
         "dashboard.md",
         "deploy-web.md",
         "discord-integration.md",
         "dynamic-subagent-sizing.md",
         "feature-tips.md",
+        "imessage-integration.md",
+        "feishu-integration.md",
+        "issue-radar-pipeline.md",
         "knowledge-library-how-it-works.md",
         "mcp-apps.md",
         "memory-and-learning.md",
+        "monitor-loops.md",
         "research-lab.md",
+        "secrets-vault.md",
+        "session-ledger.md",
         "skills.md",
         "slack-integration.md",
         "snapshot-and-restore.md",
@@ -46,6 +62,8 @@ TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
         "use-cases.md",
         "webex-integration.md",
         "wecom-integration.md",
+        "workflows.md",
         "weixin-integration.md",
+        "whatsapp-integration.md",
     }
 )

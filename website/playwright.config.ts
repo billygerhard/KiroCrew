@@ -2,6 +2,10 @@ import { defineConfig, devices } from '@playwright/test'
 
 export default defineConfig({
   testDir: './playwright',
+  // Dedicated gateways isolate artifacts by scenario; the shared suite keeps its default.
+  outputDir: process.env.PLAYWRIGHT_RUN_MEMORY_EVIDENCE === '1'
+    ? process.env.PLAYWRIGHT_MEMORY_EVIDENCE_OUTPUT_DIR
+    : undefined,
   fullyParallel: true, // Enable parallel execution
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -22,9 +26,20 @@ export default defineConfig({
   // budget-expiry soft-stop, which the fake does model ([[SLOW_NOACK]] withholds
   // the cancel ack), so it moved to @needs-agent. The tag stays wired as the
   // seam for a spec that genuinely needs real model semantics.
-  grepInvert: process.env.PLAYWRIGHT_RUN_AGENT_SPECS
-    ? /@needs-live-agent/
-    : /@needs-agent|@needs-live-agent/,
+  //
+  // @memory-evidence tags memory-embedding-evidence.spec.ts, whose every test
+  // needs a gateway PREPARED for one state (a missing custom model path, a
+  // standing rebuild, an exhausted download). The shared-gateway run must not
+  // collect it: against that gateway every test would fail on its own
+  // precondition. test/e2e/test_memory_ui_evidence.py boots one gateway per
+  // state and opts the spec back in with PLAYWRIGHT_RUN_MEMORY_EVIDENCE=1.
+  grepInvert: new RegExp(
+    [
+      '@needs-live-agent',
+      ...(process.env.PLAYWRIGHT_RUN_AGENT_SPECS ? [] : ['@needs-agent']),
+      ...(process.env.PLAYWRIGHT_RUN_MEMORY_EVIDENCE ? [] : ['@memory-evidence']),
+    ].join('|'),
+  ),
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:5476',
     // Pin the browser locale. Most specs assert English prose, and the app
@@ -36,6 +51,12 @@ export default defineConfig({
     // assertions. Declaring en-US here makes that an explicit dependency
     // instead of an accident of the runner's environment.
     locale: 'en-US',
+    // Motion is deliberately NOT suppressed here. The suite must exercise the
+    // same animated path a real user gets, and `src/index.css` gives the
+    // reduced-motion branch its own `animation-duration: 0.01ms !important`
+    // override — pinning the whole suite inside that branch would leave the
+    // default path with no coverage at all. Reduced motion is covered by
+    // `reduced-motion.spec.ts`, which emulates the media query per test.
     trace: 'on-first-retry',
     video: process.env.PLAYWRIGHT_VIDEO === '1' ? 'on' : 'off',
     navigationTimeout: 10000, // 10 second navigation timeout

@@ -51,7 +51,7 @@ export default function NewSpecView({ onCancel, onCreated, setErr, onSettings }:
   // last and mislabel the current one (repo `use-react-query` rule).
   const gitQuery = useQuery({
     queryKey: ['spec-builder', 'browse', wd],
-    queryFn: () => specApi.browse(wd),
+    queryFn: ({ signal }) => specApi.browse(wd, signal),
     enabled: !!wd,
   })
   const isGit: boolean | null = !wd || gitQuery.isPending ? null : !!gitQuery.data?.is_git
@@ -66,9 +66,11 @@ export default function NewSpecView({ onCancel, onCreated, setErr, onSettings }:
         await specApi.create(payload(autoName))
         onCreated(autoName)
       } catch (e) {
-        // Auto-retry once with a numeric suffix on a name collision.
+        // Auto-retry once with a numeric suffix on a name collision. Trim the
+        // base first so the suffix survives the 48-char cap — appending to an
+        // already-capped slug and slicing would send the same name twice.
         if (/already exists/i.test((e as Error).message)) {
-          const alt = (autoName + '-' + (Date.now() % 1000)).slice(0, 48)
+          const alt = autoName.slice(0, 44) + '-' + (Date.now() % 1000)
           await specApi.create(payload(alt))
           onCreated(alt)
         } else throw e
@@ -76,7 +78,11 @@ export default function NewSpecView({ onCancel, onCreated, setErr, onSettings }:
     } catch (e) { setErr((e as Error).message); setBusy(false) }
   }
 
-  const ready = desc.trim().length > 0 && wd.trim().length > 0 && autoName.length > 0
+  // Readiness reflects the fields the USER fills in. The derived name must
+  // not veto submission: slugify now always yields a non-empty, backend-valid
+  // name (issue #3002 — a Korean-only description used to filter to an empty
+  // slug and keep the button permanently disabled).
+  const ready = desc.trim().length > 0 && wd.trim().length > 0
 
   return (
     <div className="flex-1 min-h-0 overflow-y-auto">
@@ -96,9 +102,14 @@ export default function NewSpecView({ onCancel, onCreated, setErr, onSettings }:
             rows={3}
             aria-label={i18nT('apps.specBuilder.components.newSpecView.describe_what_you_want_to_do')}
             placeholder={i18nT('apps.specBuilder.components.newSpecView.e_g_add_login_with_google_so_users_don_t_need_pa')}
-            style={{ ...inputStyle, resize: 'vertical', marginTop: '8px', marginBottom: '24px', lineHeight: 1.5, fontWeight: 400 }}
+            style={{ ...inputStyle, resize: 'vertical', marginTop: '8px', marginBottom: desc.trim() ? '8px' : '24px', lineHeight: 1.5, fontWeight: 400 }}
           />
         </label>
+        {desc.trim() ? (
+          <div className="text-[12px] text-muted -mt-1 mb-6 leading-relaxed">
+            {i18nT('apps.specBuilder.components.newSpecView.this_spec_will_be_called', { name: autoName })}
+          </div>
+        ) : null}
 
         <div className="text-[14px] font-semibold mb-2">{i18nT('apps.specBuilder.components.newSpecView.which_project_is_this_for')}</div>
         <ProjectPicker value={wd} onChange={setWd} />
@@ -135,7 +146,7 @@ export default function NewSpecView({ onCancel, onCreated, setErr, onSettings }:
             <div>
               <div className="text-[13px] font-semibold text-text">{i18nT('apps.specBuilder.components.newSpecView.work_in_a_fresh_worktree')}</div>
               <div className="text-[12px] leading-relaxed mt-1 text-muted">
-                {i18nT('apps.specBuilder.components.newSpecView.keeps_your_main_checkout_untouched_branch', { branch: 'spec/' + (autoName || '…') })}
+                {i18nT('apps.specBuilder.components.newSpecView.keeps_your_main_checkout_untouched_branch', { branch: 'spec/' + (desc.trim() ? autoName : '…') })}
               </div>
             </div>
           </Clickable>

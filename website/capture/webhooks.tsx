@@ -21,9 +21,9 @@ import WebhooksPage from '../src/pages/WebhooksPage'
 import '../src/index.css'
 
 // Loopback on purpose: this string is rendered into the captured screenshots,
-// which are committed to the PR branch, and `website/capture/` sits outside
-// scrub-lint's roots — so a real host pasted here would ride into the public
-// tree unchecked, in the fixture AND baked into the PNGs.
+// which are committed to the PR branch. A real host pasted here would ride into
+// the public tree twice over — as this line, and BAKED INTO THE PNG, where no
+// text scanner can see it at all. The image is why this must stay loopback.
 const URL_ = 'http://127.0.0.1:6776/api/hooks/agent'
 const LIMITS = {
   session_key_prefix: 'hook:',
@@ -40,12 +40,23 @@ const TOKENS = [
   {
     id: 'wht_7f3a91', label: 'Review Bot', display_prefix: 'kc_whk_4f2b', last4: '1f3a',
     created_at: NOW - 86400 * 3, last_used_at: NOW - 480, legacy: false,
-    require_signature: true,
+    require_signature: true, agent: 'code-reviewer', enabled: true,
   },
   {
     id: 'wht_ad2be9', label: 'CI callback', display_prefix: 'kc_whk_91de', last4: 'b231',
     created_at: NOW - 86400, last_used_at: null, legacy: false,
-    require_signature: false,
+    require_signature: false, agent: 'oncall', enabled: false,
+  },
+]
+
+const AGENTS = [
+  {
+    name: 'code-reviewer', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default',
+    model: '', description: 'Reviews pull requests and reports findings', source: 'user',
+  },
+  {
+    name: 'oncall', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default',
+    model: '', description: 'Handles deployment and incident callbacks', source: 'user',
   },
 ]
 
@@ -139,6 +150,7 @@ document.documentElement.setAttribute('data-theme', theme)
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 qc.setQueryData(['webhooks'], SCENES[scene] ?? SCENES.enabled)
+qc.setQueryData(['agents-installed'], AGENTS)
 
 createRoot(document.getElementById('root')!).render(
   <Provider store={store}>

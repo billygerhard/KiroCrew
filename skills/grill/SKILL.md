@@ -1,7 +1,10 @@
 ---
 name: grill
-description: Structured questioning to reach shared understanding before action. Walks the decision tree one branch at a time, checks memory for already-answered questions, saves every answer as a lesson. Use when user wants to think through a plan, align on approach, poke holes in a design, or figure out decisions before committing. Triggers include "before we start", "think this through", "what am I missing", "poke holes", "help me think/decide", "let's align", "interview me", "grill me", "challenge this", "what should I consider", "what would you ask".
+description: Structured questioning to reach shared understanding before action. Walks the decision tree one branch at a time, checks memory for already-answered questions, and saves only durable decisions the user wants remembered. Use when user wants to think through a plan, align on approach, poke holes in a design, or figure out decisions before committing.
+triggers: grill me, interview me, challenge this, poke holes, what am I missing, think this through, help me decide, before we start, let's align, what should I consider, what would you ask
 ---
+
+# Grill: one decision at a time
 
 ## HARD RULE: One Question Per Turn
 
@@ -29,7 +32,7 @@ Every grill turn = exactly this:
 
 - **Facts vs Decisions**: Look up facts silently (code, config, memory). Only ask about decisions the user must make.
 - **Memory**: Check lessons/memory first. If already decided, confirm: "Previously you decided X. Still holds?"
-- **Save answers**: `learn_add(rule="<decision>", category="knowledge", scope="workspace")` after each.
+- **Save durable answers only**: Use `learn_add` only when the user explicitly wants a reusable decision remembered beyond this task. Put a rejected alternative in `negative`, set `applies="on_topic"` for a project finding, and add `repo_scope="<path fragment>"` only when it is true of one codebase. Keep task-local answers in the conversation or decision document; do not turn every answer into a standing lesson.
 - **Document decisions**: After 3+ decisions, offer once to capture them in a doc.
 - **Exit**: On "enough"/"just do it" → summarize decisions, proceed to action. Don't implement mid-grill.
 - **Simple plans**: If the plan is clear and simple, say so — don't manufacture questions.

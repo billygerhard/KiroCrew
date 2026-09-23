@@ -41,11 +41,13 @@ async def maybe_start_weixin(orch: "GatewayOrchestrator") -> "WeixinClient | Non
     """Start the Weixin channel if enabled + credentialed; else no-op."""
     if not getattr(orch, "_weixin_enabled", False):
         return None
+    # NOTE: ``_weixin_enabled`` already folds in token+account_id (see
+    # GatewayOrchestrator), so both are guaranteed non-empty past the guard.
+    # A factory-level "enabled but not credentialed" INFO log here would be
+    # unreachable for the same reason; the reachable equivalent for WeCom lives
+    # in ``_start_channel_transports``, generalized to all channels there.
     token = getattr(orch, "_weixin_token", "")
     account_id = getattr(orch, "_weixin_account_id", "")
-    if not token or not account_id:
-        logger.info("weixin: enabled but not credentialed (no token/account_id) — skipping. Connect via Settings QR.")
-        return None
 
     try:
         assert orch.sessions is not None and orch.ctx_builder is not None
@@ -86,6 +88,13 @@ async def maybe_start_weixin(orch: "GatewayOrchestrator") -> "WeixinClient | Non
             dm_policy=dm_policy,
             dispatch=dispatcher.handle_message,
         )
+        # The dispatcher's config applier pushes reloaded authorization fields at
+        # the transport; wired after construction, like ``client``, and BEFORE
+        # connect(): the applier treats a missing holder as "not built yet, it
+        # will read the fresh section", which is false once the transport exists
+        # — an allow-list revocation dispatched while connect() is awaited would
+        # be dropped and the boot roster kept.
+        dispatcher.transport = transport
         await transport.connect()  # starts the iLink long-poll loop
         if orch.dashboard_state is not None:
             orch.dashboard_state.register_channel_transport(transport)

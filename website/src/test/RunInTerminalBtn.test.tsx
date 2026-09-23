@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import RunInTerminalBtn from '../components/RunInTerminalBtn'
+import { RUN_IN_TERMINAL_RESULT_FALLBACK_MS } from '../utils/fenceShell'
 
 // "Run in terminal" dispatches a `mc:run-in-terminal` request on window;
 // ChatPage opens a terminal tab in the active chat, runs it, and replies with a
@@ -9,7 +10,7 @@ import RunInTerminalBtn from '../components/RunInTerminalBtn'
 //
 // A click does not run anything on its own — it opens a confirmation dialog
 // showing the exact command, and only the dialog's Run button dispatches.
-let requests: { code: string; reqId: string }[] = []
+let requests: { code: string; reqId: string; lang?: string }[] = []
 function onReq(e: Event) { requests.push((e as CustomEvent).detail) }
 function replyLast(ok: boolean) {
   const last = requests[requests.length - 1]
@@ -18,7 +19,7 @@ function replyLast(ok: boolean) {
 
 /** Click the trigger, then confirm in the dialog. */
 function clickAndConfirm() {
-  fireEvent.click(screen.getByLabelText('Run in terminal'))
+  fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
   fireEvent.click(screen.getByRole('button', { name: /^Run( anyway)?$/ }))
 }
 
@@ -36,13 +37,13 @@ afterEach(() => {
 describe('RunInTerminalBtn', () => {
   it('renders terminal icon button', () => {
     renderWithProviders(<RunInTerminalBtn code="ls -la" />)
-    expect(screen.getByLabelText('Run in terminal')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run in terminal' })).toBeInTheDocument()
     expect(screen.getByTitle('Run in terminal')).toBeInTheDocument()
   })
 
   it('opens a confirmation dialog instead of running on click', () => {
     renderWithProviders(<RunInTerminalBtn code="echo hello" />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(requests).toHaveLength(0)
     expect(screen.getByRole('dialog')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument()
@@ -51,7 +52,7 @@ describe('RunInTerminalBtn', () => {
   it('shows the full command in the dialog, including text the code block would clip', () => {
     const long = `echo ${'x'.repeat(400)} && rm -rf build`
     renderWithProviders(<RunInTerminalBtn code={long} />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(screen.getByRole('dialog').textContent).toContain('&& rm -rf build')
   })
 
@@ -62,17 +63,24 @@ describe('RunInTerminalBtn', () => {
     expect(requests[0].code).toBe('echo hello')
   })
 
+  it('carries the fence language in the run request', () => {
+    renderWithProviders(<RunInTerminalBtn code="set greeting hello" lang="fish" />)
+    clickAndConfirm()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].lang).toBe('fish')
+  })
+
   it('does not run when the dialog is cancelled', () => {
     renderWithProviders(<RunInTerminalBtn code="echo hello" />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(requests).toHaveLength(0)
-    expect(screen.getByLabelText('Run in terminal')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run in terminal' })).toBeInTheDocument()
   })
 
   it('does not run when the dialog is dismissed with Escape', () => {
     renderWithProviders(<RunInTerminalBtn code="echo hello" />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(requests).toHaveLength(0)
   })
@@ -85,7 +93,7 @@ describe('RunInTerminalBtn', () => {
 
   it('previews the stripped command, not the raw prompt text', () => {
     renderWithProviders(<RunInTerminalBtn code="$ git status" />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(screen.getByRole('dialog').textContent).toContain('git status')
     expect(screen.getByRole('dialog').textContent).not.toContain('$ git status')
   })
@@ -101,7 +109,7 @@ describe('RunInTerminalBtn', () => {
     clickAndConfirm()
     act(() => { replyLast(true) })
     expect(screen.getByLabelText('Sent to terminal')).toBeInTheDocument()
-    expect(screen.queryByLabelText('Run in terminal')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run in terminal' })).not.toBeInTheDocument()
   })
 
   it('closes the dialog once confirmed', async () => {
@@ -119,7 +127,7 @@ describe('RunInTerminalBtn', () => {
     act(() => { replyLast(true) })
     expect(screen.getByLabelText('Sent to terminal')).toBeInTheDocument()
     act(() => { vi.advanceTimersByTime(1200) })
-    expect(screen.getByLabelText('Run in terminal')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run in terminal' })).toBeInTheDocument()
   })
 
   it('shows error on a failed result', () => {
@@ -132,7 +140,7 @@ describe('RunInTerminalBtn', () => {
   it('shows error when no result arrives (timeout)', () => {
     renderWithProviders(<RunInTerminalBtn code="ls" />)
     clickAndConfirm()
-    act(() => { vi.advanceTimersByTime(8000) })
+    act(() => { vi.advanceTimersByTime(RUN_IN_TERMINAL_RESULT_FALLBACK_MS) })
     expect(screen.getByLabelText("Couldn't run in terminal")).toBeInTheDocument()
   })
 
@@ -142,7 +150,7 @@ describe('RunInTerminalBtn', () => {
     act(() => { replyLast(false) })
     expect(screen.getByLabelText("Couldn't run in terminal")).toBeInTheDocument()
     act(() => { vi.advanceTimersByTime(2000) })
-    expect(screen.getByLabelText('Run in terminal')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run in terminal' })).toBeInTheDocument()
   })
 
   it('does not strip $ when not followed by whitespace (variable ref)', () => {
@@ -159,7 +167,7 @@ describe('RunInTerminalBtn', () => {
 
   it('does nothing when code is empty after stripping prompt chars', () => {
     renderWithProviders(<RunInTerminalBtn code="$ " />)
-    fireEvent.click(screen.getByLabelText('Run in terminal'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(requests).toHaveLength(0)
   })

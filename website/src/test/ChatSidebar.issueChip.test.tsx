@@ -44,6 +44,11 @@ import ChatSidebar from '../pages/ChatSidebar'
 import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
 
+/** The chip's title now names the panel and the modifier escape hatch. Built
+ *  here rather than matched loosely, so the tooltip's promise is asserted too.
+ *  `platformShortcut` is deterministic under jsdom: navigator.platform is '',
+ *  so the non-mac branch yields 'Ctrl+click'. */
+const chipTitle = (url: string) => `Open ${url} in the side panel (Ctrl+click to open it in the browser)`
 const ISSUE_URL = 'https://github.com/kirodotdev/KiroCrew/issues/701'
 const MR_ISSUE_URL = 'https://gitlab.com/acme/service/-/issues/8'
 const PR_URL = 'https://github.com/kirodotdev/KiroCrew/pull/634'
@@ -53,11 +58,11 @@ const slots = [
   {
     key: 's1', title: 'Mixed session', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
     source_links: [
-      { provider: 'github', number: 634, url: PR_URL, state: 'open', ci: 'failed', kind: 'change' },
+      { provider: 'github', number: 634, label: '#634', url: PR_URL, state: 'open', ci: 'failed', kind: 'change' },
       // No `kind`: the wire default. Must render as a PR chip, not an issue chip.
-      { provider: 'github', number: 500, url: LEGACY_PR_URL, state: 'merged' },
-      { provider: 'github', number: 701, url: ISSUE_URL, kind: 'issue' },
-      { provider: 'gitlab', number: 8, url: MR_ISSUE_URL, kind: 'issue' },
+      { provider: 'github', number: 500, label: '#500', url: LEGACY_PR_URL, state: 'merged' },
+      { provider: 'github', number: 701, label: '#701', url: ISSUE_URL, kind: 'issue' },
+      { provider: 'gitlab', number: 8, label: '#8', url: MR_ISSUE_URL, kind: 'issue' },
     ],
     source_links_total: 6,
   },
@@ -109,7 +114,7 @@ describe('ChatSidebar – issue chips', () => {
     expect(chip.tagName).toBe('A')
     expect(chip).toHaveAttribute('href', ISSUE_URL)
     expect(chip).toHaveAttribute('target', '_blank')
-    expect(chip).toHaveAttribute('title', `Open ${ISSUE_URL}`)
+    expect(chip.getAttribute('title')).toContain(`Open ${ISSUE_URL} in the side panel`)
     expect(chip.getAttribute('rel')).toContain('noopener')
     expect(chip).toHaveTextContent('#701')
     // The PR chip's CI / merge markers carry aria-labels; an issue chip has none.
@@ -121,7 +126,13 @@ describe('ChatSidebar – issue chips', () => {
     expect(screen.queryByTestId('session-issue-chip-500')).toBeNull()
   })
 
-  it('uses # for a GitLab issue too (only merge requests use !)', () => {
+  // The RULE that a GitLab issue is `#8` and only a merge request is `!8` now
+  // lives in the serializer (`source_ref_label`, pinned by
+  // test_source_providers.py::TestSourceRefLabel). What is left to check here is
+  // that the chip renders the label it was handed verbatim and adds no
+  // punctuation of its own — which is the property that lets a provider this
+  // build has never heard of still label itself correctly.
+  it('renders the label the server sent, verbatim', () => {
     renderSidebar()
     const chip = screen.getByTestId('session-issue-chip-8')
     expect(chip).toHaveAttribute('href', MR_ISSUE_URL)
@@ -131,12 +142,12 @@ describe('ChatSidebar – issue chips', () => {
 
   it('keeps the PR chip decorated, including when kind is absent', () => {
     renderSidebar()
-    const pr = screen.getByTitle(`Open ${PR_URL}`)
+    const pr = screen.getByTitle(chipTitle(PR_URL))
     expect(pr).toHaveTextContent('#634')
     expect(pr.querySelector('[aria-label="Checks failed"]')).not.toBeNull()
 
     // `kind` absent === 'change': the merged marker still renders.
-    const legacy = screen.getByTitle(`Open ${LEGACY_PR_URL}`)
+    const legacy = screen.getByTitle(chipTitle(LEGACY_PR_URL))
     expect(legacy).toHaveTextContent('#500')
     expect(legacy.querySelector('[aria-label="Merged"]')).not.toBeNull()
   })

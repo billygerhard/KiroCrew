@@ -4,11 +4,15 @@ When no OS-level sandbox backend is available, ``wrap_argv`` must NOT silently
 fall back to running the agent subprocess unprotected. It must surface a loud
 SECURITY warning unless the operator has explicitly opted in via
 ``agent.sandbox_allow_no_isolation`` (in which case it is logged at info level).
+
+When mode='off' is explicitly configured, ``wrap_argv`` emits a SECURITY warning
+about both isolation layers being inactive (Fix #3 of the insecure-defaults audit).
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 
 import kiro_crew.sandbox as sb
 
@@ -17,11 +21,25 @@ def _reset_warned():
     # wrap_argv caches a one-shot "_warned" flag on the function object.
     if hasattr(sb.wrap_argv, "_warned"):
         delattr(sb.wrap_argv, "_warned")
+    # The mode-off warning has its own per-branch latch.
+    if hasattr(sb._warn_mode_off_unconfined, "_warned_set"):
+        delattr(sb._warn_mode_off_unconfined, "_warned_set")
+    if hasattr(sb._warn_mode_off_unconfined, "_info_logged"):
+        delattr(sb._warn_mode_off_unconfined, "_info_logged")
+
+
+def _neutralize_passthrough(monkeypatch):
+    """Prevent the 'already inside a sandbox' passthrough from short-circuiting."""
+    monkeypatch.setattr(sb, "_inside_kirocrew_sandbox", lambda: False)
+    monkeypatch.setattr(sb, "_macos_sandbox_state", lambda: None)
+    # Neutralize cgroup scope so it doesn't prepend systemd-run
+    monkeypatch.setattr(sb, "_probe_cgroup_scope", lambda: (False, "disabled-in-test"))
 
 
 def test_no_backend_emits_security_warning(monkeypatch, caplog):
     """Default (not opted in): falling back to no isolation logs a WARNING."""
     _reset_warned()
+    _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_no_isolation", lambda: False)
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: True)
@@ -40,6 +58,7 @@ def test_no_backend_emits_security_warning(monkeypatch, caplog):
 def test_no_backend_opted_in_demotes_to_info(monkeypatch, caplog):
     """When the operator opts in, the fallback is logged at info, not warning."""
     _reset_warned()
+    _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_no_isolation", lambda: True)
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: True)
@@ -55,6 +74,7 @@ def test_no_backend_opted_in_demotes_to_info(monkeypatch, caplog):
 def test_warning_emitted_once_per_process(monkeypatch, caplog):
     """The warning is one-shot — repeated calls do not spam the log."""
     _reset_warned()
+    _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_no_isolation", lambda: False)
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: True)
@@ -66,17 +86,44 @@ def test_warning_emitted_once_per_process(monkeypatch, caplog):
     assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
-def test_mode_off_does_not_warn(monkeypatch, caplog):
-    """mode='off' is an explicit operator choice — it returns early, no warning."""
+def test_mode_off_emits_security_warning(monkeypatch, caplog):
+    """mode='off' now emits a SECURITY warning when kiro-cli's internal sandbox
+    is NOT active (Fix #3: both layers inactive = loud degradation signal)."""
     _reset_warned()
-    monkeypatch.setattr(sb, "_allow_no_isolation", lambda: False)
+    _neutralize_passthrough(monkeypatch)
+    monkeypatch.setattr(sb, "kiro_internal_sandbox_enabled", lambda: False)
 
     with caplog.at_level(logging.WARNING, logger=sb.logger.name):
         argv, cleanup = sb.wrap_argv(["echo", "hi"], mode="off")
 
     assert argv == ["echo", "hi"]
     assert cleanup is None
-    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, "expected a SECURITY warning when mode=off with no delegation"
+    msg = warnings[0].getMessage()
+    assert "sandbox='off'" in msg or "both" in msg.lower() or "no OS-level" in msg.lower()
+
+
+def test_mode_off_diagnostic_never_logs_argv_values(monkeypatch, caplog):
+    """The generic sandbox logger emits only a fixed command class.
+
+    CodeQL models list elements as interchangeable, and the runtime contract is
+    stronger anyway: neither an executable path nor any later argument belongs
+    in a security-degradation log.
+    """
+    _reset_warned()
+    _neutralize_passthrough(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "win32")
+    secret_marker = "SandboxCommandSecret"
+
+    with caplog.at_level(logging.WARNING, logger=sb.logger.name):
+        sb.wrap_argv(
+            [f"C:/private/{secret_marker}/git.exe", f"--token={secret_marker}"],
+            mode="off",
+        )
+
+    assert secret_marker not in caplog.text
+    assert "Command: git" in caplog.text
 
 
 def test_scrub_env_drops_credential_keys():
@@ -101,20 +148,50 @@ def test_scrub_env_extra_prefixes_strips_python_env():
     assert out == {"PATH": "/usr/bin"}
 
 
+def test_strip_python_env_covers_pycache_prefix(monkeypatch):
+    """PYTHONPYCACHEPREFIX is scrubbed on the agent spawn path (strip_python_env)
+    and kept otherwise.
+
+    The packaged app exports it for the gateway's own interpreter tree, but a
+    foreign interpreter in the agent subtree inheriting it mirrors its whole
+    stdlib/site-packages into <data home>/cache/pycache — the unbounded cache
+    growth bug. The keep-side matters equally: the gateway's own sandboxed
+    Python children must keep writing bytecode outside the signed bundle.
+    """
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/home/x/.kiro/crew/cache/pycache")
+    stripped = sb._sandbox_env_scrub_keys("standard", True)
+    kept = sb._sandbox_env_scrub_keys("standard", False)
+    assert "PYTHONPYCACHEPREFIX" in stripped
+    assert "PYTHONPYCACHEPREFIX" not in kept
+
+
+def test_strip_python_env_covers_dont_write_bytecode(monkeypatch):
+    """PYTHONDONTWRITEBYTECODE follows the same rule as the cache prefix.
+
+    The packaged macOS app exports it so the BUNDLED interpreter never writes
+    into the sealed .app. Inherited by a foreign interpreter in the agent
+    subtree it disables bytecode caching for the user's own projects -- pytest
+    rewrites assertions in memory on every run, for one -- a slowdown nobody
+    asked for and cannot easily attribute. The keep-side matters equally: the
+    gateway's own sandboxed Python children run the bundled interpreter and
+    must keep the ban, or they become the next writer into the bundle.
+    """
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    stripped = sb._sandbox_env_scrub_keys("standard", True)
+    kept = sb._sandbox_env_scrub_keys("standard", False)
+    assert "PYTHONDONTWRITEBYTECODE" in stripped
+    assert "PYTHONDONTWRITEBYTECODE" not in kept
+
+
 def test_strip_python_env_holds_on_fail_open_path(monkeypatch):
     """On the opted-in no-backend path wrap_argv returns argv unmodified (no
     launcher strips PYTHONPATH), so sandboxed_spawn_argv MUST strip the Python
     env vars from the returned env itself (review-bot finding on security-review 92e24570)."""
     _reset_warned()
+    _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_no_isolation", lambda: True)
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: True)
-    # This test asserts the bare fail-open argv (the PYTHONPATH-strip is via the
-    # parent-level scrub, not a launcher). Neutralize the cgroup v2 scope probe
-    # so a host WITH systemd cgroup delegation doesn't prepend `systemd-run` and
-    # break the argv assertion — cgroup wrapping itself is covered by
-    # test_sandbox_argv.py.
-    monkeypatch.setattr(sb, "_probe_cgroup_scope", lambda: (False, "disabled-in-test"))
 
     base = {"PATH": "/usr/bin", "PYTHONPATH": "/kirocrew/site", "PYTHONHOME": "/py"}
     argv, env, cleanup = sb.sandboxed_spawn_argv(
@@ -133,6 +210,7 @@ def test_strip_python_env_false_keeps_python_env(monkeypatch):
     """Without strip_python_env, the chokepoint leaves PYTHONPATH intact (our own
     sandboxed Python children import kiro_crew via it)."""
     _reset_warned()
+    _neutralize_passthrough(monkeypatch)
     monkeypatch.setattr(sb, "detect_backend", lambda config_mode="auto": "none")
     monkeypatch.setattr(sb, "_allow_no_isolation", lambda: True)
     monkeypatch.setattr(sb, "_allow_unsandboxed_exec", lambda: True)

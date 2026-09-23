@@ -18,6 +18,10 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
+// Registers the zh-CN catalog the assertions below read. The vitest setup file
+// inits i18next through `./index`, which registers English only, so without this
+// a switch to zh-CN silently falls back to English.
+import './all'
 import { LanguageProvider, useLanguage } from './LanguageProvider'
 import { i18nT } from './t'
 import { LANG_STORAGE_KEY } from './detect'
@@ -98,7 +102,7 @@ describe('a language switch preserves component state', () => {
       const { setLanguage } = useLanguage()
       return (
         <div>
-          <input data-testid="draft" value={v} onChange={e => setV(e.target.value)} />
+          <input data-testid="draft" aria-label="draft" value={v} onChange={e => setV(e.target.value)} />
           <span data-testid="text">{i18nT('pages.settings.displayPanel.view')}</span>
           <button onClick={() => setLanguage('zh-CN')}>zh</button>
         </div>

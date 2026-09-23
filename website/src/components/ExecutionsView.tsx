@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
 import { Badge, Btn, Skeleton } from './ui'
-import { useAppSelector } from '../store'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateTimeNumeric, fmtDuration as fmtDurationParts, fmtUnit } from '../i18n/format'
@@ -32,16 +33,14 @@ const fmtTime = (ts: number) => fmtDateTimeNumeric(ts)
 export default function ExecutionsView({ selectedJobId }: { selectedJobId?: string }) {
   const [page, setPage] = useState(0)
   const [expanded, setExpanded] = useState<string | null>(null)
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
-
-  const { data: jobsData } = useQuery({
-    queryKey: ['cron-jobs', refreshTrigger],
+  const { data: jobsData, isError: jobsFailed } = useQuery({
+    queryKey: ['cron-jobs'],
     queryFn: () => api.crons().then(r => r.jobs || []),
   })
   const jobIds = new Set((jobsData || []).map((j: { id: string }) => j.id))
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['cron-history-all', page, selectedJobId, refreshTrigger],
+    queryKey: ['cron-history-all', page, selectedJobId],
     queryFn: async () => {
       const res = await api.cronHistoryAll({ offset: page * PAGE_SIZE, limit: PAGE_SIZE + 1, jobId: selectedJobId })
       const items: HistoryEntry[] = res.runs || []
@@ -59,11 +58,33 @@ export default function ExecutionsView({ selectedJobId }: { selectedJobId?: stri
   }
 
   if (isLoading) return <div className="flex justify-center py-12"><Skeleton className="h-6 w-32 rounded" /></div>
-  if (error) return <div className="text-danger text-sm text-center py-8">{error instanceof Error ? error.message : i18nT('components.executionsView.failed_to_load')}</div>
-  if (entries.length === 0) return <div className="text-muted text-sm text-center py-12">{i18nT('components.executionsView.no_execution_history_yet')}</div>
+  if (error) return <div className="py-8 flex justify-center"><ErrorNotice message={error instanceof Error ? error.message : i18nT('components.executionsView.failed_to_load')} askAgent /></div>
+  // The job list only annotates deleted jobs, but a failed read must still
+  // say so — otherwise a broken /crons quietly un-marks every deleted row.
+  // Hoisted above the empty-history return so the notice is not bypassed
+  // when there is nothing to annotate yet. Read-only view, nothing to lose,
+  // so the hand-off is on.
+  const jobsNotice = (
+    <ErrorNotice
+      variant="inline"
+      askAgent
+      testId="executions-jobs-error"
+      className="mb-2"
+      message={jobsFailed ? i18nT('components.executionsView.jobs_load_failed') : ''}
+    />
+  )
+  if (entries.length === 0) {
+    return (
+      <div>
+        {jobsNotice}
+        <div className="text-muted text-sm text-center py-12">{i18nT('components.executionsView.no_execution_history_yet')}</div>
+      </div>
+    )
+  }
 
   return (
     <div>
+      {jobsNotice}
       <div className="overflow-x-auto">
         <table className="w-full border-collapse table-striped">
           <thead><tr>
@@ -112,7 +133,7 @@ export default function ExecutionsView({ selectedJobId }: { selectedJobId?: stri
 }
 
 function TraceRow({ entry }: { entry: HistoryEntry }) {
-  const { data: trace, isLoading } = useQuery({
+  const { data: trace, isLoading, isError, error } = useQuery({
     queryKey: ['cron-trace', entry.job_id, entry.run_id],
     queryFn: async () => {
       const res = await api.cronRunDetail(entry.job_id, entry.run_id)
@@ -123,7 +144,14 @@ function TraceRow({ entry }: { entry: HistoryEntry }) {
   return (
     <tr>
       <td colSpan={6} className="px-4 py-3 border-b border-border bg-bg-elevated">
-        {isLoading ? <Skeleton className="h-4 w-48 rounded" /> : (
+        {isLoading ? <Skeleton className="h-4 w-48 rounded" /> : isError ? (
+          // Read failure of a historical run; the row holds no draft, so the hand-off is on.
+          <ErrorNotice
+            askAgent
+            testId="executions-trace-error"
+            message={errMessage(error) || i18nT('components.executionsView.failed_to_load')}
+          />
+        ) : (
           <pre className="text-[12px] font-mono whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto leading-relaxed">{trace}</pre>
         )}
       </td>

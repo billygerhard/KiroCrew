@@ -31,14 +31,29 @@ vi.mock('../api/client', () => ({
     updateDashboardConfig: () => Promise.resolve({}),
     tipsStatus: () => Promise.resolve({ enabled_config: true, opted_out: false }),
     tipsFeedback: () => Promise.resolve({ ok: true }),
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
 
 const seed = (agent: Record<string, unknown>) =>
@@ -72,7 +87,7 @@ describe('ChatPanel — default model', () => {
   it('renders the Model section with both controls', async () => {
     wrap(<ChatPanel />)
     expect(await screen.findByText('Model')).toBeInTheDocument()
-    expect(await screen.findByRole('combobox', { name: 'Fallback Model' })).toBeInTheDocument()
+    expect(await screen.findByRole('combobox', { name: 'Default Model' })).toBeInTheDocument()
     expect(
       await screen.findByRole('combobox', { name: 'Default Reasoning Effort' })
     ).toBeInTheDocument()
@@ -81,7 +96,7 @@ describe('ChatPanel — default model', () => {
   it('lists the models the backend advertises', async () => {
     wrap(<ChatPanel />)
     await waitFor(() => expect(modelsMock).toHaveBeenCalled())
-    const opts = await openSelect('Fallback Model')
+    const opts = await openSelect('Default Model')
     const labels = opts.map(o => o.textContent)
     expect(labels).toContain('Default (auto)')
     expect(labels).toContain('claude-opus-4.8')
@@ -90,7 +105,7 @@ describe('ChatPanel — default model', () => {
   it('PATCHes agent.model on selection', async () => {
     wrap(<ChatPanel />)
     await waitFor(() => expect(modelsMock).toHaveBeenCalled())
-    await openSelect('Fallback Model')
+    await openSelect('Default Model')
     fireEvent.click(screen.getByRole('option', { name: 'claude-opus-4.8' }))
     await waitFor(() =>
       expect(patchConfigMock).toHaveBeenCalledWith('agent.model', 'claude-opus-4.8')
@@ -101,7 +116,7 @@ describe('ChatPanel — default model', () => {
     seed({ model: 'claude-opus-4.8', reasoning_effort: '' })
     wrap(<ChatPanel />)
     await waitFor(() =>
-      expect(screen.getByRole('combobox', { name: 'Fallback Model' })).toHaveTextContent(
+      expect(screen.getByRole('combobox', { name: 'Default Model' })).toHaveTextContent(
         'claude-opus-4.8'
       )
     )
@@ -114,7 +129,7 @@ describe('ChatPanel — default model', () => {
     seed({ model: 'claude-opus-4.7-retired', reasoning_effort: '' })
     wrap(<ChatPanel />)
     await waitFor(() => expect(modelsMock).toHaveBeenCalled())
-    const opts = await openSelect('Fallback Model')
+    const opts = await openSelect('Default Model')
     expect(opts.map(o => o.textContent)).toContain('claude-opus-4.7-retired')
     expect(patchConfigMock).not.toHaveBeenCalled()
   })
@@ -123,7 +138,7 @@ describe('ChatPanel — default model', () => {
     seed({ model: '', reasoning_effort: '' })
     wrap(<ChatPanel />)
     await waitFor(() =>
-      expect(screen.getByRole('combobox', { name: 'Fallback Model' })).toHaveTextContent(
+      expect(screen.getByRole('combobox', { name: 'Default Model' })).toHaveTextContent(
         'Default (auto)'
       )
     )
@@ -133,7 +148,7 @@ describe('ChatPanel — default model', () => {
     patchConfigMock.mockImplementationOnce(() => Promise.reject(new Error('boom')) as never)
     wrap(<ChatPanel />)
     await waitFor(() => expect(modelsMock).toHaveBeenCalled())
-    await openSelect('Fallback Model')
+    await openSelect('Default Model')
     fireEvent.click(screen.getByRole('option', { name: 'claude-opus-4.8' }))
     expect(await screen.findByText(/Failed to save default model/)).toBeInTheDocument()
   })

@@ -16,12 +16,16 @@ interface MockChatMessageListProps {
   messages: unknown[]
   running: boolean
   onApprove?: (approvalId: string, decision: string) => void
+  canTrust?: boolean
+  /** The virtualized mount's slots: the embed's empty state renders above the rows. */
+  transcript?: { aboveRows?: React.ReactNode }
 }
 
 vi.mock('./ChatMessageList', () => ({
-  default: ({ messages, running, onApprove }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
-      data-can-approve={String(!!onApprove)}>
+      data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
+      {transcript?.aboveRows}
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -34,9 +38,10 @@ vi.mock('./ChatMessageList', () => ({
 
 // Mock ChatMessageList from the correct path (ChatEmbed imports from ./ChatMessageList)
 vi.mock('../app-sdk/ChatMessageList', () => ({
-  default: ({ messages, running, onApprove }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
-      data-can-approve={String(!!onApprove)}>
+      data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
+      {transcript?.aboveRows}
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -48,6 +53,9 @@ vi.mock('../app-sdk/ChatMessageList', () => ({
 }))
 
 import ChatEmbed from '../app-sdk/ChatEmbed'
+import { deriveFollowUpOptions } from '../app-sdk/protocol'
+import { api } from '../api/client'
+import type { ChatMessage } from '../types'
 
 let queryClient: QueryClient
 
@@ -261,7 +269,7 @@ describe('ChatEmbed', () => {
       }))
     })
 
-    it('does not send on Shift+Enter', async () => {
+    it('keeps a Shift+Enter newline in the draft instead of sending', async () => {
       await act(async () => {
         renderWithProviders(<ChatEmbed slotKey="slot-1" />)
       })
@@ -271,11 +279,88 @@ describe('ChatEmbed', () => {
         fireEvent.change(input, { target: { value: 'hello' } })
       })
 
+      const shiftEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
       await act(async () => {
-        fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+        input.dispatchEvent(shiftEnter)
+        if (!shiftEnter.defaultPrevented) {
+          fireEvent.input(input, { target: { value: 'hello\n' } })
+        }
       })
 
+      expect(shiftEnter.defaultPrevented).toBe(false)
+      expect(input).toHaveValue('hello\n')
       expect(mockPost).not.toHaveBeenCalled()
+    })
+
+    it('does not send the Enter that commits an IME candidate', async () => {
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+      })
+      const input = screen.getByLabelText('Chat message')
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: '你好' } })
+        fireEvent.compositionStart(input)
+        fireEvent.keyDown(input, { key: 'Enter' })
+      })
+
+      expect(input).toHaveValue('你好')
+      expect(mockPost).not.toHaveBeenCalled()
+    })
+
+    it('grows to the shared height cap, then keeps vertical scrolling', async () => {
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+      })
+      const input = screen.getByLabelText('Chat message') as HTMLTextAreaElement
+      Object.defineProperty(input, 'scrollHeight', { value: 9999, configurable: true })
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: 'a long multi-line draft' } })
+      })
+
+      expect(input).toBeInstanceOf(HTMLTextAreaElement)
+      expect(input.style.height).toBe('240px')
+      expect(input).toHaveClass('overflow-y-auto')
+    })
+
+    it('caps the auto-grow at composerMaxHeight when a fixed-height host passes one', async () => {
+      // A host that boxes the embed at a fixed height (IncidentChat's 420px
+      // panel) cannot afford the shared 240px cap: a maxed-out draft would take
+      // more than half the box. The prop is forwarded to the draft hook as its
+      // cap; the resting size is the element's own CSS floor and is not touched.
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" composerMaxHeight={160} />)
+      })
+      const input = screen.getByLabelText('Chat message') as HTMLTextAreaElement
+      Object.defineProperty(input, 'scrollHeight', { value: 9999, configurable: true })
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: 'a long multi-line draft' } })
+      })
+
+      expect(input.style.height).toBe('160px')
+    })
+
+    it('lets a draft below composerMaxHeight grow to its own content height', async () => {
+      // The prop is a cap, not a fixed height: a short draft still sizes to its
+      // content, so the prop cannot be implemented as a constant height.
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" composerMaxHeight={160} />)
+      })
+      const input = screen.getByLabelText('Chat message') as HTMLTextAreaElement
+      Object.defineProperty(input, 'scrollHeight', { value: 76, configurable: true })
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: 'three\nshort\nlines' } })
+      })
+
+      expect(input.style.height).toBe('76px')
     })
   })
 
@@ -330,7 +415,8 @@ describe('ChatEmbed', () => {
         renderWithProviders(<ChatEmbed slotKey="test-slot" />)
       })
 
-      expect(mockGet).toHaveBeenCalledWith('/api/chat/slots/' + encodeURIComponent('test-slot'))
+      // Bounded to one page (P5-e): the newest EMBED_PAGE_LIMIT rows, never the whole slot.
+      expect(mockGet).toHaveBeenCalledWith('/api/chat/slots/' + encodeURIComponent('test-slot') + '?limit=200')
     })
 
     it('polls at 5000ms interval when idle', async () => {
@@ -451,6 +537,181 @@ describe('ChatEmbed', () => {
   })
 })
 
+describe('ChatEmbed follow-up options', () => {
+  // Regression for #3304: ChatMessageList strips `[OPTIONS: a | b]` markers out of
+  // the rendered prose, but ChatEmbed never offered those choices anywhere else --
+  // an agent's follow-up question left the embedding app's user with nothing to
+  // click, unlike the main chat and side panel which render a row of pills.
+  it('renders a follow-up pill for each option in the last assistant turn', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getByText('Run tests')).toBeInTheDocument()
+    expect(screen.getByText('Skip')).toBeInTheDocument()
+  })
+
+  it('renders no follow-up bar when the last turn carries no options', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Just a plain reply.' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('suppresses the follow-up bar while the turn is still streaming', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: true,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('a later user message clears the previous turn\'s options', async () => {
+    mockGet.mockResolvedValue({
+      messages: [
+        { role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' },
+        { role: 'user', content: 'Run tests' },
+      ],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('picking an option edits the draft instead of sending immediately', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const input = screen.getByLabelText('Chat message') as HTMLInputElement
+
+    // Chip clicks are debounced 220ms (so a double-click can still fire the
+    // distinct "send now" gesture) whenever onSend is supplied, as it is here.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
+      vi.advanceTimersByTime(250)
+    })
+
+    expect(input.value).toBe('Run tests')
+    expect(mockPost).not.toHaveBeenCalledWith('/api/chat', expect.anything())
+  })
+
+  it('picking an option twice removes it from the draft again', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const input = screen.getByLabelText('Chat message') as HTMLInputElement
+
+    // Chip clicks are debounced 220ms (so a double-click can still fire the
+    // distinct "send now" gesture) whenever onSend is supplied, as it is here.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
+      vi.advanceTimersByTime(250)
+    })
+    expect(input.value).toBe('Run tests')
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
+      vi.advanceTimersByTime(250)
+    })
+    expect(input.value).toBe('')
+  })
+
+  // Pins the deliberate exclusion recorded at ChatEmbed's deriveFollowUpOptions
+  // destructure (#6057): this embed is NOT a plan-capable host. A message whose
+  // derivation yields followUpIsPlan=true still keeps its chips on the
+  // composer-draft path. Inverse of the ChatPane/ChatPage dispatch tests (same
+  // plan fixture: header + stage line + protocol footer, which is what makes
+  // parseOptions set isPlan).
+  it('a plan-shaped chip edits the draft and never dispatches a plan action', async () => {
+    const planMessages = [
+      { role: 'user', content: 'plan it' },
+      { role: 'assistant', content: '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTION: Go | Go All | Cancel]' },
+    ]
+    // Premise pin: the fixture MUST derive as a plan, or this test silently
+    // degrades into a duplicate of the plain follow-up test above while staying
+    // green (e.g. if the plan grammar tightens and only this copy drifts).
+    expect(deriveFollowUpOptions(planMessages as ChatMessage[], false).followUpIsPlan).toBe(true)
+    // Plan dispatch, wherever it is wired, goes through the global api client's
+    // planAction (usePlanActionMutation) -- NOT the useAppApi() object mocked as
+    // mockPost. Spy the real transport so a future wiring that dispatches AND
+    // fills the draft cannot sail through green. Stubbed (not call-through) so
+    // that failing case surfaces as this test's own assertion, not as an
+    // unhandled rejection from a real fetch under jsdom.
+    const planActionSpy = vi.spyOn(api, 'planAction').mockResolvedValue({ ok: true })
+
+    mockGet.mockResolvedValue({ messages: planMessages, running: false, title: '' })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-plan-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const input = screen.getByLabelText('Chat message') as HTMLInputElement
+    expect(screen.getByText('Go')).toBeInTheDocument()
+
+    // Chip clicks are debounced 220ms (so a double-click can still fire the
+    // distinct "send now" gesture) whenever onSend is supplied, as it is here.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Go'))
+      vi.advanceTimersByTime(250)
+    })
+
+    // Composer-draft path: the label lands in the input, exactly like a plain
+    // follow-up chip. This is the load-bearing assertion -- a dispatch branch
+    // returns before the draft append (per ChatPane), so wiring dispatch into
+    // this path would red this line.
+    expect(input.value).toBe('Go')
+    // And no dispatch on either client: not the embed's own API surface, not
+    // the global client's plan-action transport.
+    expect(mockPost).not.toHaveBeenCalled()
+    expect(planActionSpy).not.toHaveBeenCalled()
+  })
+})
+
 describe('ChatEmbed approvals', () => {
   // An embedded agent that hits a permission prompt must be actionable. The
   // group header only renders Approve/Reject when an onApprove handler is
@@ -488,6 +749,10 @@ describe('ChatEmbed approvals', () => {
       renderWithProviders(<ChatEmbed slotKey="slot-1" />)
       await vi.advanceTimersByTimeAsync(0)
     })
+    // The embed must DECLARE the trust tier: CollapsibleToolGroup is fail-closed
+    // and only renders the Trust button on a canTrust mount (#5434). Dropping
+    // the flag would silently remove Trust from every embedded approval row.
+    expect(screen.getByTestId('chat-message-list').dataset.canTrust).toBe('true')
     await act(async () => {
       screen.getByTestId('mock-trust').click()
       await vi.advanceTimersByTimeAsync(0)

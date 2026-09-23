@@ -15,51 +15,220 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Collection
 from pathlib import Path
+from typing import Any
+
+from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
+from kiro_crew.config.paths import kiro_home
+
+#: kiro-cli's enterprise-governance discriminator. The spec WRITER owns the
+#: literal (``agent._MCP_REGISTRY_TYPE``); this is the copy the readers share, and
+#: a ratchet test pins them equal.
+MCP_REGISTRY_TYPE = "registry"
+
+
+def mcp_entry_is_registry_governed(entry: Any) -> bool:
+    """Whether one ``mcpServers`` entry defers its launch to an admin's catalog.
+
+    A ``"type": "registry"`` entry names a catalog record rather than describing a
+    local process: in registry access mode the client resolves it by map key and
+    applies the catalog's own command, and OUTSIDE that mode the client drops it.
+    Neither outcome is a server this side may launch, which is why the answer does
+    not depend on whether registry mode is declared locally -- the marker alone
+    settles it.
+
+    Here beside :func:`mcp_entry_is_muted` because every site that decides whether
+    a server LAUNCHES has to give the same answer, and the gateway is one of them:
+    a marked entry it wraps into a broker stub carries a local command the client
+    never asked for, and the wrapped name is what the session projections subtract
+    as a "stubbed name" -- so the entry arrives as a live local process and the
+    marker governs nothing. The gateway reads this predicate for that reason, not
+    only the projections.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("type") == MCP_REGISTRY_TYPE
+
+
+def mcp_entry_is_muted(entry: Any) -> bool:
+    """Whether one ``mcpServers`` entry asks not to be launched.
+
+    Anything but an absent ``disabled`` or a literal ``False`` is a mute. That is
+    FAIL-CLOSED on purpose, and the direction matters because the two mistakes are
+    not symmetric: reading an odd value as "enabled" launches a server the user
+    tried to silence, while reading it as "muted" withholds one they can un-mute
+    by fixing the value. An ill-typed ``disabled`` is also not forwardable -- both
+    kiro-cli's spec schema and KAS's wire schema type the field as a boolean and
+    reject the document over it -- so there is no reading under which the odd value
+    yields a working server.
+
+    Lives here, in the module that already pins the shared managed-server set, so
+    the sites that decide whether a server LAUNCHES share one answer instead of
+    spelling it each. They did not: ``is True`` in the gateway rewriter against
+    ``is not False`` in the session projections meant a server muted with a
+    non-boolean was passed over by the rewriter's guard, wrapped into a live
+    pooling stub, and so subtracted from the projection as a "stubbed name" before
+    any mute check could see it -- muted in the spec, running in the session.
+
+    Not every reader of ``disabled`` belongs here. A roster row or a capability
+    listing answers "does the user consider this on", where ordinary truthiness is
+    right and a wrong answer costs a chip, not a process. This predicate is for
+    the launch decision.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("disabled", False) is not False
+
 
 logger = logging.getLogger(__name__)
 
-_KIRO_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
+# Override hook + accessor, NOT a resolved constant. Binding `kiro_home()` at
+# import time freezes whichever home was active when this module was first
+# imported, so conftest's isolation fixture -- which runs after collection has
+# already imported it -- cannot redirect it, and a test that reached
+# `clean_stale_managed_mcp()` without patching would rewrite the operator's REAL
+# mcp.json. Keeping the module-level name means the existing
+# `monkeypatch.setattr(mcp_cleanup, "_KIRO_MCP_JSON", tmp)` call sites still work.
+_KIRO_MCP_JSON: Path | None = None  # explicit override hook, None = live
+
+
+def _kiro_mcp_json() -> Path:
+    if _KIRO_MCP_JSON is not None:
+        return _KIRO_MCP_JSON
+    return kiro_home() / "settings" / "mcp.json"
+
 
 # Managed servers whose command is the kirocrew binary itself.
 # Only these are affected by install-method path changes.
-# Ordered tuple (not a set) so consumers that iterate — e.g. `kirocrew
+# Ordered tuples (not sets) so consumers that iterate — e.g. `kirocrew
 # doctor`'s MCP probe — get a deterministic order.
-KIROCREW_BIN_MCP_SERVERS = ("kirocrew-cron", "kirocrew-core", "kirocrew-computer")
+#
+# The split matters to every consumer that asks "should this server be in the
+# spec?". An ALWAYS_ON server missing from an agent spec is a broken install; an
+# OPT_IN one is an assignable set that most agents are simply not granted, so
+# demanding its presence — or minting an auto-approve grant for it — would undo
+# the assignment. Membership here must track the ``opt_in`` flags in
+# ``agent._MANAGED_MCP_SERVERS``; a ratchet test pins the two together.
+ALWAYS_ON_BIN_MCP_SERVERS = (
+    "kirocrew-cron",
+    "kirocrew-core",
+    "kirocrew-computer",
+)
+OPT_IN_BIN_MCP_SERVERS = (
+    "kirocrew-dashboard",
+    "kirocrew-work",
+    "kirocrew-crew-log",
+    "kirocrew-debug",
+    "kirocrew-panel",
+)
 
-# MeshClaw was the predecessor of KiroCrew. The rename left these managed
-# server entries — pointing at now-dead MeshClaw build paths — behind in the
-# user's global provider config; they are unambiguously stale and safe to purge.
-PREDECESSOR_BIN_MCP_SERVERS = frozenset({"meshclaw-cron", "meshclaw-core"})
+# Every managed-binary server name, regardless of how it reaches a spec. This is
+# the cleanup view: Kiro Crew never legitimately writes any of them into the
+# user's global mcp.json, so a stray entry is purgeable either way.
+KIROCREW_BIN_MCP_SERVERS = ALWAYS_ON_BIN_MCP_SERVERS + OPT_IN_BIN_MCP_SERVERS
 
 # Every managed-binary server name KiroCrew is responsible for removing from
-# the user's global mcp.json (KiroCrew never legitimately writes these there).
-STALE_MANAGED_MCP_SERVERS = frozenset(KIROCREW_BIN_MCP_SERVERS) | PREDECESSOR_BIN_MCP_SERVERS
+# the user's global mcp.json (Kiro Crew never legitimately writes these there).
+#
+# ALWAYS_ON only, and there is no ownership-proven exception. This purge exists
+# to reclaim entries an OLDER INSTALL METHOD wrote to the global file — but an
+# opt-in server is never written there by any version of Kiro Crew, since the
+# only way it is ever granted is by hand. So no legitimate residue can exist
+# under that name, and anything found there is necessarily the user's own: to be
+# left alone, not reclaimed on a technicality about how it happens to be spelled.
+STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS)
 
 
-def _invokes_meshclaw(spec: object) -> bool:
-    """True if a server spec's command is the dead MeshClaw predecessor binary.
+def _predecessor_mcp_names() -> frozenset[str]:
+    """Managed server names owned by an agent an edition supersedes.
 
-    Catches stale entries the rename left behind whose *name* isn't in the
-    managed set — e.g. a leftover ``npm:@playwright/mcp`` proxy pointing at an
-    old MeshClaw runtime (``.../MeshClaw/.../bin/meshclaw``,
-    ``...\\MeshClaw\\Scripts\\meshclaw.exe``). Keyed on the command basename so
-    it matches both the bare name and absolute paths, and never matches a
-    genuine playwright server (which runs ``npx``/``node``).
+    An edition that replaces a predecessor registers it as an import source, and
+    the same descriptor names the MCP servers that agent managed. Those entries
+    point at a runtime that is gone, so they are unambiguously stale — but only
+    the edition knows they exist, which is why this is read from the registry
+    rather than listed here.
+    """
+    # Deferred, NOT top-level: cli.py imports this module eagerly, and
+    # onboarding_import pulls yaml/croniter/vector_memory/embeddings. Hoisting it
+    # puts that weight on every CLI invocation, which
+    # test_cli_lazy_imports.py::test_cli_import_does_not_load_heavy_modules
+    # fails on by design. Same annotation as the call site in agent.py.
+    from kiro_crew.onboarding_import import predecessor_mcp_names  # noqa: PLC0415
+
+    return predecessor_mcp_names()
+
+
+def _stale_mcp_binaries() -> frozenset[str]:
+    """Launcher basenames whose leftover MCP entries an edition declared purgeable."""
+    # Deferred for the same boot-weight reason as _predecessor_mcp_names above.
+    from kiro_crew.onboarding_import import stale_mcp_binaries  # noqa: PLC0415
+
+    return stale_mcp_binaries()
+
+
+# The argv token the deleted Playwright MCP proxy was registered with. An entry
+# still carrying it spawns `kirocrew mcp-playwright-proxy`, a subcommand this
+# release removed, so kiro-cli hits ModuleNotFoundError on EVERY session until
+# the entry goes. Browsing is gone either way (there is no proxy any more), so
+# the only question is whether the operator also gets a crash on every session.
+_DELETED_PROXY_ARGV_TOKEN = "mcp-playwright-proxy"
+
+
+def _invokes_deleted_playwright_proxy(spec: object) -> bool:
+    """True if a server spec launches the Playwright MCP proxy this release deleted.
+
+    Matched on the ARGV token, never on the server name. The canonical name was
+    ``playwright-mcp``, but that is also what an operator's OWN Playwright server
+    is called, and purging by name would delete a server Kiro Crew never wrote --
+    the same trap ``_invokes_superseded_agent`` exists to avoid.
+    """
+    if not isinstance(spec, dict):
+        return False
+    args = spec.get("args", [])
+    if not isinstance(args, list):
+        return False
+    return any(isinstance(a, str) and a == _DELETED_PROXY_ARGV_TOKEN for a in args)
+
+
+#: Executable suffixes a Windows console script carries (`...\Scripts\<name>.exe`).
+#: Only these are stripped when matching a launcher basename, so an unrelated
+#: dotted command is never collapsed onto a registered name.
+_WINDOWS_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".com")
+
+
+def _invokes_superseded_agent(spec: object) -> bool:
+    """True if a server spec's command is the launcher of a superseded agent.
+
+    Catches stale entries a rename left behind whose *name* is not in the managed
+    set — e.g. a leftover ``npm:@playwright/mcp`` proxy pointing at the old
+    runtime. Keyed on the command basename so it matches both a bare name and an
+    absolute path, and never matches a genuine playwright server (which runs
+    ``npx``/``node``). The names come from the import-source registry, so the
+    core does not hardcode any superseded product name.
     """
     if not isinstance(spec, dict):
         return False
     cmd = spec.get("command", "")
     if not isinstance(cmd, str) or not cmd:
         return False
+    binaries = _stale_mcp_binaries()
+    if not binaries:
+        return False
     # mcp.json is cross-platform data (a config written on Windows may be read
     # anywhere), so split on BOTH separators rather than the host's os.sep —
-    # os.path.basename only honors the local separator. Then drop a launcher
-    # suffix so ``...\\Scripts\\meshclaw.exe`` (pip's Windows console script)
-    # matches the bare predecessor name.
+    # os.path.basename only honors the local separator.
     leaf = re.split(r"[\\/]", cmd)[-1]
-    stem = leaf.split(".", 1)[0]
-    return stem == "meshclaw"
+    stem = leaf.casefold()
+    # Strip only a real executable suffix. Splitting on the FIRST dot instead
+    # would collapse any dotted command onto its first segment, so a server
+    # launched by an unrelated `<name>.<something>` binary would match a
+    # registered `<name>` and be deleted.
+    for suffix in _WINDOWS_LAUNCHER_SUFFIXES:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem in binaries
 
 
 def clean_stale_managed_mcp() -> list[str]:
@@ -73,18 +242,17 @@ def clean_stale_managed_mcp() -> list[str]:
     config; genuine user-installed servers are never touched:
 
     * **By name** — ``kirocrew-cron`` / ``kirocrew-core`` (written there by an
-      older install method; KiroCrew now keeps these in the agent file) and the
-      dead predecessor ``meshclaw-cron`` / ``meshclaw-core``.
-    * **By command** — any server whose command is the dead MeshClaw predecessor
-      binary (basename ``meshclaw``), e.g. a leftover ``npm:@playwright/mcp``
-      proxy entry pointing at an old MeshClaw runtime.
+      older install method; Kiro Crew now keeps these in the agent file), plus
+      the managed servers of any agent an edition declares it supersedes.
+    * **By command** — any server whose command is a superseded agent's launcher,
+      e.g. a leftover ``npm:@playwright/mcp`` proxy pointing at its old runtime.
 
     Returns names of removed servers (empty list on no-op or error).
     """
-    if not _KIRO_MCP_JSON.is_file():
+    if not _kiro_mcp_json().is_file():
         return []
     try:
-        data = json.loads(_KIRO_MCP_JSON.read_text(encoding="utf-8"))
+        data = json.loads(_kiro_mcp_json().read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
     servers = data.get("mcpServers", {})
@@ -93,16 +261,180 @@ def clean_stale_managed_mcp() -> list[str]:
     removed = sorted(
         name
         for name, spec in servers.items()
-        if name in STALE_MANAGED_MCP_SERVERS or _invokes_meshclaw(spec)
+        if name in STALE_MANAGED_MCP_SERVERS
+        or name in _predecessor_mcp_names()
+        or _invokes_superseded_agent(spec)
+        or _invokes_deleted_playwright_proxy(spec)
     )
     if not removed:
         return []
     for name in removed:
         del servers[name]
     try:
-        _KIRO_MCP_JSON.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        _kiro_mcp_json().write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         logger.info("Removed stale managed MCP entries from kiro mcp.json: %s", removed)
     except OSError:
         logger.debug("Could not clean kiro mcp.json", exc_info=True)
         return []
     return removed
+
+
+def _ref_server(ref: str) -> str:
+    """The server name a ``@server`` / ``@server/tool`` ref addresses.
+
+    One spelling, matching ``agent_capabilities._materialize`` and
+    ``apps.bridges``: strip the sigil, then take everything before the first
+    ``/``. A second spelling would let the per-tool form (``@notion/search``,
+    ``@notion/*``) resolve to a different server here than it does there, and the
+    two would disagree about which refs are dangling.
+    """
+    return ref[1:].split("/", 1)[0]
+
+
+def prune_dangling_tool_refs(
+    config: dict,
+    *,
+    declared: Collection[str] = (),
+    declared_grants: Collection[str] | None = None,
+) -> list[str]:
+    """Drop ``tools``/``allowedTools`` refs naming a server the map does not hold.
+
+    ``kiro-cli`` mounts what ``mcpServers`` declares, so a ``@ref`` to a name
+    absent from that map mounts nothing. The invariant is stated twice elsewhere
+    in-tree -- :func:`purge_deleted_proxy_from_config` strips refs alongside its
+    own deletes so kiro-cli does not try to mount a server absent from the map,
+    and ``agent_capabilities._materialize`` filters ``allowedTools`` on exactly
+    this test -- and this is where it holds for the assembled agent config, whose
+    server map several passes narrow without touching the ref lists (the
+    resolution pass replaces ``mcpServers`` wholesale, dropping unresolvable
+    servers by OMISSION; the locked app re-merge ``del``\\ etes app entries whose
+    app is not confirmed enabled). One reconcile over the FINAL map covers every
+    such pass, including one added later.
+
+    A dangling ``allowedTools`` ref is the one that costs something: that list is
+    the path that never reaches the PreToolUse gate, so the grant sits on the NAME
+    and a server added under it inherits an auto-approval nobody granted for it.
+
+    *declared* names servers whose absence from the map this caller EXPECTS and a
+    later pass reverses, so they are not leftovers. Two such classes exist in the
+    rebuild, and both are unrecoverable if their refs are dropped, because an
+    existing config deliberately never re-adds a template ref: a server whose
+    command fails to resolve on this pass (a binary missing from this rebuild's
+    PATH), and a gated-off shipped server whose entry is withheld while its
+    ``tools`` ref is retained by design. The resolution case also reaches the
+    per-tool grant, which nothing re-emits -- the rebuild's ref sync only ever
+    writes whole-server ``@alias`` refs. Refs outlive one bad PATH; a lost grant
+    does not.
+
+    A ``@`` name in :data:`RESERVED_TOOL_NAMESPACES` addresses a kiro namespace
+    rather than a server, so it is never in the map and is never a leftover.
+    ``@builtin`` is the one kiro's configuration reference lists, and it carries
+    the whole built-in tool surface plus the ``tool_search`` loader, so reading it
+    as a dangling server ref would unmount all of that on every rebuild.
+
+    Fails safe in both directions: a ``mcpServers`` that is not a dict yields no
+    readable verdict, so nothing is dropped, and a non-string or sigil-less entry
+    is left for the passes that own it.
+
+    Mutates *config* in place. Returns the refs removed, first occurrence order.
+
+    *declared_grants* is the same kind of set for ``allowedTools`` alone, and it
+    exists because the two lists fail in opposite directions. Keeping a mount ref
+    too long costs a mount attempt against a name that holds nothing; dropping one
+    can unmount a server for good, since an existing config never re-adds a
+    template ref. Keeping a GRANT too long hands the next server on that name an
+    auto-approval nobody granted, on the one list that never reaches the
+    PreToolUse gate; dropping one costs an approval a human can give again. So a
+    caller that is UNSURE whether a name is still owned should name it in
+    *declared* and leave it out of *declared_grants*: the mount survives the doubt
+    and the grant does not. Defaults to *declared*, so a caller with no such
+    doubt passes one set and both lists read it.
+    """
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    _base = set(servers) | RESERVED_TOOL_NAMESPACES
+    known = {
+        "tools": _base | set(declared),
+        "allowedTools": _base | set(declared if declared_grants is None else declared_grants),
+    }
+    dropped: list[str] = []
+    unmounted: list[str] = []
+    for key in ("tools", "allowedTools"):
+        lst = config.get(key)
+        if not isinstance(lst, list):
+            continue
+        kept = []
+        for ref in lst:
+            if (
+                not isinstance(ref, str)
+                or not ref.startswith("@")
+                or _ref_server(ref) in known[key]
+            ):
+                kept.append(ref)
+                continue
+            if key == "tools" and ref not in unmounted:
+                unmounted.append(ref)
+            if ref not in dropped:
+                dropped.append(ref)
+        config[key] = kept
+    if dropped:
+        # A ``tools`` removal takes a tool OUT of the agent's surface, and the
+        # shipped ``agent.log_level`` default is WARNING, so recording that at
+        # INFO hides it from the operator who then has to debug a tool that
+        # stopped being offered. The ref named a server the final map does not
+        # hold, so the tool was already unreachable -- but a MISREAD absence
+        # here is unrecoverable, because an existing config never re-adds a
+        # template ref, and that is the case worth seeing without first raising
+        # the log level. A grant-only removal is already in SEL as
+        # ``mcp_auto_approve_revoked``, so it stays at INFO.
+        logger.log(
+            logging.WARNING if unmounted else logging.INFO,
+            "Pruned dangling MCP refs from agent config (no such server in mcpServers): %s",
+            dropped,
+        )
+    return dropped
+
+
+def purge_deleted_proxy_from_config(config: dict) -> list[str]:
+    """Drop any MCP server entry whose argv invokes the deleted Playwright proxy.
+
+    Runs on EVERY rebuild of the agent config (not behind the first-run
+    marker) because the entry can be re-injected from ~/.kiro/crew/mcp.json
+    by the merge passes that precede this call.  Matched by ARGV token, never
+    by server name, so an operator's own ``playwright-mcp`` server whose
+    command does not invoke the deleted subcommand is left untouched.
+
+    Mutates *config* in place.  Returns server names that were removed.
+    """
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    to_remove = [name for name, spec in servers.items() if _invokes_deleted_playwright_proxy(spec)]
+    for name in to_remove:
+        del servers[name]
+    if to_remove:
+        # Also strip @refs from tools/allowedTools so kiro-cli does not try
+        # to mount a server absent from the map. Both spellings
+        # the server owns go: the bare ``@name`` and the per-tool
+        # ``@name/tool`` -- a per-tool grant left in ``allowedTools`` is an
+        # auto-approval on the deleted proxy's name, and that list never
+        # reaches the PreToolUse gate. Bounded by the ``/`` so a
+        # prefix-sharing name (``@namex``) is untouched. Rebuilt in place
+        # rather than ``list.remove`` so a duplicated ref cannot survive.
+        for key in ("tools", "allowedTools"):
+            lst = config.get(key)
+            if isinstance(lst, list):
+                for name in to_remove:
+                    ref = f"@{name}"
+                    owned = f"{ref}/"
+                    lst[:] = [
+                        t
+                        for t in lst
+                        if t != ref and not (isinstance(t, str) and t.startswith(owned))
+                    ]
+        logger.info(
+            "Purged deleted-proxy MCP entries from agent config: %s",
+            to_remove,
+        )
+    return to_remove

@@ -13,10 +13,9 @@ each call so it can:
 * Scope per-session state (memory keys, file paths, audit records).
 * Enforce per-session authorization policies.
 
-Previously, the backend read this identity from the ``KIROCREW_SESSION_KEY``
-environment variable baked in at spawn time. That approach is incompatible
-with pooling because one backend would serve many sessions but see only the
-first session's env var.
+A ``KIROCREW_SESSION_KEY`` environment variable baked in at spawn time cannot
+carry this identity under pooling: one backend serves many sessions but sees
+only the first session's env var.
 
 DESIGN
 ------
@@ -45,10 +44,15 @@ This module defines a **namespaced, versioned, typed** protocol extension:
            }
        }
 
-   Gatewayd inspects this capability at backend boot. Backends that **do
-   not** advertise the extension are treated as single-session: gatewayd
-   will refuse to pool them and fall back to per-session spawn (the
-   equivalent of the old ``UNPOOLABLE_SERVERS`` list, but auto-detected).
+   Gatewayd inspects this capability at backend boot and uses it to decide
+   whether to INJECT the caller block. It does NOT decide pooling: a backend
+   that never advertises is pooled all the same, and simply never receives an
+   identity -- pooled and identity-blind, which is worse than either alone.
+   The "refuse to pool an unadvertised backend" behaviour described in earlier
+   revisions of this docstring was never implemented; ``rewriter.py`` records
+   the same fact next to ``UNPOOLABLE_SERVERS``, which is empty and remains the
+   only mechanism of its kind. A backend that cannot consume the block must be
+   listed there.
 
 3. **Typed context** — tool handlers receive a ``CallerContext`` dataclass
    as an explicit argument. No contextvars, no env reads, no implicit state.
@@ -68,12 +72,14 @@ any future KiroCrew-owned MCP server must go through this module.
 from __future__ import annotations
 
 import os
+import secrets
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from kiro_crew import platform_compat
+from kiro_crew.session_token_sig import session_key_from_env_token
 
 # --- Protocol identifiers ---------------------------------------------------
 
@@ -90,9 +96,36 @@ CALLER_CAPABILITY_KEY = "kirocrew.caller-identity"
 #: NOT bump this version — consumers MUST ignore unknown fields.
 CALLER_SCHEMA_VERSION = 1
 
+#: Namespaced key placed inside ``params._meta`` carrying a per-CONNECTION
+#: nonce, on every forwarded request — including the ones the gateway cannot
+#: attach an identity to.
+#:
+#: This is deliberately NOT part of the caller block, and the distinction is the
+#: whole point: the caller block is an IDENTITY (who is calling, used for
+#: routing callbacks and for authorization), while this is only a SEPARATOR (two
+#: calls carrying different nonces came from different stub connections). A
+#: backend that needs distinct per-tenant state for callers the gateway could
+#: not name must key that state on the nonce; it must never present the nonce as
+#: attribution, and no identity resolver reads it.
+#:
+#: Why a nonce is needed at all: a backend serving an unnamed caller falls back
+#: to a per-PROCESS namespace, which separates sessions exactly as far as the
+#: 1:1 shim topology makes them separate processes. On a POOLED backend one
+#: process serves N connections, so that fallback collapses every unnamed
+#: co-tenant onto one namespace.
+TENANT_META_KEY = "kirocrew.tenant"
+
+#: Schema version of the tenant block. Same additive rule as the caller block.
+TENANT_SCHEMA_VERSION = 1
+
+#: Bytes of entropy in a minted nonce. It is a namespace separator, not a
+#: capability, so this only has to make an accidental collision impossible;
+#: 64 bits does that for any number of connections a gateway will ever hold.
+_TENANT_NONCE_BYTES = 8
+
 #: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
 #: and ancestor pidfile chain are immutable once present, so the walk need run
-#: at most once. It no longer forks ``ps`` per ancestor (``_parent_pid``
+#: at most once. The walk does not fork ``ps`` per ancestor (``_parent_pid``
 #: delegates to ``platform_compat.get_ppid``), but it is still a chain of file
 #: reads or syscalls on a hot path. Only a non-empty result is cached, so a
 #: warm-pool session claimed after the first call can still resolve once its
@@ -153,9 +186,13 @@ class CallerContext:
     #: observed by peer sessions in a pooled topology — ``frozen=True`` on
     #: the dataclass only blocks attribute *reassignment*, not mutation of
     #: mutable field contents.
-    raw: Mapping[str, Any] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
+    raw: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    #: The signed per-session token gatewayd forwards to Kiro Crew's OWN pooled
+    #: control-plane backends (``kirocrew-core`` / ``kirocrew-cron``) so their
+    #: loopback gateway requests can carry ``X-Session-Token``. gatewayd spawns
+    #: a shared backend from its own environment, so the per-session env token
+    #: never reaches it. Never forwarded to a third-party backend.
+    session_token: str = ""
 
     @classmethod
     def from_meta(cls, meta: Any) -> "CallerContext | None":
@@ -186,12 +223,12 @@ class CallerContext:
             channel_id=str(block.get("channelId") or ""),
             from_gateway=True,
             raw=MappingProxyType(dict(block)),
+            session_token=str(block.get("sessionToken") or ""),
         )
 
     @classmethod
     def from_env(cls) -> "CallerContext":
-        """Synthesize a context from the ``KIROCREW_SESSION_KEY`` env var, or
-        the warm-pool PID file if env is absent.
+        """Resolve the single-session environment/PID identity.
 
         Used when the gateway does not inject the extension — i.e., per-session
         deployments, legacy topology, or a gateway that pre-dates this
@@ -199,8 +236,9 @@ class CallerContext:
         handlers can log or sample this to detect topology regressions.
 
         Fallback order:
-          1. ``KIROCREW_SESSION_KEY`` env var (primary, per-session mode)
-          2. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
+          1. The signed per-session token on this process's own element
+          2. Cached identity or ``KIROCREW_SESSION_KEY`` env var
+          3. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
              where kiro-cli is pre-spawned with no key and rekey()+PID file
              provides the mapping once the session is claimed)
 
@@ -209,6 +247,26 @@ class CallerContext:
         or fall through (session-key-agnostic tools).
         """
         global _FROM_ENV_CACHE
+        # Keep the ordinary host identity extension ahead of token and ambient
+        # fallbacks.  This hook is not a Memory V2 capability: the simplified
+        # memory contract never grants database access from PID ancestry.
+        try:
+            from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
+            protected = protected_member_session_for_pid(os.getpid())
+        except Exception:
+            protected = ""
+        if protected is not None:
+            return cls(session_key=protected, session_type="protected-pid", from_gateway=False)
+        # The signed per-session token is a shared execution identity source,
+        # not a member-memory capability. Read it before the process-lifetime
+        # cache so warm-pool rekeys and session-sharing claims remain visible.
+        try:
+            from_token = session_key_from_env_token()
+        except Exception:
+            from_token = ""
+        if from_token:
+            return cls(session_key=from_token, session_type="token", from_gateway=False)
         if _FROM_ENV_CACHE is not None:
             return _FROM_ENV_CACHE
         sk = os.environ.get("KIROCREW_SESSION_KEY", "")
@@ -292,7 +350,7 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
     Returns a dict suitable for placement at ``params._meta`` in the
     JSON-RPC request.
     """
-    return {
+    meta = {
         CALLER_META_KEY: {
             "schemaVersion": CALLER_SCHEMA_VERSION,
             "sessionKey": ctx.session_key,
@@ -301,6 +359,57 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
             "channelId": ctx.channel_id,
         }
     }
+    if ctx.session_token:
+        meta[CALLER_META_KEY]["sessionToken"] = ctx.session_token
+    return meta
+
+
+def new_tenant_nonce() -> str:
+    """Mint a fresh per-connection nonce.
+
+    Minted by the GATEWAY, never derived from anything the stub sends. A stub
+    supplies its own ``stub_uuid`` on the Register frame, so deriving the nonce
+    from that value would let one stub choose to land in another unnamed
+    co-tenant's namespace — re-creating the unnamed-co-tenant collision
+    deliberately instead of by accident.
+    """
+    return secrets.token_hex(_TENANT_NONCE_BYTES)
+
+
+def build_tenant_meta(nonce: str) -> dict[str, Any]:
+    """Build the ``_meta`` block carrying a per-connection *nonce*.
+
+    Separate from :func:`build_caller_meta` so the two can be injected
+    independently: a connection the gateway cannot name has a nonce but NO
+    identity, which is exactly the case that needs the separator.
+    """
+    return {
+        TENANT_META_KEY: {
+            "schemaVersion": TENANT_SCHEMA_VERSION,
+            "nonce": nonce,
+        }
+    }
+
+
+def tenant_nonce_from_meta(meta: Any) -> str:
+    """Parse the per-connection nonce out of ``params._meta``, or ``""``.
+
+    Returns ``""`` for every malformed shape rather than raising: a missing or
+    unparseable nonce must degrade to the backend's own per-process fallback,
+    not fail the call.
+    """
+    if not isinstance(meta, dict):
+        return ""
+    block = meta.get(TENANT_META_KEY)
+    if not isinstance(block, dict):
+        return ""
+    schema_v = block.get("schemaVersion")
+    if not isinstance(schema_v, int) or schema_v < 1:
+        return ""
+    nonce = block.get("nonce")
+    if not isinstance(nonce, str):
+        return ""
+    return nonce
 
 
 # --- Per-call current caller (stdio-loop dispatch state) --------------------
@@ -335,8 +444,10 @@ _CURRENT_CALLER: ContextVar["CallerContext | None"] = ContextVar(
 def set_current_caller(ctx: "CallerContext | None") -> None:
     """Install (or clear, with ``None``) the current call's verified caller.
 
-    ONLY the stdio dispatch loop may call this — tool code must treat the
-    slot as read-only via :func:`current_caller`.
+    Only a trusted dispatch boundary (stdio or an independently verified
+    internal HTTP request) may call this. Tool implementations must treat the
+    slot as read-only via :func:`current_caller`. HTTP dispatch restores the
+    previous context in a finally block inside its request-scoped worker.
     """
     _CURRENT_CALLER.set(ctx)
 
@@ -349,3 +460,35 @@ def current_caller() -> "CallerContext | None":
     resolution paths.
     """
     return _CURRENT_CALLER.get()
+
+
+# Held in its own slot rather than on ``CallerContext`` because the case it
+# exists for is precisely the one where there IS no ``CallerContext``: a
+# connection the gateway could not name. Folding it into the identity object
+# would have forced a context with an empty ``session_key`` into existence, and
+# every ``if caller is not None`` in the tree reads that as "identity known".
+_CURRENT_TENANT_NONCE: ContextVar[str] = ContextVar("kirocrew_current_tenant_nonce", default="")
+
+
+def set_current_tenant_nonce(nonce: str) -> None:
+    """Install (or clear, with ``""``) the current call's per-connection nonce.
+
+    ONLY the stdio dispatch loop may call this, mirroring
+    :func:`set_current_caller`.
+    """
+    _CURRENT_TENANT_NONCE.set(nonce)
+
+
+def current_tenant_nonce() -> str:
+    """The gateway-injected per-connection nonce for the tool call in flight.
+
+    ``""`` when the gateway did not inject one (non-pooled topology, legacy
+    gateway, or a backend that never advertised the caller extension). A backend
+    that keys per-tenant state on this MUST keep working when it is empty — the
+    1:1 topology, where the backend's own pid already separates sessions.
+
+    NOT an identity: it names a connection, not a session, and nothing about it
+    is attributable to a principal. Never write it into an audit record as the
+    caller.
+    """
+    return _CURRENT_TENANT_NONCE.get()

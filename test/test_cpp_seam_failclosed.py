@@ -417,14 +417,24 @@ def test_jailed_commands_cover_agent_bearing_set() -> None:
 # ── R5: _child_argv reuses _resolve_kirocrew_bin incl. the sentinel branch ──
 
 
-def test_child_argv_sentinel_falls_back_to_module(monkeypatch) -> None:
+def test_child_argv_sentinel_falls_back_to_module(
+    monkeypatch, nonbundled_python_without_user_site
+) -> None:
     """When _resolve_kirocrew_bin returns the bare 'kirocrew' sentinel (no usable
     binary), _child_argv falls back to ``python -m kiro_crew`` with sys.argv[1:]."""
     import kiro_crew.agent as agent_mod
 
     monkeypatch.setattr(agent_mod, "_resolve_kirocrew_bin", lambda: "kirocrew")
     monkeypatch.setattr(cli.sys, "argv", ["kirocrew", "chat", "--model", "x"])
-    assert cli._child_argv() == [cli.sys.executable, "-m", "kiro_crew", "chat", "--model", "x"]
+    assert cli._child_argv() == [
+        cli.sys.executable,
+        "-s",
+        "-m",
+        "kiro_crew",
+        "chat",
+        "--model",
+        "x",
+    ]
 
 
 def test_child_argv_resolved_path_used(monkeypatch) -> None:
@@ -947,6 +957,9 @@ def test_dashboard_contributor_sites_use_safe_context_call() -> None:
     fail-closed shims: sync ``safe_context_call`` for sso_login_handler /
     contribute_routes, async ``async_safe_context_call`` for start/stop_services."""
     src = _read_source("kiro_crew.dashboard.server")
+    # The sso_login_handler seam is resolved where its route is registered, which
+    # is the connections slice of the route table rather than server.py itself.
+    src += _read_source("kiro_crew.dashboard.routes.connections")
     for sym in ("sso_login_handler", "contribute_routes", "start_services", "stop_services"):
         assert sym in src, f"production site for {sym} disappeared"
     assert "safe_context_call(" in src

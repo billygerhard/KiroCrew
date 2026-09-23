@@ -13,6 +13,7 @@ const API = '/api/apps/meetings'
 export type MeetingStatus = 'idle' | 'active' | 'paused' | 'reviewing' | 'ended'
 export type WidgetType = 'markdown' | 'html' | 'chat'
 export type TaskPriority = 'high' | 'medium' | 'low'
+export type TranscriptSource = 'speech' | 'typed' | 'system'
 
 /**
  * Full literal catalog keys per enum value, not a suffix interpolated at the call
@@ -51,6 +52,11 @@ export interface Preset {
 export interface CalendarConfig {
   provider: string
   source: string
+  /** Background poll (backend `calendar_poller`): sync on a cadence and pre-create the meeting about to start. */
+  auto_sync?: boolean
+  poll_interval_secs?: number
+  /** Minutes before an event's start its meeting directory is created; 0 turns pre-creation off. */
+  precreate_lead_minutes?: number
 }
 
 export interface MeetingsConfig {
@@ -62,6 +68,46 @@ export interface MeetingsConfig {
   default_preset: string
   poll_interval_active: number
   poll_interval_idle: number
+  /** Target language for live transcript translation; `''` means off (the default). */
+  translation_language: string
+}
+
+/** One translated transcript line. `text` is `''` when the translation failed. */
+export interface TranslationLine {
+  n: number
+  source: string
+  text: string
+  at?: string
+}
+
+export interface TranslationsResponse {
+  language: string
+  /** The language's endonym, resolved server-side. `''` when translation is off. */
+  language_label: string
+  lines: TranslationLine[]
+  /** Cursor to send back as `since` on the next poll. */
+  next_n: number
+  /** Lines waiting on the model, and lines dropped because the backlog was full. */
+  pending: number
+  dropped: number
+}
+
+/**
+ * Metadata about one agent output the user has EDITED — the editable minutes.
+ *
+ * The edited text itself is not here: it is already in `outputs[agentId]`, because
+ * an edit takes precedence server-side. Sending it twice would double the poll for
+ * this app's largest field.
+ */
+export interface OutputEdit {
+  /**
+   * The agent has rewritten its own output since this edit was saved, so there is
+   * newer generated text sitting behind what is on screen.
+   *
+   * The edit still wins — that is the point of the feature — so this is how the user
+   * is TOLD rather than left with a panel that silently stopped updating.
+   */
+  stale: boolean
 }
 
 export interface ProviderRow {
@@ -75,6 +121,8 @@ export interface ConfigResponse {
   task_providers: ProviderRow[]
   calendar_providers: ProviderRow[]
   stt_providers: ProviderRow[]
+  /** Accepted live-translation targets. Labels are endonyms, not translated. */
+  translation_languages: ProviderRow[]
 }
 
 export interface Attachment {
@@ -121,6 +169,15 @@ export interface LiveStatus {
   agents: Record<string, AgentQueueStatus>
   agents_paused: boolean
   expired: boolean
+  /** Whether a dispatch sent now would be fanned out to the agents directly.
+   *  Present on the meeting poll (`GET /meetings/{id}`), whose consumer gates
+   *  the microphone on it; absent from the bare `/status` endpoint. */
+  accepting_dispatches?: boolean
+  /** Whether a dispatch sent now would be HELD until the agents finish
+   *  initializing, rather than refused with a 409. Speech lands either way, so
+   *  the microphone gate is this OR `accepting_dispatches` — see
+   *  `canOpenTranscription`. */
+  buffering_dispatches?: boolean
 }
 
 export interface Task {
@@ -140,6 +197,11 @@ export interface CalendarEvent {
   title: string
   start: string
   end: string
+  /** Whole-day event: `start` is a DATE ANCHOR (the date's midnight UTC), not
+   *  an instant. The UI shows the calendar date with the fields read back in
+   *  UTC and no time — converting the anchor to the browser's zone renders the
+   *  previous day for everyone west of UTC. */
+  all_day: boolean
   location: string
   organizer: string
   attendees: string[]
@@ -151,16 +213,36 @@ export interface DictionaryTerm {
   aliases: string[]
 }
 
+export interface TranscriptSegment {
+  id: string
+  timestamp: string
+  source: TranscriptSource
+  text: string
+}
+
+export interface TranscriptResponse {
+  segments: TranscriptSegment[]
+  next_cursor: number
+}
+
+export interface DispatchResponse {
+  dispatched: number
+  text: string
+  segment: TranscriptSegment
+}
+
 // ── transport ───────────────────────────────────────────────────────────────
 
 /** An error carrying the backend's status so callers can branch on 409/410/502. */
 export class MeetingsApiError extends Error {
   readonly status: number
+  readonly code: string
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code = '') {
     super(message)
     this.name = 'MeetingsApiError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -173,13 +255,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // The backend answers every error as `{"error": "..."}`; fall back to the
     // status text when the body is not JSON (a proxy error page, say).
     let detail = res.statusText
+    let code = ''
     try {
       const body = await res.json()
       if (body?.error) detail = String(body.error)
+      if (body?.code) code = String(body.code)
     } catch {
       /* non-JSON body */
     }
-    throw new MeetingsApiError(detail, res.status)
+    throw new MeetingsApiError(detail, res.status, code)
   }
   if (res.status === 204) return undefined as T
   const text = await res.text()
@@ -217,6 +301,8 @@ export const meetingsApi = {
   meetings: () => request<{ meetings: MeetingSummary[] }>('/meetings'),
   meeting: (id: string) =>
     request<{ meta: MeetingMeta; live: LiveStatus | null }>(`/meetings/${encodeURIComponent(id)}`),
+  deleteMeeting: (id: string) =>
+    request<void>(`/meetings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   init: (id: string, title: string) =>
     post<{ meeting_id: string; meta: MeetingMeta }>(
       `/meetings/${encodeURIComponent(id)}/init`,
@@ -235,8 +321,42 @@ export const meetingsApi = {
   stop: (id: string) =>
     post<{ status: MeetingStatus; meta: MeetingMeta }>(`/meetings/${encodeURIComponent(id)}/stop`),
   outputs: (id: string) =>
-    request<{ outputs: Record<string, string>; tasks: Task[] }>(
+    request<{
+      /** Each agent's EFFECTIVE output: the user's edit when there is one, else the agent's. */
+      outputs: Record<string, string>
+      /** Present only for agents the user has edited. */
+      edits: Record<string, OutputEdit>
+      tasks: Task[]
+    }>(`/meetings/${encodeURIComponent(id)}/outputs`),
+  /**
+   * Save the user's edit of one agent's output.
+   *
+   * Stored as a sidecar, so the agent keeps writing its own file and `revertOutput`
+   * restores the generated text by deleting one file.
+   */
+  saveOutput: (id: string, agentId: string, content: string) =>
+    request<{ ok: boolean; agent_id: string }>(
       `/meetings/${encodeURIComponent(id)}/outputs`,
+      { method: 'PUT', body: JSON.stringify({ agent_id: agentId, content }) },
+    ),
+  /** Discard the user's edit, so the agent's own output is shown again. */
+  revertOutput: (id: string, agentId: string) =>
+    request<{ ok: boolean; agent_id: string }>(
+      `/meetings/${encodeURIComponent(id)}/outputs`,
+      { method: 'DELETE', body: JSON.stringify({ agent_id: agentId }) },
+    ),
+  transcript: (id: string, cursor = 0) =>
+    request<TranscriptResponse>(
+      `/meetings/${encodeURIComponent(id)}/transcript${cursor ? `?cursor=${cursor}` : ''}`,
+    ),
+  /**
+   * Translated lines newer than `since`. Cursor-based rather than full-document:
+   * the panel polls while it is open and a long meeting accumulates hundreds of
+   * lines, so resending all of them each time would grow linearly for no gain.
+   */
+  translations: (id: string, since = 0) =>
+    request<TranslationsResponse>(
+      `/meetings/${encodeURIComponent(id)}/translations?since=${encodeURIComponent(String(since))}`,
     ),
   attachments: (id: string, body: { action: 'add' | 'remove'; attachments?: Attachment[]; index?: number }) =>
     post<{ attachments: Attachment[] }>(`/meetings/${encodeURIComponent(id)}/attachments`, body),
@@ -253,7 +373,7 @@ export const meetingsApi = {
       muted,
     }),
   dispatch: (id: string, text: string, chat = false) =>
-    post<{ dispatched: number; text: string }>(`/meetings/${encodeURIComponent(id)}/dispatch`, {
+    post<DispatchResponse>(`/meetings/${encodeURIComponent(id)}/dispatch`, {
       text,
       chat,
     }),

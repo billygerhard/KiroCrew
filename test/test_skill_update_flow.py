@@ -368,7 +368,7 @@ def test_process_no_candidate_emits_skipped_audit(monkeypatch):
     """When the model returns no new_skill, emit a 'skipped' audit event.
 
     Regression test for the observability gap: an eligible session that ran the
-    skill-gen prompt but got no candidate previously left NO SEL event, making
+    skill-gen prompt but got no candidate would leave NO SEL event, making
     'asked, model declined' indistinguishable from 'never asked' in the audit
     log. The else-branch in _process_auto_skills now records it.
     """
@@ -798,6 +798,35 @@ def test_frontmatter_value_reads_fields_and_tolerates_missing():
     assert H._frontmatter_value(body, "nope") == ""
     assert H._frontmatter_value("no frontmatter here", "description") == ""
     assert H._frontmatter_value(None, "description") == ""
+
+
+def test_frontmatter_value_resolves_block_scalars():
+    # A live skill authored with block-scalar frontmatter must round-trip
+    # through the update path: the staged candidate overwrites the live skill
+    # on approval, so reading the indicator verbatim would collapse the
+    # description to ">" (resolved to "" by the loader) and inject a bogus
+    # ">" entry into the merged trigger list.
+    body = (
+        "---\n"
+        "name: auto/x\n"
+        "description: >\n"
+        "  Retry a deploy\n"
+        "  after checking the logs.\n"
+        "triggers: |-\n"
+        "  a, b\n"
+        "---\n\n## Steps\n"
+    )
+    assert (
+        H._frontmatter_value(body, "description") == "Retry a deploy after checking the logs.\n"
+    )
+    # `triggers` uses `|-`, whose strip chomping drops the trailing break, so it is
+    # unaffected by the strip chomping -- the pair keeps the two modes visibly distinct here.
+    assert H._frontmatter_value(body, "triggers") == "a, b"
+    # An empty block resolves to "" rather than the indicator character.
+    assert H._frontmatter_value("---\ndescription: >\nname: x\n---\nbody", "description") == ""
+    # An indented occurrence of the key is prose inside a block, not a field.
+    nested = "---\ndescription: >\n  triggers: not real\ntriggers: real\n---\nbody"
+    assert H._frontmatter_value(nested, "triggers") == "real"
 
 
 @pytest.mark.asyncio

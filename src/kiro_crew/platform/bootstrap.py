@@ -25,24 +25,33 @@ from kiro_crew.platform.context import (
 from kiro_crew.platform.defaults import (
     DefaultAgentCatalogProvider,
     DefaultAgentExecutableResolver,
+    DefaultAgentIdentityProvider,
     DefaultAgentRuntime,
     DefaultAppRegistryPolicy,
     DefaultAppsLoader,
     DefaultCapabilityManager,
     DefaultCredentialPolicy,
     DefaultDashboardContributor,
+    DefaultDeniedRuleProvider,
     DefaultEmbeddingSource,
+    DefaultExternalAccessPolicy,
+    DefaultGatewayLifecycleProvider,
     DefaultIdentityProvider,
+    DefaultImportSourceProvider,
     DefaultJailProvider,
     DefaultKnowledgeProvider,
     DefaultMcpToolingProvider,
+    DefaultMobileConnectProvider,
     DefaultPackageManager,
     DefaultPromptSourceProvider,
     DefaultProviderRegistry,
     DefaultPublishRegistry,
+    DefaultRemoteProvisionerProvider,
     DefaultSandboxPolicy,
+    DefaultSkillDiscoveryProvider,
     DefaultSlackEnterpriseGate,
     DefaultTelemetryProvider,
+    DefaultTipsProvider,
     DefaultTunnelProvider,
 )
 from kiro_crew.platform.discovery import discover_companion_context, plugin_entry_points
@@ -126,16 +135,23 @@ def build_default_context(
         publish=DefaultPublishRegistry(),
         agent_runtime=DefaultAgentRuntime(),
         agent_executable=DefaultAgentExecutableResolver(),
+        gateway_lifecycle=DefaultGatewayLifecycleProvider(),
         sandbox=DefaultSandboxPolicy(),
         credentials=DefaultCredentialPolicy(),
         security=PolicyAuthority(),  # _NullOverlay → baseline only
         slack_gate=DefaultSlackEnterpriseGate(),
         identity=DefaultIdentityProvider(),
+        agent_identity=DefaultAgentIdentityProvider(),
         embeddings=DefaultEmbeddingSource(),
         mcp_tooling=DefaultMcpToolingProvider(),
         agent_catalog=DefaultAgentCatalogProvider(),
         prompt_sources=DefaultPromptSourceProvider(),
+        skill_discovery=DefaultSkillDiscoveryProvider(),
+        tips=DefaultTipsProvider(),
+        denied_rules=DefaultDeniedRuleProvider(),
+        import_sources=DefaultImportSourceProvider(),
         capability_manager=DefaultCapabilityManager(),
+        external_access=DefaultExternalAccessPolicy(),
         registry=DefaultAppRegistryPolicy(),
         apps_loader=DefaultAppsLoader(),
         package_manager=DefaultPackageManager(),
@@ -144,6 +160,8 @@ def build_default_context(
         telemetry=DefaultTelemetryProvider(),
         dashboard=DefaultDashboardContributor(),
         jail=DefaultJailProvider(),
+        mobile_connect=DefaultMobileConnectProvider(),
+        remote_provisioners=DefaultRemoteProvisionerProvider(),
         feature_apps=(),
         governance=governance,
     )
@@ -212,17 +230,52 @@ def bootstrap_context(cfg: "KiroCrewConfig") -> PlatformContext:
 
     set_context(ctx)
 
-    # Register any edition-contributed ACP backends now that the context is
-    # installed.  The Default ProviderRegistry.register_acp_backends() is a
-    # no-op (standalone ships Kiro-CLI-ACP only), so this is a no-op for the
-    # public edition; the Amazon companion re-registers a Claude backend through
-    # the dormant ACP_BACKEND_CLAUDE seam here.  Best-effort — a
-    # backend-registration failure must not abort boot (the provider factory
-    # still resolves).
+    # Register ACP backends through the ProviderRegistry seam now that the context
+    # is installed. In the public edition this is where the OPERATOR-authored
+    # backends (``harnesses.json``) are loaded and registered; an edition overrides
+    # the seam to add a harness the core does not ship. ONE call for both, so the
+    # Kiro construction path carries no registration conditional (harness-parity
+    # H13). It must run BEFORE anything resolves ``agent.acp_backend`` -- D4's
+    # constraint: ``resolve_selected_backend`` reads the selectable registry live
+    # (below, in the governance narrowing, and in every later
+    # ``KiroCrewConfig.load()``), so a persisted value naming an operator harness
+    # must be registered first or it silently degrades to kiro. It runs after
+    # ``set_context`` -- the descriptor loader resolves ``harnesses.json`` under
+    # the crew home, which does not reach the platform context (H3 is about the
+    # CONFIG load path; this is a separate file read at boot, not inside
+    # ``KiroCrewConfig.load``). Best-effort: a backend-registration failure must
+    # not abort boot -- the builtin harnesses keep serving, which is a startable
+    # deployment, and the provider factory still resolves.
     try:
         ctx.providers.register_acp_backends()
     except Exception:
         logger.warning("register_acp_backends failed; continuing", exc_info=True)
+
+    # Apply the ``agent_backend`` governance scope by narrowing that same registry —
+    # HERE, and only here, because this is the one point where both halves are true:
+    # the context is installed (so resolving the ceiling cannot re-enter the config
+    # load, harness-parity H3) and every edition has finished widening (so nothing
+    # registered later escapes the policy). Narrowing the registry rather than
+    # checking downstream is what keeps selectability at ONE gate (H4) and leaves the
+    # Kiro construction path free of an adapter-driven conditional (H13).
+    #
+    # Best-effort like the registration above: a policy that cannot be evaluated
+    # denies the harness it was evaluating and leaves the floor, which is a startable
+    # deployment — aborting boot would not be.
+    try:
+        from kiro_crew.agent_backend_governance import narrow_selectable_backends
+
+        if narrow_selectable_backends():
+            # The cfg passed into this function was normalized BEFORE the narrowing,
+            # so a value the policy just removed is still on this instance while
+            # every later ``KiroCrewConfig.load()`` (which re-reads from disk) sees
+            # the narrowed answer. Re-run the SAME single gate on that one field
+            # rather than adding a second one anywhere.
+            from kiro_crew.acp_backends import resolve_selected_backend
+
+            cfg.agent.acp_backend = resolve_selected_backend(cfg.agent.acp_backend)
+    except Exception:
+        logger.warning("agent_backend policy narrowing failed; continuing", exc_info=True)
 
     # Register any edition-contributed artifact-publish providers now that the
     # context is installed.  The Default PublishRegistry.register_publish_providers()

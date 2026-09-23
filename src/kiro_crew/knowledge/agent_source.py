@@ -30,11 +30,12 @@ import os
 import tempfile
 from datetime import datetime
 
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
-from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
-from .store import KnowledgeStore
+from .ingestion import DUPLICATE_JOB_STATUS, ImportChunkBudgetError, IngestionPipeline
+from .store import AUTO_ADDED_PROP, KnowledgeStore
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ _MAX_URI_LEN = 1024
 #: is only correct while nothing else writes that source concurrently -- two
 #: parallel adds would steal each other's chunks. The artifact path relies on the
 #: same invariant, enforced by its own lock.
-_ADD_LOCK = asyncio.Lock()
+_ADD_LOCK = LoopBoundLock()
 
 
 def _redact_for_ingest(text: str) -> str:
@@ -120,7 +121,7 @@ def ensure_agent_source(store: KnowledgeStore) -> tuple[str, bool]:
             name=AGENT_SOURCE_NAME,
             source_type=AGENT_SOURCE_TYPE,
             uri=AGENT_SOURCE_URI,
-            properties={"sync_status": "active", "auto_added": True},
+            properties={"sync_status": "active", AUTO_ADDED_PROP: True},
         )
         return source_id, True
     except Exception:
@@ -147,23 +148,71 @@ def get_state(store: KnowledgeStore, source_id: str, slug: str) -> tuple[str | N
     return row["content_hash"], ids
 
 
+def _record_deduped_state(store: KnowledgeStore, source_id: str, slug: str,
+                          content_hash: str, name: str,
+                          *, source_uri: str) -> None:
+    """Terminal write for a document the pre-ingest gate refused.
+
+    Invoked BY the gate as its ``on_duplicate`` finalizer, from inside the gate's
+    own ``BEGIN IMMEDIATE`` and on its worker thread, so it takes no lock and no
+    transaction of its own. The delete of the previous group, the location claim on
+    the holder's items, the terminal job row and this record are one atomic unit.
+
+    That matters most for a FIRST-TIME document: after the gate's commit this row may
+    not exist yet, and a ``delete_source_cascade`` landing in that gap reassigns the
+    surviving item here with no row to adopt it into, so the record that follows
+    reports an empty group while the source owns the item.
+
+    The group is still DERIVED, for the cascade that committed before this
+    transaction took the lock. A row that ends up owning items must be ``active``,
+    not ``deduped``: ``find_document_by_hash`` only matches ``active``, and a row
+    that owns the content while reporting ``deduped`` would let identical text in
+    again under a second slug.
+    """
+    adopted = store.surviving_group_in_txn("agent_item_state", source_id, slug)
+    _write_state_row(store, source_id, slug, content_hash, adopted, name,
+                     status="active" if adopted else "deduped",
+                     source_uri=source_uri)
+
+
 def set_state(store: KnowledgeStore, source_id: str, slug: str, content_hash: str,
-              item_ids: list[str], name: str, status: str = "active") -> None:
+              item_ids: list[str], name: str, status: str = "active",
+              *, source_uri: str) -> None:
     """Record one document's hash, item group, display name and status.
 
     ``status`` is written explicitly on every call: the statement is an
     ``INSERT OR REPLACE``, so omitting it would silently reset a ``deduped``
     marker back to the column default and the document would be re-ingested and
-    re-collapsed on every pass.
+    re-collapsed on every pass. ``source_uri`` (the redacted locator) rides the
+    same rule, and is required so no caller can erase it by accident.
+    """
+    _write_state_row(store, source_id, slug, content_hash, item_ids, name,
+                     status=status, source_uri=source_uri)
+    store.db.commit()
+
+
+def _write_state_row(store: KnowledgeStore, source_id: str, slug: str,
+                     content_hash: str, item_ids: list[str], name: str,
+                     status: str = "active", *, source_uri: str) -> None:
+    """The row write alone, with no transaction control, so a caller already
+    holding one can include it.
+
+    ``source_uri`` is the document's REDACTED locator (see
+    ``add_agent_document``); it is stored so a search hit can cite the document
+    itself rather than the aggregate's ``agent://``. It is required and
+    keyword-only for the same reason ``status`` is written explicitly on every
+    call: the statement is an ``INSERT OR REPLACE``, so a caller allowed to
+    omit it would silently erase the locator a previous add recorded. A caller
+    with genuinely no locator states ``source_uri=""``, stored as NULL.
     """
     store.db.execute(
         "INSERT OR REPLACE INTO agent_item_state "
-        "(source_id, slug, content_hash, item_ids, updated_at, name, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(source_id, slug, content_hash, item_ids, updated_at, name, status, "
+        "source_uri) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (source_id, slug, content_hash, json.dumps(item_ids),
-         datetime.now().isoformat(), name, status),
+         datetime.now().isoformat(), name, status, source_uri or None),
     )
-    store.db.commit()
 
 
 def find_document_by_hash(store: KnowledgeStore, source_id: str, content_hash: str,
@@ -197,7 +246,7 @@ def remove_document(store: KnowledgeStore, source_id: str, slug: str) -> int:
         # A document that LOST a dedup owns nothing but still holds the winner's
         # items. Removing it has to release that claim, exactly as the artifact
         # path does, or a later winner deletion resurfaces content this aggregate
-        # no longer has.
+        # does not have.
         store.detach_source_location_by_hash(source_id, prev_hash or "")
     store.db.execute(
         "DELETE FROM agent_item_state WHERE source_id = ? AND slug = ?",
@@ -225,7 +274,9 @@ async def add_agent_document(
     ``source_uri`` is where the document came from -- a path, URL or any stable
     handle -- and is a stored identity label: redacted, capped, hashed into the
     document's key (see ``document_slug``), and never opened, resolved, stat-ed or
-    fetched. Keep it that way; a caller that needs the bytes at that location reads
+    fetched. The redacted form is persisted on the document's state row so search
+    hits cite the document's own locator rather than the aggregate ``agent://``.
+    Keep it that way; a caller that needs the bytes at that location reads
     them itself and passes ``content``.
 
     It is REQUIRED, because the title alone does not identify a document.
@@ -259,7 +310,10 @@ async def _add_agent_document(
     if not text.strip():
         return {"status": "error", "error": "content is required"}
 
-    source_id, _created = ensure_agent_source(store)
+    # Off the loop: the get-or-create takes the guarded knowledge connection,
+    # and a contended take here busy-waits every task for the whole busy
+    # timeout (the watchdog heartbeat included).
+    source_id, _created = await asyncio.to_thread(ensure_agent_source, store)
 
     text = _redact_for_ingest(text)
     title = _redact_for_ingest(title)
@@ -278,7 +332,8 @@ async def _add_agent_document(
                          "overwrite each other"}
     source_uri = _redact_for_ingest(raw_uri)
     slug = document_slug(raw_uri)
-    prev_hash, old_item_ids = get_state(store, source_id, slug)
+    # Off the loop: the state read takes the guarded connection.
+    prev_hash, old_item_ids = await asyncio.to_thread(get_state, store, source_id, slug)
     content_hash = hashlib.sha256(text.encode()).hexdigest()
     # The shortcut needs a LIVE item group, not just a matching hash. A row left
     # by a refused write records the hash with an empty group, so hash alone would
@@ -287,6 +342,20 @@ async def _add_agent_document(
     # leaving the document permanently unsearchable. An empty group therefore
     # falls through and re-attempts the write.
     if prev_hash == content_hash and old_item_ids:
+        # The shortcut writes no state row, and an unchanged document takes it
+        # on EVERY re-add -- so it must repair the one thing a legacy row can
+        # lack: a NULL locator from before the column existed. Without this,
+        # "re-add to backfill" never works for a document whose content did not
+        # change, and its citations say ``agent://`` forever.
+        def _backfill_uri() -> None:
+            cur = store.db.execute(
+                "UPDATE agent_item_state SET source_uri = ? "
+                "WHERE source_id = ? AND slug = ? "
+                "AND (source_uri IS NULL OR source_uri = '')",
+                (source_uri, source_id, slug))
+            if cur.rowcount:
+                store.db.commit()
+        await asyncio.to_thread(_backfill_uri)
         return {"status": "duplicate", "reason": "unchanged since last add",
                 "slug": slug, "source_id": source_id}
 
@@ -294,7 +363,7 @@ async def _add_agent_document(
     # row behind and deleting the holder later lets this document be added
     # normally. A ``deduped`` marker here would outlive the holder and suppress
     # every future add, losing the content while its origin still exists.
-    twin = find_document_by_hash(store, source_id, content_hash, slug)
+    twin = await asyncio.to_thread(find_document_by_hash, store, source_id, content_hash, slug)
     if twin:
         return {"status": "duplicate",
                 "reason": f"identical content is already stored as {twin[1]!r}",
@@ -302,10 +371,23 @@ async def _add_agent_document(
 
     # Same rule as the folder and artifact paths: a row that owned nothing holds a
     # claim for its previous content, and this document's text has changed.
-    store.release_stale_claim(source_id, prev_hash, content_hash, old_item_ids)
+    # Off the loop: it takes the write lock through the guarded connection.
+    await asyncio.to_thread(
+        store.release_stale_claim, source_id, prev_hash, content_hash, old_item_ids)
 
-    before_ids = {r["id"] for r in store.db.execute(
-        "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
+    # Ownership is recorded from inside the ingest's finalize hop rather than
+    # after it returns. The items become durable during the ingest, and every
+    # await between that and a later write here -- the temp-file cleanup, the
+    # job-status read -- is a cancellation point that would leave them owned by
+    # nobody. Nothing then names the group: `get_state` reports no previous
+    # items, so the next add of this document neither replaces them nor is
+    # refused by `find_document_by_hash`, and the content is stored twice.
+    recorded_ids: list[str] = []
+
+    def _record_ownership(new_ids: list[str]) -> None:
+        recorded_ids[:] = new_ids
+        set_state(store, source_id, slug, content_hash, new_ids, title,
+                  source_uri=source_uri)
 
     tmp_path: str | None = None
     try:
@@ -325,7 +407,23 @@ async def _add_agent_document(
             original_name=f"{title}{_DEFAULT_EXT}",
             source_id=source_id,
             old_item_ids=old_item_ids,
+            on_committed=_record_ownership,
+            # The duplicate-branch sibling of on_committed, and inside the gate's
+            # hop for the same reason: the gate has already committed the delete
+            # and the location claim by the time it reports back.
+            on_duplicate=lambda _text_hash: _record_deduped_state(
+                store, source_id, slug, content_hash, title,
+                source_uri=source_uri),
         )
+    except ImportChunkBudgetError as exc:
+        # The cross-file import budget refused this add. Surface WHY to the agent
+        # -- the exception's message is the reasoned, ASCII, budget/window/spent
+        # text built for exactly this, and the whole point of refusing rather than
+        # silently truncating is that the caller can report it. Nothing was
+        # written, so no state to record; the agent can retry after the window
+        # rolls over or the operator can raise knowledge.import_chunk_budget.
+        return {"status": "deferred", "reason": str(exc),
+                "slug": slug, "source_id": source_id}
     finally:
         if tmp_path:
             try:
@@ -333,15 +431,17 @@ async def _add_agent_document(
             except OSError:
                 pass
 
-    job = pipeline.get_job_status(job_id) if job_id else None
+    # Off the loop: the status read takes the guarded connection. A bare
+    # to_thread suffices -- unlike the artifact path there is no fallback
+    # ownership write paired with this read (ownership is persisted inside the
+    # ingest's own finalize hop via _record_ownership, and a hop failure
+    # propagates rather than being swallowed), so a cancellation that drops
+    # the read strands nothing.
+    job = (await asyncio.to_thread(pipeline.get_job_status, job_id)) if job_id else None
     status = (job or {}).get("status")
     if status == DUPLICATE_JOB_STATUS:
-        # The gate refused the write and deleted this document's previous items,
-        # so record that rather than leaving the state row pointing at items that
-        # no longer exist -- otherwise every later add would re-attempt from a
-        # dead group. The hash IS stored, so re-adding the same text is a cheap
-        # no-op instead of a repeated gate round-trip.
-        set_state(store, source_id, slug, content_hash, [], title, status="deduped")
+        # The gate refused the write and recorded the terminal state through the
+        # ``on_duplicate`` finalizer above, so there is nothing left to write here.
         return {"status": "duplicate",
                 "reason": "this content is already in the knowledge library",
                 "slug": slug, "source_id": source_id}
@@ -349,10 +449,7 @@ async def _add_agent_document(
         return {"status": "error",
                 "error": f"ingestion did not complete (status={status})"}
 
-    after_ids = {r["id"] for r in store.db.execute(
-        "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
-    new_ids = list(after_ids - before_ids)
-    set_state(store, source_id, slug, content_hash, new_ids, title)
+    new_ids = list(recorded_ids)
     sel().log_tool_invocation(
         session_key="gateway", agent="knowledge-agent-source",
         tool_name="knowledge.agent_document.add", outcome="completed",

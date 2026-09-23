@@ -36,6 +36,7 @@ import type { ReactElement } from 'react'
 import { selectUnreadByMode, slotSurfaceKey } from '../store/dashboardSlice'
 import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
+import { readPreviewFlag } from '../utils/previewFlags'
 
 import { i18nT } from '../i18n/t'
 export type SurfaceGroup = 'Main' | 'Apps' | 'Platform' | 'Bottom'
@@ -137,6 +138,43 @@ export interface Surface {
    * bell). The route stays registered in `App.tsx`'s `<Routes>`.
    */
   hiddenFromNav?: boolean
+  /**
+   * Gate this surface behind a preview flag (a key from
+   * `utils/previewFlags.ts`). While the flag is off, the surface is not
+   * advertised anywhere in the UI — no rail row, no Search Everywhere result,
+   * and no contribution to the browser-tab attention count
+   * (`selectAllSurfacesAttention` skips it) — so an unpolished page can sit on
+   * `main` without being released.
+   *
+   * Unlike `hiddenFromNav` (a permanent "rendered elsewhere" marker, which DOES
+   * still contribute to the attention count because it is advertised, just not
+   * on the rail), this is temporary and conditional: the surface stays in
+   * `getBuiltinSurfaces()` so its label/badge wiring is still covered by tests,
+   * and consumers read `getAdvertisedSurfaces()` instead. Its route stays
+   * registered in `App.tsx`, which is what makes the surface reachable once the
+   * flag is on.
+   */
+  previewFlag?: string
+  /**
+   * Mark this surface as a PROMOTABLE SUB-ITEM: a destination that normally
+   * lives inside another surface's secondary panel (Agent Capabilities'
+   * Steering files, Skills, Hooks), which the user may promote onto the rail.
+   *
+   * It is registered exactly like any other surface — so it stays in
+   * `getBuiltinSurfaces()` and every registry-wide invariant, `labelKey`
+   * coverage included, keeps covering it — but it occupies a rail row only
+   * while its navId is in the user's pinned set (`lib/navPinned.ts`). That
+   * read is per render and comes from localStorage, so it cannot be expressed
+   * here: `App.tsx` applies it in the ONE derivation that feeds every rail
+   * list, for the same reason `previewFlag` is filtered there.
+   *
+   * Unlike `hiddenFromNav` (a permanent "rendered elsewhere" marker) this is
+   * conditional and user-controlled, and unlike `previewFlag` the surface is
+   * fully released — an unpinned sub-item is still advertised everywhere a
+   * destination can be found, because it IS reachable inside its host panel.
+   * Only the rail row is opt-in.
+   */
+  pinnable?: boolean
 }
 
 const _builtins: Surface[] = []
@@ -183,6 +221,54 @@ export function getBuiltinSurfaces(): readonly Surface[] {
 /** Look up a built-in surface by navId. Returns `undefined` for app-only ids. */
 export function getBuiltinSurface(navId: string): Surface | undefined {
   return _builtins.find(s => s.navId === navId)
+}
+
+/**
+ * Whether a surface may be advertised in the UI right now.
+ *
+ * A surface with no `previewFlag` is always advertised; a preview-gated one only
+ * while its flag is on. Prefer `getAdvertisedSurfaces()` at a call site that
+ * renders a LIST — it applies this predicate for you, so a consumer cannot
+ * forget. Use this predicate directly only for a single surface.
+ *
+ * Deliberately NOT folded into `getBuiltinSurfaces()`: that list is also the
+ * source for registry-wide invariants (every surface carries a translatable
+ * `labelKey`), and dropping preview surfaces from it would silently retire that
+ * coverage for exactly the surfaces still under construction. It is also read on
+ * every render, so it stays a cheap synchronous storage read with no allocation.
+ */
+export function surfacePreviewEnabled(s: { previewFlag?: string }): boolean {
+  return !s.previewFlag || readPreviewFlag(s.previewFlag)
+}
+
+/**
+ * The surfaces a consumer may ADVERTISE right now — the rail, the command
+ * palette, or anything else that shows a user where they can go.
+ *
+ * Prefer this over `getBuiltinSurfaces().filter(...)` at a call site. The
+ * distinction between the two lists is the whole point: `getBuiltinSurfaces()`
+ * answers "what is registered" (and so backs registry-wide invariants like
+ * every surface carrying a translatable `labelKey`, which must keep covering
+ * surfaces still under construction), while this answers "what may a user see".
+ * A call site that reaches for the former and forgets the filter leaks an
+ * unreleased surface silently, so the safe list is the one with a name.
+ */
+export function getAdvertisedSurfaces(): readonly Surface[] {
+  return getBuiltinSurfaces().filter(surfacePreviewEnabled)
+}
+
+/**
+ * The promotable sub-items a user may pin to the rail — advertised surfaces
+ * carrying `pinnable`.
+ *
+ * Named rather than left as an inline `.filter(s => s.pinnable)` at each call
+ * site for the reason `getAdvertisedSurfaces()` gives just above: a call site
+ * that reaches for the unfiltered list and forgets the predicate renders a row
+ * the user never asked for, and the failure is silent. Preview gating is
+ * applied first, so a sub-item of an unreleased surface is not offered.
+ */
+export function getPinnableSurfaces(): readonly Surface[] {
+  return getAdvertisedSurfaces().filter(s => s.pinnable)
 }
 
 /**
@@ -294,11 +380,25 @@ export function selectSurfaceActivityCount(navId: string): (state: RootState) =>
  * selectors directly (no `.find()` per call) so it's O(surfaces) on each
  * Redux state change rather than O(surfaces²); the per-surface inner
  * selectors are themselves memoized via `selectUnreadByMode`.
+ *
+ * A preview-gated surface is skipped while its flag is off, which is a
+ * user-visible correctness point rather than tidiness: the tab title is an
+ * ADVERTISEMENT too. A gated surface has no rail row and no Search Everywhere
+ * entry, so a count it contributes shows the user a `(1)` they cannot trace to
+ * anything or clear — and slots for a hidden surface really do exist, since
+ * gating removes the ingress and deliberately leaves earlier work running.
+ * `hiddenFromNav` is the deliberate opposite: it still contributes, because it
+ * IS advertised, just somewhere other than the rail (the topbar bell).
+ *
+ * The cost is one synchronous `localStorage` read per gated surface per
+ * dispatch, the same read `getAdvertisedSurfaces()` already performs on every
+ * render, and it is paid only by surfaces that carry a flag at all.
  */
 export function selectAllSurfacesAttention(state: RootState): number {
   let total = 0
   for (const s of _builtins) {
     if (s.appOnly && !state.dashboard.enabledAppIds.includes(s.navId)) continue
+    if (!surfacePreviewEnabled(s)) continue
     if (s.unreadSelector) total += s.unreadSelector(state)
     else if (s.slotMode !== undefined) total += selectUnreadByMode(s.slotMode)(state)
   }

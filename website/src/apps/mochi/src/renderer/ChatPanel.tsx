@@ -34,10 +34,16 @@ import {
 import Clickable from '../../../../components/Clickable'
 import { familyGrantIsDistinct, trustBasePattern, truncateCommandLabel } from '../shared/trustPatterns'
 import Markdown from 'react-markdown'
+import type { Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
-import { rehypeSanitize } from '../../../../components/MarkdownRenderer'
-import type { ApprovalRequest, ChatMessage } from '../shared/types'
+import { rehypeSanitize, rehypeStableRootKeys, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
+import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../../../../utils/markdownDepthBound'
+import { mdImageDestToPath } from '../../../../utils/fileTokens'
+import { copyToClipboard } from '../../../../utils/clipboard'
+import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
+import { useImeGuard } from '../../../../hooks/useImeGuard'
+import type { ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { PINNED_PANEL_WIDTH } from '../shared/constants'
 import { formatShortcut } from '../shared/shortcut'
@@ -54,7 +60,9 @@ import { PendingAttachments } from '../../panel/PendingAttachments'
 import { MochiCodeBlock } from '../../panel/MochiCodeBlock'
 import { reportStat } from '../../panel/panelBridge'
 import { i18nT } from '../../../../i18n/t'
+import { useLanguageGeneration } from '../../../../i18n/useLanguageGeneration'
 import { i18next } from '../../../../i18n'
+import { electronPlatform, isElectron } from '../../../../lib/electron'
 import { moodLabel, stateLabel } from '../../i18nKeys'
 
 /**
@@ -214,7 +222,9 @@ const PinnedChip: React.FC<{
 
   const handleClick = () => {
     api?.markPinnedSeen?.(pin.path)
-    api?.previewFile?.(pin.path)
+    // Preview is a shell-bridge capability; in a browser tab the click can
+    // only mark the pin seen, not open the OS previewer.
+    if (isElectron) api?.previewFile?.(pin.path)
     onMarkSeen?.(pin.path)
   }
 
@@ -223,27 +233,31 @@ const PinnedChip: React.FC<{
     api?.unpinFile?.(pin.path)
   }
 
-  return (
-    <Clickable
-      onClick={handleClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      title={pin.path}
-      style={{
-        display: 'flex',
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 6,
-        padding: '5px 8px',
-        borderRadius: 8,
-        cursor: 'pointer',
-        background: hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
-        transition: 'background 0.15s ease',
-        position: 'relative',
-        opacity: isDeleted ? 0.35 : 1,
-        flexShrink: 0,
-      }}
-    >
+  // The row is a click target only while the click has a visible payoff:
+  // opening the OS previewer (shell only), or clearing an unseen-update dot
+  // (HTTP-backed, works everywhere). Otherwise it renders inert — same
+  // treatment as the inline file chip — so a browser tab never shows a
+  // live-looking control that silently does nothing. Hover still reveals the
+  // unpin button, which is its own control and works everywhere.
+  const clickable = isElectron || (isUpdated && !isDeleted)
+
+  const chipStyle: React.CSSProperties = {
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    padding: '5px 8px',
+    borderRadius: 8,
+    cursor: clickable ? 'pointer' : 'default',
+    background: clickable && hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
+    transition: 'background 0.15s ease',
+    position: 'relative',
+    opacity: isDeleted ? 0.35 : 1,
+    flexShrink: 0,
+  }
+
+  const body = (
+    <>
       {/* Colored file icon */}
       <File size={14} color={isDeleted ? 'var(--text-muted)' : extColor} style={{ flexShrink: 0 }} />
 
@@ -302,6 +316,36 @@ const PinnedChip: React.FC<{
           <X size={12} />
         </button>
       )}
+    </>
+  )
+
+  if (!clickable) {
+    return (
+      // Hover intent only: the two listeners reveal the chip's own unpin button and
+      // nothing else. This branch is the chip that has no path to open, so the
+      // wrapper carries no action a keyboard could reach — the reachable control is
+      // the <button> inside `body`.
+      // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- passive hover reveal, not an interaction; the only action lives on the nested <button>
+      <div
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        title={pin.path}
+        style={chipStyle}
+      >
+        {body}
+      </div>
+    )
+  }
+
+  return (
+    <Clickable
+      onClick={handleClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      title={pin.path}
+      style={chipStyle}
+    >
+      {body}
     </Clickable>
   )
 }
@@ -314,6 +358,18 @@ interface ChatPanelProps {
   onTogglePinned?: () => void
   pinnedPanelVisible?: boolean
   pinnedFileCount?: number
+}
+
+/**
+ * The two fields of a `slots:update` entry this panel reads.
+ *
+ * Named locally rather than pulled from the bridge, which publishes the frame as
+ * `unknown[]`: the panel cares only about finding the mochi slot and whether it is
+ * running, and a wider claim would assert fields nothing here checks.
+ */
+interface SlotFrame {
+  key?: string
+  running?: boolean
 }
 
 export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelVisible, onTogglePinned, pinnedPanelVisible, pinnedFileCount }) => {
@@ -349,6 +405,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     } else if (ssDisplay) {
       setSsAnim('ssOut')
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- drives the thumbnail animation off a `screenshot` transition only; `ssDisplay` is this effect's OWN output, read as the latest value at fire time purely to ask "is there still a thumbnail to animate out". Depending on it would re-run the effect on its own write and replay 'ssIn' over a running animation.
   }, [screenshot])
 
   const onSsAnimEnd = () => {
@@ -388,8 +445,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     setGatewayStarting(false)
     setGatewayMsg('')
   }, [isOnline])
-  // Only the setter is used upstream; the array itself is never read.
-  const [, setPendingApprovals] = useState<ApprovalRequest[]>([])
+  // Only the setter is used upstream; the array itself is never read. It holds
+  // nothing but the request id because that is all the three predicates below it
+  // (dedup on arrival, clear on resolve) ever touch — the frames come off the
+  // bridge as untyped records with the bridge's own shape (`tool`, `toolInput`,
+  // ...), not an `ApprovalRequest`, so typing it as one would be a claim the
+  // value contradicts.
+  const [, setPendingApprovals] = useState<{ id: string }[]>([])
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
@@ -478,6 +540,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   }, []) // mount once — uses refs for latest state
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  // Enter sends here, so the guard has to own the key: it also covers WebKit, where
+  // the keydown committing an IME candidate reports the native flag as false.
+  const ime = useImeGuard()
 
   // Height of the bottom stack (banners + attachments + composer), measured
 
@@ -554,11 +619,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
 
   // Theme
   useEffect(() => {
-    api?.getMochiConfig?.().then((c: any) => {
+    api?.getMochiConfig?.().then((c) => {
       setPetName(resolvePetName(c))
-      applyTheme((c?.theme as ThemeId) || 'mocha')
+      // `theme` is not part of PetConfig — the pet bridge types only the appearance
+      // fields it reacts to — so it is read through a narrow view of the same
+      // settings object rather than by widening that type.
+      applyTheme((c as { theme?: string } | undefined)?.theme || 'mocha')
     })
-    api?.getConfig?.().then((c: any) => {
+    api?.getConfig?.().then((c) => {
       // Upstream read agentBackend.mode here to show a "connecting" banner while
       // it started a REMOTE gateway. The builtin is same-origin — the gateway is
       // already up if this page loaded at all.
@@ -581,11 +649,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     const off = api?.onStateChange?.((s: string) => setPetState(s))
     const offMood = api?.onMood?.((mood: string) => setPetMood(mood === 'neutral' ? '' : mood))
     const offPeek = api?.onPeeking?.((v: boolean) => setIsPeeking(v))
-    const offConfig = api?.onConfigUpdated?.((m: any) => {
+    const offConfig = api?.onConfigUpdated?.((m) => {
       setPetName(resolvePetName(m))
       if (m?.theme) applyTheme(m.theme as ThemeId)
       // Refresh shortcuts from full config (onConfigUpdated only sends mochi slice)
-      api?.getConfig?.().then((c: any) => {
+      api?.getConfig?.().then((c) => {
         if (c?.shortcuts) {
           const f = formatShortcut
           setShortcuts({
@@ -601,13 +669,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
 
   useEffect(() => {
     // Load history from KiroCrew slot
-    api?.getChatHistory?.().then((history: any) => {
+    api?.getChatHistory?.().then((history) => {
       if (Array.isArray(history)) {
+        // The bridge answers untyped rows, so the shape is asserted per FIELD here
+        // rather than trusted wholesale: the filter is what guarantees `role` is one
+        // of the two this panel renders, and a row missing a timestamp gets 0.
         const mapped = history
-          .filter((m: any) => m.role === 'user' || m.role === 'assistant')
-          .map((m: any, i: number) => ({
-            id: `hist-${i}`, role: m.role, content: m.content,
-            timestamp: m.timestamp || 0,
+          .filter((m) => m.role === 'user' || m.role === 'assistant')
+          .map((m, i): ChatMessage => ({
+            id: `hist-${i}`, role: m.role as ChatMessage['role'], content: m.content as string,
+            timestamp: (m.timestamp as number) || 0,
           }))
         setAllHistory(mapped)
         setMessages(mapped.slice(-INITIAL_HISTORY))
@@ -669,9 +740,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     })
 
     // Complete messages (user + assistant)
-    const offMsg = api?.onChatMessage?.((msg: any) => {
+    const offMsg = api?.onChatMessage?.((msg) => {
       if (msg.role) {
-        const withTs = { ...msg, timestamp: msg.timestamp || Date.now() }
+        // The frame IS a chat message; the bridge types it as an untyped record, so
+        // the shape is claimed once here instead of at each read below.
+        const withTs = { ...msg, timestamp: msg.timestamp || Date.now() } as ChatMessage
         // Cancel any pending streaming RAF and clear buffer to prevent stale chunks
         if (streamRaf) { cancelAnimationFrame(streamRaf); streamRaf = null }
         streamBuffer = ''
@@ -718,9 +791,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       setCloudAutoConnecting(switching)
       if (switching) setIsOnline(false)
     })
-    const offSlots = api?.onSlotsUpdate?.((slots: any[]) => {
+    const offSlots = api?.onSlotsUpdate?.((slots) => {
       // Track whether the mochi-pet slot is running
-      const mochiSlot = slots.find((s: any) => s.key === 'mochi')
+      const mochiSlot = (slots as SlotFrame[]).find((s) => s.key === 'mochi')
       const running = mochiSlot?.running ?? false
       setSlotRunning(running)
       // A TRANSITION out of running is the end of a turn. A bare `!running` is not:
@@ -761,12 +834,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         setAttachments((prev) => [...prev, ...added])
       })()
     })
-    const offApproval = api?.onApprovalRequest?.((req: any) => {
+    const offApproval = api?.onApprovalRequest?.((req) => {
       // Dedup by request_id: the same pending approval can arrive more than once
       // (a re-broadcast, or a permission frame replayed alongside history), and a
       // duplicate would add a second card with a colliding React key.
-      const msgId = `approval-${req.id}`
-      setPendingApprovals(prev => prev.some(a => a.id === req.id) ? prev : [...prev, req])
+      const reqId = String(req.id)
+      const msgId = `approval-${reqId}`
+      setPendingApprovals(prev => prev.some(a => a.id === reqId) ? prev : [...prev, { id: reqId }])
       setMessages(prev => prev.some(m => m.id === msgId) ? prev : [...prev, {
         id: msgId,
         role: 'assistant',
@@ -798,7 +872,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       }
     })
 
-    const offTheme = api?.onThemeChanged?.((themeId: string) => { applyTheme(themeId as any) })
+    const offTheme = api?.onThemeChanged?.((themeId: string) => { applyTheme(themeId) })
 
     const offCtx = api?.onContextUsage?.((pct: number) => setContextPct(pct))
 
@@ -854,8 +928,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     }
   }, [])
 
-  const handleApproval = useCallback(async (id: string, action: string, pattern?: string) => {
-    const res = await api?.respondApproval?.(id, action, pattern)
+  const handleApproval = useCallback(async (
+    id: string,
+    action: string,
+    pattern?: string,
+    trustGrantable = false,
+  ) => {
+    const res = await api?.respondApproval?.(id, action, pattern, trustGrantable)
     if (res !== undefined && res !== null && res.ok === false) {
       // The POST failed. Do NOT relabel the card "Approved"/"Trusted" — that
       // would claim a security decision that never reached the agent, which is
@@ -864,7 +943,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       setMessages(prev => [...prev, {
         id: `approval-error-${id}-${Date.now()}`,
         role: 'assistant',
-        content: i18nT('apps.mochi.chat.send_failed'),
+        // A stale pre-owner session is an AUTH failure, not a network one:
+        // the generic "check your connection" copy would send the user
+        // debugging the wrong thing, so name the real remedy (sign in again).
+        content: res.staleOwnerSession
+          ? i18nT('api.client.stale_owner_session_sign_in_again')
+          : i18nT('apps.mochi.chat.send_failed'),
         timestamp: Date.now(),
       }])
       return
@@ -1353,23 +1437,38 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           padding: '4px 10px', borderTop: '1px solid var(--border)',
           animation: `${ssAnim} 0.2s ease forwards`,
         }}>
-          <div style={{ position: 'relative', width: 40, height: 40, display: 'inline-block' }}
+          {/* Opening the crop full size is a CONTROL, so it must be tab-reachable and
+              fire on Enter/Space — and it belongs on this CONTAINER rather than on the
+              <img>. An image has no interactive role it may take, and the dismiss dot
+              is absolutely positioned against this box, so it cannot move inside a
+              wrapper button either. `Clickable` supplies role=button, tabIndex and the
+              key handling, and its keydown guard already ignores keys arriving from the
+              nested dismiss <button>. The hover listeners stay where they were: they
+              only fade that dot in and out. */}
+          <Clickable
+            onClick={() => openLightbox(ssDisplay)}
+            aria-label={i18nT('apps.mochi.chatPanel.open_image')}
+            style={{ position: 'relative', width: 40, height: 40, display: 'inline-block', cursor: 'zoom-in' }}
             onMouseEnter={(e) => { const b = e.currentTarget.querySelector('.x-btn') as HTMLElement; if (b) b.style.opacity = '1' }}
             onMouseLeave={(e) => { const b = e.currentTarget.querySelector('.x-btn') as HTMLElement; if (b) b.style.opacity = '0' }}
           >
+            {/* Empty alt because the container carries the accessible name: describing
+                the thumbnail again here would announce one control twice. */}
             <img
               src={`data:image/png;base64,${ssDisplay}`}
-              onClick={() => openLightbox(ssDisplay)}
+              alt=""
               style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)', cursor: 'zoom-in' }}
             />
-            <button className="x-btn" onClick={removeScreenshot} aria-label={i18nT('apps.mochi.chatPanel.remove_screenshot')} style={{
+            {/* Dismiss must not also open the lightbox now that the container is the
+                control the click would otherwise reach. */}
+            <button className="x-btn" onClick={(e) => { e.stopPropagation(); removeScreenshot() }} aria-label={i18nT('apps.mochi.chatPanel.remove_screenshot')} style={{
               position: 'absolute', top: -4, right: -4, width: 16, height: 16,
               background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: '50%',
               color: 'var(--text-muted)', fontSize: 10, lineHeight: '14px', textAlign: 'center',
               cursor: 'pointer', opacity: 0, transition: 'opacity 0.15s', padding: 0,
               display: 'flex', alignItems: 'center', justifyContent: 'center',
             }}><X size={10} /></button>
-          </div>
+          </Clickable>
         </div>
       )}
       <style>{`
@@ -1457,6 +1556,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
 
         <textarea
           ref={inputRef}
+          {...ime.bindComposition<HTMLTextAreaElement>({
+            onFocus: (e) => {
+              e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
+              e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
+            },
+            onBlur: (e) => {
+              e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border)'
+              e.currentTarget.style.boxShadow = editingTs ? '0 0 0 2px var(--accent-glow)' : 'none'
+            },
+          })}
           value={input} onChange={(e) => { setInput(e.target.value); setCmdIdx(0); autoResize(e.currentTarget) }}
           onKeyDown={(e) => {
             // Command autocomplete navigation
@@ -1466,12 +1575,22 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
               if (showAutocomplete) {
                 if (e.key === 'ArrowDown') { e.preventDefault(); setCmdIdx(i => (i + 1) % filtered.length); return }
                 if (e.key === 'ArrowUp') { e.preventDefault(); setCmdIdx(i => (i - 1 + filtered.length) % filtered.length); return }
-                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing)) {
+                if (e.key === 'Tab') {
+                  // Tab accepts the highlighted command INTO the composer, so an
+                  // IME cycling its candidate list with Tab must not rewrite the
+                  // draft mid-composition. Claimed like the Enter branch below.
+                  if (!ime.claimKey(e)) return
                   e.preventDefault(); setInput(filtered[cmdIdx].cmd); setCmdIdx(0); return
+                }
+                // While the picker is open Enter belongs to it, so the key is claimed
+                // here either way and never falls through to the send branch below.
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  if (ime.claimEnter(e)) { setInput(filtered[cmdIdx].cmd); setCmdIdx(0) }
+                  return
                 }
               }
             }
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend() }
+            if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) handleSend() }
           }}
           onPaste={(e) => {
             const files = filesFrom(e.clipboardData)
@@ -1499,14 +1618,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
             lineHeight: '1.4',
             maxHeight: 120, overflowY: 'auto',
             boxShadow: editingTs ? '0 0 0 2px var(--accent-glow)' : undefined,
-          }}
-          onFocus={(e) => {
-            e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
-            e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
-          }}
-          onBlur={(e) => {
-            e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border)'
-            e.currentTarget.style.boxShadow = editingTs ? '0 0 0 2px var(--accent-glow)' : 'none'
           }}
         />
         <button onClick={handleSend} title={i18nT('apps.mochi.chat.send')} aria-label={i18nT('apps.mochi.chat.send')} style={{
@@ -1538,8 +1649,19 @@ const LocalImage: React.FC<{ path: string; onClickImage?: (src: string) => void 
   // consumer wants to DO something with the file -- open it in the OS viewer --
   // and a data URL cannot be opened. Passing the rendered URL made each call
   // site look wired while doing nothing.
-  return <img src={src} onClick={() => onClickImage?.(path)}
-    style={{ maxWidth: 200, maxHeight: 200, borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
+  //
+  // A real <button>, not a clickable <img>: the transcript renders the image at
+  // 200px, so opening the file at full size is a CONTROL, and only the native
+  // element puts it in the tab order and fires it on Enter/Space. `inline-flex`
+  // with zero chrome keeps the image inline and at exactly its own size, and the
+  // button carries the accessible name so the image takes an empty alt rather
+  // than being announced twice.
+  return <button type="button" onClick={() => onClickImage?.(path)}
+    aria-label={i18nT('apps.mochi.chatPanel.open_image')}
+    style={{ display: 'inline-flex', padding: 0, border: 'none', background: 'none', cursor: 'zoom-in' }}>
+    <img src={src} alt=""
+      style={{ maxWidth: 200, maxHeight: 200, borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
+  </button>
 }
 
 /**
@@ -1549,6 +1671,10 @@ const LocalImage: React.FC<{ path: string; onClickImage?: (src: string) => void 
  * raw text.
  */
 const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  // The whitespace-run cap (see markdownDepthBound) is applied per TEXT
+  // segment below, after widget extraction, so a widget body reaches
+  // WidgetFrame byte-identical -- its <pre> indentation included.
   const cleaned = content.replace(/^\n+/, '')
   // If there's a complete widget in the stream, render it
   if (hasWidgets(cleaned)) {
@@ -1562,20 +1688,20 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
           // Last text segment after final widget — still streaming
           if (i > lastWidget) {
             const stripped = seg.content.replace(/<mcwidget[\s\S]*$/, '')
-            const prepared = fixStreamingFences(stripped)
+            const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
             return <React.Fragment key={i}>
               <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
               <span style={{ animation: 'blink 1s step-end infinite', display: 'inline-flex', verticalAlign: 'middle' }}><PawPrint size={11} /></span>
             </React.Fragment>
           }
-          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
         })}
       </>
     )
   }
   // Strip any partial/unclosed <mcwidget tag during streaming
   const stripped = cleaned.replace(/<mcwidget[\s\S]*$/, '')
-  const prepared = fixStreamingFences(stripped)
+  const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
   return (
     <>
       <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
@@ -1586,8 +1712,9 @@ const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
 
 /** Ensure blank line before fences glued to text, and close any unclosed fence. */
 function fixStreamingFences(s: string): string {
-  // Ensure blank line before opening fences glued to preceding text
-  s = s.replace(/([^\n])(\n?)(```\w*\n)/g, (_, pre, nl, fence) =>
+  // The info string is the whole backtick-free line, including attributes and
+  // a leading space, matching the dashboard's FENCE_OPEN.
+  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // If there's an odd number of ``` fences, the last one is unclosed — close it
@@ -1596,7 +1723,11 @@ function fixStreamingFences(s: string): string {
   return s
 }
 
-const MD_REMARK = [remarkGfm]
+// `remarkBoundDepth` first: it bounds the parsed tree's depth inside parse(),
+// ahead of remark-gfm's recursive post-parse transform. Shared with the
+// core renderer, for the same reason the sanitizer is: this panel parses
+// the same untrusted message content through the same kind of pipeline.
+const MD_REMARK = [remarkBoundDepth, remarkGfm, remarkVerbatimUnknownTags]
 /**
  * Raw HTML must be ADMITTED, then SANITIZED — in that order.
  *
@@ -1606,18 +1737,43 @@ const MD_REMARK = [remarkGfm]
  * The sanitizer is the core's, imported rather than copied: admitting raw HTML
  * is exactly the point where a second, drifting allowlist would become a hole.
  */
-const MD_REHYPE = [rehypeRaw, rehypeSanitize]
+// ``rehypeStableRootKeys`` goes LAST, after ``rehypeSanitize``, and the order is
+// load-bearing rather than cosmetic: the sanitizer keeps only allowlisted
+// attributes, and ``style`` is on neither the global list nor any list for
+// ``div``. Ahead of it the wrapper would lose ``display: contents`` and become a
+// real layout box around every block, which is a visible regression that the
+// keys it stabilises would not reveal.
+const MD_REHYPE = [rehypeBoundRawDepth, rehypeRaw, rehypeSanitize, rehypeStableRootKeys]
 
-const mdComponents: Record<string, React.FC<any>> = {
-  a: (p: any) => <a {...p} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
-    onMouseEnter={(e: any) => (e.currentTarget.style.textDecoration = 'underline')}
-    onMouseLeave={(e: any) => (e.currentTarget.style.textDecoration = 'none')}
-    onClick={(e: any) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }} />,
-  table: (p: any) => <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', margin: '4px 0' }} {...p} />,
-  th: (p: any) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
-  td: (p: any) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
-  code: (p: any) => {
-    const match = /language-(\w+)/.exec(p.className || '')
+/**
+ * Typed against react-markdown's own `Components`, so each override receives the
+ * real props of the tag it replaces (the same contract the dashboard's
+ * MarkdownRenderer uses) instead of an `any` that hides a misspelled prop.
+ */
+const mdComponents: Components = {
+  // react-markdown's defaultUrlTransform rewrites a destination whose scheme is
+  // outside its allowlist (and an empty `[x]()` destination) to href="". An
+  // anchor with an empty href still paints as a live link and its "Copy Link
+  // Address" resolves to the current page URL, so a refused destination renders
+  // as inert text instead -- same degradation as md-notebook's Preview.
+  //
+  // On the anchor path, `href` and the children are restated after the spread --
+  // both already arrive in `p`, so this is the same anchor at runtime -- because
+  // an <a> whose href is only ever supplied by a spread is indistinguishable
+  // from a bare <a onClick>: it is not focusable and Enter does not fire it, and
+  // neither a reader nor the linter can tell it apart from a real link.
+  a: (p) => p.href ? <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
+    onMouseEnter={(e) => (e.currentTarget.style.textDecoration = 'underline')}
+    onMouseLeave={(e) => (e.currentTarget.style.textDecoration = 'none')}
+    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>
+    : <span>{p.children}</span>,
+  table: (p) => <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', margin: '4px 0' }} {...p} />,
+  th: (p) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
+  td: (p) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
+  code: (p) => {
+    // Whole class token, not its leading `\w+` run: `language-error-report`
+    // labels as `error-report`, not `error` (same rule as MarkdownRenderer).
+    const match = /language-(\S+)/.exec(p.className || '')
     if (match) {
       return <MochiCodeBlock lang={match[1]} code={String(p.children).replace(/\n$/, '')} />
     }
@@ -1628,8 +1784,8 @@ const mdComponents: Record<string, React.FC<any>> = {
     }
     return <code style={{ background: 'var(--bg-input)', borderRadius: 3, padding: '1px 4px', fontSize: 11 }} {...p} />
   },
-  pre: (p: any) => <>{p.children}</>,
-  p: (p: any) => {
+  pre: (p) => <>{p.children}</>,
+  p: (p) => {
     // Detect file paths in paragraph text and render as FileChip
     const children = React.Children.toArray(p.children)
     const processed = children.map((child, i) => {
@@ -1649,10 +1805,10 @@ const mdComponents: Record<string, React.FC<any>> = {
     })
     return <p style={{ margin: '2px 0' }}>{processed}</p>
   },
-  ul: (p: any) => <ul style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
-  ol: (p: any) => <ol style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
-  li: (p: any) => <li style={{ marginBottom: 1 }} {...p} />,
-  img: (p: any) => {
+  ul: (p) => <ul style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
+  ol: (p) => <ol style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
+  li: (p) => <li style={{ marginBottom: 1 }} {...p} />,
+  img: (p) => {
     const src = p.src
     // Any LOCAL FILE path goes through LocalImage, which reads the bytes over the
     // app API and renders a data URL. A bare `<img src="/Users/…/x.png">` cannot
@@ -1670,7 +1826,10 @@ const mdComponents: Record<string, React.FC<any>> = {
       // opens a file, and openLightbox rejects data: URLs for that reason.
       return <LocalImage path={src} onClickImage={() => api?.openLightbox?.(src)} />
     }
-    return <img {...p} style={{ maxWidth: '100%', borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
+    // The markdown author's own alt text, defaulting to '' — an image written
+    // without one is decorative, and an explicit empty alt is what tells a screen
+    // reader to skip it instead of falling back to reading out the URL.
+    return <img {...p} alt={p.alt ?? ''} style={{ maxWidth: '100%', borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
   },
 }
 
@@ -1690,6 +1849,16 @@ function isLocalFilePath(src: unknown): src is string {
 const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
   const parts = filePath.split('/')
   const short = parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : parts.slice(-2).join('/')
+  // The SHELL's platform, not the gateway's: `revealFile` is an IPC send Mochi's
+  // Electron main process handles, so that host owns which application opens. A
+  // browser tab has no shell to report one — and no shell to reveal anything
+  // either — so it takes the generic wording.
+  const hostPlatform = classifyPlatform(electronPlatform())
+  const revealLabel = hostPlatform === 'darwin'
+    ? i18nT('apps.mochi.chatPanel.open_in_finder')
+    : hostPlatform === 'windows'
+      ? i18nT('apps.mochi.chatPanel.open_in_file_explorer')
+      : i18nT('apps.mochi.chatPanel.show_in_file_manager')
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -1698,29 +1867,42 @@ const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
       fontSize: 11, lineHeight: 1.3, verticalAlign: 'middle',
     }}>
       <File size={11} color="var(--text-muted)" />
-      <span style={{ color: 'var(--text)', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        title={filePath}
-        role="button"
-        tabIndex={0}
-        onClick={() => api?.previewFile?.(filePath)}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); api?.previewFile?.(filePath) } }}
-      >{short}</span>
-      <button onClick={() => api?.previewFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.preview')} aria-label={i18nT('apps.mochi.chatPanel.preview')} style={{
-        background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-        color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-        transition: 'color 0.15s',
-      }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-      ><Eye size={11} /></button>
-      <button onClick={() => api?.revealFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.reveal_in_finder')} aria-label={i18nT('apps.mochi.chatPanel.reveal_in_finder')} style={{
-        background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-        color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-        transition: 'color 0.15s',
-      }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-      ><Folder size={11} /></button>
+      {/* Preview and reveal both delegate to the shell bridge (window.mochi),
+          published only by the Electron preload — in a browser tab the calls
+          are silent no-ops, so the dead controls are withheld rather than
+          rendered. Inside the shell the reveal label names that host's own file
+          manager, since the shell is what performs the reveal. */}
+      {isElectron ? (
+        <>
+          <span style={{ color: 'var(--text)', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            title={filePath}
+            role="button"
+            tabIndex={0}
+            onClick={() => api?.previewFile?.(filePath)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); api?.previewFile?.(filePath) } }}
+          >{short}</span>
+          <button onClick={() => api?.previewFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.preview')} aria-label={i18nT('apps.mochi.chatPanel.preview')} style={{
+            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
+            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+            transition: 'color 0.15s',
+          }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
+          ><Eye size={11} /></button>
+          <button onClick={() => api?.revealFile?.(filePath)} title={revealLabel} aria-label={revealLabel} style={{
+            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
+            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+            transition: 'color 0.15s',
+          }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
+          ><Folder size={11} /></button>
+        </>
+      ) : (
+        <span style={{ color: 'var(--text)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          title={filePath}
+        >{short}</span>
+      )}
     </span>
   )
 }
@@ -1764,6 +1946,8 @@ interface ApprovalPayload {
   fullCommand?: string
   /** Comma-joined base binaries ("cat,wc"), for a grant scoped to the family. */
   baseCommand?: string
+  /** Server proof that this pending card may create a durable trust grant. */
+  trustGrantable?: boolean
 }
 
 /** Parse an approval payload, or null when the text is not really one of ours.
@@ -1813,7 +1997,10 @@ const trustScopeBtnStyle: React.CSSProperties = {
   textAlign: 'left',
 }
 
-const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
+// Exported for the capture harness (capture/mochi-trust-label.tsx), which mounts
+// the real approval card as screenshot evidence; not part of the app's API.
+export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string, trustGrantable?: boolean) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const mounted = React.useRef(false)
   const shouldAnimate = animate && !mounted.current
   const [copied, setCopied] = React.useState(false)
@@ -1839,7 +2026,26 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
     // grant — see src/shared/trustPatterns, which must stay equivalent to the
     // dashboard's TrustDropdown so both surfaces offer the same scopes.
     const showTrustBase = familyGrantIsDistinct(req.fullCommand, req.baseCommand)
-    const hasTrustScopes = Boolean(req.fullCommand) || showTrustBase
+    const hasTrustScopes = req.trustGrantable === true
+      && (Boolean(req.fullCommand) || showTrustBase)
+    const approvalActions = [
+      ['approve', i18nT('apps.mochi.approval.btn_approve'), '#2e7d32', Check],
+      ...(req.trustGrantable === true
+        ? [[
+          'trust',
+          // With scopes this button only OPENS the tier list, so the bare verb is
+          // right. Without them the same click IS the broadest grant, so the
+          // button must name what it grants: consent has to match the scope, and
+          // an unqualified "Trust" beside one tool reads as trusting that tool.
+          hasTrustScopes
+            ? i18nT('apps.mochi.approval.btn_trust')
+            : i18nT('apps.mochi.approval.trust_all_tools'),
+          '#1565c0',
+          Handshake,
+        ]]
+        : []),
+      ['reject', i18nT('apps.mochi.approval.btn_reject'), '#c62828', Ban],
+    ] as [string, string, string, React.ComponentType<{ size?: number }>][]
     return (
       <div style={{ alignSelf: 'flex-start', maxWidth: '85%', animation: shouldAnimate ? 'msgIn 0.25s ease-out' : 'none' }}>
         <div style={{
@@ -1853,21 +2059,17 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
                 string: an emoji in the copy can't follow the theme, renders at
                 whatever size the font picks, and has to be repeated in every
                 locale (AGENTS.md: emoji-as-icon is a bug). */}
-            {([
-              ['approve', i18nT('apps.mochi.approval.btn_approve'), '#2e7d32', Check],
-              ['trust', i18nT('apps.mochi.approval.btn_trust'), '#1565c0', Handshake],
-              ['reject', i18nT('apps.mochi.approval.btn_reject'), '#c62828', Ban],
-            ] as [string, string, string, React.ComponentType<{ size?: number }>][]).map(
+            {approvalActions.map(
               ([action, label, bg, Icon]) => (
               <button
                 key={action}
                 // Trust is a SCOPE choice, not one verb. Tapping it reveals the
-                // grants inline (see below) instead of firing the broadest one;
-                // when the gateway sent no pattern fields there is nothing to
-                // scope, so it stays a direct single-action button.
+                // grants inline (see below) instead of firing the broadest one.
+                // The action exists only when the gateway supplied grant proof;
+                // a proven but scopeless card remains a direct broad action.
                 onClick={() => {
                   if (action === 'trust' && hasTrustScopes) { setTrustOpen(v => !v); return }
-                  onApproval?.(req.id, action)
+                  onApproval?.(req.id, action, undefined, req.trustGrantable === true)
                 }}
                 aria-expanded={action === 'trust' && hasTrustScopes ? trustOpen : undefined}
                 style={{
@@ -1887,25 +2089,47 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 }}>
               {req.fullCommand && (
                 <button
-                  onClick={() => onApproval?.(req.id, 'trust_command', req.fullCommand)}
+                  onClick={() => onApproval?.(req.id, 'trust_command', req.fullCommand, true)}
+                  // The untruncated command as a tooltip: the label is budget-clamped,
+                  // and this grant is an exact-string match, so the user must be able
+                  // to read the whole thing before agreeing to it.
+                  title={req.fullCommand}
                   style={trustScopeBtnStyle}
-                ><Shield size={11} />{i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}</button>
+                ><Shield size={11} style={{ flexShrink: 0 }} />
+                  {/* The label WRAPS rather than ellipsizing: the panel column
+                      (~240px of text) shows only ~28 chars per line, so a CSS
+                      ellipsis would re-collide the very labels the 64-char budget
+                      distinguishes. minWidth:0 lets the flex item shrink;
+                      overflowWrap:'anywhere' lets an unbreakable run (a sha, a
+                      base64 arg) wrap instead of clipping past the panel edge.
+                      whiteSpace:'pre-wrap' because the default COLLAPSES runs of
+                      whitespace, which for an exact-string grant is an elision
+                      one character wide: `grep "a  b" f` would render as
+                      `grep "a b" f` while granting the two-space string. The
+                      budget clamp above is a layout decision for this narrow
+                      column; collapsing whitespace earns nothing anywhere. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                    {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
+                  </span></button>
               )}
               {showTrustBase && (
                 <button
-                  onClick={() => onApproval?.(req.id, 'trust_base', trustBasePattern(req.baseCommand ?? ''))}
+                  onClick={() => onApproval?.(req.id, 'trust_base', trustBasePattern(req.baseCommand ?? ''), true)}
                   style={trustScopeBtnStyle}
                 ><ShieldPlus size={11} />{i18nT('apps.mochi.approval.trust_all_base', { base: (req.baseCommand ?? '').split(',').join(', ') })}</button>
               )}
               <button
-                onClick={() => onApproval?.(req.id, 'trust')}
+                onClick={() => onApproval?.(req.id, 'trust', undefined, true)}
                 style={trustScopeBtnStyle}
               ><ShieldCheck size={11} />{i18nT('apps.mochi.approval.trust_all_tools')}</button>
             </div>
           )}
-          {!hasTrustScopes && (
+          {req.trustGrantable === true && !hasTrustScopes && (
+            // This hint renders ONLY on the scopeless path, where the button
+            // grants the whole session. It therefore describes the session and
+            // names no tool: naming the pending tool understates the grant.
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 5 }}>
-              {i18nT('apps.mochi.approval.trust_hint', { tool: req.tool })}
+              {i18nT('apps.mochi.approval.trust_hint')}
             </div>
           )}
         </div>
@@ -1927,9 +2151,12 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
   // started honouring the tag. Attachments, options and widgets each count as
   // content, so only a genuinely empty message is dropped.
   const hasVisibleText = text.replace(/<[^>]*>/g, '').trim() !== ''
+  // Bound to a const so the narrowing survives into the click handler below, which
+  // is a closure and would otherwise see the optional field again.
+  const shot = message.screenshot
   const hasOtherContent =
     options.length > 0 ||
-    !!(message as any).screenshot ||
+    !!shot ||
     text.includes('![') ||
     hasWidgets(text)
   if (!hasVisibleText && !hasOtherContent) return null
@@ -1943,19 +2170,31 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
           borderRadius: isUser ? '10px 10px 2px 10px' : '10px 10px 10px 2px',
           background: isUser ? 'var(--bubble-user)' : 'var(--bubble-assistant)',
         }}>
-          {(message as any).screenshot && (
-            <img src={`data:image/png;base64,${(message as any).screenshot}`}
-              onClick={() => onImageClick?.((message as any).screenshot)}
-              style={{ width: '100%', maxWidth: 200, borderRadius: 4, marginBottom: 4, cursor: 'zoom-in' }} />
+          {shot && (
+            // A real <button>, not a clickable <img>: the bubble caps the image at
+            // 200px, so opening it full size is a CONTROL and must be tab-reachable
+            // and Enter/Space-activated. Zero chrome and the same width bounds as the
+            // image had, so the thumbnail is unchanged; the button carries the
+            // accessible name, hence the empty alt.
+            <button type="button" onClick={() => onImageClick?.(shot)}
+              aria-label={i18nT('apps.mochi.chatPanel.open_image')}
+              style={{ display: 'block', width: '100%', maxWidth: 200, padding: 0, border: 'none', background: 'none', cursor: 'zoom-in' }}>
+              <img src={`data:image/png;base64,${shot}`} alt=""
+                style={{ width: '100%', borderRadius: 4, marginBottom: 4, cursor: 'zoom-in' }} />
+            </button>
           )}
           <div style={{ wordBreak: 'break-word', fontSize: 12, lineHeight: 1.4, overflow: 'hidden' }}>
             {isUser
               ? <span style={{ whiteSpace: 'pre-wrap' }}>
                   {text.split(/\n/).map((line, i) => {
-                    // Detect markdown image syntax: ![...](path)
+                    // Detect markdown image syntax: ![...](path). The path may
+                    // be mdImageDest's `<…>`-wrapped form (attachmentLines in
+                    // composerDrop routes uploads through it) — resolve it with
+                    // the shared wrap-aware inverse; unwrapped legacy paths
+                    // are preserved verbatim (issue #3497).
                     const mdImgMatch = line.match(/^!\[[^\]]*\]\((.+)\)$/)
                     if (mdImgMatch) {
-                      return <LocalImage key={i} path={mdImgMatch[1]} onClickImage={onImageClick} />
+                      return <LocalImage key={i} path={mdImageDestToPath(mdImgMatch[1])} onClickImage={onImageClick} />
                     }
                     // Detect bare image file paths — line starts with / and ends with image extension.
                     const trimmed = line.trim()
@@ -1980,14 +2219,14 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
                     return <>
                       {segments.map((seg, i) => seg.type === 'widget'
                         ? <WidgetFrame key={i} html={seg.content} title={seg.title} />
-                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{seg.content}</Markdown>
+                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
                       )}
                       {images.map((p, i) => <LocalImage key={`img-${i}`} path={p} onClickImage={onImageClick} />)}
                     </>
                   }
 
                   return <>
-                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{cleanText}</Markdown>}
+                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(cleanText)}</Markdown>}
                     {images.map((p, i) => <LocalImage key={i} path={p} onClickImage={onImageClick} />)}
                   </>
                 })()
@@ -2036,9 +2275,11 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
             <button
               className="copy-md-btn"
               onClick={() => {
-                navigator.clipboard.writeText(text)
-                setCopied(true)
-                setTimeout(() => setCopied(false), 1500)
+                copyToClipboard(text).then((ok) => {
+                  if (!ok) return
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                })
               }}
               title={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
               aria-label={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
@@ -2115,4 +2356,3 @@ function ContextRing({ pct }: { pct: number }) {
     </div>
   )
 }
-

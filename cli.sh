@@ -12,11 +12,30 @@
 # venv). No unsigned/checksum-only fallback exists. Unlike install.sh (which
 # builds from a git clone), this pulls the published wheel.
 #
+# Python: provisions a python-build-standalone CPython via a SHA-256-pinned uv
+# into a user-owned directory (the default) — no package manager, no sudo,
+# works on old-glibc distros (CentOS 7). Opt out with --system-python to run on
+# a system interpreter (>=3.12) instead; the choice is recorded and survives
+# updates. If the managed default cannot be provisioned (no network), the run
+# falls back to a usable system interpreter rather than failing.
+#
+# Dependencies: installed from prebuilt wheels ONLY (`pip --only-binary=:all:`),
+# so the install never needs a C compiler or -dev headers. A host no wheel of a
+# dependency can run on fails with a supported-platform message before any
+# build starts; KIROCREW_ALLOW_SOURCE_BUILDS=1 opts back into compiling.
+#
 # Options / env:
 #   --channel <nightly|insider|stable>   (default: stable; env KIROCREW_CHANNEL)
 #   --version <X.Y.Z>                    pin an exact version, verified against
 #                                        its immutable signed CLI manifest
 #   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
+#   --managed-python                     force the managed default back on after
+#                                        a recorded --system-python opt-out
+#                                        (env KIROCREW_MANAGED_PYTHON=1)
+#   --system-python                      run on the system interpreter instead
+#                                        of the managed default (sticky: later
+#                                        runs and updates keep the choice)
+#                                        (env KIROCREW_MANAGED_PYTHON=0)
 # ──────────────────────────────────────────────────────────────────────
 set -eu
 
@@ -35,6 +54,27 @@ FEED_BASE="${KIROCREW_CDN_BASE:-https://updates.crew.kiro.dev}"
 ARTIFACT_BASE="${KIROCREW_CDN_BASE:-https://download.crew.kiro.dev}"
 CHANNEL="${KIROCREW_CHANNEL:-stable}"
 PIN_VERSION=""
+# Three states: "" = undecided (fall back to the persisted python-mode marker,
+# then to the managed default), "1" = managed, "0" = system. An explicit env
+# value or flag always outranks the marker, so an operator can override a
+# sticky choice.
+MANAGED_PYTHON="${KIROCREW_MANAGED_PYTHON:-}"
+
+# Pinned uv release used to provision a managed Python interpreter when the
+# system has none (or when --managed-python asks for one). uv is only ever
+# fetched as a tarball and verified against these SHA-256 digests — the
+# astral.sh install script is never piped into a shell, keeping the signed
+# installer's no-unsigned-third-party-script invariant. Bump the version and
+# all four digests together (each uv release publishes <asset>.tar.gz.sha256
+# files beside the tarballs). Linux pins the musl builds: they are fully
+# static, so they run on any glibc age — old distros are the whole point of
+# this path.
+UV_VERSION="0.10.11"
+UV_PYTHON_SERIES="cpython-3.12"
+UV_SHA_LINUX_X64="d78246139dc6cf3ed6d03c84da762686bced7ad1de67977ee372a45b95a1f6d0"
+UV_SHA_LINUX_ARM64="5d80a7f6343d2676dfde1e5126582070a2bbc62df6f60d5527a169be3788532a"
+UV_SHA_MACOS_X64="ff90020b554cf02ef8008535c9aab6ef27bb7be6b075359300dec79c361df897"
+UV_SHA_MACOS_ARM64="437a7d498dd6564d5bf986074249ba1fc600e73da55ae04d7bd4c24d5f149b95"
 
 # Offline trust root for CLI artifact manifests. These two values are replaced
 # together during the operational KMS-key enablement documented in
@@ -55,6 +95,8 @@ while [ $# -gt 0 ]; do
     --version=*) PIN_VERSION="${1#*=}"; shift ;;
     --cdn) FEED_BASE="${2:?--cdn needs a value}"; ARTIFACT_BASE="$2"; shift 2 ;;
     --cdn=*) FEED_BASE="${1#*=}"; ARTIFACT_BASE="${1#*=}"; shift ;;
+    --managed-python) MANAGED_PYTHON=1; shift ;;
+    --system-python) MANAGED_PYTHON=0; shift ;;
     -h|--help)
       cat <<'EOF'
 KiroCrew CLI installer (channel / wheel based).
@@ -74,7 +116,26 @@ Options / env:
   --version <X.Y.Z>                    pin an exact version, verified against
                                        its immutable signed CLI manifest
   --cdn <base-url>                     (default CloudFront; env KIROCREW_CDN_BASE)
+  --managed-python                     force the managed default back on after
+                                       a recorded --system-python opt-out
+                                       (env KIROCREW_MANAGED_PYTHON=1)
+  --system-python                      run on the system interpreter (>=3.12)
+                                       instead of the managed default (sticky:
+                                       later runs and updates keep the choice)
+                                       (env KIROCREW_MANAGED_PYTHON=0)
   KIROCREW_VENV                        override the managed venv location
+  KIROCREW_PYTHON_DIR                  override where uv-provisioned interpreters
+                                       are stored (default: beside the data home,
+                                       ~/.kiro/crew-python)
+  KIROCREW_UV_URL                      mirror base for the uv release tarballs
+                                       (default: the uv GitHub release tree; the
+                                       SHA-256 pin is enforced either way)
+  UV_PYTHON_INSTALL_MIRROR             mirror for the python-build-standalone
+                                       interpreter downloads (read by uv)
+  KIROCREW_ALLOW_SOURCE_BUILDS=1       let pip compile a dependency that has no
+                                       prebuilt wheel for this host (needs a C
+                                       toolchain and -dev headers); by default
+                                       the install refuses instead of building
 EOF
       exit 0 ;;
     *) echo "kirocrew-install: unknown argument '$1'" >&2; exit 2 ;;
@@ -84,6 +145,115 @@ FEED_BASE="${FEED_BASE%/}"
 ARTIFACT_BASE="${ARTIFACT_BASE%/}"
 
 err() { echo "kirocrew-install: $*" >&2; exit 1; }
+
+# Dependencies come from prebuilt wheels only. Left to itself, pip treats a
+# dependency with no wheel for this host as something to BUILD from its
+# sdist, and a native one (numpy, Pillow, cryptography, lxml) then needs a C
+# toolchain and -dev headers the host was never required to have; the failure
+# lands deep inside a compiler run, after the working venv has already been
+# moved aside. The managed python-build-standalone interpreter runs on
+# old-glibc distros, but each dependency's wheels carry their own glibc floor
+# (their manylinux tag), which is the part that varies per host.
+# `--only-binary=:all:` makes pip resolve the newest release of every
+# dependency that publishes a wheel this host can run, and when no release
+# does, fail before any build starts -- which _report_pip_failure turns into
+# a supported-platform message. KIROCREW_ALLOW_SOURCE_BUILDS=1 is the opt-in
+# for a host that has the toolchain and wants the compile fallback back.
+PIP_BINARY_ONLY="--only-binary=:all:"
+if [ "${KIROCREW_ALLOW_SOURCE_BUILDS:-0}" = "1" ]; then
+  PIP_BINARY_ONLY=""
+fi
+
+# "<OS> <arch>, <libc>" for the failure message. getconf answers on glibc;
+# `ldd --version` covers a libc without it (musl prints its own banner); an
+# unknown libc is simply left out rather than guessed.
+_platform_description() {
+  _plat="$(uname -s) $(uname -m)"
+  _libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  if [ -z "$_libc" ] && command -v ldd >/dev/null 2>&1; then
+    _libc="$(ldd --version 2>&1 | head -n 1 || true)"
+  fi
+  [ -n "$_libc" ] && _plat="$_plat, $_libc"
+  printf '%s' "$_plat"
+}
+
+# Report a failed pip/pipx install from its captured log ($1). The log tail
+# always goes first so pip's own words stay visible. Under binary-only
+# resolution, pip's "No matching distribution found" means no release it may
+# install has a wheel this host can run. pip's "(from versions: ...)" list
+# does not separate the causes: it only counts candidates that survived its
+# link filter, so a package whose every wheel targets a newer libc or another
+# arch reads "(from versions: none)" -- the same text as an index that does
+# not carry the package or could not be reached -- and a numeric list means
+# only versions outside the required range have a wheel here. So the report
+# names the platform, the packages and the usual cause (a host older than
+# the wheels' floor), says the index is the other possibility, and gives the
+# way out -- a newer host, or an explicit opt-in to compile -- without
+# claiming a verdict pip's text cannot support.
+_report_pip_failure() {
+  if [ -s "$1" ]; then
+    echo "----- pip output (tail) -----" >&2
+    tail -n 30 "$1" >&2
+    echo "-----------------------------" >&2
+  fi
+  [ -n "$PIP_BINARY_ONLY" ] || return 0
+  grep -q 'No matching distribution found for' "$1" 2>/dev/null || return 0
+  _missing="$(grep 'No matching distribution found for' "$1" \
+    | sed 's/.*No matching distribution found for //' | head -n 5 | tr '\n' ' ')"
+  echo "kirocrew-install: pip found no prebuilt wheel it may install on this platform ($(_platform_description)) for: ${_missing:-a required dependency}" >&2
+  echo "kirocrew-install: Kiro Crew installs prebuilt wheels only and never compiles a dependency. Usually this means the host is older than the wheels' floor: the current dependency set needs a newer Linux (Amazon Linux 2023, RHEL/Rocky 8+, Ubuntu 22.04+, Debian 12+) on x86_64/aarch64, or macOS. It can also mean the package index could not be reached or does not carry these releases; pip's output above shows the retries or the versions it saw. To compile on this host instead, install a C/C++ toolchain and the -dev headers the packages above need, then re-run with KIROCREW_ALLOW_SOURCE_BUILDS=1." >&2
+}
+
+# Take the install lock held open on fd 9 (the caller has already run
+# `exec 9>>"$lockfile"`), waiting up to $1 seconds for another installer run
+# to finish. Two installer runs against one pipx venv must not interleave:
+# each copies the venv aside, lets pipx mutate it, and on failure puts ITS
+# copy back -- so a run that snapshotted the old venv, then failed after a
+# sibling run had already updated it, would restore the stale copy over the
+# sibling's finished update. pipx serializes only its own mutation, never our
+# copy or our restore, so the whole copy/mutate/restore sequence is
+# serialized here instead. flock(2) rather than a lock directory: the kernel
+# drops the lock when the holder exits, however it exits, so a crashed run
+# leaves nothing stale to detect or clean; the lock lives on the open file
+# description, so once this child has taken it on the inherited fd the shell
+# keeps holding it until the fd is closed. Only "already locked"
+# (BlockingIOError) is waited on; any other error (the fd was not inherited)
+# fails the call outright so a broken guarantee is never mistaken for a busy
+# one. Exit 3 marks a timeout for the caller's message.
+_wait_install_lock() {
+  "$PY" -c '
+import fcntl, sys, time
+deadline = time.monotonic() + float(sys.argv[1])
+told = False
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            sys.exit(3)
+        if not told:
+            print("Another kirocrew installer run is working on this install; waiting for it to finish ...", flush=True)
+            told = True
+        time.sleep(0.5)
+    else:
+        sys.exit(0)
+' "$1"
+}
+
+# Put a backup tree ($1) back at its original path ($2). Succeeds only when
+# the original path is GONE before the move: `mv` onto a directory that
+# survived `rm -rf` (an immutable file, a read-only remount after an I/O
+# error, a mount point) nests the backup INSIDE it and still exits 0, which
+# would read as a restore that never happened while `kirocrew` stays broken.
+# A dangling symlink at the path fails `-e` yet would still make `mv` rename
+# beside it, so `-L` is checked too. The caller reports the outcome.
+_restore_tree() {
+  rm -rf "$2" 2>/dev/null || true
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    return 1
+  fi
+  mv "$1" "$2" 2>/dev/null
+}
 
 # The channel name IS the storage path segment: publish-cli.yml writes
 # feed/<channel>/latest-cli.json and cli/<channel>/<version>/ using the literal
@@ -123,29 +293,6 @@ _is_within() {
 
 command -v curl    >/dev/null 2>&1 || err "curl is required"
 command -v openssl >/dev/null 2>&1 || err "openssl is required to verify the signed manifest"
-# KiroCrew needs Python >=3.10 at runtime (contextlib.aclosing, etc.) even
-# though older published wheels' METADATA claimed >=3.9 -- pip would install
-# fine on 3.9 and then crash on first run. Prefer the newest interpreter the
-# project builds and tests on (3.12 is the CI target); 3.13 is untested and
-# only a last resort before bare python3, which itself only counts if >=3.10.
-PY=""
-for c in python3.12 python3.11 python3.10 python3.13 python3; do
-  command -v "$c" >/dev/null 2>&1 || continue
-  if "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-    PY="$c"; break
-  fi
-done
-if [ -z "$PY" ] && command -v dnf >/dev/null 2>&1; then
-  # Amazon Linux 2023 ships python3 = 3.9; a 3.10+ interpreter is one dnf away.
-  echo "No Python >=3.10 found; attempting: dnf install python3.11 ..."
-  if [ "$(id -u)" = "0" ]; then
-    dnf install -y -q python3.11 >/dev/null 2>&1 || true
-  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    sudo dnf install -y -q python3.11 >/dev/null 2>&1 || true
-  fi
-  command -v python3.11 >/dev/null 2>&1 && PY="python3.11"
-fi
-[ -n "$PY" ] || err "Python >=3.10 is required (KiroCrew uses 3.10+ stdlib features). On Amazon Linux: sudo dnf install python3.11"
 if command -v sha256sum >/dev/null 2>&1; then SHA_CMD="sha256sum"
 elif command -v shasum  >/dev/null 2>&1; then SHA_CMD="shasum -a 256"
 else err "need sha256sum or shasum to verify the download"; fi
@@ -153,22 +300,235 @@ else err "need sha256sum or shasum to verify the download"; fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-# Materialize and self-check the embedded trust root. The key id is the SHA-256
-# fingerprint of SubjectPublicKeyInfo DER, so an accidental edit to either
-# pinned value fails before the network is consulted.
-if ! printf '%s' "$CLI_MANIFEST_PUBLIC_KEY_B64" \
-    | "$PY" -c 'import base64,sys; open(sys.argv[1], "xb").write(base64.b64decode(sys.stdin.buffer.read(), validate=True))' \
-        "$TMP/cli-manifest-public.pem" 2>/dev/null; then
-  err "embedded CLI manifest public key is malformed"
+# Kiro Crew needs Python >=3.12 at runtime -- that is what every release
+# artifact bundles and the only version CI tests, and older published wheels'
+# METADATA claimed a lower floor, so pip would install fine and then crash on
+# first run. Prefer the exact interpreter the project builds and tests on
+# (3.12); 3.13 is untested and only a last resort before bare python3, which
+# itself only counts if >=3.12.
+# A version-manager shim (mise, pyenv, asdf) can wedge instead of answering --
+# notably when HOME does not hold the config the shim expects -- and an
+# unbounded probe then hangs the whole install on its FIRST candidate,
+# python3.12, leaving a spinning orphan behind. Bound it so a wedged candidate
+# fails over to the next one. A healthy interpreter answers in well under a
+# tenth of a second, so 5s is generous and caps the whole ladder at ~25s.
+# `timeout` is absent from a stock macOS, so its absence must leave the probe
+# working rather than fail every candidate.
+_PY_PROBE_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+  _PY_PROBE_TIMEOUT="timeout 5"
 fi
-if ! openssl pkey -pubin -in "$TMP/cli-manifest-public.pem" \
-    -outform DER -out "$TMP/cli-manifest-public.der" 2>/dev/null; then
+
+_py_usable() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  if [ -n "$_PY_PROBE_TIMEOUT" ]; then
+    # Unquoted on purpose: expands to two words, or to nothing when unavailable.
+    # shellcheck disable=SC2086
+    $_PY_PROBE_TIMEOUT "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null
+    return $?
+  fi
+  # No `timeout` binary (stock macOS): emulate the same 5s bound with a POSIX
+  # watchdog, so a wedged version-manager shim still fails over to the next
+  # candidate instead of hanging the install on its first probe.
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' >/dev/null 2>&1 &
+  _py_pid=$!
+  (
+    # On TERM from the fast-exit path below, kill our own in-flight `sleep`
+    # before exiting: a plain kill on this subshell cannot reach its child,
+    # which would otherwise linger for up to a second. kill -9 is untrappable,
+    # so the parent must TERM us for this cleanup to run.
+    trap 'kill "${_wd_sleep:-}" 2>/dev/null || true; exit 0' TERM
+    _i=0
+    while [ "$_i" -lt 5 ]; do
+      sleep 1 & _wd_sleep=$!
+      wait "$_wd_sleep" 2>/dev/null || true
+      kill -0 "$_py_pid" 2>/dev/null || exit 0
+      _i=$((_i + 1))
+    done
+    kill -9 "$_py_pid" 2>/dev/null || true
+  ) &
+  _watchdog_pid=$!
+  # Capture the probe's real exit status: a plain `wait ... || true` would
+  # overwrite $? and report every candidate as usable. 137 (killed by the
+  # watchdog) and 1 (version too old) must both read as "not usable".
+  _py_status=0
+  wait "$_py_pid" 2>/dev/null || _py_status=$?
+  kill "$_watchdog_pid" 2>/dev/null || true
+  wait "$_watchdog_pid" 2>/dev/null || true
+  return "$_py_status"
+}
+
+# Resolve the newest supported interpreter into PY (left empty if none found).
+_resolve_python() {
+  for _c in python3.12 python3.13 python3; do
+    if _py_usable "$_c"; then PY="$_c"; return 0; fi
+  done
+  return 1
+}
+
+# ── Managed-Python provisioning (uv + python-build-standalone) ──────────────
+# Provision a CPython interpreter without touching the system: uv is a static,
+# dependency-free binary, and the interpreters it installs are prebuilt
+# python-build-standalone archives that unpack into a user-owned directory —
+# no package manager, no sudo, and they run on old-glibc distros (CentOS 7)
+# whose base repos never reach 3.10. The pinned uv release is downloaded and
+# verified against the SHA-256 digests above before it runs -- an installed
+# `uv` on PATH is never consulted (see the note inside).
+# Sets PY on success. Network/platform failures return 1 so the caller can
+# print guidance; a digest mismatch is a security stop and errs immediately.
+_provision_python_via_uv() {
+  _uv_bin=""
+  # An installed `uv` on PATH is deliberately NOT consulted. With managed as
+  # the default, every install and update run reaches this function, and PATH
+  # commonly leads with user-writable directories (~/.local/bin) that an agent
+  # session can write -- a planted `uv` shim would be executed by the user's
+  # own unattended update run. The pinned, SHA-256-verified tarball is the
+  # only uv this script runs. The download recurs on every managed run; a
+  # failure degrades to a usable system interpreter unless managed was
+  # explicitly requested this run (see the mode block below).
+  # GNU tar's -z shells out to gzip, so both must exist before downloading.
+  for _uv_tool in tar gzip; do
+    if ! command -v "$_uv_tool" >/dev/null 2>&1; then
+      echo "kirocrew-install: $_uv_tool is required to unpack uv" >&2
+      return 1
+    fi
+  done
+  case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64)              _uv_target="x86_64-unknown-linux-musl";  _uv_sha="$UV_SHA_LINUX_X64" ;;
+    Linux/aarch64|Linux/arm64) _uv_target="aarch64-unknown-linux-musl"; _uv_sha="$UV_SHA_LINUX_ARM64" ;;
+    Darwin/x86_64)             _uv_target="x86_64-apple-darwin";        _uv_sha="$UV_SHA_MACOS_X64" ;;
+    Darwin/arm64)              _uv_target="aarch64-apple-darwin";       _uv_sha="$UV_SHA_MACOS_ARM64" ;;
+    *)
+      echo "kirocrew-install: no pinned uv build for $(uname -s)/$(uname -m)" >&2
+      return 1 ;;
+  esac
+  echo "Downloading uv $UV_VERSION ($_uv_target) ..."
+  # -L: GitHub release assets redirect to a storage host; --proto-redir keeps
+  # every hop on HTTPS (curl's redirect default would also allow plain http).
+  # KIROCREW_UV_URL points air-gapped / proxied hosts at a mirror of the uv
+  # release tree; the SHA-256 pin below still applies, so a mirror can serve
+  # the bytes but never substitute them. (uv's own python-build-standalone
+  # download honors UV_PYTHON_INSTALL_MIRROR, which inherits through env.)
+  _uv_base="${KIROCREW_UV_URL:-https://github.com/astral-sh/uv/releases/download}"
+  curl -fsSL --proto '=https' --proto-redir '=https' \
+    "${_uv_base%/}/$UV_VERSION/uv-$_uv_target.tar.gz" \
+    -o "$TMP/uv.tar.gz" || return 1
+  _uv_got="$($SHA_CMD "$TMP/uv.tar.gz" | awk '{print $1}')"
+  [ "$_uv_got" = "$_uv_sha" ] \
+    || err "uv download SHA-256 mismatch (expected $_uv_sha, got $_uv_got) — refusing to continue"
+  ( cd "$TMP" && tar -xzf uv.tar.gz ) || return 1
+  _uv_bin="$TMP/uv-$_uv_target/uv"
+  [ -x "$_uv_bin" ] || return 1
+  # The interpreter store lives BESIDE the data home, like the managed venv and
+  # for the same blast-radius reason: no data-home-wide operation may ever
+  # reach the interpreter that the venv's shebangs point at.
+  _uv_data_home="${KIROCREW_HOME:-$HOME/.kiro/crew}"
+  _uv_py_dir="${KIROCREW_PYTHON_DIR:-${_uv_data_home%/}-python}"
+  UV_PYTHON_INSTALL_DIR="$_uv_py_dir" "$_uv_bin" python install "$UV_PYTHON_SERIES" \
+    || return 1
+  # only-managed: resolve the interpreter just installed, never a system one
+  # that happens to satisfy the series (matters under --managed-python, where
+  # a usable system 3.12 may exist but was explicitly opted out of).
+  _cand="$(UV_PYTHON_INSTALL_DIR="$_uv_py_dir" UV_PYTHON_PREFERENCE=only-managed \
+    "$_uv_bin" python find "$UV_PYTHON_SERIES" 2>/dev/null || true)"
+  if [ -n "$_cand" ] && _py_usable "$_cand"; then
+    PY="$_cand"
+    echo "Provisioned managed Python: $_cand"
+    return 0
+  fi
+  return 1
+}
+
+# Materialize and self-check the embedded trust root. The key id is the
+# SHA-256 fingerprint of SubjectPublicKeyInfo DER, so an accidental edit to
+# either pinned value fails before the network is consulted. This runs BEFORE
+# the interpreter block below -- the managed-Python default may download uv,
+# and the fail-before-network guarantee must not depend on how the
+# interpreter is provisioned -- so it uses openssl (a hard prerequisite
+# checked above) rather than an interpreter to decode the key.
+printf '%s' "$CLI_MANIFEST_PUBLIC_KEY_B64" \
+  | openssl base64 -d -A > "$TMP/cli-manifest-public.pem" 2>/dev/null || true
+if ! [ -s "$TMP/cli-manifest-public.pem" ] \
+    || ! openssl pkey -pubin -in "$TMP/cli-manifest-public.pem" \
+      -outform DER -out "$TMP/cli-manifest-public.der" 2>/dev/null; then
   err "embedded CLI manifest public key is invalid"
 fi
 PINNED_KEY_SHA="$($SHA_CMD "$TMP/cli-manifest-public.der" | awk '{print $1}')"
 [ "$CLI_MANIFEST_KEY_ID" = "sha256:$PINNED_KEY_SHA" ] \
   || err "embedded CLI manifest public key fingerprint mismatch"
 
+PY=""
+# The interpreter choice is STICKY: a completed install records its mode in
+# the data home (next to `channel`), and a later run without an explicit flag
+# or env value reuses it. Without this, every re-run of the one-liner -- most
+# importantly the one `kirocrew update` performs -- would silently flip the
+# interpreter under an existing install.
+#
+# Managed is the DEFAULT: with no flag, no env value, and no recorded pin,
+# the installer provisions a python-build-standalone CPython via uv. Opt out
+# with --system-python (or KIROCREW_MANAGED_PYTHON=0), which records a
+# `system-pinned` marker so the choice survives updates. A bare `system`
+# marker is NOT an opt-out: earlier installers recorded it for every default
+# install, so it only says "an old default ran here" -- such installs migrate
+# onto the managed default at their next update.
+_DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
+# The marker is agent-writable state, so the READ is guarded like the write:
+# only a plain regular file counts (a planted symlink -- e.g. to /dev/zero --
+# or a FIFO would wedge an unbounded read or spoof the mode), and the read is
+# bounded to the first bytes rather than slurping the file.
+_py_mode_file="$_DATA_HOME/python-mode"
+# Tracks whether the resolved mode was ASKED FOR in THIS run (flag or env
+# value). Only an explicit managed request fails hard when uv cannot
+# provision. A `managed` marker records a DEFAULTED choice, so marker-driven
+# runs keep the degrade-to-system fallback below -- otherwise the first
+# successful default install would turn every later update into a hard
+# network dependency on the uv download.
+PY_MODE_EXPLICIT=0
+PY_MODE_FALLBACK=0
+[ -n "$MANAGED_PYTHON" ] && PY_MODE_EXPLICIT=1
+if [ -z "$MANAGED_PYTHON" ] && [ -f "$_py_mode_file" ] && [ ! -L "$_py_mode_file" ]; then
+  case "$(head -c 16 "$_py_mode_file" 2>/dev/null || true)" in
+    managed)
+      echo "Reusing the recorded managed-python choice (override with --system-python)."
+      MANAGED_PYTHON=1 ;;
+    system-pinned)
+      echo "Reusing the recorded system-python choice (override with --managed-python)."
+      MANAGED_PYTHON=0; PY_MODE_EXPLICIT=1 ;;
+  esac
+fi
+[ -n "$MANAGED_PYTHON" ] || MANAGED_PYTHON=1
+
+if [ "$MANAGED_PYTHON" = "1" ]; then
+  echo "Using a managed Python (the default; opt out with --system-python)."
+  # Interpreters in the store are ALWAYS resolved through the pinned,
+  # SHA-256-verified uv binary (`uv python install` is idempotent, so a
+  # healthy interpreter is reused without a re-download). The store is never
+  # scanned or executed directly: it lives on an agent-writable disk, and a
+  # planted executable there would otherwise run inside the user's own
+  # unattended update.
+  if ! _provision_python_via_uv; then
+    if [ "$PY_MODE_EXPLICIT" = "1" ]; then
+      err "could not provision a managed Python via uv. Check the network connection, or re-run with --system-python to use a system interpreter instead."
+    fi
+    _resolve_python || true
+    if [ -n "$PY" ]; then
+      echo "kirocrew-install: WARNING: could not provision a managed Python (network?); using the system interpreter $PY for this run. The next run retries the managed default." >&2
+      MANAGED_PYTHON=0
+      PY_MODE_FALLBACK=1
+    fi
+  fi
+else
+  _resolve_python || true
+  if [ -z "$PY" ]; then
+    echo "No system Python >=3.12 found; provisioning one via uv ..."
+    _provision_python_via_uv || true
+  fi
+fi
+[ -n "$PY" ] || err "Python >=3.12 is required and could not be found or provisioned. Install Python 3.12+ yourself (your distro's packages, or https://www.python.org/downloads/), then re-run."
+
+# The trust root was materialized and self-checked BEFORE the interpreter
+# block above: the managed-Python default may download uv, and a corrupted
+# trust root must fail before any network I/O.
 if [ -n "$PIN_VERSION" ]; then
   case "$PIN_VERSION" in
     *[!A-Za-z0-9._+]*) err "invalid pinned version '$PIN_VERSION'" ;;
@@ -179,11 +539,34 @@ else
   MANIFEST_URL="$FEED_BASE/feed/$CHANNEL_PATH/latest-cli.json"
   echo "Resolving KiroCrew ($CHANNEL channel) ..."
 fi
+# A pinned miss is policy far more often than it is a broken CDN: releases
+# published before manifest signing was enabled carry no signed manifest and are
+# permanently unpinnable. The URL alone reads as infrastructure failure, which
+# sends an operator whose rollback runbook names such a release to file a CDN bug
+# instead of to the migration path. There is deliberately no version arithmetic
+# here: stock macOS sort has no -V, so the numeric floor lives in the
+# documentation this points at and the immutable manifest stays the only thing
+# this script enforces. Kept as a helper so the fetch below stays a bare `curl`
+# line, which is what test_installer_fetches_authenticated_urls_without_redirects
+# scans for when it proves every authenticated fetch refuses redirects.
+manifest_miss() {
+  # 22 is what `curl -f` returns when the host answered with an HTTP error, so
+  # it is the only status that means the manifest is genuinely absent rather
+  # than unreachable. On a connect, DNS or timeout failure curl has already
+  # printed the transport error and the cutoff is not the operator's problem, so
+  # claiming it there would blame policy for an outage.
+  if [ "$1" = 22 ] && [ -n "$PIN_VERSION" ]; then
+    echo "kirocrew-install: '$PIN_VERSION' cannot be pinned: it either predates signed CLI manifests or was never published." >&2
+    echo "kirocrew-install: Pinning policy and the minimum pinnable release: https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/install.md#pinning-an-exact-version" >&2
+    echo "kirocrew-install: Re-run without --version to install the current $CHANNEL release." >&2
+  fi
+  err "signed CLI manifest not found at $MANIFEST_URL"
+}
 # Bound unauthenticated metadata before it reaches disk. curl 7.58+ enforces
 # --max-filesize against received bytes even without a Content-Length header.
 curl -fsS --proto '=https' --max-filesize 65536 "$MANIFEST_URL" \
   -o "$TMP/cli-manifest.json" \
-  || err "signed CLI manifest not found at $MANIFEST_URL"
+  || manifest_miss $?
 
 # The signature covers canonical JSON containing every field except the
 # signature itself. Reject duplicate/extra/missing keys, decode into bounded
@@ -200,6 +583,10 @@ expected = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "signature", "version", "wheel_url",
 }
+# Signed-but-optional: a breaking release adds a fleet floor. The signature
+# still covers it (it stays in the canonical payload below), so the set check
+# tolerates exactly this key and nothing else.
+optional = {"min_version"}
 
 def no_duplicates(pairs):
     value = {}
@@ -214,7 +601,9 @@ try:
     if len(raw) > 65536:
         raise ValueError("oversized manifest")
     manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
-    if not isinstance(manifest, dict) or set(manifest) != expected:
+    if not isinstance(manifest, dict):
+        raise ValueError("unexpected fields")
+    if not expected <= set(manifest) or set(manifest) - expected - optional:
         raise ValueError("unexpected fields")
     if not all(isinstance(value, str) and value for value in manifest.values()):
         raise ValueError("invalid field type")
@@ -265,8 +654,9 @@ expected_fields = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "version", "wheel_url",
 }
+optional_fields = {"min_version"}
 try:
-    if set(payload) != expected_fields:
+    if not expected_fields <= set(payload) or set(payload) - expected_fields - optional_fields:
         raise ValueError
     if payload["channel"] != expected_channel:
         raise ValueError
@@ -274,6 +664,12 @@ try:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+]{0,127}", version) is None:
         raise ValueError
     if pinned_version and version != pinned_version:
+        raise ValueError
+    # The floor is metadata for RUNNING installs; this installer always
+    # installs the signed version itself, so format is all it checks.
+    if "min_version" in payload and re.fullmatch(
+        r"[0-9]+(?:\.[0-9]+)*", payload["min_version"]
+    ) is None:
         raise ValueError
     if re.fullmatch(r"[0-9a-f]{64}", payload["sha256"]) is None:
         raise ValueError
@@ -311,26 +707,229 @@ GOT="$($SHA_CMD "$WHL" | awk '{print $1}')"
 [ "$GOT" = "$SHA" ] || err "SHA-256 mismatch (expected $SHA, got $GOT) — refusing to install"
 echo "Verified SHA-256."
 
+# Build under a umask that masks group/other WRITE, so bin/kirocrew and its
+# dirs are born non-group-writable -- whether pipx or the managed venv builds
+# them. `kirocrew service install` refuses to attach its AppArmor
+# unprivileged-userns profile to a launcher whose file -- or any ancestor dir
+# -- is group- or world-writable, since another local user could plant an
+# executable at that path and inherit the grant. venv/pip/pipx honour the
+# process umask, so a permissive umask (002, common on shared dev hosts) would
+# otherwise yield a 0775 tree and the profile install would refuse, recurring
+# on every re-install. Tightening at BIRTH (not with a post-build chmod) leaves
+# no window in which a same-group user could modify the tree before it is
+# hardened and blessed. We OR the caller's umask with 022 so we only ever ADD
+# the write-mask bits -- a stricter umask (e.g. 077) is preserved, never
+# loosened. Each branch restores it once its tree is built.
+_KC_PREV_UMASK="$(umask)"
+umask "$(printf '%03o' "$(( $(umask) | 022 ))")"
 if command -v pipx >/dev/null 2>&1; then
   echo "Installing with pipx ..."
-  pipx install --force --python "$PY" "$WHL" >/dev/null
+  # `pipx install --force` over an EXISTING kirocrew venv is not transactional
+  # on pipx's side: its install path removes the whole venv when pip fails,
+  # so a dependency that no longer resolves (the binary-only policy turning a
+  # would-be source build into a refusal, a download that dies) would take a
+  # WORKING `kirocrew` down with it. Keep pipx's own install exactly as it is
+  # today -- --force installs INTO the existing venv (`--force-reinstall`, no
+  # --clear), so `pipx inject`ed packages, anything added with `pipx runpip`,
+  # and every exposed command survive a successful reinstall -- and wrap it in
+  # a rollback: copy the venv aside first, restore the copy if pipx fails,
+  # drop it on success. pipx's launcher symlinks point INTO the venv path, so
+  # a restored tree brings the command back with no relink. A copy, not a
+  # rename, because the install has to run in place for the venv's extra
+  # contents to survive; a rename-and-rebuild would silently drop whatever
+  # pipx's metadata does not record. Guards: pyvenv.cfg proves the target is
+  # a venv; a symlinked venv root is left alone; if pipx cannot name its venv
+  # dir there is nothing to copy and the install runs as today; if the copy
+  # itself fails the installer stops before pipx touches anything. The whole
+  # copy/mutate/restore runs under one install lock (see _wait_install_lock)
+  # so a second installer run cannot snapshot the venv this run is about to
+  # update and later restore that stale snapshot over the finished update.
+  # The lock file sits beside the venv as a plain file (pipx enumerates only
+  # directories there) and is never deleted: removing it would let a waiter
+  # lock a file nobody else opens.
+  _PIPX_VENV_BACKUP=""
+  _PIPX_VENV="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null || true)"
+  _PIPX_VENV="${_PIPX_VENV:+${_PIPX_VENV%/}/kirocrew}"
+  if [ -n "$_PIPX_VENV" ]; then
+    _PIPX_LOCK="$_PIPX_VENV.install.lock"
+    mkdir -p "${_PIPX_VENV%/*}" 2>/dev/null || true
+    if ! : >> "$_PIPX_LOCK" 2>/dev/null; then
+      err "could not create the install lock $_PIPX_LOCK (is ${_PIPX_VENV%/*} writable?). Nothing was changed."
+    fi
+    exec 9>>"$_PIPX_LOCK"
+    _wait_install_lock 900 && _st=0 || _st=$?
+    if [ "$_st" -ne 0 ]; then
+      [ "$_st" -eq 3 ] \
+        && err "another kirocrew installer run has been working on $_PIPX_VENV for 15 minutes (lock $_PIPX_LOCK). Nothing was changed. Wait for it to finish, or stop it, then re-run this installer." \
+        || err "could not take the install lock $_PIPX_LOCK. Nothing was changed."
+    fi
+  fi
+  if [ -n "$_PIPX_VENV" ] && [ -f "$_PIPX_VENV/pyvenv.cfg" ] && [ ! -L "$_PIPX_VENV" ]; then
+    _PIPX_VENV_BACKUP="$_PIPX_VENV.pre-rebuild.$$"
+    _n=0
+    while [ -e "$_PIPX_VENV_BACKUP" ]; do
+      _n=$((_n + 1))
+      _PIPX_VENV_BACKUP="$_PIPX_VENV.pre-rebuild.$$.$_n"
+    done
+    # -R -p (not -a, not -L): symlinks inside the venv stay symlinks, modes
+    # and times are kept; portable to macOS's base cp. If the copy cannot be
+    # made (no space -- the same condition that makes the install itself
+    # likely to fail), stop HERE: running pipx without a rollback would let
+    # a pip failure delete the working install, which is what this copy
+    # exists to prevent. Nothing has been changed at this point.
+    if ! cp -R -p "$_PIPX_VENV" "$_PIPX_VENV_BACKUP" 2>/dev/null; then
+      rm -rf "$_PIPX_VENV_BACKUP" 2>/dev/null || true
+      err "could not copy the existing install aside for rollback ($_PIPX_VENV -> $_PIPX_VENV_BACKUP; out of disk space?). Nothing was changed and the current kirocrew keeps working. Free space (or remove the existing install with 'pipx uninstall kirocrew' to install fresh) and re-run this installer."
+    fi
+  fi
+  # pipx forwards --pip-args to the pip install it drives, so the binary-only
+  # policy reaches the dependency resolution here exactly as in the venv
+  # branch. The `${...:+...}` form adds the flag as one word when the policy
+  # is on and nothing at all when it is off (no empty argument for pipx to
+  # trip on). The output is captured so a failure can be explained; pipx's
+  # own words are replayed by _report_pip_failure.
+  if ! pipx install --force --python "$PY" \
+      ${PIP_BINARY_ONLY:+"--pip-args=$PIP_BINARY_ONLY"} "$WHL" \
+      > "$TMP/pip-install.log" 2>&1; then
+    _report_pip_failure "$TMP/pip-install.log"
+    if [ -n "$_PIPX_VENV_BACKUP" ] && [ -d "$_PIPX_VENV_BACKUP" ]; then
+      _restore_tree "$_PIPX_VENV_BACKUP" "$_PIPX_VENV" \
+        && err "installing the wheel with pipx failed (see the output above). The previous install was restored and keeps working; re-run this installer to retry." \
+        || err "installing the wheel with pipx failed and the previous install could not be restored: $_PIPX_VENV could not be removed, so the working copy was left intact at $_PIPX_VENV_BACKUP. Remove $_PIPX_VENV by hand (check for read-only or immutable files), move the copy back to that path, then re-run this installer."
+    fi
+    err "installing the wheel with pipx failed."
+  fi
+  if [ -n "$_PIPX_VENV_BACKUP" ] && [ -d "$_PIPX_VENV_BACKUP" ]; then
+    rm -rf "$_PIPX_VENV_BACKUP" 2>/dev/null || true
+  fi
+  # The transaction is complete; let a waiting installer run proceed. (On
+  # every failure path above, `err` exits and the kernel drops the lock.)
+  if [ -n "$_PIPX_VENV" ]; then exec 9>&-; fi
+  umask "$_KC_PREV_UMASK"
   BIN="$(pipx environment --value PIPX_BIN_DIR 2>/dev/null || echo "$HOME/.local/bin")"
 else
   # The managed venv lives BESIDE the data home, never inside it. Nesting the
-  # interpreter in the data home put the runtime and the user's data in one
-  # blast radius: the one-time ~/.kirocrew -> ~/.kiro/crew data-home migration
-  # copied the whole legacy tree and then deleted it, which for a wheel install
-  # meant copying a non-relocatable venv (dead shebangs at the destination) and
-  # deleting the live interpreter mid-run — leaving a dangling
-  # ~/.local/bin/kirocrew and no working CLI. Keeping the venv out of the data
-  # home means no home-wide operation can ever reach the interpreter again.
+  # interpreter in the data home would put the runtime and the user's data in
+  # one blast radius: any home-wide operation (a bulk delete, a backup restore,
+  # a relocation) could reach the live interpreter — a non-relocatable venv with
+  # absolute shebangs — and leave a dangling ~/.local/bin/kirocrew and no working
+  # CLI. Keeping the venv out of the data home means no home-wide operation can
+  # ever reach the interpreter.
   _DATA_HOME_FOR_VENV="${KIROCREW_HOME:-$HOME/.kiro/crew}"
   VENV="${KIROCREW_VENV:-${_DATA_HOME_FOR_VENV%/}-venv}"
   _OLD_VENV="${_DATA_HOME_FOR_VENV%/}/venv"
   echo "Installing into managed venv at $VENV ..."
-  "$PY" -m venv "$VENV"
+  # Debian/Ubuntu ship the base `python3` WITHOUT the venv/ensurepip module (it
+  # lives in the separate `python3-venv` / `python3.X-venv` package), so
+  # `python3 -m venv` there dies with "ensurepip is not available" and, under
+  # `set -eu`, aborts the whole install with a raw stack trace. Rather than
+  # driving the system package manager with sudo, fall back to a managed
+  # interpreter: python-build-standalone bundles venv and pip, so the re-probe
+  # always passes on it.
+  if ! "$PY" -c 'import ensurepip, venv' >/dev/null 2>&1; then
+    echo "$PY cannot create a virtual environment (venv/ensurepip missing); provisioning a managed Python via uv instead ..."
+    _provision_python_via_uv \
+      || err "$PY cannot create a virtual environment (the venv/ensurepip module is missing) and a managed Python could not be provisioned. On Debian/Ubuntu install the module with 'sudo apt-get install python3-venv', then re-run."
+  fi
+  # Rebuilding over an EXISTING venv must not keep the old interpreter: the
+  # venv module rewrites pyvenv.cfg but leaves an existing bin/python* symlink
+  # in place, producing a hybrid that CLAIMS the new interpreter while running
+  # the old one. And a rebuild is not committed until the wheel lands: a
+  # relink to a different interpreter series orphans the old site-packages,
+  # so a download failure in the pip step below would otherwise leave a venv
+  # that can no longer import the CLI at all. Make the rebuild transactional:
+  # move the working venv aside (a rename, so it costs nothing), build fresh,
+  # and restore the original on failure. Guards: pyvenv.cfg proves the target
+  # IS a venv (a mis-pointed KIROCREW_VENV at a plain directory is never
+  # touched), and a symlinked venv root (trailing slash stripped so `-L` sees
+  # the link itself) is left as-is. If the rename itself fails (exotic
+  # filesystem), fall back to removing only the stale interpreter links so
+  # the rebuild still cannot produce the hybrid.
+  _VENV_BACKUP=""
+  if [ -f "$VENV/pyvenv.cfg" ] && [ ! -L "${VENV%/}" ]; then
+    _VENV_BACKUP="${VENV%/}.pre-rebuild.$$"
+    # A tree already at the backup path (a crashed earlier run whose PID was
+    # recycled) would make `mv` nest the venv INSIDE it instead of renaming.
+    # That tree may be the only WORKING install left -- a run interrupted
+    # between its move-aside and its restore parks the good venv exactly
+    # there -- so it is never deleted: pick the next free sibling instead.
+    _n=0
+    while [ -e "$_VENV_BACKUP" ]; do
+      _n=$((_n + 1))
+      _VENV_BACKUP="${VENV%/}.pre-rebuild.$$.$_n"
+    done
+    if ! mv "$VENV" "$_VENV_BACKUP" 2>/dev/null; then
+      _VENV_BACKUP=""
+      rm -f "$VENV/bin/python" "$VENV/bin/python3" "$VENV/bin"/python3.* 2>/dev/null || true
+    fi
+  fi
+  # EVERY failure after the move-aside must restore the backup -- under
+  # `set -eu` an unguarded command would exit past the restore and leave the
+  # working install orphaned at the backup path.
+  if ! "$PY" -m venv "$VENV"; then
+    if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
+      _restore_tree "$_VENV_BACKUP" "$VENV" \
+        && err "creating the venv at $VENV failed (disk full?). The previous install was restored and keeps working; re-run this installer to retry." \
+        || err "creating the venv at $VENV failed and the previous install could not be restored from $_VENV_BACKUP."
+    fi
+    err "creating the venv at $VENV failed."
+  fi
   "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
-  "$VENV/bin/pip" install --quiet "$WHL"
+  # On failure, put the pre-rebuild venv back so the previous install keeps
+  # working -- then name the retry instead of dying with a raw pip trace. The
+  # binary-only flag is unquoted on purpose: it is one word or nothing.
+  # shellcheck disable=SC2086
+  if ! "$VENV/bin/pip" install --quiet $PIP_BINARY_ONLY "$WHL" \
+      > "$TMP/pip-install.log" 2>&1; then
+    _report_pip_failure "$TMP/pip-install.log"
+    if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
+      _restore_tree "$_VENV_BACKUP" "$VENV" \
+        && err "installing the wheel into $VENV failed (see the pip output above). The previous install was restored and keeps working; re-run this installer to retry." \
+        || err "installing the wheel into $VENV failed and the previous install could not be restored from $_VENV_BACKUP. Re-run this installer to complete the install."
+    fi
+    err "installing the wheel into $VENV failed. Re-run this installer to complete the install; until then the previous 'kirocrew' command may be unusable."
+  fi
+  if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
+    rm -rf "$_VENV_BACKUP" 2>/dev/null || true
+  fi
+  # Venv tree is fully built and born non-group-writable; restore the caller's
+  # umask so the launcher symlinks below follow it.
+  umask "$_KC_PREV_UMASK"
+  # Keep the stable launch path (`${VENV}-current`) naming the tree that holds
+  # the LAST-INSTALLED version. The gateway's shadow-venv updater
+  # (kiro_crew/platform/wheel_engine.py) promotes this same symlink to a fresh
+  # versioned tree; a later re-run of this installer writes into the fixed
+  # $VENV again, so without this repoint the stable link would keep naming the
+  # older versioned tree and a gateway restart would resurrect it. Replaced
+  # atomically (sibling symlink + rename) via the interpreter because POSIX
+  # `mv` onto a symlink-to-directory moves INTO the target and `ln -sfn` has
+  # an unlink/create window. A real directory at the stable name is corrupt
+  # state and is left alone — the updater refuses it too, so nothing consumes
+  # it. Failure is non-fatal: the stable link is an optimization layer, and
+  # the direct launcher symlink below keeps working without it.
+  _VENV_CURRENT="${VENV%/}-current"
+  if [ -L "$_VENV_CURRENT" ] || [ ! -e "$_VENV_CURRENT" ]; then
+    "$PY" -c 'import os,sys
+target, link = os.path.abspath(sys.argv[1]), sys.argv[2]
+tmp = f"{link}.{os.getpid()}.new"
+try:
+    # PID reuse can leave a stale tmp from a killed installer at this exact
+    # name; without removing it first os.symlink raises EEXIST, os.replace is
+    # skipped, and the restart stays pinned to the old version. Mirrors the
+    # pre-unlink the wheel-engine promote/launcher paths already do.
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+' "$VENV" "$_VENV_CURRENT" || echo "WARNING: could not update $_VENV_CURRENT; continuing." >&2
+  fi
   mkdir -p "$HOME/.local/bin"
   ln -sf "$VENV/bin/kirocrew" "$HOME/.local/bin/kirocrew"
   BIN="$HOME/.local/bin"
@@ -374,11 +973,57 @@ fi
 
 _DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
 mkdir -p "$_DATA_HOME"
-printf '%s\n' "$CHANNEL" > "$_DATA_HOME/channel"
+# Atomic, symlink-proof marker writes. A plain `>` redirection FOLLOWS a
+# pre-planted symlink at the destination -- the data home is agent-writable,
+# so a hostile `ln -sf ~/.bashrc .../python-mode` would turn the next install
+# run into an arbitrary-file overwrite. mktemp creates a fresh regular file
+# (O_EXCL, never a symlink); a pre-existing symlink at the destination is
+# removed first (mv would REPLACE a symlink-to-file, but would move the temp
+# file INSIDE a symlink-to-directory's target); a real directory at the
+# marker path is corrupt state and is refused loudly -- mv would otherwise
+# move the temp file inside it and every later read would silently miss the
+# marker. After those guards the destination is absent or a regular file, so
+# the rename is atomic and can never land outside the data home.
+_write_marker() {
+  _marker_dest="$_DATA_HOME/$1"
+  [ -L "$_marker_dest" ] && rm -f "$_marker_dest"
+  [ -d "$_marker_dest" ] \
+    && err "refusing to record $1: a directory occupies $_marker_dest -- remove it and re-run"
+  _marker_tmp="$(mktemp "$_DATA_HOME/.marker.XXXXXX")"
+  printf '%s\n' "$2" > "$_marker_tmp"
+  mv -f "$_marker_tmp" "$_marker_dest"
+}
+_write_marker channel "$CHANNEL"
+# Record the interpreter mode so the next run -- including the re-run that
+# `kirocrew update` performs -- keeps the same choice without the flag.
+# `system-pinned` is only ever written for an EXPLICIT system choice; a
+# transient fallback from the managed default records nothing, so the next
+# run retries managed instead of freezing a network hiccup into a pin.
+if [ "$MANAGED_PYTHON" = "1" ]; then
+  _write_marker python-mode managed
+elif [ "$PY_MODE_FALLBACK" = "1" ]; then
+  :
+else
+  _write_marker python-mode system-pinned
+fi
 
 echo ""
 echo "Installed kirocrew $VER (channel: $CHANNEL)."
 case ":$PATH:" in
-  *":$BIN:"*) echo "Run: kirocrew --help" ;;
-  *) echo "Add $BIN to your PATH, then run: kirocrew --help" ;;
+  *":$BIN:"*) : ;;
+  *) echo "Add $BIN to your PATH first (e.g. add it in your shell profile)." ;;
 esac
+# Point at the actual next step, not just --help: a user who ran the one-liner
+# wants a running gateway. The persistent-service path (systemd/launchd) is
+# otherwise buried in the docs, which is the #1 remote-crew onboarding
+# complaint. `service install` is the durable path; `gateway` is the foreground
+# one for a quick look.
+echo ""
+echo "Next steps:"
+echo "  kirocrew gateway            # start the dashboard now (http://localhost:5476)"
+echo "  kirocrew service install    # run it 24/7 as a service (survives logout, restarts on crash)"
+echo "  kirocrew --help             # everything else"
+echo ""
+echo "Need a non-default port (e.g. 5476 is already taken)? Set it at install time;"
+echo "it is baked into the service unit:"
+echo "  KIROCREW_PORT=5477 kirocrew service install"

@@ -4,6 +4,9 @@ ACP provider cli.json overlay helpers."""
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +20,7 @@ from kiro_crew.effort import (
     model_supports_effort,
     resolve_effort_for_model,
 )
+from kiro_crew.providers import acp as acp_provider
 from kiro_crew.providers.acp import (
     _clear_cli_overlay_effort,
     _read_cli_overlay,
@@ -201,6 +205,62 @@ class TestCliOverlay:
         _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7")  # must not raise
         assert _read_cli_overlay(tmp_path) == {}
 
+    def test_clear_reports_success_only_when_the_file_stops_naming_the_model(self, tmp_path):
+        # The postcondition is about the FILE, so an absent file and an absent
+        # entry are both successes -- there is nothing left to re-seed from.
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+        assert _read_cli_overlay(tmp_path) == {}
+
+    def test_clear_separates_a_malformed_file_from_a_failed_read(self, tmp_path, monkeypatch):
+        # Two very different facts share one code path. A malformed file names no
+        # effort for anyone and `_read_cli_overlay` reads it as {} too, so the
+        # postcondition already holds. A read that fails while the file EXISTS
+        # and the lock is held is transient IO, and the level may still be on
+        # disk -- reporting a clear there is the silent stale reload this return
+        # value exists to prevent.
+        settings_dir = tmp_path / ".kiro" / "settings"
+        settings_dir.mkdir(parents=True)
+        (settings_dir / "cli.json").write_text("{ not json", encoding="utf-8")
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+        real_read_text = Path.read_text
+
+        def _flaky_read(self, *args, **kwargs):
+            if self.name == "cli.json":
+                raise OSError("sharing violation")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _flaky_read)
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is False
+        monkeypatch.undo()
+        assert _read_cli_overlay(tmp_path) == {"claude-opus-4.7": "max"}
+
+    def test_clear_reports_failure_only_when_the_lock_is_genuinely_stuck(
+        self, tmp_path, monkeypatch
+    ):
+        # The clear takes the ACTION ceiling, far above projection's own
+        # sub-second critical section, so losing the lock means a stuck holder
+        # rather than routine contention. That is what keeps this answer
+        # two-valued instead of needing a third state for a failure that would
+        # otherwise happen by design.
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+        seen = {}
+
+        @contextmanager
+        def _busy(_work_dir, *, timeout=None):
+            seen["timeout"] = timeout
+            raise OSError("lock busy")
+            yield  # pragma: no cover - unreachable, keeps the generator shape
+
+        monkeypatch.setattr(acp_provider, "workspace_cli_settings_lock", _busy)
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is False
+        monkeypatch.undo()
+        assert seen["timeout"] == acp_provider.CLI_SETTINGS_LOCK_ACTION_TIMEOUT_SECS
+        assert _read_cli_overlay(tmp_path) == {"claude-opus-4.7": "max"}
+
     def test_gpt_write_uses_reasoning_key_and_roundtrips(self, tmp_path):
         # kiro-cli persists GPT effort under `reasoning`, not `output_config`;
         # the wrong key is silently ignored, so the on-disk shape must match.
@@ -327,6 +387,323 @@ class TestFactoryEffortThreading:
             reasoning_effort_override="ultra",
         )
         assert kwargs.get("effort_per_model") == {}
+
+
+class TestFactoryDropWarning:
+    """The factory's effort gate is the single authority that drops a requested
+    effort, so IT names the drop: one warning at the gate covers every
+    surface that funnels through it (spawn, dashboard slot, cron) and cannot
+    drift from the decision it reports on. Silence stays the contract when the
+    effort is delivered, invalid, or absent."""
+
+    _LOGGER = "kiro_crew.config.loader"
+
+    def _drop_warnings(self, caplog, tmp_path, **factory_call) -> list[str]:
+        cfg = KiroCrewConfig()
+        cfg.agent.provider = "acp"
+        with patch("kiro_crew.providers.acp.AcpProvider") as mock_provider:
+            mock_provider.return_value = MagicMock()
+            factory = cfg.create_provider_factory()
+            with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+                # cwd is tmp_path-scoped so the factory never falls through to
+                # _session_work_dir() -> workspace_root(), which would CREATE
+                # the operator's real workspace dir as a test side effect.
+                factory(cwd=str(tmp_path), **factory_call)
+            assert mock_provider.called, "factory did not construct AcpProvider"
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno == logging.WARNING
+            and "will not be applied" in r.getMessage()
+        ]
+
+    def test_non_capable_model_warns_once_naming_model_and_level(self, caplog, tmp_path):
+        msgs = self._drop_warnings(
+            caplog,
+            tmp_path,
+            session_key="dashboard:1",
+            model_override="deepseek-3.2",
+            reasoning_effort_override="high",
+        )
+        assert len(msgs) == 1
+        assert "'deepseek-3.2'" in msgs[0]
+        assert "'high'" in msgs[0]
+        # Attribution: the session the drop happened for is in the line.
+        assert "dashboard:1" in msgs[0]
+
+    def test_unresolved_model_warns_once_naming_auto(self, caplog, tmp_path):
+        # 'auto' collapses to "" through to_acp_id — nothing is pinned and the
+        # overlay cannot be keyed. The gate names it 'auto' (the DEFAULT_MODEL
+        # sentinel the backend resolves itself), matching the spawn-side
+        # effort_dropped verdict so one drop event reads as one event.
+        msgs = self._drop_warnings(
+            caplog,
+            tmp_path,
+            session_key="dashboard:1",
+            model_override="auto",
+            reasoning_effort_override="max",
+        )
+        assert len(msgs) == 1
+        assert "'auto'" in msgs[0]
+        assert "'max'" in msgs[0]
+
+    def test_explicit_override_warns_every_time(self, caplog, tmp_path):
+        # A caller's own request being dropped is the event this gate exists
+        # to surface — an explicit override never dedupes, so a config-default
+        # drop cannot burn the key and silence a later per-slot request
+        # (Design review on this PR).
+        cfg = KiroCrewConfig()
+        cfg.agent.provider = "acp"
+        with patch("kiro_crew.providers.acp.AcpProvider") as mock_provider:
+            mock_provider.return_value = MagicMock()
+            factory = cfg.create_provider_factory()
+            with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+                factory(
+                    session_key="dashboard:1",
+                    model_override="deepseek-3.2",
+                    reasoning_effort_override="high",
+                    cwd=str(tmp_path),
+                )
+                factory(
+                    session_key="dashboard:2",
+                    model_override="deepseek-3.2",
+                    reasoning_effort_override="high",
+                    cwd=str(tmp_path),
+                )
+        msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno == logging.WARNING
+            and "will not be applied" in r.getMessage()
+        ]
+        assert len(msgs) == 2
+        assert "dashboard:1" in msgs[0]
+        assert "dashboard:2" in msgs[1]
+
+    def test_config_default_drop_warns_once_per_factory(self, caplog, tmp_path):
+        # A static config fact (agent.reasoning_effort with a non-capable
+        # model, no per-call override) must not repeat on every provider
+        # construction — the factory dedupes it per (model, level).
+        cfg = KiroCrewConfig()
+        cfg.agent.provider = "acp"
+        cfg.agent.reasoning_effort = "high"
+        with patch("kiro_crew.providers.acp.AcpProvider") as mock_provider:
+            mock_provider.return_value = MagicMock()
+            factory = cfg.create_provider_factory()
+            with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+                factory(
+                    session_key="dashboard:1",
+                    model_override="deepseek-3.2",
+                    cwd=str(tmp_path),
+                )
+                factory(
+                    session_key="dashboard:2",
+                    model_override="deepseek-3.2",
+                    cwd=str(tmp_path),
+                )
+        msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno == logging.WARNING
+            and "will not be applied" in r.getMessage()
+        ]
+        assert len(msgs) == 1
+
+    def test_config_default_dedupe_does_not_silence_explicit_override(self, caplog, tmp_path):
+        # The exact interleave the Design review flagged: a config-default
+        # drop fires first and burns its dedupe key; a later EXPLICIT request
+        # for the same (model, level) must still warn.
+        cfg = KiroCrewConfig()
+        cfg.agent.provider = "acp"
+        cfg.agent.reasoning_effort = "high"
+        with patch("kiro_crew.providers.acp.AcpProvider") as mock_provider:
+            mock_provider.return_value = MagicMock()
+            factory = cfg.create_provider_factory()
+            with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+                factory(
+                    session_key="dashboard:1",
+                    model_override="deepseek-3.2",
+                    cwd=str(tmp_path),
+                )
+                factory(
+                    session_key="cron:job-1",
+                    model_override="deepseek-3.2",
+                    reasoning_effort_override="high",
+                    cwd=str(tmp_path),
+                )
+        msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno == logging.WARNING
+            and "will not be applied" in r.getMessage()
+        ]
+        assert len(msgs) == 2
+        assert "cron:job-1" in msgs[1]
+
+    def test_capable_model_stays_silent(self, caplog, tmp_path):
+        msgs = self._drop_warnings(
+            caplog,
+            tmp_path,
+            session_key="dashboard:1",
+            model_override="claude-opus-4.7",
+            reasoning_effort_override="xhigh",
+        )
+        assert msgs == []
+
+    def test_invalid_effort_stays_silent(self, caplog, tmp_path):
+        # An invalid level is not a "valid requested effort dropped" — it was
+        # never eligible for the overlay, so the gate says nothing.
+        msgs = self._drop_warnings(
+            caplog,
+            tmp_path,
+            session_key="dashboard:1",
+            model_override="claude-opus-4.7",
+            reasoning_effort_override="ultra",
+        )
+        assert msgs == []
+
+    def test_no_effort_stays_silent(self, caplog, tmp_path):
+        msgs = self._drop_warnings(
+            caplog,
+            tmp_path,
+            session_key="dashboard:1",
+            model_override="deepseek-3.2",
+        )
+        assert msgs == []
+
+
+class TestPoolEffortPostClaim:
+    """A requested reasoning effort on a warm-pool claim is applied post-claim
+    via provider.change_effort, recovering pool-hit startup latency without
+    bypassing the pool."""
+
+    @pytest.mark.asyncio
+    async def test_pool_claim_with_effort_override_applies_effort_post_claim(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.providers.acp import AcpProvider
+        from kiro_crew.session import SessionManager
+
+        cfg = MagicMock()
+        cfg.session.pool_size = 2
+        cfg.session.pool_agent = "kirocrew"
+        cfg.session.pool_ttl_secs = 1800
+        cfg.session.timeout_secs = 3600
+        cfg.agent.default_agent = ""
+        cfg.agent.model = "auto"
+
+        pooled = MagicMock(spec=AcpProvider)
+        pooled.client = MagicMock()
+        pooled.client._model = "claude-sonnet-4.6"
+        pooled.client.rekey = MagicMock()
+        pooled.change_effort = AsyncMock(return_value=True)
+        pooled.is_process_alive = MagicMock(return_value=True)
+        pooled.cwd = ""
+
+        factory = MagicMock(return_value=pooled)
+        mgr = SessionManager(cfg, factory)
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+
+        provider, is_new, resumed = await mgr.get_or_create(
+            "slot-1",
+            agent=None,
+            reasoning_effort_override="high",
+        )
+
+        assert provider is pooled
+        mgr._drain_and_claim.assert_awaited_once()
+        pooled.change_effort.assert_awaited_once_with("high")
+        factory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pool_claim_with_unsupported_model_logs_warning(self, caplog):
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.providers.acp import AcpProvider
+        from kiro_crew.session import SessionManager
+
+        cfg = MagicMock()
+        cfg.session.pool_size = 2
+        cfg.session.pool_agent = "kirocrew"
+        cfg.session.pool_ttl_secs = 1800
+        cfg.session.timeout_secs = 3600
+        cfg.agent.default_agent = ""
+        cfg.agent.model = "auto"
+
+        pooled = MagicMock(spec=AcpProvider)
+        pooled.client = MagicMock()
+        pooled.client._model = "deepseek-3.2"  # not effort-capable
+        pooled.client.rekey = MagicMock()
+        pooled.change_effort = AsyncMock(return_value=False)
+        pooled.is_process_alive = MagicMock(return_value=True)
+        pooled.cwd = ""
+
+        factory = MagicMock(return_value=pooled)
+        mgr = SessionManager(cfg, factory)
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+
+        with caplog.at_level(logging.WARNING):
+            provider, is_new, resumed = await mgr.get_or_create(
+                "slot-2",
+                agent=None,
+                reasoning_effort_override="high",
+            )
+
+        assert provider is pooled
+        pooled.change_effort.assert_awaited_once_with("high")
+        assert any(
+            "reasoning effort 'high' will not be applied (session slot-2)" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_pool_claim_with_change_effort_exception_logs_warning_and_spares_session(
+        self, caplog
+    ):
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.providers.acp import AcpProvider
+        from kiro_crew.session import SessionManager
+
+        cfg = MagicMock()
+        cfg.session.pool_size = 2
+        cfg.session.pool_agent = "kirocrew"
+        cfg.session.pool_ttl_secs = 1800
+        cfg.session.timeout_secs = 3600
+        cfg.agent.default_agent = ""
+        cfg.agent.model = "auto"
+
+        pooled = MagicMock(spec=AcpProvider)
+        pooled.client = MagicMock()
+        pooled.client._model = "claude-sonnet-4.6"
+        pooled.client.rekey = MagicMock()
+        pooled.change_effort = AsyncMock(side_effect=RuntimeError("KAS effort unsupported"))
+        pooled.is_process_alive = MagicMock(return_value=True)
+        pooled.cwd = ""
+
+        factory = MagicMock(return_value=pooled)
+        mgr = SessionManager(cfg, factory)
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+
+        with caplog.at_level(logging.WARNING):
+            provider, is_new, resumed = await mgr.get_or_create(
+                "slot-3",
+                agent=None,
+                reasoning_effort_override="high",
+            )
+
+        assert provider is pooled
+        pooled.change_effort.assert_awaited_once_with("high")
+        assert any(
+            "Pool post-claim: failed to apply reasoning effort 'high' (session slot-3)" in r.message
+            for r in caplog.records
+        )
 
 
 class TestFactoryDefaultEffortFallback:

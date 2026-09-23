@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew import env as env_mod
 from kiro_crew import platform_compat
 
@@ -38,10 +39,13 @@ def _fake_node_bin(d: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
-    """``node_bin_dirs`` is lru_cached for the process lifetime — reset per test."""
+    """``node_bin_dirs`` / ``_node_all_bin_dirs`` are lru_cached for the process
+    lifetime — reset per test."""
     env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
     yield
     env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
 
 
 @pytest.fixture
@@ -67,6 +71,11 @@ def isolated_home(tmp_path, monkeypatch):
     # No marker file: point data_home at an empty dir.
     monkeypatch.setattr(
         env_mod, "_marker_node_bin_dir", lambda: None, raising=True
+    )
+    # The standalone-tree tier reads data_home(); keep it inside the fake HOME so
+    # a real ensure-node.sh install on the developer's box cannot leak in.
+    monkeypatch.setattr(
+        env_mod, "data_home", lambda: home / ".kiro" / "crew", raising=True
     )
     return home
 
@@ -113,9 +122,13 @@ def test_relative_marker_is_rejected(tmp_path, monkeypatch):
 def test_absolute_marker_first_line_is_taken(tmp_path, monkeypatch):
     home = tmp_path / "dh"
     home.mkdir()
-    (home / "node-bin-dir").write_text("/opt/node/bin\ntrailing junk\n")
+    # Spelled for the host (conftest.host_abs): the marker is validated with
+    # ``os.path.isabs``, which from Python 3.13 rejects a bare ``/opt/node/bin``
+    # on Windows (no drive).
+    node_bin = host_abs("opt", "node", "bin")
+    (home / "node-bin-dir").write_text(f"{node_bin}\ntrailing junk\n")
     monkeypatch.setattr(env_mod, "data_home", lambda: home, raising=True)
-    assert env_mod._marker_node_bin_dir() == "/opt/node/bin"
+    assert env_mod._marker_node_bin_dir() == node_bin
 
 
 def test_missing_marker_is_not_an_error(tmp_path, monkeypatch):
@@ -157,7 +170,8 @@ def test_validated_bin_dir_rejects(bad):
 
 
 def test_validated_bin_dir_accepts_and_strips():
-    assert env_mod._validated_bin_dir("  /opt/node/bin  ") == "/opt/node/bin"
+    node_bin = host_abs("opt", "node", "bin")
+    assert env_mod._validated_bin_dir(f"  {node_bin}  ") == node_bin
 
 
 def test_data_home_is_imported_at_module_scope():
@@ -187,6 +201,34 @@ def test_numeric_versions_outrank_alias_names(isolated_home):
     _fake_node_bin(root / "lts-krypton" / "bin")
     _fake_node_bin(root / "24.16.0" / "bin")
     assert env_mod.node_bin_dirs()[0] == str(root / "24.16.0" / "bin")
+
+
+def test_build_and_discovery_tiers_keep_their_own_policies(isolated_home):
+    """The two callers of the manager-root scan need DIFFERENT answers.
+
+    ``node_bin_dirs`` (build PATH) must return only the best real toolchain per
+    root; ``node_all_bin_dirs`` (MCP binary discovery) must return every
+    version's bin dir — including ones without ``node`` — because a global npm
+    binary can live under any installed version. Collapsing these into one
+    policy is exactly the regression this rule warns against.
+    """
+    root = isolated_home / ".local/share/mise/installs/node"
+    best = _fake_node_bin(root / "24.16.0" / "bin")
+    older = _fake_node_bin(root / "18.0.0" / "bin")
+    bare = root / "16.0.0" / "bin"  # no node inside — still a search location
+    bare.mkdir(parents=True)
+
+    build = env_mod.node_bin_dirs()
+    assert str(best) in build
+    assert str(older) not in build
+    assert str(bare) not in build
+
+    discovery = env_mod.node_all_bin_dirs()
+    assert str(best) in discovery
+    assert str(older) in discovery
+    assert str(bare) in discovery
+    # Best version still leads the discovery ordering.
+    assert discovery.index(str(best)) < discovery.index(str(older))
 
 
 def test_version_key_orders_numerically_not_lexicographically():
@@ -235,6 +277,7 @@ def test_each_version_manager_layout_is_found(isolated_home, layout):
     ".local/share/mise/shims",
     ".volta/bin",
     "n/bin",
+    ".n/bin",
 ])
 def test_shim_dirs_are_found(isolated_home, layout):
     d = _fake_node_bin(isolated_home / layout)
@@ -303,3 +346,62 @@ def test_find_node_tool_returns_absolute_path(isolated_home):
 
 def test_find_node_tool_returns_none_when_absent(isolated_home):
     assert env_mod.find_node_tool("npm", "") is None
+
+
+# --- standalone Node trees (no version manager, no marker) ---
+def test_hand_unpacked_tarball_under_local_node_is_found(isolated_home):
+    """A nodejs.org tarball unpacked by hand is a real toolchain, not "no Node".
+
+    Nothing about this host is a version manager and nothing wrote the marker, so
+    before the tree tier existed the resolver returned empty and every caller
+    that pins PATH reported Node as missing on a machine that plainly had it.
+    """
+    d = _fake_node_bin(isolated_home / ".local" / "node" / "bin")
+    assert str(d) in env_mod.node_bin_dirs()
+
+
+def test_ensure_node_glibc217_tree_is_found_without_the_marker(isolated_home):
+    """The tree Kiro Crew's own installer unpacks must not depend on the marker.
+
+    ``ensure-node.sh`` writes ``<data-home>/node-bin-dir`` after installing, but a
+    tree installed under a different KIROCREW_HOME (or a marker since deleted)
+    left the product unable to see the Node it installed itself.
+    """
+    d = _fake_node_bin(env_mod.data_home() / "node-glibc217" / "bin")
+    assert str(d) in env_mod.node_bin_dirs()
+
+
+def test_a_manager_install_outranks_a_standalone_tree(isolated_home):
+    """Build callers get the manager's version -- the one engines were resolved
+    against -- and the standalone tree only as a fallback behind it."""
+    tree = _fake_node_bin(isolated_home / ".local" / "node" / "bin")
+    managed = _fake_node_bin(
+        isolated_home / ".local/share/mise/installs/node/24.0.0/bin"
+    )
+
+    dirs = env_mod.node_bin_dirs()
+    assert dirs.index(str(managed)) < dirs.index(str(tree))
+
+
+def test_a_general_purpose_bin_dir_is_not_a_node_tree(isolated_home):
+    """``~/.local/bin`` holds node BESIDE unrelated user binaries, and every entry
+    here is prepended to a deliberately pinned build PATH -- adding it would let
+    a user copy of any tool shadow the system one that pinning guarantees."""
+    _fake_node_bin(isolated_home / ".local" / "bin")
+    assert env_mod.node_bin_dirs() == ()
+
+
+def test_npm_and_npx_resolve_through_a_standalone_tree(isolated_home):
+    """The failure that surfaced this was an unresolvable ``npm``/``npx``, not
+    ``node`` -- resolution has to cover the tools the installers actually spawn."""
+    d = isolated_home / ".local" / "node" / "bin"
+    _fake_node_bin(d)
+    npx = d / ("npx.cmd" if platform_compat.IS_WINDOWS else "npx")
+    npx.write_text("@echo off\n" if platform_compat.IS_WINDOWS else "#!/bin/sh\nexit 0\n")
+    npx.chmod(0o755)
+
+    # An empty base path stands in for a service PATH that omits the tree.
+    for tool in ("node", "npm", "npx"):
+        found = env_mod.find_node_tool(tool, "")
+        assert found is not None, tool
+        assert Path(found).parent == d

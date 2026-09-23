@@ -1,4 +1,4 @@
-"""The host-mutation floor guards itself (issue #1722).
+"""The host-mutation floor guards itself.
 
 Two jobs:
 
@@ -26,7 +26,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import source_corpus
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_host_service_guard")
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _ROOT_CONFTEST = _REPO_ROOT / "conftest.py"
 _SRC = _REPO_ROOT / "src" / "kiro_crew"
@@ -98,6 +104,12 @@ _DELIBERATELY_UNGUARDED = {
     # behind them — a detector of `doas`, not a spawn of it. `doas systemctl
     # restart` is still caught on the inner `systemctl` token.
     "doas": "privilege prefix; the wrapped command carries the action",
+    # The polkit equivalent, and excluded for the identical reason. Its only
+    # appearance in src/ is as a MEMBER of `name_grant._DISPATCHERS`, the table
+    # that refuses to vouch for a program which runs another program named in
+    # its arguments -- a detector of `pkexec`, not a spawn of it. `pkexec
+    # systemctl restart` is still caught on the inner `systemctl` token.
+    "pkexec": "privilege prefix; the wrapped command carries the action",
 }
 
 
@@ -127,14 +139,19 @@ def _service_tools_referenced_in_src() -> dict[str, tuple[str, ...]]:
     needing to model every call shape -- the codebase spawns through several
     wrappers (``_run_cmd``, ``_systemctl``, ``sandboxed_spawn_argv``), so a scan
     anchored on stdlib call sites alone would miss most of them.
+
+    No single literal narrows this gate (any vocabulary word could appear
+    without any other), so it walks the whole tree via
+    ``source_corpus.parsed_candidates()`` -- one shared read of the source text
+    and one parse per module, instead of this file re-reading and re-parsing
+    ``src/`` on its own. The RESULT (file:line strings) is tiny and safe to
+    keep memoized for the rest of this module; the corpus's own ~160 MB text
+    cache is what ``test/conftest.py``'s module-scoped
+    ``_release_source_corpus_after_module`` drops at teardown.
     """
     found: dict[str, list[str]] = {}
-    for path in sorted(_SRC.rglob("*.py")):
+    for path, _text, tree in source_corpus.parsed_candidates():
         if "_vendor" in path.parts:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
             continue
         skip = _docstring_nodes(tree)
         for node in ast.walk(tree):
@@ -157,7 +174,7 @@ class TestRatchet:
         """A new service-control tool in production must be a conscious decision.
 
         Without this, someone adding an ``initctl`` or ``pkexec`` call site would
-        land a spawn the floor does not recognise, and the next #1722 would look
+        land a spawn the floor does not recognise, and the next such regression would look
         exactly like the first one.
         """
         accounted = (
@@ -200,9 +217,35 @@ class TestRatchet:
         assert "systemctl" in referenced
         assert "launchctl" in referenced
 
-    def test_exec_allowlist_is_empty(self) -> None:
-        """No test may drive a real service today, and adding one needs review."""
-        assert _root._HOST_SERVICE_EXEC_ALLOWED_MODULES == frozenset()
+    #: The only modules allowed to drive a real service manager: the opt-in
+    #: end-to-end suites. Pinned as an exact set so an addition is a reviewed
+    #: change to this file, not a silent widening.
+    EXPECTED_ALLOWLIST = frozenset(
+        {
+            "e2e.scenarios.test_cron_fire",
+            "e2e.scenarios.test_service_install_dry_run",
+            "e2e.scenarios.test_settings_save",
+            "e2e.scenarios.test_subagent_spawn",
+            "e2e.scenarios.test_wheel_install",
+            "test_pod_windows_boot",
+        }
+    )
+
+    def test_exec_allowlist_names_only_the_opt_in_e2e_suites(self) -> None:
+        """Adding a real-service test needs review, and every entry must exist."""
+        assert _root._HOST_SERVICE_EXEC_ALLOWED_MODULES == self.EXPECTED_ALLOWLIST
+        test_dir = pathlib.Path(__file__).resolve().parent
+        for name in self.EXPECTED_ALLOWLIST:
+            path = test_dir.joinpath(*name.split(".")).with_suffix(".py")
+            assert path.exists(), f"allowlisted module has no file: {path}"
+
+    def test_every_allowlisted_suite_is_opt_in(self) -> None:
+        """A listed module skips itself unless its operator variable is set."""
+        test_dir = pathlib.Path(__file__).resolve().parent
+        scenarios_conftest = (test_dir / "e2e" / "scenarios" / "conftest.py").read_text()
+        assert "KIROCREW_E2E_SCENARIOS" in scenarios_conftest
+        canary = (test_dir / "test_pod_windows_boot.py").read_text()
+        assert 'os.environ.get("KIROCREW_E2E_POD_WINDOWS") != "1"' in canary
 
     def test_live_target_reexecs_through_the_guarded_funnel(self) -> None:
         """The guard traps ``execve`` only; pin that this is still the funnel used.
@@ -304,6 +347,31 @@ class TestRefusalReason:
     def test_a_verb_before_the_manager_is_ignored(self) -> None:
         """Only the tail is scanned, so a wrapper's own flags cannot be the action."""
         assert _root._refusal_reason(["restart-helper", "--", "systemctl", "show", "x"]) is None
+
+    def test_the_pod_cli_mutating_verbs_are_refused(self) -> None:
+        """A child ``kirocrew pod up`` reaches a service manager one process away."""
+        assert _root._refusal_reason(["python", "-m", "kiro_crew", "pod", "up", "wt", "--json"])
+        assert _root._refusal_reason(["/x/.venv/bin/kirocrew", "pod", "down", "wt"])
+        assert _root._refusal_reason(["C:\\v\\Scripts\\kirocrew.exe", "pod", "install"])
+        assert _root._refusal_reason(["kirocrew", "pod", "prune", "--all"])
+
+    def test_the_pod_cli_read_only_verbs_are_allowed(self) -> None:
+        assert _root._refusal_reason(["kirocrew", "pod", "ls", "--json"]) is None
+        assert _root._refusal_reason(["python", "-m", "kiro_crew", "pod", "status", "wt"]) is None
+        assert _root._refusal_reason(["kirocrew", "pod", "api", "wt", "GET", "health"]) is None
+
+    def test_pod_as_an_argument_to_another_program_is_ignored(self) -> None:
+        assert _root._refusal_reason(["git", "pod", "up"]) is None
+        assert _root._refusal_reason(["python", "-m", "other", "pod", "up"]) is None
+
+    def test_schtasks_mutating_switches_are_refused(self) -> None:
+        """Task Scheduler is a service manager too; its verbs are `/Create`-style."""
+        assert _root._refusal_reason(["schtasks", "/Create", "/F", "/TN", "x", "/TR", "y"])
+        assert _root._refusal_reason(["C:\\Windows\\System32\\schtasks.exe", "/Run", "/TN", "x"])
+        assert _root._refusal_reason(["schtasks", "/delete", "/TN", "x", "/F"])
+
+    def test_schtasks_query_is_allowed(self) -> None:
+        assert _root._refusal_reason(["schtasks", "/Query", "/TN", "x"]) is None
 
     def test_an_ordinary_spawn_is_allowed(self) -> None:
         assert _root._refusal_reason(["git", "status", "--porcelain"]) is None
@@ -454,10 +522,10 @@ class TestXdgRedirect:
         assert pathlib.Path(xdg).resolve() != (pathlib.Path.home() / ".config").resolve()
 
     def test_the_dropin_path_lands_outside_the_real_config_dir(self) -> None:
-        """The exact call that caused #1722, now provably harmless.
+        """The exact call that caused the incident, now provably harmless.
 
         ``_dropin_path()`` is unstubbed here on purpose -- that is the whole point.
-        A test that forgets to stub it must no longer be able to name the
+        A test that forgets to stub it must not be able to name the
         operator's real unit directory.
         """
         from kiro_crew.apps.builtins.dev_fleet import server as mod
@@ -465,3 +533,215 @@ class TestXdgRedirect:
         dropin = mod._dropin_path().resolve()
         real = (pathlib.Path.home() / ".config" / "systemd" / "user").resolve()
         assert real not in dropin.parents, f"{dropin} is inside the operator's real config dir"
+
+
+class TestRepositoryRootResidueGuard:
+    """The checkout is host state, and this is the only layer that guards it.
+
+    A test writing into the repository is invisible to every other check: the test
+    passes, CI is green, and the review bots see nothing, because the write happens
+    in a grandchild process against an inherited CWD with no ``touch`` or ``open``
+    in the test's own source. So what these pin is the guard's judgement, in both
+    directions -- it must name a real artifact, and it must stay silent on anything
+    the runner or git already owns, because a guard that cries wolf gets deleted
+    and then protects nothing.
+    """
+
+    def test_it_reports_a_name_git_does_not_ignore(self) -> None:
+        root = _load_root_conftest()
+
+        assert root._not_ignored({"INJECTED"}) == ["INJECTED"]
+
+    def test_it_stays_silent_on_names_git_ignores(self) -> None:
+        """Toolchain scratch is declared ignorable, so it is not residue.
+
+        Deferred to `git check-ignore` rather than a pattern list in the guard,
+        which is what keeps the two from drifting apart.
+        """
+        root = _load_root_conftest()
+
+        assert root._not_ignored({".pytest_cache"}) == []
+
+    def test_an_empty_set_needs_no_subprocess(self) -> None:
+        root = _load_root_conftest()
+
+        with mock.patch.object(
+            root.subprocess, "run", side_effect=AssertionError("must not spawn")
+        ):
+            assert root._not_ignored(set()) == []
+
+    @pytest.mark.parametrize(
+        "boom",
+        [OSError("no git"), subprocess.SubprocessError("broken")],
+        ids=["git-missing", "spawn-failed"],
+    )
+    def test_it_reports_unclassifiable_when_git_cannot_be_run(self, boom: Exception) -> None:
+        """``None`` is a third answer: git never looked, so neither verdict holds."""
+        root = _load_root_conftest()
+
+        with mock.patch.object(root.subprocess, "run", side_effect=boom):
+            assert root._not_ignored({"INJECTED", ".pytest_cache"}) is None
+
+    def test_a_fatal_git_exit_is_not_read_as_nothing_ignored(self) -> None:
+        """The route the real cases take, and the one an exception test misses.
+
+        MEASURED: `check-ignore` exits 1 with empty stdout when nothing is
+        ignored, and 128 with empty stdout when it could not look at all -- a
+        non-git export, or a checkout git refuses for dubious ownership. Reading
+        128 as "nothing is ignored" would report every toolchain artifact as
+        residue and fail the whole suite on such a host.
+        """
+        root = _load_root_conftest()
+        fatal = subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="fatal")
+
+        with mock.patch.object(root.subprocess, "run", return_value=fatal):
+            assert root._not_ignored({"INJECTED", ".pytest_cache"}) is None
+
+    def test_nothing_ignored_is_distinguished_from_cannot_look(self) -> None:
+        """Exit 1 with the same empty stdout means every name IS residue."""
+        root = _load_root_conftest()
+        none_ignored = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+
+        with mock.patch.object(root.subprocess, "run", return_value=none_ignored):
+            assert root._not_ignored({"INJECTED"}) == ["INJECTED"]
+
+    def test_an_unclassifiable_root_does_not_fail_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A guard that reds the suite on an unanswerable question gets deleted,
+        and then it protects nothing."""
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", set())
+        monkeypatch.setattr(root, "_root_entries", lambda: {"INJECTED"})
+        monkeypatch.setattr(root, "_not_ignored", lambda names: None)
+        session = self._session_with_residue(root, pytest.ExitCode.OK)
+
+        root.pytest_sessionfinish(session, pytest.ExitCode.OK)
+
+        assert session.exitstatus == pytest.ExitCode.OK
+
+    def test_runner_scratch_is_exempt_regardless_of_what_git_says(self) -> None:
+        """MEASURED: the same `.pytest_cache` at the same commit reports ignored on
+        Linux and NOT ignored on the Windows runner. Leaning only on git therefore
+        failed three Windows shards on which every test passed. pytest and coverage
+        create these, so they are outside what this guard looks for."""
+        root = _load_root_conftest()
+
+        assert root._runner_owned(".pytest_cache") is True
+        assert root._runner_owned(".coverage") is True
+        assert root._runner_owned(".cache") is True
+        # Coverage writes one file per process, so an exact-name list would miss them.
+        assert root._runner_owned(".coverage.fv-az1234.4321.XmYqRt") is True
+
+    def test_a_test_written_file_is_not_exempt(self) -> None:
+        root = _load_root_conftest()
+
+        assert root._runner_owned("INJECTED") is False
+        assert root._runner_owned("scratch.txt") is False
+
+    def test_runner_scratch_never_reaches_the_verdict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exemption is applied BEFORE git is consulted, so a host where git
+        misclassifies the cache cannot fail the run over it. Asserted on the spawn
+        rather than the helper: the helper short-circuits an empty set, and it is
+        the subprocess that would carry the misclassification."""
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", set())
+        monkeypatch.setattr(root, "_root_entries", lambda: {".pytest_cache", ".coverage"})
+        monkeypatch.setattr(
+            root.subprocess, "run", lambda *a, **k: pytest.fail("git spawned for runner scratch")
+        )
+        session = self._session_with_residue(root, pytest.ExitCode.OK)
+
+        root.pytest_sessionfinish(session, pytest.ExitCode.OK)
+
+        assert session.exitstatus == pytest.ExitCode.OK
+
+    def test_a_real_artifact_still_fails_alongside_runner_scratch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exempting the cache must not exempt what shipped next to it."""
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", set())
+        monkeypatch.setattr(root, "_root_entries", lambda: {".pytest_cache", "INJECTED"})
+        seen: list[set[str]] = []
+        monkeypatch.setattr(
+            root, "_not_ignored", lambda names: seen.append(names) or sorted(names)
+        )
+        session = self._session_with_residue(root, pytest.ExitCode.OK)
+
+        root.pytest_sessionfinish(session, pytest.ExitCode.OK)
+
+        assert seen == [{"INJECTED"}], "runner scratch must be filtered before git"
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_only_the_controller_snapshots(self) -> None:
+        """Every xdist worker shares this filesystem. Letting each one snapshot
+        and report would turn one stray file into one failure per worker."""
+        root = _load_root_conftest()
+        worker = SimpleNamespace(config=SimpleNamespace(workerinput={}))
+        before = root._ROOT_BASELINE
+
+        root.pytest_sessionstart(worker)
+
+        assert root._ROOT_BASELINE is before
+
+    def _session_with_residue(self, root, exitstatus: int):
+        """A finished session whose run left one residue entry."""
+        session = SimpleNamespace(
+            config=SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda _n: None)),
+            exitstatus=exitstatus,
+        )
+        return session
+
+    @pytest.mark.parametrize(
+        "exitstatus",
+        [
+            pytest.ExitCode.INTERRUPTED,
+            pytest.ExitCode.INTERNAL_ERROR,
+            pytest.ExitCode.USAGE_ERROR,
+            pytest.ExitCode.NO_TESTS_COLLECTED,
+        ],
+        ids=["interrupted", "internal-error", "usage-error", "no-tests"],
+    )
+    def test_it_does_not_overwrite_a_more_specific_exit_status(
+        self, monkeypatch: pytest.MonkeyPatch, exitstatus: pytest.ExitCode
+    ) -> None:
+        """INTERRUPTED and INTERNAL_ERROR say the run did not finish. Reporting
+        TESTS_FAILED instead would tell a caller it completed and failed, which is
+        a different fact, so a residue report must not launder one into the other.
+        """
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", set())
+        monkeypatch.setattr(root, "_root_entries", lambda: {"INJECTED"})
+        monkeypatch.setattr(root, "_not_ignored", lambda names: sorted(names))
+        session = self._session_with_residue(root, exitstatus)
+
+        root.pytest_sessionfinish(session, exitstatus)
+
+        assert session.exitstatus == exitstatus
+
+    def test_it_promotes_only_a_clean_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", set())
+        monkeypatch.setattr(root, "_root_entries", lambda: {"INJECTED"})
+        monkeypatch.setattr(root, "_not_ignored", lambda names: sorted(names))
+        session = self._session_with_residue(root, pytest.ExitCode.OK)
+
+        root.pytest_sessionfinish(session, pytest.ExitCode.OK)
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_a_clean_root_leaves_the_exit_status_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard must be inert on the overwhelmingly common path."""
+        root = _load_root_conftest()
+        monkeypatch.setattr(root, "_ROOT_BASELINE", {"src"})
+        monkeypatch.setattr(root, "_root_entries", lambda: {"src"})
+        session = self._session_with_residue(root, pytest.ExitCode.OK)
+
+        root.pytest_sessionfinish(session, pytest.ExitCode.OK)
+
+        assert session.exitstatus == pytest.ExitCode.OK

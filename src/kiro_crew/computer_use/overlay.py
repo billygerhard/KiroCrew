@@ -38,9 +38,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 import threading
-from typing import Any, Sequence
+from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.computer_use.cursor_motion import MotionPlan, plan_motion
@@ -309,7 +308,7 @@ class CursorOverlay:
         repo's spawn-isolation contract, so the child sits in its own process group
         and :func:`platform_compat.kill_process_tree` can reap it.
         """
-        argv = [sys.executable, "-m", OVERLAY_MODULE]
+        argv = platform_compat.isolated_python_argv("-m", OVERLAY_MODULE)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -423,11 +422,6 @@ def _move_command(plan: MotionPlan) -> "dict[str, Any]":
         OVERLAY_KEY_POINTS: [[point[0], point[1]] for point in plan.points],
         OVERLAY_KEY_MS: plan.duration_ms,
     }
-
-
-def points_payload(points: Sequence[tuple[float, float]]) -> "list[list[float]]":
-    """Wire form for an arbitrary point sequence (used by tests and diagnostics)."""
-    return [[float(x), float(y)] for x, y in points]
 
 
 # ── Process-wide shared supervisor ──

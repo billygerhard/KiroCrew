@@ -71,7 +71,7 @@ Layer 4  Output ....... credential redaction + URL exfil scan + streaming redact
 Layer 3  Validation ... typed MCP tool schemas, unicode normalization, length caps
 Layer 2  Command ...... denied-command rules + sensitive-bash + exfil shapes
 Layer 1  Filesystem ... resolved-path gate (read block + wider write block)
-Layer 0  OS sandbox ... namespace (Linux) / Seatbelt (macOS), opt-in
+Layer 0  OS sandbox ... namespace (Linux) / Seatbelt (macOS), default auto where supported
 
 Across all layers: request auth (dashboard tokens, CSRF, Host allowlist),
                    Slack owner lock + workspace origin check,
@@ -89,13 +89,17 @@ active YOLO grant can never route around a hard deny.
 Confines the `kiro-cli` subprocess tree with platform-native isolation, hiding
 credential directories by bind-mount (Linux user + mount namespaces) or file-read
 denial (macOS Seatbelt), and scrubbing credential-bearing environment variables
-on the way in. The parent gateway process is unaffected.
+on the way in. Windows has no Kiro Crew OS wrapper, so positively identified
+official Kiro CLI spawns delegate to the CLI's built-in sandbox; their environment
+is scrubbed by the parent before spawn. The parent gateway process is unaffected.
 
-**`agent.sandbox` defaults to `"off"`, and the only other selectable value is
-`"auto"`** (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
+**`agent.sandbox` defaults to `"auto"`, engaging OS-level isolation
+(namespace on Linux, sandbox-exec on macOS).** The only alternative value is
+`"off"` (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
 the same two-value enum gates the dashboard config editor in
-`dashboard/handlers/core.py`). `"off"` is not "no isolation": it defers isolation
-to `kiro-cli`'s own internal agent sandbox, which cannot nest inside Kiro Crew's
+`dashboard/handlers/core.py`). `"off"` skips Kiro Crew's own sandbox but still
+delegates to `kiro-cli`'s internal agent sandbox on macOS when it is enabled,
+which cannot nest inside Kiro Crew's
 Seatbelt wrap (the macOS kernel returns EPERM even under an allow-all outer
 profile), so exactly one layer can own isolation per spawn. Setting `"auto"`
 re-enables Kiro Crew's own sandbox.
@@ -114,19 +118,56 @@ Two properties are load-bearing at the architecture level:
 
 - **Failure is refusal, not degradation.** With no sandbox backend available and
   a mode other than `off`, `wrap_argv` raises rather than spawning unconfined.
-  Running unconfined is an explicit opt-in (`agent.sandbox_allow_unsandboxed_exec`);
+  Running unconfined is permitted by an explicit opt-in
+  (`agent.sandbox_allow_unsandboxed_exec=true`) or, on a platform with no
+  installable backend, by that platform's default;
   a separate flag (`agent.sandbox_allow_no_isolation`) only demotes the warning's
   log level and does not permit execution. The opt-in's default is
-  **platform-independent** — a platform-derived default would grant unconfined
-  execution on every backend-less host with no operator having declared it — so
-  the discoverable path is instead a consent step in `kirocrew setup`, which
-  prompts (default no) when `detect_backend()` reports `"none"` and writes the
-  key only on an explicit yes.
+  **platform-dependent** — allow on Windows, where no user namespace, no
+  `sandbox-exec` and nothing installable can ever satisfy the check, and
+  fail-closed everywhere else, where a missing backend is broken or one AppArmor
+  profile away from working and the guidance names that profile. The cost is
+  stated rather than glossed: on Windows this removes a deny-by-default
+  authorization. A declared `false` outranks the platform default in both
+  directions, a governance `sandbox.min_level` floor outranks the declaration,
+  and every unconfined spawn is SEL-audited `unconfined` naming the permitting
+  party — the platform grant has no config file standing as its record.
+  `kirocrew setup` still asks, in the direction that matches the default: the
+  opt-IN where it is fail-closed, and the exposure stated plus the opt-OUT where
+  it is allow, writing nothing on a decline so the host stays undeclared.
+- **Windows Kiro delegation is not a global fail-open.** `is_kiro_cli=True` from a
+  reviewed official-Kiro spawn site delegates directly to Kiro's built-in sandbox
+  before backend probing. A Kiro-looking filename is insufficient on Windows.
+  Third-party ACP backends, scripts, hooks and other subprocesses still take the
+  normal no-backend refusal and require the explicit opt-in above.
 - **Delegation is audited, never silent.** When `kiro-cli`'s internal sandbox owns
   isolation for a spawn, the decision is config-driven (never a reaction to a wrap
   failure), logged once per process, and SEL-audited on an audit-or-deny basis: if
-  the audit cannot be written, the delegation is refused and Kiro Crew's own
-  Seatbelt takes the spawn.
+  the audit cannot be written, the delegation is refused. Kiro Crew's own Seatbelt
+  takes the spawn on macOS; Windows returns to its no-backend fail-closed policy.
+
+**The crew-home masks do NOT apply on the delegated path, and that is a stated
+residual rather than an oversight.** Kiro Crew's built-in HIDDEN leaves — the
+credential homes, `.env`, `live_target.json`, `inbound-spool`, `whatsapp`,
+`tasks`, `scratch` — are applied by Kiro Crew's OWN launcher (bind mounts on
+Linux, Seatbelt on macOS). A delegated spawn returns before that launcher runs
+(`wrap_argv` → `_delegate_to_kiro_internal_sandbox`), so inside a delegated child
+a shell can open any of them. The residual is the same for every leaf and is not
+specific to any one of them; only the caller-supplied `extra_hidden_dirs` /
+`extra_visible_dirs` / `extra_writable_dirs` / `extra_expose_files` disable
+delegation, because those are the restrictions a caller asked for explicitly and
+the delegated sandbox cannot prove it enforces. Member memory does not add
+another sandbox delegation restriction.
+
+Extending the same test to the built-in leaves is the obvious remedy and it is the
+WRONG one: on Windows every first-party kiro-cli spawn would fall to the
+no-backend path, which is unconfined — strictly worse than a delegated sandbox
+that happens not to mask the crew home. So the coherent fix is at the delegation
+layer (teach the delegated sandbox the leaf set, or refuse the leaves' contents at
+a boundary the delegated child still crosses), not at the mask list. Until then,
+Layers 1, 2 and 4 are what cover these paths on those two platforms, and a NEW
+leaf inherits exactly this residual: adding one strictly improves Linux and
+non-delegated macOS, and changes nothing on the delegated paths.
 
 **Launcher shims are deliberately not bypassed on the delegated path.** On that
 path the shim is part of `kiro-cli`'s own sandbox mechanism, so resolving past it
@@ -169,6 +210,21 @@ access: it re-checks the resolved target and then opens the canonical path with
 `O_NOFOLLOW`, which closes the TOCTOU window where the final component is swapped
 for a symlink after the check.
 
+The text, byte and prefix readers also check the opened descriptor before consuming
+content. They require a regular file, a kernel-reported path matching the canonical
+name validated before opening, and a non-sensitive target. An unavailable path
+witness or an ancestor-directory swap refuses the read and closes the descriptor.
+The name comparison does not resolve the original path again. Benign links already
+resolved during validation and arbitrary authorized non-sensitive files remain
+readable; this does not replace the separate hardlink and root restrictions of
+the stricter `safe_read_file_bytes_nolink()` reader, which performs the same witness
+check even without a root argument. The identity-allowlist reader retains its
+opened-inode authorization. These readers, the media-copy reader, fixed-path
+internal sensitive reads and export descriptor admission request nonblocking
+POSIX opens so a FIFO cannot stall before the regular-file check. They do not
+promise a content snapshot against an external writer modifying the same inode
+in place.
+
 ### The keystone: the agent cannot read or rewrite its own ceiling
 
 The governance trust root (`security_policy.json`, `profiles/`,
@@ -185,11 +241,50 @@ than through the shared gate, so real functionality is unaffected.
 Each leaf is registered under every known data-home prefix, so a not-yet-migrated
 legacy home is fenced identically to the current `~/.kiro/crew`.
 
-**Do not weaken this when editing the path or bash matchers.** Write and extract
-verbs must stay covered: a bash command that merely *names* a write-protected
-leaf is refused, verb-independently, because an enumerated write-verb allowlist is
-inherently bypassable (quoted redirects, `cp`, a Python `open(..., 'w')`, or any
-novel verb).
+### Member memory routing and path guidance
+
+Memory V2 assigns one stable member to one managed SQLite store. It separates
+learning ownership rather than promising that same-host agents cannot read each
+other's files. Member-specific OS views, hardlink scans, process ancestry proofs,
+HMAC capabilities and duplicate protected grants are not part of this contract.
+The host sandbox, credentials, HTTP/MCP authentication, owner/app permissions,
+audit integrity and mandatory enterprise rules retain their independent duties.
+
+Built-in file tools continue to guard `memory_stores/` against accidental raw
+access and database/sidecar writes. Globbed project instructions skip managed
+memory state. Ordinary Linux and macOS sandbox rules expose the named-store root
+read-only: built-in writes run in the gateway, so sandboxed code needs no direct
+write access. Linux prepares an absent root as an empty directory for its mount;
+this creates no database or member configuration. Reads remain possible across
+members. This is write integrity where the ordinary sandbox is active, not a
+same-host confidentiality or universal integrity guarantee. Sandbox-off execution,
+external host tools and pre-existing writable aliases remain outside that rule.
+Existing named V1 root links remain supported; the Global V1 paths are unchanged.
+
+Authenticated internal memory calls capture the session's canonical execution
+record once and carry that binding into background work. An unknown member or
+unavailable selected database never falls back to Global. Templates and projects
+do not change ownership. Explicit cross-member delegation uses the target's
+existing store and the normal delegation permissions. It does not copy learning.
+
+The dashboard's explicit `?store=` parameter remains owner-only. The middleware's
+user claim is distinct from internal transport authentication and from app-token
+scope; a bound memory tool does not acquire owner privileges. Local owner-token
+bootstrap still requires positive host provenance or a live backend launched by
+this gateway. Its OS identity checks remain shared host authorization, independent
+of which member stores exist. On Linux, a CLI peer in a different user or mount
+namespace is refused unless it is a live application backend tracked by this
+gateway. This intentional owner-token bootstrap restriction applies even with no
+members;
+cross-namespace CLI login from containers, Snap or Flatpak is not claimed as
+verified.
+
+Trusted storage APIs validate the selected database's member/store identity and
+use SQLite transactions. The injection audit reads each member's SQLite lessons
+and labels findings by store; V2 has no writable JSONL learning fallback. Global
+V1 keeps its existing Markdown/JSONL behavior. See
+[security](../system-specs/modules/security.md#member-memory-boundaries) and
+[memory](../system-specs/modules/memory-skills-hooks.md) for the detailed contract.
 
 ### Audited internal carve-out
 
@@ -242,12 +337,18 @@ granted).
 
 ## Layer 3: Input validation (`validation.py`)
 
-Every MCP tool call is checked against a declarative `FieldSpec` + `ToolSchema`
-before the handler sees it: NFC unicode normalization with hidden-character
-stripping (control, format, private-use and surrogate code points, preserving
-`\n`/`\r`/`\t`), enum allow-lists, regex patterns for identifiers, range checks,
-unknown-field rejection, tiered length caps (`MAX_TOOL_NAME_LEN` 256,
-`MAX_SHORT_STRING` 500, `MAX_MEDIUM_STRING` 5 000, `MAX_LONG_STRING` 50 000), and
+Every Kiro Crew-owned MCP tool call is checked against a declarative
+`FieldSpec` + `ToolSchema` before the handler sees it: NFC unicode normalization with hidden-character
+stripping (control, format and surrogate code points, preserving `\n`/`\r`/`\t`
+plus the four shaping marks in `_ALLOWED_FORMAT` when they sit next to non-ASCII
+text; private-use code points are deliberately kept, because Nerd Font and
+terminal-theme icon glyphs live there and are visible to a reader, so they cannot
+hide a credential from one), enum allow-lists, regex patterns for identifiers,
+range checks, unknown-field rejection, tiered length caps (`MAX_TOOL_NAME_LEN` 256,
+`MAX_SHORT_STRING` 500, `MAX_MEDIUM_STRING` 5 000, `MAX_LONG_STRING` 50 000, and
+the field-specific `MAX_CRON_MESSAGE` 50 000 for the cron `message` — a task
+prompt, enforced on the MCP schemas, both REST cron endpoints, and the
+`CronService` persistence chokepoint), and
 response truncation at `MAX_RESPONSE_LEN` (100 000 chars) so unbounded tool output
 cannot be a DoS vector.
 
@@ -262,6 +363,10 @@ an external service. The authoritative list is the `redaction_paths` control in
 test: every redactor call site in the package must be either a registered sink or
 on an explicit non-egress allowlist, so a new egress path cannot be added without
 someone deciding which bucket it belongs in.
+
+The memory recovery, record editor, and member recall/copy APIs each register
+their own output boundary. Their response fields pass through the shared
+credential and exfiltration-URL chain before reaching the dashboard or MCP caller.
 
 - `redact_credentials()` recognizes credential families in plaintext and
   base64-encoded form (it decodes base64-looking chunks and re-checks the decoded
@@ -307,6 +412,16 @@ proceed when their audit cannot be written. The one documented exception is the
 nested-sandbox passthrough, which has no safe alternative (the kernel denies a
 re-wrap by design) and would otherwise couple every in-sandbox spawn to SEL
 health; it logs loudly and proceeds, still confined by the outer boundary.
+
+That exception has one carve-out, and only one: a **cron script child** whose
+audit write fails with `ENOSYS`. That errno means the child inherited a seccomp
+filter from a sandbox torn down underneath it, so it can neither audit nor
+persist anything it goes on to do, and nobody is watching it -- its parent
+records the run as ok either way. Such a child refuses instead of proceeding
+(`sandbox.refuse_unaudited_on_dead_fs`, gated on a marker the cron launcher puts
+in the child's environment AND on that errno). Everything else, including the
+gateway's own spawns and any other audit failure, keeps the log-and-proceed
+posture above. `test_sandbox_cron_child_audit.py` pins both halves.
 
 ## Governance: the enterprise ceiling
 
@@ -381,7 +496,13 @@ Enterprise Grid validation is a two-layer, **default-open** control: with no
 `auth.test` caches the workspace `team_id` (plus the org-level enterprise id on
 Grid) at startup, and each inbound event's `team` is compared against the cached
 allowlist. A governance `channels.posture` policy is the agent-unweakenable
-ceiling on top of the operator-editable config allowlist.
+ceiling on top of the operator-editable config allowlist. A corrupt `config.json`
+does not reopen the control: because `KiroCrewConfig.load()` degrades a torn
+config to defaults rather than raising, the module positively detects that case (a
+config file that exists but does not parse) and fails CLOSED, keeping the allowlist
+enforced and admitting NO origin -- not even the just-validated workspace,
+since which authenticated workspace is allowed is exactly what the unreadable
+allowlist would have decided -- rather than reverting to default-open.
 
 ### Interactive trust escalation
 
@@ -416,7 +537,11 @@ enterprise policy can deny it via the `yolo_duration` scope's `permanent` member
 which downgrades it to the ordinary ad-hoc duration.
 
 Every lifecycle transition (`activate`, `renew`, `expired`, `deactivate`) is
-SEL-audited, and fleet-visibility endpoints expose the live state
+SEL-audited. The transitions that create or extend auto-approval authority
+(`activate`, `activate_scoped`, `renew`) audit **fail-closed**: the SEL event is
+written before the grant is committed, and if the write fails the grant (or the
+extension) is refused — auto-approval authority never exists without an audit
+record. Fleet-visibility endpoints expose the live state
 (`/api/status` reports `yolo_active` / `yolo_expires_at`;
 `/api/admin/compliance/yolo-status` carries the full override status).
 
@@ -432,10 +557,10 @@ text is framed as explicitly untrusted data with a SEL event on every drop.
 
 | Control | Implementation |
 |---|---|
-| XSS prevention | DOMPurify on all rendered HTML content |
-| Safe DOM APIs | `createElement` + `textContent` for error fallbacks |
-| Mermaid | `securityLevel: 'strict'` (iframe sandbox), so an injected diagram cannot execute JS |
-| No `innerHTML` | React text children rather than HTML string construction |
+| HTML/SVG sanitization | Model-authored Markdown, highlighted code, Mermaid, SVG and icon markup pass through DOMPurify before a controlled HTML sink |
+| Executable document isolation | Widgets and other executable `srcdoc` content use sandboxed iframes plus restrictive CSP rather than DOMPurify, which would strip their scripts |
+| Safe DOM APIs | Ordinary text and error fallbacks use React text children or `createElement` + `textContent` |
+| Mermaid | `securityLevel: 'strict'`, followed by sanitization, so an injected diagram cannot execute JS |
 | No regex linkification | React elements via `.split()` |
 
 ## Credential file handling
@@ -495,8 +620,41 @@ credential stores, and blocking the whole home directory would make the agent
 useless for its normal work. An agent write there is therefore a real persistence
 vector, mitigated only by the approval gate and the destructive-command rules.
 
-**Resource ceilings depend on the platform.** The cgroup v2 scope that bounds
-fork bombs and memory balloons requires Linux with cgroup delegation; where it is
-unavailable (macOS, older Linux, no user session) it is a no-op with a loud
-warning and only the file-descriptor limit applies. See
-[`resource-protection.md`](resource-protection.md).
+**Resource ceilings depend on the platform.** Linux uses cgroup v2 for
+subtree process and memory ceilings when delegation is available. Windows ACP
+agent trees instead use Job Object process-count and memory limits (with process,
+not thread, semantics). macOS and Linux hosts without delegation have no hard
+per-subtree process/memory ceiling; they retain the file-descriptor cap and
+post-failure reapers. See [`resource-protection.md`](resource-protection.md).
+
+**Launcher self-poisoning by the same user is accepted, not defended (CWE-345;
+tracked as CWE-778 by
+[#371](https://github.com/kirodotdev/KiroCrew/pull/371) /
+[#417](https://github.com/kirodotdev/KiroCrew/issues/417)).** The resolved
+`kiro-cli` launcher is executed in place with no signature, hash, ownership or
+install-source check — the only gate is `platform_compat.is_executable_file`
+(`kiro_cli.py`) — so an agent running as the invoking user can overwrite its own
+launcher and have those bytes executed on the next spawn. **Status: ACCEPTED.**
+The mechanism that would close it is *rejected by design*, not missing by
+oversight: see
+[`security.md` § Kiro prerequisite setup boundary](../system-specs/modules/security.md),
+which records that trust is "the CLI runs, and it has a valid login" regardless
+of install source, owner, or fixed path, because Kiro Crew is not the authority
+on where Kiro CLI lives and its own self-updater legitimately rewrites those
+bytes as the user — an owner / path / Developer-ID gate would strand real
+installs (toolbox, Homebrew, winget, a self-updated `/Applications` bundle) with
+no in-product recovery path. The same section records the sibling resolve-to-exec
+byte-binding copy as deliberately removed ("Do NOT reintroduce it") once Kiro CLI
+became a multi-call binary. The accepted tradeoff is therefore **install-model
+compatibility over a same-UID integrity check**: the attack presupposes local
+write access as the operator, which is outside this product's threat model (an
+attacker holding the operator's UID already owns the account) and is not
+defended against anywhere else — `~/.bashrc`, above, is the same class. Residual
+blast radius is bounded on the confined spawn paths (Linux namespace, macOS
+seatbelt) which run even a poisoned launcher inside Kiro Crew's own sandbox;
+only macOS internal-sandbox delegation exec's it directly. A multi-tenant or
+enterprise posture would need signing infrastructure, key management and an
+install-layout decision, and any such gate must default **off** — the
+`KIROCREW_PROVIDER_BIN_STRICT` precedent
+(`github_runner.py:validate_provider_executable`) records that requiring a
+root-owned copy made every stock package-manager install fail.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -107,6 +108,45 @@ class TestArtifactReferenceLink:
         assert ARTIFACT_ROUTE_PREFIX not in result
         assert "<mcwidget" in result
 
+    def test_save_hints_when_the_slug_was_suffixed(self) -> None:
+        # given a markdown save whose derived slug was already taken. The
+        # name-based dedup probe is scoped to chat widgets and stays silent
+        # here, so the store's report is the only signal.
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary-2",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+                "slug_collided_with": "run-summary",
+            },
+        ):
+            # when the save tool result is rendered
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# corrected", "kind": "markdown"},
+            )
+        # then it names the taken slug and the verb that versions in place
+        assert "'run-summary'" in result
+        assert "artifact_update" in result
+
+    def test_save_omits_the_hint_when_the_slug_was_free(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# notes", "kind": "markdown"},
+            )
+        assert "already taken" not in result
+
     def test_get_non_widget_emits_markdown_link(self) -> None:
         # given a fetched markdown artifact
         with patch(
@@ -144,7 +184,7 @@ class TestArtifactReferenceLink:
 
     def test_update_non_widget_emits_markdown_link(self) -> None:
         # given an updated text artifact
-        with patch("kiro_crew.mcp_core.urllib.request.urlopen") as urlopen_mock:
+        with patch("kiro_crew.mcp_core.loopback_urlopen") as urlopen_mock:
             urlopen_mock.return_value.__enter__.return_value.read.return_value = (
                 b'{"slug": "log", "version": 5, "name": "Run Log", "kind": "text"}'
             )
@@ -155,7 +195,7 @@ class TestArtifactReferenceLink:
 
     def test_link_falls_back_to_slug_when_name_missing(self) -> None:
         # given an updated non-widget artifact whose response omits 'name'
-        with patch("kiro_crew.mcp_core.urllib.request.urlopen") as urlopen_mock:
+        with patch("kiro_crew.mcp_core.loopback_urlopen") as urlopen_mock:
             urlopen_mock.return_value.__enter__.return_value.read.return_value = (
                 b'{"slug": "anon-doc", "version": 1, "kind": "markdown"}'
             )
@@ -468,6 +508,87 @@ class TestArtifactSave:
         assert "Saved artifact" in result
 
 
+class TestThemeContrastHint:
+    # The save/update responses attach a soft warning when the gateway's
+    # relayed ``theme_contrast_warning`` field says the persisted content
+    # hardcodes its palette. The MCP tool does NOT recompute the verdict
+    # (the request body can be stale for file-promoted saves) — it reads
+    # the relayed field, exactly like ``slug_collided_with``. Detection
+    # edge cases are unit-tested directly on the store predicate in
+    # test_artifacts.py. Warning only — the save/update always proceeds.
+
+    def test_save_hint_when_gateway_flags(self) -> None:
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={
+                    "slug": "perf",
+                    "version": 1,
+                    "kind": "widget",
+                    "theme_contrast_warning": True,
+                },
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Perf page", "content": '<div style="color:#111">hi</div>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+        assert "var(--text,#111)" in result
+
+    def test_save_no_hint_when_gateway_silent(self) -> None:
+        # False AND absent (older gateway) must both stay silent.
+        for extra in ({"theme_contrast_warning": False}, {}):
+            with (
+                patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+                patch(
+                    "kiro_crew.mcp_core._post",
+                    return_value={"slug": "perf", "version": 1, "kind": "widget", **extra},
+                ),
+            ):
+                result = _call_tool_inner(
+                    "artifact_save",
+                    {"name": "Perf page", "content": "<div>hi</div>"},
+                )
+            assert "Hardcoded colors" not in result
+
+    def test_update_hint_when_gateway_flags(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={
+                "slug": "perf",
+                "version": 2,
+                "kind": "widget",
+                "name": "Perf",
+                "theme_contrast_warning": True,
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "content": '<body style="background:#fffbe6">x</body>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+
+    def test_update_no_hint_when_gateway_silent(self) -> None:
+        # Metadata-only updates: the gateway stamps False (nothing to lint).
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={
+                "slug": "perf",
+                "version": 2,
+                "kind": "widget",
+                "name": "P2",
+                "theme_contrast_warning": False,
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "name": "P2"},
+            )
+        assert "Hardcoded colors" not in result
+
+
 class TestArtifactGet:
     def test_get_current(self) -> None:
         with patch(
@@ -609,7 +730,7 @@ class TestArtifactRevert:
                 "kiro_crew.mcp_core._get",
                 return_value={"slug": "doc", "version": 2, "content": target_content},
             ) as get_mock,
-            patch("kiro_crew.mcp_core.urllib.request.urlopen") as urlopen_mock,
+            patch("kiro_crew.mcp_core.loopback_urlopen") as urlopen_mock,
         ):
             urlopen_mock.return_value.__enter__.return_value.read.return_value = (
                 b'{"slug": "doc", "version": 4}'
@@ -651,7 +772,7 @@ class TestArtifactRevert:
                 "kiro_crew.mcp_core._get",
                 return_value={"slug": "doc", "version": 2, "content": "v2"},
             ),
-            patch("kiro_crew.mcp_core.urllib.request.urlopen") as urlopen_mock,
+            patch("kiro_crew.mcp_core.loopback_urlopen") as urlopen_mock,
         ):
             urlopen_mock.return_value.__enter__.return_value.read.return_value = (
                 b'{"slug": "doc", "version": 4, "source_path": "/home/u/notes/doc.md"}'
@@ -670,7 +791,7 @@ class TestArtifactRevert:
                 "kiro_crew.mcp_core._get",
                 return_value={"slug": "doc", "version": 2, "content": "v2"},
             ),
-            patch("kiro_crew.mcp_core.urllib.request.urlopen") as urlopen_mock,
+            patch("kiro_crew.mcp_core.loopback_urlopen") as urlopen_mock,
         ):
             urlopen_mock.return_value.__enter__.return_value.read.return_value = (
                 b'{"slug": "doc", "version": 4}'  # no source_path
@@ -721,7 +842,7 @@ class TestArtifactGetCommentsFullBody:
         assert body in result
 
     def test_long_body_not_truncated(self) -> None:
-        # 500-char body — previously would be cut to 200
+        # 500-char body: the full body is preserved, not truncated to 200.
         body = "A" * 250 + " MIDDLE " + "B" * 242
         assert len(body) == 500
         with patch(
@@ -1226,3 +1347,112 @@ class TestArtifactDeleteCommentTool:
                     {"slug": "doc", "comment_id": "c1"},
                 )
         dl.assert_not_called()
+
+
+class TestArtifactPatchUsesTheVerbHelper:
+    """Both artifact PATCH senders carry the same recovery every verb has.
+
+    ``mcp_core._patch`` carries the refusal->invalidate->re-resolve->replay
+    rule that a raw ``_api_urlopen`` does not: a gateway that came up (or moved
+    ports) after this tool server booted is recorded only in the run marker, so
+    the first attempt is refused and every verb must recover from that.
+
+    The resolver is scripted at ``_resolve_api_port`` — the one seam the whole
+    discovery chain funnels through — so these tests do not depend on how many
+    times a single attempt consults it.
+    """
+
+    def _moving_gateway(self, monkeypatch):
+        """First attempt refused; the gateway is then discoverable on a new port."""
+        import kiro_crew.mcp_core as mcp_core
+
+        monkeypatch.setattr(mcp_core, "_API_PORT", None)
+        monkeypatch.setattr(mcp_core, "_API", None)
+        monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", None)
+        monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+
+        state = {"port": 5476}
+        monkeypatch.setattr(mcp_core, "_resolve_api_port", lambda: (state["port"], "marker"))
+
+        attempts: list[str] = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"slug": "doc", "version": 5, "source_path": "/n/doc.md"}'
+
+        def fake_loopback(req, timeout=None, unix_socket_path=None):
+            attempts.append(req.full_url)
+            if ":5476" in req.full_url:
+                # The gateway moved; the marker now records the new port.
+                state["port"] = 7788
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+            return _Resp()
+
+        monkeypatch.setattr(mcp_core, "loopback_urlopen", fake_loopback)
+        return attempts
+
+    def test_update_recovers_from_a_refused_first_attempt(self, monkeypatch) -> None:
+        attempts = self._moving_gateway(monkeypatch)
+
+        result = _call_tool_inner("artifact_update", {"slug": "doc", "content": "new"})
+
+        assert len(attempts) == 2, f"no replay: {attempts}"
+        assert ":5476" in attempts[0] and ":7788" in attempts[1]
+        assert all(u.endswith("/api/artifacts/doc") for u in attempts)
+        assert "Updated artifact" in result and "Error" not in result
+
+    def test_revert_recovers_from_a_refused_first_attempt(self, monkeypatch) -> None:
+        import kiro_crew.mcp_core as mcp_core
+
+        monkeypatch.setattr(
+            mcp_core, "_get", lambda *a, **k: {"slug": "doc", "version": 2, "content": "v2"}
+        )
+        attempts = self._moving_gateway(monkeypatch)
+
+        result = _call_tool_inner("artifact_revert", {"slug": "doc", "target_version": 2})
+
+        assert len(attempts) == 2, f"no replay: {attempts}"
+        assert ":5476" in attempts[0] and ":7788" in attempts[1]
+        assert "Reverted doc to v2" in result and "Error" not in result
+
+    def test_both_senders_carry_the_caller_attribution_header(self, monkeypatch) -> None:
+        """``X-Internal-Caller`` lets the gateway audit log name the component
+        that wrote. Without it an artifact write is the one internal write the
+        audit cannot attribute."""
+        import kiro_crew.mcp_core as mcp_core
+
+        monkeypatch.setattr(mcp_core, "internal_caller", lambda: "kirocrew-artifacts")
+        seen: list[dict] = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"slug": "doc", "version": 5}'
+
+        def capture(req, timeout=None, unix_socket_path=None):
+            seen.append(dict(req.headers))
+            return _Resp()
+
+        monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "")
+        monkeypatch.setattr(mcp_core, "loopback_urlopen", capture)
+        monkeypatch.setattr(mcp_core, "_API", "http://127.0.0.1:5476")
+        monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", "")
+
+        _call_tool_inner("artifact_update", {"slug": "doc", "content": "new"})
+
+        assert seen, "no request was sent"
+        headers = {k.lower(): v for k, v in seen[0].items()}
+        assert headers.get("X-internal-caller".lower()) == "kirocrew-artifacts"

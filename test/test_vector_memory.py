@@ -2,25 +2,44 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
+import source_corpus
 
+import kiro_crew.embeddings as embeddings_mod
 from kiro_crew.vector_memory import (
     _HAS_FAISS,
     _HAS_NUMPY,
+    _MAX_EPISODIC_RETIRED_PER_WRITE,
     _MMR_MAX_POOL,
     SemanticRejectCode,
     VectorMemoryStore,
     _contains_injection,
+    _get_snowball,
     _jaccard,
     _mmr_rerank,
+    _sanitize_decay_rates,
+    _stem_one,
     _stem_words,
     _tokenize,
 )
+
+# One xdist worker for the whole module: the three package-wide AST guards below
+# (``TestAsyncInitOffloadGuard``, ``TestHandlerOffload1947``) read src/ through
+# ``test/source_corpus.py``'s shared, module-lifetime text cache. Under `--dist loadgroup`
+# an unmarked module is spread across workers and each worker re-pays that read and holds
+# its own copy of the corpus. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_vector_memory")
 
 
 class TestSemanticCRUD:
@@ -239,6 +258,102 @@ class TestValidateSemantic:
         code, _ = result
         assert code.value == "value_size"
 
+    def test_null_value_rejected(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic("pref.os", None, 1.0, "user_explicit")
+        assert result is not None
+        code, _ = result
+        assert code.value == "value_empty"
+
+    def test_empty_string_value_rejected(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic("pref.os", "", 1.0, "user_explicit")
+        assert result is not None
+        code, _ = result
+        assert code.value == "value_empty"
+
+    def test_pre_serialized_null_rejected(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic(
+            "pref.os", "ignored", 1.0, "user_explicit", value_json="null"
+        )
+        assert result is not None
+        code, _ = result
+        assert code.value == "value_empty"
+
+    def test_falsy_json_values_still_accepted(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for value in (0, False, [], {}, "0"):
+            assert store.validate_semantic("pref.os", value, 1.0, "user_explicit") is None, value
+
+    def test_null_write_refused_end_to_end(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.set_semantic("pref.os", None, 1.0, "user_explicit")
+        assert result is not None
+        assert result[0] is SemanticRejectCode.VALUE_EMPTY
+        assert store.get_semantic("pref.os") is None
+
+    def test_null_write_does_not_clobber_existing_row(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", None, 1.0, "user_explicit") is not None
+        assert store.get_semantic("pref.os")["value_json"] == '"macos"'
+
+    def test_whitespace_only_value_rejected(self, tmp_path: Path) -> None:
+        # The envelope of a blank string is '"  "', which is neither empty nor a
+        # member of _EMPTY_VALUE_JSON, so an envelope-only gate stores it as a value.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for value in ("  ", "\t", "\n", " \u00a0 "):
+            result = store.validate_semantic("pref.os", value, 1.0, "user_explicit")
+            assert result is not None, value
+            assert result[0] is SemanticRejectCode.VALUE_EMPTY, value
+
+    def test_pre_serialized_whitespace_rejected(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic(
+            "pref.os", "ignored", 1.0, "user_explicit", value_json='"  "'
+        )
+        assert result is not None
+        assert result[0] is SemanticRejectCode.VALUE_EMPTY
+
+    def test_padded_value_still_accepted(self, tmp_path: Path) -> None:
+        # The control for the check above: content surrounded by whitespace is a value,
+        # so the gate must read the padding and not trim the meaning out of it.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.validate_semantic("pref.os", " x ", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", " x ", 1.0, "user_explicit") is None
+        assert store.get_semantic("pref.os")["value_json"] == '" x "'
+
+    def test_whitespace_write_does_not_clobber_existing_row(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", "   ", 1.0, "user_explicit") is not None
+        assert store.get_semantic("pref.os")["value_json"] == '"macos"'
+
+    def test_value_empty_is_auditable(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        with patch.object(store, "_log_event") as mock_log:
+            store.log_reject_event(SemanticRejectCode.VALUE_EMPTY, "pref.os", None, "user_explicit")
+        assert mock_log.called
+        # The documented contrast is VALUE_EMPTY auditable where VALUE_SIZE is not, so pin both
+        # here rather than leaving the refusal half to a sibling test on another code.
+        with patch.object(store, "_log_event") as mock_log_size:
+            store.log_reject_event(SemanticRejectCode.VALUE_SIZE, "pref.os", None, "user_explicit")
+        assert not mock_log_size.called
+
 
 class TestLogRejectEvent:
     def test_auditable_code_logs_event(self, tmp_path: Path) -> None:
@@ -277,6 +392,62 @@ class TestLogRejectEvent:
             mock_log.assert_called_once_with(
                 "injection_blocked", "semantic", "pref.x", None, '{"k": "v"}', "user_explicit"
             )
+
+    def test_repeated_non_security_reject_audits_once_per_cause(self, tmp_path: Path) -> None:
+        """A refused promotion cluster retries every pass, so the audit must not repeat per pass."""
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        with patch.object(store, "_log_event") as mock_log:
+            for _ in range(3):
+                store.log_reject_event(
+                    SemanticRejectCode.VALUE_EMPTY, "pref.general", None, "promotion"
+                )
+        assert mock_log.call_count == 1, "the repeating refusal audited once per pass"
+        # A different cause on the same key is a different defect and must still be audited,
+        # which is what keeps the dedupe from hiding real findings.
+        with patch.object(store, "_log_event") as mock_other_cause:
+            store.log_reject_event(SemanticRejectCode.ALLOWLIST, "pref.general", "v", "promotion")
+        assert mock_other_cause.call_count == 1, "a second cause on the same key was suppressed"
+
+    def test_repeated_preexisting_reject_audits_every_attempt(self, tmp_path: Path) -> None:
+        """The dedupe must not reach ALLOWLIST or CONFIDENCE: get_rejection_stats counts them
+        per attempt, so once-per-(key, cause) would silently redefine two existing metrics."""
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for code in (SemanticRejectCode.ALLOWLIST, SemanticRejectCode.CONFIDENCE):
+            with patch.object(store, "_log_event") as mock_log:
+                for _ in range(3):
+                    store.log_reject_event(code, "pref.general", "v", "promotion")
+            assert mock_log.call_count == 3, f"{code.value} was deduped and lost per-attempt counts"
+
+    def test_repeated_security_reject_audits_every_attempt(self, tmp_path: Path) -> None:
+        """Negative control on the dedupe's scope: the security trail must keep every attempt."""
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        with patch.object(store, "_log_event") as mock_log:
+            for _ in range(3):
+                store.log_reject_event(
+                    SemanticRejectCode.INJECTION, "pref.x", "payload", "consolidation:s"
+                )
+        assert mock_log.call_count == 3, "deduping reached a security code and lost audit rows"
+
+    def test_audited_reject_set_is_bounded(self, tmp_path: Path) -> None:
+        """Bounded oldest-first, so an evicted pair audits again rather than the set growing."""
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        with patch("kiro_crew.vector_memory._MAX_AUDITED_REJECTS", 0):
+            with patch.object(store, "_log_event") as mock_log:
+                store.log_reject_event(SemanticRejectCode.VALUE_EMPTY, "pref.os", None, "promotion")
+                store.log_reject_event(SemanticRejectCode.VALUE_EMPTY, "pref.os", None, "promotion")
+        assert mock_log.call_count == 2
 
 
 class TestConflictResolution:
@@ -404,6 +575,67 @@ class TestConflictResolution:
         assert code == SemanticRejectCode.CONFLICT
         assert "user" in msg.lower()
 
+    def _plant_degenerate(self, store: VectorMemoryStore, key: str, value_json: str) -> None:
+        """Leave *key* holding *value_json* under user_explicit, as a legacy row does.
+
+        The write gate refuses these values now, so the only way such a row exists is
+        to have been written before the gate did -- which is exactly the row that has
+        to be repairable.
+        """
+        assert store.set_semantic(key, "macos", 1.0, "user_explicit") is None
+        store.db.execute(
+            "UPDATE semantic_memory SET value_json = ? WHERE key = ?", (value_json, key)
+        )
+        store.db.commit()
+
+    @pytest.mark.parametrize("value_json", ["null", '""', '"   "'])
+    def test_degenerate_user_row_is_repaired_by_an_automated_write(
+        self, tmp_path: Path, value_json: str
+    ) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        self._plant_degenerate(store, "pref.os", value_json)
+        assert store.set_semantic("pref.os", "linux", 0.9, "consolidation:b") is None
+        assert store.get_semantic("pref.os")["value_json"] == '"linux"'
+
+    def test_repairing_a_degenerate_row_retires_no_episodic_memory(self, tmp_path: Path) -> None:
+        # The V1 retirement heuristic embeds "<key suffix>: <old value>", so a blank old
+        # value degenerates to the bare key suffix and tombstones every episode on that
+        # subject. The repair must not pay for itself in lost episodic memories.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        self._plant_degenerate(store, "pref.os", '"   "')
+        calls: list[tuple[str, str]] = []
+        with mock.patch.object(
+            store, "_retire_stale_episodic", side_effect=lambda k, v, **kw: calls.append((k, v))
+        ):
+            assert store.set_semantic("pref.os", "linux", 0.9, "consolidation:b") is None
+        assert calls == []
+
+    def test_replacing_a_real_value_still_retires_episodic_memory(self, tmp_path: Path) -> None:
+        # The control for the guard above: a superseded value that says something still
+        # supersedes the episodes that assert it.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        calls: list[tuple[str, str]] = []
+        with mock.patch.object(
+            store, "_retire_stale_episodic", side_effect=lambda k, v, **kw: calls.append((k, v))
+        ):
+            assert store.set_semantic("pref.os", "linux", 1.0, "user_explicit") is None
+        assert calls == [("pref.os", "macos")]
+
+    def test_healthy_user_row_still_refuses_an_automated_write(self, tmp_path: Path) -> None:
+        # The control for the repair above: the carve-out reads the stored VALUE, so a row
+        # that holds one keeps the source precedence it always had.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+        result = store.set_semantic("pref.os", "linux", 0.95, "consolidation:b")
+        assert result is not None
+        assert result[0] is SemanticRejectCode.CONFLICT
+        assert store.get_semantic("pref.os")["value_json"] == '"macos"'
+
 
 class TestInjectionDetection:
     def test_known_patterns_blocked(self, tmp_path: Path) -> None:
@@ -459,6 +691,148 @@ class TestValueSizeLimit:
         store = VectorMemoryStore(db_path=tmp_path / "mem.db")
         store.init()
         assert store.set_semantic("pref.os", "macos", 1.0, "user_explicit") is None
+
+    def test_non_ascii_value_gets_the_full_raw_byte_budget(self, tmp_path: Path) -> None:
+        # "\ud55c" is U+D55C, the Hangul syllable HAN (below the surrogate
+        # range, which starts at U+D800). 800 of them = 2400 raw UTF-8 bytes
+        # (+2 JSON quotes), well under the 4096 cap. The escaped dump is 4802
+        # bytes: measuring it instead of the raw bytes refuses this value at
+        # one sixth of the budget.
+        from kiro_crew.vector_memory import _MAX_VALUE_BYTES
+
+        korean = "\ud55c" * 800
+        raw_bytes = len(json.dumps(korean, ensure_ascii=False).encode("utf-8"))
+        escaped_bytes = len(json.dumps(korean).encode("utf-8"))
+        assert raw_bytes <= _MAX_VALUE_BYTES < escaped_bytes
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.validate_semantic("pref.os", korean, 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", korean, 1.0, "user_explicit") is None
+        entry = store.get_semantic("pref.os")
+        assert entry is not None
+        # The persisted representation is the raw dump the gate measured.
+        assert entry["value_json"] == json.dumps(korean, ensure_ascii=False)
+        assert json.loads(entry["value_json"]) == korean
+
+    def test_over_cap_raw_non_ascii_value_still_refused(self, tmp_path: Path) -> None:
+        # 1400 Hangul syllables = 4200 raw bytes (+2 quotes) > 4096: refused,
+        # and the message quotes the raw measurement, not the escaped count.
+        from kiro_crew.vector_memory import _MAX_VALUE_BYTES
+
+        korean = "\ud55c" * 1400
+        raw_bytes = len(json.dumps(korean, ensure_ascii=False).encode("utf-8"))
+        assert raw_bytes > _MAX_VALUE_BYTES
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic("pref.os", korean, 1.0, "user_explicit")
+        assert result is not None
+        code, msg = result
+        assert code.value == "value_size"
+        assert f"({raw_bytes} bytes" in msg
+        assert store.set_semantic("pref.os", korean, 1.0, "user_explicit") is not None
+
+    def test_non_ascii_value_accepted_by_set_semantic_if_absent(self, tmp_path: Path) -> None:
+        korean = "\ud55c" * 800  # U+D55C Hangul syllable HAN; 2400 raw bytes
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic_if_absent("pref.os", korean, 1.0, "user_explicit") == "imported"
+        entry = store.get_semantic("pref.os")
+        assert entry is not None
+        assert json.loads(entry["value_json"]) == korean
+
+    def test_stored_value_equality_is_type_strict(self) -> None:
+        # Python's == conflates bool with int (and int with float); a decoded
+        # compare must not treat an existing 1 and a submitted true as
+        # unchanged, or the automated write is silently skipped and the stale
+        # value never self-corrects.
+        from kiro_crew.vector_memory import _json_value_equal
+
+        assert not _json_value_equal("1", "true")
+        assert not _json_value_equal("0", "false")
+        assert not _json_value_equal("1", "1.0")
+        assert not _json_value_equal('{"a": 1}', '{"a": true}')
+        assert not _json_value_equal("[0]", "[false]")
+        assert _json_value_equal("1", "1")
+        assert _json_value_equal('{"a": [1.5, "x"]}', '{"a": [1.5, "x"]}')
+        # The purpose of the helper: escaped and raw dumps of one value match.
+        korean = "\ud55c\uad6d\uc5b4"  # U+D55C U+AD6D U+C5B4, hangugeo
+        assert _json_value_equal(json.dumps(korean), json.dumps(korean, ensure_ascii=False))
+        # A value nested past the recursion limit must not crash the compare:
+        # it reports "changed" (safe) rather than raising and aborting the write.
+        deep = "\ud55c"
+        for _ in range(999):
+            deep = [deep]
+        assert _json_value_equal(json.dumps(deep), json.dumps(deep, ensure_ascii=False)) is False
+
+    def test_bool_reset_of_numeric_fact_is_not_silently_skipped(self, tmp_path: Path) -> None:
+        # An existing 1 re-set as true must register as a change (update on
+        # this policy), never the reaffirm no-op that retains the stale value.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        assert store.set_semantic("pref.os", 1, 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.os", True, 1.0, "user_explicit") is None
+        assert json.loads(store.get_semantic("pref.os")["value_json"]) is True
+
+    def test_lone_surrogate_is_rejected_not_raised(
+        self, tmp_path: Path
+    ) -> None:  # json.dumps/loads accept a lone surrogate but the result cannot be
+        # UTF-8 encoded; the gate must refuse it as a validation outcome
+        # instead of letting UnicodeEncodeError escape set_semantic.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for value in ("\ud800", {"note": "x" + "\udfff"}):
+            result = store.validate_semantic("pref.os", value, 1.0, "user_explicit")
+            assert result is not None
+            code, msg = result
+            assert code.value == "value_encoding"
+            assert "surrogate" in msg
+            assert store.set_semantic("pref.os", value, 1.0, "user_explicit") == result
+        assert store.get_semantic("pref.os") is None
+
+    def test_lone_surrogate_in_lesson_rule_is_rejected_not_raised(self, tmp_path: Path) -> None:
+        # The lesson branch measures the raw rule text and reaches the same
+        # encode; the shared guard covers it too.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        result = store.validate_semantic(
+            "lesson.dev.x",
+            {"rule": "bad \ud800 rule", "category": None, "negative": None},
+            1.0,
+            "user_explicit",
+        )
+        assert result is not None
+        assert result[0].value == "value_encoding"
+
+    def test_non_ascii_lesson_embedding_is_persisted(self, tmp_path: Path) -> None:
+        # write_lesson persists the row via set_semantic (raw UTF-8) and then
+        # attaches the embedding with an UPDATE guarded on value_json. The
+        # guard must serialize with the same ensure_ascii=False flavor: an
+        # escaped dump matches no row for a non-ASCII rule, so the embedding
+        # stays NULL and the lesson is invisible to semantic search.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = lambda text: [0.1] * 8
+
+        korean = "\ud55c\uad6d\uc5b4 rule that must be embeddable"
+        store.write_lesson(korean, category="knowledge", source="user_explicit")
+        row = store.db.execute(
+            "SELECT value_json, embedding FROM semantic_memory "
+            "WHERE is_deleted = 0 AND value_json LIKE '%\ud55c\uad6d\uc5b4%'"
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row[0])["rule"] == korean
+        assert row[1] is not None  # embedding landed on the raw-persisted row
+
+        # ASCII control: unaffected by the serialization flavor.
+        store.write_lesson(
+            "an ascii rule that is also embeddable", category="knowledge", source="user_explicit"
+        )
+        ascii_row = store.db.execute(
+            "SELECT embedding FROM semantic_memory "
+            "WHERE is_deleted = 0 AND value_json LIKE '%ascii rule%'"
+        ).fetchone()
+        assert ascii_row is not None
+        assert ascii_row[0] is not None
 
 
 class TestEventLog:
@@ -517,11 +891,261 @@ class TestSchemaInit:
     def test_file_permissions(self, tmp_path: Path) -> None:
         import stat
 
+        from kiro_crew import platform_compat
+
         db_path = tmp_path / "mem.db"
         store = VectorMemoryStore(db_path=db_path)
         store.init()
-        mode = stat.S_IMODE(db_path.stat().st_mode)
-        assert mode == 0o600
+        # NTFS reports 0o666 for any file regardless of its DACL, so the mode
+        # assertion is meaningful only on POSIX. The routing assertion below is
+        # what covers Windows.
+        if platform_compat.IS_POSIX:
+            assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    def test_creation_routes_through_restrict_to_owner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lockdown must go through ``restrict_to_owner``, on every platform.
+
+        ``chmod_safe`` is a no-op on Windows, so a regression back to it would leave
+        the user's memories and embeddings under the DACL the file inherits — and no
+        mode assertion can catch that, because NTFS has no mode bits to read. This
+        asserts the call, which is observable everywhere.
+        """
+        from kiro_crew import vector_memory as vm
+
+        seen: list[str] = []
+        real = vm.platform_compat.restrict_to_owner
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "restrict_to_owner",
+            lambda p: (seen.append(str(p)), real(p))[1],
+        )
+        db_path = tmp_path / "mem.db"
+        store = VectorMemoryStore(db_path=db_path)
+        try:
+            store.init()
+        finally:
+            store.close()  # an open handle blocks tmp_path teardown on Windows
+        # The main DB, plus whatever else legitimately routes through this helper.
+        # Asserted as a set of ALLOWED paths rather than an exact list, because the
+        # membership is not fixed: the WAL sidecars may or may not exist yet on a
+        # fresh create. The parent DIRECTORY is listed but not expected on
+        # either platform -- `make_owner_only_dir` routes it through
+        # `restrict_dir_to_owner`, the directory twin, so it does not reach this
+        # helper at all. Kept in the set as a harmless superset entry so the
+        # assertion stays green if that routing changes back.
+        allowed = {
+            str(db_path),
+            f"{db_path}-wal",
+            f"{db_path}-shm",
+            str(db_path.parent / "memory.faiss"),
+            str(db_path.parent / "memory.ids.json"),
+            str(db_path.parent),
+        }
+        assert str(db_path) in seen, seen
+        assert set(seen) <= allowed, set(seen) - allowed
+
+    def test_the_directory_is_owner_only_so_wal_sidecars_inherit_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Locking the .db file alone does not protect the memories.
+
+        ``journal_mode=WAL`` makes SQLite create ``memory.db-wal`` and
+        ``memory.db-shm``, and a COMMITTED row lives in the ``-wal`` until a
+        checkpoint moves it. SQLite creates and destroys those files throughout the
+        DB's life, at moments no caller can hook, so the directory they inherit
+        access from is the only place it can be settled once. Without this, a
+        readable parent directory leaves committed memories readable on Windows even
+        though the .db file itself is locked down.
+        """
+        from kiro_crew import vector_memory as vm
+
+        dirs: list[str] = []
+        real = vm.platform_compat.make_owner_only_dir
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "make_owner_only_dir",
+            lambda p: (dirs.append(str(p)), real(p))[1],
+        )
+        db_path = tmp_path / "nested" / "mem.db"
+
+        store = VectorMemoryStore(db_path=db_path)
+        try:
+            store.init()
+        finally:
+            store.close()  # an open handle blocks tmp_path teardown on Windows
+
+        assert dirs == [str(db_path.parent)], dirs
+
+    def test_an_existing_wal_sidecar_is_repaired_on_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The directory fixes new sidecars; this fixes the ones already there.
+
+        A ``-wal`` created before the directory was tightened keeps the access it was
+        born with, and it can hold committed rows indefinitely if no checkpoint has
+        run -- so an existing install is not repaired by the directory alone.
+        """
+        from kiro_crew import vector_memory as vm
+
+        db_path = tmp_path / "mem.db"
+        first = VectorMemoryStore(db_path=db_path)
+        first.init()
+        # CLOSED before the sidecar is touched: Windows refuses a write to a file
+        # another handle holds open, and SQLite keeps -wal open for the life of the
+        # connection. Closing is also what the scenario describes -- an install whose
+        # sidecar was left behind by an earlier process.
+        first.close()
+        wal = Path(f"{db_path}-wal")
+        wal.write_bytes(b"pretend committed rows")
+
+        seen: list[str] = []
+        real = vm.platform_compat.restrict_to_owner
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "restrict_to_owner",
+            lambda p: (seen.append(str(p)), real(p))[1],
+        )
+        second = VectorMemoryStore(db_path=db_path)
+        try:
+            second.init()
+        finally:
+            second.close()
+
+        assert str(wal) in seen, seen
+
+    def test_the_faiss_index_is_repaired_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The embedding index carries the same secrets as the DB.
+
+        And the owner-only directory does not cover it on Windows: Bypass Traverse
+        Checking is granted to Everyone by default, so a permissive DACL on a file
+        that already exists stays reachable inside a tightened directory. An install
+        whose FAISS index predates the lockdown is therefore only fixed by naming the
+        file.
+        """
+        from kiro_crew import vector_memory as vm
+
+        db_path = tmp_path / "mem.db"
+        faiss = tmp_path / "memory.faiss"
+        faiss.write_bytes(b"pretend embeddings")
+
+        seen: list[str] = []
+        real = vm.platform_compat.restrict_to_owner
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "restrict_to_owner",
+            lambda p: (seen.append(str(p)), real(p))[1],
+        )
+        store = VectorMemoryStore(db_path=db_path)
+        try:
+            store.init()
+        finally:
+            store.close()
+
+        assert str(faiss) in seen, seen
+
+    def test_an_existing_db_is_restricted_before_the_migrations_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering, not just coverage: the migrations must not run on a writable file.
+
+        An existing DB may still carry a writable inherited DACL. If the lockdown only
+        happened at the end of ``init()``, every schema migration would run against a
+        file another local user could concurrently write.
+        """
+        from kiro_crew import vector_memory as vm
+
+        db_path = tmp_path / "mem.db"
+        first = VectorMemoryStore(db_path=db_path)
+        first.init()
+        first.close()
+
+        events: list[str] = []
+        real_restrict = vm.platform_compat.restrict_to_owner
+        real_connect = vm.sqlite3.connect
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "restrict_to_owner",
+            lambda p: (events.append(f"restrict:{Path(p).name}"), real_restrict(p))[1],
+        )
+        monkeypatch.setattr(
+            vm.sqlite3,
+            "connect",
+            lambda *a, **k: (
+                events.append(
+                    "probe_readonly"
+                    if k.get("uri") and str(a[0]).endswith("?mode=ro")
+                    else "connect"
+                ),
+                real_connect(*a, **k),
+            )[1],
+        )
+        store = VectorMemoryStore(db_path=db_path)
+        try:
+            store.init()
+        finally:
+            store.close()
+
+        assert events.count("probe_readonly") == 1, events
+        assert events.count("connect") == 1, events
+        restricted_db_before = events.index("restrict:mem.db") < events.index("connect")
+        assert restricted_db_before, events
+
+    def test_relaxed_mode_is_retightened_on_reopen(self, tmp_path: Path) -> None:
+        """A DB whose mode was widened after creation is locked down again.
+
+        Covers the POSIX arm of the every-init re-tighten: a home migration or a
+        restored backup can land ``memory.db`` group-readable, and only re-applying
+        the lockdown on open closes it.
+        """
+        import stat
+
+        from kiro_crew import platform_compat
+
+        if not platform_compat.IS_POSIX:
+            pytest.skip("POSIX mode bits")
+        db_path = tmp_path / "mem.db"
+        VectorMemoryStore(db_path=db_path).init()
+        db_path.chmod(0o644)
+        VectorMemoryStore(db_path=db_path).init()
+        assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    def test_absent_sidecars_are_never_handed_to_the_helper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file that does not exist is skipped by a check, not by catching.
+
+        On Windows ``restrict_to_owner``'s DACL write raises plain ``OSError``
+        for a missing path rather than ``FileNotFoundError`` -- which only ever
+        comes from the POSIX ``os.chmod``. Catching alone therefore paid a futile
+        lockdown attempt per absent file and logged a false "may be readable by
+        other users" warning for each, twice per init. Asserting on what reaches the
+        helper pins the check itself, which is observable on both platforms; a mode or
+        DACL assertion could not distinguish the two implementations.
+        """
+        from kiro_crew import vector_memory as vm
+
+        # Existence is recorded AT CALL TIME, not after init: the pass runs twice and
+        # ``close()`` checkpoints the ``-wal``/``-shm`` away, so a sidecar that existed
+        # when the helper saw it is legitimately gone by the end of the test.
+        seen: list[tuple[str, bool]] = []
+        real = vm.platform_compat.restrict_to_owner
+        monkeypatch.setattr(
+            vm.platform_compat,
+            "restrict_to_owner",
+            lambda p: (seen.append((str(p), Path(p).exists())), real(p))[1],
+        )
+        db_path = tmp_path / "mem.db"
+        store = VectorMemoryStore(db_path=db_path)
+        try:
+            store.init()
+        finally:
+            store.close()  # an open handle blocks tmp_path teardown on Windows
+        assert seen, "the lockdown pass never ran"
+        assert [p for p, existed in seen if not existed] == []
 
     def test_idempotent_init(self, tmp_path: Path) -> None:
         store = VectorMemoryStore(db_path=tmp_path / "mem.db")
@@ -744,6 +1368,15 @@ class TestEpisodicInjectionScreening:
         stats = store.get_rejection_stats()
         assert stats.get("injection_blocked") == 2
 
+    def test_rejection_stats_counts_value_empty(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        # Pins the 'value_empty' token in get_rejection_stats's IN(...) list: without it the
+        # reject this change adds is absent from the operator panel while every test stays green.
+        store.set_semantic("project.beta.status", None, 1.0, "user_explicit")
+        stats = store.get_rejection_stats()
+        assert stats.get("value_empty") == 1
+
     def test_injection_screen_runs_before_embedding(self, tmp_path: Path) -> None:
         """Blocked entries must short-circuit before the (expensive) embed call."""
         store = VectorMemoryStore(db_path=tmp_path / "mem.db")
@@ -759,9 +1392,8 @@ class TestEpisodicInjectionScreening:
         assert calls == []
 
     def test_audit_snippet_is_redacted(self, tmp_path: Path) -> None:
-        """The persisted audit snippet is surfaced verbatim on the dashboard
-        (/api/memory/events), so credentials in the rejected text must be
-        scrubbed before storage."""
+        """Rejected-input snippets are scrubbed before storage as defense in
+        depth; the dashboard also redacts all memory events on egress."""
         store = VectorMemoryStore(db_path=tmp_path / "mem.db")
         store.init()
         secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -786,6 +1418,9 @@ class TestMemoryStats:
         assert stats["semantic_active"] == 1
         assert stats["episodic_active"] == 1
         assert stats["faiss_index_size"] == 0  # no FAISS without numpy/faiss
+        # Availability of the optional accelerator is reported separately so
+        # callers can distinguish "not installed" from "nothing indexed".
+        assert isinstance(stats["faiss_available"], bool)
 
 
 class TestStemWords:
@@ -816,14 +1451,100 @@ class TestStemWords:
         result = _stem_words({"bug", "run", "fix"})
         assert {"bug", "run", "fix"} <= result
 
+    def test_memoized_stem_matches_the_batch_stemmer(self) -> None:
+        """The per-word cache must not change what stemming produces.
+
+        The previous implementation stemmed a whole set in one ``stemWords``
+        call. Memoizing per word is only safe if it yields the same set, so
+        pin that against the stemmer directly rather than against itself.
+        """
+        words = {
+            "testing",
+            "deployment",
+            "shipped",
+            "fixes",
+            "running",
+            "caches",
+            "relevance",
+            "ranked",
+            "lessons",
+            "workspaces",
+            "bug",
+            "run",
+        }
+        direct = words | set(_get_snowball().stemWords(sorted(words)))
+
+        assert _stem_words(words) == direct
+        # And per single word, where a batch call cannot mask an ordering bug.
+        for word in words:
+            assert _stem_words({word}) == {word} | set(_get_snowball().stemWords([word]))
+
+    def test_repeated_words_are_stemmed_once(self) -> None:
+        """A word seen again is served from the cache instead of re-stemmed."""
+        _stem_one.cache_clear()
+        _stem_words({"provisioning"})
+        after_first = _stem_one.cache_info()
+        _stem_words({"provisioning"})
+        after_second = _stem_one.cache_info()
+
+        assert after_first.misses == 1
+        assert after_second.misses == 1, "second call must not re-stem"
+        assert after_second.hits == after_first.hits + 1
+
+
+class TestEmbedLogsCarryNoMemoryText:
+    """The embed diagnostics log sizes, never the memory text itself.
+
+    ``text`` is user memory content. A DEBUG line that echoes even a 50-char
+    prefix puts that content into the log; the three branches (success, None,
+    exception) must all stay content-free.
+    """
+
+    _SENTINEL = "SENTINEL-MEMORY-CONTENT-do-not-log"
+
+    def _store(self, tmp_path: Path) -> VectorMemoryStore:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    def _assert_not_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        for record in caplog.records:
+            assert self._SENTINEL not in record.getMessage()
+            assert self._SENTINEL not in (record.exc_text or "")
+
+    def test_success_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+        store.embed_fn = lambda _t: [0.1, 0.2]
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) == [0.1, 0.2]
+        self._assert_not_logged(caplog)
+
+    def test_none_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+        store.embed_fn = lambda _t: None
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) is None
+        self._assert_not_logged(caplog)
+
+    def test_exception_branch(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        store = self._store(tmp_path)
+
+        def boom(_t: str) -> list[float]:
+            raise RuntimeError("embedder down")
+
+        store.embed_fn = boom
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+            assert store._try_embed(self._SENTINEL) is None
+        self._assert_not_logged(caplog)
+
 
 class TestEmbedFnLazyRebind:
     """Tests for lazy embed_fn rebinding via embed_fn_factory.
 
-    Regression: Mesh-XXXX. Before this fix, if Ollama was unavailable at gateway
-    boot, vector_memory.embed_fn stayed None for the entire gateway lifetime,
-    and every new memory wrote with embedding=NULL. Lazy rebind recovers from
-    this by retrying the factory on subsequent embed attempts (rate-limited).
+    Before this fix, if Ollama was unavailable at gateway boot,
+    vector_memory.embed_fn stayed None for the entire gateway lifetime, and
+    every new memory wrote with embedding=NULL. Lazy rebind recovers from this
+    by retrying the factory on subsequent embed attempts (rate-limited).
     """
 
     def test_no_factory_returns_none(self, tmp_path: Path) -> None:
@@ -932,7 +1653,7 @@ class TestEmbedFnLazyRebind:
     def test_factory_returning_empty_list_probe_does_not_bind(self, tmp_path: Path) -> None:
         """If probe returns an empty list (zero-dim or misconfigured model), do not bind.
 
-        Regression for review feedback on the original `if probe:` check
+        The original `if probe:` check
         was falsy for `[]` AND for `0` AND for `None`, conflating "probe failed" with
         "probe returned a degenerate response." The tightened check rejects empty/None
         explicitly so a misconfigured model can't slip through as a working embed_fn.
@@ -952,7 +1673,7 @@ class TestEmbedFnLazyRebind:
     def test_rebind_lock_serializes_concurrent_factory_calls(self, tmp_path: Path) -> None:
         """Two threads racing into the rebind block share at most one factory call per cooldown.
 
-        Regression for review feedback on without the lock, both threads
+        Without the lock, both threads
         could observe `embed_fn is None` and `cooldown elapsed` simultaneously, then both
         call the factory + probe. With the lock, the loser sees the cooldown bumped and skips.
         """
@@ -994,7 +1715,7 @@ class TestEmbedFnLazyRebind:
         t2.join(timeout=5.0)
 
         # Exactly one factory call despite two concurrent _try_embed invocations.
-        # The lock serializes; the loser sees embed_fn is no longer None on re-check
+        # The lock serializes; the loser sees embed_fn is not None on re-check
         # and skips the factory entirely.
         assert call_count[0] == 1, f"Lock failed: factory called {call_count[0]} times"
         assert store.embed_fn is not None  # one of the threads bound it
@@ -1157,6 +1878,63 @@ class TestMmrRerankNegativeScores:
         assert len(out) == 2
 
 
+def _join_stress_threads(
+    threads: list[threading.Thread],
+    progress: dict[int, int],
+    label: str,
+    *,
+    window: float = 30.0,
+    stall_windows: int = 2,
+) -> None:
+    """Join stress threads, distinguishing a real deadlock from a slow runner.
+
+    A plain ``join(timeout=60)`` cannot tell "the lock is stuck" from "this
+    Windows runner is overloaded" — it fails both the same way, so a genuine
+    deadlock and mere slowness produce the same red. Per AGENTS.md a timing
+    test must assert the *shape* (does work advance?), not a wall-clock
+    duration.
+
+    Each worker records its completed-iteration count in ``progress`` (keyed by
+    ``threading.get_ident()``). We observe in ``window``-second slices: a thread
+    is only declared deadlocked if it is still alive AND the workers made zero
+    forward progress across ``stall_windows`` consecutive windows. A stalled
+    lock never advances; a slow-but-live worker keeps incrementing its counter
+    and is simply waited on. Slowness alone is never a failure.
+
+    Each observation window costs ~``window`` seconds *in total*, not per
+    thread: the per-thread join timeout is divided by the live-thread count and
+    the window is capped by a monotonic deadline. Joining N threads for the full
+    ``window`` each would make one window take ``window * N`` — with 8 stalled
+    workers that is 240s, past the pytest ``--timeout`` kill, so a real deadlock
+    would hang to the harness kill instead of failing cleanly. Bounding the
+    window keeps the ``stall_windows * window`` no-progress budget (~60s at the
+    defaults) safely under that timeout.
+    """
+    stalled_windows = 0
+    last_total = -1
+    while any(t.is_alive() for t in threads):
+        deadline = time.monotonic() + window
+        for t in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            live = sum(1 for x in threads if x.is_alive()) or 1
+            t.join(timeout=min(remaining, window / live))
+        total = sum(progress.values())
+        if any(t.is_alive() for t in threads):
+            if total == last_total:
+                stalled_windows += 1
+                if stalled_windows >= stall_windows:
+                    raise AssertionError(
+                        f"{label}: no progress across {stall_windows} x "
+                        f"{window:g}s windows ({total} iterations done) — "
+                        f"genuine deadlock, not slow runner"
+                    )
+            else:
+                stalled_windows = 0
+            last_total = total
+
+
 @pytest.mark.xdist_group("vector_memory_concurrency")
 class TestVectorStoreConcurrency:
     """Writes are offloaded to worker threads (consolidation, dashboard) while
@@ -1241,8 +2019,11 @@ class TestVectorStoreConcurrency:
         store.embed_fn = _fake_embed
 
         transient: list[BaseException] = []
+        progress: dict[int, int] = {}
 
         def _lesson_writer(n: int) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             for i in range(n):
                 try:
                     store.write_lesson(
@@ -1252,14 +2033,18 @@ class TestVectorStoreConcurrency:
                     )
                 except Exception as exc:  # noqa: BLE001 — see docstring
                     transient.append(exc)
+                progress[tid] += 1
 
         def _lesson_reader(n: int) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             for _ in range(n):
                 try:
                     store.get_lessons()
                     store.get_lessons_context()
                 except Exception as exc:  # noqa: BLE001 — see docstring
                     transient.append(exc)
+                progress[tid] += 1
 
         threads = [
             threading.Thread(target=_lesson_writer, args=(20,)),
@@ -1269,9 +2054,7 @@ class TestVectorStoreConcurrency:
         ]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads), "stress threads deadlocked"
+        _join_stress_threads(threads, progress, "lesson write/read stress")
 
         # Store must remain fully functional after the stress: a fresh
         # write/read cycle succeeds and returns coherent lesson rows.
@@ -1288,7 +2071,7 @@ class TestVectorStoreConcurrency:
     def test_concurrent_semantic_write_and_context_no_errors(self, tmp_path) -> None:
         """get_semantic_context runs on executor threads (subagent context builds
         via run_in_embed_pool) concurrent with set_semantic writers on worker
-        threads. Its SELECTs used to hit the shared connection WITHOUT _db_lock,
+        threads. Its SELECTs must not hit the shared connection WITHOUT _db_lock,
         racing writers' implicit transactions and the per-connection statement
         cache — observed in production as sqlite3.InterfaceError ("bad parameter
         or other API misuse") from get_semantic_context, which propagates
@@ -1307,16 +2090,22 @@ class TestVectorStoreConcurrency:
 
         start_barrier = threading.Barrier(4)
         errors: list[BaseException] = []
+        progress: dict[int, int] = {}
 
         def _writer(n: int, tag: str) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             start_barrier.wait()
             try:
                 for i in range(n):
                     store.set_semantic(f"project.stress.{tag}{i:03d}", f"gamma {i}", 1.0, "tool")
+                    progress[tid] += 1
             except BaseException as exc:  # noqa: BLE001 - capture any thread crash
                 errors.append(exc)
 
         def _context_reader(n: int) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             start_barrier.wait()
             try:
                 for i in range(n):
@@ -1325,6 +2114,7 @@ class TestVectorStoreConcurrency:
                         store.get_semantic_context(query_text="alpha beta gamma")
                     else:
                         store.get_semantic_context()
+                    progress[tid] += 1
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
@@ -1336,9 +2126,7 @@ class TestVectorStoreConcurrency:
         ]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads), "stress threads deadlocked"
+        _join_stress_threads(threads, progress, "semantic write/context stress")
         assert not errors, f"concurrent set_semantic/get_semantic_context raised: {errors!r}"
 
         # Coherence: a post-stress read returns the seeded entries intact.
@@ -1365,8 +2153,11 @@ class TestVectorStoreConcurrency:
 
         start_barrier = threading.Barrier(4)
         reader_errors: list[BaseException] = []
+        progress: dict[int, int] = {}
 
         def _lesson_writer(n: int, tag: str) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             start_barrier.wait()
             for i in range(n):
                 try:
@@ -1377,12 +2168,16 @@ class TestVectorStoreConcurrency:
                     )
                 except Exception:  # noqa: BLE001 - writer transients tolerated
                     pass
+                progress[tid] += 1
 
         def _lesson_reader(n: int) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             start_barrier.wait()
             try:
                 for _ in range(n):
                     store.get_lessons_context()
+                    progress[tid] += 1
             except BaseException as exc:  # noqa: BLE001
                 reader_errors.append(exc)
 
@@ -1394,13 +2189,11 @@ class TestVectorStoreConcurrency:
         ]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads), "stress threads deadlocked"
+        _join_stress_threads(threads, progress, "lesson write/context stress")
         assert not reader_errors, f"get_lessons_context raised: {reader_errors!r}"
 
     def test_stem_words_thread_safe(self) -> None:
-        """_stem_words used to share ONE module-level snowballstemmer instance.
+        """_stem_words must not share ONE module-level snowballstemmer instance.
         The pure-Python stemmer keeps the word under stem as mutable instance
         state (set_current -> _stem -> get_current), so concurrent
         get_semantic_context calls (parallel subagent context builds)
@@ -1409,30 +2202,30 @@ class TestVectorStoreConcurrency:
         thread: hammering _stem_words from many threads must neither raise nor
         diverge from the single-threaded result.
         """
-        vocab = [
-            f"word{i} running jumped happily nationalization {i}" for i in range(50)
-        ]
+        vocab = [f"word{i} running jumped happily nationalization {i}" for i in range(50)]
         word_sets = [set(v.split()) for v in vocab]
         expected = [_stem_words(ws) for ws in word_sets]
 
         start_barrier = threading.Barrier(8)
         errors: list[BaseException] = []
+        progress: dict[int, int] = {}
 
         def _stemmer_worker() -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
             start_barrier.wait()
             try:
                 for _ in range(40):
                     for ws, exp in zip(word_sets, expected):
                         assert _stem_words(ws) == exp
+                    progress[tid] += 1
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
         threads = [threading.Thread(target=_stemmer_worker) for _ in range(8)]
         for t in threads:
             t.start()
-        for t in threads:
-            t.join(timeout=60)
-        assert not any(t.is_alive() for t in threads), "stemmer threads deadlocked"
+        _join_stress_threads(threads, progress, "stemmer stress")
         assert not errors, f"concurrent _stem_words raised/diverged: {errors!r}"
 
 
@@ -1644,6 +2437,141 @@ class TestEmbeddingDimPlumbing:
         assert captured_kwargs.get("embedding_dim") == 384
 
 
+class TestDedupThresholdPlumbing:
+    """`memory.episodic_dedup_threshold` must reach the store it configures.
+
+    The loader parses the key into ``MemorySection``; no production
+    ``VectorMemoryStore(...)`` site passed it on, so the store always used
+    ``_DEFAULT_DEDUP_THRESHOLD`` and the documented knob was inert regardless of
+    faiss (the separate faiss gating of the cosine check is a separate concern, not
+    this one). These tests pin the plumbing only — no embedding or index needed.
+    """
+
+    # Production stores whose episodic writes reach the inline similarity check
+    # (history consolidation, migrate_from_markdown, import_memory). Deferred
+    # writers (ledger_index, onboarding_import) skip that check by contract and
+    # the bench harness (eval/bench/ingest.py) supplies its own sweep value, so
+    # neither is required to plumb the config key.
+    _PLUMBED_SITES = (
+        "slack/gateway.py",
+        "cli_server.py",
+        "dashboard/handlers/memory.py",
+    )
+
+    def test_dashboard_fallback_passes_dedup_threshold(self, tmp_path: Path, monkeypatch) -> None:
+        """The dashboard standalone fallback builds a store carrying cfg's value."""
+        from unittest.mock import MagicMock
+
+        import kiro_crew.dashboard.handlers.memory as mem_mod
+
+        mock_cfg = MagicMock()
+        mock_cfg.memory.embedding_dim = 1024
+        mock_cfg.memory.decay_rates = {}
+        # Deliberately NOT 0.88: a test written against the default would pass
+        # against the module constant even with nothing plumbed.
+        mock_cfg.memory.episodic_dedup_threshold = 0.42
+
+        built: list[VectorMemoryStore] = []
+
+        class TmpPathStore(VectorMemoryStore):
+            """Real store (so __init__ stores the value) on a throwaway db."""
+
+            def __init__(self, **kwargs):
+                kwargs.setdefault("db_path", tmp_path / "dashboard.db")
+                super().__init__(**kwargs)
+                built.append(self)
+
+            def init(self) -> None:  # sqlite/migrations are not what this pins
+                return None
+
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.vector_memory as vm_mod
+
+        mock_config_cls = MagicMock()
+        mock_config_cls.load.return_value = mock_cfg
+        monkeypatch.setattr(loader_mod, "KiroCrewConfig", mock_config_cls)
+        monkeypatch.setattr(vm_mod, "VectorMemoryStore", TmpPathStore)
+
+        mock_memory = MagicMock()
+        mock_memory.vector_store = None
+        monkeypatch.setattr(mem_mod, "_get_memory", lambda state: mock_memory)
+
+        fresh_state = type("FreshState", (), {})()
+        mem_mod._get_vector_store(fresh_state)
+
+        assert len(built) == 1, "fallback did not construct the standalone store"
+        assert built[0]._dedup_threshold == 0.42
+
+    @staticmethod
+    def _find_unplumbed_sites(tree, where: str = "") -> list[str]:
+        """Report every ``VectorMemoryStore(...)`` call that drops the key.
+
+        Structural rather than behavioural for the gateway and `kirocrew run`:
+        both construct inside long async bootstraps (`_init_services`,
+        `_run_task`) that cannot be driven in a unit test without mocking the
+        whole service graph, and the regression this guards is a missing
+        keyword at a call site.
+        """
+        import ast
+
+        violations: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name != "VectorMemoryStore":
+                continue
+            kw = next((k for k in node.keywords if k.arg == "dedup_threshold"), None)
+            if kw is None:
+                violations.append(
+                    f"{where}line {node.lineno}: VectorMemoryStore(...) omits "
+                    "dedup_threshold — pass memory.episodic_dedup_threshold (#8903)"
+                )
+                continue
+            if not ast.unparse(kw.value).endswith("memory.episodic_dedup_threshold"):
+                violations.append(
+                    f"{where}line {node.lineno}: dedup_threshold is not bound to "
+                    f"memory.episodic_dedup_threshold (got {ast.unparse(kw.value)!r})"
+                )
+        return violations
+
+    def test_production_sites_pass_the_configured_threshold(self) -> None:
+        import ast
+        import inspect
+        from pathlib import Path as _Path
+
+        import kiro_crew
+
+        pkg_root = _Path(inspect.getfile(kiro_crew)).parent
+        violations: list[str] = []
+        for rel in self._PLUMBED_SITES:
+            src = pkg_root / rel
+            assert src.is_file(), f"construction site moved: {rel}"
+            tree = ast.parse(src.read_text(encoding="utf-8"))
+            violations.extend(self._find_unplumbed_sites(tree, where=f"{rel}:"))
+        assert not violations, "config key never reaches the store:\n" + "\n".join(violations)
+
+    def test_guard_catches_a_seeded_violation(self) -> None:
+        """The guard must flag both failure shapes and stay quiet on the good
+        one — otherwise a refactor could silently disarm it."""
+        import ast
+
+        seeded = ast.parse(
+            "a = VectorMemoryStore(embedding_dim=1024)\n"
+            "b = VectorMemoryStore(dedup_threshold=0.88)\n"
+            "c = VectorMemoryStore(dedup_threshold=cfg.memory.episodic_dedup_threshold)\n"
+            "d = vm.VectorMemoryStore(dedup_threshold=self._cfg.memory.episodic_dedup_threshold)\n"
+        )
+        violations = self._find_unplumbed_sites(seeded)
+        # `a` omits the keyword, `b` hardcodes it; `c` and `d` are the two
+        # spellings the production sites use (module-local and attribute call,
+        # plain and `self._cfg`).
+        assert len(violations) == 2
+        assert "omits dedup_threshold" in violations[0]
+        assert "not bound to" in violations[1]
+
+
 @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not available (Linux-compiled binary)")
 class TestWriteEpisodicWithoutEmbedding:
     """write_episodic must not crash when the write has no embedding but the
@@ -1651,9 +2579,9 @@ class TestWriteEpisodicWithoutEmbedding:
 
     Repro: memories were written with embeddings (index populated), then
     embeddings are disabled (embedding_provider="none" -> embed_fn unbound) or
-    a single embed call fails. The FAISS dedup block used to dereference the
+    a single embed call fails. The FAISS dedup block must not dereference the
     unbound `vec` local and raise UnboundLocalError, losing the memory.
-    Regression guard for the gateway consolidation crash (2026-07-15).
+    Regression guard for the gateway consolidation crash.
     """
 
     dim = 16
@@ -1800,7 +2728,7 @@ class TestEpisodicGhostVectorDedup:
 class TestBackfillMissingEmbeddings:
     """Re-embed sweep: embed episodic rows written without a vector."""
 
-    def test_backfills_null_rows_and_rebuilds_index(self, tmp_path: Path) -> None:
+    def test_backfills_null_rows_and_extends_index(self, tmp_path: Path) -> None:
         # Write episodic entries with NO embed_fn → embedding stored as NULL.
         store = VectorMemoryStore(db_path=tmp_path / "mem.db")
         store.init()
@@ -1819,7 +2747,7 @@ class TestBackfillMissingEmbeddings:
             "SELECT COUNT(*) FROM episodic_memories WHERE embedding IS NULL"
         ).fetchone()[0]
         assert null_after == 0
-        # Index rebuilt to include the freshly-embedded rows.
+        # The resident index includes the freshly embedded rows without a rebuild.
         assert store._faiss_index is not None
         assert store._faiss_index.ntotal == 2  # type: ignore[attr-defined]
         # Stored vectors must be L2-normalized (IndexFlatIP scores IP == cosine
@@ -1862,6 +2790,137 @@ class TestBackfillMissingEmbeddings:
         store.embed_fn = lambda text: [0.1] * store._embedding_dim
         # No episodic rows at all → returns 0.
         assert store.backfill_missing_embeddings() == 0
+
+    def test_bounded_pages_extend_resident_index_without_full_rebuild(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        for index in range(33):
+            assert store.write_episodic(
+                f"Deferred bounded repair row {index}", defer_embedding=True
+            )
+        store.embed_fn = lambda text: [0.1] * store._embedding_dim
+        with (
+            mock.patch.object(store, "build_faiss_index") as rebuild,
+            mock.patch.object(store, "save_faiss_index") as save,
+        ):
+            assert store.backfill_missing_embeddings(max_rows_per_kind=16, pace=False) == 16
+            assert store.backfill_missing_embeddings(max_rows_per_kind=16, pace=False) == 16
+            assert store.backfill_missing_embeddings(max_rows_per_kind=16, pace=False) == 1
+        rebuild.assert_not_called()
+        save.assert_not_called()
+        assert store._faiss_index is not None
+        assert store._faiss_index.ntotal == 33  # type: ignore[attr-defined]
+
+
+@pytest.mark.skipif(not (_HAS_FAISS and _HAS_NUMPY), reason="faiss/numpy not available")
+class TestBoundedFaissRecall:
+    class _Index:
+        def __init__(self, indices, distances, ntotal):
+            self.ntotal = ntotal
+            self.indices = indices
+            self.distances = distances
+            self.requested = None
+
+        def search(self, vector, k):
+            import numpy as np
+
+            self.requested = k
+            return (
+                np.asarray([self.distances[:k]], dtype=np.float32),
+                np.asarray([self.indices[:k]], dtype=np.int64),
+            )
+
+    @staticmethod
+    def _store(tmp_path: Path) -> tuple[VectorMemoryStore, str]:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=4)
+        store.init()
+        assert store.write_episodic(
+            "The selected database is PostgreSQL", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        row_id = store.get_episodic_list()[0]["id"]
+        return store, row_id
+
+    def test_native_hit_fetch_uses_index_score_without_embedding_blob(self, tmp_path: Path) -> None:
+        store, row_id = self._store(tmp_path)
+        index = self._Index([0], [0.9], 1)
+        store._faiss_index = index
+        store._faiss_id_map = [row_id]
+        store._faiss_data_version = store._sqlite_data_version()
+        real_batch = store._get_episodic_batch
+        fetched = []
+
+        def observe_batch(ids):
+            fetched.append(ids)
+            return real_batch(ids)
+
+        with mock.patch.object(store, "_get_episodic_batch", side_effect=observe_batch):
+            result = store.search_episodic(query_embedding=[1.0, 0.0, 0.0, 0.0], limit=8, mmr=False)
+
+        assert [row["id"] for row in result] == [row_id]
+        assert fetched == [[row_id]]
+        assert "embedding" not in result[0]
+        assert index.requested == 1
+
+    def test_fixed_native_window_falls_back_when_ghosts_starve_results(
+        self, tmp_path: Path
+    ) -> None:
+        store, row_id = self._store(tmp_path)
+        index = self._Index(list(range(16)), [0.99] * 16, 3001)
+        store._faiss_index = index
+        store._faiss_id_map = [f"deleted-{i}" for i in range(3000)] + [row_id]
+        store._faiss_data_version = store._sqlite_data_version()
+
+        with mock.patch.object(
+            store, "_ineligible_ids", wraps=store._ineligible_ids
+        ) as eligibility:
+            result = store.search_episodic(query_embedding=[1.0, 0.0, 0.0, 0.0], limit=8, mmr=False)
+
+        assert index.requested == 16
+        assert len(eligibility.call_args_list[0].args[0]) == 16
+        assert [row["id"] for row in result] == [row_id]
+
+
+def test_fresh_store_records_ready_custom_space_before_first_vector(tmp_path, monkeypatch) -> None:
+    dimension = 20
+
+    class _CustomBackend:
+        model_id = "custom:test-space"
+
+        def __init__(self):
+            self.dim = dimension
+
+        @staticmethod
+        def is_ready():
+            return True
+
+        @staticmethod
+        def embed(text, *, priority=0):
+            index = int(text.rsplit(" ", 1)[-1])
+            vector = [0.0] * dimension
+            vector[index] = 1.0
+            return vector
+
+    backend = _CustomBackend()
+    monkeypatch.setattr(embeddings_mod, "_shared_embedder", backend)
+    monkeypatch.setattr(embeddings_mod, "_backend_factory", lambda: backend)
+    store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dimension)
+    store.init()
+    assert store.recorded_embedding_space() is None
+    assert store.has_stored_embeddings() is False
+    store.embed_fn = embeddings_mod.make_sync_embed_fn()
+
+    for index in range(dimension):
+        assert store.write_episodic(f"Fresh custom vector {index}")
+
+    assert store.recorded_embedding_space() == embeddings_mod.embedding_space_signature(
+        backend.model_id, backend.dim
+    )
+    assert (
+        store.db.execute(
+            "SELECT COUNT(*) FROM episodic_memories WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        == dimension
+    )
 
 
 @pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not available")
@@ -2203,6 +3262,13 @@ class _AuditingConnection:
         self._lock = lock
         self._violations = violations
 
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._inner.__exit__(*exc)
+
     def _must_be_locked(self, sql: str) -> bool:
         if sql.lstrip().upper().startswith(self._DML):
             return True
@@ -2258,11 +3324,17 @@ class TestSharedConnectionLockDiscipline:
         assert store.search_episodic(query_text="findings doc", limit=3)
 
         # Semantic write, then an overwrite so _retire_stale_episodic runs.
-        assert store.set_semantic("project.notes.findings_doc", "v1 draft", 0.9, "consolidation") is None
-        assert store.set_semantic("project.notes.findings_doc", "v2 final", 0.9, "consolidation") is None
+        assert (
+            store.set_semantic("project.notes.findings_doc", "v1 draft", 0.9, "user_explicit")
+            is None
+        )
+        assert (
+            store.set_semantic("project.notes.findings_doc", "v2 final", 0.9, "user_explicit")
+            is None
+        )
 
         # Remaining writers: lessons (incl. embedding backfill), deletes, rotation.
-        assert store.write_lesson("prefer explicit transactions over implicit ones") is True
+        assert store.write_lesson("prefer explicit transactions over implicit ones").wrote is True
         store.delete_semantic("project.notes.findings_doc", "user_explicit")
         rows = store.get_episodic_list(limit=1)
         if rows:
@@ -2330,11 +3402,1544 @@ class TestSharedConnectionLockDiscipline:
         store.init()
         assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
 
-        def _boom(key: str, old_value: str) -> None:
+        def _boom(key: str, old_value: str, **kw: object) -> None:
             raise RuntimeError("cannot start a transaction within a transaction")
 
         store._retire_stale_episodic = _boom  # type: ignore[assignment]
-        assert store.set_semantic("pref.editor", "emacs", 0.9, "consolidation") is None
+        assert store.set_semantic("pref.editor", "emacs", 0.9, "user_explicit") is None
         entry = store.get_semantic("pref.editor")
         assert entry is not None
         assert entry["value_json"] == '"emacs"'
+
+    def test_retire_search_skips_mmr_rerank(self, tmp_path: Path) -> None:
+        """``_retire_stale_episodic``'s internal lookup passes ``mmr=False``.
+
+        The caller applies its own ``cosine_sim > 0.7`` threshold, so diversity
+        reranking buys nothing there, and the default MMR rerank cost ~71ms per
+        superseding semantic write at 1,000 pooled candidates.
+        """
+        dim = 16
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+
+        # Matches the retire query "editor: vim" exactly, so the vector path
+        # clears its cosine threshold regardless of tokenizer details.
+        text = "editor: vim"
+        assert store.write_episodic(text, embedding=embed(text)) is True
+
+        calls: list[dict] = []
+        returned: list[list[dict]] = []
+        real_search = store.search_episodic
+
+        def _spy(*args: object, **kwargs: object) -> list[dict]:
+            calls.append(dict(kwargs))
+            out = real_search(*args, **kwargs)  # type: ignore[arg-type]
+            returned.append(out)
+            return out
+
+        store.search_episodic = _spy  # type: ignore[assignment]
+        assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
+        # The superseding write triggers _retire_stale_episodic on "vim".
+        assert store.set_semantic("pref.editor", "emacs", 0.9, "consolidation") is None
+
+        retire_calls = [c for c in calls if c.get("query_embedding") is not None]
+        assert retire_calls, "superseding write never reached search_episodic"
+        assert all(
+            c.get("mmr") is False for c in retire_calls
+        ), f"retirement search must skip the MMR rerank: {retire_calls}"
+
+        # The VECTOR branch itself cleared the threshold: without this, the
+        # is_deleted check below would be satisfied by the text-LIKE fallback
+        # alone (the fixture text matches its first pattern verbatim) and a
+        # broken vector path under mmr=False would keep the test green.
+        assert any(
+            r.get("cosine_sim", 0) > 0.7 for out in returned for r in out
+        ), "vector retirement path returned no row above the cosine threshold"
+
+        # The superseded episodic row is still soft-deleted without the rerank.
+        row = store.db.execute(
+            "SELECT is_deleted FROM episodic_memories WHERE text = ?", (text,)
+        ).fetchone()
+        assert row is not None
+        assert row["is_deleted"] == 1
+
+    def test_retire_recall_survives_without_the_mmr_pool(self, tmp_path: Path) -> None:
+        """The vector arm alone fills the per-write cap when MMR is off.
+
+        ``mmr`` does not only pick a reranker — it sizes the candidate pool
+        (``_MMR_MAX_POOL`` vs ``limit``), so the retirement lookup keeps a wide
+        ``limit``: the caller's own ``cosine_sim > 0.7`` threshold, not the pool
+        cut, decides which rows are candidates. The row texts avoid both
+        text-LIKE fallback patterns ("editor: vim" / "editor vim"), so only the
+        vector branch can retire them, and the write must retire exactly
+        ``_MAX_EPISODIC_RETIRED_PER_WRITE`` of the fifteen conflicting rows: fewer
+        means the vector branch under-delivered, more means the cap is not
+        applied on V1.
+        """
+        dim = 64
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=dim)
+        store.init()
+        embed = self._fake_embed(dim)
+        store.embed_fn = embed
+        store._faiss_index = None  # deterministic: exercise the fallback tier
+
+        fillers = [
+            "alpha",
+            "bravo",
+            "charlie",
+            "delta",
+            "echo",
+            "foxtrot",
+            "golf",
+            "hotel",
+            "india",
+            "juliet",
+            "kilo",
+            "lima",
+            "mike",
+            "november",
+            "oscar",
+        ]
+        # Tokens {vim, editor, <filler>} give cosine ~0.82 against the retire
+        # query "editor: vim" (tokens {editor, vim}) under the bag-of-words
+        # fake embed — above the 0.7 threshold, below the 0.88 dedup gate.
+        texts = [f"vim editor {w}" for w in fillers]
+        for t in texts:
+            assert store.write_episodic(t, embedding=embed(t)) is True
+
+        assert store.set_semantic("pref.editor", "vim", 0.9, "consolidation") is None
+        assert store.set_semantic("pref.editor", "emacs", 0.9, "consolidation") is None
+
+        remaining = store.db.execute(
+            "SELECT COUNT(*) FROM episodic_memories WHERE is_deleted = 0"
+        ).fetchone()[0]
+        assert (
+            remaining == len(texts) - _MAX_EPISODIC_RETIRED_PER_WRITE
+        ), f"{len(texts) - remaining} rows retired; the vector arm must spend exactly the cap"
+
+
+class TestLockedFetchHelpers:
+    """The locked fetch helpers — the single route for plain SELECTs."""
+
+    def test_fetch_all_locked_returns_materialized_rows(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.set_semantic("pref.editor", "vim", 0.9, "user_explicit")
+        store.set_semantic("pref.shell", "zsh", 0.9, "user_explicit")
+        rows = store._fetch_all_locked(
+            "SELECT key FROM semantic_memory WHERE key LIKE ? AND is_deleted = 0 ORDER BY key",
+            ("pref.%",),
+        )
+        # A materialized list (not a live cursor), safe to iterate unlocked.
+        assert isinstance(rows, list)
+        assert [r["key"] for r in rows] == ["pref.editor", "pref.shell"]
+
+    def test_fetch_one_locked_hit_and_miss(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.set_semantic("pref.editor", "vim", 0.9, "user_explicit")
+        row = store._fetch_one_locked(
+            "SELECT value_json FROM semantic_memory WHERE key = ?", ("pref.editor",)
+        )
+        assert row is not None and row["value_json"] == '"vim"'
+        assert (
+            store._fetch_one_locked(
+                "SELECT value_json FROM semantic_memory WHERE key = ?", ("pref.nope",)
+            )
+            is None
+        )
+
+    def test_helpers_are_reentrant_under_held_lock(self, tmp_path: Path) -> None:
+        """_db_lock is an RLock: locked write sections may call readers that
+        route through the helpers (e.g. search_episodic -> _get_episodic_batch)
+        without deadlocking."""
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.set_semantic("pref.editor", "vim", 0.9, "user_explicit")
+        with store._db_lock:
+            rows = store._fetch_all_locked("SELECT key FROM semantic_memory")
+        assert len(rows) == 1
+
+
+class TestDbLockGuard:
+    """AST guard: EVERY statement on the shared
+    ``check_same_thread=False`` connection must be serialized on ``_db_lock``.
+
+    Enforcing the contract by convention alone is error-prone. This test
+    makes a raw unlocked ``self.db.execute(...)`` in vector_memory.py a CI
+    failure instead of a code-review catch: new fetches must route through
+    ``_fetch_all_locked``/``_fetch_one_locked`` (which lock internally) or sit
+    inside an explicit ``with self._db_lock:`` read-modify-write section or
+    ``_vector_commit``. The helper's own acquisition is checked too; removing it
+    must fail this guard, not turn the helper's name into an exemption.
+    """
+
+    #: Methods allowed to touch the raw ``self._db`` attribute unlocked:
+    #: they run before/after the store is shared across threads.
+    _RAW_DB_ALLOWED = {"init", "_init_database", "close", "db"}
+
+    @staticmethod
+    def _is_self_attr(node: object, attr: str) -> bool:
+        import ast
+
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == attr
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        )
+
+    @classmethod
+    def _find_unserialized_statements(cls, tree) -> list[str]:
+        """Return a violation string per sqlite statement not serialized on
+        ``_db_lock``. Shared by the real guard and its self-test below."""
+        import ast
+
+        violations: list[str] = []
+        guard = cls
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.lock_depth = 0
+                self.exit_stacks: set[str] = set()
+                self.func_stack: list[str] = []
+
+            def visit_With(self, node: ast.With) -> None:
+                saved_depth, saved_stacks = self.lock_depth, self.exit_stacks.copy()
+                for item in node.items:
+                    expr = item.context_expr
+                    if guard._is_self_attr(expr, "_db_lock") or (
+                        isinstance(expr, ast.Call)
+                        and guard._is_self_attr(expr.func, "_vector_commit")
+                    ):
+                        self.lock_depth += 1
+                    if (
+                        isinstance(expr, ast.Call)
+                        and isinstance(expr.func, ast.Name)
+                        and expr.func.id == "ExitStack"
+                        and isinstance(item.optional_vars, ast.Name)
+                    ):
+                        self.exit_stacks.add(item.optional_vars.id)
+                self.generic_visit(node)
+                self.lock_depth, self.exit_stacks = saved_depth, saved_stacks
+
+            def visit_Expr(self, node: ast.Expr) -> None:
+                self.generic_visit(node)
+                call = node.value
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "enter_context"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id in self.exit_stacks
+                    and len(call.args) == 1
+                    and guard._is_self_attr(call.args[0], "_db_lock")
+                ):
+                    self.lock_depth += 1
+
+            def visit_Try(self, node: ast.Try) -> None:
+                # An enter_context which raises cannot protect its error handler.
+                saved = self.lock_depth
+                for statement in node.body:
+                    self.visit(statement)
+                for statement in node.orelse:
+                    self.visit(statement)
+                self.lock_depth = saved
+                for handler in node.handlers:
+                    self.visit(handler)
+                    self.lock_depth = saved
+                for statement in node.finalbody:
+                    self.visit(statement)
+                self.lock_depth = saved
+
+            def visit_If(self, node: ast.If) -> None:
+                saved = self.lock_depth
+                self.visit(node.test)
+                for statement in node.body:
+                    self.visit(statement)
+                self.lock_depth = saved
+                for statement in node.orelse:
+                    self.visit(statement)
+                self.lock_depth = saved
+
+            visit_While = visit_If
+
+            def visit_For(self, node: ast.For) -> None:
+                saved = self.lock_depth
+                self.generic_visit(node)
+                self.lock_depth = saved
+
+            def visit_ClassDef(self, node) -> None:
+                self.func_stack.append(node.name)
+                self.generic_visit(node)
+                self.func_stack.pop()
+
+            def _visit_func(self, node) -> None:
+                self.func_stack.append(node.name)
+                saved, saved_stacks = self.lock_depth, self.exit_stacks
+                self.lock_depth = 0  # function body runs at call time, not here
+                self.exit_stacks = set()
+                self.generic_visit(node)
+                self.lock_depth, self.exit_stacks = saved, saved_stacks
+                self.func_stack.pop()
+
+            visit_FunctionDef = _visit_func
+            visit_AsyncFunctionDef = _visit_func
+
+            def visit_Call(self, node: ast.Call) -> None:
+                func = node.func
+                if isinstance(func, ast.Attribute) and func.attr in (
+                    "execute",
+                    "executemany",
+                    "executescript",
+                ):
+                    where = ".".join(self.func_stack) or "<module>"
+                    if guard._is_self_attr(func.value, "db") and self.lock_depth == 0:
+                        violations.append(
+                            f"line {node.lineno} ({where}): self.db.{func.attr}() outside "
+                            "`with self._db_lock:` — use _fetch_all_locked/_fetch_one_locked "
+                            "for reads or take the lock explicitly for writes"
+                        )
+                    elif guard._is_self_attr(func.value, "_db") and not (
+                        self.func_stack and self.func_stack[-1] in guard._RAW_DB_ALLOWED
+                    ):
+                        violations.append(
+                            f"line {node.lineno} ({where}): raw self._db.{func.attr}() outside "
+                            f"{sorted(guard._RAW_DB_ALLOWED)} — go through self.db under _db_lock"
+                        )
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return violations
+
+    def test_every_db_statement_is_lock_serialized(self) -> None:
+        import ast
+        import inspect
+
+        from kiro_crew import vector_memory
+
+        source = inspect.getsource(vector_memory)
+        tree = ast.parse(source)
+        violations = self._find_unserialized_statements(tree)
+        assert not violations, "unserialized sqlite statement(s):\n" + "\n".join(violations)
+
+    def test_guard_catches_a_seeded_violation(self) -> None:
+        """The guard itself must fail on an unlocked fetch — otherwise a refactor
+        that breaks its With/function tracking would silently disarm it."""
+        import ast
+
+        seeded = ast.parse(
+            "class S:\n"
+            "    def bad(self):\n"
+            "        return self.db.execute('SELECT 1').fetchone()\n"
+            "    def good(self):\n"
+            "        with self._db_lock:\n"
+            "            return self.db.execute('SELECT 1').fetchone()\n"
+            "    def sneaky(self):\n"
+            "        with self._db_lock:\n"
+            "            def inner():\n"
+            "                return self.db.execute('SELECT 1').fetchone()\n"
+            "            return inner\n"
+            "    def raw(self):\n"
+            "        return self._db.execute('SELECT 1').fetchone()\n"
+        )
+        violations = self._find_unserialized_statements(seeded)
+        # `bad` is a plain unlocked fetch; `sneaky`'s inner function is defined
+        # under the lock but runs at call time; `raw` bypasses the property
+        # outside the allowed lifecycle methods. `good` must not be flagged.
+        assert len(violations) == 3
+        flagged = "\n".join(violations)
+        assert "(S.bad)" in flagged
+        assert "(S.sneaky.inner)" in flagged
+        assert "(S.raw)" in flagged
+        assert "S.good" not in flagged
+
+    def test_guard_tracks_exit_stack_scope_and_acquisition(self) -> None:
+        import ast
+
+        tree = ast.parse(
+            "class S:\n"
+            "    def scopes(self, condition):\n"
+            "        with ExitStack() as resources:\n"
+            "            self.db.execute('before')\n"
+            "            if condition:\n"
+            "                resources.enter_context(self._db_lock)\n"
+            "            self.db.execute('conditional')\n"
+            "            try:\n"
+            "                resources.enter_context(self._db_lock)\n"
+            "                self.db.execute('guarded')\n"
+            "            except OSError:\n"
+            "                self.db.execute('failed admission')\n"
+            "            resources.enter_context(self._db_lock)\n"
+            "            self.db.execute('guarded again')\n"
+            "            def later():\n"
+            "                resources.enter_context(self._db_lock)\n"
+            "                self.db.execute('captured closed stack')\n"
+            "        self.db.execute('after')\n"
+            "    def transaction(self):\n"
+            "        with self._vector_commit([1.0]):\n"
+            "            self.db.execute('guarded transaction')\n"
+        )
+        violations = self._find_unserialized_statements(tree)
+        assert len(violations) == 5, violations
+        assert sum("S.scopes.later" in item for item in violations) == 1
+        assert not any("S.transaction" in item for item in violations)
+
+    def test_guard_rejects_vector_commit_without_its_real_lock(self) -> None:
+        import ast
+        import inspect
+
+        from kiro_crew import vector_memory
+
+        source = inspect.getsource(vector_memory)
+        acquisition = "resources.enter_context(self._db_lock)"
+        assert source.count(acquisition) == 1
+        violations = self._find_unserialized_statements(
+            ast.parse(source.replace(acquisition, "pass"))
+        )
+        assert any("VectorMemoryStore._vector_commit" in item for item in violations), violations
+
+
+class TestAsyncInitOffloadGuard:
+    """AST guard for blocking ``VectorMemoryStore`` lifecycle calls.
+
+    An ``async def`` must never call ``init()`` or ``close()`` inline. The
+    init path is blocking file IO whose Windows DACL writes can block on a
+    network volume round-trip, and close serializes on the same store lock
+    as ordinary database operations, so either can freeze the event
+    loop. Async callers offload via ``asyncio.to_thread`` / ``run_in_executor``
+    (which take the callable UNCALLED, so they never trip this guard).
+
+    A prose-only contract drifts, so this test makes the next drift a CI failure
+    instead of a code-review catch. Same shape as ``TestDbLockGuard``,
+    including the seeded-violation self-test that keeps the guard armed.
+    """
+
+    @classmethod
+    def _find_inline_async_lifecycle_calls(
+        cls, tree, methods: set[str], where: str = ""
+    ) -> list[str]:
+        """Find direct lifecycle calls on constructor-bound vector stores.
+
+        The receiver must be a name or ``self.<attr>`` assigned from
+        ``VectorMemoryStore(...)`` in the same module. This keeps the generic
+        ``close`` name useful without flagging unrelated transports, clients,
+        files, and responses across the package.
+        """
+        import ast
+
+        def _is_store_ctor(node: object) -> bool:
+            return isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "VectorMemoryStore")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "VectorMemoryStore")
+            )
+
+        # Pass 1: collect module-local bindings created from the constructor.
+        store_names: set = set()
+        store_attrs: set = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if value is not None and _is_store_ctor(value):
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            store_names.add(target.id)
+                        elif isinstance(target, ast.Attribute) and isinstance(
+                            target.value, ast.Name
+                        ):
+                            store_attrs.add(target.attr)
+
+        # Pass 2: flag direct lifecycle calls on those bindings inside async defs.
+        violations: list[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.name_stack: list = []
+                self.async_stack: list = []
+
+            def visit_ClassDef(self, node) -> None:
+                self.name_stack.append(node.name)
+                self.generic_visit(node)
+                self.name_stack.pop()
+
+            def _visit_func(self, node, is_async: bool) -> None:
+                self.name_stack.append(node.name)
+                self.async_stack.append(is_async)
+                self.generic_visit(node)
+                self.async_stack.pop()
+                self.name_stack.pop()
+
+            def visit_FunctionDef(self, node) -> None:
+                self._visit_func(node, is_async=False)
+
+            def visit_AsyncFunctionDef(self, node) -> None:
+                self._visit_func(node, is_async=True)
+
+            def visit_Call(self, node: ast.Call) -> None:
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in methods
+                    and self.async_stack
+                    and self.async_stack[-1]
+                ):
+                    receiver = func.value
+                    hit = (isinstance(receiver, ast.Name) and receiver.id in store_names) or (
+                        isinstance(receiver, ast.Attribute)
+                        and receiver.attr in store_attrs
+                        and isinstance(receiver.value, ast.Name)
+                    )
+                    if hit:
+                        loc = ".".join(self.name_stack) or "<module>"
+                        violations.append(
+                            f"{where}line {node.lineno} ({loc}): "
+                            f"VectorMemoryStore.{func.attr}() "
+                            "called inline in an async function — offload it via "
+                            f"`await asyncio.to_thread(<store>.{func.attr})`"
+                        )
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return violations
+
+    @classmethod
+    def _find_inline_async_inits(cls, tree, where: str = "") -> list[str]:
+        return cls._find_inline_async_lifecycle_calls(tree, {"init"}, where)
+
+    def test_no_async_function_calls_init_inline(self) -> None:
+        # A violation needs a constructor binding (``VectorMemoryStore``) AND an
+        # ``async`` def in the SAME module, so a file whose text lacks either can
+        # never match: parse only the ones that hold both, off the shared corpus.
+        pkg_root = source_corpus.src_root()
+        violations: list = []
+        for py, _text, tree in source_corpus.parsed_candidates(
+            require_all=("VectorMemoryStore", "async")
+        ):
+            rel = py.relative_to(pkg_root.parent)
+            violations.extend(self._find_inline_async_inits(tree, where=f"{rel}:"))
+        assert not violations, "inline async VectorMemoryStore.init() call(s):\n" + "\n".join(
+            violations
+        )
+
+    def test_guard_catches_a_seeded_violation(self) -> None:
+        """The guard must fail on a seeded inline call and stay quiet on the
+        offloaded / sync forms — otherwise a refactor that breaks its binding
+        or async tracking would silently disarm it."""
+        import ast
+
+        seeded = ast.parse(
+            "store = VectorMemoryStore()\n"
+            "class S:\n"
+            "    def __init__(self):\n"
+            "        self.vm = VectorMemoryStore()\n"
+            "    async def bad(self):\n"
+            "        store.init()\n"
+            "    async def bad_attr(self):\n"
+            "        self.vm.init()\n"
+            "    async def good(self):\n"
+            "        await asyncio.to_thread(store.init)\n"
+            "    def sync_ok(self):\n"
+            "        store.init()\n"
+            "    async def outer(self):\n"
+            "        def helper():\n"
+            "            store.init()\n"
+            "        await asyncio.to_thread(helper)\n"
+        )
+        violations = self._find_inline_async_inits(seeded)
+        # `bad` and `bad_attr` call init inline on the loop; `good` passes the
+        # callable uncalled; `sync_ok` is a sync function; `helper` is a sync
+        # function that runs at call time (inside to_thread).
+        assert len(violations) == 2
+        flagged = "\n".join(violations)
+        assert "(S.bad)" in flagged
+        assert "(S.bad_attr)" in flagged
+        assert "S.good" not in flagged
+        assert "S.sync_ok" not in flagged
+        assert "S.outer" not in flagged
+
+    def test_no_async_function_calls_close_inline_on_a_vector_store(self) -> None:
+        # Same narrowing as the init guard: the receiver must be bound from
+        # ``VectorMemoryStore(...)`` in the same module as the ``async`` def.
+        root = TestHandlerOffload1947._package_root()
+        violations: list[str] = []
+        for path, _text, tree in source_corpus.parsed_candidates(
+            require_all=("VectorMemoryStore", "async")
+        ):
+            violations.extend(
+                self._find_inline_async_lifecycle_calls(
+                    tree, {"close"}, where=f"{path.relative_to(root)}:"
+                )
+            )
+        assert not violations, "inline async VectorMemoryStore.close() call(s):\n" + "\n".join(
+            violations
+        )
+
+    def test_close_guard_is_receiver_aware_and_non_vacuous(self) -> None:
+        import ast
+
+        seeded = ast.parse(
+            "store = VectorMemoryStore()\n"
+            "async def bad():\n"
+            "    store.close()\n"
+            "async def unrelated(response):\n"
+            "    response.close()\n"
+            "async def good():\n"
+            "    await asyncio.to_thread(store.close)\n"
+        )
+        violations = self._find_inline_async_lifecycle_calls(seeded, {"close"})
+        assert len(violations) == 1
+        assert "(bad)" in violations[0]
+        assert "VectorMemoryStore.close()" in violations[0]
+
+
+@pytest.mark.xdist_group("vector_memory_concurrency")
+class TestReaderConcurrency1947:
+    """Stress the readers that take ``_db_lock`` on the shared connection
+    (get_semantic, get_all_semantic, search_semantic, get_events,
+    get_episodic_list, memory_stats, _get_episodic, get_rejection_stats)
+    against concurrent writers.
+
+    Same defect class: an unserialized statement racing a writer's
+    implicit transaction corrupts the per-connection statement cache
+    (sqlite3.InterfaceError "bad parameter or other API misuse") or silently
+    corrupts row iteration. With every fetch routed through the locked helper,
+    readers must raise NOTHING — dashboard/API callers surface any exception
+    as a 500.
+    """
+
+    def test_previously_unlocked_readers_survive_concurrent_writes(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        # Seed both tables plus the event log so every reader has real rows.
+        seeded_episodic_ids: list[str] = []
+        for i in range(10):
+            store.set_semantic(f"project.seed.k{i:02d}", f"alpha value {i}", 1.0, "tool")
+            store.write_episodic(f"seeded episodic memory {i} about alpha beta topics")
+        seeded_episodic_ids = [m["id"] for m in store.get_episodic_list(limit=10)]
+
+        start_barrier = threading.Barrier(4)
+        errors: list[BaseException] = []
+        progress: dict[int, int] = {}
+
+        def _writer(n: int, tag: str) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
+            start_barrier.wait()
+            try:
+                for i in range(n):
+                    store.set_semantic(f"project.stress.{tag}{i:03d}", f"gamma {i}", 1.0, "tool")
+                    store.write_episodic(f"stress episodic {tag}{i:03d} gamma delta {i}")
+                    progress[tid] += 1
+            except BaseException as exc:  # noqa: BLE001 - capture any thread crash
+                errors.append(exc)
+
+        def _reader(n: int) -> None:
+            tid = threading.get_ident()
+            progress[tid] = 0
+            start_barrier.wait()
+            try:
+                for i in range(n):
+                    store.get_semantic("project.seed.k00")
+                    store.get_all_semantic(limit=20)
+                    store.search_semantic("project.")
+                    store.get_events(limit=20)
+                    store.get_episodic_list(limit=20)
+                    store.memory_stats()
+                    store._get_episodic(seeded_episodic_ids[i % len(seeded_episodic_ids)])
+                    store.get_rejection_stats()
+                    progress[tid] += 1
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_writer, args=(40, "a")),
+            threading.Thread(target=_writer, args=(40, "b")),
+            threading.Thread(target=_reader, args=(30,)),
+            threading.Thread(target=_reader, args=(30,)),
+        ]
+        for t in threads:
+            t.start()
+        _join_stress_threads(threads, progress, "unlocked-reader/writer stress")
+        assert not errors, f"concurrent reader/writer stress raised: {errors!r}"
+
+        # Post-stress coherence: counts add up and a fresh read round-trips.
+        stats = store.memory_stats()
+        assert stats["semantic_active"] >= 90  # 10 seed + 2×40 stress writers
+        assert store.get_semantic("project.stress.a000") is not None
+
+
+class TestHandlerOffload1947:
+    """Async code must not call lock-serialized store methods inline on the
+    event loop.
+
+    Every plain fetch serializes on ``_db_lock``. A worker thread can
+    hold that lock for seconds (backfill's locked FAISS rebuild, reconcile's
+    bulk UPDATEs), so an async function that calls a locked method inline would
+    freeze the whole gateway event loop — chat, heartbeats, every request — for
+    the duration. Async callers must offload
+    via ``asyncio.to_thread`` / ``run_in_executor`` / ``run_in_embed_pool``.
+
+    Both the method set and the caller set are DERIVED, not hand-listed
+    (a hand-maintained list re-introduces
+    enforcement-by-convention one level up): the methods come from
+    ``vector_memory.py``'s AST (public methods that reach
+    ``with self._db_lock:`` directly or transitively through other ``self``
+    calls), and the scan covers every module in the ``kiro_crew`` package.
+    """
+
+    #: Lock-reaching methods exempt from this name-only scan. ``init`` is the
+    #: one-time lifecycle call made before the store is shared across threads.
+    #: ``close`` collides with unrelated clients, transports, and responses;
+    #: TestAsyncInitOffloadGuard covers it with constructor-bound receivers.
+    _EXEMPT = {"close", "init"}
+
+    @staticmethod
+    def _package_root() -> Path:
+        import kiro_crew
+
+        return Path(kiro_crew.__file__).resolve().parent
+
+    @classmethod
+    def _derive_locked_methods(cls) -> set[str]:
+        """Public ``VectorMemoryStore`` methods that acquire ``_db_lock``,
+        directly or transitively through other ``self`` method calls."""
+        import ast
+
+        source = (cls._package_root() / "vector_memory.py").read_text(encoding="utf-8")
+        klass = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ClassDef) and node.name == "VectorMemoryStore"
+        )
+
+        callees: dict[str, set[str]] = {}
+        direct: set[str] = set()
+        for node in klass.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            called: set[str] = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.withitem) and TestDbLockGuard._is_self_attr(
+                    sub.context_expr, "_db_lock"
+                ):
+                    direct.add(node.name)
+                if isinstance(sub, ast.Call):
+                    func = sub.func
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "self"
+                    ):
+                        called.add(func.attr)
+            callees[node.name] = called
+
+        # Fixpoint over the self-call graph: a method that calls a
+        # lock-reaching method is itself lock-reaching.
+        reaching = set(direct)
+        changed = True
+        while changed:
+            changed = False
+            for name, called in callees.items():
+                if name not in reaching and called & reaching:
+                    reaching.add(name)
+                    changed = True
+
+        return {name for name in reaching if not name.startswith("_")} - cls._EXEMPT
+
+    @classmethod
+    def _find_inline_calls(cls, tree, locked: set[str], label: str) -> list[str]:
+        """Violation string per inline call of a locked method inside an
+        ``async def``. Shared by the real guard and its seeded self-test."""
+        import ast
+
+        violations: list[str] = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.async_stack: list[str] = []
+
+            def visit_AsyncFunctionDef(self, node) -> None:
+                self.async_stack.append(node.name)
+                self.generic_visit(node)
+                self.async_stack.pop()
+
+            def visit_FunctionDef(self, node) -> None:
+                # A sync def's body runs wherever it is CALLED from; handlers
+                # that offload a sync helper (run_in_executor on
+                # _build_memory_graph) are the compliant pattern, so sync
+                # bodies are out of scope here.
+                saved, self.async_stack = self.async_stack, []
+                self.generic_visit(node)
+                self.async_stack = saved
+
+            def visit_Call(self, node: ast.Call) -> None:
+                func = node.func
+                # Direct attribute call: <expr>.<method>(...) — inline execution.
+                # Offloaded forms pass the method as an OBJECT
+                # (asyncio.to_thread(store.get_events, ...)), which is an
+                # Attribute argument, not a Call, so they do not match here.
+                if self.async_stack and isinstance(func, ast.Attribute) and func.attr in locked:
+                    violations.append(
+                        f"{label} line {node.lineno} "
+                        f"(async {self.async_stack[-1]}): inline .{func.attr}() call — "
+                        "offload with asyncio.to_thread to keep a contended _db_lock "
+                        "from blocking the event loop"
+                    )
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return violations
+
+    def test_derived_method_set_is_sound(self) -> None:
+        """The derivation must stay non-vacuous: known lock-takers present
+        (direct AND transitive), known lock-free methods absent."""
+        locked = self._derive_locked_methods()
+        # Direct: write_episodic takes the lock in its own body. Transitive:
+        # build_faiss_index and delete_semantic reach it only through other
+        # self calls (get_all_semantic / get_semantic locked fetches).
+        assert {
+            "get_lessons",
+            "write_episodic",
+            "build_faiss_index",
+            "delete_semantic",
+            "memory_stats",
+        } <= locked
+        # Lock-free public methods must not be flagged, or the guard would
+        # force pointless offloads. Lifecycle/generic-name exemptions are also
+        # absent from the derived enforcement set.
+        assert "validate_semantic" not in locked
+        assert "embed_lesson" in locked
+        assert not {"close", "init"} & locked
+
+    def test_guard_catches_seeded_violation(self) -> None:
+        """The scanner must flag a known-bad inline call, so a visitor
+        regression cannot silently turn the guard vacuous."""
+        import ast
+        import textwrap
+
+        seeded = textwrap.dedent("""
+            async def handler(store):
+                return store.get_lessons()
+
+            def sync_helper(store):
+                return store.get_lessons()  # sync def: out of scope
+
+            async def compliant(store):
+                import asyncio
+                return await asyncio.to_thread(store.get_lessons)
+            """)
+        violations = self._find_inline_calls(ast.parse(seeded), {"get_lessons"}, "<seeded>")
+        assert len(violations) == 1
+        assert "async handler" in violations[0]
+        assert ".get_lessons()" in violations[0]
+
+    def test_async_callers_offload_locked_methods(self) -> None:
+        import ast
+
+        locked = self._derive_locked_methods()
+        root = self._package_root()
+        violations: list[str] = []
+        for path in sorted(root.rglob("*.py")):
+            if path.name == "vector_memory.py":
+                continue  # the store may call its own methods inline
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            violations.extend(self._find_inline_calls(tree, locked, str(path.relative_to(root))))
+        assert not violations, "\n".join(violations)
+
+
+class TestSemanticWriteTimeEmbedding:
+    """set_semantic persists a value vector; retrieval ranks from storage.
+
+    The write path embeds ``"<key> <value_json>"`` in _write_semantic's tail
+    and get_semantic_context ranks from the STORED blobs (one query embed per
+    request, never one per row). The backfill sweep repairs rows written while
+    the model was absent, including set_semantic_if_absent imports.
+    """
+
+    _DIM = 8
+
+    def _directional_embed(self, counter: list[int] | None = None):
+        """Deterministic embed: one axis per known topic word.
+
+        ``tokyo`` and ``nippon`` share an axis so a query can hit a row on the
+        VECTOR term with zero keyword overlap — isolating what is under test.
+        Optionally counts calls via *counter* (a single-element list).
+        """
+        axes = {"paris": 0, "tokyo": 1, "nippon": 1, "coffee": 2}
+
+        def _embed(text: str) -> list[float]:
+            if counter is not None:
+                counter[0] += 1
+            vec = [0.0] * self._DIM
+            for word, i in axes.items():
+                if word in text.lower():
+                    vec[i] += 1.0
+            if not any(vec):
+                vec[self._DIM - 1] = 1.0
+            return vec
+
+        return _embed
+
+    def _stored_embedding(self, store: VectorMemoryStore, key: str) -> bytes | None:
+        row = store.db.execute(
+            "SELECT embedding FROM semantic_memory WHERE key = ?", (key,)
+        ).fetchone()
+        assert row is not None
+        return row["embedding"]
+
+    def test_set_semantic_persists_embedding(self, tmp_path: Path) -> None:
+        import struct
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        embed = self._directional_embed()
+        store.embed_fn = embed
+
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+
+        blob = self._stored_embedding(store, "pref.city")
+        assert blob is not None, "write-time embedding was not persisted"
+        # The stored vector is the embed of "<key> <value_json>" — the same
+        # text retrieval ranks against.
+        expected = embed('pref.city "Paris"')
+        assert list(struct.unpack(f"{len(blob) // 4}f", blob)) == pytest.approx(expected)
+
+    def test_update_replaces_stale_vector(self, tmp_path: Path) -> None:
+        import struct
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        embed = self._directional_embed()
+        store.embed_fn = embed
+
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.city", "Tokyo", 1.0, "user_explicit") is None
+
+        blob = self._stored_embedding(store, "pref.city")
+        assert blob is not None
+        assert list(struct.unpack(f"{len(blob) // 4}f", blob)) == pytest.approx(
+            embed('pref.city "Tokyo"')
+        )
+
+    def test_update_without_embed_fn_clears_stale_vector(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = self._directional_embed()
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert self._stored_embedding(store, "pref.city") is not None
+
+        # Model gone: the re-write must NOT keep ranking by the old value's
+        # vector — NULL leaves the row a backfill candidate.
+        store.embed_fn = None
+        assert store.set_semantic("pref.city", "Tokyo", 1.0, "user_explicit") is None
+        assert self._stored_embedding(store, "pref.city") is None
+
+    def test_space_swap_mid_embed_leaves_null(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        inner = self._directional_embed()
+
+        def _swapping_embed(text: str):
+            # A model swap lands while the embed is in flight: the produced
+            # vector belongs to the OLD space and must not be committed.
+            store._space_generation += 1
+            return inner(text)
+
+        store.embed_fn = _swapping_embed
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert self._stored_embedding(store, "pref.city") is None
+
+    def test_lesson_write_keeps_raw_rule_vector(self, tmp_path: Path) -> None:
+        import struct
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        counter = [0]
+        embed = self._directional_embed(counter)
+        store.embed_fn = embed
+
+        rule = "always drink coffee before reviews"
+        assert store.write_lesson(rule).wrote is True
+        lessons = store.get_lessons()
+        assert len(lessons) == 1
+        blob = lessons[0]["embedding"]
+        assert isinstance(blob, bytes)
+        # write_lesson owns the lesson vector contract: raw rule text, NOT the
+        # "<key> <value_json>" envelope _write_semantic embeds for KV rows.
+        assert list(struct.unpack(f"{len(blob) // 4}f", blob)) == pytest.approx(embed(rule))
+        # counter includes the assertion line's own embed(rule) call above.
+        # Exactly ONE embed during write_lesson (the rule): _write_semantic must
+        # skip lesson.* keys, or every lesson write pays a second, discarded
+        # embed of the JSON envelope.
+        assert counter[0] == 2, "lesson write embedded more than the rule text"
+
+    def test_get_semantic_context_ranks_from_stored_vectors(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = self._directional_embed()
+        # "nippon" shares a vector axis with "tokyo" but has zero keyword
+        # overlap with the query, so ranking it first requires the stored
+        # vector to be read — the keyword term alone cannot produce it.
+        assert store.set_semantic("pref.travel", "nippon", 1.0, "user_explicit") is None
+        assert store.set_semantic("pref.drink", "coffee", 1.0, "user_explicit") is None
+
+        counter = [0]
+        store.embed_fn = self._directional_embed(counter)
+        ctx = store.get_semantic_context(query_text="tokyo")
+
+        assert counter[0] == 1, "retrieval must embed only the query, never per row"
+        lines = [ln for ln in ctx.splitlines() if ln.startswith("pref.")]
+        assert lines and lines[0].startswith("pref.travel"), ctx
+
+    def test_write_time_embed_uses_bulk_priority(self, tmp_path: Path) -> None:
+        from kiro_crew.embeddings import PRIORITY_BULK
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        seen: list[int] = []
+
+        def _embed(text: str, priority: int = -1) -> list[float]:
+            seen.append(priority)
+            return [1.0] * self._DIM
+
+        _embed.accepts_priority = True  # type: ignore[attr-defined]
+        store.embed_fn = _embed
+
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        # The write-time vector is a corpus-style deferred asset (nothing
+        # blocks on it), reached from consolidation and import loops — it must
+        # never queue ahead of interactive or explicit-write embeds.
+        assert seen == [PRIORITY_BULK]
+
+    def test_reaffirmation_keeps_vector_without_reembedding(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        texts: list[str] = []
+        inner = self._directional_embed()
+
+        def _embed(text: str) -> list[float]:
+            texts.append(text)
+            return inner(text)
+
+        store.embed_fn = _embed
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        blob = self._stored_embedding(store, "pref.city")
+        assert blob is not None
+
+        # Same value re-affirmed (consolidation rewrites the same keys every
+        # cycle): the upsert keeps the vector and the tail skips the embed —
+        # re-embedding identical text would spend an inference per cycle.
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert self._stored_embedding(store, "pref.city") == blob
+        assert texts.count('pref.city "Paris"') == 1, texts
+
+    def test_null_vector_row_does_not_outrank_embedded_row(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        # Legacy row written while the model was absent: NULL vector, but a
+        # perfect keyword overlap with the query (key + value hit every word).
+        assert (
+            store.set_semantic(
+                "pref.tokyo_travel_plans", "tokyo travel plans", 1.0, "user_explicit"
+            )
+            is None
+        )
+        # Embedded row: zero keyword overlap, perfect vector match ("nippon"
+        # shares the query's axis in the fake embedding space).
+        store.embed_fn = self._directional_embed()
+        assert store.set_semantic("pref.trip", "nippon", 1.0, "user_explicit") is None
+
+        ctx = store.get_semantic_context(query_text="tokyo travel plans")
+        lines = [ln for ln in ctx.splitlines() if ln.startswith("pref.")]
+        # Both rows score on the same weighted scale: the vectorless row must
+        # not keep the unweighted keyword score (1.0) and outrank the
+        # vector-matched row (0.6) — evidence-backed rows win.
+        assert lines and lines[0].startswith("pref.trip"), ctx
+
+    def test_embedding_persist_failure_does_not_fail_the_write(self, tmp_path: Path) -> None:
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = self._directional_embed()
+
+        # A DB error while persisting the derived vector (disk full, I/O error)
+        # must not escape: the semantic row is already committed, and callers
+        # batch many keys per call — an exception here would discard every
+        # remaining item in the batch. The row stays NULL for the backfill.
+        import sqlite3 as _sqlite3
+
+        real_db = store.db
+
+        class _FailingDb:
+            def execute(self, sql: str, *args: object):
+                if sql.startswith("UPDATE semantic_memory SET embedding"):
+                    raise _sqlite3.OperationalError("disk I/O error")
+                return real_db.execute(sql, *args)
+
+            def __getattr__(self, name: str):
+                return getattr(real_db, name)
+
+        store._db = _FailingDb()  # type: ignore[assignment]
+        try:
+            assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        finally:
+            store._db = real_db
+
+        row = store.db.execute(
+            "SELECT value_json, embedding FROM semantic_memory WHERE key = 'pref.city'"
+        ).fetchone()
+        assert row is not None and row["value_json"] == '"Paris"'
+        assert row["embedding"] is None
+
+    def test_backfill_covers_semantic_kv_rows(self, tmp_path: Path) -> None:
+        import struct
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        # Written while the model is absent: rows land with NULL embeddings.
+        assert store.set_semantic("pref.city", "Paris", 1.0, "user_explicit") is None
+        assert store.set_semantic_if_absent("pref.drink", "coffee", 1.0, "import") == "imported"
+        assert self._stored_embedding(store, "pref.city") is None
+        assert self._stored_embedding(store, "pref.drink") is None
+
+        embed = self._directional_embed()
+        store.embed_fn = embed
+        store.backfill_missing_embeddings()
+
+        for key, value_json in (("pref.city", '"Paris"'), ("pref.drink", '"coffee"')):
+            blob = self._stored_embedding(store, key)
+            assert blob is not None, f"backfill left {key} NULL"
+            assert list(struct.unpack(f"{len(blob) // 4}f", blob)) == pytest.approx(
+                embed(f"{key} {value_json}")
+            )
+
+
+@pytest.mark.skipif(not _HAS_NUMPY, reason="numpy not available (Linux-compiled binary)")
+class TestPromotionSkipIsObservable:
+    """A rejected promotion keeps its episodic rows, so it re-clusters and re-attempts forever.
+
+    The success branch owns the only log line in the loop, so before this the retry was silent.
+    """
+
+    def test_rejected_promotion_is_logged_and_counted(self, tmp_path: Path, caplog) -> None:
+        import logging
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=8)
+        store.init()
+        store._faiss_index = None  # keep the promotion corpus independent of optional dedup
+        store.embed_fn = lambda text: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        for i in range(3):
+            store.write_episodic(f"user prefers {i}")
+
+        # set_semantic refuses: promoted stays 0 and the rows survive. The mock returns the REAL
+        # tuple shape, so these assertions can still fail if the log stops unpacking it.
+        with (
+            patch.object(store, "_infer_semantic_key", return_value="pref.os"),
+            patch.object(
+                store,
+                "set_semantic",
+                return_value=(SemanticRejectCode.VALUE_EMPTY, "Value must not be null or empty"),
+            ),
+            patch.object(store, "_delete_episodic_row") as mock_delete,
+            # Scoped to this module's logger: the package level is raised elsewhere, so an
+            # unscoped at_level passes alone and fails in a full-suite run.
+            caplog.at_level(logging.INFO, logger="kiro_crew.vector_memory"),
+        ):
+            promoted = store.promote_episodic_patterns(min_count=1, min_sim=0.0)
+
+        assert promoted == 0
+        # Rows are retained, which is what makes the refusal repeat on every later pass.
+        assert not mock_delete.called
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "Promotion skipped pref.os (value_empty: Value must not be null or empty)" in m
+            for m in msgs
+        ), msgs
+        assert any("promoted," in m and "skipped" in m for m in msgs), msgs
+
+    def test_repeat_refusal_warns_once_but_counts_every_pass(self, tmp_path: Path, caplog) -> None:
+        """The refusal is deterministic, so a second pass must not re-warn about the same key."""
+        import logging
+        from unittest.mock import patch
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=8)
+        store.init()
+        store._faiss_index = None  # keep the promotion corpus independent of optional dedup
+        store.embed_fn = lambda text: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        for i in range(3):
+            store.write_episodic(f"user prefers {i}")
+
+        with (
+            patch.object(store, "_infer_semantic_key", return_value="pref.os"),
+            patch.object(
+                store,
+                "set_semantic",
+                return_value=(SemanticRejectCode.VALUE_EMPTY, "Value must not be null or empty"),
+            ),
+            patch.object(store, "_delete_episodic_row"),
+            caplog.at_level(logging.INFO, logger="kiro_crew.vector_memory"),
+        ):
+            store.promote_episodic_patterns(min_count=1, min_sim=0.0)
+            store.promote_episodic_patterns(min_count=1, min_sim=0.0)
+
+        warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len([m for m in warns if "Promotion skipped pref.os" in m]) == 1, warns
+        # The count is NOT suppressed: both passes still report the skip in their summary.
+        summaries = [m for m in caplog.records if "promoted," in m.getMessage()]
+        assert len(summaries) == 2, [m.getMessage() for m in summaries]
+
+    def test_refusal_set_is_bounded_so_an_evicted_key_warns_again(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The warn-once set is capped, so eviction trades a repeat warning for bounded memory."""
+        import logging
+        from unittest.mock import patch
+
+        import kiro_crew.vector_memory as vm_mod
+
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=8)
+        store.init()
+        store._faiss_index = None  # keep the promotion corpus independent of optional dedup
+        store.embed_fn = lambda text: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        for i in range(3):
+            store.write_episodic(f"user prefers {i}")
+
+        # Cap 0 evicts the entry as soon as it is added, which is the eviction path itself
+        # rather than a stand-in for it: the second pass must therefore warn again.
+        with (
+            patch.object(vm_mod, "_MAX_PROMOTION_REFUSED", 0),
+            patch.object(store, "_infer_semantic_key", return_value="pref.os"),
+            patch.object(
+                store,
+                "set_semantic",
+                return_value=(SemanticRejectCode.VALUE_EMPTY, "Value must not be null or empty"),
+            ),
+            patch.object(store, "_delete_episodic_row"),
+            caplog.at_level(logging.INFO, logger="kiro_crew.vector_memory"),
+        ):
+            store.promote_episodic_patterns(min_count=1, min_sim=0.0)
+            store.promote_episodic_patterns(min_count=1, min_sim=0.0)
+            assert len(store._promotion_refused) == 0
+
+        warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len([m for m in warns if "Promotion skipped pref.os" in m]) == 2, warns
+
+
+class TestSanitizeDecayRates:
+    """_sanitize_decay_rates: user-edited JSON is screened, not trusted."""
+
+    def test_clamps_to_bounds(self) -> None:
+        out = _sanitize_decay_rates({"fast": 99.0, "neg": -5.0, "ok": 0.5})
+        assert out == {"fast": 10.0, "neg": 0.0, "ok": 0.5}
+
+    def test_oversized_json_integers_clamp_instead_of_crashing(self) -> None:
+        # json.loads parses arbitrary-precision integers; float()/math.isfinite()
+        # raise OverflowError past ~1e308, which would abort store construction
+        # (gateway boot) on a garbage config value. Clamping must happen first.
+        big = 10**400
+        out = _sanitize_decay_rates({"huge": big, "neghuge": -big})
+        assert out == {"huge": 10.0, "neghuge": 0.0}
+
+    def test_ignores_non_numeric_with_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.vector_memory"):
+            out = _sanitize_decay_rates(
+                {"legal": "forever", "flag": True, "nan": float("nan"), "ok": 0.1}
+            )
+        assert out == {"ok": 0.1}
+        warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len([m for m in warns if "decay_rates" in m]) == 3, warns
+
+    def test_lowercases_and_strips_keys(self) -> None:
+        assert _sanitize_decay_rates({" Legal ": 0.0}) == {"legal": 0.0}
+
+    def test_empty_and_none_yield_empty(self) -> None:
+        assert _sanitize_decay_rates(None) == {}
+        assert _sanitize_decay_rates({}) == {}
+
+
+class TestEpisodicDecayRates:
+    """Per-tag configurable recency decay (memory.decay_rates) in retrieval scoring."""
+
+    _DIM = 4
+
+    @staticmethod
+    def _vec() -> list[float]:
+        # Unit vector: query == stored embedding gives cosine_sim of exactly 1.0.
+        return [1.0, 0.0, 0.0, 0.0]
+
+    def _store(self, tmp_path: Path, rates: dict[str, object] | None = None) -> VectorMemoryStore:
+        store = VectorMemoryStore(
+            db_path=tmp_path / "mem.db",
+            embedding_dim=self._DIM,
+            decay_rates=rates,  # type: ignore[arg-type]
+        )
+        store.init()
+        return store
+
+    def _write_backdated(
+        self,
+        store: VectorMemoryStore,
+        text: str,
+        days: int,
+        tags: list[str] | None = None,
+    ) -> None:
+        assert store.write_episodic(text, embedding=self._vec(), tags=tags)
+        # The extra hour keeps (now - created).days at exactly `days` for the
+        # duration of the test regardless of sub-second timing.
+        created = (datetime.now(tz=timezone.utc) - timedelta(days=days, hours=1)).isoformat()
+        store.db.execute(
+            "UPDATE episodic_memories SET created_at = ? WHERE text = ?", (created, text)
+        )
+        # init() runs the connection with implicit transactions (isolation_level
+        # ""), so the raw UPDATE above opens one that must be committed here --
+        # otherwise the next write_episodic's BEGIN IMMEDIATE raises "cannot
+        # start a transaction within a transaction".
+        store.db.commit()
+
+    def _score(self, store: VectorMemoryStore, text: str) -> float:
+        results = store.search_episodic(query_embedding=self._vec(), query_text="q", mmr=False)
+        by_text = {r["text"]: r["score"] for r in results}
+        assert text in by_text, f"memory {text!r} not retrieved: {sorted(by_text)}"
+        return by_text[text]
+
+    @staticmethod
+    def _expected(rate: float, days: int) -> float:
+        # cosine_sim = 1.0, default importance 0.5 -> base factor 0.85.
+        return 1.0 * (0.7 + 0.3 * 0.5) * math.exp(-rate * days)
+
+    def test_default_rate_unchanged_without_config(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        self._write_backdated(store, "note about the database migration", days=10)
+        assert self._score(store, "note about the database migration") == pytest.approx(
+            self._expected(0.03, 10), abs=1.5e-4
+        )
+
+    def test_per_tag_override_applied(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, rates={"trading_data": 1.0})
+        self._write_backdated(store, "yesterday's market prices", days=2, tags=["trading_data"])
+        assert self._score(store, "yesterday's market prices") == pytest.approx(
+            self._expected(1.0, 2), abs=1.5e-4
+        )
+
+    def test_multi_tag_picks_slowest_decay(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, rates={"legal": 0.0, "general": 0.5})
+        self._write_backdated(
+            store, "legal reasoning on the contract", days=30, tags=["legal", "general"]
+        )
+        # Slowest decay (rate 0.0) wins: the broader tag must not age it out.
+        assert self._score(store, "legal reasoning on the contract") == pytest.approx(
+            self._expected(0.0, 30), abs=1.5e-4
+        )
+
+    def test_default_key_overrides_builtin_rate(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, rates={"default": 0.5})
+        self._write_backdated(store, "untagged observation from a session", days=5)
+        assert self._score(store, "untagged observation from a session") == pytest.approx(
+            self._expected(0.5, 5), abs=1.5e-4
+        )
+
+    def test_unmatched_tag_uses_builtin_default(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, rates={"legal": 0.0})
+        self._write_backdated(store, "note tagged outside the config", days=10, tags=["other"])
+        assert self._score(store, "note tagged outside the config") == pytest.approx(
+            self._expected(0.03, 10), abs=1.5e-4
+        )
+
+    def test_tag_matching_is_case_insensitive(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path, rates={"LEGAL": 0.0})
+        self._write_backdated(store, "precedent kept forever", days=30, tags=["Legal"])
+        assert self._score(store, "precedent kept forever") == pytest.approx(
+            self._expected(0.0, 30), abs=1.5e-4
+        )
+
+    def test_invalid_values_fall_back_to_default(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.vector_memory"):
+            store = self._store(tmp_path, rates={"legal": "forever", "default": True})
+        self._write_backdated(store, "note with unusable decay config", days=10, tags=["legal"])
+        assert self._score(store, "note with unusable decay config") == pytest.approx(
+            self._expected(0.03, 10), abs=1.5e-4
+        )
+        warns = [r.getMessage() for r in caplog.records if "decay_rates" in r.getMessage()]
+        assert len(warns) == 2, warns
+
+    def test_faiss_path_applies_configured_rate(self, tmp_path: Path) -> None:
+        if not (_HAS_FAISS and _HAS_NUMPY):
+            pytest.skip("FAISS/numpy not available on this platform")
+        store = self._store(tmp_path, rates={"legal": 0.0})
+        self._write_backdated(store, "faiss path retention check", days=30, tags=["legal"])
+        store.build_faiss_index()
+        assert store._faiss_index is not None
+        assert store._faiss_index.ntotal > 0  # type: ignore[attr-defined]
+        assert self._score(store, "faiss path retention check") == pytest.approx(
+            self._expected(0.0, 30), abs=1.5e-4
+        )
+
+
+class TestEpisodicKeywordFallbackCjk:
+    """The no-embeddings episodic fallback must not discard whole-word CJK queries.
+
+    ``search_episodic`` drops to ``_fts5_episodic_search`` whenever no query
+    embedding is available -- the normal state for a deployment with no embedding
+    model configured. That fallback matches with ``LIKE '%token%'``, which is a
+    plain substring test and needs no tokenizer, so a spaceless CJK term is a
+    perfectly good needle. The only thing standing between the query and the row
+    is the minimum-token-length filter, which counts CHARACTERS: two characters
+    is a stopword in English but an ordinary whole word in Chinese, Japanese and
+    Korean, so the filter emptied the term list and the search returned nothing.
+    """
+
+    @staticmethod
+    def _store(tmp_path: Path) -> VectorMemoryStore:
+        """A store with no embed_fn, so search_episodic takes the keyword fallback."""
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        return store
+
+    @pytest.mark.parametrize(
+        ("term", "sentence"),
+        [
+            ("模型", "用户决定用这个模型来做推理"),  # zh: "model"
+            ("会議", "チームは会議で方針を決めた"),  # ja: "meeting"
+            ("회의", "팀은 회의에서 방침을 정했다"),  # ko: "meeting"
+        ],
+        ids=["zh", "ja", "ko"],
+    )
+    def test_a_two_character_word_still_finds_its_row(
+        self, tmp_path: Path, term: str, sentence: str
+    ) -> None:
+        store = self._store(tmp_path)
+        assert store.write_episodic(sentence)
+        # The row plainly contains the term -- LIKE would match it.
+        assert term in sentence
+        hits = store.search_episodic(query_text=term, limit=8)
+        assert [h["text"] for h in hits] == [sentence]
+
+    def test_a_two_word_cjk_query_is_not_emptied(self, tmp_path: Path) -> None:
+        """Both tokens are two characters; the whole query must not filter to []."""
+        store = self._store(tmp_path)
+        sentence = "我们讨论了模型训练的流程"
+        assert store.write_episodic(sentence)
+        hits = store.search_episodic(query_text="模型 训练", limit=8)
+        assert [h["text"] for h in hits] == [sentence]
+
+    def test_a_longer_cjk_run_keeps_working(self, tmp_path: Path) -> None:
+        """Regression guard: >2 characters was already accepted and must stay so."""
+        store = self._store(tmp_path)
+        sentence = "团队选择了机器学习作为方向"
+        assert store.write_episodic(sentence)
+        hits = store.search_episodic(query_text="机器学习", limit=8)
+        assert [h["text"] for h in hits] == [sentence]
+
+    def test_a_short_latin_query_is_still_filtered_out(self, tmp_path: Path) -> None:
+        """Negative control: the English stopword behaviour must NOT widen.
+
+        ``to`` is two ASCII characters. Accepting it would turn ``LIKE '%to%'``
+        into a near-universal match, which is exactly what the length filter
+        exists to prevent -- so the fix must leave this case refused.
+        """
+        store = self._store(tmp_path)
+        assert store.write_episodic("User decided to use PostgreSQL for the database layer")
+        assert store.search_episodic(query_text="to", limit=8) == []
+
+    def test_a_single_character_cjk_query_stays_filtered(self, tmp_path: Path) -> None:
+        """One Han character is as unselective as an English stopword: still refused."""
+        store = self._store(tmp_path)
+        assert store.write_episodic("用户决定用这个模型来做推理")
+        assert store.search_episodic(query_text="的", limit=8) == []
+
+
+class TestDedupThresholdLoaderValidation:
+    """The loader must normalize `memory.episodic_dedup_threshold` like its siblings.
+
+    A bare `memory_data.get(..., 0.88)` lets a string
+    typo in config.json survive to the store, where
+    `cosine_sim > self._dedup_threshold` raises TypeError and aborts the
+    episodic write. Sibling numeric fields (`embedding_bulk_duty`) already
+    route through `_safe_float`; this class pins the same guard here.
+    """
+
+    def _memory_section(self, tmp_path: Path, monkeypatch, raw_value: object):
+        import json as _json
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            _json.dumps({"memory": {"episodic_dedup_threshold": raw_value}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg_path)
+        return KiroCrewConfig.load().memory
+
+    def test_a_string_typo_falls_back_to_the_default(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._memory_section(tmp_path, monkeypatch, "0.9x")
+        assert section.episodic_dedup_threshold == 0.88
+        assert isinstance(section.episodic_dedup_threshold, float)
+
+    def test_a_numeric_string_is_coerced_not_crashed(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._memory_section(tmp_path, monkeypatch, "0.5")
+        assert section.episodic_dedup_threshold == 0.5
+
+    def test_out_of_range_values_are_clamped_into_cosine_range(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        assert self._memory_section(tmp_path, monkeypatch, 7).episodic_dedup_threshold == 1.0
+        assert self._memory_section(tmp_path, monkeypatch, -3).episodic_dedup_threshold == 0.0
+
+    def test_a_valid_float_passes_through(self, tmp_path: Path, monkeypatch) -> None:
+        assert self._memory_section(tmp_path, monkeypatch, 0.42).episodic_dedup_threshold == 0.42
+
+    def _section_with(self, tmp_path: Path, monkeypatch, memory: dict):
+        import json as _json
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(_json.dumps({"memory": memory}), encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg_path)
+        return KiroCrewConfig.load().memory
+
+    def test_sibling_numeric_fields_absorb_typos_the_same_way(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The whole MemorySection numeric block shares one validation rule.
+
+        Same defect class as the dedup threshold: `semantic_confidence_threshold`
+        is plumbed to the same production stores, and the two int fields feed
+        LIMIT/retention arithmetic. A typo in any of them must fall back, not
+        surface as a TypeError at first use.
+        """
+        section = self._section_with(
+            tmp_path,
+            monkeypatch,
+            {
+                "semantic_confidence_threshold": "high",
+                "episodic_max_results": "many",
+                "episodic_max_count": None,
+            },
+        )
+        assert section.semantic_confidence_threshold == 0.8
+        assert section.episodic_max_results == 8
+        assert section.episodic_max_count == 10_000
+
+    def test_sibling_fields_still_accept_valid_values(self, tmp_path: Path, monkeypatch) -> None:
+        section = self._section_with(
+            tmp_path,
+            monkeypatch,
+            {
+                "semantic_confidence_threshold": 0.6,
+                "episodic_max_results": 12,
+                "episodic_max_count": 500,
+            },
+        )
+        assert section.semantic_confidence_threshold == 0.6
+        assert section.episodic_max_results == 12
+        assert section.episodic_max_count == 500

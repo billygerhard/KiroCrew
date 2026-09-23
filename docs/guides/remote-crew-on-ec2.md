@@ -1,9 +1,12 @@
 # Setting up Remote Crew on an EC2 instance
 
 You run the Kiro Crew gateway on an EC2 box and drive it from your laptop. The
-gateway always binds **loopback only**, so you reach it through a tunnel — either
-an **SSH tunnel** or an **AWS SSM Session Manager** tunnel. This page covers both,
-plus the EC2-specific gotchas people actually hit (from `kirocrew doctor`).
+gateway binds **loopback by default**, so you reach it through a tunnel — either
+an **SSH tunnel** or an **AWS SSM Session Manager** tunnel. (`KIROCREW_BIND` is
+the explicit, container-oriented bind override described in the linked remote
+guide.)
+This page covers both, plus the EC2-specific gotchas people actually hit (from
+`kirocrew doctor`).
 
 > Installing the gateway itself (host requirements, packages, running it as a
 > service, moving your state over) is covered in
@@ -78,9 +81,9 @@ spawn — fails closed. Pick one:
 
   Then restart the gateway.
 - **Or opt into unsandboxed execution (trades isolation — only on a box you
-  trust).** Run `kirocrew setup` (it offers this interactively), or set
-  `agent.sandbox_allow_unsandboxed_exec: true` in `~/.kiro/crew/config.json`, then
-  restart the gateway. This lets agent subprocesses run without any sandbox.
+  trust).** Run `kirocrew setup` (it offers this interactively), or run
+  `kirocrew config set agent.sandbox_allow_unsandboxed_exec true`, then restart
+  the gateway. This lets agent subprocesses run without any sandbox.
 
 ### Gateway/pods die on logout: "linger disabled"
 
@@ -96,9 +99,53 @@ survives logout; linger still matters for pods and for user-level installs.)
 
 ### "kiro login: not logged in"
 
-kiro-cli must be authenticated **on the box**. Run `kiro-cli login` there and
-complete the device-code flow. Chat errors like "not logged in" mean this step was
-skipped on the remote.
+kiro-cli must be authenticated **on the box**. Run `kirocrew cloud login` from
+your laptop and complete the device-code flow in the browser it opens. Chat errors
+like "not logged in" mean this step was skipped on the remote.
+
+### Signing in as a different Kiro account
+
+`kirocrew cloud login` short-circuits when the box already has a session ("already
+signed in"), so switching accounts is a sign-out first:
+
+```bash
+kirocrew cloud logout    # drops the kiro-cli session on the instance
+kirocrew cloud login     # device-code flow for the new account
+```
+
+`logout` also kills any background login still polling on the box — otherwise it
+would quietly re-authenticate the account you just dropped.
+
+### Which Kiro identity the crew signs in as
+
+A managed crew is "your Kiro running elsewhere", so its sign-in identity is a
+property of the launch, not of whichever `kiro-cli login` happens to run:
+
+- **Inherited by default.** `kirocrew setup`'s cloud step, `kirocrew cloud launch`
+  and the dashboard's Remote Crew launch read your local `kiro-cli whoami`. If you
+  are signed in through **IAM Identity Center** (Kiro Pro), the crew is signed in
+  through the same organization portal — you are asked for the **Identity Center
+  region** (the AWS Region your Identity Center instance lives in, *not* the EC2
+  region the crew runs in) because `whoami` does not report it. Builder ID users
+  get the Builder ID flow, exactly as before.
+- **Overridable.** `kirocrew cloud launch --identity-provider https://example.awsapps.com/start --license pro --idp-region us-east-1`
+  names the identity explicitly; `--no-inherit-identity` forces Builder ID. The
+  dashboard form offers the same choice. If `kiro-cli whoami` fails to run on the
+  launching computer (it hangs, errors out, or the binary cannot be resolved), the
+  identity is unknown and the launch refuses rather than guessing Builder ID — pass
+  one of those two forms. A computer with no kiro-cli at all has no sign-in to
+  inherit and gets the Builder ID flow.
+- **Durable.** The target is stored with the launch job and used on every start
+  *and* resume of the device flow, so a gateway restart or an expired device code
+  never falls back to Builder ID. An Identity Center sign-in that cannot produce a
+  device code fails visibly rather than degrading to a different identity.
+- **Verified.** "Already signed in" now means signed in *as the intended identity*.
+  A valid session for the wrong account (a Builder ID session on a crew that should
+  be on your organization's Identity Center) is reported as a mismatch with the
+  `cloud logout` / `cloud login` commands to switch — not as success.
+
+The same three flags exist on `kirocrew cloud login` for an already-launched crew;
+with a wrong-but-valid session present, run `kirocrew cloud logout` first.
 
 ### Port/tunnel mismatch (the common one)
 
@@ -121,15 +168,16 @@ port into the CSRF allowlist — see
 
 ### Non-fatal warnings you can ignore
 
-- **`ffmpeg: not found`** — only needed for speech-to-text. Drop a static ffmpeg
-  build into `~/.local/bin` (it's not in the AL2023 repos; Kiro Crew auto-detects
-  it).
+- **`ffmpeg: not found`**: only needed for speech-to-text. Install ffmpeg into
+  `/usr/local/bin` (a location Kiro Crew searches; it's not in the AL2023 repos),
+  or fetch a decoder from the dashboard Speech-to-Text card
+  (Settings → Speech-to-Text, then Download now).
 - **`Vector Memory … vendored runtime failed to load`** — the in-process embedding
   runtime couldn't load its shared library on this host; memory falls back
   gracefully and keeps working. Safe to ignore unless you specifically rely on
   local vector memory.
-- **`project dir: not set`** — cosmetic. Run `kirocrew setup` from a project root
-  if you want a default project directory.
+- **`source dir: not set`** — cosmetic. It is set from a Kiro Crew source
+  checkout by `kirocrew setup`; wheel installs do not need it.
 
 ## Related
 

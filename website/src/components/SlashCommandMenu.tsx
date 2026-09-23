@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
+import type { SendMode } from '../pages/chat/ChatSettings'
 
 interface SlashCommand {
   name: string
@@ -44,6 +45,9 @@ interface SlashCommand {
  */
 const COMMAND_DESC_KEY: Record<string, string> = {
   '/agent': 'components.slashCommandMenu.desc_agent',
+  // Alias of /side, so it shares the description key deliberately: the two
+  // rows must never drift apart, and the locale catalogs stay untouched.
+  '/btw': 'components.slashCommandMenu.desc_side',
   '/changelog': 'components.slashCommandMenu.desc_changelog',
   '/chat': 'components.slashCommandMenu.desc_chat',
   '/clear': 'components.slashCommandMenu.desc_clear',
@@ -62,6 +66,7 @@ const COMMAND_DESC_KEY: Record<string, string> = {
   '/model': 'components.slashCommandMenu.desc_model',
   '/onboarding': 'components.slashCommandMenu.desc_onboarding',
   '/paste': 'components.slashCommandMenu.desc_paste',
+  '/plain': 'components.slashCommandMenu.desc_plain',
   '/prompts': 'components.slashCommandMenu.desc_prompts',
   '/q': 'components.slashCommandMenu.desc_quit',
   '/quit': 'components.slashCommandMenu.desc_quit',
@@ -71,6 +76,7 @@ const COMMAND_DESC_KEY: Record<string, string> = {
   '/todos': 'components.slashCommandMenu.desc_todos',
   '/tools': 'components.slashCommandMenu.desc_tools',
   '/usage': 'components.slashCommandMenu.desc_usage',
+  '/workflow': 'components.slashCommandMenu.desc_workflow',
 }
 
 /**
@@ -90,15 +96,19 @@ function commandDescription(cmd: SlashCommand): string {
 }
 
 // Offline fallback shown before the API query resolves (or if it fails).
-// Kept in sync with the backend SLASH_COMMAND_DESCRIPTIONS map so the same
-// commands appear whether they came from the live API or this fallback; the
-// descriptions themselves come from COMMAND_DESC_KEY either way. /kb is a
-// frontend-only command (also merged via FRONTEND_COMMANDS below).
+// Kept in sync with the backend's GET /api/slash-commands payload — the
+// _SLASH_COMMANDS set MINUS _BLOCKED_SLASH_COMMANDS — so the same commands
+// appear whether they came from the live API or this fallback. Blocked
+// commands (/quit, /exit, /q, /chat, /paste, /reply, /editor, /tangent) are
+// terminal-only kiro-cli gestures the dashboard rejects, and /todos is one the
+// ACP harness does not implement, so suggesting any of them anywhere is an
+// inert affordance; the descriptions themselves come from COMMAND_DESC_KEY
+// either way. /kb is a frontend-only command (also merged via
+// FRONTEND_COMMANDS below).
 const FALLBACK_COMMAND_NAMES = [
-  '/agent', '/changelog', '/chat', '/clear', '/code', '/compact', '/context',
-  '/editor', '/exit', '/experiment', '/help', '/hooks', '/issue', '/kb',
-  '/logdump', '/mcp', '/model', '/paste', '/prompts', '/q', '/quit', '/reply',
-  '/side', '/tangent', '/todos', '/tools', '/usage',
+  '/agent', '/changelog', '/clear', '/code', '/compact', '/context',
+  '/experiment', '/help', '/hooks', '/issue', '/kb', '/logdump',
+  '/mcp', '/model', '/prompts', '/side', '/tools', '/usage', '/workflow',
 ] as const
 
 const FALLBACK_COMMANDS: SlashCommand[] = FALLBACK_COMMAND_NAMES.map(name => ({ name }))
@@ -109,16 +119,38 @@ interface Props {
   onSelect: (command: string) => void
   onClose: () => void
   open?: boolean
+  /**
+   * The composer's effective send binding (see ChatInput's SendMode). Only
+   * read by the settled-empty copy: in 'ctrl-enter' mode a released bare
+   * Enter is a newline, so the announcement must name Ctrl+Enter instead.
+   */
+  sendOnEnter?: SendMode
 }
 
-const FRONTEND_COMMAND_NAMES = ['/kb', '/onboarding'] as const
+/**
+ * Commands the backend's GET /api/slash-commands does not report, merged in so
+ * the menu still offers them. Two different kinds live here, and the difference
+ * matters when adding a row:
+ *
+ * - CLIENT-INTERCEPTED (`/btw`, `/kb`, `/onboarding`): the composer recognises
+ *   the text and acts on it locally; the message is never sent. Those also need
+ *   a branch in `interceptSlashCommand` (`/btw` rides `/side`'s — it is a pure
+ *   alias, matched by the same SIDE_RE).
+ * - QUICK PROMPT (`/plain`): a backend MACRO. The message IS sent, unchanged, and
+ *   `ContextBuilder.build_message` swaps the token for the instruction it stands
+ *   for (`src/kiro_crew/quick_prompts.py`). It must therefore stay OUT of
+ *   `interceptSlashCommand` — intercepting it would stop it ever reaching the
+ *   expansion — and out of the kiro-cli passthrough set, which would forward it
+ *   to a harness that has no such command.
+ */
+const FRONTEND_COMMAND_NAMES = ['/btw', '/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 
-export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true }: Props) {
-  const { data: apiCommands = FALLBACK_COMMANDS } = useQuery<SlashCommand[]>({
+export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter' }: Props) {
+  const { data: apiCommands = FALLBACK_COMMANDS, isFetching, isError } = useQuery<SlashCommand[]>({
     queryKey: ['slash-commands'],
-    queryFn: () => api.slashCommands(),
+    queryFn: ({ signal }) => api.slashCommands(signal),
     enabled: typeof api.slashCommands === 'function',
   })
   const commands = useMemo(() => {
@@ -141,6 +173,26 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     if (c) onSelect(c.name + ' ')
   }, [onSelect])
 
+  // Filter computed synchronously (not inside the ordering effect) so the
+  // keyboard-release gate below reads the SAME render's match set — a gate
+  // derived from the `displayed` state would lag one effect flush behind and
+  // could release Enter while matches exist.
+  const filtered = useMemo(
+    () => (visible ? commands.filter(c => c.name.slice(1).startsWith(filter)) : []),
+    [visible, filter, commands]
+  )
+
+  // Zero matches while `visible` is still true: the nav hook's document
+  // listener stays attached, and an invisible surface must not swallow Enter
+  // on unmatched slash input like "/xyz" (the #5029 trap, deferred to the
+  // sibling pickers by #5041). Releasing (rather than auto-closing on empty)
+  // keeps the composer's input-derived reopen path working when the user
+  // backspaces to a matching prefix. `!isFetching` guards the one in-flight
+  // window: a server-only command typed before the remote list replaces the
+  // synchronous fallback is transiently a zero-match, and releasing there
+  // would send the half-typed command as a chat message.
+  const releaseKeysWhenEmpty = !isFetching && filtered.length === 0
+
   // Uses the SAME nav hook as the $skill / @file pickers, which gives the slash
   // menu arrow-scroll and consistent Enter/Tab/Escape.
   const { selected, setSelected, selectedRef, itemRefs } = useListKeyboardNav({
@@ -148,20 +200,20 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     count: displayed.length,
     onChoose: choose,
     onClose,
+    releaseKeysWhenEmpty,
   })
 
   // Order + initial selection: bottom-up when the menu opens above the input
-  // (shared helper — identical to the other pickers). Filter is computed INSIDE
-  // the effect and keyed on primitives (visible/filter/commands) so unrelated
-  // re-renders (e.g. arrow-key selection changes) don't reset the selection.
+  // (shared helper — identical to the other pickers). Keyed on the memoized
+  // `filtered` so unrelated re-renders (e.g. arrow-key selection changes)
+  // don't reset the selection.
   useEffect(() => {
     if (!visible) { setDisplayed([]); resultsRef.current = []; return }
-    const f = commands.filter(c => c.name.slice(1).startsWith(filter))
-    const above = anchorRef.current ? menuGeometry(anchorRef.current, f.length, 40).above : false
-    const { ordered, initialIndex } = bottomUpOrder(f, above)
+    const above = anchorRef.current ? menuGeometry(anchorRef.current, filtered.length, 40).above : false
+    const { ordered, initialIndex } = bottomUpOrder(filtered, above)
     setDisplayed(ordered); resultsRef.current = ordered
     setSelected(initialIndex)
-  }, [visible, filter, commands, anchorRef, setSelected])
+  }, [visible, filtered, anchorRef, setSelected])
 
   // Scroll the selected row into view once it renders (open + filter change),
   // matching the $skill / @file pickers.
@@ -170,17 +222,50 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     itemRefs.current[selectedRef.current]?.scrollIntoView({ block: 'nearest' })
   }, [displayed, visible, itemRefs, selectedRef])
 
-  if (!visible || displayed.length === 0 || !anchorRef.current) return null
+  if (!visible || !anchorRef.current) return null
+  // Rows are ordered by an effect, so a matching list is briefly empty here.
+  // Render nothing until it lands, whether or not a refetch is in flight.
+  if (displayed.length === 0 && filtered.length > 0) return null
 
-  const { top, left, width, maxHeight } = menuGeometry(anchorRef.current, displayed.length, 40)
+  const { above, top, bottom, left, width, maxHeight } =
+    menuGeometry(anchorRef.current, Math.max(displayed.length, 1), 40)
+
+  /** Copy for the zero-row state. A settled ERROR is not a zero-match: both
+   *  release Enter, but "No matching commands" asserts the live list was read
+   *  and did not hold the typed prefix. On a failed load it was never read —
+   *  the rows are the offline fallback, and the served list is provider-aware,
+   *  so a command it would have offered may simply never have arrived. Named
+   *  per the send binding on both paths, for the reason given below. */
+  const emptyKey = isError
+    ? (sendOnEnter === 'ctrl-enter'
+        ? 'components.slashCommandMenu.commands_load_failed_ctrl_enter_sends'
+        : 'components.slashCommandMenu.commands_load_failed_enter_sends')
+    : (sendOnEnter === 'ctrl-enter'
+        ? 'components.slashCommandMenu.no_matching_commands_ctrl_enter_sends'
+        : 'components.slashCommandMenu.no_matching_commands_enter_sends')
+
+  // While the fetch is in flight the release gate is still closed, so the send
+  // key is swallowed here — name that hold instead of leaving it mute.
+  const loadingKey = sendOnEnter === 'ctrl-enter'
+    ? 'components.slashCommandMenu.loading_commands_ctrl_enter_held'
+    : 'components.slashCommandMenu.loading_commands_enter_held'
 
   return createPortal(
     <div
       className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg overflow-y-auto py-1 animate-slide-up"
       role="listbox"
-      style={{ top, left, width: Math.min(width, 380), maxHeight }}
+      style={{ ...(above ? { bottom } : { top }), left, width: Math.min(width, 380), maxHeight }}
     >
-      {displayed.map((cmd, i) => (
+      {displayed.length === 0
+        // Settled zero-match: Enter's meaning flips (pick → send), and the
+        // menu vanishing on its own would leave that flip invisible — announce
+        // it at the point of action, mirroring the $skill picker's empty state.
+        // Named per the composer's send binding ('ctrl-enter' → bare Enter is
+        // a newline); role="status" so screen-reader users hear the flip too.
+        ? (isFetching
+            ? <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(loadingKey)}</div>
+            : <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(emptyKey)}</div>)
+        : displayed.map((cmd, i) => (
         <button
           role="option"
           aria-selected={i === selected}

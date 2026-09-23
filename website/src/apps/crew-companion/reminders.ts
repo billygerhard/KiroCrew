@@ -84,3 +84,8 @@ export function clampBreakMins(raw: string | number): number | null {
   if (!Number.isFinite(n) || n <= 0) return null
   return Math.min(BREAK_MAX_MINS, Math.max(BREAK_MIN_MINS, Math.round(n)))
 }
+
+
+// Re-exported so the panel can keep importing its reminder helpers and the
+// presets from one place; the values themselves live in ./constants.
+export { BREAK_PRESETS } from './constants'

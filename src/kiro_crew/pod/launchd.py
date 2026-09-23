@@ -17,13 +17,14 @@ absolute ``kirocrew`` path at *install* time, which goes stale when the worktree
 it points into is pruned (``unit_exec_ok``'s self-heal exists for exactly that);
 re-rendering per ``up`` cannot go stale.
 
-**2. No ``ExecStopPost``.** systemd guarantees zero-residue teardown by running
-``kirocrew pod _cleanup <name>`` after the service stops, whatever stopped it.
-launchd has no post-stop hook, so the ``down`` path must invoke
-``runtime.cleanup_home`` itself after ``bootout`` succeeds. The consequence is
-real and documented rather than hidden: a pod whose process dies without an
-explicit ``down`` (host crash, force-reboot) leaves its isolated HOME behind on
-macOS where Linux would have reaped it. :func:`orphan_homes` exists so ``pod ls`` can REPORT those
+**2. No ``ExecStopPost``.** Neither platform reclaims a pod's isolated HOME from a
+post-stop service hook: systemd's would run before the final kill of the unit's
+cgroup (racing the pod's own surviving subprocesses) and would also fire on the
+stop half of a ``Restart=``, so :func:`kiro_crew.pod.runtime.stop_pod` owns
+reclamation on both. launchd simply never had such a hook, which is why the
+consequence was visible here first: a pod whose process dies without an explicit
+``down`` (host crash, force-reboot) leaves its isolated HOME behind.
+:func:`kiro_crew.pod.runtime.orphan_homes` exists so ``pod ls`` can REPORT those
 (reclaim is `pod down <name>`, run by the user — nothing deletes them
 automatically).
 
@@ -52,24 +53,16 @@ derived port, no tunnel, ``--no-crons``, and the refusal to bind the live port.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import plistlib
 import re
-import shlex
 import shutil
 import subprocess
-import threading
 import time
 from pathlib import Path
 
-try:  # POSIX only; the backend refuses to run where launchd is absent anyway
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    fcntl = None  # type: ignore[assignment]
-
-from kiro_crew.pod.config import PodConfig, environment_vars
-from kiro_crew.pod.unit import _kirocrew_bin
+from kiro_crew.pod.config import TERMINAL_BOOT_EXIT_CODES, PodConfig, environment_vars
+from kiro_crew.pod.unit import _kirocrew_argv as _shared_kirocrew_argv
 
 # Reverse-DNS label namespace. One label per pod; the name has already been
 # through runtime.validate_name (single safe segment, no '/', no '..'), which is
@@ -165,61 +158,6 @@ def plist_path(cfg: PodConfig, name: str) -> Path:
     return cfg.pods_dir / f"{pod_label(cfg, name)}.plist"
 
 
-_MUTEX_STATE = threading.local()
-
-
-@contextlib.contextmanager
-def pod_mutex(cfg: PodConfig, name: str):
-    """Serialize this pod's lifecycle transactions per name.
-
-    ``down`` and ``up`` are independent entry points (CLI and Dev Fleet, which
-    shells out to the CLI) with no other per-name coordination. Without a mutex,
-    a stop that has just confirmed the label absent races a concurrent start:
-    the start writes its checkout pin and a fresh plist, and the stop's sweep
-    then deletes the NEW pod's definition, HOME, or env file — each a
-    review-blocking data-loss bug in earlier rounds. An exclusive flock on a
-    sibling lock file makes the whole transaction (pin + plist + bootstrap on
-    the up side; bootout + confirmation + HOME sweep + env unlink on the down
-    side) atomic with respect to the same name.
-
-    **Reentrant within a thread** so the CLI can hold it across a transaction
-    while ``runtime.start_pod``/``stop_pod`` re-acquire it internally (their own
-    protection for direct callers): flock is per open-file-description, so a
-    naive second acquisition in the same thread would deadlock against itself.
-
-    Advisory and cooperative by design: every mutating path routes through
-    here. On platforms without ``fcntl`` the mutex degrades to a no-op —
-    acceptable because launchd never runs there (:func:`require_backend`
-    refuses); only unit tests do. The lock file is deliberately never deleted:
-    unlinking a lock file another process may be opening reintroduces the race
-    the lock exists to close.
-    """
-    if fcntl is None:
-        yield
-        return
-    held = getattr(_MUTEX_STATE, "held", None)
-    if held is None:
-        held = _MUTEX_STATE.held = {}
-    key = pod_label(cfg, name)
-    if held.get(key, 0):
-        held[key] += 1
-        try:
-            yield
-        finally:
-            held[key] -= 1
-        return
-    cfg.pods_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = cfg.pods_dir / f"{key}.lock"
-    with open(lock_file, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        held[key] = 1
-        try:
-            yield
-        finally:
-            held[key] = 0
-            fcntl.flock(fh, fcntl.LOCK_UN)
-
-
 def log_paths(cfg: PodConfig, name: str) -> tuple[Path, Path]:
     """stdout/stderr files that stand in for the journal."""
     d = cfg.artifacts_dir / name
@@ -227,13 +165,8 @@ def log_paths(cfg: PodConfig, name: str) -> tuple[Path, Path]:
 
 
 def _kirocrew_argv() -> list[str]:
-    """``ProgramArguments`` needs a real argv, not systemd's command string.
-
-    ``unit._kirocrew_bin()`` may return ``"<python> -m kiro_crew"`` (two words)
-    when no console script is installed, so it is split rather than used as a
-    single path.
-    """
-    return shlex.split(_kirocrew_bin())
+    """Return the shared entry-point prefix in launchd's list form."""
+    return list(_shared_kirocrew_argv())
 
 
 def render_plist(cfg: PodConfig, name: str) -> dict[str, object]:
@@ -251,6 +184,13 @@ def render_plist(cfg: PodConfig, name: str) -> dict[str, object]:
         "RunAtLoad": True,
         # Self-heal a crash but do not fight a deliberate `down`: launchd will
         # restart only on a non-zero exit, so `bootout` stays authoritative.
+        #
+        # LOAD-BEARING for the terminal-refusal guarantee, not just crash
+        # recovery: `launchd_exit_code` makes a refusal terminal by exiting 0,
+        # which only works because this policy is "restart on NON-ZERO". Changing
+        # it to `True`, or to a bare `KeepAlive: True` (restart unconditionally),
+        # silently turns every terminal refusal back into a 5s loop. Pinned by
+        # `test_the_keepalive_policy_the_terminal_exit_relies_on_is_pinned`.
         "KeepAlive": {"SuccessfulExit": False},
         # systemd's RestartSec=5. launchd's own default floor is 10s.
         "ThrottleInterval": 5,
@@ -265,6 +205,47 @@ def render_plist(cfg: PodConfig, name: str) -> dict[str, object]:
     # macOS cannot enforce the cgroup ceiling and a weaker key here would read as
     # if it could.
     return body
+
+
+def launchd_exit_code(code: int) -> int:
+    """Translate a ``boot`` exit code into one launchd will not restart-loop on.
+
+    **This is the launchd half of the terminal-refusal guarantee.** On systemd a
+    refusal that a retry cannot heal exits non-zero and the unit names those codes
+    in ``RestartPreventExitStatus``, so the unit goes ``failed`` and stays there.
+    launchd has **no per-exit-code exemption at all** -- its only restart
+    discriminator is the success/failure axis. From ``launchd.plist(5)`` on
+    ``KeepAlive``'s ``SuccessfulExit``:
+
+        If true, the job will be restarted as long as the program exits and with
+        an exit status of zero. If false, the job will be restarted in the
+        inverse condition.
+
+    This backend renders ``KeepAlive = {"SuccessfulExit": False}`` (see
+    :func:`render_plist`), i.e. **restart on NON-ZERO exit**. So the very thing
+    that makes the refusal terminal under systemd -- exiting 78 -- is what makes
+    it a loop here: launchd relaunches every ``ThrottleInterval`` (5s), re-runs
+    the identical refusal, and buries the ``FATAL`` line in the log file.
+
+    The fix therefore has to move the exit code, not the plist: a TERMINAL
+    refusal returns **0**, which is the one value ``SuccessfulExit: False`` does
+    not relaunch. Every other non-zero exit -- an ordinary crash, an unexpected
+    traceback -- is passed through untouched and still restarts, so crash recovery
+    is preserved. That is the whole mechanism, and it needs no new plist key,
+    which is why there is no launchd analogue of the systemd side's
+    ``_REQUIRED_DIRECTIVES`` upgrade check: the policy it relies on is the one
+    this backend has always rendered, and plists are re-rendered on every ``up``
+    (module docstring, point 1) so they cannot go stale in the first place.
+
+    The cost, stated rather than hidden: to ``launchctl`` a terminal refusal now
+    looks like a clean exit. :meth:`PodConfig.refusal_file` is what keeps it
+    legible -- ``boot`` writes it before returning, and the ``FATAL`` lines are
+    still in ``StandardErrorPath``. Callers that want the honest code (a human
+    running the internal verb by hand, the audit record) read ``boot``'s return
+    value, which is unchanged; only the process exit status handed to launchd is
+    translated.
+    """
+    return 0 if code in TERMINAL_BOOT_EXIT_CODES else code
 
 
 def write_plist(cfg: PodConfig, name: str) -> Path:
@@ -304,7 +285,7 @@ def start(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
 def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.CompletedProcess:
     """``bootout`` the agent, wait for it to actually go, and drop its plist.
 
-    Two things here are not obvious and were both found by a real bring-up:
+    Three things here are not obvious:
 
     **``bootout`` is asynchronous.** It returns before launchd has finished
     unloading, so immediately afterwards ``launchctl print`` still resolves the
@@ -315,7 +296,7 @@ def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.Comp
 
     **A per-pod plist must not outlive its pod.** systemd's template unit is
     machine-wide and deliberately persists; a launchd plist is per-pod, so leaving
-    it behind makes :func:`orphan_homes` classify the leftover HOME as "installed,
+    it behind makes :func:`kiro_crew.pod.runtime.orphan_homes` classify the leftover HOME as "installed,
     not orphaned" and never collect it, and leaves a stale definition that could be
     bootstrapped later.
 
@@ -334,9 +315,9 @@ def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.Comp
     while time.monotonic() < deadline:
         probe = _print(cfg, name)
         # Only the EXPLICIT not-loaded result confirms the unload. Any other
-        # nonzero print (permissions, transient daemon error) proves nothing —
-        # treating it as gone was itself a review-blocking bug: teardown would
-        # delete a possibly-live pod's state on a flaky probe.
+        # nonzero print (permissions, transient daemon error) proves nothing;
+        # treating one as gone would let teardown delete a possibly-live pod's
+        # state on a flaky probe.
         if _service_absent(probe):
             unloaded = True
             break
@@ -354,10 +335,6 @@ def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.Comp
         )
     plist_path(cfg, name).unlink(missing_ok=True)
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=cp.stdout or "", stderr="")
-
-
-def restart(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
-    return launchctl("kickstart", "-k", service_target(cfg, name))
 
 
 def _print(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
@@ -385,6 +362,36 @@ def is_active(cfg: PodConfig, name: str) -> bool:
             f"refusing to report it absent: {(cp.stderr or cp.stdout or '').strip()}"
         )
     return _PID_RE.search(cp.stdout or "") is not None
+
+
+def main_pid(cfg: PodConfig, name: str) -> int | None:
+    """PID of this pod's own process, or ``None`` when it is not running.
+
+    The launchd counterpart of systemd's ``MainPID``, and the identity
+    ``runtime.port_owner`` compares a port's listener against. ``launchctl
+    print`` reports the live pid of a running agent; a loaded-but-dead agent
+    prints without one.
+
+    Fails the same way :func:`is_active` does, and for the same reason: a label
+    that is simply not loaded is a real answer (``None``), while an OPERATIONAL
+    failure proves nothing and raises. The distinction is load-bearing for the
+    caller — "asked, and this pod has no process" is what lets a listener be
+    attributed to someone else, whereas "could not ask" must stay undecided.
+    """
+    cp = _print(cfg, name)
+    if cp.returncode != 0:
+        if _service_absent(cp):
+            return None
+        raise LaunchdError(
+            f"launchctl print failed (rc={cp.returncode}) for "
+            f"{pod_label(cfg, name)}; cannot tell which process this pod is, "
+            f"refusing to guess: {(cp.stderr or cp.stdout or '').strip()}"
+        )
+    m = _PID_RE.search(cp.stdout or "")
+    if not m:
+        return None
+    pid = int(m.group(1))
+    return pid if pid > 0 else None
 
 
 def unit_state(cfg: PodConfig, name: str) -> tuple[str, int]:
@@ -452,28 +459,3 @@ def recent_journal(cfg: PodConfig, name: str, lines: int = 50) -> str:
             "that never started writes nothing here."
         )
     return "\n\n".join(chunks)
-
-
-def orphan_homes(cfg: PodConfig) -> list[str]:
-    """Pod HOMEs left behind with no live pod and no installed plist.
-
-    Only reachable on macOS: with no ``ExecStopPost``, a pod killed without an
-    explicit ``down`` leaves its isolated HOME. Reported (not deleted) here so the
-    caller decides, and so deletion still goes through
-    ``runtime.cleanup_home``'s re-validation rather than a raw recursive remove.
-    """
-    try:
-        entries = [p for p in cfg.pod_root.iterdir() if p.is_dir()]
-    except OSError:
-        return []
-    live = active_names(cfg)
-    out = []
-    for p in entries:
-        if p.name.startswith("."):
-            continue
-        if p.name in live:
-            continue
-        if plist_path(cfg, p.name).exists():
-            continue
-        out.append(p.name)
-    return sorted(out)

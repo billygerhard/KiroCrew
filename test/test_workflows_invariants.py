@@ -12,7 +12,7 @@ constructs an LLM-authored workflow script must never contain:
 Plus the authoring-shape rules (pure-literal META, ``async def workflow(ctx)``).
 
 If a case here goes from RED to GREEN because a check was loosened, that is a
-sandbox regression — see ``docs/system-specs/modules/workflow-gates.md`` group B. New escape
+sandbox regression — see ``docs/system-specs/modules/workflows.md`` group B. New escape
 ideas append to ``ADVERSARIAL_CORPUS`` (the intervention flywheel).
 """
 
@@ -115,6 +115,20 @@ def test_b2_dunder_attribute_rejected(attr: str) -> None:
     res = validate(_bad(f"y = ctx.{attr}"))
     assert res.ok is False
     assert any(attr in e for e in res.errors)
+
+
+def test_b2_deeply_nested_expression_rejected_not_raised() -> None:
+    """A stack-exhausting expression is a rejection, never a raised error.
+
+    ``validate`` is reached straight from the workflow HTTP API, so a leaked
+    ``RecursionError`` would be a 500 instead of a refusal. Every walk in the
+    validator (and ``ast.parse`` itself) recurses with the tree's depth, so the
+    guard sits at the top rather than in any one walk.
+    """
+    deep = " + ".join(['"a"'] * 20_000)
+    res = validate(_bad(f"y = {deep}"))
+    assert res.ok is False
+    assert any("too deep" in e for e in res.errors)
 
 
 # --------------------------------------------------------------------------- #

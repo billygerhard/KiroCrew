@@ -4,8 +4,10 @@ import { X, Plus, GitFork, Loader2, Circle } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { api } from '../api/client'
 import SessionGridLayout from './SessionGridLayout'
-import ChatPane from './ChatPane'
+import ChatPane, { type PaneLeading } from './ChatPane'
 import { useSessionGrid, type GridLeaf } from '../hooks/useSessionGrid'
+import { emitSlotFocused } from '../hooks/useWebSocket'
+import PaneDim from './PaneDim'
 
 import { i18nT } from '../i18n/t'
 type Slot = {
@@ -13,6 +15,9 @@ type Slot = {
   title?: string
   running?: boolean
   pending_approval?: boolean
+  /** The agent asked something and is waiting on the answer: sorted and marked
+   *  with the owed decisions rather than with idle sessions. */
+  needs_input?: boolean
   messages?: number
   agent?: string
   last_activity_ts?: string
@@ -35,13 +40,23 @@ export default function SessionGridView({
   onClose,
   onCollapse,
   seedSlot,
+  openSideChat,
+  leading,
 }: {
   /** Leave split mode entirely (everything closed, or a lone empty placeholder). */
   onClose: () => void
   /** Down to a single session pane → return to the native single-chat surface on
    *  that session (the grid never shows a 1-pane chrome). */
-  onCollapse: (slot: string) => void
+  onCollapse: (slot: string, anchorTs?: string, anchorMid?: string) => void
   seedSlot?: string | null
+  /** Bring the host's Side Chat surface on screen for a pane's slot — what the
+   *  selection toolbar's Ask needs. The grid owns no Side Chat of its own
+   *  (the host's activity panel does), so without it panes offer Quote only. */
+  openSideChat?: (slot: string) => boolean | void | Promise<boolean | void>
+  /** The host's sessions-sidebar toggle lives at the surface's top-left. The
+   *  geometric top-left pane either reserves its column (`inset`, desktop) or
+   *  renders it inline (`control`, mobile) — see ChatPane's `leading`. */
+  leading?: PaneLeading
 }) {
   const grid = useSessionGrid(seedSlot)
 
@@ -82,6 +97,7 @@ export default function SessionGridView({
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the three fields read are listed individually; `useSessionGrid` returns a fresh object literal every render, so depending on `grid` itself would rebind the document listener on every render while covering nothing these deps miss
   }, [grid.focusedId, grid.leaves, grid.splitLeaf])
 
   const { data: slots = [] } = useQuery<Slot[]>({
@@ -99,17 +115,29 @@ export default function SessionGridView({
     grid.pruneAgainst(slots.map((s) => s.key))
     // Depend on the stable pruneAgainst callback (useCallback []), not the whole grid
     // object (new literal each render) — avoids re-scheduling the effect every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above: `grid` is a new literal every render and `pruneAgainst` is the only member this effect calls
   }, [slots, grid.pruneAgainst])
 
   // Fork source = the focused session pane, else the first session pane in the grid.
   const focusedLeaf = grid.leaves.find((l) => l.id === grid.focusedId)
+  // Split view keeps its own local focus model (pane focus never routes
+  // through Redux activeSlot), so pane focus must report the slot-focused
+  // intent signal itself for resume prefetch to cover already-mounted panes.
+  const focusedPaneSlot = focusedLeaf?.kind === 'session' ? (focusedLeaf.slot ?? null) : null
+  useEffect(() => {
+    // Unconditional: a placeholder pane taking focus must emit the null
+    // (blur) frame so the server cancels this connection's pending prefetch,
+    // matching the visibilitychange blur semantics.
+    emitSlotFocused(focusedPaneSlot)
+  }, [focusedPaneSlot])
   const forkSourceSlot =
     focusedLeaf?.kind === 'session' && focusedLeaf.slot
       ? focusedLeaf.slot
       : grid.leaves.find((l) => l.kind === 'session' && l.slot)?.slot
   const forkSourceTitle = slots.find((s) => s.key === forkSourceSlot)?.title
 
-  const renderLeaf = (leaf: GridLeaf) => {
+  const renderLeaf = (leaf: GridLeaf, ownsTopLeft: boolean) => {
+    const paneLeading = ownsTopLeft ? leading : undefined
     if (leaf.kind === 'session' && leaf.slot) {
       return (
         <ChatPane
@@ -119,6 +147,9 @@ export default function SessionGridView({
           onRemove={() => grid.closeLeaf(leaf.id)}
           onSplitRight={() => grid.splitLeaf(leaf.id, 'right')}
           onSplitDown={() => grid.splitLeaf(leaf.id, 'down')}
+          onOpenFull={onCollapse}
+          openSideChat={openSideChat}
+          leading={paneLeading}
         />
       )
     }
@@ -142,6 +173,7 @@ export default function SessionGridView({
         onCancel={() => grid.closeLeaf(leaf.id)}
         onSplitRight={() => grid.splitLeaf(leaf.id, 'right')}
         onSplitDown={() => grid.splitLeaf(leaf.id, 'down')}
+        leading={paneLeading}
       />
     )
   }
@@ -173,6 +205,7 @@ function PlaceholderPane({
   onCancel,
   onSplitRight,
   onSplitDown,
+  leading,
 }: {
   slots: Slot[]
   occupied: string[]
@@ -184,6 +217,7 @@ function PlaceholderPane({
   onCancel: () => void
   onSplitRight: () => void
   onSplitDown: () => void
+  leading?: PaneLeading
 }) {
   const [search, setSearch] = useState('')
   const queryClient = useQueryClient()
@@ -210,6 +244,10 @@ function PlaceholderPane({
     )
     .sort((a, b) => {
       if (!!a.pending_approval !== !!b.pending_approval) return a.pending_approval ? -1 : 1
+      // An unanswered agent question ranks with the other owed decisions, above
+      // running sessions: this list is what a user picks a pane's session from,
+      // and the ones waiting on them are the ones worth opening first.
+      if (!!a.needs_input !== !!b.needs_input) return a.needs_input ? -1 : 1
       if (!!a.running !== !!b.running) return a.running ? -1 : 1
       return (b.last_activity_ts || '').localeCompare(a.last_activity_ts || '')
     })
@@ -220,15 +258,26 @@ function PlaceholderPane({
   return (
     <div
       onMouseDownCapture={onFocus}
-      className={`flex flex-col h-full border-[1.5px] border-dashed rounded-lg bg-bg overflow-hidden m-1 ${focused ? 'border-accent' : 'border-border'}`}
+      className={`relative flex flex-col h-full border-[1.5px] border-dashed rounded-lg bg-bg overflow-hidden m-1 ${focused ? 'border-accent' : 'border-border'}`}
     >
-      <div className="flex items-center gap-1 p-2 border-b border-border">
+      {/* Leading edge (#10585): the geometric top-left pane stands in for the
+          single-chat title row. `inset` clears the shell's stationary sidebar
+          toggle: this card starts at container x 8 (2px grid inset + 4px
+          margin + 1.5px border), the toggle spans container x 8..36, so the
+          hairline sits at container 44 = pane 36 and the row's content starts
+          at container 52 = pane 44 — the same columns the single-chat row uses
+          (its left-[52px] / pl-[60px] are measured from container x -8).
+          `control` renders the toggle inline ahead of the search field. */}
+      <div className={`relative flex items-center gap-1 py-2 pr-2 border-b border-border transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[44px]' : 'pl-2'}`}>
+        {leading?.inset && <span aria-hidden="true" data-pane-leading-divider className="absolute left-[36px] top-1/2 -translate-y-1/2 w-px h-5 bg-border" />}
+        {leading?.control}
         <input
           autoFocus={focused}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder={i18nT('components.sessionGridView.search_sessions')}
-          className="flex-1 min-w-0 bg-bg-elevated border border-border rounded px-2 py-1 text-[13px] text-text placeholder:text-muted outline-none focus:border-accent"
+          aria-label={i18nT('components.sessionGridView.search_sessions')}
+          className="flex-1 min-w-0 bg-bg-elevated border border-border rounded px-2 py-1 text-[13px] text-text placeholder:text-muted outline-hidden focus-visible:border-accent"
         />
         <button onClick={onSplitRight} title={i18nT('components.sessionGridView.split_right_d')} aria-label={i18nT('components.sessionGridView.split_right')} className={ctrlBtn}>
           <SplitGlyph />
@@ -245,6 +294,9 @@ function PlaceholderPane({
           <X size={14} />
         </button>
       </div>
+      {/* After the header so the header stays the first child (tests locate it
+          that way); absolute, so order does not change what paints where. */}
+      <PaneDim dimmed={!focused} />
 
       {/* Three creation entry points (Terminal arrives in Phase 2). */}
       <div className="flex gap-1.5 p-2 border-b border-border">
@@ -277,7 +329,7 @@ function PlaceholderPane({
             >
               <Circle
                 size={10}
-                className={`shrink-0 ${s.pending_approval ? 'fill-warn text-warn' : s.running ? 'fill-ok text-ok' : 'fill-muted text-muted'}`}
+                className={`shrink-0 ${s.pending_approval ? 'fill-warn text-warn' : s.needs_input ? 'fill-info text-info' : s.running ? 'fill-ok text-ok' : 'fill-muted text-muted'}`}
               />
               <span className="truncate flex-1">{s.title || s.key}</span>
               <span className="text-[11px] text-muted shrink-0">{s.messages ?? 0} {i18nT('components.sessionGridView.msgs')}</span>

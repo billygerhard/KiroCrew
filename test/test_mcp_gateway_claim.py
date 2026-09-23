@@ -63,7 +63,6 @@ def _register(
         "autoapprove_set_hash": "2" * 64,
         "approval_mode": "interactive",
         "trust_all_tools": False,
-        "user_identity": "cp",
         "channel_id": "C_CP",
         "config_snapshot_hash": "3" * 64,
         "parent_pid": (ancestor_pids or _ANCESTORS)[0],  # legacy field, first ancestor
@@ -136,10 +135,16 @@ class _RecordingWriter:
 
 class _FakeBackend:
     supports_caller_identity = True
+    control_plane = False
     quarantined = False
 
     def __init__(self) -> None:
         self.callers: list[Any] = []
+        # Per-connection nonces the handler forwarded, in order. Recorded rather
+        # than swallowed so this double keeps ANSWERING the identity question it
+        # exists for: a nonce is what tells two co-tenants apart when the caller
+        # is None.
+        self.nonces: list[str] = []
         self.forwarded = asyncio.Event()
         self._pending_requests: dict = {}
 
@@ -155,8 +160,11 @@ class _FakeBackend:
     async def recycle_if_idle(self) -> bool:
         return False
 
-    async def forward_from_stub(self, _uuid: str, _msg: dict, caller: Any = None) -> None:
+    async def forward_from_stub(
+        self, _uuid: str, _msg: dict, caller: Any = None, tenant_nonce: str = ""
+    ) -> None:
         self.callers.append(caller)
+        self.nonces.append(tenant_nonce)
         self.forwarded.set()
 
 
@@ -189,7 +197,7 @@ def _patch_env(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeBackend, list[dict
         def log_api_access(self, **kwargs: Any) -> None:
             sel_calls.append(kwargs)
 
-    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any):
+    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any, **_kw: Any):
         return fake_backend, True
 
     async def _fake_drain(_inbox: Any, _writer: Any, _stub_uuid: str = "") -> None:
@@ -231,7 +239,7 @@ async def test_claim_retargets_live_connection(monkeypatch: pytest.MonkeyPatch) 
     await asyncio.wait_for(fb.forwarded.wait(), timeout=5.0)
     assert fb.callers == [None]
 
-    ack = gw._apply_claim(_claim(_WRAPPER_PID, "dashboard:chat-CP-1"))
+    ack = await gw._apply_claim(_claim(_WRAPPER_PID, "dashboard:chat-CP-1"))
     assert ack["type"] == "claimed" and ack["updated"] == 1
 
     fb.forwarded.clear()
@@ -243,6 +251,13 @@ async def test_claim_retargets_live_connection(monkeypatch: pytest.MonkeyPatch) 
     assert len(fb.callers) == 2
     assert fb.callers[1] is not None
     assert fb.callers[1].session_key == "dashboard:chat-CP-1"
+    # The nonce names the CONNECTION, not the session, so a claim that retargets
+    # the identity must leave it alone. If it moved with the identity, a backend
+    # keying per-tenant state on it would lose that state the moment its session
+    # was named — and the pre-claim frames would be attributed to a namespace no
+    # later frame can reach.
+    assert len(fb.nonces) == 2
+    assert fb.nonces[0] and fb.nonces[0] == fb.nonces[1]
     events = _claim_events(sel)
     assert len(events) == 1 and events[0]["outcome"] == "allowed"
     assert events[0]["caller"] == "dashboard:chat-CP-1"
@@ -276,7 +291,7 @@ async def test_claim_matches_host_pid_for_pidns_stub(monkeypatch: pytest.MonkeyP
         assert pid in gw._CONN_INDEX, f"pid {pid} missing from claim index"
 
     # The gateway claims with the HOST launcher pid (top of the host chain).
-    ack = gw._apply_claim(_claim(host_chain[-1], "dashboard:chat-NS-1"))
+    ack = await gw._apply_claim(_claim(host_chain[-1], "dashboard:chat-NS-1"))
     assert ack["type"] == "claimed" and ack["updated"] == 1
 
     fb.forwarded.clear()
@@ -349,7 +364,7 @@ async def test_no_host_indexing_when_peer_pid_unavailable(
 
     assert resolve_calls == []  # never resolved without a kernel-attested pid
     assert 9100 not in gw._CONN_INDEX and 9020 not in gw._CONN_INDEX
-    ack = gw._apply_claim(_claim(9020, "dashboard:chat-NS-2"))
+    ack = await gw._apply_claim(_claim(9020, "dashboard:chat-NS-2"))
     assert ack["updated"] == 0
 
     reader.feed({"type": "unregister"})
@@ -401,7 +416,8 @@ def test_resolve_peer_identity_config_dir_error_returns_empty(
     assert gw._resolve_peer_identity(999) == ("", [])
 
 
-def test_claim_zero_connections_warns_and_audits(
+@pytest.mark.asyncio
+async def test_claim_zero_connections_warns_and_audits(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A claim naming a pid with no indexed connection must leave a loud
@@ -417,7 +433,7 @@ def test_claim_zero_connections_warns_and_audits(
     monkeypatch.setattr(gw, "SecurityEventLog", _FakeSEL)
     gw._CONN_INDEX.clear()
     with caplog.at_level("WARNING", logger="kiro_crew.mcp_gateway.gatewayd"):
-        ack = gw._apply_claim(_claim(777777, "dashboard:chat-GHOST"))
+        ack = await gw._apply_claim(_claim(777777, "dashboard:chat-GHOST"))
     assert ack == {"type": "claim-noop", "updated": 0, "connections": 0}
     assert any("ZERO connections" in r.message for r in caplog.records)
     noop = [
@@ -426,6 +442,191 @@ def test_claim_zero_connections_warns_and_audits(
         and e.get("outcome") == "noop"
     ]
     assert len(noop) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_rekey_evicts_old_callers_subscriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim that CHANGES a stub's owner must evict the old caller's
+    resource subscriptions on the hosting backend (the new session must
+    not receive the old session's resource-update URIs); an idempotent
+    re-claim to the same key must not evict."""
+    _patch_env(monkeypatch)
+
+    class _FakeBackend:
+        def __init__(self) -> None:
+            self.evicted: list[str] = []
+
+        async def evict_stub_subscriptions(self, stub_uuid: str) -> int:
+            self.evicted.append(stub_uuid)
+            return 1
+
+    class _FakePool:
+        def __init__(self, backend: "_FakeBackend") -> None:
+            self._backend = backend
+
+        def backends_hosting_stub(self, stub_uuid: str) -> list:
+            return [self._backend]
+
+    fake_backend = _FakeBackend()
+    fake_pool = _FakePool(fake_backend)
+    gw._CONN_INDEX.clear()
+    conn = gw._StubConn(
+        stub_uuid="stub-rk-1", ancestor_pids=[_PID],
+        pool_label="pool", caller=None,
+    )
+    gw._CONN_INDEX[_PID] = {conn}
+    try:
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:owner-A"), fake_pool)
+        assert ack["updated"] == 1
+        assert fake_backend.evicted == ["stub-rk-1"]  # owner change: evict
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:owner-A"), fake_pool)
+        assert ack["updated"] == 0
+        assert fake_backend.evicted == ["stub-rk-1"]  # idempotent: no evict
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:owner-B"), fake_pool)
+        assert ack["updated"] == 1
+        assert fake_backend.evicted == ["stub-rk-1", "stub-rk-1"]
+    finally:
+        gw._CONN_INDEX.clear()
+
+
+@pytest.mark.asyncio
+async def test_claim_retargets_all_connections_before_first_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first eviction's await yields; a sibling connection still
+    carrying the OLD caller during that await would forward its frames as
+    the previous session — wrong-principal execution. Every eligible
+    connection must be retargeted BEFORE the first eviction runs."""
+    _patch_env(monkeypatch)
+    conn_a = gw._StubConn(
+        stub_uuid="stub-2p-a", ancestor_pids=[_PID],
+        pool_label="pool", caller=None,
+    )
+    conn_b = gw._StubConn(
+        stub_uuid="stub-2p-b", ancestor_pids=[_PID],
+        pool_label="pool", caller=None,
+    )
+    callers_at_first_evict: list[str] = []
+
+    class _SpyBackend:
+        async def evict_stub_subscriptions(self, stub_uuid: str) -> int:
+            if not callers_at_first_evict:
+                for c in (conn_a, conn_b):
+                    callers_at_first_evict.append(
+                        c.caller.session_key if c.caller is not None else "")
+            return 1
+
+    class _SpyPool:
+        def __init__(self) -> None:
+            self._backend = _SpyBackend()
+
+        def backends_hosting_stub(self, stub_uuid: str) -> list:
+            return [self._backend]
+
+    gw._CONN_INDEX.clear()
+    gw._CONN_INDEX[_PID] = {conn_a, conn_b}
+    try:
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:owner-2P"), _SpyPool())
+        assert ack["updated"] == 2
+        # At the moment the FIRST eviction ran, BOTH connections already
+        # carried the new owner — no wrong-principal window.
+        assert callers_at_first_evict == [
+            "dashboard:owner-2P", "dashboard:owner-2P",
+        ]
+    finally:
+        gw._CONN_INDEX.clear()
+
+
+@pytest.mark.asyncio
+async def test_claim_survives_disconnect_during_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection disconnecting while another's eviction awaits must not
+    abort the claim mid-iteration: the loop walks a snapshot."""
+    _patch_env(monkeypatch)
+
+    class _MutatingBackend:
+        def __init__(self) -> None:
+            self.evicted: list[str] = []
+
+        async def evict_stub_subscriptions(self, stub_uuid: str) -> int:
+            self.evicted.append(stub_uuid)
+            # Simulate a sibling connection disconnecting mid-await.
+            gw._CONN_INDEX[_PID].discard(
+                next(iter(gw._CONN_INDEX[_PID])))
+            return 1
+
+    class _FakePool:
+        def __init__(self, backend: "_MutatingBackend") -> None:
+            self._backend = backend
+
+        def backends_hosting_stub(self, stub_uuid: str) -> list:
+            return [self._backend]
+
+    fake_backend = _MutatingBackend()
+    gw._CONN_INDEX.clear()
+    conns = {
+        gw._StubConn(
+            stub_uuid=f"stub-mu-{i}", ancestor_pids=[_PID],
+            pool_label="pool", caller=None,
+        )
+        for i in range(3)
+    }
+    gw._CONN_INDEX[_PID] = set(conns)
+    try:
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:owner-X"), _FakePool(fake_backend))
+        assert ack["type"] == "claimed"  # no RuntimeError, claim acked
+        assert len(fake_backend.evicted) == 3  # snapshot walked fully
+    finally:
+        gw._CONN_INDEX.clear()
+
+
+@pytest.mark.asyncio
+async def test_claim_reassigns_owner_before_eviction_awaits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subscribe arriving while the eviction awaits must be authorized as
+    the NEW caller: the owner reassignment happens before the await."""
+    _patch_env(monkeypatch)
+
+    class _SpyBackend:
+        def __init__(self, conn: "gw._StubConn") -> None:
+            self._conn = conn
+            self.owner_at_evict: list[str] = []
+
+        async def evict_stub_subscriptions(self, stub_uuid: str) -> int:
+            self.owner_at_evict.append(
+                self._conn.caller.session_key if self._conn.caller else "")
+            return 0
+
+    class _FakePool:
+        def __init__(self, backend: "_SpyBackend") -> None:
+            self._backend = backend
+
+        def backends_hosting_stub(self, stub_uuid: str) -> list:
+            return [self._backend]
+
+    gw._CONN_INDEX.clear()
+    conn = gw._StubConn(
+        stub_uuid="stub-ord-1", ancestor_pids=[_PID],
+        pool_label="pool", caller=None,
+    )
+    gw._CONN_INDEX[_PID] = {conn}
+    spy = _SpyBackend(conn)
+    try:
+        ack = await gw._apply_claim(
+            _claim(_PID, "dashboard:new-owner"), _FakePool(spy))
+        assert ack["updated"] == 1
+        assert spy.owner_at_evict == ["dashboard:new-owner"]
+    finally:
+        gw._CONN_INDEX.clear()
 
 
 @pytest.mark.asyncio
@@ -439,7 +640,7 @@ async def test_claim_replaces_existing_identity(monkeypatch: pytest.MonkeyPatch)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
     await asyncio.wait_for(fb.forwarded.wait(), timeout=5.0)
 
-    ack = gw._apply_claim(_claim(_PID, "dashboard:new-session"))
+    ack = await gw._apply_claim(_claim(_PID, "dashboard:new-session"))
     assert ack["updated"] == 1
 
     fb.forwarded.clear()
@@ -465,7 +666,7 @@ async def test_claim_idempotent_same_key(monkeypatch: pytest.MonkeyPatch) -> Non
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
     await asyncio.wait_for(fb.forwarded.wait(), timeout=5.0)
 
-    ack = gw._apply_claim(_claim(_PID, "dashboard:same-1"))
+    ack = await gw._apply_claim(_claim(_PID, "dashboard:same-1"))
     assert ack["type"] == "claimed" and ack["updated"] == 0 and ack["connections"] == 1
     reader.feed({"type": "unregister"})
     await task
@@ -482,7 +683,7 @@ async def test_claim_malformed_rejected_and_audited(monkeypatch: pytest.MonkeyPa
         _claim(True, "dashboard:x"),       # bool is not a pid
         _claim(_PID, ""),                  # empty session key
     ):
-        ack = gw._apply_claim(bad)
+        ack = await gw._apply_claim(bad)
         assert ack["type"] == "claim-rejected", bad
     events = _claim_events(sel)
     assert len(events) == 4
@@ -499,6 +700,192 @@ async def test_claim_first_frame_connection_acked(monkeypatch: pytest.MonkeyPatc
     await _handle(reader, writer)
     assert writer.frames and writer.frames[0]["type"] == "claim-noop"
     assert writer.frames[0]["updated"] == 0  # nothing registered under _PID
+
+
+# --- PID-recycle guard (claim start-token verification) ----------------------
+
+
+def _fake_sel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    sel_calls: list[dict[str, Any]] = []
+
+    class _FakeSEL:
+        def log_api_access(self, **kwargs: Any) -> None:
+            sel_calls.append(kwargs)
+
+    monkeypatch.setattr(gw, "SecurityEventLog", _FakeSEL)
+    return sel_calls
+
+
+def _indexed_conn(pid: int, token: Optional[str], session_key: str = "") -> gw._StubConn:
+    """Register-shaped connection: indexed under ``pid`` with a recorded
+    start token, carrying an optional existing caller identity."""
+    caller = None
+    if session_key:
+        caller = gw._caller_from_register(_claim(pid, session_key))
+    conn = gw._StubConn("rt-stub", [pid], "rt-pool", caller, {pid: token})
+    gw._conn_index_add(conn)
+    return conn
+
+
+def _claim_with_token(pid: int, session_key: str, token: Optional[str]) -> dict[str, Any]:
+    frame = _claim(pid, session_key)
+    frame["pid_start_id"] = token
+    return frame
+
+
+@pytest.mark.asyncio
+async def test_claim_skips_recycled_pid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The core defect scenario: the register-time owner of PID P exited, the
+    OS recycled P to a different session's runtime, and the claim for the NEW
+    process must not retarget the STALE connection. A definite token mismatch
+    must skip, WARN, and write a denied audit."""
+    sel = _fake_sel(monkeypatch)
+    conn = _indexed_conn(_PID, "111", "dashboard:original-owner")
+    with caplog.at_level("WARNING", logger="kiro_crew.mcp_gateway.gatewayd"):
+        ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:new-owner", "222"))
+    assert ack == {"type": "claimed", "updated": 0, "connections": 1, "skipped": 1}
+    assert conn.caller is not None
+    assert conn.caller.session_key == "dashboard:original-owner"  # unchanged
+    assert any("recycled" in r.message for r in caplog.records)
+    denied = [e for e in _claim_events(sel) if e["outcome"] == "denied"]
+    assert len(denied) == 1
+    assert "recycled" in denied[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_claim_applies_on_matching_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same token on both sides — the register-time process is still alive —
+    keeps the existing replace behavior."""
+    sel = _fake_sel(monkeypatch)
+    conn = _indexed_conn(_PID, "111", "dashboard:old-session")
+    ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:new-session", "111"))
+    assert ack == {"type": "claimed", "updated": 1, "connections": 1, "skipped": 0}
+    assert conn.caller is not None and conn.caller.session_key == "dashboard:new-session"
+    events = _claim_events(sel)
+    assert len(events) == 1 and events[0]["outcome"] == "allowed"
+
+
+@pytest.mark.parametrize(
+    ("frame_token", "recorded_token"),
+    [
+        (None, None),  # neither side knows — Windows both ends / legacy frame
+        (None, "111"),  # legacy claim frame without the field
+        ("111", None),  # register-time token unreadable (Windows, /proc denied)
+        ("111", "111"),  # both known and equal
+    ],
+)
+@pytest.mark.asyncio
+async def test_claim_unknown_token_is_match(
+    monkeypatch: pytest.MonkeyPatch,
+    frame_token: Optional[str],
+    recorded_token: Optional[str],
+) -> None:
+    """``None`` on either side means "identity unknown" and MUST be treated
+    as a match — otherwise Windows (where get_process_start_id is always
+    None) and legacy claim frames would reject every claim."""
+    _fake_sel(monkeypatch)
+    conn = _indexed_conn(_PID, recorded_token)
+    ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:chat-TOK-1", frame_token))
+    assert ack["updated"] == 1 and ack["skipped"] == 0
+    assert conn.caller is not None
+    assert conn.caller.session_key == "dashboard:chat-TOK-1"
+
+
+@pytest.mark.asyncio
+async def test_claim_mixed_bucket_retargets_only_matching_conn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Index buckets stay keyed on the raw int PID, so a bucket may mix a
+    stale (pre-recycle) connection with a live one — the per-connection token
+    check is what disambiguates: only the matching conn is retargeted."""
+    sel = _fake_sel(monkeypatch)
+    stale = _indexed_conn(_PID, "111", "dashboard:original-owner")
+    live = _indexed_conn(_PID, "222")
+    ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:new-owner", "222"))
+    assert ack == {"type": "claimed", "updated": 1, "connections": 2, "skipped": 1}
+    assert stale.caller is not None
+    assert stale.caller.session_key == "dashboard:original-owner"
+    assert live.caller is not None and live.caller.session_key == "dashboard:new-owner"
+    outcomes = sorted(e["outcome"] for e in _claim_events(sel))
+    assert outcomes == ["allowed", "denied"]
+
+
+@pytest.mark.asyncio
+async def test_claim_non_string_token_treated_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A garbage (non-string) ``pid_start_id`` never becomes a mismatch: it is
+    normalized to "unknown" so a malformed field cannot deny valid claims."""
+    _fake_sel(monkeypatch)
+    conn = _indexed_conn(_PID, "111")
+    frame = _claim(_PID, "dashboard:chat-G-1")
+    frame["pid_start_id"] = 12345  # wrong type
+    ack = await gw._apply_claim(frame)
+    assert ack["updated"] == 1 and ack["skipped"] == 0
+    assert conn.caller is not None and conn.caller.session_key == "dashboard:chat-G-1"
+
+
+@pytest.mark.asyncio
+async def test_stubconn_legacy_constructor_defaults_to_empty_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-guard constructor shape (no ``pid_start_ids``) keeps working:
+    the mapping defaults to empty, every lookup is "unknown", and claims
+    still apply."""
+    _fake_sel(monkeypatch)
+    conn = gw._StubConn("legacy-stub", [_PID], "legacy-pool", None)
+    assert conn.pid_start_ids == {}
+    gw._conn_index_add(conn)
+    ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:chat-L-1", "999"))
+    assert ack["updated"] == 1 and ack["skipped"] == 0
+    assert conn.caller is not None and conn.caller.session_key == "dashboard:chat-L-1"
+
+
+@pytest.mark.asyncio
+async def test_register_records_start_tokens_and_claim_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full wiring through the register handler: tokens are snapshotted for
+    every indexed PID at register time, and a later claim carrying a
+    different token for that PID is skipped."""
+    fb, sel = _patch_env(monkeypatch)
+    monkeypatch.setattr(gw, "_get_process_start_id", lambda _pid: "111")
+    reader = _QueueReader()
+    reader.feed(_register(""))
+    reader.feed(_CALL)
+    task = asyncio.create_task(_handle(reader, _RecordingWriter()))
+    await asyncio.wait_for(fb.forwarded.wait(), timeout=5.0)
+    (conn,) = gw._CONN_INDEX[_PID]
+    assert conn.pid_start_ids == {p: "111" for p in _ANCESTORS}
+
+    ack = await gw._apply_claim(_claim_with_token(_PID, "dashboard:chat-W-1", "222"))
+    assert ack["updated"] == 0 and ack["skipped"] == 1
+
+    fb.forwarded.clear()
+    reader.feed(_CALL)
+    await asyncio.wait_for(fb.forwarded.wait(), timeout=5.0)
+    reader.feed({"type": "unregister"})
+    await task
+    assert fb.callers == [None, None]  # identity never misattributed
+    denied = [e for e in _claim_events(sel) if e["outcome"] == "denied"]
+    assert len(denied) == 1
+
+
+def test_build_claim_frame_includes_pid_start_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sender resolves the claimed runtime's start token and puts it on
+    the frame verbatim (including None passthrough on platforms without a
+    token)."""
+    monkeypatch.setattr(pc, "get_process_start_id", lambda pid: f"tok-{pid}")
+    frame = claim_mod.build_claim_frame(777, "dashboard:chat-F-1", None)
+    assert frame["pid_start_id"] == "tok-777"
+
+    monkeypatch.setattr(pc, "get_process_start_id", lambda _pid: None)
+    frame = claim_mod.build_claim_frame(777, "dashboard:chat-F-1", None)
+    assert frame["pid_start_id"] is None
 
 
 @pytest.mark.asyncio
@@ -543,6 +930,22 @@ def test_stub_register_payload_carries_ancestor_pids() -> None:
     # Chain walks upward: on Linux the second entry (when present) must be
     # the parent of the first.
     assert len(set(chain)) == len(chain)  # no cycles
+
+
+def test_stub_register_payload_keeps_legacy_user_identity_key() -> None:
+    """Wire-compat ratchet: ``user_identity`` is not a PoolKey dimension, but
+    the register payload must keep sending the key. The manager adopts a
+    running daemon with no version handshake, so an older daemon can serve new
+    stubs — and its ``PoolKey.from_register`` hard-requires the field,
+    rejecting a payload without it and silently un-pooling every session until
+    the daemon restarts. Keep sending it while any such daemon can be adopted."""
+    args = stub_mod._parse_args(
+        ["--server", "echo-mcp", "--agent", "cp-agent",
+         "--target-command", "/bin/true", "--work-dir", "/tmp"]
+    )
+    payload = stub_mod.build_register_payload(args)
+    assert "user_identity" in payload
+    assert isinstance(payload["user_identity"], str) and payload["user_identity"]
 
 
 def test_classify_session_type() -> None:

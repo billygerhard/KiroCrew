@@ -1,10 +1,22 @@
 """Unit tests for argument validation in attach_backend.py and detach_backend.py."""
+
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-SCRIPTS_DIR = Path(__file__).parent.parent / "src" / "kiro_crew" / "deploy" / "skills" / "artifact-deploy" / "scripts"
+SCRIPTS_DIR = (
+    Path(__file__).parent.parent
+    / "src"
+    / "kiro_crew"
+    / "deploy"
+    / "skills"
+    / "artifact-deploy"
+    / "scripts"
+)
 
 
 def _load_script(name: str):
@@ -26,6 +38,10 @@ class TestAttachBackendValidation:
     def test_valid_args_pass(self):
         """Known-good inputs should not raise."""
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+'."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
     def test_empty_profile_allowed(self):
         """Empty profile (default) should pass."""
@@ -70,6 +86,10 @@ class TestDetachBackendValidation:
     def test_valid_args_pass(self):
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+'."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
     def test_empty_profile_allowed(self):
         self.mod._validate_args("", "ap-southeast-2", "ABCDEFGHIJKLM", "demo")
 
@@ -87,3 +107,125 @@ class TestDetachBackendValidation:
         with pytest.raises(SystemExit) as exc:
             self.mod._validate_args("", "us-west-2", "E1A2B3C4D5E6F7", "-starts-with-dash")
         assert exc.value.code == 2
+
+
+class TestAwsSpawnFlow:
+    """The ``aws()`` helper in both scripts: timeout, temp-profile cleanup, exit codes.
+
+    These scripts mutate a live CloudFront distribution, so the failure handling
+    around the spawn must be pinned, not just inspected: the temp sandbox profile
+    is unlinked on EVERY outcome, a hung AWS CLI is bounded by the timeout, and a
+    nonzero CLI exit propagates as the script's own exit code with stderr shown.
+
+    ``run_limited`` / ``sandboxed_spawn_argv`` are imported function-locally from
+    ``kiro_crew.sandbox`` (the fail-closed import), so the patch point is the
+    sandbox module itself, not the script module.
+    """
+
+    @pytest.fixture(params=["attach_backend.py", "detach_backend.py"])
+    def mod(self, request):
+        return _load_script(request.param)
+
+    @pytest.fixture
+    def profile_file(self, tmp_path):
+        p = tmp_path / "sandbox.sb"
+        p.write_text("(version 1)", encoding="utf-8")
+        return p
+
+    def _patch(self, monkeypatch, profile_file, run):
+        import kiro_crew.sandbox as sandbox
+
+        monkeypatch.setattr(
+            sandbox, "sandboxed_spawn_argv", lambda cmd: (list(cmd), {}, str(profile_file))
+        )
+        monkeypatch.setattr(sandbox, "run_limited", run)
+
+    def test_success_returns_stdout_and_cleans_up(self, mod, monkeypatch, profile_file):
+        seen = {}
+
+        def _run(argv, **kw):
+            seen.update(kw)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        self._patch(monkeypatch, profile_file, _run)
+        assert mod.aws("", "us-west-2", "cloudfront", "list-distributions") == "{}"
+        # The unbounded-spawn fix: a stalled endpoint cannot hang the script.
+        assert seen["timeout"] == 300
+        assert not profile_file.exists(), "temp sandbox profile must be unlinked on success"
+
+    def test_timeout_exits_1_and_cleans_up(self, mod, monkeypatch, profile_file, capsys):
+        def _run(argv, **kw):
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=kw["timeout"])
+
+        self._patch(monkeypatch, profile_file, _run)
+        with pytest.raises(SystemExit) as exc:
+            mod.aws("", "us-west-2", "cloudfront", "get-distribution")
+        assert exc.value.code == 1
+        assert "timed out" in capsys.readouterr().err
+        assert not profile_file.exists(), "temp sandbox profile must be unlinked on timeout"
+
+    def test_cli_failure_propagates_exit_code_and_cleans_up(
+        self, mod, monkeypatch, profile_file, capsys
+    ):
+        def _run(argv, **kw):
+            return SimpleNamespace(returncode=7, stdout="", stderr="AccessDenied\n")
+
+        self._patch(monkeypatch, profile_file, _run)
+        with pytest.raises(SystemExit) as exc:
+            mod.aws("", "us-west-2", "cloudfront", "get-distribution")
+        assert exc.value.code == 7
+        assert "AccessDenied" in capsys.readouterr().err
+        assert not profile_file.exists(), "temp sandbox profile must be unlinked on CLI failure"
+
+
+class TestAwsHelperResolvesAbsolutely:
+    """The scripts' aws() spawn helper must resolve the CLI absolutely under a
+    GUI-launched gateway's minimal PATH via the deploy engine's shared
+    well-known-dirs resolver."""
+
+    @pytest.fixture(params=["attach_backend.py", "detach_backend.py"])
+    def mod(self, request):
+        return _load_script(request.param)
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="fallback install dirs are POSIX literals; dead on Windows by design",
+    )
+    def test_cmd_head_absolute_under_minimal_path(self, mod, monkeypatch, tmp_path):
+        from kiro_crew import github_runner, sandbox
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        seen: dict = {}
+
+        def fake_spawn_argv(cmd):
+            seen["cmd"] = list(cmd)
+            return list(cmd), {}, None
+
+        def fake_run_limited(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        # The helper imports these lazily from kiro_crew.sandbox at call time,
+        # so patching the sandbox module attributes intercepts the spawn.
+        monkeypatch.setattr(sandbox, "sandboxed_spawn_argv", fake_spawn_argv)
+        monkeypatch.setattr(sandbox, "run_limited", fake_run_limited)
+
+        out = mod.aws("dev", "us-west-2", "sts", "get-caller-identity")
+        assert out == "{}"
+        assert seen["cmd"][0] == str(fake_aws)  # absolute, not a bare "aws"
+        assert seen["cmd"][1:] == [
+            "--profile",
+            "dev",
+            "--region",
+            "us-west-2",
+            "sts",
+            "get-caller-identity",
+        ]

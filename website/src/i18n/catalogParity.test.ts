@@ -8,15 +8,16 @@
 
 import { describe, it, expect } from 'vitest'
 
-import { CATALOGS as RUNTIME_CATALOGS } from './index'
+import { CATALOGS as RUNTIME_CATALOGS } from './catalogs'
 import { SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE, isSupportedLanguage } from './languages'
 import pluralKeys from './pluralKeys.json'
 
 /**
  * Catalogs exactly as the runtime composes them — including English's
- * generated + manual merge. Reading `CATALOGS` from `./index` rather than
- * re-importing the JSON means this suite can never disagree with what actually
- * ships, and adding a language needs no edit here.
+ * generated + manual merge. Reading `CATALOGS` from `./catalogs`, the module that
+ * owns every catalog import, rather than re-importing the JSON means this suite
+ * can never disagree with what actually ships, and adding a language needs no
+ * edit here.
  */
 const CATALOGS: Record<string, unknown> = Object.fromEntries(
   Object.entries(RUNTIME_CATALOGS).map(([code, bundle]) => [
@@ -113,6 +114,28 @@ describe('language registry', () => {
   it('includes the fallback language', () => {
     expect(isSupportedLanguage(DEFAULT_LANGUAGE)).toBe(true)
   })
+
+  it('does not add a thirteenth statically bundled catalog', () => {
+    // The lazy-loading ratchet, as a GATE rather than a sentence.
+    //
+    // `index.ts` and `docs/system-specs/modules/config.md` both say catalog #13
+    // belongs behind the `i18next-http-backend` seam, because every catalog ships
+    // to every user whatever language they read (~173 KB gzip each, ~2.0 MB gzip
+    // for the twelve). A doc cannot hold that line: the PR that crosses it is
+    // also the PR that can rewrite the doc, which is exactly how #12 landed in
+    // front of a seam #12 was supposed to trigger.
+    //
+    // Raising this number is legitimate ONLY together with the seam, or with a
+    // re-measured figure in `config.md` and a reviewer who accepted the deferral.
+    // The pseudolocale is excluded: it is DEV-only and Rollup drops it from a
+    // production build.
+    const authored = SUPPORTED_LANGUAGES.filter(l => !l.devOnly)
+    expect(
+      authored.length,
+      'Adding a catalog puts its full weight in every user\'s first load. Land the '
+      + 'lazy-loading seam in i18n/catalogs.ts instead, or re-measure and say why here.',
+    ).toBeLessThanOrEqual(12)
+  })
 })
 
 describe('catalog parity', () => {
@@ -187,9 +210,19 @@ describe('catalog parity', () => {
         // `{{count}}` dropped in translation renders a sentence missing its
         // number; a placeholder renamed in translation renders a literal
         // "{{cnt}}". Both are invisible without this check.
+        //
+        // Self-closing component tags carry interpolated content too, and until
+        // this second pass existed they were covered by NOTHING. A <Trans> key
+        // like "Set <model/> as default model for <agent/>" whose translation
+        // loses `<agent/>` renders a sentence with the agent name missing
+        // entirely — silently, because Trans just omits an absent tag. That is
+        // strictly worse than the mustache case, which at least fails here. The
+        // pass is deliberately the same shape as the mustache one: parity
+        // against en, no stored count, nothing for a future PR to ratchet.
         const enFlat = flatten(en)
         const flat = flatten(CATALOGS[code])
         const placeholders = (s: string) => (s.match(/\{\{[^}]+\}\}/g) ?? []).sort()
+        const tags = (s: string) => (s.match(/<[a-zA-Z][^>]*\/>/g) ?? []).sort()
         const mismatched: string[] = []
         for (const key of EN_SINGULAR_KEYS) {
           if (flat[key] === undefined) continue
@@ -197,6 +230,11 @@ describe('catalog parity', () => {
           const got = placeholders(flat[key])
           if (want.join(',') !== got.join(',')) {
             mismatched.push(`${key}: expected [${want}] got [${got}]`)
+          }
+          const wantTags = tags(enFlat[key])
+          const gotTags = tags(flat[key])
+          if (wantTags.join(',') !== gotTags.join(',')) {
+            mismatched.push(`${key}: expected tags [${wantTags}] got [${gotTags}]`)
           }
         }
         // Plural forms are checked against the English `_other` form rather than

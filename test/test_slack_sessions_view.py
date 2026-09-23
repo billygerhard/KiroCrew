@@ -8,35 +8,59 @@ Home Tab all share, plus the keyword handler in
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import pathlib
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from source_corpus import parsed_candidates
 
 from conftest import MockSlackClient
-from kiro_crew.slack.handler import _handle_sessions_command
+from kiro_crew.slack import sessions_view
+from kiro_crew.slack.handler import _handle_sessions_command, _is_sessions_keyword
 from kiro_crew.slack.sessions_view import (
     _SESSION_KIND_DASHBOARD,
     _SESSION_KIND_OTHER,
     _SESSION_KIND_TASKRUNNER,
+    SESSIONS_INCLUDE_ENDED_ARGS,
     _build_sessions_blocks,
     _classify_session_key,
     _collect_recent_sessions,
+    _collect_recent_sessions_off_loop,
     _default_session_title,
+    sessions_include_ended,
 )
 
 
-def _write_jsonl(path: Path, *, title: str = "", agent: str = "", messages: list | None = None) -> None:
-    """Write a session JSONL file with an optional metadata line and messages."""
+def _write_jsonl(
+    path: Path,
+    *,
+    title: str = "",
+    agent: str = "",
+    messages: list | None = None,
+    closed: bool = False,
+    closed_at: float | None = None,
+) -> None:
+    """Write a session JSONL file with an optional metadata line and messages.
+
+    *closed* / *closed_at* write the dismissal record the End button leaves
+    behind, so a test can build a row the user has already ended.
+    """
     lines: list[str] = []
     meta: dict = {"_type": "metadata"}
     if title:
         meta["title"] = title
     if agent:
         meta["agent"] = agent
-    if title or agent:
+    if closed:
+        meta["closed"] = True
+        meta["closed_at"] = time.time() if closed_at is None else closed_at
+    if title or agent or closed:
         lines.append(json.dumps(meta))
     for role, content in messages or []:
         lines.append(json.dumps({"role": role, "content": content}))
@@ -225,6 +249,24 @@ class TestCollectRecentSessions:
         assert rows[0]["title"] == "ok"
         assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
 
+    def test_skips_valid_json_lines_that_are_not_records(self, sess_dir):
+        path = sess_dir / "dashboard_non_record.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"_type": "metadata", "title": "ok"}),
+                    "null",
+                    json.dumps(["not", "a", "record"]),
+                    json.dumps({"role": "user", "content": "hi"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        rows = _collect_recent_sessions(None)
+
+        assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
+
     def test_truncates_long_message_content(self, sess_dir):
         big = "x" * 10000
         _write_jsonl(sess_dir / "dashboard_a.jsonl", title="t", messages=[("user", big)])
@@ -267,7 +309,322 @@ class TestCollectRecentSessions:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Ended rows
+# ---------------------------------------------------------------------------
+
+
+class _LiveKeys:
+    """SessionManager stand-in whose live keys are a fixed set."""
+
+    def __init__(self, *keys: str) -> None:
+        self._keys = set(keys)
+
+    def has_session(self, key: str) -> bool:
+        return key in self._keys
+
+
+class TestEndedRowsLeaveTheList:
+    """The End button's promise: the row goes away and frees its slot."""
+
+    @pytest.fixture
+    def sess_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._SESSIONS_DIR", d)
+        return d
+
+    def test_dismissed_row_is_left_out(self, sess_dir):
+        _write_jsonl(sess_dir / "slack_C1.100.jsonl", title="kept")
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="ended by me", closed=True)
+        titles = [r["title"] for r in _collect_recent_sessions(None)]
+        assert titles == ["kept"]
+
+    def test_dismissed_row_frees_its_slot(self, sess_dir):
+        """The regression: an ended row must not spend one of ``limit`` slots.
+
+        Eleven transcripts, one of them dismissed, limit ten. The ten real ones
+        must all come back — if the dismissed row were merely skipped after the
+        cap was counted, the oldest real session would be pushed off instead.
+        """
+        now = time.time()
+        for i in range(10):
+            p = sess_dir / f"slack_C1.10{i:02d}.jsonl"
+            _write_jsonl(p, title=f"real {i}")
+            os.utime(p, (now - 100 - i, now - 100 - i))
+        dismissed = sess_dir / "slack_C1.9999.jsonl"
+        _write_jsonl(dismissed, title="ended by me", closed=True)
+        os.utime(dismissed, (now, now))  # newest, so it sorts first
+
+        rows = _collect_recent_sessions(None, limit=10)
+        titles = [r["title"] for r in rows]
+        assert "ended by me" not in titles
+        assert titles == [f"real {i}" for i in range(10)]
+
+    def test_opt_in_returns_the_dismissed_row_flagged(self, sess_dir):
+        _write_jsonl(sess_dir / "slack_C1.100.jsonl", title="kept")
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="ended by me", closed=True)
+        rows = _collect_recent_sessions(None, include_ended=True)
+        by_title = {r["title"]: r for r in rows}
+        assert set(by_title) == {"kept", "ended by me"}
+        assert by_title["ended by me"]["ended"] is True
+        assert by_title["kept"]["ended"] is False
+
+    def test_live_session_outranks_the_dismissal(self, sess_dir):
+        """A resumed conversation is listed immediately, flag still on disk."""
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="came back", closed=True)
+        rows = _collect_recent_sessions(_LiveKeys("slack_C1.200"))
+        assert [r["title"] for r in rows] == ["came back"]
+        assert rows[0]["ended"] is False
+        assert rows[0]["active"] is True
+
+    def test_a_later_write_does_not_undo_the_dismissal(self, sess_dir):
+        """Housekeeping writes must not resurface the row.
+
+        Consolidation, skill extraction and auto-titling all write the file on
+        the way out of an End, after the dismissal is stamped. A rule that
+        compared the file's mtime against ``closed_at`` would read those as the
+        user coming back and put the row straight back at the top, which is the
+        reported bug.
+        """
+        path = sess_dir / "slack_C1.200.jsonl"
+        stamped = time.time() - 60
+        _write_jsonl(path, title="ended by me", closed=True, closed_at=stamped)
+        os.utime(path, (stamped + 30, stamped + 30))  # written 30s AFTER the End
+        assert _collect_recent_sessions(None) == []
+
+    def test_absent_and_false_flags_are_both_listed(self, sess_dir):
+        _write_jsonl(sess_dir / "slack_C1.100.jsonl", title="no flag")
+        path = sess_dir / "slack_C1.200.jsonl"
+        path.write_text(
+            json.dumps({"_type": "metadata", "title": "flag false", "closed": False}) + "\n",
+            encoding="utf-8",
+        )
+        assert {r["title"] for r in _collect_recent_sessions(None)} == {"no flag", "flag false"}
+
+    def test_metadata_only_read_still_sees_the_flag(self, sess_dir):
+        """``with_messages=False`` reads line 0 only, which is where the flag is."""
+        _write_jsonl(
+            sess_dir / "slack_C1.200.jsonl",
+            title="ended by me",
+            closed=True,
+            messages=[("user", "hi")],
+        )
+        rows = sessions_view._collect_neutral(
+            None, sessions_dir=sess_dir, with_messages=False
+        )
+        assert rows == []
+
+
+class _LiveChannel:
+    """SessionManager stand-in that unfolds channel stems, as the real one does.
+
+    ``history._safe_key`` folds the ``:`` in ``slack:C1.200`` to ``_``, so the
+    filename is ``slack_C1.200.jsonl`` and the fold cannot be inverted from the
+    name alone. The real manager answers from the session map.
+    """
+
+    def __init__(self, *keys: str) -> None:
+        self._keys = set(keys)
+
+    def channel_key_for_stem(self, stem: str) -> str:
+        for key in self._keys:
+            if key.replace(":", "_") == stem:
+                return key
+        return ""
+
+    def has_session(self, key: str) -> bool:
+        return key in self._keys
+
+
+class TestChannelStemsResolveToTheirRealKey:
+    """A folded filename must not read as an idle session."""
+
+    @pytest.fixture
+    def sess_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._SESSIONS_DIR", d)
+        return d
+
+    def test_live_channel_session_is_not_read_as_idle(self, sess_dir):
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="live thread")
+        rows = _collect_recent_sessions(_LiveChannel("slack:C1.200"))
+        assert rows[0]["active"] is True
+        assert rows[0]["key"] == "slack:C1.200"
+
+    def test_a_live_dismissed_channel_row_stays_listed(self, sess_dir):
+        """The consequence the fold hid: a running session vanishing from view.
+
+        Read under the folded spelling the session looks idle, so a dismissal on
+        its transcript would hide a conversation that is still running, and the
+        row's End button would carry a key naming no live session.
+        """
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="live thread", closed=True)
+        rows = _collect_recent_sessions(_LiveChannel("slack:C1.200"))
+        assert [r["title"] for r in rows] == ["live thread"]
+        assert rows[0]["ended"] is False
+
+    def test_unknown_stem_keeps_the_folded_spelling(self, sess_dir):
+        """An empty resolver answer means "not knowable", never "guess"."""
+        _write_jsonl(sess_dir / "slack_C1.999.jsonl", title="unmapped")
+        rows = _collect_recent_sessions(_LiveChannel("slack:C1.200"))
+        assert [(r["key"], r["active"]) for r in rows] == [("slack_C1.999", False)]
+
+    def test_dashboard_stem_still_unfolds_without_the_resolver(self, sess_dir):
+        _write_jsonl(sess_dir / "dashboard_chat-1-100.jsonl", title="tab")
+        rows = _collect_recent_sessions(_LiveKeys("dashboard:chat-1-100"))
+        assert rows[0]["key"] == "dashboard:chat-1-100"
+        assert rows[0]["active"] is True
+
+    def test_a_raising_resolver_does_not_break_the_listing(self, sess_dir):
+        class _Boom:
+            def channel_key_for_stem(self, stem: str) -> str:
+                raise RuntimeError("map unreadable")
+
+            def has_session(self, key: str) -> bool:
+                return False
+
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="still listed")
+        rows = _collect_recent_sessions(_Boom())
+        assert [r["title"] for r in rows] == ["still listed"]
+
+    def test_an_answer_that_does_not_fold_back_is_refused(self, sess_dir):
+        """The resolver is verified, not trusted.
+
+        A key the filename does not fold to would put this row's End and Resume
+        buttons on one conversation while the transcript belongs to another.
+        """
+
+        class _WrongKey:
+            def channel_key_for_stem(self, stem: str) -> str:
+                return "slack:SOMEONE.else"
+
+            def has_session(self, key: str) -> bool:
+                return key == "slack:SOMEONE.else"
+
+        _write_jsonl(sess_dir / "slack_C1.200.jsonl", title="mine")
+        rows = _collect_recent_sessions(_WrongKey())
+        assert [(r["key"], r["active"]) for r in rows] == [("slack_C1.200", False)]
+
+
+class TestEndedRowRendering:
+    """An opted-in list has to show WHICH rows the user ended."""
+
+    def _row(self, **over) -> dict:
+        row = {
+            "key": "slack_C1.200",
+            "title": "ended by me",
+            "agent": "kirocrew",
+            "mtime": 0.0,
+            "active": False,
+            "ended": True,
+            "kind": _SESSION_KIND_OTHER,
+            "msgs": [],
+        }
+        row.update(over)
+        return row
+
+    def test_task_card_marks_an_ended_row(self):
+        blocks = _build_sessions_blocks([self._row()])
+        assert "🛑" in blocks[0]["title"]
+
+    def test_task_card_keeps_idle_and_active_glyphs(self):
+        idle = _build_sessions_blocks([self._row(ended=False)])
+        live = _build_sessions_blocks([self._row(ended=False, active=True)])
+        assert "⚫" in idle[0]["title"]
+        assert "🟢" in live[0]["title"]
+
+    def test_home_tab_marks_an_ended_row(self):
+        blocks = _build_sessions_blocks([self._row()], for_home_tab=True)
+        assert "🛑" in blocks[0]["text"]["text"]
+
+    def test_rendering_tolerates_a_row_without_the_key(self):
+        """Older collectors and monkeypatched ones return no ``ended`` key."""
+        row = self._row()
+        del row["ended"]
+        assert "⚫" in _build_sessions_blocks([row])[0]["title"]
+        assert "⚫" in _build_sessions_blocks([row], for_home_tab=True)[0]["text"]["text"]
+
+
+class TestSessionsIncludeEndedArgument:
+    """Typing the opt-in has to reach a handler and be read there."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("", False),
+            ("sessions", False),
+            ("all", True),
+            ("ended", True),
+            ("sessions all", True),
+            ("sessions ended", True),
+            ("  SESSIONS   All  ", True),
+            ("allowlist", False),
+        ],
+    )
+    def test_parses_either_half_of_the_phrase(self, text, expected):
+        assert sessions_include_ended(text) is expected
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("sessions", True),
+            (" Sessions ", True),
+            ("sessions all", True),
+            ("sessions ended", True),
+            ("sessions foo", False),
+            ("sessions all extra", False),
+            ("session", False),
+        ],
+    )
+    def test_keyword_admits_exactly_the_argument_it_reads(self, text, expected):
+        """The matcher and the reader share one vocabulary.
+
+        A form the matcher rejects never reaches the sessions handler at all,
+        so it would be sent to the agent as ordinary chat. Any word the reader
+        acts on must therefore be a word the matcher lets through.
+        """
+        assert _is_sessions_keyword(text) is expected
+
+    def test_every_accepted_argument_is_admitted_by_the_keyword(self):
+        for word in SESSIONS_INCLUDE_ENDED_ARGS:
+            assert _is_sessions_keyword(f"sessions {word}") is True
+            assert sessions_include_ended(f"sessions {word}") is True
+
+    @pytest.mark.asyncio
+    async def test_keyword_handler_forwards_the_opt_in(self):
+        seen: dict = {}
+
+        async def _fake(sessions, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        slack = MockSlackClient()
+        with patch("kiro_crew.slack.handler._collect_recent_sessions_off_loop", _fake):
+            await _handle_sessions_command(
+                "sessions all", slack, "C1", "1.0", "1.0", "slack:C1", None
+            )
+        assert seen["include_ended"] is True
+
+    @pytest.mark.asyncio
+    async def test_keyword_handler_defaults_to_hiding_ended(self):
+        seen: dict = {}
+
+        async def _fake(sessions, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        slack = MockSlackClient()
+        with patch("kiro_crew.slack.handler._collect_recent_sessions_off_loop", _fake):
+            await _handle_sessions_command(
+                "sessions", slack, "C1", "1.0", "1.0", "slack:C1", None
+            )
+        assert seen["include_ended"] is False
+
+
 class TestBuildSessionsBlocks:
+
     def test_empty_input(self):
         assert _build_sessions_blocks([]) == []
 
@@ -398,7 +755,7 @@ class TestBuildSessionsBlocks:
         assert "AKIAIOSFODNN7EXAMPLE" not in rendered
 
     def test_redacts_exfiltration_urls_in_message_content(self):
-        """Regression for review-bot security-controls comment on rev 1.
+        """Message content is redacted before it is posted to Slack.
 
         The pre-refactor inline code applied BOTH ``redact_exfiltration_urls()``
         and ``redact_credentials()`` to message content before posting to Slack.
@@ -574,16 +931,15 @@ class TestHandleSessionsCommandDelegation:
     async def test_keyword_collector_failure_emits_error_audit(
         self, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls. The keyword path
-        previously called the collector outside any try/except, so an
-        OSError would skip the SEL audit entirely. Locks in that the
+        """The keyword path must call the collector inside a try/except, or an
+        OSError skips the SEL audit entirely. Locks in that the
         error-outcome audit fires on collector failure, mirroring the
         slash and Home Tab error-path patterns.
         """
         slack = MockSlackClient()
         with (
             patch(
-                "kiro_crew.slack.handler._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=OSError("disk error"),
             ),
             patch("kiro_crew.slack.handler.sel") as mock_sel,
@@ -624,7 +980,7 @@ class TestHandleSessionsCommandDelegation:
         leaked_key = "AKIAIOSFODNN7EXAMPLE"
         with (
             patch(
-                "kiro_crew.slack.handler._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=OSError(f"failed reading {leaked_key} from path"),
             ),
             patch("kiro_crew.slack.handler.sel") as mock_sel,
@@ -737,7 +1093,7 @@ class TestSlashSessionsAudit:
     async def test_slash_unauthorized_denied_with_audit(
         self, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls / authorization rule.
+        """The slash command enforces the authorization rule.
 
         Per the deny-by-default guideline, the slash command must reject
         callers that are neither the owner nor an explicitly-allowed user,
@@ -854,7 +1210,7 @@ class TestSlashSessionsAudit:
             patch("kiro_crew.slack.events.is_owner", return_value=True),
             patch("kiro_crew.slack.events.is_allowed_user", return_value=False),
             patch(
-                "kiro_crew.slack.events._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=OSError("disk error"),
             ),
         ):
@@ -899,7 +1255,7 @@ class TestSlashSessionsAudit:
             patch("kiro_crew.slack.events.is_owner", return_value=True),
             patch("kiro_crew.slack.events.is_allowed_user", return_value=False),
             patch(
-                "kiro_crew.slack.events._collect_recent_sessions",
+                "kiro_crew.slack.sessions_view._collect_recent_sessions",
                 side_effect=OSError(f"failed reading {leaked_key} from path"),
             ),
         ):
@@ -909,3 +1265,295 @@ class TestSlashSessionsAudit:
         kwargs = mock_sel.return_value.log_api_access.call_args.kwargs
         # Credential MUST NOT survive into the audit field
         assert leaked_key not in kwargs["error"]
+
+
+# ---------------------------------------------------------------------------
+# Bounded reads: only the newest ``limit`` matching transcripts are opened
+# ---------------------------------------------------------------------------
+
+
+class TestWithMessagesBoundsTheRead:
+    """``with_messages=False`` must avoid the transcript READ, not just the append.
+
+    The parameter exists because a caller rendering only title/agent/active would
+    otherwise pay a multi-MB read per row for a preview it discards. A gate placed
+    after ``read_text()`` skips building ``msgs`` and saves none of that, which is a
+    promise the docstring makes and the code has to keep.
+    """
+
+    def _seed(self, tmp_path):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        p = d / "dashboard_big.jsonl"
+        _write_jsonl(
+            p,
+            title="huge",
+            agent="kirocrew",
+            messages=[("user", "x" * 2000) for _ in range(50)],
+        )
+        return d, p
+
+    def test_it_reads_only_the_metadata_line(self, tmp_path, monkeypatch):
+        from kiro_crew.messaging import sessions_view as sv
+
+        d, path = self._seed(tmp_path)
+        # Measured on the FILE, so this cannot pass by the collector reading
+        # everything and discarding it: read_text pulls the whole transcript,
+        # readline pulls one line.
+        real_read_text = pathlib.Path.read_text
+        used_read_text = []
+
+        def _spy(self, *a, **kw):
+            if self == path:
+                used_read_text.append(True)
+            return real_read_text(self, *a, **kw)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _spy)
+        rows = sv._collect_recent_sessions(None, limit=5, sessions_dir=d, with_messages=False)
+
+        assert not used_read_text, "with_messages=False must not read the whole transcript"
+        # Still a usable row: the header fields the caller actually asked for.
+        assert len(rows) == 1
+        assert rows[0]["title"] == "huge"
+        assert rows[0]["agent"] == "kirocrew"
+        # Shape does not fork: msgs is present and empty.
+        assert rows[0]["msgs"] == []
+
+    def test_the_default_still_reads_the_preview(self, tmp_path):
+        """Non-vacuity: the bound is scoped to the flag, not applied always."""
+        from kiro_crew.messaging import sessions_view as sv
+
+        d, _ = self._seed(tmp_path)
+        rows = sv._collect_recent_sessions(None, limit=5, sessions_dir=d)
+        assert rows[0]["msgs"], "the default must still build the preview"
+
+
+class TestBoundedTranscriptReads:
+    @pytest.fixture
+    def sess_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._SESSIONS_DIR", d)
+        return d
+
+    def _seed_many(self, sess_dir: Path, count: int, *, prefix: str = "dashboard_chat-") -> None:
+        """Seed *count* transcripts with distinct, ascending mtimes."""
+        base = 1_700_000_000
+        for i in range(count):
+            p = sess_dir / f"{prefix}{i}.jsonl"
+            _write_jsonl(p, title=f"session {i}", messages=[("user", f"msg {i}")])
+            os.utime(p, (base + i, base + i))
+
+    def test_reads_only_the_limit_newest_transcripts(self, sess_dir):
+        self._seed_many(sess_dir, 30)
+        opened: list[str] = []
+        real_read_text = Path.read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            opened.append(self.name)
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", counting_read_text):
+            rows = _collect_recent_sessions(None, limit=10)
+
+        # Output is identical to a full scan: the 10 newest, mtime-descending.
+        assert [r["title"] for r in rows] == [f"session {i}" for i in range(29, 19, -1)]
+        # But only those 10 files were actually opened — not all 30.
+        assert sorted(opened) == sorted(f"dashboard_chat-{i}.jsonl" for i in range(20, 30))
+
+    def test_kind_filter_applies_before_any_read(self, sess_dir):
+        self._seed_many(sess_dir, 5, prefix="dashboard_chat-")
+        self._seed_many(sess_dir, 5, prefix="cron_job-")
+        opened: list[str] = []
+        real_read_text = Path.read_text
+
+        def counting_read_text(self, *args, **kwargs):
+            opened.append(self.name)
+            return real_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", counting_read_text):
+            rows = _collect_recent_sessions(None, limit=10, kind=_SESSION_KIND_DASHBOARD)
+
+        assert len(rows) == 5
+        # Kind is classified from the filename stem, so filtered-out files
+        # are never opened at all.
+        assert all(name.startswith("dashboard_") for name in opened)
+
+    def test_scan_continues_past_invalid_files_to_fill_limit(self, sess_dir):
+        self._seed_many(sess_dir, 12)
+        # Empty out the two NEWEST transcripts: they are opened, found
+        # invalid, and skipped — the scan must continue down the mtime
+        # order so the caller still gets ``limit`` valid rows.
+        base = 1_700_000_000
+        for i in (10, 11):
+            p = sess_dir / f"dashboard_chat-{i}.jsonl"
+            p.write_text("", encoding="utf-8")
+            os.utime(p, (base + i, base + i))
+
+        rows = _collect_recent_sessions(None, limit=10)
+
+        assert [r["title"] for r in rows] == [f"session {i}" for i in range(9, -1, -1)]
+
+
+# ---------------------------------------------------------------------------
+# Event-loop offload: async surfaces must not run the collector on the loop
+# ---------------------------------------------------------------------------
+
+
+class TestCollectorEventLoopOffload:
+    @pytest.mark.asyncio
+    async def test_off_loop_wrapper_runs_collector_in_worker_thread(self, tmp_path, monkeypatch):
+        sess_dir = tmp_path / "sessions"
+        sess_dir.mkdir()
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._SESSIONS_DIR", sess_dir)
+        _write_jsonl(sess_dir / "dashboard_a.jsonl", title="t", messages=[("user", "x")])
+
+        seen: dict = {}
+        real = sessions_view._collect_recent_sessions
+
+        def recording_collector(*args, **kwargs):
+            seen["thread"] = threading.current_thread()
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sessions_view, "_collect_recent_sessions", recording_collector)
+        rows = await _collect_recent_sessions_off_loop(None, limit=5)
+
+        assert seen["thread"] is not threading.current_thread()
+        assert [r["title"] for r in rows] == ["t"]
+
+    @pytest.mark.asyncio
+    async def test_sessions_keyword_handler_does_not_block_the_loop(self, tmp_path, monkeypatch):
+        """Seeded sessions dir (many files, one large); the keyword handler
+        must leave the event loop free while the collector reads them.
+
+        Deterministic proof, no timing races: the collector is gated on a
+        ``threading.Event`` that only a coroutine on the event loop sets.
+        If the handler ran the collector ON the loop, that coroutine could
+        never run while the collector waits, the 5s gate would time out and
+        ``released`` would be False. With the offload, the loop stays free,
+        sets the event, and the collector proceeds.
+        """
+        sess_dir = tmp_path / "sessions"
+        sess_dir.mkdir()
+        monkeypatch.setattr("kiro_crew.slack.sessions_view._SESSIONS_DIR", sess_dir)
+        for i in range(25):
+            _write_jsonl(
+                sess_dir / f"dashboard_chat-{i}.jsonl",
+                title=f"s{i}",
+                messages=[("user", "hi")],
+            )
+        # One large transcript (~1MB) among the newest.
+        _write_jsonl(
+            sess_dir / "dashboard_big.jsonl",
+            title="big",
+            messages=[("user", "x" * 1_000_000)],
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+        outcome: dict = {}
+        real = sessions_view._collect_recent_sessions
+
+        def gated_collector(*args, **kwargs):
+            entered.set()
+            # Only a coroutine on the (free) event loop sets ``release``.
+            outcome["released"] = release.wait(timeout=5)
+            outcome["thread"] = threading.current_thread()
+            return real(*args, **kwargs)
+
+        # The handler dispatches through the off-loop wrapper, which resolves
+        # this module-global at call time.
+        monkeypatch.setattr(sessions_view, "_collect_recent_sessions", gated_collector)
+
+        slack = MockSlackClient()
+        task = asyncio.create_task(
+            _handle_sessions_command(
+                "sessions",
+                slack,
+                "C123",
+                "100.000",
+                "100.000",
+                "C123:100.000",
+                None,
+                sessions=None,
+            )
+        )
+        # Wait off-loop for the collector to be entered, keeping the loop free.
+        assert await asyncio.to_thread(entered.wait, 5), "collector was never invoked"
+        # This line executing WHILE the collector blocks is only possible if
+        # the handler offloaded the collector.
+        release.set()
+        await asyncio.wait_for(task, timeout=10)
+
+        assert outcome["released"] is True
+        assert outcome["thread"] is not threading.current_thread()
+        assert [a[0] for a in slack.actions] == ["blocks"]
+
+
+class TestOffLoopStructuralRatchet:
+    """Pin every async surface to the off-loop chokepoints, structurally.
+
+    The functional tests above prove the keyword handler offloads; these
+    AST-level pins keep the slash-command and Home-Tab call sites (whose
+    handlers need heavyweight orchestrator setup), the resume-context
+    transcript read, and any FUTURE module from regressing to on-loop
+    calls. AST checks cannot be fooled by comments or docstrings that
+    happen to mention the guarded names.
+    """
+
+    def test_sync_collector_is_private_to_sessions_view(self):
+        """No module outside sessions_view.py may import or reference the
+        synchronous collector — async callers must go through
+        _collect_recent_sessions_off_loop, which owns the thread hop.
+
+        Routed through the shared corpus helper instead of an own rglob +
+        ast.parse of all ~1,555 package modules, which cost ~4 s of CPU per
+        run to answer a question four files hold. The narrowing cannot hide
+        an offender: neither AST pattern below can match unless the literal
+        ``_collect_recent_sessions`` is in the module's text, and
+        ``candidate_sources`` filters on NFKC-normalised text, so a Unicode
+        compatibility homoglyph of the name — which CPython folds to this
+        ASCII identifier at parse time, making it a real AST match — is
+        still a candidate.
+        """
+        import ast
+
+        offenders: list[str] = []
+        for py, _text, tree in parsed_candidates(require_all=["_collect_recent_sessions"]):
+            if py.name == "sessions_view.py":
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and any(
+                    alias.name == "_collect_recent_sessions" for alias in node.names
+                ):
+                    offenders.append(f"{py}:{node.lineno} (import)")
+                elif isinstance(node, ast.Attribute) and node.attr == "_collect_recent_sessions":
+                    offenders.append(f"{py}:{node.lineno} (attribute access)")
+        assert not offenders, (
+            "the synchronous collector must stay private to sessions_view.py; "
+            "call _collect_recent_sessions_off_loop from async code instead: "
+            f"{offenders}"
+        )
+
+    def test_resume_context_has_no_direct_read_text_call(self):
+        """interactions.py must never CALL .read_text() directly (it runs on
+        the event loop); the only allowed form passes the bound method to
+        asyncio.to_thread, where read_text appears as an argument, not as
+        the func of a Call node."""
+        import ast
+
+        import kiro_crew.slack.interactions as interactions_mod
+
+        tree = ast.parse(Path(interactions_mod.__file__).read_text(encoding="utf-8"))
+        direct_calls = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "read_text"
+        ]
+        assert not direct_calls, (
+            "direct .read_text() call(s) in slack/interactions.py at lines "
+            f"{direct_calls}; whole-transcript reads inside async handlers "
+            "must be offloaded via asyncio.to_thread"
+        )

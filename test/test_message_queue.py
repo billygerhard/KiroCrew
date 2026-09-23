@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.session import SessionManager, _Session
+from kiro_crew.session import SessionManager, _Session, unlink_queued_temp_paths
 
 # ── Unit tests for _Session queue fields ──
 
@@ -222,6 +223,30 @@ class TestHandleMessageDeleted:
         assert orch._pending_queue == {"thread1": [("ts_other", "keep", {})]}
 
     @pytest.mark.asyncio
+    async def test_pending_queue_drop_unlinks_temp_files(self, tmp_path):
+        """A pre-session entry dropped by message_deleted must unlink its temps."""
+        from kiro_crew.slack.events import _handle_message_deleted
+
+        dropped = tmp_path / "dropped.png"
+        dropped.write_bytes(b"fake")
+        kept = tmp_path / "kept.png"
+        kept.write_bytes(b"fake")
+        orch = self._make_orch()
+        orch._pending_queue = {
+            "thread1": [
+                ("ts_del", "hello", {"image_temp_paths": [str(dropped)]}),
+                ("ts_other", "keep", {"image_temp_paths": [str(kept)]}),
+            ]
+        }
+        event = self._make_event()
+        with patch("kiro_crew.slack.events.is_allowed_user", return_value=True), \
+             patch("kiro_crew.slack.events.sel"):
+            await _handle_message_deleted(orch, event)
+        assert not dropped.exists()
+        assert kept.exists()
+        assert len(orch._pending_queue["thread1"]) == 1
+
+    @pytest.mark.asyncio
     async def test_pending_queue_cleaned_when_empty(self):
         from kiro_crew.slack.events import _handle_message_deleted
 
@@ -323,10 +348,25 @@ class TestDispatchQueued:
 
 def _make_route_orch() -> MagicMock:
     """Minimal mock orch that passes _route_message guards."""
-    from kiro_crew.config.loader import ACTIVATION_ALWAYS, KiroCrewConfig
+    from kiro_crew.config.loader import ACTIVATION_ALWAYS, KiroCrewConfig, MessagingConfig
 
     orch = MagicMock()
-    orch._cfg = KiroCrewConfig(slack_channels={}, slack_dm_activation=ACTIVATION_ALWAYS)
+    # Pin the dispatch path explicitly. MessagingConfig.use_transport defaults
+    # to True, so a bare KiroCrewConfig() sends _route_message down
+    # handle_message_transport and every `patch(...events.handle_message)` in
+    # this file becomes inert: the real transport coroutine then runs against
+    # this MagicMock session plumbing, raises TypeError inside
+    # transport_dispatch, and has it swallowed by that module's own error
+    # handler. The drain assertions below still passed -- via the failure path
+    # rather than the completed-turn path they document. Pinning it False keeps
+    # these tests on the native _on_done drain they are named for; the
+    # transport-side drain has its own coverage in test_channel_activation.py
+    # (TestQueuedDrain::test_queued_drains_to_transport_when_on).
+    orch._cfg = KiroCrewConfig(
+        slack_channels={},
+        slack_dm_activation=ACTIVATION_ALWAYS,
+        messaging=MessagingConfig(use_transport=False),
+    )
     orch.channel_history = MagicMock()
     orch.slack = AsyncMock()
     orch.sessions = MagicMock()
@@ -356,6 +396,35 @@ _ROUTE_PATCHES = [
     patch("kiro_crew.slack.events.is_allowed_user", return_value=True),
     patch("kiro_crew.slack.enterprise.check_message_origin", return_value=True),
 ]
+
+
+async def _settle_handler_tasks(orch: MagicMock, *, rounds: int = 20) -> None:
+    """Await the dispatched handler task and the drain chain its done-callback
+    schedules, without sleeping on the wall clock.
+
+    _route_message dispatches fire-and-forget, and the drain runs in the task's
+    done-callback -- which can itself schedule a follow-up _dispatch_queued
+    task. A fixed `asyncio.sleep(0.05)` makes the assertion a race against a
+    handler that does real work (the transport branch alone does two
+    KiroCrewConfig.load() disk reads while building its coroutine), so it holds
+    only while the runner is fast enough. Draining the task set to empty is the
+    same wait expressed as a condition instead of a duration.
+    """
+    for _ in range(rounds):
+        pending = [t for t in orch._handler_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # Yield on EVERY round, including the one that just gathered. A task's
+        # done-callback runs via loop.call_soon, and on Python 3.12 awaiting a
+        # gather() whose tasks are already finished returns *without* yielding
+        # to the loop (3.10/3.11 yielded), so gathering alone never lets
+        # _on_done discard the task or run the drain: the set stays non-empty
+        # and this helper spins out its rounds. sleep(0) gives the ready queue
+        # one turn on every version.
+        await asyncio.sleep(0)
+        if not orch._handler_tasks:
+            return
+    raise AssertionError("handler tasks did not settle")
 
 
 class TestQueueRouting:
@@ -431,15 +500,18 @@ class TestOnDoneDrain:
             None,
         ]
         event = {"user": "U1", "text": "first", "ts": "ts1", "channel": "D1", "channel_type": "im", "team": "T1"}
-        with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock), \
+        with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock) as mock_hm, \
+             patch("kiro_crew.slack.events.handle_message_transport", new_callable=AsyncMock) as mock_tr, \
              patch("kiro_crew.slack.events.is_allowed_user", return_value=True), \
              patch("kiro_crew.slack.enterprise.check_message_origin", return_value=True):
             await _route_message(orch, event, SeenCache(), is_mention=True)
-            await asyncio.sleep(0.05)
             # Drain should have dispatched the queued message via _dispatch_queued
-            tasks = list(orch._handler_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            await _settle_handler_tasks(orch)
+        # The stub must actually have been reached: if the dispatch path moves,
+        # this test would otherwise keep passing on the drain-after-failure
+        # branch and stop testing what it is named for.
+        mock_hm.assert_called()
+        mock_tr.assert_not_called()
         # dequeue was called in _on_done
         orch.sessions.dequeue.assert_called()
 
@@ -453,14 +525,14 @@ class TestOnDoneDrain:
         # Stash in pending queue
         orch._pending_queue = {"ts1": [("ts_pq", "pending", {"channel": "C1"})]}
         event = {"user": "U1", "text": "first", "ts": "ts1", "channel": "D1", "channel_type": "im", "team": "T1"}
-        with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock), \
+        with patch("kiro_crew.slack.events.handle_message", new_callable=AsyncMock) as mock_hm, \
+             patch("kiro_crew.slack.events.handle_message_transport", new_callable=AsyncMock) as mock_tr, \
              patch("kiro_crew.slack.events.is_allowed_user", return_value=True), \
              patch("kiro_crew.slack.enterprise.check_message_origin", return_value=True):
             await _route_message(orch, event, SeenCache(), is_mention=True)
-            await asyncio.sleep(0.05)
-            tasks = list(orch._handler_tasks)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            await _settle_handler_tasks(orch)
+        mock_hm.assert_called()
+        mock_tr.assert_not_called()
         # pending queue should have been drained
         assert "ts1" not in getattr(orch, "_pending_queue", {})
 
@@ -527,7 +599,7 @@ class TestStopTurnPreserveQueue:
 class TestQueuedMessageImagePaths:
     """A message with image attachments that arrives while the session is busy
     is enqueued with its clean_text embedding the downloaded image temp-file
-    paths. The enqueue path previously called _cleanup_image_temps() immediately,
+    paths. An enqueue path that calls _cleanup_image_temps() immediately,
     os.unlink()ing those files before the queued turn ran — so at dispatch
     p.is_file() was False and _send_prompt silently dropped the images. The fix
     carries the paths in the queue kwargs and defers unlink to _dispatch_queued
@@ -573,3 +645,100 @@ class TestQueuedMessageImagePaths:
 
         assert seen_paths["existed_at_dispatch"] is True  # survived until the turn
         assert not img.is_file()  # cleaned up afterwards (no leak)
+
+
+# ── Regression tests: discarded queue entries unlink their temp files ──
+
+
+class TestQueueTempFileCleanup:
+    """Discard paths must unlink image_temp_paths; the dispatch path must not."""
+
+    @staticmethod
+    def _temp_files(tmp_path, n: int = 2) -> list[str]:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for i in range(n):
+            p = tmp_path / f"img{i}.png"
+            p.write_bytes(b"fake")
+            paths.append(str(p))
+        return paths
+
+    def test_cancel_queued_unlinks_temp_files(self, tmp_path):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        paths = self._temp_files(tmp_path)
+        sess.queue.append(("ts1", "hello", {"image_temp_paths": paths}))
+        assert mgr.cancel_queued("thread1", "ts1") is True
+        assert len(sess.queue) == 0
+        for p in paths:
+            assert not os.path.exists(p)
+
+    def test_cancel_queued_leaves_other_entries_files(self, tmp_path):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        cancelled_paths = self._temp_files(tmp_path / "a")
+        kept_paths = self._temp_files(tmp_path / "b")
+        sess.queue.append(("ts1", "cancel me", {"image_temp_paths": cancelled_paths}))
+        sess.queue.append(("ts2", "keep me", {"image_temp_paths": kept_paths}))
+        assert mgr.cancel_queued("thread1", "ts1") is True
+        for p in cancelled_paths:
+            assert not os.path.exists(p)
+        for p in kept_paths:
+            assert os.path.exists(p)
+
+    def test_clear_queue_unlinks_all_entries_temp_files(self, tmp_path):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        paths1 = self._temp_files(tmp_path / "e1")
+        paths2 = self._temp_files(tmp_path / "e2")
+        sess.queue.append(("ts1", "one", {"image_temp_paths": paths1}))
+        sess.queue.append(("ts2", "two", {"image_temp_paths": paths2}))
+        mgr.clear_queue("thread1")
+        assert len(sess.queue) == 0
+        for p in paths1 + paths2:
+            assert not os.path.exists(p)
+
+    def test_dequeue_cancelled_skip_unlinks_temp_files(self, tmp_path):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        paths = self._temp_files(tmp_path)
+        sess.queue.append(("ts1", "cancelled", {"image_temp_paths": paths}))
+        sess.queue.append(("ts2", "live", {}))
+        sess.cancelled.add("ts1")
+        result = mgr.dequeue("thread1")
+        assert result is not None
+        assert result[0] == "ts2"
+        for p in paths:
+            assert not os.path.exists(p)
+
+    def test_dequeue_returned_entry_keeps_temp_files(self, tmp_path):
+        """The dispatch path owns cleanup; dequeue must NOT unlink what it returns."""
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        paths = self._temp_files(tmp_path)
+        sess.queue.append(("ts1", "live", {"image_temp_paths": paths}))
+        result = mgr.dequeue("thread1")
+        assert result is not None
+        assert result[0] == "ts1"
+        for p in paths:
+            assert os.path.exists(p)
+
+    def test_already_missing_files_do_not_raise(self, tmp_path):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        missing = [str(tmp_path / "gone1.png"), str(tmp_path / "gone2.png")]
+        sess.queue.append(("ts1", "hello", {"image_temp_paths": missing}))
+        assert mgr.cancel_queued("thread1", "ts1") is True
+        sess.queue.append(("ts2", "world", {"image_temp_paths": missing}))
+        mgr.clear_queue("thread1")  # must not raise either
+        assert len(sess.queue) == 0
+
+    def test_entries_without_temp_paths_are_fine(self):
+        mgr, sess = TestSessionManagerQueue._make_mgr()
+        sess.queue.append(("ts1", "no kwargs key", {}))
+        sess.queue.append(("ts2", "none value", {"image_temp_paths": None}))
+        assert mgr.cancel_queued("thread1", "ts1") is True
+        mgr.clear_queue("thread1")
+        assert len(sess.queue) == 0
+
+    def test_unlink_helper_directly(self, tmp_path):
+        p = tmp_path / "img.png"
+        p.write_bytes(b"fake")
+        unlink_queued_temp_paths({"image_temp_paths": [str(p)]})
+        assert not p.exists()
+        unlink_queued_temp_paths({"image_temp_paths": [str(p)]})  # idempotent
+        unlink_queued_temp_paths({})  # no key

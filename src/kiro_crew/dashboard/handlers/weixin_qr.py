@@ -1,6 +1,6 @@
 """Dashboard endpoints for the Weixin (iLink) QR-login setup flow.
 
-Two routes back the Settings > Channels > WeChat "Connect via QR" flow:
+Two routes back the Settings > Messaging Channels > WeChat "Connect via QR" flow:
 
   POST /api/channels/weixin/qr/start   -> start an iLink QR session, return the
                                           QR image + a server-side session id.
@@ -23,10 +23,9 @@ take — so a QR confirmation can never interleave with another config save.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -34,11 +33,18 @@ from typing import Any, Dict, Optional
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_WEIXIN_TOKEN, KiroCrewConfig, config_path, env_path
+from kiro_crew.dashboard.channel_folders import (
+    channel_restart_required,
+    clean_session_folder,
+    ensure_channel_folder,
+    stored_folder_name,
+)
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
+from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.handlers.messaging import is_direct_local_request
-from kiro_crew.platform_compat import restrict_to_owner
 from kiro_crew.weixin.client import ILINK_BASE_URL, WeixinClient
 
 logger = logging.getLogger(__name__)
@@ -53,18 +59,13 @@ def _render_qr_data_uri(scan_data: str) -> str:
     """Encode ``scan_data`` (the iLink login URL) into a PNG data URI.
 
     Runs in a worker thread: PNG encoding is CPU-bound and must not stall the
-    gateway event loop. Import is function-local deliberately — qrcode pulls
-    Pillow, and this is the only feature needing it at handler-module import.
+    gateway event loop. Delegates to :mod:`kiro_crew.qr`, the single owner of QR
+    encoding, so this surface and tailnet mobile access cannot drift into two
+    different encoders.
     """
-    import qrcode as _qrcode  # noqa: PLC0415 — heavy optional import, QR path only
+    from kiro_crew.qr import render_qr_data_uri  # noqa: PLC0415 - heavy import, QR path only
 
-    qr = _qrcode.QRCode(border=2, box_size=8)
-    qr.add_data(scan_data)
-    qr.make(fit=True)
-    image = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return render_qr_data_uri(scan_data)
 
 
 def _prune_sessions() -> None:
@@ -89,21 +90,22 @@ def _atomic_write(path: Path, text: str, *, secret: bool = False) -> None:
     with ``mkstemp`` so concurrent writers to the same target cannot collide on a
     deterministic ``.tmp`` name (an ENOENT race).
 
-    Permissions are never weakened. ``secret=True`` forces 0600 and then applies
-    :func:`restrict_to_owner`, which locks the file down on Windows too (POSIX
-    mode bits are meaningless against NTFS ACLs). For a non-secret file the
-    EXISTING mode is carried over, because the replacement would otherwise adopt
-    the umask default and silently downgrade an already-restricted file —
-    ``config.json`` can hold inline fallback credentials, so a 0600 → 0644
-    transition there would expose them to other local users.
+    Permissions are never weakened. ``secret=True`` passes
+    ``restrict_to_owner=True`` to the shared helper, which locks the unique
+    temp file down to its owner BEFORE any content byte is written — POSIX mode
+    bits are meaningless against NTFS ACLs, so a lockdown applied to the final
+    path after the write would leave the credential readable under the
+    directory-inherited DACL for the whole write. ``restrict_on_error="warn"``
+    keeps this writer's contract: a host where the lockdown cannot be applied
+    must not abort a credential save that already succeeded. For a non-secret
+    file the EXISTING mode is carried over, because the replacement would
+    otherwise adopt the umask default and silently downgrade an
+    already-restricted file — ``config.json`` can hold inline fallback
+    credentials, so a 0600 → 0644 transition there would expose them to other
+    local users.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     if secret:
-        atomic_write(path, text, mode=0o600)
-        try:
-            restrict_to_owner(path)
-        except OSError:
-            logger.warning("weixin: could not restrict credential permissions", exc_info=True)
+        atomic_write(path, text, restrict_to_owner=True, restrict_on_error="warn")
         return
     preserved: Optional[int] = None
     try:
@@ -175,26 +177,54 @@ def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None
     paired with stale account metadata — the channel would authenticate against
     the wrong account — and the previously working credential would be gone, with
     no way to recover it from the dashboard.
+
+    Acquires the shared ``.env.lock`` cross-process advisory lock (same sidecar
+    file used by ``secrets import --apply``) before any read or write of ``.env``,
+    so the importer and this handler cannot interleave their read-modify-write
+    cycles.  If the lock is already held by another process the function raises
+    ``OSError`` with a descriptive message; the caller (``_persist``) propagates
+    it as a 500 response, which is the same outcome as any other I/O failure here.
+    The existing in-process ``_get_config_lock()`` (held by the caller one level
+    up) continues to serialise same-process concurrent callers; the file lock adds
+    the cross-process exclusion layer on top.
     """
-    prior = _read_env_value(CRED_WEIXIN_TOKEN)
-    _write_env_secret(CRED_WEIXIN_TOKEN, token)
+    ep = env_path()
+    # Lazy import: the migration importer is an optional CLI subsystem, so keep it
+    # off the gateway boot-import path (weixin_qr is imported at server startup).
+    # Only load it when a credential write actually happens.
+    from kiro_crew.secrets.migrate import _env_lock_path
+
+    lock_path = _env_lock_path(ep)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        _atomic_write(cp, serialized)
-    except BaseException:
-        try:
-            if prior is None:
-                _delete_env_key(CRED_WEIXIN_TOKEN)
-            else:
-                _write_env_secret(CRED_WEIXIN_TOKEN, prior)
-        except Exception:
-            # Surfacing the rollback failure would mask the original cause, so
-            # log it and let the real error propagate.
-            logger.error(
-                "weixin: config commit failed AND credential rollback failed; "
-                "the stored credential may not match config.json",
-                exc_info=True,
+        if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+            raise OSError(
+                f"{ep} is locked by another process (secrets import in progress); "
+                "the WeChat credential was not written.  Retry the QR sign-in "
+                "once the other operation finishes."
             )
-        raise
+        prior = _read_env_value(CRED_WEIXIN_TOKEN)
+        _write_env_secret(CRED_WEIXIN_TOKEN, token)
+        try:
+            _atomic_write(cp, serialized)
+        except BaseException:
+            try:
+                if prior is None:
+                    _delete_env_key(CRED_WEIXIN_TOKEN)
+                else:
+                    _write_env_secret(CRED_WEIXIN_TOKEN, prior)
+            except Exception:
+                # Surfacing the rollback failure would mask the original cause, so
+                # log it and let the real error propagate.
+                logger.error(
+                    "weixin: config commit failed AND credential rollback failed; "
+                    "the stored credential may not match config.json",
+                    exc_info=True,
+                )
+            raise
+    finally:
+        platform_compat.release_lock(lock_fd)
+        os.close(lock_fd)
 
 
 def _stage_weixin_config(*, account_id: str, base_url: str) -> tuple[Path, str]:
@@ -323,9 +353,8 @@ async def weixin_qr_status(request: web.Request) -> web.Response:
         # BOTH — otherwise a concurrent channel save can interleave and silently
         # drop one side's write.
         #
-        # The whole block runs OFF the loop: besides the file I/O,
-        # restrict_to_owner() shells out to whoami/icacls on Windows, which would
-        # freeze the gateway for seconds on the first confirmation.
+        # The whole block runs OFF the loop: the file I/O plus, on Windows,
+        # the owner-only DACL restrict_to_owner() applies.
         async with _get_config_lock():
             await asyncio.to_thread(_persist)
     except Exception as exc:
@@ -375,6 +404,7 @@ async def weixin_config_get(request: web.Request) -> web.Response:
             "account_id": wx.account_id,
             "dm_policy": wx.dm_policy,
             "allowed_user_ids": [str(u) for u in wx.allowed_user_ids],
+            "session_folder": wx.session_folder,
         }
     )
 
@@ -402,6 +432,13 @@ async def weixin_config_save(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid dm_policy"}, status=400)
     if "allowed_user_ids" in body and not isinstance(body["allowed_user_ids"], list):
         return web.json_response({"error": "allowed_user_ids must be a list"}, status=400)
+    if "session_folder" in body:
+        try:
+            session_folder = clean_session_folder(body["session_folder"])
+        except ValueError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_session_folder"}, status=400
+            )
 
     async with _get_config_lock():
         cp = config_path()
@@ -429,8 +466,33 @@ async def weixin_config_save(request: web.Request) -> web.Response:
             wx["allowed_user_ids"] = [
                 str(u).strip() for u in body["allowed_user_ids"] if str(u).strip()
             ]
+        if "session_folder" in body:
+            wx["session_folder"] = session_folder
         serialized = json.dumps(data, ensure_ascii=False, indent=2)
         await asyncio.to_thread(_atomic_write, cp, serialized)
 
-    # Every weixin field is read once in the orchestrator's constructor.
-    return web.json_response({"ok": True, "restart_required": True})
+        # Create the configured session folder now, on this user-initiated save,
+        # so the reconcile path never has to write the folder store. Best-effort:
+        # a failure leaves conversations unfiled until the next save.
+        _folder_name = stored_folder_name(wx.get("session_folder"))
+        if _folder_name:
+            _state = request.app.get("state")
+            if _state is not None:
+                await ensure_channel_folder(
+                    _state, "weixin", _folder_name,
+                    relabel="session_folder" in body,
+                )
+
+    # Answer only after the watcher applied the write: this save carries the
+    # allow-list, so a removed sender must be unauthorized on the running
+    # transport before the caller sees "saved", not one poll interval later.
+    await _hot_apply_after_write()
+    # Per field: session_folder is re-read live by the channel-slot reconciler,
+    # and the connection fields (token, account_id, base_url, enabled) are what a
+    # restart is actually for.
+    return web.json_response(
+        {
+            "ok": True,
+            "restart_required": channel_restart_required("weixin", body.keys()),
+        }
+    )

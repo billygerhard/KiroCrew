@@ -82,16 +82,47 @@ describe('QuestionCard', () => {
     render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
     fireEvent.click(screen.getByText('Red').closest('button')!)
     fireEvent.click(screen.getByText('Blue').closest('button')!)
-    expect(screen.getByText('Red').closest('button')!.className).not.toContain('bg-accent-subtle')
-    expect(screen.getByText('Blue').closest('button')!.className).toContain('bg-accent-subtle')
+    expect(screen.getByText('Red').closest('button')!).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText('Blue').closest('button')!).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('multi-select allows multiple selections', () => {
     render(<QuestionCard questions={multiQuestion} onSubmit={vi.fn()} />)
     fireEvent.click(screen.getByText('Dark mode').closest('button')!)
     fireEvent.click(screen.getByText('Notifications').closest('button')!)
-    expect(screen.getByText('Dark mode').closest('button')!.className).toContain('border-accent')
-    expect(screen.getByText('Notifications').closest('button')!.className).toContain('border-accent')
+    expect(screen.getByText('Dark mode').closest('button')!).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('Notifications').closest('button')!).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('exposes aria-pressed on every option, tracking single-select transitions including deselect', () => {
+    // WCAG 4.1.2 Name/Role/Value: the selected state must be programmatic, not
+    // CSS-only. aria-pressed (toggle button), not role=radio + aria-checked,
+    // because single-select intentionally allows click-again-to-deselect, which
+    // radio semantics forbid.
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
+    const red = screen.getByText('Red').closest('button')!
+    const blue = screen.getByText('Blue').closest('button')!
+    expect(red).toHaveAttribute('aria-pressed', 'false')
+    expect(blue).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(red)
+    expect(red).toHaveAttribute('aria-pressed', 'true')
+    expect(blue).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(red) // deselect: second click on the selected option
+    expect(red).toHaveAttribute('aria-pressed', 'false')
+    expect(blue).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('multi-select toggles aria-pressed independently per option', () => {
+    render(<QuestionCard questions={multiQuestion} onSubmit={vi.fn()} />)
+    const dark = screen.getByText('Dark mode').closest('button')!
+    const notif = screen.getByText('Notifications').closest('button')!
+    fireEvent.click(dark)
+    fireEvent.click(notif)
+    expect(dark).toHaveAttribute('aria-pressed', 'true')
+    expect(notif).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(dark) // independent toggle off; the other keeps its state
+    expect(dark).toHaveAttribute('aria-pressed', 'false')
+    expect(notif).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('submit button disabled when nothing selected', () => {
@@ -122,7 +153,7 @@ describe('QuestionCard', () => {
     fireEvent.click(screen.getByText('Red').closest('button')!)
     const input = screen.getByPlaceholderText('Or type a custom answer...')
     fireEvent.change(input, { target: { value: 'Yellow' } })
-    expect(screen.getByText('Red').closest('button')!.className).not.toContain('bg-accent-subtle')
+    expect(screen.getByText('Red').closest('button')!).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('selecting option clears custom input', () => {
@@ -162,6 +193,35 @@ describe('QuestionCard — collapsing', () => {
   ]
 
   const header = (text: string) => screen.getByText(text).closest('button')!
+
+  it('starts a multi-question card compact, with only the first question open', () => {
+    // A fully open multi-question card is taller than the viewport, so it buries
+    // the composer and the conversation and leaves collapse-all as the only way
+    // back. Opening at one question is the shape the card already walks towards
+    // as answers fold; it just starts there now.
+    render(<QuestionCard questions={twoQuestions} onSubmit={vi.fn()} />)
+    expect(screen.getByText('Carve-out')).toBeInTheDocument()
+    expect(screen.queryByText('staging')).not.toBeInTheDocument()
+    expect(header('Trust model')).toHaveAttribute('aria-expanded', 'true')
+    expect(header('Environments')).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('starts a single-question card open, where folding would only add a click', () => {
+    // Nothing follows it and nothing is buried, so the card is already at the
+    // height it needs. Same predicate the auto-fold uses.
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
+    expect(screen.getByText('Red')).toBeInTheDocument()
+    expect(header('What is your favorite color?')).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('starts a replaced question set in the same shape as a fresh mount', () => {
+    // The reset and the initial state read one helper. Were they to drift, a
+    // re-dispatched card would open at full height while a fresh one did not.
+    const { rerender } = render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
+    rerender(<QuestionCard questions={twoQuestions} onSubmit={vi.fn()} />)
+    expect(screen.getByText('Carve-out')).toBeInTheDocument()
+    expect(screen.queryByText('staging')).not.toBeInTheDocument()
+  })
 
   it('folds a question away and back on the header toggle', () => {
     render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
@@ -233,11 +293,13 @@ describe('QuestionCard — collapsing', () => {
     expect(screen.getByText('Submit').closest('button')!).toBeDisabled()
   })
 
-  it('auto-folds an answered question on a multi-question card', () => {
+  it('auto-folds an answered question and opens the next unanswered one', () => {
     render(<QuestionCard questions={twoQuestions} onSubmit={vi.fn()} />)
     fireEvent.click(screen.getByText('Carve-out').closest('button')!)
-    // Q1 folds to its answer; Q2 stays open, so the card walks DOWN to Submit
-    // instead of growing past it.
+    // Q1 folds to its answer and Q2 opens in the same beat, so the card walks
+    // DOWN towards Submit with exactly one question open: the next one needing
+    // an answer. Without the hand-off a compact card would leave Q2 shut and
+    // charge a click on a muted row to find it.
     expect(screen.queryByText('Public only')).not.toBeInTheDocument()
     expect(screen.getByText('staging')).toBeInTheDocument()
   })
@@ -249,6 +311,35 @@ describe('QuestionCard — collapsing', () => {
     fireEvent.click(screen.getByText('staging').closest('button')!)
     fireEvent.click(screen.getByText('Submit').closest('button')!)
     expect(onSubmit).toHaveBeenCalledWith({ 'Trust model': 'Carve-out', 'Environments': 'staging' })
+  })
+
+  it('folds the whole card once the last question is answered', () => {
+    render(<QuestionCard questions={twoQuestions} onSubmit={vi.fn()} />)
+    fireEvent.click(screen.getByText('Carve-out').closest('button')!)
+    fireEvent.click(screen.getByText('staging').closest('button')!)
+    // Nothing is left to hand off to, so the card ends walked all the way down
+    // to Submit rather than re-opening something the user already settled.
+    expect(screen.queryByText('Public only')).not.toBeInTheDocument()
+    expect(screen.queryByText('prod')).not.toBeInTheDocument()
+    expect((screen.getByText('Submit').closest('button') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('does not reopen an answered question when an earlier answer changes', () => {
+    // The hand-off targets the first question with no answer, not the one after
+    // the click. Opening `qIdx + 1` instead would reopen a settled question here.
+    const threeQuestions = [
+      ...twoQuestions,
+      { question: 'Rollout', options: [{ label: 'canary' }, { label: 'full' }] },
+    ]
+    render(<QuestionCard questions={threeQuestions} onSubmit={vi.fn()} />)
+    fireEvent.click(screen.getByText('Carve-out').closest('button')!)
+    fireEvent.click(screen.getByText('staging').closest('button')!)
+    fireEvent.click(screen.getByText('canary').closest('button')!)
+
+    fireEvent.click(header('Trust model'))
+    fireEvent.click(screen.getByText('Public only').closest('button')!)
+    expect(screen.queryByText('prod')).not.toBeInTheDocument()
+    expect(screen.queryByText('full')).not.toBeInTheDocument()
   })
 
   it('does not auto-fold a single-question card', () => {
@@ -290,16 +381,81 @@ describe('QuestionCard — collapsing', () => {
 
   it('folds the rest when only some questions are already folded', () => {
     // Mixed state must mean "collapse all", not "expand all" — otherwise the
-    // control re-opens what the user just folded.
+    // control re-opens what the user just folded. A fresh multi-question card is
+    // already mixed, first question open and the rest folded, so the starting
+    // state is the case under test and needs no manual fold to reach.
     render(<QuestionCard questions={twoQuestions} onSubmit={vi.fn()} />)
-    fireEvent.click(header('Trust model'))
     expect(screen.getByText('Collapse all')).toBeInTheDocument()
     fireEvent.click(screen.getByText('Collapse all'))
+    expect(screen.queryByText('Carve-out')).not.toBeInTheDocument()
     expect(screen.queryByText('staging')).not.toBeInTheDocument()
   })
 
   it('offers no collapse-all on a single question, where the chevron is the same gesture', () => {
     render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
     expect(screen.queryByText('Collapse all')).not.toBeInTheDocument()
+  })
+
+  it('publishes draft-active for a pending option selection, and clears it on deselect', () => {
+    // GPT round-10: an unsubmitted option pick is in-progress work exactly
+    // like typed custom text — the store must know, or auto-retirement
+    // destroys it. Deselecting (single-select second click) must clear the
+    // flag so the card becomes retirable again.
+    const onDraftChange = vi.fn()
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} onDraftChange={onDraftChange} />)
+    onDraftChange.mockClear() // initial effect publishes false
+    fireEvent.click(screen.getByText('Red').closest('button')!)
+    expect(onDraftChange).toHaveBeenLastCalledWith(true)
+    fireEvent.click(screen.getByText('Red').closest('button')!) // deselect
+    expect(onDraftChange).toHaveBeenLastCalledWith(false)
+  })
+
+  it('publishes draft-active for custom text and clears the flag on unmount', () => {
+    const onDraftChange = vi.fn()
+    const { unmount } = render(
+      <QuestionCard questions={singleQuestion} onSubmit={vi.fn()} onDraftChange={onDraftChange} />,
+    )
+    fireEvent.change(screen.getByPlaceholderText(/custom answer/i), { target: { value: 'maybe teal' } })
+    expect(onDraftChange).toHaveBeenLastCalledWith(true)
+    // A card removed for any other reason (resolution, dismiss) must not
+    // leave a stale draftActive blocking a future card's retirement.
+    unmount()
+    expect(onDraftChange).toHaveBeenLastCalledWith(false)
+  })
+
+  it('says what Dismiss does, on the row and on the control', () => {
+    // Dismiss is the only exit for a question nobody will answer, and the bare
+    // label reads as "hide this for now": a user who suspects it might discard
+    // the question leaves the dead card parked above the composer. The
+    // consequence is stated as a visible line (a tooltip is not there for touch
+    // or for a keyboard user reading the row) and repeated as the control's own
+    // title.
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} onDismiss={vi.fn()} />)
+    const hint = /stops the agent waiting for an answer/i
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /dismiss question without answering/i }))
+      .toHaveAttribute('title', expect.stringMatching(hint) as unknown as string)
+  })
+
+  it('shows no dismiss consequence line when the card cannot be dismissed', () => {
+    // The line describes a control, so it must not appear without it.
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} />)
+    expect(screen.queryByText(/stops the agent waiting for an answer/i)).toBeNull()
+  })
+
+  it('caps its height and scrolls the questions, keeping the action row out of the scroller', () => {
+    // A card taller than the column it mounts in grew PAST the top of the
+    // viewport and was clipped there, so the first questions were neither
+    // readable nor reachable. The questions must live in their own bounded
+    // scroller, and Submit / Dismiss must sit outside it so they stay reachable
+    // without scrolling to the end.
+    render(<QuestionCard questions={singleQuestion} onSubmit={vi.fn()} onDismiss={vi.fn()} />)
+    const card = screen.getByText('What is your favorite color?').closest('div.rounded-xl')!
+    expect(card.className).toContain('max-h-[min(60vh,32rem)]')
+    const scroller = screen.getByText('What is your favorite color?').closest('.overflow-y-auto')
+    expect(scroller).not.toBeNull()
+    // The action row is a sibling of the scroller, never inside it.
+    const submitRow = screen.getByText('Submit').closest('div')!
+    expect(scroller!.contains(submitRow)).toBe(false)
   })
 })

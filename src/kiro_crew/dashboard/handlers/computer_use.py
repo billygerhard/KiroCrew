@@ -72,7 +72,9 @@ from kiro_crew.computer_use.types import (
     MIN_SCREENSHOT_MAX_PX,
     PERMISSION_UNKNOWN,
     PERMISSION_UNSUPPORTED,
+    PLATFORM_FAKE,
     PLATFORM_MACOS,
+    PLATFORM_WINDOWS,
     STATE_KEY_ALLOWED_APPS,
     STATE_KEY_ENABLED,
     STATE_KEY_EXTRA_DENIED_APPS,
@@ -98,6 +100,15 @@ DOCTOR_ARGS: tuple[str, ...] = ("doctor", "--json")
 # a stalled TCC daemon, and the Settings page must render regardless — the rows
 # are advisory, so "unknown" is a fine answer and far better than a hung request.
 DOCTOR_TIMEOUT_SECS = 5.0
+
+#: Platforms whose driver has a permission probe worth spawning a child for.
+#: Membership rather than an inequality, so a platform that gains a driver opts IN
+#: explicitly: an ``!= PLATFORM_MACOS`` test silently answered "unsupported" for
+#: Windows after its driver shipped, making ``WindowsBackend.probe_permissions``
+#: unreachable while the CLI's own ``doctor`` reported it fine. ``PLATFORM_FAKE`` is
+#: included so the suite's fake backend exercises this path rather than the
+#: short-circuit.
+_PROBEABLE_PLATFORMS: frozenset[str] = frozenset({PLATFORM_MACOS, PLATFORM_WINDOWS, PLATFORM_FAKE})
 
 # Body caps for the PUT. The app lists are operator-authored patterns; the caps
 # exist so a malformed or hostile request cannot make the keystone unbounded.
@@ -244,22 +255,29 @@ def _normalize_permissions(raw: object) -> dict[str, str]:
 
 
 async def _probe_permissions(platform_id: str) -> dict[str, str]:
-    """Probe macOS Accessibility / Screen Recording OUT OF PROCESS.
+    """Probe the platform's capture/automation permissions OUT OF PROCESS.
 
     Shells ``kirocrew computer doctor --json`` instead of calling the frameworks
     here, and that is the whole point: a missing ctypes ``argtypes`` is a SIGSEGV,
     not an exception, and in the gateway that
     would take down every chat session, the cron scheduler, the Slack socket and
     the dashboard WebSocket at once. In a short-lived child the blast radius is a
-    permission row that reads ``unknown``.
+    permission row that reads ``unknown``. The argument applies with MORE force to
+    the Windows driver, whose whole surface is manual COM vtable dispatch.
+
+    Runs for every platform that has a DRIVER, asking the backend rather than naming
+    an OS — the same seam ``_payload`` reads. Gating this on macOS made
+    ``WindowsBackend.probe_permissions`` unreachable from the surface it was written
+    for, so ``kirocrew computer doctor --json`` reported ``accessibility=granted``
+    while the API reported ``unsupported`` for the same host. A platform with no
+    driver still short-circuits: there is nothing to probe and nothing to spawn.
 
     Never raises — every failure degrades to ``unknown``, because these rows are
     ADVISORY and must never gate the feature: macOS attributes a TCC grant to the
     RESPONSIBLE PARENT of the process tree, so a probe can honestly report
     ``missing`` while a full-fidelity capture succeeds.
     """
-    if platform_id != PLATFORM_MACOS:
-        # Nothing to probe and nothing to spawn: TCC is a macOS concept.
+    if platform_id not in _PROBEABLE_PLATFORMS:
         return _permission_block(PERMISSION_UNSUPPORTED)
 
     # Reuses the resolver the managed MCP servers use, so the probe runs the SAME
@@ -563,7 +581,7 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             error="app tokens may not write the computer-use keystone",
         )
         return web.json_response(
-            {"error": "dashboard user required"},
+            {"error": "dashboard user required", "code": "dashboard_user_required"},
             status=403,
         )
 
@@ -571,10 +589,13 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="invalid_json")
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="body_not_object")
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "body_not_object"},
+            status=400,
+        )
 
     # ── Validate EVERYTHING before writing anything ──
     state_patch: dict[str, Any] = {}
@@ -583,7 +604,10 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             _audit(
                 request, operation=OP_CONFIG_SAVE, outcome="denied", resources="enabled=bad_type"
             )
-            return web.json_response({"error": "enabled must be a boolean"}, status=400)
+            return web.json_response(
+                {"error": "enabled must be a boolean", "code": "invalid_field_type"},
+                status=400,
+            )
         state_patch[STATE_KEY_ENABLED] = body["enabled"]
     for key in _APP_LIST_KEYS:
         if key not in body:
@@ -596,7 +620,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                     "error": (
                         f"{key} must be a list of at most {MAX_APP_PATTERNS} strings, "
                         f"each at most {MAX_APP_PATTERN_LEN} characters"
-                    )
+                    ),
+                    "code": "invalid_app_patterns",
                 },
                 status=400,
             )
@@ -611,11 +636,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # explicitly — a JSON ``true`` must not become the integer 1 for a budget.
         if isinstance(value, bool) or not isinstance(value, int):
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}=bad_type")
-            return web.json_response({"error": f"{key} must be an integer"}, status=400)
+            return web.json_response(
+                {"error": f"{key} must be an integer", "code": "invalid_field_type"},
+                status=400,
+            )
         if value < low or value > high:
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}={value}")
             return web.json_response(
-                {"error": f"{key} must be between {low} and {high}"}, status=400
+                {
+                    "error": f"{key} must be between {low} and {high}",
+                    "code": "value_out_of_range",
+                },
+                status=400,
             )
         limits_patch[key] = value
     for key in _BOOL_KEYS:
@@ -623,12 +655,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             continue
         if not isinstance(body[key], bool):
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}=bad_type")
-            return web.json_response({"error": f"{key} must be a boolean"}, status=400)
+            return web.json_response(
+                {"error": f"{key} must be a boolean", "code": "invalid_field_type"},
+                status=400,
+            )
         limits_patch[key] = body[key]
 
     if not state_patch and not limits_patch:
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="empty_patch")
-        return web.json_response({"error": "no known computer-use fields in body"}, status=400)
+        return web.json_response(
+            {"error": "no known computer-use fields in body", "code": "no_known_fields"},
+            status=400,
+        )
 
     # No governance step here, deliberately: the computer-use governance model
     # (and the 409 it would have returned) does not exist. The write boundary
@@ -677,7 +715,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                 error=str(exc),
             )
             logger.error("refusing computer-use mutation: %s", exc)
-            return web.json_response({"error": ERR_STATE_CORRUPT}, status=500)
+            return web.json_response(
+                {"error": ERR_STATE_CORRUPT, "code": "config_corrupt"}, status=500
+            )
         except OSError as exc:
             _audit(
                 request,
@@ -687,7 +727,13 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                 error=str(exc),
             )
             logger.error("computer-use settings write failed: %s", exc)
-            return web.json_response({"error": "failed to write computer-use settings"}, status=500)
+            return web.json_response(
+                {
+                    "error": "failed to write computer-use settings",
+                    "code": "config_write_failed",
+                },
+                status=500,
+            )
 
     # Audit the DECISION, not the payload: the enable is the security-relevant
     # bit, and the app patterns can name applications the operator would rather
@@ -711,14 +757,51 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
     # tear down the user's session.
     sessions_reset = 0
     if STATE_KEY_ENABLED in state_patch and state_patch[STATE_KEY_ENABLED] != enabled_before:
+        # REBUILD THE AGENT SPEC FIRST. The enable is also a spec-emission gate
+        # (``agent._computer_use_spec_gate``): while it is off the server is not in
+        # ``mcpServers`` at all, so no backend is spawned. A reset alone would
+        # therefore restart every session into the SAME spec that omits the server
+        # — the tools would not appear until the next gateway start. Rebuilding
+        # here holds the user-visible contract: enable, sessions restart, tools
+        # are there.
+        #
+        # UNDER THE CONFIG LOCK, reacquired: the rebuild READS the keystone and
+        # WRITES the spec, so leaving it outside would let two overlapping PUTs
+        # interleave — an enable's slower rebuild could land its spec after a
+        # later disable's, leaving a spec that mounts (and spawns) the server the
+        # keystone now forbids. Holding the lock makes read-decide-write atomic
+        # against every keystone writer, so the rebuild that finishes last is the
+        # one that read the final state. The write block above has already exited
+        # its own acquisition, and ``rebuild_agent_config`` never takes this lock,
+        # so this cannot self-deadlock.
+        #
+        # A rebuild failure must not fail the SAVE: the write already landed and
+        # was audited. The fallback is the un-rebuilt spec — the tool surface
+        # appears on the next gateway start.
+        #
+        # The import is function-local and must STAY function-local, which is not
+        # a style choice: it makes the name resolve at CALL time, so
+        # ``kiro_crew.agent`` is the single place a test can substitute the
+        # rebuild. Hoisting it to module scope binds the name here at import time,
+        # and the test guard that keeps the suite from rewriting the operator's
+        # real ``~/.kiro/agents`` would silently stop reaching this call site.
+        # Pinned by ``test_patching_the_agent_module_REACHES_the_handler``.
+        try:
+            from kiro_crew.agent import rebuild_agent_config
+
+            async with _get_config_lock():
+                await asyncio.to_thread(rebuild_agent_config)
+        except Exception:
+            logger.exception("computer-use enable saved, but agent config rebuild failed")
+
         from kiro_crew.dashboard.handlers.sessions import _reset_all_sessions
 
         try:
             sessions_reset = await _reset_all_sessions(request)
         except Exception:
             # The write already landed and was audited; a restart failure must not
-            # report the SAVE as failed. Worst case is the pre-existing behaviour:
-            # the new tool surface appears on the next cold session.
+            # report the SAVE as failed. Worst case: the new tool surface appears
+            # on the next cold session.
             logger.exception("computer-use enable saved, but session reset failed")
 
     payload = await _full_payload()
@@ -769,11 +852,16 @@ async def api_computer_use_invoke(request: web.Request) -> web.Response:
     shim) still get 4xx.
 
     The identity fields are not an authorization claim this handler trusts: the
-    ``session_key`` is resolved STRICTLY on the shim side (``KIROCREW_SESSION_KEY``,
-    else ``KIROCREW_HOST_PID`` + the HMAC sidecar), which refuses an unresolvable
-    key before it reaches the wire. Passing them in the body is how the gateway
-    learns which surface is calling — it is the AUDIT identity, not a permit; the
-    trust comes from the local-secret handshake plus that strict resolution.
+    ``session_key`` is resolved STRICTLY on the shim side (the gateway-injected
+    caller block, else ``KIROCREW_SESSION_KEY``, else ``KIROCREW_HOST_PID`` + the
+    HMAC sidecar). An unresolvable key is NOT refused there: the shim substitutes
+    its ``unresolved:<pid>[#<nonce>]`` placeholder in the body and sends no
+    ``X-Session-Key`` header at all, so the middleware's kernel peer check has no
+    claim to verify and the call proceeds unnamed (``mcp_computer._declares_identity``).
+    Passing them in the body is how the gateway learns which surface is calling; it
+    is the AUDIT identity and the ``SnapshotIndex`` namespace, not a permit. The
+    trust comes from the local-secret handshake plus the peer check on any key
+    that IS declared.
 
     ``approval_recorded`` is passed as ``False`` and does not change any outcome:
     nothing reads it. It is not minted from the request body, because a body field
@@ -801,21 +889,31 @@ async def api_computer_use_invoke(request: web.Request) -> web.Response:
             resources=request.path,
             error="internal secret required",
         )
-        return web.json_response({"error": "forbidden"}, status=403)
+        return web.json_response(
+            {"error": "forbidden", "code": "internal_secret_required"}, status=403
+        )
 
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "body_not_object"},
+            status=400,
+        )
 
     tool = body.get("tool")
     if not isinstance(tool, str) or not tool:
-        return web.json_response({"error": "tool must be a non-empty string"}, status=400)
+        return web.json_response(
+            {"error": "tool must be a non-empty string", "code": "tool_required"},
+            status=400,
+        )
     args = body.get("args") or {}
     if not isinstance(args, dict):
-        return web.json_response({"error": "args must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "args must be a JSON object", "code": "invalid_args"}, status=400
+        )
     session_key = body.get("session_key")
     agent = body.get("agent")
     app = body.get("app")
@@ -930,7 +1028,7 @@ async def api_computer_use_frame(request: web.Request) -> web.Response:
             resources="non-loopback",
             error="loopback only",
         )
-        return web.json_response({"error": "loopback only"}, status=403)
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
 
     # And the machine grant, for exactly the reason ``api_computer_use_invoke``
     # re-asserts it: being listed in ``_STRICT_INTERNAL_API_PATHS`` does NOT prove
@@ -949,18 +1047,20 @@ async def api_computer_use_frame(request: web.Request) -> web.Response:
             resources=request.path,
             error="internal secret required",
         )
-        return web.json_response({"error": "forbidden"}, status=403)
+        return web.json_response(
+            {"error": "forbidden", "code": "internal_secret_required"}, status=403
+        )
 
     try:
         body = await request.json()
     except Exception:
         _audit(request, operation=OP_FRAME, outcome="invalid_input", resources="invalid-json")
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
 
     payload = build_frame_payload(body if isinstance(body, dict) else {})
     if payload is None:
         _audit(request, operation=OP_FRAME, outcome="invalid_input", resources="no-frame-data")
-        return web.json_response({"error": "no frame data"}, status=400)
+        return web.json_response({"error": "no frame data", "code": "no_frame_data"}, status=400)
 
     state = request.app["state"]
     delivered = await state.deliver_ws_owners(COMPUTER_USE_FRAME_EVENT, payload)

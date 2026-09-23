@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
-import { ArrowLeft, AlertTriangle, ExternalLink, GitFork, Loader2, User, MessageSquare } from 'lucide-react'
+import { ArrowLeft, ExternalLink, GitFork, Loader2, User, MessageSquare, RotateCw, Eye } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import { safeHttpUrl } from '../lib/safeUrl'
-import { sanitizeCssValue } from '../lib/cssSanitize'
-import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
+import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
 import { PageHeader, Card, Badge, Btn } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { CommentsSidebar } from '../components/CommentsSidebar'
 import { CommentPopover } from '../components/CommentOverlay'
@@ -16,16 +16,8 @@ import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridg
 import type { ArtifactComment } from '../types'
 
 import { i18nT } from '../i18n/t'
-function readThemeVars(): Record<string, string> {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return {}
-  const computed = getComputedStyle(document.documentElement)
-  const out: Record<string, string> = {}
-  for (const name of THEME_VAR_NAMES) {
-    const v = sanitizeCssValue(computed.getPropertyValue(name))
-    if (v) out[name] = v
-  }
-  return out
-}
+import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
 
 /** Shape of the `GET /api/remote-artifacts/{provider}/{external_id}` response.
  *  These are the provider `fetch_content` contract fields — flat **snake_case**
@@ -68,7 +60,7 @@ export default function RemoteArtifactDetailPage() {
   const [forkError, setForkError] = useState('')
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const mdPreviewRef = useRef<HTMLDivElement>(null)
-  const [popover, setPopover] = useState<{ x: number; y: number; quote: string; prefix?: string; suffix?: string; startOffset?: number; endOffset?: number } | null>(null)
+  const [popover, setPopover] = useState<{ x: number; y: number; quote: string; copyText?: string; prefix?: string; suffix?: string; startOffset?: number; endOffset?: number } | null>(null)
   const [flashComment, setFlashComment] = useState<{ id: string; nonce: number } | null>(null)
   const [iframeScrollTarget, setIframeScrollTarget] = useState<{ id: string; nonce: number } | null>(null)
   const mdScrollerRef = useRef<HTMLDivElement>(null)
@@ -92,10 +84,16 @@ export default function RemoteArtifactDetailPage() {
   // view_url at the top level. Flatten so content_type (and title/owner/version)
   // resolve — otherwise isHtml is always false and the page renders raw source
   // instead of the iframe.
-  const meta = raw?.artifact ?? raw
-  const art: RemoteArtifactDetail | undefined = raw
-    ? { ...meta, content: raw.content ?? meta?.content, view_url: raw.view_url ?? meta?.view_url }
-    : undefined
+  // Memoized because this object is the dep of `onAddAnchored` (it reads
+  // `current_version` for the anchor) and, via `art?.content`, of the srcdoc
+  // memo: rebuilt every render it would rebuild both, and a new srcdoc string
+  // remounts the sandboxed iframe. React Query keeps `data` referentially stable
+  // between refetches that resolve deep-equal, so this changes only on real data.
+  const art: RemoteArtifactDetail | undefined = useMemo(() => {
+    if (!raw) return undefined
+    const meta = raw.artifact ?? raw
+    return { ...meta, content: raw.content ?? meta.content, view_url: raw.view_url ?? meta.view_url }
+  }, [raw])
   const comments = commentsQuery.data?.comments ?? []
   const remoteSyncError = commentsQuery.data?.remote_sync_error ?? null
 
@@ -121,9 +119,11 @@ export default function RemoteArtifactDetailPage() {
     setSidebarOpen(comments.length > 0)
   }, [externalId, comments.length])
 
-  // Writes go through useMutation (use-react-query guideline): errors aren't
-  // swallowed and cache invalidation is centralized. Status-change + delete on
-  // a shared artifact write straight through to the provider.
+  // Writes go through useMutation (use-react-query guideline): cache
+  // invalidation is centralized, and each mutation's `error` is rendered below
+  // (`commentWriteError`) so a refused post/reply/status change/delete is
+  // reported rather than just re-fetched. Status-change + delete on a shared
+  // artifact write straight through to the provider.
   const postMut = useMutation({
     mutationFn: (vars: { text: string; anchor?: object }) =>
       api.postRemoteArtifactComment(provider, externalId, vars),
@@ -142,6 +142,17 @@ export default function RemoteArtifactDetailPage() {
     mutationFn: (id: string) => api.deleteRemoteComment(provider, externalId, id),
     onSuccess: invalidateComments, onError: invalidateComments,
   })
+  // The most recent refused write. react-query clears a mutation's error on its
+  // next `mutate`, and Dismiss resets all four, so a stale failure cannot linger
+  // past the user's next attempt.
+  const commentWriteError = postMut.error?.message
+    ?? replyMut.error?.message
+    ?? markReviewMut.error?.message
+    ?? deleteMut.error?.message
+    ?? null
+  const dismissCommentWriteError = useCallback(() => {
+    postMut.reset(); replyMut.reset(); markReviewMut.reset(); deleteMut.reset()
+  }, [postMut, replyMut, markReviewMut, deleteMut])
   const onAdd = useCallback((text: string) => { postMut.mutate({ text }) }, [postMut])
   const onReply = useCallback((parentId: string, text: string) => { replyMut.mutate({ parentId, text }) }, [replyMut])
   const onMarkReview = useCallback((id: string) => { markReviewMut.mutate(id) }, [markReviewMut])
@@ -204,14 +215,16 @@ export default function RemoteArtifactDetailPage() {
     () => (isHtml && art?.content ? buildSrcdoc({ html: art.content, themeVars, mode: theme, enableComments: true }) : null),
     [isHtml, art?.content, themeVars, theme],
   )
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
-  useEffect(() => {
-    if (!srcdoc) { setBlobUrl(null); return }
-    const blob = new Blob([srcdoc], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    setBlobUrl(url)
-    return () => URL.revokeObjectURL(url)
-  }, [srcdoc])
+  // A gateway-served document, not a `blob:` URL — the same reason the artifact
+  // and widget frames moved: some WebKit-based in-app browsers refuse a blob
+  // load outright and can take the whole page down with it.
+  const { url: blobUrl, failed, pending, retry } = useSandboxDoc(srcdoc)
+  // A mint can succeed while the frame never fires `load` — a visible-but-blank
+  // frame here, since this surface has no opacity gate. `silent` overlays the
+  // same notice + retry the mint-`failed` branch uses so the blank is explained
+  // and recoverable. Same watch ArtifactBody / WidgetFrame use; keep the four
+  // in step.
+  const { silent: loadSilent, onLoaded: onFrameLoaded } = useSilentLoadWatch(blobUrl)
 
   // Anchored-comment highlights for the remote markdown body use the SAME
   // DOM-rect overlay as the local artifact page (InlineCommentOverlay), so
@@ -254,26 +267,44 @@ export default function RemoteArtifactDetailPage() {
     const rect = range.getBoundingClientRect()
     const startOffset = idx
     const endOffset = idx + quote.length
-    setPopover({ x: rect.left, y: rect.bottom, quote, prefix, suffix, startOffset, endOffset })
+    setPopover({ x: rect.left, y: rect.bottom, quote, copyText: raw, prefix, suffix, startOffset, endOffset })
   }, [isMarkdown])
 
   if (detailQuery.isLoading) return <div className="p-6 text-muted">{i18nT('pages.remoteArtifactDetailPage.loading')}</div>
-  if (detailQuery.error || !art) {
+  if (detailQuery.isError || !art) {
+    const failed = detailQuery.isError
     const msg = detailQuery.error instanceof Error ? detailQuery.error.message : i18nT('pages.remoteArtifactDetailPage.failed_to_load_remote_artifact')
     return (
       <>
-        <PageHeader title={i18nT('pages.remoteArtifactDetailPage.remote_artifact')} subtitle={externalId} />
-        <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-          <Card>
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="lucide-inline text-danger" />
-              <div>
-                <div className="text-sm text-danger font-medium">{i18nT('pages.remoteArtifactDetailPage.failed_to_load_remote_artifact')}</div>
-                <div className="text-[13px] text-muted mt-1">{msg}</div>
-              </div>
-            </div>
-            <div className="mt-3"><Btn onClick={() => navigate('/artifacts')}>{i18nT('pages.remoteArtifactDetailPage.back_to_library')}</Btn></div>
-          </Card>
+        <div className="sticky top-0 z-10 bg-bg border-b border-border">
+          <PageHeader title={i18nT('pages.remoteArtifactDetailPage.remote_artifact')} subtitle={externalId} />
+          <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
+            <Btn onClick={() => navigate('/artifacts')} className="flex items-center gap-1">
+              <ArrowLeft size={13} /> {i18nT('pages.remoteArtifactDetailPage.back')}
+            </Btn>
+          </div>
+        </div>
+        <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+          {failed ? (
+            <Card>
+              {/* askAgent on: the detail read rejected, so nothing else rendered —
+                  no comment draft exists on this branch to lose. */}
+              <ErrorNotice
+                title={i18nT('pages.remoteArtifactDetailPage.failed_to_load_remote_artifact')}
+                message={msg}
+                askAgent
+                testId="remote-artifact-detail-error"
+              />
+              <div className="mt-3"><Btn onClick={() => navigate('/artifacts')}>{i18nT('pages.remoteArtifactDetailPage.back_to_library')}</Btn></div>
+            </Card>
+          ) : (
+            // The provider answered but had no artifact under this id: an empty
+            // state, not a failure — the same plain note the local detail page uses.
+            <Card>
+              <div className="text-sm text-muted">{i18nT('pages.artifactDetailPage.not_found')}</div>
+              <div className="mt-3"><Btn onClick={() => navigate('/artifacts')}>{i18nT('pages.remoteArtifactDetailPage.back_to_library')}</Btn></div>
+            </Card>
+          )}
         </div>
       </>
     )
@@ -288,9 +319,9 @@ export default function RemoteArtifactDetailPage() {
 
   return (
     <>
-      <PageHeader title={title} subtitle={i18nT('pages.remoteArtifactDetailPage.remote_artifact_2', { provider })} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        <div className="flex flex-wrap items-center gap-2 mb-4">
+      <div className="sticky top-0 z-10 bg-bg border-b border-border">
+        <PageHeader title={title} subtitle={i18nT('pages.remoteArtifactDetailPage.remote_artifact_2', { provider })} />
+        <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           <Btn onClick={() => navigate('/artifacts')} className="flex items-center gap-1">
             <ArrowLeft size={13} /> {i18nT('pages.remoteArtifactDetailPage.back')}
           </Btn>
@@ -335,30 +366,136 @@ export default function RemoteArtifactDetailPage() {
             </Btn>
           </span>
         </div>
+      </div>
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
 
         {art.summary && <div className="mb-3 text-sm text-muted italic">{art.summary}</div>}
         {forkError && (
-          <div className="mb-3 px-3 py-2 rounded-md border border-danger/40 bg-danger-subtle text-[13px] text-danger">{forkError}</div>
+          /* No hand-off: the comments sidebar's draft shares this page —
+             navigating away would discard an in-progress comment. */
+          <ErrorNotice message={forkError} className="mb-3" />
+        )}
+        {commentsQuery.isError && (
+          /* No hand-off: the comments sidebar's comment draft (and an open
+             anchored-comment popover) share this page — navigating away would
+             discard an in-progress comment. */
+          <ErrorNotice
+            message={commentsQuery.error?.message}
+            className="mb-3"
+            testId="remote-artifact-comments-error"
+          />
+        )}
+        {commentWriteError && (
+          /* No hand-off: the comments sidebar's comment draft is exactly what a
+             refused post/reply leaves behind — navigating away would discard it. */
+          <ErrorNotice
+            message={commentWriteError}
+            onDismiss={dismissCommentWriteError}
+            className="mb-3"
+            testId="remote-artifact-comment-write-error"
+          />
         )}
 
         <div className="flex gap-4 items-start">
           <div className="flex-1 min-w-0">
             {isHtml ? (
-              <div className="rounded-xl border border-border bg-card overflow-hidden" style={{ minHeight: 480 }}>
+              <div className="relative rounded-xl border border-border bg-card overflow-hidden" style={{ minHeight: 480 }}>
                 {blobUrl ? (
+                  /* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onLoad is a frame-load lifecycle handler (it clears the silent-load watch), not a user interaction; the frame's own content is what a keyboard reaches, and nothing here can be triggered from one */
                   <iframe
                     ref={iframeRef}
                     src={blobUrl}
+                    onLoad={onFrameLoaded}
                     sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+                    // NO clipboard-write delegation here, deliberately. These frames host
+                    // agent-generated HTML whose scripts run on load, so a delegated
+                    // permission would let one overwrite the user's clipboard with no Copy
+                    // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+                    // execCommand fallback that a real button press satisfies and a
+                    // gesture-less on-load script does not.
                     className="w-full border-none bg-card"
-                    style={{ height: 'calc(100vh - 240px)', minHeight: 480 }}
+                    style={{
+                      height: 'calc(100vh - 240px)',
+                      minHeight: 480,
+                      // See ArtifactBody's frame: a laid-out document whose first
+                      // paint is skipped shows an empty box, and promoting the
+                      // frame to its own compositing layer is the remedy that
+                      // needs no post-load timing. The remote detail frame was
+                      // left out when the local one was promoted.
+                      transform: 'translateZ(0)',
+                    }}
                     title={i18nT('pages.remoteArtifactDetailPage.remote_artifact_3', { name: externalId })}
                   />
+                ) : failed ? (
+                  <div className="p-6 flex items-center gap-3 text-text">
+                    <span>{i18nT('components.artifactBody.could_not_render')}</span>
+                    <Btn onClick={retry} disabled={pending} className="flex items-center gap-1">
+                      <RotateCw className="lucide-inline" />
+                      {i18nT('components.artifactBody.retry')}
+                    </Btn>
+                  </div>
                 ) : <div className="p-6 text-muted">{i18nT('pages.remoteArtifactDetailPage.rendering')}</div>}
+                {/* Recovery overlay for a frame that is STILL mounted (blobUrl
+                    present). Two states can strand a mounted frame with no
+                    in-flow recovery, because the ternary above picks <iframe>
+                    whenever blobUrl is set and so never reaches its own `failed`
+                    branch while a (possibly spent) url survives:
+                      - loadSilent: the mint succeeded but the frame never fired
+                        `load` -- a blank box. Cause-neutral copy + Eye/"Show
+                        artifact" (a frame that did not report is not a proven
+                        failure).
+                      - failed: a re-mint (e.g. taking "Show artifact") rejected
+                        while the previous url stayed in place (see useSandboxDoc),
+                        so blobUrl is still truthy and `failed` is now true. That
+                        is a known read failure -- could_not_render + RotateCw/
+                        "Retry". Without this the overlay's old `!failed` guard hid
+                        it AND the ternary kept showing the spent iframe, leaving
+                        no notice and no recovery at all.
+                    `failed` wins when both hold: a known failed mint is the more
+                    specific diagnosis. */}
+                {blobUrl && (failed || loadSilent) && (
+                  <div className="absolute top-0 left-0 right-0 z-10 p-6 flex flex-wrap items-center gap-3 text-text bg-bg-elevated/95 border-b border-border">
+                    {failed && !pending ? (
+                      // A rejected mint is a known read failure, rendered through
+                      // ErrorNotice per the errors-use-error-notice rule. The
+                      // RotateCw + "Retry" Btn below is the recovery.
+                      // No hand-off: the comments sidebar's draft (and an open
+                      // anchored-comment popover) share this page - the hand-off
+                      // navigates to the chat and unmounts the whole page, not
+                      // just this frame, so it would discard an in-progress
+                      // comment. The three sibling ErrorNotices on this page keep
+                      // the hand-off off for the same reason.
+                      <ErrorNotice
+                        variant="inline"
+                        testId="remote-artifact-silent-mint-error"
+                        className="min-w-0"
+                        message={i18nT('components.artifactBody.could_not_render')}
+                      />
+                    ) : (
+                      // Silent load (or a re-mint in flight): a frame that did
+                      // not report, NOT a proven failure, so cause-neutral copy
+                      // in a live region and an Eye action labeled by what it
+                      // does. An ErrorNotice here would assert a failure the
+                      // surface cannot verify.
+                      <span role="status" className="min-w-0">
+                        {i18nT(pending
+                          ? 'components.artifactBody.rendering'
+                          : 'components.artifactBody.no_longer_showing')}
+                      </span>
+                    )}
+                    <Btn onClick={retry} disabled={pending} className="flex items-center gap-1">
+                      {failed ? <RotateCw className="lucide-inline" /> : <Eye className="lucide-inline" />}
+                      {i18nT(failed
+                        ? 'components.artifactBody.retry'
+                        : 'components.artifactBody.show_artifact')}
+                    </Btn>
+                  </div>
+                )}
               </div>
             ) : (
               <div ref={mdScrollerRef} className="relative rounded-xl border border-border bg-card overflow-auto p-5" style={{ minHeight: 480, height: 'calc(100vh - 240px)' }}>
                 {isMarkdown
+                  // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- a passive drag-select probe over the rendered prose, not a control: onMouseUp only reads back a text selection so the popover can offer to comment on that quote, and there is no action to activate. Giving the wrapper a role and tabIndex would announce a phantom button around the whole document and put a focus stop in front of the text.
                   ? <div ref={mdPreviewRef} onMouseUp={handleMdMouseUp} className="msg-content text-sm leading-relaxed"><MarkdownRenderer content={art.content ?? ''} /></div>
                   : <pre className="text-[13px] text-text whitespace-pre-wrap break-words font-mono">{art.content ?? ''}</pre>}
                 {isMarkdown && comments.length > 0 && (
@@ -379,6 +516,7 @@ export default function RemoteArtifactDetailPage() {
                 y={popover.y}
                 onSubmit={onAddAnchored}
                 onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }}
+                copyText={popover.copyText ?? popover.quote}
               />
             )}
           </div>

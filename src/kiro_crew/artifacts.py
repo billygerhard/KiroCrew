@@ -21,8 +21,19 @@ Security
 - Slugs are validated against ``_SLUG_RE`` to block path-traversal attempts.
 - All filesystem writes go through ``Path.resolve()`` + a parent-directory
   check to prevent escapes.
-- ``security.is_sensitive_path()`` is queried before any read/write, so the
-  store cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc.
+- The sensitive-path fence is queried before any read/write, so the store
+  cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc. The store's own
+  file helpers hand it the ``realpath`` they already computed through
+  ``security.is_sensitive_canonical_path()`` (see ``_fence_refuses``), which
+  answers off the event loop without a resolver-pool submission and with the
+  bounded ``security.is_sensitive_path()`` on the loop; the root check and the
+  source-file pointers ask the bounded gate directly.
+- Store reads are pinned to the descriptor they open
+  (``pinned_fs.open_fenced_for_read`` via ``_open_pinned_for_read``): the open
+  refuses a link at the final name, the inode must be a regular file with one
+  link, and the fence judges the kernel's own path for that inode when it
+  differs from the path already judged, so a swap between the check and the
+  open cannot redirect the read.
 - Tool invocations emit SEL audit events via ``sel().log_tool_invocation()``.
 
 The MCP tools (``artifact_save`` etc.) and HTTP handlers wrap this module --
@@ -32,6 +43,7 @@ logic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -47,9 +59,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from typing import List as _List
 
-from kiro_crew import hooks
+from kiro_crew import hooks, pinned_fs
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
 from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API compatibility
     WebAppArchitecture,
     WebAppCost,
@@ -59,8 +72,10 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
     WebAppTeardown,
     webapp_metadata_from_dict,
 )
+from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
+from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +91,11 @@ MAX_VERSIONS = 50
 #: HTML reports, CSVs) routinely exceed 1 MiB — at 1 MiB clone/pull would
 #: silently fail on exactly the shared-HTML artifacts bidirectional sync
 #: targets. 25 MiB is large enough to bring those down locally while still
-#: refusing truly unbounded content. Keep in lockstep with
-#: ``validation.ARTIFACT_CONTENT_MAX`` (the MCP tool-arg cap) so a save's limit
-#: doesn't depend on its entry path — guarded by a regression test.
-MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+#: refusing truly unbounded content. Owned by
+#: ``constants.ARTIFACT_MAX_CONTENT_BYTES`` (a leaf) so
+#: ``validation.ARTIFACT_CONTENT_MAX`` -- the MCP tool-arg cap -- reads the same
+#: name without importing this module; re-exported here for the store's callers.
+MAX_CONTENT_BYTES = ARTIFACT_MAX_CONTENT_BYTES
 
 #: Maximum length of human-readable name / description fields.
 MAX_NAME_LEN = 200
@@ -157,14 +173,13 @@ MAX_EVENTS_PER_ARTIFACT = 500
 #: are dropped (a thread root + its replies together), never a reply orphaned.
 MAX_COMMENTS_PER_ARTIFACT = 500
 
-#: Maximum number of tags per artifact, and max length per tag.
+#: Maximum number of tags per artifact. Per-tag length is bounded by ``_TAG_RE``.
 MAX_TAGS = 16
-MAX_TAG_LEN = 64
 
 # Slug pattern: lowercase letters, digits, hyphens. 1-80 chars. No leading or
 # trailing hyphen. Single-character slugs are allowed for trivial names.
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
-_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
+_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.html$")
 _SLUG_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -191,6 +206,16 @@ class ArtifactAlreadyExistsError(ArtifactError):
 
 class ArtifactValidationError(ArtifactError):
     """Raised when a field fails validation (slug, tag, kind, content, etc.)."""
+
+
+class ArtifactStillPublishedError(ArtifactError):
+    """Raised by ``delete(refuse_if_published=True)`` when the artifact is published.
+
+    The artifact's publication record is the only handle able to withdraw a copy that
+    may still be served, so a caller destroying artifacts in bulk uses this to be told
+    "not this one" instead of silently erasing that handle. Distinct from the base
+    error so such a caller can separate "refused, and correctly" from a real failure.
+    """
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -251,11 +276,28 @@ class ArtifactPublication:
     collab_mode: str = "mirror"
     last_pushed_sha256: str = ""  # concurrency guard for the next version push
     last_synced_kirocrew_version: int = 0
+    #: Wrapper envelope revision at the time of the last push — compared against
+    #: ``publish_sync.WRAPPER_REVISION`` to detect wrapper-only staleness.
+    wrapper_revision: int = 0
     # Maps str(kirocrew_version) -> remote_version_number.
     version_map: dict[str, int] = field(default_factory=dict)
     published_at: str = ""
     published_by: str = ""  # gateway owner alias (ownerAlias from the remote store)
     last_error: str = ""  # conflict / sync-failure surfaced to the UI
+    #: A non-error status line for a publish that SUCCEEDED but whose link is
+    #: not usable yet (e.g. CloudFront still rolling out the first deploy). This
+    #: is NOT an error — it must never be written to ``last_error``, which every
+    #: consumer reads as failure (renders the publish red and withholds the URL).
+    notice: str = ""
+    #: Machine-readable discriminator for :attr:`notice`, so the frontend can
+    #: select per-case copy instead of printing one fixed "still rolling out"
+    #: string for every notice. Exactly one of ``"rolling_out"`` /
+    #: ``"distribution_disabled"`` / ``"unknown"``, or ``""`` when there is no
+    #: notice. Always moves with :attr:`notice`: it is set from the publish
+    #: result's ``notice_code`` and cleared wherever ``notice`` is cleared.
+    #: Additive + defaulted, so a legacy meta.json with no ``notice_code`` loads
+    #: as empty (no migration).
+    notice_code: str = ""
     #: sha256 of the LIVE (CRDT) remote body as of the last sync (publish / push
     #: / pull / clone / overwrite). A live CRDT provider canonicalizes markdown on write, so
     #: drift is detected remote-vs-remote against this hash — snapshot_seq bumps
@@ -303,6 +345,41 @@ class ArtifactComment:
     # Transient: set on inbound provider mirrors that came back as tombstones so
     # merge_remote_comments can drop the local copy. Never persisted.
     deleted: bool = False
+
+
+@dataclass
+class ImageMetadata:
+    """Sidecar description of a ``kind="image"`` artifact's raster bytes.
+
+    The bytes themselves live next to ``meta.json`` in
+    ``artifacts/<slug>/asset.<ext>`` — NOT in ``current.html``, which stays
+    empty for image kind. This record is the JSON-serializable metadata the
+    dashboard needs to render and lay out the image (natural dimensions for
+    aspect-ratio boxing, mime for the ``<img>`` type, size/hash for cache and
+    integrity) without having to fetch the bytes first.
+
+    Every field has a default so a partial or legacy ``image`` block in
+    meta.json is tolerant-loaded rather than raising — the same contract the
+    other nested metadata blocks (``publication`` / ``fork_metadata`` /
+    ``webapp_metadata``) follow.
+    """
+
+    #: Raster mime — one of the create-time allowlist (png/jpeg/webp/gif).
+    mime: str = ""
+    #: File extension used for the sidecar (``asset.<ext>``), derived from mime.
+    ext: str = ""
+    #: Byte length of the stored asset.
+    size_bytes: int = 0
+    #: Natural pixel dimensions, or ``None`` when the header sniff could not
+    #: determine them (a truncated/odd file is stored anyway, just unmeasured).
+    width: int | None = None
+    height: int | None = None
+    #: SHA-256 of the bytes — content-addressed cache key + integrity check.
+    sha256: str = ""
+    #: The uploaded/source filename, when known. Provenance only.
+    original_filename: str = ""
+    #: Alt text for accessibility, carried from the markdown ``![alt](...)``.
+    alt: str = ""
 
 
 @dataclass
@@ -430,15 +507,29 @@ class Artifact:
     #: the live read of it FAILED — the file was deleted or moved, is no longer
     #: readable, or resolves outside the roots that authorize it. The store
     #: falls back to the last snapshot in that case so the artifact stays
-    #: viewable, which used to make a dead pointer indistinguishable from a
-    #: healthy one (``live_dirty`` was computed against the fallback and so
-    #: read "in sync"). This field is the signal that the pointer is dead.
+    #: viewable, which on its own makes a dead pointer indistinguishable from a
+    #: healthy one (``live_dirty`` is computed against the fallback and so
+    #: reads "in sync"). This field is the signal that the pointer is dead.
     #: Not persisted; set by ``get()`` — same contract as ``live_dirty``.
     source_missing: bool = False
+    #: Set by ``create()`` when it had to suffix the slug derived from ``name``
+    #: because that slug was taken: names the plain slug that was already in
+    #: use, and is empty otherwise. Reported by the uniquifier rather than
+    #: inferred by a caller, because only the create knows a suffix happened —
+    #: ``update()`` renames without recomputing the slug, and a reused record
+    #: read from disk would compare as collided when nothing collided.
+    #: Not persisted; a create-time fact, meaningless on a later read.
+    slug_collided_with: str = ""
     #: Structured metadata for ``kind="webapp"`` artifacts — a deployed application
     #: (deploy target, architecture, lifecycle/TTL, cost estimate, teardown handle).
     #: ``None`` for every other kind. Tolerant-loaded from meta.json.
     webapp_metadata: "WebAppMetadata | None" = None
+    #: Structured metadata for ``kind="image"`` artifacts. ``None`` for every
+    #: other kind. The raster bytes live in the ``asset.<ext>`` sidecar (see
+    #: :class:`ImageMetadata`); this block is what the dashboard renders from.
+    #: Tolerant-loaded from meta.json (older/other-kind artifacts default to
+    #: ``None``).
+    image: "ImageMetadata | None" = None
 
     def to_dict(self, *, include_content: bool = False, persist: bool = False) -> dict[str, Any]:
         """Render as a JSON-friendly dict, optionally including the content blob.
@@ -451,6 +542,11 @@ class Artifact:
         d = asdict(self)
         if not include_content:
             d.pop("content", None)
+        # slug_collided_with is an internal create-time signal read off the
+        # attribute, never through this dict: a response that reports it composes
+        # the key itself, and serializing it here would leak it into every later
+        # GET as though the collision had just happened.
+        d.pop("slug_collided_with", None)
         if persist:
             # live_dirty is a transient, GET-time-computed
             # field. Persisting it via meta.json would create staleness
@@ -479,7 +575,8 @@ def _now_iso() -> str:
 def slugify(name: str) -> str:
     """Normalize a free-form name into a URL-safe slug.
 
-    Falls back to ``"artifact"`` if the input contains no slug-safe characters.
+    Falls back to ``artifact-<hash of the input>`` if the input contains no
+    slug-safe characters, so distinct non-ASCII names derive distinct slugs.
     Truncated to 80 characters.
     """
     if not isinstance(name, str):
@@ -491,8 +588,8 @@ def slugify(name: str) -> str:
     text = _SLUG_NORMALIZE_RE.sub("-", text)
     text = text.strip("-")
     if not text:
-        return "artifact"
-    return text[:80].rstrip("-") or "artifact"
+        return slug_hash_fallback(name, "artifact")
+    return text[:80].rstrip("-") or slug_hash_fallback(name, "artifact")
 
 
 def _validate_slug(slug: str) -> str:
@@ -609,6 +706,53 @@ def is_document_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in DOC_EXTENSIONS
 
 
+# Literal-color detector backing the theme-contrast warning. Lives here (the
+# store module) so every artifact-authoring surface computes the SAME verdict:
+# the gateway handlers stamp it on save/update responses, and the MCP tool
+# phrases its own hint from it. Hex colors are 3/4/6/8 digits -- 5 and 7 are
+# excluded on purpose so hex-ish CSS id selectors ("#added1") don't fire. The
+# leading [:=(\s"'] anchors the literal to a value position (color:#111,
+# fill="#111") rather than a fragment anchor or an id selector at line start.
+# IGNORECASE is what lets RGB(...) / HSL(...) match -- CSS functions are
+# case-insensitive. Fragment/URL hrefs (href="#abc") are excluded by
+# stripping href attributes BEFORE scanning (see _HREF_ATTR_RE) rather than
+# by a lookbehind: Python lookbehinds must be fixed-width, so a lookbehind
+# cannot tolerate `href = "#abc"` spacing -- the strip is whitespace-tolerant
+# and covers xlink:href and any case for free.
+# Accepted noise, documented rather than parsed away: a whitespace-preceded
+# hex-ish id selector ("... } #decade {") can still fire, but whitespace must
+# stay in the prefix class or true positives like "border: 1px solid #ccc"
+# are lost -- and every consumer surfaces this as a soft warning, never a
+# rejection.
+_HARDCODED_COLOR_RE = re.compile(
+    r"[:=(\s\"']#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\b" r"|\brgba?\(" r"|\bhsla?\(",
+    re.IGNORECASE,
+)
+
+# href / xlink:href attribute (quoted value), whitespace-tolerant around the
+# ``=``. An href value is a URL or fragment, never a rendered color, so it is
+# removed before the color scan to keep the warning's false-positive rate low.
+_HREF_ATTR_RE = re.compile(r"href\s*=\s*(\"[^\"]*\"|'[^']*')", re.IGNORECASE)
+
+
+def has_unthemed_hardcoded_colors(kind: str, content: str) -> bool:
+    """True when iframe-rendered content hardcodes its palette.
+
+    Only widget/html kinds render inside the dashboard's themed iframe, so
+    only they can clash with the injected theme defaults. Content carrying a
+    single ``var(--`` reference is treated as theme-aware -- including the
+    recommended fallback form ``color:var(--text,#111)`` -- and never flags.
+    A full foreground/background *pairing* check needs a CSS parser; this
+    zero-var heuristic catches the observed failure class (partially styled
+    content clashing with the injected theme) with one regex.
+    """
+    if kind not in ("widget", "html"):
+        return False
+    if not content or "var(--" in content:
+        return False
+    return bool(_HARDCODED_COLOR_RE.search(_HREF_ATTR_RE.sub("href=x", content)))
+
+
 def _infer_kind(content: str, source_path: str = "", explicit: str | None = None) -> str:
     """Infer an artifact ``kind`` when the caller didn't pin one.
 
@@ -715,7 +859,7 @@ def _strip_session_scope(key: str) -> str:
     """
     prefix = "dashboard:"
     if key.startswith(prefix):
-        return key[len(prefix):]
+        return key[len(prefix) :]
     from kiro_crew.history import _safe_key
     from kiro_crew.messaging.link import is_channel_session_key
 
@@ -793,12 +937,12 @@ def _validate_description(description: str | None) -> str:
 def _validate_source_path(value: str | None, field_name: str = "source_path") -> str:
     """Validate a filesystem-pointer field (``source_path`` / ``source_root``).
 
-    REJECTS an over-long value instead of truncating it. Truncation used to be
-    silent (``source_path[:512]``), which turned a too-long-but-valid path into
-    a shorter path that points somewhere else — practically always somewhere
-    that doesn't exist. The artifact then looked file-backed while its live read
-    could never succeed. Failing the save is the honest outcome: the caller
-    learns immediately instead of the user discovering a hollow artifact later.
+    REJECTS an over-long value instead of truncating it. Silent truncation
+    (``source_path[:512]``) turns a too-long-but-valid path into a shorter path
+    that points somewhere else — practically always somewhere that doesn't
+    exist. The artifact then looks file-backed while its live read can never
+    succeed. Failing the save is the honest outcome: the caller learns
+    immediately instead of the user discovering a hollow artifact later.
     """
     if value is None:
         return ""
@@ -821,19 +965,198 @@ def _validate_content(content: str) -> str:
     return content
 
 
+#: Raster image mime → sidecar file extension. This IS the create-time
+#: allowlist for image artifacts: a mime not present here is rejected. SVG is
+#: deliberately absent — it is markup (stored as ``kind="svg"`` text), not a
+#: raster asset, and serving attacker-authored SVG as an image is an XSS vector.
+_IMAGE_MIME_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+}
+
+
+def _sniff_image_dimensions(data: bytes, mime: str) -> tuple[int | None, int | None]:
+    """Best-effort natural (width, height) from a raster file header.
+
+    Pure stdlib, no decode, no third-party dependency (no Pillow): it reads only
+    the few header bytes each format puts its dimensions in. Any parse failure —
+    truncated file, unexpected layout, an exotic encoding — returns
+    ``(None, None)`` rather than raising, because an unmeasured image is still a
+    perfectly storable one; dimensions are a rendering nicety, not a gate.
+    """
+    try:
+        if mime == "image/png":
+            # 8-byte signature, then the IHDR chunk (len+type) at 8..16, with
+            # width/height as big-endian uint32 immediately after the type.
+            if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+                return (
+                    int.from_bytes(data[16:20], "big"),
+                    int.from_bytes(data[20:24], "big"),
+                )
+        elif mime == "image/gif":
+            # Logical-screen descriptor: width/height as little-endian uint16.
+            if len(data) >= 10 and data[:6] in (b"GIF87a", b"GIF89a"):
+                return (
+                    int.from_bytes(data[6:8], "little"),
+                    int.from_bytes(data[8:10], "little"),
+                )
+        elif mime == "image/jpeg":
+            return _sniff_jpeg_dimensions(data)
+        elif mime == "image/webp":
+            return _sniff_webp_dimensions(data)
+        elif mime == "image/bmp":
+            # BITMAPINFOHEADER: signed little-endian int32 width at 18 and
+            # height at 22. A negative height means a top-down bitmap, so take
+            # the magnitude rather than reporting a negative dimension.
+            if len(data) >= 26 and data[:2] == b"BM":
+                width = int.from_bytes(data[18:22], "little", signed=True)
+                height = int.from_bytes(data[22:26], "little", signed=True)
+                if width and height:
+                    return abs(width), abs(height)
+    except Exception:  # pragma: no cover — sniffing must never raise
+        return None, None
+    return None, None
+
+
+def _sniff_jpeg_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    """Walk JPEG marker segments to the frame header (SOFn) for dimensions."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None, None
+    i, n = 2, len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        # Padding fill bytes and standalone markers (SOI/EOI/RSTn/TEM) carry no
+        # length field — step over them without reading a segment length.
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2 : i + 4], "big")
+        # SOF0..SOF15 hold the frame dimensions; exclude the non-frame C-markers
+        # DHT (0xC4), JPG (0xC8) and DAC (0xCC).
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = int.from_bytes(data[i + 5 : i + 7], "big")
+            width = int.from_bytes(data[i + 7 : i + 9], "big")
+            return width, height
+        if seg_len < 2:
+            return None, None  # malformed length — stop rather than loop
+        i += 2 + seg_len
+    return None, None
+
+
+def _sniff_webp_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    """Dimensions for the three WebP chunk layouts (VP8 / VP8L / VP8X)."""
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None, None
+    chunk = data[12:16]
+    if chunk == b"VP8 ":
+        # Lossy: 3-byte start code 0x9d012a, then two little-endian 14-bit dims.
+        if data[23:26] == b"\x9d\x01\x2a":
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return width, height
+    elif chunk == b"VP8L":
+        # Lossless: 0x2f signature, then 14-bit (width-1) and (height-1) packed
+        # across the next four bytes.
+        if data[20] == 0x2F:
+            b0, b1, b2, b3 = data[21], data[22], data[23], data[24]
+            width = ((b1 & 0x3F) << 8 | b0) + 1
+            height = ((b3 & 0x0F) << 10 | b2 << 2 | (b1 & 0xC0) >> 6) + 1
+            return width, height
+    elif chunk == b"VP8X":
+        # Extended: 24-bit little-endian (canvas dim - 1) at bytes 24 and 27.
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return width, height
+    return None, None
+
+
 # ── Store ────────────────────────────────────────────────────────────────────
+
+
+#: One lock per resolved artifact root, shared across every ``ArtifactStore``
+#: instance pointed at that root -- not just the process-wide singleton
+#: (:func:`get_default_store`). A caller that constructs its own
+#: ``ArtifactStore()`` against the default root (as opposed to threading the
+#: singleton through) would otherwise get its own private
+#: ``threading.Lock()``, unserialized against every other instance on the
+#: same root: two writers (or a writer and a reader) could interleave their
+#: file operations, corrupting a version or serving a stale read. Keyed by
+#: the resolved root path so distinct roots (tests' isolated tmp_path stores)
+#: still get independent locks.
+_root_locks: dict[str, threading.Lock] = {}
+_root_locks_guard = threading.Lock()
+
+
+def _lock_for_root(root: Path) -> threading.Lock:
+    key = str(root)
+    with _root_locks_guard:
+        lock = _root_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _root_locks[key] = lock
+        return lock
+
+
+def _fence_refuses(resolved: Path) -> bool:
+    """Ask the sensitive-path fence about a path the store already canonicalised.
+
+    *resolved* MUST be the output of ``os.path.realpath`` computed by the caller
+    on the line above, in the same function: that is the precondition of
+    ``security.is_sensitive_canonical_path`` (see its docstring), and the
+    store's file helpers are pinned to it by ``test_artifacts_pathres.py``.
+
+    Which gate answers is the shared entry point's decision, by thread: off the
+    event loop -- a ``run_in_executor`` / ``to_thread`` worker, or a plain
+    synchronous caller -- the pre-resolved gate answers with no ``mc-pathres``
+    submission. ``list()`` reaches this once per ``meta.json``, and the bounded
+    gate costs two pool hops per call, so a listing over a few hundred
+    artifacts would fill the two-worker pool with resolutions of paths this
+    store has already canonicalised; the fail-closed stall then reads as a
+    sensitive-path refusal and drops healthy artifacts from the listing. On the
+    loop the bounded gate stays in place, so an on-loop store call behaves as
+    it always has, and a caller earns the off-pool gate by offloading, never by
+    declaring anything.
+    """
+    return is_sensitive_canonical_path(str(resolved))
+
+
+def _open_pinned_for_read(resolved: Path) -> int:
+    """Open a store file for reading, pinned to the descriptor it returns.
+
+    *resolved* is a path the caller has already canonicalised and judged with
+    :func:`_fence_refuses`. :func:`pinned_fs.open_fenced_for_read` refuses a
+    link at the final component, requires a regular file with a single link,
+    and asks :func:`_fence_refuses` about the kernel's own path for the opened
+    inode exactly when that path differs from the judged one. Refusals raise
+    :class:`ArtifactError`; a missing file raises ``FileNotFoundError``.
+    """
+    return pinned_fs.open_fenced_for_read(
+        resolved,
+        fence=lambda fd_real: _fence_refuses(Path(fd_real)),
+        refusal=ArtifactError,
+    )
 
 
 class ArtifactStore:
     """File-system backed store for artifacts.
 
-    Thread-safe via a coarse-grained lock; concurrent writes to the same
-    artifact are serialized.
+    Thread-safe via a coarse-grained lock, shared across every instance
+    pointed at the same root (see :func:`_lock_for_root`) -- concurrent
+    writes to the same artifact are serialized regardless of how many
+    ``ArtifactStore`` objects address it.
     """
 
     def __init__(self, root: Path | None = None) -> None:
         self._root = (root or (config_dir() / "artifacts")).expanduser()
-        self._lock = threading.Lock()
         # Optional change-listener fired after a content-affecting mutation
         # (create / content-update / delete). Lets the gateway observe every
         # write path — agent (MCP-proxied), dashboard, bookmark, CLI, and the
@@ -846,6 +1169,9 @@ class ArtifactStore:
         resolved = self._root.resolve(strict=False)
         if is_sensitive_path(str(resolved)):
             raise ArtifactError(f"refusing to use sensitive path as artifact root: {resolved}")
+        # Keyed by the RESOLVED root so a symlinked alias of the same
+        # directory still shares the lock, not just a literal path match.
+        self._lock = _lock_for_root(resolved)
         self._root.mkdir(parents=True, exist_ok=True)
 
     # ── public API ────────────────────────────────────────────────────────
@@ -947,8 +1273,12 @@ class ArtifactStore:
 
         with self._lock:
             if slug is None:
-                slug = self._unique_slug(slugify(name))
+                derived = slugify(name)
+                slug = self._unique_slug(derived)
+                # The uniquifier is the only place that knows it suffixed.
+                collided_with = derived if slug != derived else ""
             else:
+                collided_with = ""
                 slug = _validate_slug(slug)
                 if self._artifact_dir(slug).exists():
                     raise ArtifactAlreadyExistsError(f"artifact already exists: {slug}")
@@ -974,6 +1304,7 @@ class ArtifactStore:
                 auto_registered=bool(auto_registered),
                 version_kinds={"1": kind},
                 webapp_metadata=webapp_metadata,
+                slug_collided_with=collided_with,
             )
             # Lifecycle: emit `created` event. New artifacts are tagged
             # `events_backfilled=True` because their history starts here —
@@ -988,7 +1319,179 @@ class ArtifactStore:
             self._write_artifact(art, content)
             logger.info("artifact created: slug=%s name=%s kind=%s", slug, name, kind)
         self._fire_change("upsert", slug)
+        # After the write, so a failed create contributes nothing. ``kind`` and
+        # ``source`` are the values ``_validate_kind`` / ``_validate_source``
+        # already restrict to closed sets, and ``kind_auto`` says whether the
+        # kind was inferred rather than pinned by the caller.
+        emit_counter(
+            ARTIFACTS_CREATED,
+            {"kind": kind, "source": source, "kind_auto": bool(kind_auto)},
+        )
         return art
+
+    def create_image(
+        self,
+        *,
+        name: str,
+        image_bytes: bytes,
+        mime: str,
+        slug: str | None = None,
+        source: str = "chat",
+        session_key: str = "",
+        auto_registered: bool = False,
+        alt: str = "",
+        original_filename: str = "",
+        description: str = "",
+        tags: list[str] | None = None,
+        folder_id: str = "",
+    ) -> Artifact:
+        """Persist a raster image as a first-class ``kind="image"`` artifact.
+
+        The bytes are stored in an ``asset.<ext>`` sidecar next to ``meta.json``;
+        ``current.html`` stays empty (image artifacts carry no text body). This
+        keeps the text store untouched — the same three-file directory shape,
+        the same slug/version/event machinery — with the bytes riding alongside
+        as an extra file that :meth:`delete`'s whole-directory ``_rmtree`` cleans
+        up for free.
+
+        ``mime`` must be one of the raster allowlist (:data:`_IMAGE_MIME_EXT`:
+        png / jpeg / webp / gif). SVG is intentionally rejected — it is markup,
+        belongs to ``kind="svg"``, and serving attacker-authored SVG as an image
+        is an XSS vector. ``image_bytes`` must be non-empty and within
+        :data:`MAX_CONTENT_BYTES`. The SHA-256 and (best-effort) pixel
+        dimensions are recorded in :class:`ImageMetadata`.
+
+        ``auto_registered=True`` marks the record machine-created (from a
+        chat-emitted ``![](...)``), making it sweepable by
+        :meth:`prune_auto_widgets` while unpinned — the same lifecycle as
+        auto-registered widgets. Only :mod:`kiro_crew.image_artifacts` sets it.
+        """
+        if not isinstance(image_bytes, (bytes, bytearray)):
+            raise ArtifactValidationError(
+                f"image_bytes must be bytes, got {type(image_bytes).__name__}"
+            )
+        data = bytes(image_bytes)
+        norm_mime = (mime or "").strip().lower()
+        if norm_mime not in _IMAGE_MIME_EXT:
+            raise ArtifactValidationError(
+                f"unsupported image mime {mime!r}: must be one of {sorted(_IMAGE_MIME_EXT)}"
+            )
+        if not data:
+            raise ArtifactValidationError("image bytes are empty")
+        if len(data) > MAX_CONTENT_BYTES:
+            raise ArtifactValidationError(f"image exceeds {MAX_CONTENT_BYTES} bytes ({len(data)})")
+        name = _validate_name(name)
+        source = _validate_source(source)
+        description = _validate_description(description)
+        tags_list = _validate_tags(tags)
+        ext = _IMAGE_MIME_EXT[norm_mime]
+        width, height = _sniff_image_dimensions(data, norm_mime)
+        image_meta = ImageMetadata(
+            mime=norm_mime,
+            ext=ext,
+            size_bytes=len(data),
+            width=width,
+            height=height,
+            sha256=hashlib.sha256(data).hexdigest(),
+            original_filename=str(original_filename or "")[:MAX_NAME_LEN],
+            alt=str(alt or "")[:MAX_DESCRIPTION_LEN],
+        )
+
+        with self._lock:
+            if slug is None:
+                derived = slugify(name)
+                slug = self._unique_slug(derived)
+                # The uniquifier is the only place that knows it suffixed.
+                collided_with = derived if slug != derived else ""
+            else:
+                collided_with = ""
+                slug = _validate_slug(slug)
+                if self._artifact_dir(slug).exists():
+                    raise ArtifactAlreadyExistsError(f"artifact already exists: {slug}")
+
+            now = _now_iso()
+            art = Artifact(
+                slug=slug,
+                name=name,
+                kind="image",
+                source=source,
+                description=description,
+                tags=tags_list,
+                version=1,
+                created_at=now,
+                updated_at=now,
+                content="",  # image body lives in the asset sidecar, not here
+                folder_id=folder_id or "",
+                session_key=session_key[:256] if session_key else "",
+                auto_registered=bool(auto_registered),
+                version_kinds={"1": "image"},
+                image=image_meta,
+                slug_collided_with=collided_with,
+            )
+            self._append_event(
+                art,
+                type="created",
+                by=source if source != "chat" else "agent",
+                version=1,
+            )
+            art.events_backfilled = True
+            try:
+                self._write_image_artifact(art, data)
+            except Exception:
+                # A half-written directory still reserves the slug, and the slug
+                # is deterministic — so every retry would raise
+                # ArtifactAlreadyExistsError and the image would be lost for
+                # good. Roll the reservation back, then let the caller see the
+                # real failure.
+                try:
+                    self._rmtree(self._artifact_dir(slug))
+                except Exception:  # pragma: no cover — cleanup is best-effort
+                    logger.warning("could not clean up partial image artifact %s", slug)
+                raise
+            logger.info(
+                "image artifact created: slug=%s name=%s mime=%s bytes=%d",
+                slug,
+                name,
+                norm_mime,
+                len(data),
+            )
+        self._fire_change("upsert", slug)
+        return art
+
+    def read_image_bytes(self, slug: str) -> tuple[bytes, str]:
+        """Return ``(bytes, mime)`` for an image artifact's stored asset.
+
+        Raises :class:`ArtifactNotFoundError` when the slug does not resolve,
+        is not an image artifact, or its asset sidecar is missing. The read is
+        routed through the gated :meth:`_read_bytes` so the sensitive-path
+        denylist fires here as on every other store read.
+        """
+        slug = _validate_slug(slug)
+        with self._lock:
+            meta = self._load_meta(slug)
+            if meta.kind != "image" or meta.image is None:
+                raise ArtifactNotFoundError(f"artifact {slug!r} has no image asset")
+            # Re-validate on READ, and derive the extension from the allowlist
+            # rather than trusting the stored ``ext``. ``create_image`` already
+            # checks the mime, but meta.json is a file: anything that can write
+            # it (a prompt-injected agent, a hand edit, a restored backup) could
+            # otherwise name ``text/html`` here and have the asset endpoint
+            # serve same-origin HTML from an authenticated URL.
+            norm_mime = (meta.image.mime or "").strip().lower()
+            ext = _IMAGE_MIME_EXT.get(norm_mime, "")
+            if not ext:
+                raise ArtifactNotFoundError(
+                    f"image asset for {slug!r} has an unsupported mime {meta.image.mime!r}"
+                )
+            asset = self._artifact_dir(slug) / f"asset.{ext}"
+            if not asset.exists():
+                raise ArtifactNotFoundError(f"image asset missing for {slug!r}")
+            mime = norm_mime
+        # Read OUTSIDE the lock: an asset can be tens of MiB, and holding the
+        # store-wide lock across it would block every concurrent artifact
+        # operation for the duration of the read. The path was resolved under
+        # the lock and an image artifact's bytes are never rewritten in place.
+        return self._read_image_asset_bytes(asset), mime
 
     def get(self, slug: str, *, version: int | None = None) -> Artifact:
         """Return an artifact (with content) by slug, optionally a specific version.
@@ -1046,8 +1549,8 @@ class ArtifactStore:
                 else:
                     # Fall through to the snapshot fallback — file moved /
                     # deleted / unreadable / outside the authorized root. Flag
-                    # it: the fallback keeps the artifact viewable, which
-                    # previously made a dead pointer look completely healthy.
+                    # it: the fallback keeps the artifact viewable, which on its
+                    # own makes a dead pointer look completely healthy.
                     meta.source_missing = True
                     meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
             else:
@@ -1179,12 +1682,11 @@ class ArtifactStore:
                 return None
             # Bound the read at the FILE level, not after-the-fact: read
             # MAX_CONTENT_BYTES+1 bytes from disk, decode (errors='replace'
-            # for invalid sequences). Previously called
-            # p.read_text() which loads the entire file into memory before
-            # the size check — a multi-GB file pointed to by source_path
-            # would exhaust memory before truncation triggered. Bounding
-            # the read caps memory at MAX_CONTENT_BYTES+1 regardless of
-            # file size.
+            # for invalid sequences). p.read_text() would load the entire
+            # file into memory before the size check — a multi-GB file
+            # pointed to by source_path would exhaust memory before
+            # truncation triggered. Bounding the read caps memory at
+            # MAX_CONTENT_BYTES+1 regardless of file size.
             # Read through the descriptor-pinned helper rather than by name.
             # The containment check above is on a RESOLVED path, which still
             # leaves a check-to-use window: the final component, or an ancestor
@@ -1262,9 +1764,7 @@ class ArtifactStore:
             # worse than reading through one, so the same fd-pinned gate the
             # read side uses applies here: O_NOFOLLOW open first, then hardlink
             # / regular-file / real-path / sensitive checks on that descriptor.
-            if not hooks.safe_write_file_nolink(
-                str(p), content, within_root=str(containing)
-            ):
+            if not hooks.safe_write_file_nolink(str(p), content, within_root=str(containing)):
                 logger.warning(
                     "source_path %r refused by the descriptor-pinned write gate", source_path
                 )
@@ -1460,11 +1960,12 @@ class ArtifactStore:
                     # Lifecycle event. Caller-specified event_type wins
                     # (revert flow uses 'reverted'); otherwise actor-based
                     # default: agent → iterated, user → edited.
-                    resolved_event_type = (
-                        event_type
-                        if event_type is not None
-                        else ("iterated" if actor == "agent" else "edited")
-                    )
+                    if event_type is not None:
+                        resolved_event_type = event_type
+                    elif actor == "agent":
+                        resolved_event_type = "iterated"
+                    else:
+                        resolved_event_type = "edited"
                     self._append_event(
                         art,
                         type=resolved_event_type,
@@ -1641,12 +2142,9 @@ class ArtifactStore:
         candidates = [art for art in self.list() if self._is_sweepable_auto_widget(art)]
         if len(candidates) <= keep:
             return 0
-        # ``list()`` sorts by ``updated_at`` alone, which is not a total order:
-        # two widgets registered in the same microsecond tie-break by directory
-        # scan order, making WHICH of them gets deleted nondeterministic. Re-sort
-        # on ``(updated_at, slug)`` so the kept/dropped boundary is stable and
-        # testable. Kept local to the sweep — ``list()``'s ordering is shared with
-        # the library UI and is not this change's to redefine.
+        # ``list()`` already sorts on ``(updated_at, slug)``, so the kept/dropped
+        # boundary is stable. Re-sorting here is belt-and-braces: this sweep DELETES,
+        # so it must not inherit an ordering assumption from a caller-supplied list.
         candidates.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         # Newest-first, so everything past `keep` is the oldest tail.
         deleted = 0
@@ -1785,13 +2283,42 @@ class ArtifactStore:
         art.updated_at = _now_iso()
         self._write_meta(art)
 
-    def delete(self, slug: str) -> None:
-        """Permanently delete an artifact and all of its versions."""
+    def delete(self, slug: str, *, refuse_if_published: bool = False) -> None:
+        """Permanently delete an artifact and all of its versions.
+
+        ``refuse_if_published`` raises :class:`ArtifactStillPublishedError` instead of
+        deleting when the artifact holds a publication record. It defaults to False to
+        keep callers that never publish unchanged, but BOTH delete paths that can reach a
+        published artifact now pass it.
+
+        The flag only means anything to a caller that has already cleared the record for
+        the copy it withdrew. Once that is done, a record found here can only be a
+        publication that landed AFTER the withdrawal, so refusing protects a live copy
+        instead of rejecting an ordinary delete. Both callers are built that way: the
+        folder cascade clears per artifact in its withdrawal pass, and the single-artifact
+        handler clears immediately after its withdrawal is confirmed. A caller that
+        withdrew but did NOT clear would be refused on every published artifact, which is
+        why the flag is off by default rather than always on.
+
+        The check runs inside the same lock as the removal, so unlike a pre-pass it
+        cannot be overtaken by a publish landing after the decision and before the
+        delete -- which is the whole reason the flag is here rather than at the caller.
+        """
         slug = _validate_slug(slug)
         with self._lock:
             adir = self._artifact_dir(slug)
             if not adir.exists():
                 raise ArtifactNotFoundError(f"artifact not found: {slug}")
+            if refuse_if_published:
+                # Deliberately re-read under the lock rather than trusting anything the
+                # caller passed in. `_load_meta` does not take this lock (meta reads are
+                # unlocked by design), so this cannot deadlock.
+                if self._load_meta(slug).publication is not None:
+                    raise ArtifactStillPublishedError(
+                        f"artifact {slug} is still published; withdraw the published "
+                        "copy before deleting it, or its record -- the only handle able "
+                        "to take that copy down -- is lost with it"
+                    )
             self._rmtree(adir)
             logger.info("artifact deleted: slug=%s", slug)
         self._fire_change("delete", slug)
@@ -1908,7 +2435,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ) as exc:
@@ -1947,7 +2473,14 @@ class ArtifactStore:
             if pinned is not None and bool(art.pinned) is not pinned:
                 continue
             results.append(art)
-        results.sort(key=lambda a: a.updated_at, reverse=True)
+        # ``updated_at`` alone is not a total order: it is microsecond ISO, so two
+        # artifacts written inside one microsecond carry the identical stamp, and a
+        # stable sort then leaves the tie to directory scan order -- "newest first"
+        # becomes whatever the filesystem enumerated first, which differs per
+        # platform. Windows CI failed ``test_artifacts_handlers`` on exactly that.
+        # ``slug`` makes the order total, and every caller (the library UI, the MCP
+        # list tool, the pruning sweep) gets the same answer on every host.
+        results.sort(key=lambda a: (a.updated_at, a.slug), reverse=True)
         return results
 
     def migrate_kinds(self, *, apply: bool = False) -> _List[dict[str, Any]]:
@@ -1979,7 +2512,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ) as exc:
@@ -2064,7 +2596,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -2120,7 +2651,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -2165,7 +2695,6 @@ class ArtifactStore:
             except (
                 ArtifactError,
                 OSError,
-                json.JSONDecodeError,
                 ValueError,
                 TypeError,
             ):
@@ -2718,13 +3247,33 @@ class ArtifactStore:
         self._snapshot_version(art.slug, art.version, adir / "current.html")
         self._write_meta(art)
 
+    def _write_image_artifact(self, art: Artifact, data: bytes) -> None:
+        """Write an image artifact: empty text body + the raster asset sidecar.
+
+        Mirrors :meth:`_write_artifact` so image records share the exact same
+        directory shape (``current.html`` + ``versions/`` + ``meta.json``) and
+        every text-store helper — ``get``, version snapshotting, ``_rmtree``
+        delete — works on them unchanged. ``current.html`` is written empty per
+        the image-kind contract; the bytes go to ``asset.<ext>`` through the
+        gated byte writer.
+        """
+        adir = self._artifact_dir(art.slug)
+        adir.mkdir(parents=True, exist_ok=True)
+        (adir / "versions").mkdir(parents=True, exist_ok=True)
+        self._write_text(adir / "current.html", art.content or "")
+        self._snapshot_version(art.slug, art.version, adir / "current.html")
+        assert art.image is not None  # set by create_image before this is called
+        self._write_bytes(adir / f"asset.{art.image.ext}", data)
+        self._write_meta(art)
+
     def _snapshot_version(self, slug: str, version: int, src: Path) -> None:
         target = self._artifact_dir(slug) / "versions" / f"v{version}.html"
         # Defense in depth: route the read through the gated helper so the
-        # is_sensitive_path() check fires on every filesystem read, even when
+        # sensitive-path check fires on every filesystem read, even when
         # ``src`` is a store-internal path constructed by the store itself.
-        # Per the security-controls rule: all file reads must go through
-        # hooks.py which enforces is_sensitive_path().
+        # Per security rule 1: a read either goes through hooks.py or, as
+        # here, asks ``is_sensitive_canonical_path`` on the canonicalised
+        # path and opens through ``pinned_fs.open_fenced_for_read``.
         self._write_text(target, self._read_text(src))
 
     def _write_meta(self, art: Artifact) -> None:
@@ -2855,6 +3404,7 @@ class ArtifactStore:
         # unpublished rather than raising).
         publication = self._parse_publication(raw.get("publication"))
         fork_metadata = self._parse_fork_metadata(raw.get("fork_metadata"))
+        image = self._parse_image_metadata(raw.get("image"))
         # Per-version render kinds (tolerant: keys + values must be str).
         raw_vk = raw.get("version_kinds") or {}
         version_kinds: dict[str, str] = {}
@@ -2889,6 +3439,41 @@ class ArtifactStore:
             fork_metadata=fork_metadata,
             version_kinds=version_kinds,
             webapp_metadata=webapp_metadata_from_dict(raw.get("webapp_metadata")),
+            image=image,
+        )
+
+    @staticmethod
+    def _parse_image_metadata(raw_img: Any) -> "ImageMetadata | None":
+        """Build an :class:`ImageMetadata` from a meta.json sub-object.
+
+        Returns ``None`` when the block is absent or not a dict (every non-image
+        artifact). Tolerant per field: a wrong-typed value falls back to the
+        dataclass default rather than raising, so a partially-written or
+        forward/backward-skewed block still loads. ``width``/``height`` stay
+        ``None`` unless present as ints — the sniff genuinely could not measure
+        the image, and ``0`` would be a lie the frontend would box to.
+        """
+        if not isinstance(raw_img, dict):
+            return None
+
+        def _int_or_none(v: Any) -> int | None:
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+        def _int(v: Any) -> int:
+            return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+        def _str(v: Any) -> str:
+            return v if isinstance(v, str) else ""
+
+        return ImageMetadata(
+            mime=_str(raw_img.get("mime")),
+            ext=_str(raw_img.get("ext")),
+            size_bytes=_int(raw_img.get("size_bytes")),
+            width=_int_or_none(raw_img.get("width")),
+            height=_int_or_none(raw_img.get("height")),
+            sha256=_str(raw_img.get("sha256")),
+            original_filename=_str(raw_img.get("original_filename")),
+            alt=_str(raw_img.get("alt")),
         )
 
     @staticmethod
@@ -2926,6 +3511,10 @@ class ArtifactStore:
             last_synced = int(raw_pub.get("last_synced_kirocrew_version", 0) or 0)
         except (TypeError, ValueError):
             last_synced = 0
+        try:
+            wrapper_rev = int(raw_pub.get("wrapper_revision", 0) or 0)
+        except (TypeError, ValueError):
+            wrapper_rev = 0
         return ArtifactPublication(
             artifact_id=str(artifact_id),
             view_url=str(raw_pub.get("view_url") or ""),
@@ -2936,10 +3525,13 @@ class ArtifactStore:
             collab_mode=("live" if raw_pub.get("collab_mode") == "live" else "mirror"),
             last_pushed_sha256=str(raw_pub.get("last_pushed_sha256") or ""),
             last_synced_kirocrew_version=last_synced,
+            wrapper_revision=wrapper_rev,
             version_map=version_map,
             published_at=str(raw_pub.get("published_at") or ""),
             published_by=str(raw_pub.get("published_by") or ""),
             last_error=str(raw_pub.get("last_error") or ""),
+            notice=str(raw_pub.get("notice") or ""),
+            notice_code=str(raw_pub.get("notice_code") or ""),
             last_synced_remote_hash=str(raw_pub.get("last_synced_remote_hash") or ""),
         )
 
@@ -2969,19 +3561,94 @@ class ArtifactStore:
         )
 
     def _read_text(self, path: Path) -> str:
+        """Read a store-internal text file through a pinned descriptor.
+
+        The fence is asked with the ``realpath`` computed on the line above (see
+        :func:`_fence_refuses` for which gate answers, and why). The opened
+        descriptor is checked again so a replacement at the final name cannot
+        redirect the read after that first decision.
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to read sensitive path: {resolved}")
-        return resolved.read_text(encoding="utf-8")
+        fd = _open_pinned_for_read(resolved)
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            return fh.read()
 
     def _write_text(self, path: Path, text: str) -> None:
+        """Atomically write a store-internal file through the sensitive-path fence.
+
+        Same fence and same precondition as :meth:`_read_text`. This is the
+        read+write fence (``_SENSITIVE_HOME_DIRS`` plus the keystone publish
+        artifacts): the write-only superset ``is_sensitive_write_path`` guards the
+        agent's file-edit tool, has no pre-resolved form, and adopting it here
+        would change the decision rather than the submission path.
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to write sensitive path: {resolved}")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: tmp file + rename.
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")
+        tmp.replace(resolved)
+
+    def _read_bytes(self, path: Path) -> bytes:
+        """Binary sibling of :meth:`_read_text` (image asset reads).
+
+        Same sensitive-path gate and the same descriptor checks as text reads.
+        """
+        resolved = Path(os.path.realpath(path))
+        if _fence_refuses(resolved):
+            raise ArtifactError(f"refusing to read sensitive path: {resolved}")
+        fd = _open_pinned_for_read(resolved)
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
+
+    def _read_image_asset_bytes(self, path: Path) -> bytes:
+        """Read an image sidecar with the open descriptor as the unit of trust.
+
+        :meth:`_read_bytes` resolves the path, checks it, then opens it by name —
+        which leaves a window where the sidecar is replaced with a link to
+        something sensitive between the check and the open. The asset endpoint is
+        reachable with nothing but a slug, so that window is worth closing here:
+        the open is ``O_NOFOLLOW`` and the inode it actually opened is validated
+        (regular file, not hardlinked), so a swapped sidecar is refused rather
+        than followed.
+
+        ``within_root`` is deliberately NOT passed to the helper: its containment
+        check reads the descriptor's real path via ``/proc/self/fd`` or
+        ``F_GETPATH`` and fails closed when neither is available — which is every
+        Windows host, so requiring it would make image assets permanently
+        unreadable there. Containment is enforced here instead, with a
+        ``realpath`` comparison that behaves the same on every platform. That
+        check is load-bearing rather than belt-and-braces: the helper resolves
+        the path before opening it, so ``O_NOFOLLOW`` alone never sees a swapped
+        symlink — it sees the target.
+        """
+        root = Path(os.path.realpath(self._root))
+        resolved = Path(os.path.realpath(path))
+        if resolved != root and root not in resolved.parents:
+            raise ArtifactNotFoundError(f"image asset escapes the store root: {path.name}")
+        data = hooks.safe_read_file_bytes_nolink(str(resolved), max_bytes=MAX_CONTENT_BYTES)
+        if data is None:
+            # Refused: not a regular file, hardlinked, or unreadable.
+            # Indistinguishable from "gone" to the caller by design.
+            raise ArtifactNotFoundError(f"image asset is not readable: {path.name}")
+        return data
+
+    def _write_bytes(self, path: Path, data: bytes) -> None:
+        """Binary sibling of :meth:`_write_text` (image asset writes).
+
+        Same sensitive-path gate and same atomic tmp-file + rename so a reader
+        never observes a half-written asset.
+        """
+        resolved = Path(os.path.realpath(path))
+        if _fence_refuses(resolved):
+            raise ArtifactError(f"refusing to write sensitive path: {resolved}")
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        tmp = resolved.with_suffix(resolved.suffix + ".tmp")
+        tmp.write_bytes(data)
         tmp.replace(resolved)
 
     def _prune_versions(self, slug: str) -> None:
@@ -3060,7 +3727,61 @@ class ArtifactFolderStore:
         self._path = (path or (config_dir() / self._FILE)).expanduser()
         self._lock = threading.Lock()
         self._folders: _List[dict[str, Any]] = []
+        #: Per-folder icon epoch, bumped under ``self._lock`` by every
+        #: user-visible mutation a generated icon must not outlive: a manual
+        #: icon set, an icon clear, and a rename. An in-flight generation task
+        #: captures the epoch at scheduling time and its write-back
+        #: (:meth:`set_icon_if_epoch`) is dropped unless the epoch is
+        #: unchanged. One invariant closes all three races that a bare
+        #: existence check leaves open and that a value-pin cannot catch: a
+        #: clear (absent -> absent) and a rename (icon untouched) both leave
+        #: the icon VALUE unchanged, so only a counter distinguishes them.
+        #: Deliberately per-folder rather than a store-wide generation
+        #: counter, which would cancel a legitimate icon delivery whenever an
+        #: unrelated folder changed mid-generation. Held per store INSTANCE
+        #: (not module-level as in the chat-folder original, whose folders
+        #: live on DashboardState rather than in a store object) so two stores
+        #: over different JSON paths cannot alias each other's folder ids. In
+        #: memory on purpose -- in-flight tasks die with the process, so the
+        #: epoch has nothing to survive a restart for. Entries are dropped on
+        #: a confirmed folder delete. Mirrors the chat-folder guard
+        #: ``_CHAT_FOLDER_ICON_EPOCHS``.
+        self._icon_epochs: dict[str, int] = {}
         self._load()
+
+    def _bump_icon_epoch_locked(self, folder_id: str) -> None:
+        """Invalidate any in-flight icon generation for this folder.
+
+        Must be called with ``self._lock`` held -- holding the lock is what
+        orders the bump against :meth:`set_icon_if_epoch`'s check, so a
+        mutation can never interleave between that check and its write.
+        """
+        self._icon_epochs[folder_id] = self._icon_epochs.get(folder_id, 0) + 1
+
+    def set_icon_if_epoch(
+        self, folder_id: str, icon: str, expected_epoch: int
+    ) -> dict[str, Any] | None:
+        """Apply a generated icon only while the folder's epoch is unchanged.
+
+        The re-find, the epoch check and the write share one critical section,
+        so a manual icon set, an icon clear, or a rename that lands while
+        generation was in flight wins over the stale generated result. Returns
+        the updated folder, or ``None`` when the write was dropped (folder
+        deleted mid-generation, or the epoch moved).
+
+        Does NOT bump the epoch: this is the generated result landing, not a
+        user-visible mutation that later generations must lose to.
+        """
+        with self._lock:
+            folder = self._by_id().get(folder_id)
+            if folder is None:
+                return None  # deleted mid-generation; drop the icon
+            if self._icon_epochs.get(folder_id, 0) != expected_epoch:
+                # Icon or name changed while generation ran -- drop the result.
+                return None
+            folder["icon"] = str(icon or "")[:16]
+            self._save()
+            return dict(folder)
 
     # ── persistence ───────────────────────────────────────────────────────
 
@@ -3161,6 +3882,17 @@ class ArtifactFolderStore:
         with self._lock:
             return folder_id in self._by_id()
 
+    def subtree_ids(self, folder_id: str) -> set[str]:
+        """Public view of the subtree rooted at ``folder_id`` (inclusive).
+
+        Exists so a caller that must act on a cascade's artifacts BEFORE the cascade
+        runs -- withdrawing their published copies, which this store cannot do because
+        the withdrawal is async and lives a layer up -- can enumerate them without
+        reaching into a private method.
+        """
+        with self._lock:
+            return self._subtree_ids(folder_id)
+
     def create(self, name: str, parent_id: str = "", color: str = "") -> dict[str, Any]:
         """Create a folder under ``parent_id`` (``""`` = root)."""
         name = self._clean_name(name)
@@ -3192,15 +3924,32 @@ class ArtifactFolderStore:
             )
             return dict(folder)
 
-    def rename(self, folder_id: str, name: str) -> dict[str, Any]:
+    def rename(self, folder_id: str, name: str) -> tuple[dict[str, Any], int]:
+        """Rename, returning the folder AND the icon epoch this rename produced.
+
+        The epoch comes back from inside the same critical section as the bump,
+        which is the only way a caller can arm background icon generation
+        safely. Renaming and then READING the epoch back would be two lock
+        acquisitions: a competing manual icon set landing between them bumps the
+        epoch again, the later read would capture THAT epoch, and the generated
+        icon would then satisfy :meth:`set_icon_if_epoch` and clobber the manual
+        pick -- the very race the epoch exists to prevent. Returning it closes
+        that window by construction, because there is no read to lose.
+
+        The tuple is deliberately the ONLY spelling of this mutation: a
+        dict-returning ``rename`` alongside it would be a second spelling of one
+        write, and the two would drift.
+        """
         name = self._clean_name(name)
         with self._lock:
             folder = self._by_id().get(folder_id)
             if folder is None:
                 raise ArtifactNotFoundError(f"folder not found: {folder_id}")
             folder["name"] = name
+            # An in-flight icon was derived from the OLD name -- invalidate it.
+            self._bump_icon_epoch_locked(folder_id)
             self._save()
-            return dict(folder)
+            return dict(folder), self._icon_epochs[folder_id]
 
     def reparent(self, folder_id: str, new_parent: str = "") -> dict[str, Any]:
         """Move a folder under ``new_parent`` (``""`` = root). Cycle-guarded."""
@@ -3239,6 +3988,9 @@ class ArtifactFolderStore:
             if folder is None:
                 raise ArtifactNotFoundError(f"folder not found: {folder_id}")
             folder["icon"] = str(icon or "")[:16]
+            # A manual set OR a clear (icon == "") invalidates any in-flight
+            # generation: its result was derived before the user's choice.
+            self._bump_icon_epoch_locked(folder_id)
             self._save()
             return dict(folder)
 
@@ -3413,30 +4165,72 @@ class ArtifactFolderStore:
                         f["parent_id"] = parent
             self._folders = [f for f in self._folders if f.get("id") not in affected_ids]
             self._save()
+            # Release the icon-epoch guards only after the removal is
+            # CONFIRMED persisted. _save() raising propagates out of this
+            # block, so the pop is skipped and the guard stays armed. Note
+            # what a failed _save() actually leaves behind: self._folders was
+            # already filtered above, so the folder is gone from memory but
+            # SURVIVES on disk, and any later reload brings it back. Keeping
+            # its epoch is the conservative side of that split -- resetting it
+            # to 0 would let a stale in-flight generation clobber a manual
+            # icon on the record that comes back. After a confirmed delete the
+            # entries have nothing left to guard (set_icon_if_epoch already
+            # drops a folder it cannot re-find); popping keeps the registry
+            # from growing with every deleted id.
+            for _gone in affected_ids:
+                self._icon_epochs.pop(_gone, None)
 
         # Phase 2: artifacts. ``affected_ids`` is the subtree for cascade, or
         # just the single folder for the safe path.
         #
-        # Race window (accepted): Phase 2 runs OUTSIDE the folder lock (the
-        # artifact store has its own independent lock, and holding both would
-        # invite ordering deadlocks). Between Phase 1 removing the folder and
-        # this scan re-parenting/deleting its artifacts, a concurrent
-        # ``ArtifactStore.set_folder()`` could file an artifact into the
-        # just-deleted folder id. Such an artifact simply ends up with a
-        # dangling ``folder_id``, which every reader already tolerates by
+        # Race window: Phase 2 runs OUTSIDE the folder lock (the artifact store
+        # has its own independent lock, and holding both would invite ordering
+        # deadlocks). Between Phase 1 removing the folder and this scan, a
+        # concurrent ``ArtifactStore.set_folder()`` can file an artifact into
+        # the just-deleted folder id.
+        #
+        # On the RE-PARENT path that stays harmless: such an artifact ends up
+        # with a dangling ``folder_id``, which every reader already tolerates by
         # degrading it to Unfiled (see ``list(folder=)`` and the tree view's
-        # dangling-id handling). Acceptable for a single-user local tool; not
-        # worth cross-lock coordination.
+        # dangling-id handling).
+        #
+        # On the CASCADE path it is NOT harmless, because the consequence is
+        # destruction rather than a stale field. The caller withdraws every
+        # published copy in the subtree before calling here and clears each
+        # record it withdrew, so an artifact still holding a publication at this
+        # point is exactly one that arrived after that preflight -- its copy was
+        # never withdrawn, and destroying it would erase the only handle able to
+        # take that copy down.
+        #
+        # The refusal is asked of `delete` itself rather than checked here: a
+        # check in this loop is a check-then-act over a snapshot, so a publish
+        # landing between it and the delete would still be destroyed. Inside
+        # `delete` the check shares the lock with the removal, which is what
+        # makes it hold. Phase 1 has already committed the folder-tree change and
+        # cannot be rolled back here, so a kept artifact survives with a dangling
+        # ``folder_id`` and degrades to Unfiled -- the outcome this path already
+        # tolerates, and a recoverable one: the owner restores access to the
+        # destination, withdraws the copy, and deletes it deliberately. Note that
+        # unpublishing is NOT a second route out of this state -- it refuses on an
+        # unreachable destination for the same reason this delete did.
         deleted_slugs: _List[str] = []
         reparented_slugs: _List[str] = []
+        kept_published_slugs: _List[str] = []
         for art in artifact_store.list():
             fid = getattr(art, "folder_id", "") or ""
             if fid not in affected_ids:
                 continue
             if delete_contents:
                 try:
-                    artifact_store.delete(art.slug)
+                    artifact_store.delete(art.slug, refuse_if_published=True)
                     deleted_slugs.append(art.slug)
+                except ArtifactStillPublishedError:
+                    kept_published_slugs.append(art.slug)
+                    logger.warning(
+                        "cascade kept %s: still published, so destroying it would "
+                        "strand a public copy with no withdrawal handle",
+                        art.slug,
+                    )
                 except ArtifactError as exc:  # pragma: no cover — best-effort
                     logger.warning("cascade delete failed for %s: %s", art.slug, exc)
             else:
@@ -3452,6 +4246,7 @@ class ArtifactFolderStore:
         return {
             "deleted_folder_ids": sorted(affected_ids),
             "deleted_artifact_slugs": deleted_slugs,
+            "kept_published_artifact_slugs": kept_published_slugs,
             "reparented_artifact_slugs": reparented_slugs,
             "reparented_to": parent,
             "delete_contents": delete_contents,
@@ -3473,13 +4268,6 @@ def get_default_store() -> ArtifactStore:
         return _default_store
 
 
-def reset_default_store() -> None:
-    """Drop the cached default store (test-only helper)."""
-    global _default_store
-    with _default_store_lock:
-        _default_store = None
-
-
 _default_folder_store: "ArtifactFolderStore | None" = None
 _default_folder_store_lock = threading.Lock()
 
@@ -3491,10 +4279,3 @@ def get_default_folder_store() -> "ArtifactFolderStore":
         if _default_folder_store is None:
             _default_folder_store = ArtifactFolderStore()
         return _default_folder_store
-
-
-def reset_default_folder_store() -> None:
-    """Drop the cached default folder store (test-only helper)."""
-    global _default_folder_store
-    with _default_folder_store_lock:
-        _default_folder_store = None

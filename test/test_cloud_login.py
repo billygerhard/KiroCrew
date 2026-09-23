@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 from kiro_crew.cloud import login, ssm
 
 
@@ -37,6 +39,20 @@ class TestParseLoginOutput:
         assert p.code == "WXYZ-1234"
         assert p.actionable is True
         assert p.already_logged_in is False
+
+    def test_prefers_complete_url_over_bare_verification_uri(self):
+        # kiro-cli prints the bare verification_uri FIRST and the code-embedded
+        # verification_uri_complete second. We must surface the complete one so the
+        # user deep-links to the approve screen instead of a generic sign-in page.
+        text = (
+            "To sign in, open:\n"
+            "  https://device.sso.us-east-1.amazonaws.com/\n"
+            "and enter code ABCD-1234, or open:\n"
+            "  https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-1234\n"
+        )
+        p = login.parse_login_output(text)
+        assert p.url == "https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-1234"
+        assert p.code == "ABCD-1234"
 
     def test_already_logged_in(self):
         p = login.parse_login_output("You are already logged in as user@example.com")
@@ -125,6 +141,96 @@ class TestIsLoggedIn:
         assert login.is_logged_in("i-0abc", "dev") is False
 
 
+class TestAuthProbe:
+    """The probe is tri-state: a failed probe is NOT evidence of being signed out."""
+
+    def test_none_when_command_times_out(self, monkeypatch):
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("TimedOut", "", "", -1)
+        )
+        assert login._auth_probe("i-0abc", "dev") is None
+
+    def test_none_when_output_has_no_sentinel(self, monkeypatch):
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("Failed", "", "boom", 255)
+        )
+        assert login._auth_probe("i-0abc", "dev") is None
+
+    def test_false_on_positive_noauth_sentinel(self, monkeypatch):
+        # The remote script echoes __NOAUTH__ and exits 1 — a non-ok result that
+        # is nonetheless a definitive "signed out".
+        monkeypatch.setattr(
+            ssm,
+            "run_command",
+            lambda *a, **k: ssm.CommandResult("Failed", login._NOAUTH_SENTINEL, "", 1),
+        )
+        assert login._auth_probe("i-0abc", "dev") is False
+
+
+class TestLogout:
+    def test_reports_signed_out_when_session_gone(self, monkeypatch):
+        commands: list[str] = []
+        monkeypatch.setattr(
+            ssm,
+            "run_command",
+            lambda _i, command, *a, **k: commands.append(command)
+            or ssm.CommandResult("Success", "", "", 0),
+        )
+        monkeypatch.setattr(login, "_auth_probe", lambda *a, **k: False)
+        assert login.logout("i-0abc", "dev") is True
+        cmd = commands[0]
+        # A background `kiro-cli login` still polling would re-authenticate the
+        # old account, so it must be killed BEFORE the logout runs.
+        assert cmd.index("pkill") < cmd.index("logout")
+        # Live `kiro-cli acp` runtimes hold the old account's credential in
+        # memory and must not survive the sign-out either.
+        assert "kiro-cli acp" in cmd
+        assert cmd.index("kiro-cli acp") < cmd.index('"$KIRO" logout')
+        # The stale device-code URL+code must not survive the sign-out.
+        assert login._LOGIN_LOG_PATH in cmd
+
+    def test_false_when_session_survives(self, monkeypatch):
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("Success", "", "", 0)
+        )
+        monkeypatch.setattr(login, "_auth_probe", lambda *a, **k: True)
+        assert login.logout("i-0abc", "dev") is False
+
+    def test_false_when_cleanup_command_never_completes(self, monkeypatch):
+        # If the cleanup SSM command times out / fails to deliver, the kills it
+        # was meant to do (background login, ACP runtimes) may not have landed —
+        # the follow-up probe then can't be trusted, so fail closed. The script
+        # ends in `exit 0`, so a "Success" status here means the script ran, not
+        # that the kills worked; a non-"Success" status is the untrusted case.
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("TimedOut", "", "", -1)
+        )
+        probe_called = []
+        monkeypatch.setattr(login, "_auth_probe", lambda *a, **k: probe_called.append(1) or False)
+        assert login.logout("i-0abc", "dev") is False
+        assert probe_called == []  # must not trust a probe after a failed cleanup
+
+    def test_false_when_verification_is_inconclusive(self, monkeypatch):
+        # An SSM timeout on the verify probe leaves the session possibly still
+        # active. Reporting success would tell the user their account was
+        # dropped when it may not have been, so logout must fail CLOSED.
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("Success", "", "", 0)
+        )
+        monkeypatch.setattr(login, "_auth_probe", lambda *a, **k: None)
+        assert login.logout("i-0abc", "dev") is False
+
+    def test_no_session_to_drop_still_signed_out(self, monkeypatch):
+        # `kiro-cli logout` exits non-zero when there was no session to drop, but
+        # the cleanup script swallows that and `exit 0`s, so SSM reports Success;
+        # the probe then positively confirms signed-out, and logout is a success.
+        monkeypatch.setattr(
+            ssm, "run_command", lambda *a, **k: ssm.CommandResult("Success", "", "", 0)
+        )
+        monkeypatch.setattr(login, "_auth_probe", lambda *a, **k: False)
+        assert login.logout("i-0abc", "dev") is True
+
+
 class TestStartDeviceLogin:
     def test_short_circuits_when_logged_in(self, monkeypatch):
         monkeypatch.setattr(login, "is_logged_in", lambda *a, **k: True)
@@ -156,7 +262,8 @@ class TestStartDeviceLogin:
         monkeypatch.setattr(ssm, "run_command", fake_run_command)
         login.start_device_login("i-0abc", "dev", open_browser=False)
         assert "nohup" in captured["command"]
-        assert "kiro-cli login --use-device-flow" in captured["command"]
+        assert "login --use-device-flow" in captured["command"]
+        assert login._LOGIN_PROCESS_PATTERN in captured["command"]  # the replace pkill
         assert "timeout 20" not in captured["command"]
 
     def test_headless_browser_open_returns_false(self, monkeypatch):
@@ -175,7 +282,7 @@ class TestStartDeviceLogin:
 
         def fake_run_command(instance_id, command, profile="", region="", **_kwargs):
             commands.append(command)
-            if "kiro-cli login --use-device-flow" in command:
+            if login._LOGIN_PROCESS_PATTERN in command and "nohup" in command:
                 return ssm.CommandResult("Success", "device flow unavailable", "", 0)
             if "mkfifo" in command:
                 return ssm.CommandResult(
@@ -211,7 +318,7 @@ class TestStartDeviceLogin:
         assert p.port_forward is proc
         assert forwards == [("i-0abc", 49153, 49153, "dev", "us-west-2")]
         assert opened == ["https://auth.example.com/start?session=abc"]
-        assert any("kiro-cli login --use-device-flow" in cmd for cmd in commands)
+        assert any(login._LOGIN_PROCESS_PATTERN in cmd and "nohup" in cmd for cmd in commands)
         # kiro-cli is invoked via the resolved "$KIRO" absolute path now.
         assert any('"$KIRO" login <&3' in cmd for cmd in commands)
         assert any("printf '\\n' >&4" in cmd for cmd in commands)
@@ -232,7 +339,7 @@ class TestStartDeviceLogin:
         reaped: list[object] = []
 
         def fake_run_command(_instance_id, command, *_args, **_kwargs):
-            if "kiro-cli login --use-device-flow" in command:
+            if login._LOGIN_PROCESS_PATTERN in command and "nohup" in command:
                 return ssm.CommandResult("Success", "device flow unavailable", "", 0)
             if "mkfifo" in command:
                 return ssm.CommandResult(
@@ -262,7 +369,7 @@ class TestStartDeviceLogin:
         proc = _DummyProcess()
 
         def fake_run_command(_instance_id, command, *_args, **_kwargs):
-            if "kiro-cli login --use-device-flow" in command:
+            if login._LOGIN_PROCESS_PATTERN in command and "nohup" in command:
                 return ssm.CommandResult("Success", "", "", 0)
             if "mkfifo" in command:
                 return ssm.CommandResult("Success", "Use localhost:49153", "", 0)
@@ -287,7 +394,7 @@ class TestStartDeviceLogin:
         monkeypatch.setattr(login, "is_logged_in", lambda *a, **k: False)
 
         def fake_run_command(_instance_id, command, *_args, **_kwargs):
-            if "kiro-cli login --use-device-flow" in command:
+            if login._LOGIN_PROCESS_PATTERN in command and "nohup" in command:
                 return ssm.CommandResult("Success", "", "", 0)
             if "mkfifo" in command:
                 return ssm.CommandResult("Success", "Use localhost:49153", "", 0)
@@ -316,3 +423,127 @@ class TestWaitUntilLoggedIn:
         monkeypatch.setattr(ssm, "_sleep", lambda *_a: None)
         monkeypatch.setattr(login, "is_logged_in", lambda *a, **k: False)
         assert login.wait_until_logged_in("i-0abc", "dev", attempts=3) is False
+
+
+class TestIdentityProviderFlags:
+    """The --identity-provider, --license, and --region flags must be forwarded
+    to the kiro-cli login command on the remote instance."""
+
+    def test_device_login_command_appends_all_flags(self):
+        cmd = login._device_login_command(
+            replace_existing=False,
+            identity_provider="https://d-1234567890.awsapps.com/start",
+            license_="pro",
+            idp_region="us-east-1",
+        )
+        assert "--identity-provider https://d-1234567890.awsapps.com/start" in cmd
+        assert "--license pro" in cmd
+        assert "--region us-east-1" in cmd
+        # Flags appear on BOTH the stdbuf and the non-stdbuf branches.
+        lines_with_login = [ln for ln in cmd.splitlines() if "login --use-device-flow" in ln]
+        for line in lines_with_login:
+            assert "--identity-provider" in line
+
+    def test_device_login_command_omits_flags_when_empty(self):
+        cmd = login._device_login_command(replace_existing=False)
+        assert "--identity-provider" not in cmd
+        assert "--license" not in cmd
+        # --region should NOT appear (avoid confusion with the cloud/EC2 region)
+        assert "--region" not in cmd
+
+    def test_device_login_command_partial_flags(self):
+        cmd = login._device_login_command(
+            replace_existing=False,
+            identity_provider="https://d-abc.awsapps.com/start",
+        )
+        assert "--identity-provider https://d-abc.awsapps.com/start" in cmd
+        assert "--license" not in cmd
+        assert "--region" not in cmd
+
+    def test_device_login_command_shell_quotes_flag_values(self):
+        """Flag values reach a bash script run on the remote instance via SSM,
+        so a value carrying a command substitution, spaces, or quotes must land
+        as a single quoted token — never as executable shell syntax."""
+        evil = "$(touch /tmp/pwned)"
+        spaced = "https://idp.example.com/start page"
+        quoted = "pro'; touch /tmp/pwned; echo '"
+        cmd = login._device_login_command(
+            replace_existing=False,
+            identity_provider=evil,
+            license_=quoted,
+            idp_region=spaced,
+        )
+        # The raw (unquoted) interpolations must NOT appear.
+        assert f"--identity-provider {evil}" not in cmd
+        assert f"--license {quoted}" not in cmd
+        assert f"--region {spaced}" not in cmd
+        # The shell-quoted forms must appear instead.
+        assert f"--identity-provider {shlex.quote(evil)}" in cmd
+        assert f"--license {shlex.quote(quoted)}" in cmd
+        assert f"--region {shlex.quote(spaced)}" in cmd
+        # Each value round-trips through shell tokenization as ONE token equal
+        # to the original string, on every launch branch.
+        login_lines = [ln for ln in cmd.splitlines() if "login --use-device-flow" in ln]
+        assert login_lines
+        for line in login_lines:
+            tokens = shlex.split(line.strip().rstrip("&").strip())
+            for flag, value in (
+                ("--identity-provider", evil),
+                ("--license", quoted),
+                ("--region", spaced),
+            ):
+                idx = tokens.index(flag)
+                assert tokens[idx + 1] == value
+
+    def test_resume_login_command_shell_quotes_flag_values(self):
+        """_resume_login_command delegates to _device_login_command; the
+        quoting must survive that path too."""
+        evil = "$(id)"
+        cmd = login._resume_login_command(identity_provider=evil)
+        assert f"--identity-provider {evil}" not in cmd
+        assert f"--identity-provider {shlex.quote(evil)}" in cmd
+
+    def test_resume_login_command_forwards_flags(self):
+        cmd = login._resume_login_command(
+            identity_provider="https://d-1234567890.awsapps.com/start",
+            license_="free",
+            idp_region="eu-west-1",
+        )
+        assert "--identity-provider https://d-1234567890.awsapps.com/start" in cmd
+        assert "--license free" in cmd
+        assert "--region eu-west-1" in cmd
+
+    def test_start_device_login_passes_flags_to_command(self, monkeypatch):
+        monkeypatch.setattr(login, "is_logged_in", lambda *a, **k: False)
+        captured: dict[str, str] = {}
+
+        def fake_run_command(_instance_id, command, *_args, **_kwargs):
+            captured["command"] = command
+            return ssm.CommandResult(
+                "Success",
+                "Open https://device.sso.example.com/?user_code=TEST-1234 code: TEST-1234",
+                "",
+                0,
+            )
+
+        monkeypatch.setattr(ssm, "run_command", fake_run_command)
+        from kiro_crew.cloud.login_target import KiroLoginTarget
+
+        login.start_device_login(
+            "i-0abc",
+            "dev",
+            open_browser=False,
+            target=KiroLoginTarget.from_fields(
+                license="pro", start_url="https://d-test.awsapps.com/start", region="us-east-1"
+            ),
+        )
+        assert "--identity-provider https://d-test.awsapps.com/start" in captured["command"]
+        assert "--license pro" in captured["command"]
+        assert "--region us-east-1" in captured["command"]
+
+    def test_callback_login_command_does_not_get_identity_flags(self):
+        """The social/callback login path uses plain `kiro-cli login` (no
+        --use-device-flow), so it should NOT receive the identity flags."""
+        cmd = login._callback_login_command()
+        assert "--identity-provider" not in cmd
+        assert "--license" not in cmd

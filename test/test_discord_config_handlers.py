@@ -41,8 +41,13 @@ def test_save_denies_forwarded_loopback_request() -> None:
     assert resp.status == 403
 
 
-def _client_put(mod, monkeypatch, tmp_path, body):
-    """Run a save over a real TestClient with paths isolated to tmp_path."""
+def _client_put(mod, monkeypatch, tmp_path, body, state=None):
+    """Run a save over a real TestClient with paths isolated to tmp_path.
+
+    *state* seeds ``app["state"]``; the folder-creation hook is skipped when it is
+    absent, which is also the production guard for a request that arrives before
+    the dashboard state is wired.
+    """
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -55,6 +60,8 @@ def _client_put(mod, monkeypatch, tmp_path, body):
 
     async def _run():
         app = web.Application()
+        if state is not None:
+            app["state"] = state
         app.router.add_put("/api/discord/config", mod.api_discord_config_save)
         async with TestClient(TestServer(app)) as client:
             resp = await client.put("/api/discord/config", json=body)
@@ -85,7 +92,7 @@ def test_save_persists_token_and_config(tmp_path: Path, monkeypatch) -> None:
 
     _accept_token(monkeypatch, mod)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
-    (status_body, env) = _client_put(
+    status_body, env = _client_put(
         mod,
         monkeypatch,
         tmp_path,
@@ -94,6 +101,8 @@ def test_save_persists_token_and_config(tmp_path: Path, monkeypatch) -> None:
             "enabled": True,
             "allowed_user_ids": ["123456789012345678", "987654321098765432"],
             "allowed_thread_ids": ["234567890123456789"],
+            "allowed_channel_ids": ["345678901234567890"],
+            "auto_thread": False,
             "soft_threshold_pct": 75,
         },
     )
@@ -110,9 +119,11 @@ def test_save_persists_token_and_config(tmp_path: Path, monkeypatch) -> None:
         "987654321098765432",
     ]
     assert cfg["discord"]["allowed_thread_ids"] == ["234567890123456789"]
-    assert loader.KiroCrewConfig.load().discord.allowed_thread_ids == [
-        "234567890123456789"
-    ]
+    assert cfg["discord"]["allowed_channel_ids"] == ["345678901234567890"]
+    loaded = loader.KiroCrewConfig.load().discord
+    assert loaded.allowed_thread_ids == ["234567890123456789"]
+    assert loaded.allowed_channel_ids == ["345678901234567890"]
+    assert loaded.auto_thread is False
     assert cfg["discord"]["soft_threshold_pct"] == 75
 
 
@@ -121,7 +132,7 @@ def test_save_rejects_malformed_token(tmp_path: Path, monkeypatch) -> None:
     import kiro_crew.dashboard.handlers.messaging as mod
 
     _accept_token(monkeypatch, mod)
-    (status_body, env) = _client_put(mod, monkeypatch, tmp_path, {"bot_token": "not-a-token"})
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token": "not-a-token"})
     status, body = status_body
     assert status == 400
     assert "Developer Portal" in body["error"]
@@ -133,9 +144,7 @@ def test_save_strips_accidental_bot_prefix(tmp_path: Path, monkeypatch) -> None:
     import kiro_crew.dashboard.handlers.messaging as mod
 
     _accept_token(monkeypatch, mod)
-    (status_body, env) = _client_put(
-        mod, monkeypatch, tmp_path, {"bot_token": f"Bot {VALID_TOKEN}"}
-    )
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token": f"Bot {VALID_TOKEN}"})
     status, _ = status_body
     assert status == 200
     assert f"DISCORD_BOT_TOKEN={VALID_TOKEN}" in env.read_text(encoding="utf-8")
@@ -149,7 +158,7 @@ def test_save_rejects_token_discord_refuses(tmp_path: Path, monkeypatch) -> None
         return "401: Unauthorized"
 
     monkeypatch.setattr(mod, "_validate_discord_token", _reject)
-    (status_body, env) = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
     status, body = status_body
     assert status == 400
     assert "Unauthorized" in body["error"]
@@ -164,7 +173,7 @@ def test_save_proceeds_with_warning_when_discord_unreachable(tmp_path: Path, mon
         raise ConnectionError("no route to discord.com")
 
     monkeypatch.setattr(mod, "_validate_discord_token", _unreachable)
-    (status_body, env) = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
     status, body = status_body
     assert status == 200
     assert body["verify_warning"]
@@ -175,7 +184,7 @@ def test_save_rejects_non_numeric_user_ids(tmp_path: Path, monkeypatch) -> None:
     import kiro_crew.dashboard.handlers.messaging as mod
 
     _accept_token(monkeypatch, mod)
-    (status_body, _) = _client_put(mod, monkeypatch, tmp_path, {"allowed_user_ids": ["@username"]})
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_user_ids": ["@username"]})
     status, body = status_body
     assert status == 400
     assert "numeric" in body["error"]
@@ -185,13 +194,29 @@ def test_save_rejects_non_numeric_thread_ids(tmp_path: Path, monkeypatch) -> Non
     import kiro_crew.dashboard.handlers.messaging as mod
 
     _accept_token(monkeypatch, mod)
-    (status_body, _) = _client_put(
-        mod, monkeypatch, tmp_path, {"allowed_thread_ids": ["general"]}
-    )
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_thread_ids": ["general"]})
     status, body = status_body
     assert status == 400
     assert "thread ID" in body["error"]
     assert "numeric" in body["error"]
+
+
+def test_save_rejects_non_numeric_channel_ids(tmp_path: Path, monkeypatch) -> None:
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_channel_ids": ["general"]})
+    status, body = status_body
+    assert status == 400
+    assert "channel ID" in body["error"]
+
+
+def test_save_requires_boolean_auto_thread(tmp_path: Path, monkeypatch) -> None:
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"auto_thread": "true"})
+    assert status_body[0] == 400
 
 
 def test_clear_flag_must_be_strict_boolean(tmp_path: Path, monkeypatch) -> None:
@@ -202,11 +227,11 @@ def test_clear_flag_must_be_strict_boolean(tmp_path: Path, monkeypatch) -> None:
     env = tmp_path / ".env"
     env.write_text(f"DISCORD_BOT_TOKEN={VALID_TOKEN}\n", encoding="utf-8")
 
-    (status_body, env) = _client_put(mod, monkeypatch, tmp_path, {"bot_token_clear": "false"})
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token_clear": "false"})
     assert status_body[0] == 400
     assert VALID_TOKEN in env.read_text(encoding="utf-8")
 
-    (status_body, env) = _client_put(mod, monkeypatch, tmp_path, {"bot_token_clear": True})
+    status_body, env = _client_put(mod, monkeypatch, tmp_path, {"bot_token_clear": True})
     assert status_body[0] == 200
     assert "DISCORD_BOT_TOKEN" not in env.read_text(encoding="utf-8")
 
@@ -221,7 +246,7 @@ def test_restart_required_only_on_actual_change(tmp_path: Path, monkeypatch) -> 
         '{"discord": {"enabled": true, "allowed_user_ids": ["111"], ' '"soft_threshold_pct": 80}}',
         encoding="utf-8",
     )
-    (status_body, _) = _client_put(
+    status_body, _ = _client_put(
         mod,
         monkeypatch,
         tmp_path,
@@ -231,7 +256,16 @@ def test_restart_required_only_on_actual_change(tmp_path: Path, monkeypatch) -> 
     assert status == 200
     assert body["restart_required"] is False
 
-    (status_body, _) = _client_put(mod, monkeypatch, tmp_path, {"enabled": False})
+    # A real change to a hot-applied field is NOT a restart: the config watcher
+    # reloads `discord.enabled` and pushes it at the live transport, so telling
+    # the operator to restart would be a false instruction.
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"enabled": False})
+    assert status_body[1]["restart_required"] is False
+
+    # A credential write still is: the token is hoisted from the environment at
+    # connect time and the watcher does not watch `.env`.
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
+    assert status_body[0] == 200
     assert status_body[1]["restart_required"] is True
 
 
@@ -240,8 +274,11 @@ def test_soft_threshold_bounds(tmp_path: Path, monkeypatch) -> None:
 
     _accept_token(monkeypatch, mod)
     for bad in (0, 101, "80", True):
-        (status_body, _) = _client_put(mod, monkeypatch, tmp_path, {"soft_threshold_pct": bad})
+        status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"soft_threshold_pct": bad})
         assert status_body[0] == 400, f"soft_threshold_pct={bad!r} should be rejected"
+        # A machine-readable code, not prose only: the dashboard renders `error`
+        # verbatim into a localized UI, so prose alone is untranslatable.
+        assert status_body[1]["code"] == "soft_threshold_pct_invalid"
 
 
 def test_get_masks_token_and_reports_state(tmp_path: Path, monkeypatch) -> None:
@@ -277,3 +314,204 @@ def test_get_masks_token_and_reports_state(tmp_path: Path, monkeypatch) -> None:
     assert body["enabled"] is True
     assert body["allowed_user_ids"] == ["42"]
     assert body["allowed_thread_ids"] == ["99"]
+
+
+def test_save_persists_session_folder_without_asking_for_a_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``session_folder`` is read live, so changing it alone needs no restart."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"session_folder": " Discord "})
+    status, body = status_body
+    assert status == 200
+    assert body["restart_required"] is False
+    data = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert data["discord"]["session_folder"] == "Discord"
+
+
+def test_save_creates_the_configured_folder(tmp_path: Path, monkeypatch) -> None:
+    """The folder is created HERE, on the save — never on the reconcile path.
+
+    Creation from the reconciler would put an ``fsync`` on the event loop and,
+    being reachable from both the 30s pass and every inbound channel message,
+    could drop a concurrent folder edit. The save endpoint is user-initiated and
+    already writes config.json, so it is the right owner.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    created: list[tuple[str, str, bool]] = []
+
+    async def fake_ensure(state, namespace: str, name: str, *, relabel: bool = False) -> str:
+        created.append((namespace, name, relabel))
+        return "fid"
+
+    monkeypatch.setattr(mod, "ensure_channel_folder", fake_ensure)
+    status_body, _ = _client_put(
+        mod, monkeypatch, tmp_path, {"session_folder": "Team chat"}, state=object()
+    )
+    assert status_body[0] == 200
+    assert created == [("discord", "Team chat", True)]
+
+
+def test_save_ignores_a_hand_edited_non_string_session_folder(tmp_path: Path, monkeypatch) -> None:
+    """A hand-edited non-string must not become a folder on an unrelated save.
+
+    The save endpoints read ``session_folder`` back out of the RAW config.json dict
+    they just edited, which bypasses the loader's coercion. Saving any OTHER field
+    in the section therefore carries the stored value straight to
+    ``ensure_channel_folder`` — and coercing it with ``str()`` would create a real
+    sidebar folder literally named ``123``, which nobody chose. It has to fail
+    closed to "off" instead.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    # Hand-edited config: session_folder is a number, not text.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"discord": {"session_folder": 123}}), encoding="utf-8"
+    )
+
+    created: list[tuple[str, str, bool]] = []
+
+    async def fake_ensure(state, namespace: str, name: str, *, relabel: bool = False) -> str:
+        created.append((namespace, name, relabel))
+        return "fid"
+
+    monkeypatch.setattr(mod, "ensure_channel_folder", fake_ensure)
+    # Save an UNRELATED field, leaving the hand-edited value in place.
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"enabled": True}, state=object())
+    assert status_body[0] == 200
+    assert created == [], f"a non-string session_folder created a folder: {created!r}"
+
+
+def test_save_creates_no_folder_when_the_setting_is_off(tmp_path: Path, monkeypatch) -> None:
+    """Off is the default; a save that leaves it off must not create anything."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    created: list[tuple[str, str, bool]] = []
+
+    async def fake_ensure(state, namespace: str, name: str) -> str:
+        created.append((namespace, name))
+        return ""
+
+    monkeypatch.setattr(mod, "ensure_channel_folder", fake_ensure)
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"enabled": True}, state=object())
+    assert status_body[0] == 200
+    assert created == []
+
+
+def test_save_asks_for_a_restart_only_for_a_credential_write(tmp_path: Path, monkeypatch) -> None:
+    """Config fields are hot-applied; only an env write still needs a restart.
+
+    ``session_folder`` and ``enabled`` are reloaded by the config watcher, so a
+    save touching either must not tell the operator to restart; the restart hint
+    is answered from the schema's
+    ``restart`` flag, so this save must NOT claim a restart -- while the token,
+    which is hoisted from the environment at connect time, still must.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    status_body, _ = _client_put(
+        mod, monkeypatch, tmp_path, {"session_folder": "Discord", "enabled": True}
+    )
+    status, body = status_body
+    assert status == 200
+    assert body["restart_required"] is False
+
+    _accept_token(monkeypatch, mod)
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"bot_token": VALID_TOKEN})
+    assert status_body[0] == 200
+    assert status_body[1]["restart_required"] is True
+
+
+def test_save_rejects_an_unusable_session_folder(tmp_path: Path, monkeypatch) -> None:
+    """A name that could not address a sidebar folder is refused, not coerced."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    for bad in ("nested/name", "back\\slash", "line\nbreak", "x" * 101, 42):
+        status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"session_folder": bad})
+        assert status_body[0] == 400, f"session_folder={bad!r} should be rejected"
+
+
+def test_get_reports_the_configured_session_folder(tmp_path: Path, monkeypatch) -> None:
+    """The panel reads the current value back, defaulting to off."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"discord": {"session_folder": "Discord"}}', encoding="utf-8")
+    monkeypatch.setattr(loader, "config_path", lambda: cfg)
+    monkeypatch.setattr(loader, "env_path", lambda: tmp_path / ".env")
+    monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+
+    class _State:
+        discord_connected = False
+        discord_connect_error = ""
+
+    req = make_mocked_request("GET", "/api/discord/config", app={"state": _State()})
+    body = json.loads(asyncio.run(mod.api_discord_config_get(req)).text)
+    assert body["session_folder"] == "Discord"
+
+
+def test_an_unrelated_save_does_not_relabel_the_folder(tmp_path: Path, monkeypatch) -> None:
+    """Only the save that carried session_folder may rename the folder.
+
+    This endpoint runs on every section save, so relabelling unconditionally
+    renamed a folder the user had renamed in the sidebar back to the stored config
+    value — undoing their change on a save that had nothing to do with folders.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    # Stored config already carries a folder name; this save touches another field.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"discord": {"session_folder": "Team chat"}}), encoding="utf-8"
+    )
+
+    created: list[tuple[str, str, bool]] = []
+
+    async def fake_ensure(state, namespace: str, name: str, *, relabel: bool = False) -> str:
+        created.append((namespace, name, relabel))
+        return "fid"
+
+    monkeypatch.setattr(mod, "ensure_channel_folder", fake_ensure)
+    # A save that touches only an unrelated field.
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"enabled": True}, state=object())
+    assert status_body[0] == 200
+    assert created, "the folder should still be ensured to exist"
+    assert created[0][2] is False, f"an unrelated save asked to relabel the folder: {created!r}"
+
+
+def test_a_folder_save_does_relabel(tmp_path: Path, monkeypatch) -> None:
+    """The save that expresses folder intent is the one allowed to rename."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    created: list[tuple[str, str, bool]] = []
+
+    async def fake_ensure(state, namespace: str, name: str, *, relabel: bool = False) -> str:
+        created.append((namespace, name, relabel))
+        return "fid"
+
+    monkeypatch.setattr(mod, "ensure_channel_folder", fake_ensure)
+    status_body, _ = _client_put(
+        mod, monkeypatch, tmp_path, {"session_folder": "Team chat"}, state=object()
+    )
+    assert status_body[0] == 200
+    assert created == [("discord", "Team chat", True)]
+
+
+def test_a_save_answers_only_after_the_watcher_applied_it(tmp_path: Path, monkeypatch) -> None:
+    """A narrowed allow-list must be in force before the caller sees "saved".
+
+    The saver awaits one watcher cycle before responding, so the response never
+    races the poll: whatever authorization the write expresses is already applied
+    to the running transport when the 200 arrives.
+    """
+    from unittest.mock import AsyncMock
+
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    applied = AsyncMock()
+    monkeypatch.setattr(mod, "_hot_apply_after_write", applied)
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_user_ids": ["111"]})
+    assert status_body[0] == 200
+    applied.assert_awaited_once()

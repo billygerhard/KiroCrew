@@ -13,6 +13,14 @@ superseded-by: []
 ---
 # RFC: Federated App Platform — Dynamic ESM Loading with Import Maps
 
+> **Current behaviour: see [`../system-specs/modules/app-kit-platform.md`](../system-specs/modules/app-kit-platform.md) §18.**
+> The shipped Phase 1 path dynamically imports an app's ESM module through
+> `AppHost` and the manifest's `ui.entry`, with `@kirocrew/app-sdk` provided by
+> the host. The host-declared import map and vendored `/vendor/` ESM shims now
+> ship from `website/vite.config.ts` and `website/public/vendor/`; the CDN import
+> map inside MCP App `srcdoc` iframes is a separate mechanism. Read the remaining
+> phases below as proposals, not descriptions of current behaviour.
+
 **Author:** KiroCrew contributors  
 **Date:** 2026-04-18  
 **Status:** partial — Phase 1 is substantially on main (import map, vendored ESM shims, `AppHost.tsx`, `@kirocrew/app-sdk`, static app-UI serving); Phase 3 is half-built (`app init --ui` shipped, `app dev` reinterpreted as a dev-mode toggle, no `kirocrewApp()` Vite plugin, no `app publish`). Unstarted: Phase 2 (Agent Worlds extraction — contradicted by the compiled-in builtin-apps pattern that shipped instead), Phase 1's entire removal table (app backends are alive and load-bearing), Phase 4's bundle+hash+CDN lane, Phase 5's CSP/monitoring. §3.3 and §3.7 are superseded by `rfc-appstore-official-registry.md`; this RFC's loading model is not.

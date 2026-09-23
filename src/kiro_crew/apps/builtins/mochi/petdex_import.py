@@ -32,6 +32,9 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from kiro_crew.apps.builtins.mochi.windows_names import is_windows_reserved
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
+
 logger = logging.getLogger(__name__)
 
 #: Where the petdex CLI installs pets. Fixed by that CLI, not configurable.
@@ -59,14 +62,12 @@ _MAX_SHEET_BYTES = 16 * 1024 * 1024
 #: Total seconds for one import, connect through last byte.
 _TIMEOUT_SECS = 30
 
-#: Accepted sheet formats, by magic bytes. The renderer decodes the sheet in an
-#: <img>, so the browser is the real parser -- this only keeps non-images out.
-_MAGIC: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"GIF87a", "image/gif"),
-    (b"GIF89a", "image/gif"),
-    (b"\xff\xd8\xff", "image/jpeg"),
-)
+#: Accepted sheet formats. The renderer decodes the sheet in an <img>, so the
+#: browser is the real parser -- this only keeps non-images out. Detection is
+#: the shared raster sniffer (:mod:`kiro_crew.messaging.raster`); this local
+#: allowlist keeps the accept-set exactly as before (notably: BMP, which the
+#: sniffer knows, stays rejected here).
+_ALLOWED_SHEET_MIMES = frozenset({"image/png", "image/gif", "image/jpeg", "image/webp"})
 
 _PET_JSON_NAME = "pet.json"
 #: Sheet names the CLI writes, in preference order.
@@ -102,6 +103,12 @@ def normalize_slug(raw: str) -> str:
     text = text.lower()
     if not _SLUG_RE.match(text):
         raise PetdexError(f"not a valid petdex pet name: {raw!r}")
+    # The pattern above is a character check, and these two rules are not
+    # expressible as one: a reserved DOS device name (`con`, `nul`, `com1`) and a
+    # trailing dot both satisfy it, then fail when the slug becomes a directory
+    # name on Windows -- as an unreadable OSError from inside the install write.
+    if is_windows_reserved(text):
+        raise PetdexError(f"that pet name cannot be stored on this system: {raw!r}")
     return text
 
 
@@ -120,13 +127,10 @@ def _assert_allowed_url(url: str) -> None:
 
 
 def _sniff_mime(blob: bytes) -> str:
-    for magic, mime in _MAGIC:
-        if blob.startswith(magic):
-            return mime
-    # WebP is RIFF<size>WEBP, so the tag is not a plain prefix.
-    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
-        return "image/webp"
-    raise PetdexError("the spritesheet is not a recognized image")
+    mime = sniff_raster_mime(blob[:SNIFF_BYTES])
+    if mime is None or mime not in _ALLOWED_SHEET_MIMES:
+        raise PetdexError("the spritesheet is not a recognized image")
+    return mime
 
 
 def parse_pet_json(text: str) -> dict[str, str]:
@@ -361,5 +365,9 @@ def read_installed(slug: str) -> dict[str, Any]:
         "meta": meta,
         "imageMime": _sniff_mime(sheet),
         "imageBase64": base64.b64encode(sheet).decode("ascii"),
-        "source": str(INSTALLED_PETS_DIR),
+        # as_posix, not str: this is a DISPLAY string naming where the petdex CLI
+        # installs pets, and that CLI writes the POSIX form. str() of a Path built
+        # from a POSIX literal renders with backslashes on Windows, which would
+        # show the user a path shape the tool they are being pointed at never uses.
+        "source": INSTALLED_PETS_DIR.as_posix(),
     }

@@ -135,6 +135,11 @@ async def test_text_file_redacted_blocks_download(tmp_path, mock_sel):
             assert resp.status == 400
             payload = await resp.json()
             assert "redacted" in payload["error"]
+            # The scan refusal carries a machine-readable discriminator (the
+            # same one file-stream/upload emit) so the client can name it a
+            # CREDENTIAL refusal rather than confusing it with the endpoint's
+            # other 400s (invalid input, out-of-project path).
+            assert payload["code"] == "content_redacted"
 
 
 # --- Security envelope ---
@@ -146,6 +151,9 @@ async def test_invalid_path_rejected(mock_sel):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/file-download?path=/etc/passwd")
             assert resp.status == 400
+            # A non-scan 400 must NOT carry the content_redacted code, or the
+            # client would mislabel a rejected path as a credential refusal.
+            assert (await resp.json()).get("code") != "content_redacted"
 
 
 @pytest.mark.asyncio
@@ -189,24 +197,17 @@ async def test_symlink_rejected(tmp_path, mock_sel):
 
 @pytest.mark.asyncio
 async def test_oversize_file_rejected(tmp_path, mock_sel):
-    """Files larger than _MAX_UPLOAD_BYTES (50 MB) must be rejected with 413
-    before the body is buffered. We simulate via stat patching to avoid
-    actually writing 50 MB to disk in a unit test."""
-    f = tmp_path / "huge.docx"
-    f.write_bytes(b"\x00" * 1024)  # tiny on disk; we lie about the size
-    real_fstat = os.fstat
+    """Files larger than _MAX_UPLOAD_BYTES must be rejected with 413.
 
-    def _fake_fstat(fd):
-        st = real_fstat(fd)
-        # Replace st_size with one byte over the cap
-        from kiro_crew.dashboard.handlers.files import _MAX_UPLOAD_BYTES
-        return os.stat_result((
-            st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
-            _MAX_UPLOAD_BYTES + 1, st.st_atime, st.st_mtime, st.st_ctime,
-        ))
+    The guard is the BOUNDED READ (read cap+1, refuse when over) rather than an
+    fstat pre-check, so a file growing between check and read cannot outrun the
+    cap. We shrink the cap instead of writing 50 MB to disk in a unit test; the
+    file is genuinely over the (patched) cap, exercising the real guard."""
+    f = tmp_path / "huge.docx"
+    f.write_bytes(b"\x00" * 1024)  # 1 KiB on disk, over the patched 512-byte cap
 
     with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)), \
-         patch("os.fstat", side_effect=_fake_fstat):
+         patch("kiro_crew.dashboard.handlers.files._MAX_UPLOAD_BYTES", 512):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-download?path={f}")
             assert resp.status == 413

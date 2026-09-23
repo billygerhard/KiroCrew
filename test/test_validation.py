@@ -8,6 +8,8 @@ from kiro_crew.validation import (
     ARTIFACT_SAVE_SCHEMA,
     CHANNEL_ID_RE,
     CRON_ADD_SCHEMA,
+    FILE_READ_SCHEMA,
+    FILE_WRITE_SCHEMA,
     LEARN_ADD_SCHEMA,
     SEND_MESSAGE_SCHEMA,
     SET_PROJECT_SCHEMA,
@@ -19,6 +21,7 @@ from kiro_crew.validation import (
     ValidationError,
     build_tool_response,
     normalize_unicode,
+    sanitize_json_values,
     sanitize_response,
     sanitize_string,
     strip_hidden_unicode,
@@ -165,6 +168,30 @@ class TestSanitizeString:
         assert sanitize_string("\u0645\u200c\u062e") == "\u0645\u200c\u062e"
 
 
+class TestSanitizeJsonValues:
+    def test_strips_hidden_chars_from_nested_values_and_keys(self):
+        # A ``\u200b`` escape in raw JSON is plain ASCII to the schema
+        # sanitizer; it becomes a real zero-width char only on decode. The
+        # decoded walk must strip it wherever it lands.
+        decoded = {
+            "no\u200bte": "AKIA\u200bIOSFODNN7EXAMPLE",
+            "nested": {"list": ["a\u200bb", 7, None, True]},
+        }
+        cleaned = sanitize_json_values(decoded)
+        assert cleaned == {
+            "note": "AKIAIOSFODNN7EXAMPLE",
+            "nested": {"list": ["ab", 7, None, True]},
+        }
+
+    def test_non_string_scalars_untouched(self):
+        assert sanitize_json_values({"n": 1, "f": 2.5, "b": False, "x": None}) == {
+            "n": 1,
+            "f": 2.5,
+            "b": False,
+            "x": None,
+        }
+
+
 # ── Response Sanitization ──
 
 
@@ -257,6 +284,31 @@ class TestValidateToolArgs:
     def test_spawn_run_max_turns_negative_rejected(self):
         with pytest.raises(ValidationError, match=">="):
             validate_tool_args({"task": "x", "max_turns": -1}, SPAWN_RUN_SCHEMA)
+
+    def test_spawn_run_context_groups_accepted(self):
+        result = validate_tool_args(
+            {
+                "task": "x",
+                "include_memory": False,
+                "include_lessons": True,
+                "include_project": False,
+            },
+            SPAWN_RUN_SCHEMA,
+        )
+        assert result["include_memory"] is False
+        assert result["include_lessons"] is True
+        assert result["include_project"] is False
+
+    def test_spawn_run_context_groups_omitted(self):
+        """Absent flags must not materialize as False — omitted means all groups on."""
+        result = validate_tool_args({"task": "x"}, SPAWN_RUN_SCHEMA)
+        assert result.get("include_memory") is not False
+        assert result.get("include_lessons") is not False
+        assert result.get("include_project") is not False
+
+    def test_spawn_run_context_group_non_bool_rejected(self):
+        with pytest.raises(ValidationError):
+            validate_tool_args({"task": "x", "include_memory": "no"}, SPAWN_RUN_SCHEMA)
 
     def test_learn_add_valid(self):
         result = validate_tool_args(
@@ -953,7 +1005,7 @@ class TestValidateMcpToolArguments:
                      "max nesting depth")
 
 
-# ── MCP Apps arg-validation hardening (PR #339 round 7) ──
+# ── MCP Apps arg-validation hardening ──
 
 def test_boolean_false_subschema_rejects():
     with pytest.raises(ValidationError):
@@ -1027,3 +1079,154 @@ def test_unique_items_distinguishes_bool_from_number():
             {"type": "object",
              "properties": {"x": {"type": "array", "uniqueItems": True}}},
         )
+
+
+# ── File I/O path shape (FILE_READ_SCHEMA / FILE_WRITE_SCHEMA) ──
+
+
+class TestFilePathShape:
+    """The syntax gate every dashboard file endpoint validates `path` against.
+
+    It ran POSIX-only until the dashboard file viewer was found to 400 on every
+    file on Windows: the pattern required a `~` or `/` first character and
+    allowed neither `\\` nor `:`, so a native Windows path was refused ahead of
+    the Windows-aware canonicalization below it.
+
+    The body is a denylist, not an enumerated punctuation allowlist: it refuses
+    only the two classes that are hazards in the path string itself -- a control
+    character (C0, DEL or C1), and `:` outside the drive prefix. The accept cases
+    below
+    exist because re-narrowing the body to a punctuation list reads as a
+    security tightening while being a regression: it answers HTTP 400 for every
+    legal filename holding a character the list omits.
+    """
+
+    @staticmethod
+    def _accepts(path: str) -> bool:
+        try:
+            validate_tool_args({"path": path}, FILE_READ_SCHEMA)
+            return True
+        except ValidationError:
+            return False
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/home/user/project/notes.md",
+            "~/project/notes.md",
+            "/tmp/a file with spaces.md",
+        ],
+    )
+    def test_accepts_posix_absolute(self, path):
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Parentheses: the "Name (alias).md" convention a whole notes folder
+            # can be built on, so one refused character 400s every file in it.
+            "/home/user/notes/One on one/Ada Lovelace (ada).md",
+            "/home/user/Desktop/AI Projects/(AI) Fluency Workshop/agenda.md",
+            # Spaces and parentheses together, plus the URL-reserved characters
+            # the client percent-encodes and the server therefore sees literally.
+            "/home/user/notes/Q1 2026 (draft) #2.md",
+            "/home/user/notes/is it done?.md",
+            "/home/user/notes/a & b, c'd.md",
+            "/home/user/notes/50% done [final]+1.md",
+            r"C:\Users\me\One on one\Ada Lovelace (ada) #2.md",
+            # Non-BMP: an emoji in a name is legal and carries no hazard.
+            "/home/user/notes/ship \U0001f680.md",
+        ],
+    )
+    def test_accepts_urlreserved_and_punctuation(self, path):
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/$evil",
+            "/tmp/a;rm -rf b",
+            "/tmp/a|b",
+            "/tmp/a`b`",
+            "/tmp/a*b?",
+        ],
+    )
+    def test_accepts_shell_metacharacters(self, path):
+        # A shell metacharacter is an ordinary filename character here: every
+        # subprocess in the file handlers is exec-form argv with no shell, and
+        # the security boundary is hooks.validate_file_path's realpath +
+        # is_sensitive_path below this gate. Refusing them bought nothing and
+        # cost legal files, so the refusal is not reinstated.
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            r"C:\Users\me\workspace\notes.md",
+            "C:/Users/me/workspace/notes.md",
+            r"c:\lower\drive\letter.md",
+            r"\\host\share\notes.md",
+            r"C:\Users\me\a file with spaces.md",
+        ],
+    )
+    def test_accepts_windows_absolute(self, path):
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Drive-relative: resolves against a per-drive working directory the
+            # caller cannot see, so its target is not the path it appears to name.
+            r"C:notes.md",
+            # NTFS alternate data stream: reads a different byte stream than the
+            # file the path appears to name. ':' is confined to the drive prefix
+            # precisely so this stays refused.
+            r"C:\Users\me\notes.md:hidden",
+            # A bare relative path is still refused -- the endpoints that accept
+            # relative input rewrite it to absolute via _resolve_project_relative
+            # under resolve=1, ahead of this gate.
+            "src/main.py",
+            # A prefix alone names a root, not a file.
+            "/",
+            "C:\\",
+            # The three C0 controls that survive sanitize_string, each of which
+            # splits a log line the path is later written into.
+            "/tmp/a\nb",
+            "/tmp/a\rb",
+            "/tmp/a\tb",
+        ],
+    )
+    def test_refuses(self, path):
+        assert not self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "/tmp/a\x00b",
+            "/tmp/a\x1b[2Jb",
+            "/tmp/a\x7fb",
+            # C1: a UTF-8 terminal decodes U+0085 as NEL and U+009B as an 8-bit
+            # CSI, the same escape-injection hazard as ESC. They are inside the
+            # denylist's range and are also stripped here, like ESC and DEL.
+            "/tmp/a\x85b",
+            "/tmp/a\x9bb",
+            "/tmp/a\x80b",
+            "/tmp/a\x9fb",
+        ],
+    )
+    def test_other_control_characters_never_reach_the_gate(self, raw):
+        # sanitize_string runs first and drops every control character except
+        # \n, \r and \t, so those three are all the pattern has to refuse. The
+        # denylist still spells out the whole C0 + DEL + C1 range: the day
+        # sanitization is scoped or reordered, the gate must not be the layer
+        # that widened. No filesystem name legitimately holds a control
+        # character, so the wider range refuses nothing a caller wants.
+        cleaned = sanitize_string(raw)
+        assert not any(ch in cleaned for ch in "\x00\x1b\x7f\x85\x9b\x80\x9f")
+        assert self._accepts(cleaned)
+
+    def test_write_schema_shares_the_same_gate(self):
+        # One pattern object backs both schemas, so they cannot drift apart.
+        validate_tool_args({"path": r"C:\Users\me\notes.md", "content": "x"}, FILE_WRITE_SCHEMA)
+        with pytest.raises(ValidationError):
+            validate_tool_args({"path": r"C:notes.md", "content": "x"}, FILE_WRITE_SCHEMA)

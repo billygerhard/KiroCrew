@@ -17,11 +17,11 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.apps.builtins.meetings.backend import calendar_sync
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.providers import calendar as cal
 from kiro_crew.apps.builtins.meetings.backend.routes._common import (
-    audit,
     data_root,
     query_int,
 )
@@ -43,12 +43,19 @@ def _read_cached_calendar(root: Any) -> tuple[dict[str, Any], list[dict[str, Any
 
 
 async def handle_get_calendar(request: web.Request) -> web.Response:
-    """The last successful sync's events, straight from the cache."""
+    """The last successful sync's events, straight from the cache.
+
+    Each event is normalized to carry ``all_day``: a cache written before the
+    field existed lacks the key, and the frontend's wire type declares it
+    required. All-day-ness is not recoverable from a stale row (midnight alone
+    cannot prove it), so a legacy row normalizes to ``false`` and renders as a
+    timed event until the next sync rewrites the cache with real flags.
+    """
     config, events = await asyncio.to_thread(_read_cached_calendar, data_root(request))
     calendar_cfg = config.get("calendar") or {}
     return web.json_response(
         {
-            "events": events,
+            "events": [{**event, "all_day": bool(event.get("all_day"))} for event in events],
             "provider": calendar_cfg.get("provider", k.DEFAULT_CALENDAR_PROVIDER),
             "configured": bool(calendar_cfg.get("source")),
         }
@@ -67,24 +74,12 @@ async def handle_calendar_sync(request: web.Request) -> web.Response:
     """
     root = data_root(request)
     days = query_int(request, "days", default=k.CALENDAR_SYNC_DAYS, low=1, high=365)
-    # Two hops rather than one grouped helper: the fetch between them is an
-    # `await`, so the read and the write cannot share a thread. They touch
-    # different files, so there is no read-modify-write to keep atomic.
-    config = await asyncio.to_thread(store.read_config, root)
-    calendar_cfg = config.get("calendar") or {}
-    provider = cal.get_calendar_provider(
-        str(calendar_cfg.get("provider") or ""), str(calendar_cfg.get("source") or "")
-    )
-
+    # The fetch-and-cache itself lives in `calendar_sync`, shared with the
+    # background poller, so a manual Sync and a scheduled one are the same sync.
     try:
-        events = await provider.fetch(days=days)
+        provider_id, payload = await calendar_sync.sync_calendar(root, days=days)
     except cal.CalendarError as exc:
-        audit("meetings.calendar_sync", provider.provider_id, outcome="error", error=str(exc))
         return web.json_response({"ok": False, "error": str(exc), "code": "calendar_sync_failed"}, status=502)
-
-    payload = [event.to_dict() for event in events]
-    await asyncio.to_thread(store.write_calendar_cache, payload, root)
-    audit("meetings.calendar_sync", provider.provider_id, outcome="ok")
     return web.json_response(
-        {"ok": True, "count": len(payload), "events": payload, "provider": provider.provider_id}
+        {"ok": True, "count": len(payload), "events": payload, "provider": provider_id}
     )

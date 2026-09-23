@@ -1,4 +1,4 @@
-"""Tests for deploy Round 29 fixes: pod real-deploy bugs.
+"""Deploy-path pod real-deploy bugs.
 
 F1: _allowed_local_roots includes config_dir workspace + registered workspaces
 F2: Boundary preflight + dead-stack detection in deploy-backend.sh / install-reaper.sh
@@ -8,13 +8,24 @@ F5: SKILL.md metadata-backfill ordering note
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+from yaml_helpers import load_with
 
+from conftest import _find_posix_test_shell
 from kiro_crew.deploy import handlers
+
+
+def _bash():
+    shell = _find_posix_test_shell() if os.name == "nt" else shutil.which("bash")
+    assert shell, "Syntax checks require native Git Bash on Windows or Bash on POSIX"
+    return shell
+
 
 SCRIPTS_DIR = (
     Path(__file__).parent.parent
@@ -142,7 +153,8 @@ class TestF2BoundaryPreflight:
         """bash -n validates script syntax."""
         script = SCRIPTS_DIR / script_name
         result = subprocess.run(
-            ["bash", "-n", str(script)], capture_output=True, text=True
+            [_bash(), "-n", str(script)],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
         assert result.returncode == 0, f"bash -n failed for {script_name}: {result.stderr}"
 
@@ -176,7 +188,7 @@ def _load_cfn_yaml(path: Path) -> dict:
     )
 
     with open(path) as f:
-        return yaml.load(f, Loader=CfnLoader)
+        return load_with(CfnLoader, f)
 
 
 class TestF3IdentitySourceList:

@@ -13,9 +13,16 @@ superseded-by: []
 ---
 # RFC: Config System, Named Memory Stores & Plugin Architecture
 
+> **Current behaviour: see [`../system-specs/modules/config.md`](../system-specs/modules/config.md)**
+> and [`../system-specs/modules/memory-skills-hooks.md`](../system-specs/modules/memory-skills-hooks.md),
+> which own the shipped configuration and memory contracts. Phase 3 did not ship
+> as written: Global Memory remains V1, while explicitly created Crew Members
+> receive isolated V2 stores with immutable member/store identities. Treat the
+> concrete Phase 3 paths, query parameter, and migration plan below as historical.
+
 **Author:** KiroCrew contributors  
 **Date:** 2026-03-25 (rev 2: 2026-03-25)  
-**Status:** partial — Phases 1 and 2 are verifiably on main (schema registry + `/api/config/schema`; `WorkspaceConfig`, `MemoryStoreConfig`, `resolve_agent_bindings` with seven real callers, auto-migration). Phase 3 is half-built: the markdown/lesson layer is store-scoped, but **per-store `memory.db`/`memory.faiss` isolation was affirmatively reversed** by commit `7d1ff74e`, which shares one `VectorMemoryStore` across all stores — this doc's Phase 3 text is stale on that point. Phase 4 (`MemoryBackend` / `EmbeddingBackend` plugin entry points) is unstarted. Two deviations: the merge shipped as `resolve_memory_store_config`, not `resolve_effective_config`, and per-workspace `agent` overrides were never built.
+**Status:** partial — Phases 1–2 are implemented in `config/sections.py`, `config/loader.py`, and `memory_stores.py`. Current member-memory routing is captured in `execution_context.py` and carried by sessions, runs, and scheduled jobs; owner-authorized dashboard reads use `?store=`, while agent and MCP recall derive the store from the trusted execution context. Phase 4 is partial: `embeddings.py` provides `EmbeddingBackend` and `register_embedding_backend()`, but there is no `MemoryBackend` or per-store backend plugin system. Per-workspace agent overrides and `resolve_effective_config` were not implemented.
 **Branches:** both named below are **gone** — neither `feat/workspace-scoped-vector-memory` nor `config-standarize-` exists on the remote; Phases 1–2 landed via the pre-fork import commit `64e47961`.
 **Branch (parked):** `feat/workspace-scoped-vector-memory`  
 **Branch (active):** `config-standarize-`
@@ -280,7 +287,7 @@ Store resolution at session start:
 
 **Memory boundary permeability (addressing review comment):** Memory stores are soft boundaries, not hard walls. The default behavior is isolation — each store has its own SQLite DB and FAISS index. But cross-store access is possible:
 
-- **Read-through:** an agent can explicitly query another store via API (`GET /api/memory/semantic?memory_store=oncall-knowledge`). This is opt-in per request, not automatic.
+- **Read-through:** an agent can explicitly query another store via API (`GET /api/memory/semantic?memory_store=oncall-knowledge`). This is opt-in per request, not automatic. **What shipped inverts this bullet, deliberately: the parameter is `?store=` and an AGENT cannot use it at all.** Naming a store requires the dashboard owner's identity, which kiro-cli, the MCP servers and subagents do not have; the content API serves the global store when the parameter is absent. Agent lessons follow a named session binding only with verified internal authentication (or dashboard-owner identity). See [security](../system-specs/modules/security.md) before proposing a permeable read-through again.
 - **ConversationLog stays global** — sessions already track their store in metadata. Cross-store history search works. Consolidation writes to the session's designated store.
 - **Lessons are global by default** — `lesson.*` keys live in a shared store (or all stores, TBD). Corrections like "always use snake_case" apply everywhere.
 - **Future: cross-store search** — a query could fan out to multiple stores with results merged and ranked. Not in Phase 3 scope, but the architecture doesn't block it.

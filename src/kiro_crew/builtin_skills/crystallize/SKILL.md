@@ -26,13 +26,21 @@ the work is worth keeping.
 
 - The user says any trigger phrase above (candidate mode), or explicitly asks
   for a "live" / "active" skill (live mode).
-- The session contains a **non-trivial, reusable procedure** — a multi-step
-  workflow, a debugging path for a class of error, a fixed command/API
-  sequence, or a research-synthesis flow — that a future session would benefit
-  from.
+- The session demonstrated a procedure that will **recur** — one a future
+  session, working on a DIFFERENT target, would run again substantially
+  unchanged: a repeatable debugging method for a class of error, a fixed
+  command/API sequence, a verification technique, a research-synthesis flow.
 
-Do **not** crystallize a trivial one-shot answer, a one-off failure, or a
-session that touched credentials / sensitive paths.
+Apply the same recurrence test the automatic pass uses: name the future session
+that would load this skill and the different target it would run against. If the
+only honest answer reuses this session's own artifact — this bug, this file,
+this component, this one question — the procedure does not recur. Effort is not evidence of recurrence: a long, many-step, genuinely difficult session is still one-off if its steps were chosen for one target.
+
+Do **not** crystallize a task done once and now finished (a specific bug's fix,
+a one-time audit or trace of one component, a migration, a probe run to answer a
+question that is now answered), a design or planning discussion, a narrative of
+what happened in this session, a trivial one-shot answer, a one-off failure, or
+a session that touched credentials / sensitive paths. Being asked does not make a one-off reusable — but the call is the user's, not yours. When the session carries no recurring procedure, say so and name what makes it one-off, then let them decide; if they still want it captured, crystallize it. Never silently decline a direct request.
 
 ## Procedure
 
@@ -71,7 +79,9 @@ session that touched credentials / sensitive paths.
    **(a) Candidate — the default.** For "crystallize", "create a skill",
    "save this as a skill", "make this reusable" and every other phrasing, stage
    to the pending queue so a human approves before anything loads. Create
-   `<skills-dir>/auto/.pending/<slug>/` (`<slug>` kebab-case, 3–60 chars) with
+   `<skills-dir>/auto/.pending/<slug>/` (`<slug>` kebab-case, 3–64 chars,
+   starting and ending with a letter or digit — a name outside that shape is
+   silently skipped by the pending list and cannot be approved) with
    `SKILL.md`:
 
    ```
@@ -100,38 +110,35 @@ session that touched credentials / sensitive paths.
    shows blank in **Skills → Pending review** and dedup loses its match data:
    `{"slug": "<slug>", "name": "auto/<slug>", "source": "crystallize",
    "created_at": "<ISO>", "description": "...", "triggers": "...",
-   "has_scripts": <bool>, "scripts": [...]}`.
+   "has_scripts": <bool>, "scripts": [...], "kind": "new"}`.
    Only `scripts/` is conditional: if you generated a script, put it under
    `scripts/<name>.py` in that folder, set `"has_scripts": true`, and list it in
    `scripts`; for a prose-only candidate use `"has_scripts": false, "scripts": []`.
 
-   **(b) Live — ONLY on an explicit "create a live skill" / "create an active
-   skill".** The user must actually say "live" or "active" (or confirm it when
-   asked) — never take this path by inference. Write directly to a top-level
-   live directory `<skills-dir>/<slug>/SKILL.md` — no `auto/` prefix, no
-   `.meta.json`, no pending stage — using this frontmatter:
+   **Freshening an existing live auto-skill is an UPDATE candidate, not a new
+   one.** Same pending folder, but set `"kind": "update"`, `"target":
+   "<the live slug>"` and `"base_version": "<the version you merged from>"`.
+   Approving an update snapshots the live file to
+   `auto/<slug>/.versions/v<N>-SKILL.md` before overwriting it and keeps the 20
+   newest snapshots, so the human can roll back.
 
-   ```
-   ---
-   name: <slug>
-   description: <=150 chars, starts with a verb
-   triggers: <3-8 comma-separated keywords/phrases>
-   source: crystallize
-   ---
+   Staging a candidate whose slug is already PENDING is safe: the loader claims a
+   distinct slug (`<slug>-2`, `<slug>-3`, …) and stages beside the existing
+   candidate rather than overwriting it. That guard covers the pending path only —
+   the live path in (b) has none.
 
-   # <slug>
+   **(b) Live: ONLY when the user explicitly says "live" / "active" or confirms
+   it when asked.** Write `<skills-dir>/<slug>/SKILL.md` directly, with no
+   `auto/` prefix, `.meta.json`, or pending stage.
 
-   ## When to use
-   ...
-   ## Steps
-   ...
-   ## Gotchas
-   ...
-   ```
+   Reuse (a)'s template with `name: <slug>`, `source: crystallize`, and title
+   `# <slug>`; omit `session_key` and `created_at`. Keep the same description,
+   triggers, and When to use / Steps / Gotchas sections.
 
    **Do not overwrite an existing skill:** if `<skills-dir>/<slug>/` already
    exists (a live or builtin skill), pick a different slug or ask the user —
-   the live path has no collision guard, so writing blindly clobbers it. Put
+   the live path has no collision guard, so writing blindly clobbers it, and
+   unlike the pending path nothing claims a distinct slug for you. Put
    any script under `scripts/<name>.py` and, since no approval step runs for
    you, mark it executable yourself — on POSIX, `chmod +x`; skip that on
    Windows, where the executable bit is a no-op.

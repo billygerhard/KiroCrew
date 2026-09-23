@@ -1,16 +1,23 @@
 /**
- * Test: the sidebar PR/MR chip is a real link.
+ * Test: the sidebar PR / issue chip opens the pull request IN THE APP.
  *
- * The chip is an <a> that opens the pull request in a new tab, so the PR it
- * names is reachable from the sidebar. Because the session row itself is a
- * click-to-switch button, the anchor must also stop the click from bubbling —
- * otherwise opening the PR would switch sessions at the same time.
+ * The chip used to leave for the provider's website in a new tab. It now
+ * switches to the session it belongs to and asks the consumer to reveal the link
+ * in that session's side panel (`onOpenSource`), so a PR is read without leaving
+ * the dashboard.
+ *
+ * The chip is still a real anchor with a real href, and four cases deliberately
+ * fall through to plain link navigation instead — each pinned below:
+ *   - no `onOpenSource` (a surface with no side panel: the sessions embed)
+ *   - a modifier click (the user explicitly asked for a new tab)
+ *   - offline (the panel loads a PR through the LOCAL provider CLI)
+ * plus the row-switch it must never trigger by bubbling.
  *
  * Mock setup mirrors ChatSidebar.offline.test.tsx: the chat slice's switchSlot
  * thunk is mocked so we can assert whether a click reached the row handler.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, createEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -55,21 +62,36 @@ import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
 
 const PR_URL = 'https://github.com/kirodotdev/KiroCrew/pull/634'
+const ISSUE_URL = 'https://github.com/kirodotdev/KiroCrew/issues/701'
+/** The chip on the session that is ALREADY active. */
+const ACTIVE_PR_URL = 'https://github.com/kirodotdev/KiroCrew/pull/12'
 
 const slots = [
-  { key: 's1', title: 'Other', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z' },
+  {
+    key: 's1', title: 'Active', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+    source_links: [{ provider: 'github', number: 12, label: '#12', url: ACTIVE_PR_URL, state: 'open', kind: 'change' }],
+    source_links_total: 1,
+  },
   {
     key: 's2', title: 'PR session', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
-    source_links: [{ provider: 'github', number: 634, url: PR_URL, state: 'open', ci: 'passed' }],
-    source_links_total: 1,
+    source_links: [
+      { provider: 'github', number: 634, label: '#634', url: PR_URL, state: 'open', ci: 'passed' },
+      { provider: 'github', number: 701, label: '#701', url: ISSUE_URL, kind: 'issue' },
+    ],
+    source_links_total: 2,
   },
 ] as unknown as ChatSlot[]
 
-function renderSidebar(rows: ChatSlot[] = slots) {
+function renderSidebar(opts: {
+  onOpenSource?: (slot: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
+  connected?: boolean
+  rows?: ChatSlot[]
+} = {}) {
+  const rows = opts.rows ?? slots
   const store = createTestStore({
     dashboard: {
       status: { platform: 'darwin' },
-      connected: true,
+      connected: opts.connected ?? true,
       slots: rows,
       approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
@@ -96,6 +118,7 @@ function renderSidebar(rows: ChatSlot[] = slots) {
             <ChatSidebar
               slots={rows} activeSlot={'s1'} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent={'default'} installedAgents={[]}
+              onOpenSource={opts.onOpenSource}
             />
           </MemoryRouter>
         </ThemeProvider>
@@ -104,13 +127,31 @@ function renderSidebar(rows: ChatSlot[] = slots) {
   )
 }
 
-const chip = () => screen.getByTitle(`Open ${PR_URL}`)
+/** The chip's title now names the panel and the modifier escape hatch. Built
+ *  here rather than matched loosely, so the tooltip's promise is asserted too.
+ *  `platformShortcut` is deterministic under jsdom: navigator.platform is '',
+ *  so the non-mac branch yields 'Ctrl+click'. */
+const chipTitle = (url: string) => `Open ${url} in the side panel (Ctrl+click to open it in the browser)`
+const chip = (url = PR_URL) => screen.getByTitle(chipTitle(url))
+/** Click and report whether the anchor's own navigation was suppressed. */
+const clickChip = (el: HTMLElement, init?: MouseEventInit): boolean => {
+  const event = createEvent.click(el, init)
+  fireEvent(el, event)
+  return event.defaultPrevented
+}
+/** The consumer took the link (the normal case). */
+const took = () => vi.fn(() => true)
 
-describe('ChatSidebar – PR chip link', () => {
-  beforeEach(() => switchSlotMock.mockClear())
+describe('ChatSidebar – PR chip', () => {
+  beforeEach(() => {
+    switchSlotMock.mockClear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
 
-  it('renders the chip as an anchor that opens the pull request in a new tab', () => {
-    renderSidebar()
+  it('is still an anchor carrying the provider url', () => {
+    // Link semantics are load-bearing for the fall-through cases below, for
+    // "Copy link address", and for assistive tech.
+    renderSidebar({ onOpenSource: took() })
     const a = chip()
     expect(a.tagName).toBe('A')
     expect(a).toHaveAttribute('href', PR_URL)
@@ -119,17 +160,84 @@ describe('ChatSidebar – PR chip link', () => {
     expect(a).toHaveTextContent('#634')
   })
 
-  it('clicking the chip does NOT switch sessions, while clicking the row still does', () => {
-    renderSidebar()
+  it('switches to the chip\'s session and reveals the pull request in the panel', () => {
+    const onOpenSource = took()
+    renderSidebar({ onOpenSource })
+    expect(clickChip(chip())).toBe(true) // no navigation to github.com
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 's2', announceOnMissing: true })
+    expect(onOpenSource).toHaveBeenCalledWith('s2', { url: PR_URL, kind: 'change' })
+  })
+
+  it('reports an issue chip as kind "issue" so the Issues tab is opened', () => {
+    const onOpenSource = took()
+    renderSidebar({ onOpenSource })
+    expect(clickChip(chip(ISSUE_URL))).toBe(true)
+    expect(onOpenSource).toHaveBeenCalledWith('s2', { url: ISSUE_URL, kind: 'issue' })
+  })
+
+  it('does not re-switch when the chip is on the session already open', () => {
+    // Re-dispatching switchSlot for the active slot refetches the transcript and
+    // flashes the loading state for nothing.
+    const onOpenSource = took()
+    renderSidebar({ onOpenSource })
+    expect(clickChip(chip(ACTIVE_PR_URL))).toBe(true)
+    expect(switchSlotMock).not.toHaveBeenCalled()
+    expect(onOpenSource).toHaveBeenCalledWith('s1', { url: ACTIVE_PR_URL, kind: 'change' })
+  })
+
+  it('never lets a chip click reach the row underneath', () => {
+    renderSidebar({ onOpenSource: took() })
     // Positive control first: the row handler IS reachable in this harness, so
     // the negative assertion below is meaningful and not vacuous.
     const row = chip().closest('.session-row') as HTMLElement
     fireEvent.click(row)
-    expect(switchSlotMock).toHaveBeenCalledWith('s2')
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 's2', announceOnMissing: true })
 
+    // A chip click switches to s2 exactly once — via the chip, not by bubbling
+    // (which would fire the row handler on top of it).
     switchSlotMock.mockClear()
-    fireEvent.click(chip())
+    clickChip(chip())
+    expect(switchSlotMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('lets a modifier click through to the provider in a new tab', () => {
+    const onOpenSource = took()
+    renderSidebar({ onOpenSource })
+    for (const modifier of ['metaKey', 'ctrlKey', 'shiftKey', 'altKey'] as const) {
+      expect(clickChip(chip(), { [modifier]: true })).toBe(false)
+    }
+    expect(onOpenSource).not.toHaveBeenCalled()
     expect(switchSlotMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the provider link on a surface with no side panel', () => {
+    // `onOpenSource` omitted — the /embed/sessions list has no panel to reveal into.
+    renderSidebar()
+    expect(clickChip(chip())).toBe(false)
+    expect(switchSlotMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the provider link while the gateway is offline', () => {
+    // The panel loads a PR through the local provider CLI, so with the gateway
+    // down the provider's own page is the only thing that can answer.
+    const onOpenSource = took()
+    renderSidebar({ onOpenSource, connected: false })
+    expect(clickChip(chip())).toBe(false)
+    expect(onOpenSource).not.toHaveBeenCalled()
+    expect(switchSlotMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the provider link when the panel cannot resolve the url', () => {
+    // The panel re-parses the url against ITS OWN host allowlist, which is loaded
+    // from dashboard config and is empty until that query resolves — so a
+    // self-hosted chip the backend scan accepted can still be unresolvable here.
+    // Suppressing navigation on that path would make the click do nothing at all.
+    const onOpenSource = vi.fn(() => false)
+    renderSidebar({ onOpenSource })
+    expect(clickChip(chip())).toBe(false)
+    // Asked, declined, and handed back to the anchor — not skipped like the
+    // offline/no-panel cases above.
+    expect(onOpenSource).toHaveBeenCalledWith('s2', { url: PR_URL, kind: 'change' })
   })
 })
 
@@ -153,12 +261,12 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
         key: 's2', title: 'PR states', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
         source_links: [
           // Every chip carries ci: 'running' so the ONLY variable is `state`.
-          { provider: 'github', number: 993, url: url(993), state: 'closed', ci: 'running' },
-          { provider: 'github', number: 994, url: url(994), state: 'merged', ci: 'running' },
-          { provider: 'github', number: 995, url: url(995), state: 'open', ci: 'running' },
+          { provider: 'github', number: 993, label: '#993', url: url(993), state: 'closed', ci: 'running' },
+          { provider: 'github', number: 994, label: '#994', url: url(994), state: 'merged', ci: 'running' },
+          { provider: 'github', number: 995, label: '#995', url: url(995), state: 'open', ci: 'running' },
           // No `state` at all: the provider status has not been read yet, which
           // is NOT terminal — CI must still render.
-          { provider: 'github', number: 996, url: url(996), ci: 'running' },
+          { provider: 'github', number: 996, label: '#996', url: url(996), ci: 'running' },
         ],
         source_links_total: 4,
       },
@@ -166,18 +274,18 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
   }
 
   const spinner = (n: number) =>
-    screen.getByTitle(`Open ${url(n)}`).querySelector('[aria-label="Checks running"]')
+    chip(url(n)).querySelector('[aria-label="Checks running"]')
 
   it.each([
     ['closed', 993],
     ['merged', 994],
   ])('hides the running-checks spinner on a %s chip', (_state, number) => {
-    renderSidebar(stateRows())
-    expect(spinner(number)).toBeNull()
+    renderSidebar({ rows: stateRows() })
+    expect(spinner(number as number)).toBeNull()
   })
 
   it('still shows the spinner while the PR is live or its state is unknown', () => {
-    renderSidebar(stateRows())
+    renderSidebar({ rows: stateRows() })
     // Positive control: proves the fixture really does carry ci: 'running' and
     // the assertions above are not passing because nothing rendered.
     expect(spinner(995)).not.toBeNull()
@@ -185,10 +293,30 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
   })
 
   it('keeps the closed chip\'s own lifecycle label', () => {
-    renderSidebar(stateRows())
+    renderSidebar({ rows: stateRows() })
     // The spinner goes away; the terminal signal must not.
-    expect(screen.getByTitle(`Open ${url(993)}`)).toHaveTextContent('closed')
-    expect(screen.getByTitle(`Open ${url(994)}`).querySelector('[aria-label="Merged"]')).not.toBeNull()
+    expect(chip(url(993))).toHaveTextContent('Closed')
+    expect(chip(url(994)).querySelector('[aria-label="Merged"]')).not.toBeNull()
+  })
+
+  it('renders the closed label from the catalog, not the raw wire value', () => {
+    // The chip used to print the raw wire value `link.state` ("closed"),
+    // untranslated in every locale, cased by a CSS `capitalize`, and invisible
+    // to assistive tech under any other language. It now renders the catalog
+    // string as real text, so the anchor's accessible name carries the
+    // translated label with no extra ARIA. The span deliberately has no
+    // `title`: a child title would shadow the anchor's own tooltip (the URL
+    // and the modifier escape hatch) for the region the word covers.
+    renderSidebar({ rows: stateRows() })
+    const chipEl = chip(url(993))
+    const label = Array.from(chipEl.querySelectorAll('span'))
+      .find(s => s.textContent === 'Closed') as HTMLElement
+    expect(label).toBeDefined()
+    // The catalog, not a CSS `capitalize` over the wire value, decides casing.
+    expect(label.classList.contains('capitalize')).toBe(false)
+    expect(label).not.toHaveAttribute('title')
+    // The anchor's accessible name (its text content) includes the label.
+    expect(chipEl).toHaveAccessibleName(/Closed/)
   })
 
   it.each(['passed', 'failed'] as const)('hides a %s CI glyph on a closed chip too', (ci) => {
@@ -196,13 +324,178 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
       { key: 's1', title: 'Other', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z' },
       {
         key: 's2', title: 'PR states', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
-        source_links: [{ provider: 'github', number: 993, url: url(993), state: 'closed', ci }],
+        source_links: [{ provider: 'github', number: 993, label: '#993', url: url(993), state: 'closed', ci }],
         source_links_total: 1,
       },
     ] as unknown as ChatSlot[]
-    renderSidebar(rows)
-    const chipEl = screen.getByTitle(`Open ${url(993)}`)
+    renderSidebar({ rows })
+    const chipEl = chip(url(993))
     expect(chipEl.querySelector('[aria-label="Checks passed"]')).toBeNull()
     expect(chipEl.querySelector('[aria-label="Checks failed"]')).toBeNull()
+  })
+
+  /**
+   * The pending-CI glyph must be STATIC. An animated spinner on a session card
+   * reads as "the agent is working on this session" — users conflated PR check
+   * status with session activity. Motion on the card is reserved for session
+   * activity; PR-pending is a still amber dot (the provider's own convention).
+   */
+  it('renders pending CI as a static glyph, not a spinner', () => {
+    renderSidebar({ rows: stateRows() })
+    const glyph = spinner(995)
+    expect(glyph).not.toBeNull()
+    expect(glyph!.classList.contains('animate-spin')).toBe(false)
+    expect(glyph!.className.baseVal ?? glyph!.className).not.toMatch(/animate/)
+  })
+})
+
+/**
+ * A chip whose branch cannot merge must not read as "ready".
+ *
+ * The green check answers "did the checks pass", which a conflicted pull request
+ * can satisfy while being unmergeable — so a chip gated on the rollup alone reads
+ * "ready" on work that needs a rebase. The merge pair the backend already ships
+ * (`mergeable` / `mergeStateStatus`, owner-gated like `ci`) is what settles it.
+ *
+ * These cases pin the PRECEDENCE, which is the whole design: exactly one glyph
+ * renders, and a failed rollup outranks a conflict — with both blockers live the
+ * worse outcome is the one worth showing.
+ */
+describe('ChatSidebar – conflicted PR chips', () => {
+  const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
+
+  /** One chip carrying exactly the merge/CI combination under test. */
+  function chipRows(link: Record<string, unknown>): ChatSlot[] {
+    return [
+      { key: 's1', title: 'Other', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z' },
+      {
+        key: 's2', title: 'PR', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+        source_links: [{ provider: 'github', number: 700, label: '#700', url: url(700), state: 'open', ...link }],
+        source_links_total: 1,
+      },
+    ] as unknown as ChatSlot[]
+  }
+
+  const glyph = (label: string) => chip(url(700)).querySelector(`[aria-label="${label}"]`)
+
+  it.each([
+    // GitHub settles the two fields independently, so either one alone is a real
+    // conflict answer: a poll can land `dirty` while `mergeable` is still unknown.
+    ['both merge fields', { mergeable: 'conflicting', mergeStateStatus: 'dirty' }],
+    ['mergeable alone', { mergeable: 'conflicting' }],
+    ['mergeStateStatus alone', { mergeable: 'unknown', mergeStateStatus: 'dirty' }],
+  ])('replaces the passing check with a conflict glyph — %s', (_case, merge) => {
+    renderSidebar({ rows: chipRows({ ci: 'passed', ...merge }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+    // The defect itself: a green check on a branch that cannot land.
+    expect(glyph('Checks passed')).toBeNull()
+  })
+
+  it('shows the failed rollup, not the conflict, when both are live', () => {
+    renderSidebar({ rows: chipRows({ ci: 'failed', mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Checks failed')).not.toBeNull()
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+
+  it('outranks a pending rollup', () => {
+    // Pending is not a verdict; a settled conflict is.
+    renderSidebar({ rows: chipRows({ ci: 'running', mergeable: 'conflicting' }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+    expect(glyph('Checks running')).toBeNull()
+  })
+
+  it('renders on a chip with no rollup at all', () => {
+    // The backend records the merge pair independently of `ci` (each field lands
+    // only once the provider settles it), so a conflict can arrive before any
+    // rollup does. That chip carried no status glyph, which is the same thing it
+    // showed while genuinely mergeable.
+    renderSidebar({ rows: chipRows({ mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Merge conflicts')).not.toBeNull()
+  })
+
+  it.each([
+    // Positive control: proves the fixture and selector work, so the negative
+    // cases below are not passing because nothing rendered.
+    ['a clean branch', { mergeable: 'mergeable', mergeStateStatus: 'clean' }],
+    // `blocked` is the normal state of every open PR on a repo with required
+    // reviews — flagging it would decorate the whole session list and mean nothing.
+    ['a branch blocked on required reviews', { mergeable: 'mergeable', mergeStateStatus: 'blocked' }],
+    // A branch merely behind base still merges; only conflicts are flagged here.
+    ['a behind-base branch', { mergeable: 'mergeable', mergeStateStatus: 'behind' }],
+    // Non-owner clients and payloads predating the merge pair send neither field.
+    ['a payload with no merge fields', {}],
+  ])('keeps the passing check on %s', (_case, merge) => {
+    renderSidebar({ rows: chipRows({ ci: 'passed', ...merge }) })
+    expect(glyph('Checks passed')).not.toBeNull()
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+
+  it.each(['merged', 'closed'])('suppresses the conflict glyph on a %s chip', (state) => {
+    // Terminal states share the CI gate: the providers stop answering the merge
+    // pair, so a carried-forward value must not outlive the lifecycle glyph.
+    renderSidebar({ rows: chipRows({ state, ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
+    expect(glyph('Merge conflicts')).toBeNull()
+  })
+})
+
+describe('ChatSidebar – chip label and provider mark', () => {
+  /** A payload naming a provider this build does not know.
+   *
+   *  Cast because `provider` is typed as the three the serializer produces
+   *  today — which is the point: the type is an assertion about the server, not
+   *  a guarantee about the bytes, and the chip has to stay honest when the two
+   *  disagree. */
+  const foreignRows = [
+    {
+      key: 's1', title: 'Foreign review', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+      source_links: [
+        { provider: 'acme-review', number: 4821, label: 'CR-4821', url: 'https://review.acme.internal/c/4821', state: 'open', kind: 'change' },
+      ],
+      source_links_total: 1,
+    },
+  ] as unknown as ChatSlot[]
+
+  it('renders an unknown provider with a neutral mark, never a vendor logo', () => {
+    // The regression this pins: both mark and label used GitLab as their
+    // implicit `else`, so a chip from any other review system wore GitLab's
+    // tanuki and GitLab's `!` numbering. Misattributing one vendor's work to
+    // another is the one thing a wayfinding chip must not do.
+    renderSidebar({ rows: foreignRows })
+    const el = chip('https://review.acme.internal/c/4821')
+    expect(el.querySelector('[data-provider-mark="gitlab"]')).toBeNull()
+    expect(el.querySelector('[data-provider-mark="github"]')).toBeNull()
+    expect(el.querySelector('[data-testid="jira-provider-mark"]')).toBeNull()
+    expect(el).toHaveTextContent('CR-4821')
+    expect(el).not.toHaveTextContent('!4821')
+  })
+
+  it('keeps each known provider on its own mark', () => {
+    renderSidebar()
+    expect(chip().querySelector('[data-provider-mark="github"]')).not.toBeNull()
+    expect(chip().querySelector('[data-provider-mark="gitlab"]')).toBeNull()
+  })
+
+  /** A payload with no `label` at all: this bundle talking to a gateway that
+   *  predates the field. The chip must still name the object rather than
+   *  printing `undefined`, which is the failure mode that made `kind` optional
+   *  on the wire in the first place. */
+  const unlabelledRows = [
+    {
+      key: 's1', title: 'Older gateway', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+      source_links: [
+        { provider: 'jira', number: 123, repo: 'PROJ', url: 'https://acme.atlassian.net/browse/PROJ-123', kind: 'issue' },
+      ],
+      source_links_total: 1,
+    },
+  ] as unknown as ChatSlot[]
+
+  it('falls back to #number when the payload carries no label', () => {
+    renderSidebar({ rows: unlabelledRows })
+    const el = screen.getByTestId('session-issue-chip-123')
+    expect(el).toHaveTextContent('#123')
+    expect(el.textContent).not.toContain('undefined')
+    // The fallback stays generic on purpose: reaching for `repo` here would be
+    // a second copy of the naming rule, which is what this change removes.
+    expect(el).not.toHaveTextContent('PROJ-123')
   })
 })
