@@ -506,8 +506,68 @@ made; no gate reads it back. Two consumers:
 
 Spawn flow:
 1. **YOLO mode**: skips approval, runs immediately
-2. **Parent trusted**: parent session has `approval_policy="auto"` (set by
-   dashboard trust toggle) → skips approval, runs immediately
+2. **Parent trusted**: the session at the ROOT of the spawn tree has
+   `approval_policy="auto"` (set by dashboard trust toggle) → skips approval,
+   runs immediately. The root is captured once on the spawn's first entry via
+   `SubagentManager.root_session_key`, which follows `subagent:<id>` parent
+   links to the chat, cron or channel key that started the tree, so a subagent
+   spawning its own subagent inherits the chat's trust at any depth; a
+   non-subagent parent is its own root. A `subagent:<id>` key names a
+   CONVERSATION shared by the original run and every continuation, and a
+   request under it cannot say which of them sent it, so the answer never
+   depends on which run is live: every record of the conversation carries the
+   same `conversation_root_session_key`, fixed by the run that founded it. A
+   continuation from a different root marks the conversation contested, and a
+   contested conversation resolves to `contested:<key>` -- a marker that is no
+   session key, which the trust lookup (`root_approval_policy`) refuses
+   outright and no tab shows; its prompts reach the global approvals feed
+   only. The same marker covers a conversation whose founding chat cannot be
+   established -- no readable record, a pre-stamp nested record, or a founder
+   that was no chat -- so the one state sentence is written to be true for
+   every case (`This run has no single owning chat`) rather than asserting a
+   second chat. Each keeps the ask as its title (`spawn_run(...)`, `shell(...)`) and
+   writes its purpose -- the feed card's body -- in the words of what the user
+   did: on the spawn prompt the state `CONTESTED_PROMPT_STATE` (`This run has
+   no single owning chat`) with its why as a clause -- so the card's two lines
+   say what the prompt is -- then the remedy `CONTESTED_PROMPT_REMEDY` (`Start
+   this task again from a single chat, or approve this request`, the safe
+   action first, the object named) (`contested_spawn_note`); on a tool prompt the state with the why as a clause, the tool's own purpose -- led with "The run says:" and set as a quote, so the untrusted run's claim never reads as the system's -- and the remedy last, as three paragraphs -- whole in Review, off the card's two lines (`contested_tool_note`, applied by the run loop
+   through `_label_contested_prompt`), so an entry says what is asked, why it
+   has no chat and what to do, whichever prompt it is; the dashboard's feed
+   card puts the purpose ahead of the command for a subagent prompt that
+   arrives with no slot (`approvalNotificationBody(..., { purposeFirst })`),
+   so the why is on the card and not only in Review. Runs
+   admitted beneath the conversation carry the
+   marker in their own stamps, so the refusal outlives the records that
+   established it. The founding root also outlives the records: admission
+   writes it into the run's `state.json` (`conversation_root`), a contested
+   continuation writes the contest onto the FOUNDER's record before its turn
+   runs (`_write_state_off_loop` with the founder's id; a skipped write --
+   the founder's record unreadable -- is retried once and then refuses the
+   run, since the write is the contest's only durable carrier; it goes through
+   `update_state(durable=True)`, so a founder held live-only at that moment --
+   tightened into `_LIVE_RUN_STATES` by an incognito or temporary
+   continuation, where a plain merge would report success without touching
+   the file -- still has its `state.json` stamped; the retained founder record
+   in memory takes the marker only after the file holds it, so a failed write
+   leaves memory and disk agreeing on the old root rather than memory
+   claiming a contest a restart would undo), and a continuation
+   arriving when no in-memory record remains (restart, eviction) compares
+   against the founder's record -- read off the loop by `spawn_async`
+   (`_durable_conversation_root`, via `asyncio.to_thread`) and handed to the
+   gate as `_durable_conversation_root`; the resolver on the loop reads
+   nothing and fails closed without the value; a captured contest outranks
+   every retained record, since the contesting record may be evicted while the
+   founder's is not -- inheriting a
+   matching root, and contested for a different one, a persisted contest, or
+   no readable root at all (folder gone, or a nested record that
+   predates the stamp; a depth-one pre-stamp record still names its chat parent, which is
+   the root admission would have stamped, so a same-chat continuation of a
+   pre-upgrade run is spared a one-time lockout), so a chat cannot found in
+   its own name a conversation another chat authored. A run with no parent (a cron's or the CLI's spawn) founds
+   its conversation in its own name and resolves to its own key: nothing
+   contests it, so its registered policy is read as before, and a chat that
+   continues it contests the conversation rather than founding it.
 3. **Non-YOLO, non-trusted**: enters `_spawn_with_approval`, which re-checks
    YOLO (defense-in-depth against toggle race), then requests interactive
    approval with a 2-minute timeout. Timeout or rejection frees the
@@ -546,8 +606,12 @@ unregistered on client shutdown. The per-agent `auto_approve_spawn` rung (issue 
 item 2) is deferred to #4751/#4693 and is NOT added here.
 
 **Delivery order.** A spawn-approval prompt that reaches `_spawn_with_approval`
-is offered to surfaces in this fixed order, and the search stops at the first one
-that answers:
+is raised under the key of the chat at the ROOT of the run's spawn tree
+(`root_session_key_for`, equal to the parent for a depth-one run), never its
+literal `subagent:<id>` parent: that key owns the channel and the tab the prompt
+is delivered to, and it is the key a Trust press writes and the gate reads back.
+The prompt is offered to surfaces in this fixed order, and the search stops at
+the first one that answers:
 
 1. **Originating channel hook** — the channel-neutral seam above. A `True`/`False`
    return is the user's in-channel decision and is used verbatim; `None` (no hook
@@ -607,9 +671,65 @@ is decided in strict priority order:
 5. **Deny by default** — none of the above matched → reject
 
 `parent_policy` is resolved once when `_run_inner` starts, using this chain:
-1. Read from parent session via `get_approval_policy(parent_session_key)`
+1. Read from the ROOT session of the spawn tree via
+   `root_approval_policy(trust_root_for(info))`. `SubagentInfo.root_session_key`
+   is stamped at admission (while the calling parent is still a live record) by
+   walking `parent_session_key` links to the first non-`subagent:` key; it equals
+   `parent_session_key` for a depth-one run. The stamp, not a check-time walk, is
+   what the run reads, so a deleted or cancelled ancestor cannot drop a nested
+   run's trust. `trust_root_for` is that stamp with one exception: a
+   continuation admitted into a CONTESTED conversation (its
+   `conversation_root_session_key` is the contested marker) reads the marker,
+   not the chat that continued it -- the turn it runs was authored under
+   another chat's key, so the continuing chat's trust does not approve what it
+   asks for; its card still belongs to the continuing chat's tab
+   (`root_session_key_for`). The spawn gate's `parent_trusted` check, the
+   spawn prompt's address (`pump.py`) and the gateway's `_spawn_approval_slot`
+   read the same `trust_root_for`, so such a run is interactive at admission
+   too and its prompt is never slotted to a tab whose Trust would answer it, and the dashboard retry of a failed
+   contested continuation passes the marker as `_conversation_root_session_key`
+   rather than letting the retry found a fresh conversation at the chat. The same root key is handed to the interactive approver, so a
+   prompt that still needs a human lands in the root chat's tab (a `subagent:<id>`
+   parent names no tab), and the run's per-run WS frames (`subagent_spawn` /
+   `tool` / `chunk` / `done` / `snapshot`, keyed by `(slot, id)` on the wire)
+   carry that same slot, so the card the prompt planted there advances. The
+   list-carrying `subagent_status` frame addresses the same tab and lists the
+   tree rooted there (`running_agents_rooted_at`): its `agents` payload replaces
+   a slot's whole list and a `running` of 0 evicts the slot's cards, so a frame
+   keyed on the literal parent would wipe a live nested card the moment its
+   coordinator finished. The reconnect replay (`subagent_replay_slot`) names the
+   same tab from the run's stamp, which also rides a failed terminal report's
+   retry snapshot (`_ReportFailureSnapshot`) so the retried frames find the
+   root tab after the ancestors are gone, and `/api/spawn` exposes the tab name (`slot`,
+   the same mapping), so the dashboard's reconcile compares slot to slot for
+   cron- and channel-born tabs too. `running_agents_for` stays parent-keyed: it
+   answers the orchestration question (the parent's own wave), not the tab's. A run that re-enters admission with a root captured
+   earlier is governed by that root, never by a fresh walk: between the two
+   admissions its parent conversation can have been evicted and continued from
+   another, trusted, chat. The re-entry paths are exhaustive: every re-entry
+   that resumes an admission -- the store-accepted re-entry of `spawn_async`
+   (`PreparedSpawn.params`), the queue drain and the stagger drain (the queued
+   parameters) -- reuses the one parameter dict captured on the first gate pass,
+   which carries `_root_session_key`; the dashboard retry of a failed run
+   (`api_spawn_retry`) is the one re-admission built from a finished record and
+   passes that record's stamp explicitly, as does the automatic follow-up
+   (`_deliver_followups` -> `continue_conversation_async(_root_session_key=...)`),
+   a run's own next turn dispatched after it finished: by then its parent may
+   be evicted, and a re-walk from a key with no record would answer the key
+   itself and falsely contest the run's own conversation, persisting the
+   contest onto its founder; a parentless run (cron, CLI) has no chat root and
+   passes the conversation root it founded in its own name, for the same
+   reason. The gate enforces one structural rule
+   for every resumed admission (`_from_queue`, `_store_accepted`): a nested
+   caller arriving without the stamp resolves to a contested root there, so a
+   re-entry path that forgets the parameter costs an interactive prompt, never
+   an escalation. That rule is also what covers a durable row written before
+   roots were stamped -- its `subagent:` caller has no record to walk after the
+   restart that outlived it, and every window entry re-enters through the
+   drains with `_from_queue=True` -- so the store's read side (`_window_entry`)
+   hands the row through as written rather than keeping a second copy.
 2. If empty and YOLO mode active → `"auto"`
-3. If still empty **and subagent has no parent session key** → use the cached `KiroCrewConfig.agent.approval_mode` (snapshotted at `SubagentManager` init); if `"auto"` → `"auto"`
+3. If still empty **and subagent has no parent session key** → use the cached `KiroCrewConfig.agent.approval_mode` (snapshotted at `SubagentManager` init); if `"auto"` → `"auto"`. The liveness probe on this rung reads the literal `parent_session_key`: it asks whether THIS run's parent is alive.
 
 Step 3 ensures parentless subagents (e.g. cron jobs) respect the user's
 global approval mode instead of falling through to interactive approval.
