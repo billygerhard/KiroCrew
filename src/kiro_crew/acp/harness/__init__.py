@@ -41,7 +41,9 @@ __all__ = [
     "SpawnContext",
     "SpawnPlan",
     "TeardownPolicy",
+    "descriptor_mcp_delivery",
     "harness_for",
+    "operator_descriptor",
     "register_operator_harness",
 ]
 
@@ -145,3 +147,39 @@ def harness_for(backend: str) -> HarnessAdapter:
     raise ValueError(
         f"no ACP harness for backend {backend!r}; the shared-process runtime serves {served}"
     )
+
+
+def operator_descriptor(backend: str) -> HarnessDescriptor | None:
+    """The OPERATOR-declared descriptor for *backend*, or ``None``.
+
+    ``None`` for a builtin backend and for an id nothing declares, so a caller
+    asking "is this config-authored, and what did it declare?" never has to know
+    which of the two registers a name lives in. Deliberately does NOT go through
+    :func:`harness_for`: that constructs a :class:`DescriptorHarness`, and a
+    transport question must not pay for building a spawn strategy to answer it.
+    """
+    return _OPERATOR_REGISTER.get(backend)
+
+
+def descriptor_mcp_delivery(backend: str) -> str:
+    """How *backend* receives its MCP servers, as a delivery constant.
+
+    Empty for a builtin backend, and for a descriptor that declares nothing
+    (``MCP_DELIVERY_AGENT_FILE`` is the default, and a harness that reads its own
+    agent file needs no array from Crew). The answer for a builtin is left to the
+    caller's own table -- this reports only what a DESCRIPTOR declared, because a
+    descriptor is the one place where the transport property is written down by the
+    person who owns the harness, and the builtins predate the field.
+
+    This is the seam that makes ``mcp_delivery`` load-bearing. A descriptor that
+    declares ``session_array`` is promising that the host learns its servers ONLY
+    from the ``session/new`` array, so Crew has to fill it -- and the built-in
+    static tables cannot carry that promise for a config-authored id, because the
+    tables are frozen at import time while the register is filled at load. Reading
+    the declaration is what lets an operator-declared harness join the array path
+    without being added to a shipped set.
+    """
+    descriptor = _OPERATOR_REGISTER.get(backend)
+    if descriptor is None:
+        return ""
+    return descriptor.mcp_delivery

@@ -61,8 +61,10 @@ from kiro_crew.acp.harness import (
     SessionExtras,
     SpawnContext,
     SpawnPlan,
+    descriptor_mcp_delivery,
     harness_for,
 )
+from kiro_crew.acp.harness.descriptor import MCP_DELIVERY_SESSION_ARRAY
 from kiro_crew.acp.harness.kas import PROTOCOL_VERSION_KAS
 from kiro_crew.acp.harness.kiro import KIRO_CLI_SUBCMD, PROTOCOL_VERSION
 from kiro_crew.acp.kas_agents import hoist_managed_servers, load_agent_spec
@@ -139,6 +141,7 @@ from kiro_crew.metrics.events import (
     DROPPED_FRAMES,
     emit_counter,
 )
+from kiro_crew.providers.mirrors.descriptor_array import DescriptorArrayProjection
 from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
@@ -1459,6 +1462,57 @@ def _disable_check_scope(backend: str, work_dir: Any) -> Any:
     as "not disabled", and the server it withdraws would mount.
     """
     return overlay_project_scope(backend, work_dir).get("work_dir")
+
+
+def _array_projection_for(backend: str) -> Any:
+    """The object that builds *backend*'s session ``mcpServers`` array, or ``None``.
+
+    ONE owner for the question, because it is answered in two places that must not
+    disagree -- whether to take the mirrored branch at all, and which projection to
+    run once there. A backend that passed the first and found nothing in the second
+    would come up with an empty array: present-but-absent, the shape hardest to see
+    and the one this whole seam exists to prevent.
+
+    Two answers, and the descriptor's is the one a frozen table cannot hold:
+
+    * a registered mirror, for the builtins, whose transport property predates the
+      descriptor field;
+    * :class:`~kiro_crew.providers.mirrors.descriptor_array.DescriptorArrayProjection`
+      for an operator-declared harness whose descriptor says
+      ``mcp_delivery: "session_array"`` -- a promise that the ``session/new`` array
+      is its ONLY channel for MCP servers. Nothing honoured that promise before, so
+      such a harness silently took the pooled-stubs branch and, with the shared
+      gateway off, came up with no tools at all. ``harnesses.json`` is read at load,
+      so there is no id to hardcode and this is answered from the register instead.
+
+    ``None`` for a backend in neither, which is the honest answer rather than a
+    generic fallback: a harness that reads its own agent file must NOT be handed an
+    array it did not ask for.
+    """
+    if has_mirror(backend):
+        return mirror_for(backend)
+    if descriptor_mcp_delivery(backend) == MCP_DELIVERY_SESSION_ARRAY:
+        return DescriptorArrayProjection(backend)
+    return None
+
+
+def _has_array_projection(backend: str) -> bool:
+    """Whether :func:`_array_projection_for` would return something for *backend*.
+
+    Exists so the construction path can reach a COMPARISON and stop, which is the
+    H13 requirement: the await of :meth:`AcpRuntime._mirrored_session_mcp` must sit
+    behind a synchronous in-memory read, or a host with no projection pays a
+    coroutine, a call frame and a failure point on its construction path in service
+    of an adapter -- kiro's and KAS's included, which is why ``has_mirror`` alone
+    used to answer it.
+
+    Answered by asking the resolver and discarding the result would construct a
+    ``DescriptorArrayProjection`` per session for nothing, so the two cases are
+    spelled once here and once in the resolver; they are the same predicate over
+    the same two registries, and :func:`test_array_projection_predicate_matches_its_resolver`
+    pins that they cannot drift.
+    """
+    return has_mirror(backend) or (descriptor_mcp_delivery(backend) == MCP_DELIVERY_SESSION_ARRAY)
 
 
 def _pooled_session_servers_and_ref_spec(
@@ -5714,14 +5768,12 @@ class AcpRuntime:
         Blocking work (an agent-spec parse, an overlay read) runs off the loop, the
         same as the pooled resolution it replaces.
         """
-        # ONE registry read, not two. ``has_mirror`` is ``backend in MIRRORS`` and this
-        # returns ``MIRRORS[backend]()`` when present, so a second read could only ever
-        # agree -- and a branch for the disagreement would be dead code whose only
-        # possible direction is wrong: falling through to the caller's pooled branch
-        # mounts the unprojected broker stubs this whole method exists to withhold.
-        # There is no degraded-but-running option worth having for that class, so the
-        # state is made unrepresentable instead of handled.
-        mirror = mirror_for(self.acp_backend)
+        # ONE resolver read, not two. It answers "is there a projection, and which",
+        # so the branch below and this one cannot disagree about a backend that has
+        # an array to build. Reading ``has_mirror`` here and ``mirror_for`` at the
+        # call site separately is what let a config-authored ``session_array``
+        # harness pass the first and find nothing in the second.
+        mirror = _array_projection_for(self.acp_backend)
         if mirror is None:
             return None
         active_agent = agent or self._agent
@@ -5989,7 +6041,7 @@ class AcpRuntime:
             # own I/O off the event loop: the lookup stats/reads files, and blocking
             # the loop stalls every other session's I/O.
             mirrored = None
-            if has_mirror(self.acp_backend):
+            if _has_array_projection(self.acp_backend):
                 mirrored = await self._mirrored_session_mcp(
                     agent,
                     work_dir=session_work_dir,
@@ -6783,7 +6835,7 @@ class AcpRuntime:
         # step, nothing to unwind, no shared coroutine that could grow a failure mode
         # later. A membership read is the sanctioned form of that comparison.
         mirrored = None
-        if has_mirror(self.acp_backend):
+        if _has_array_projection(self.acp_backend):
             mirrored = await self._mirrored_session_mcp(
                 active_agent,
                 work_dir=session_work_dir,

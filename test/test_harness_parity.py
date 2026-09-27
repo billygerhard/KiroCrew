@@ -1238,6 +1238,16 @@ def test_the_projection_seam_is_never_awaited_on_a_shared_construction_path():
     import inspect
     import textwrap
 
+    # The guard predicate is a NAME because the property is structural: a host with
+    # no array projection must reach a COMPARISON and stop, never an awaited adapter
+    # seam. ``has_mirror`` is that predicate for a registered mirror;
+    # ``_has_array_projection`` widens it to a config-authored harness whose
+    # descriptor declares ``mcp_delivery: "session_array"``, which is the same
+    # synchronous in-memory read over the two registries. Naming the set rather than
+    # one function is what keeps a THIRD unguarded await from passing under a name
+    # nobody thought to list -- the ``seen`` count below is the backstop for that.
+    guard_names = {"has_mirror", "_has_array_projection"}
+
     unguarded: list[str] = []
     seen = 0
     for name in ("create_session", "load_session"):
@@ -1248,7 +1258,7 @@ def test_the_projection_seam_is_never_awaited_on_a_shared_construction_path():
             if isinstance(node, ast.If)
             and isinstance(node.test, ast.Call)
             and isinstance(node.test.func, ast.Name)
-            and node.test.func.id == "has_mirror"
+            and node.test.func.id in guard_names
         ]
         guarded = {id(child) for guard in guards for child in ast.walk(guard)}
         for node in ast.walk(tree):
@@ -1264,10 +1274,63 @@ def test_the_projection_seam_is_never_awaited_on_a_shared_construction_path():
     # left no await to find would otherwise report "all guarded".
     assert seen == 2, f"expected one guarded seam await per session-start path, found {seen}"
     assert not unguarded, (
-        "the projection seam is awaited outside an `if has_mirror(...)` guard, so a host "
-        "with no mirror pays an awaited adapter step on its construction path (H13):\n  "
-        + "\n  ".join(unguarded)
+        "the projection seam is awaited outside a synchronous guard (`has_mirror` / "
+        "`_has_array_projection`), so a host with no array projection pays an awaited "
+        "adapter step on its construction path (H13):\n  " + "\n  ".join(unguarded)
     )
+
+
+def test_array_projection_predicate_matches_its_resolver():
+    """H13's guard and the resolver it guards must answer the SAME question.
+
+    ``_has_array_projection`` decides whether the construction path may await
+    :meth:`AcpRuntime._mirrored_session_mcp`; ``_array_projection_for`` decides what
+    that await gets. They are the same predicate over the same two registries, spelled
+    twice -- once as a boolean to guard, once as a value to use -- and a drift between
+    them is invisible from behaviour alone: a guard that admits a backend the resolver
+    answers ``None`` for is an awaited step returning nothing (the H13 cost, restored),
+    and a guard that refuses one the resolver can build is an array that silently goes
+    missing, which is the defect this whole seam exists to prevent.
+
+    Checked over BUILTIN and DESCRIPTOR backends together, because the two registries
+    are the two arms of the predicate and testing only one arm leaves the other free to
+    drift.
+    """
+    import kiro_crew.acp.harness as harness_mod
+    from kiro_crew.acp_backends import ACP_BACKENDS_SESSION_MCP_ARRAY
+
+    builtins = sorted(set(ACP_BACKENDS_SESSION_MCP_ARRAY) | {"kiro", "kas", "pi"})
+    for backend in builtins:
+        assert acp_runtime._has_array_projection(backend) == (
+            acp_runtime._array_projection_for(backend) is not None
+        ), f"{backend}: guard and resolver disagree"
+
+    # A descriptor arm: an id no frozen table holds, so only the register can answer.
+    from kiro_crew.acp.harness.descriptor import MCP_DELIVERY_SESSION_ARRAY, HarnessDescriptor
+
+    declared = HarnessDescriptor(
+        id="parity-probe-session-array",
+        executable="/bin/true",
+        argv=("{executable}",),
+        mcp_delivery=MCP_DELIVERY_SESSION_ARRAY,
+    )
+    agent_file = HarnessDescriptor(
+        id="parity-probe-agent-file",
+        executable="/bin/true",
+        argv=("{executable}",),
+    )
+    harness_mod.register_operator_harness(declared)
+    harness_mod.register_operator_harness(agent_file)
+    try:
+        for backend, expected in ((declared.id, True), (agent_file.id, False)):
+            assert (
+                acp_runtime._has_array_projection(backend) is expected
+            ), f"{backend}: descriptor arm answered wrong"
+            assert (
+                acp_runtime._array_projection_for(backend) is not None
+            ) is expected, f"{backend}: descriptor resolver answered wrong"
+    finally:
+        harness_mod._reset_operator_register()
 
 
 def test_every_runtime_path_identity_test_is_declared():
