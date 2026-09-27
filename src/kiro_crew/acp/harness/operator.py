@@ -101,6 +101,18 @@ class DescriptorHarness(MembershipHarness):
         self._descriptor = descriptor
         self.backend = descriptor.id
 
+    @property
+    def min_sandbox_tier(self) -> str:
+        """This descriptor's own ``min_sandbox``, or empty when it declared none.
+
+        A pass-through, deliberately: the value is already validated to a
+        tightening tier at registration (:data:`MIN_SANDBOX_TIERS`), and the one
+        clamp lives in the runtime so a harness cannot implement its own
+        comparison and get the direction wrong. Empty is the common answer -- an
+        ``agent_spec`` descriptor is not tool-gate enforced and needs no floor.
+        """
+        return self._descriptor.min_sandbox
+
     # ── Seam 1: spawn ──
 
     async def resolve_spawn(self, ctx: SpawnContext) -> SpawnPlan:

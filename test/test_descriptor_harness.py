@@ -539,3 +539,89 @@ async def test_spawn_refuses_when_the_verified_binary_changed_and_revokes(
         b._baseline.update(baseline)
         b._selectable.clear()
         b._selectable.update(selectable)
+
+
+# ── min_sandbox: the per-harness tier floor ──
+#
+# An enforced descriptor (``session_config`` routing) depends on the OS credential
+# mask, and ``agent.sandbox`` is ONE global value -- so on a host set to ``off`` for
+# the operator's own coding agents, the tool gate refuses the descriptor and the
+# only remedy it can name confines every other backend too. ``min_sandbox`` raises
+# THIS harness's spawn instead. These pin the direction, because a floor that could
+# lower the tier would be a way to drop the mask from configuration.
+
+
+def test_a_descriptor_declaring_no_floor_answers_empty():
+    # Every bundled harness answers this way too (the base class default), so their
+    # spawn arguments are untouched by the feature existing.
+    assert DescriptorHarness(_descriptor()).min_sandbox_tier == ""
+
+
+def test_a_descriptor_floor_reaches_the_harness_seam():
+    harness = DescriptorHarness(_descriptor(min_sandbox="standard"))
+    assert harness.min_sandbox_tier == "standard"
+
+
+@pytest.mark.parametrize(
+    "configured,floor,expected",
+    [
+        # The case this exists for: the operator runs unconfined coding agents and
+        # the enforced descriptor still gets a tier that applies its mask.
+        ("off", "standard", "standard"),
+        ("off", "strict", "strict"),
+        ("auto", "strict", "strict"),
+        # Already at or above the floor: untouched, including the alias, which must
+        # not be rewritten to its canonical spelling for no reason.
+        ("strict", "standard", "strict"),
+        ("auto", "standard", "auto"),
+        ("standard", "standard", "standard"),
+        # No opinion is the common answer and must be a true no-op.
+        ("off", "", "off"),
+    ],
+)
+def test_the_clamp_only_ever_tightens(configured, floor, expected):
+    from kiro_crew.sandbox import raise_sandbox_mode
+
+    assert raise_sandbox_mode(configured, floor) == expected
+
+
+def test_the_runtime_raises_the_tier_before_the_harness_is_asked(monkeypatch, tmp_path):
+    """The tier the harness is JUDGED against is the tier it is WRAPPED at.
+
+    Both come from ``AcpRuntime._sandbox_mode``: the refuse-then-mask preflight
+    reads it through ``ctx.sandbox_mode``, and ``wrap_argv`` reads it again at the
+    spawn. A tier raised for only one of them would resolve a credential mask and
+    then hand back an unwrapped child -- the exact state the tool gate's sandbox
+    floor exists to refuse, reached by another route. So this asserts the
+    ``SpawnContext`` the harness receives carries the RAISED tier, and that the
+    runtime's own field was raised with it.
+    """
+    from kiro_crew.acp.harness.base import SpawnPlan
+    from kiro_crew.acp.runtime import AcpRuntime
+
+    runtime = object.__new__(AcpRuntime)
+    runtime._sandbox_mode = "off"
+    runtime._acp_backend = "my-acp"
+    runtime._agent = "a"
+    runtime._work_dir = Path(tmp_path)
+    runtime._model = None
+    runtime._member_context = False
+
+    seen: dict[str, str] = {}
+
+    class _Harness:
+        min_sandbox_tier = "standard"
+
+        async def resolve_spawn(self, ctx):
+            seen["tier"] = ctx.sandbox_mode
+            return SpawnPlan(argv=["/bin/true"])
+
+    monkeypatch.setattr(type(runtime), "_harness", property(lambda self: _Harness()))
+    monkeypatch.setattr("kiro_crew.agent.require_fresh_derived_spec", lambda agent, work_dir: None)
+
+    import asyncio
+
+    asyncio.run(runtime._resolve_spawn_plan())
+
+    assert seen["tier"] == "standard"
+    assert runtime._sandbox_mode == "standard"

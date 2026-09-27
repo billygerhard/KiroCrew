@@ -21,6 +21,7 @@ from kiro_crew.acp.harness.descriptor import (
     MCP_DELIVERY_AGENT_FILE,
     MCP_DELIVERY_DEFAULT,
     MCP_DELIVERY_SESSION_ARRAY,
+    MIN_SANDBOX_TIERS,
     MODEL_SOURCE_ACP_ADVERTISED,
     MODEL_SOURCE_STATIC,
     OPERATOR_HARNESSES_LEAF,
@@ -66,6 +67,7 @@ def test_the_schema_key_set_is_exactly_what_is_documented():
             "mcp_delivery",
             "routing",
             "permission_config",
+            "min_sandbox",
         }
     )
 
@@ -104,6 +106,51 @@ def test_routing_and_delivery_vocabularies():
     assert MCP_DELIVERIES == frozenset({"agent_file", "session_array"})
     assert MCP_DELIVERY_DEFAULT == MCP_DELIVERY_AGENT_FILE
     assert PERMISSION_CONFIG_KEYS == frozenset({"option", "value"})
+
+
+def test_min_sandbox_admits_only_tightening_tiers():
+    # The field can RAISE this harness's spawn tier above ``agent.sandbox`` and
+    # never lower it, so the loosest tier is not one of its values: admitting
+    # "off" would let harnesses.json switch off the credential mask that an
+    # enforced routing depends on.
+    assert MIN_SANDBOX_TIERS == frozenset({"standard", "strict"})
+    assert "off" not in MIN_SANDBOX_TIERS
+    assert "auto" not in MIN_SANDBOX_TIERS
+
+
+def test_min_sandbox_is_optional():
+    d = HarnessDescriptor(id="my-tool", executable="/opt/tool", argv=("{executable}",))
+    assert d.min_sandbox == ""
+    assert validate_descriptor(d) == []
+
+
+@pytest.mark.parametrize("tier", sorted(MIN_SANDBOX_TIERS))
+def test_min_sandbox_accepts_each_tightening_tier(tier):
+    d, reasons = descriptor_from_mapping(
+        _operator_descriptor(min_sandbox=tier), harness_id="my-tool"
+    )
+    assert reasons == []
+    assert d is not None and d.min_sandbox == tier
+
+
+@pytest.mark.parametrize("bad", ["off", "auto", "cc", "STRICT", "on"])
+def test_min_sandbox_rejects_anything_that_is_not_a_tightening_tier(bad):
+    # Refused rather than ignored: a silently-dropped tier reads as honoured and
+    # spawns the child at the session's tier, which for an enforced descriptor is
+    # the difference between a masked credential home and an unmasked one.
+    d, reasons = descriptor_from_mapping(
+        _operator_descriptor(min_sandbox=bad), harness_id="my-tool"
+    )
+    assert d is None
+    assert any("min_sandbox is not one of" in r for r in reasons), reasons
+
+
+def test_min_sandbox_must_be_a_string():
+    d, reasons = descriptor_from_mapping(
+        _operator_descriptor(min_sandbox=True), harness_id="my-tool"
+    )
+    assert d is None
+    assert any("min_sandbox must be a string" in r for r in reasons), reasons
 
 
 # ── validate_descriptor: identifier rules ──

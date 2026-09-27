@@ -10669,6 +10669,35 @@ def _clamp_sandbox_mode_to_floor(mode: str, floor: str | None) -> str:
     return floor
 
 
+def raise_sandbox_mode(mode: str, minimum: str) -> str:
+    """Raise *mode* to *minimum* when *minimum* is the stricter of the two.
+
+    The one-way half of :func:`_clamp_sandbox_mode_to_floor`, exported for a
+    caller whose floor is a HARNESS's rather than governance's: an ACP host
+    declaring ``min_sandbox`` is asking to be confined more than
+    ``agent.sandbox`` asked for, so its spawn -- and only its spawn -- is raised.
+
+    Delegates the strictness ranking rather than comparing here, so this cannot
+    drift from the governed scale the ``sandbox.min_level`` clamp already reads:
+    a tier added to ``governance._ORDINAL_SCALES['sandbox']`` is ordered
+    correctly for both callers with no edit. The two floors COMPOSE by both being
+    clamps in the same direction, and their order does not matter -- the
+    governance read inside ``wrap_argv`` still runs on whatever this returns, so
+    a ceiling can raise a harness floor further but a harness floor can never
+    lower a ceiling.
+
+    An empty *minimum* is "no opinion" and returns *mode* untouched, which is
+    every bundled harness. An unrecognised *minimum* RAISES out of the delegate
+    rather than being ranked as the loosest tier: a floor nobody can order is a
+    floor that would silently not apply, and for an enforced host that is the
+    difference between a masked credential home and an unmasked one. Descriptor
+    validation is what normally keeps that from reaching here.
+    """
+    if not minimum:
+        return mode
+    return _clamp_sandbox_mode_to_floor(mode, minimum)
+
+
 def wrap_argv(
     argv: list[str],
     mode: str = "auto",

@@ -84,6 +84,33 @@ ROUTING_AGENT_SPEC = "agent_spec"
 ROUTING_SESSION_CONFIG = "session_config"
 ROUTINGS = frozenset({ROUTING_AGENT_SPEC, ROUTING_SESSION_CONFIG})
 
+# ── Minimum sandbox tier (a descriptor may only TIGHTEN) ──
+# ``session_config`` is an ENFORCED routing, and the OS credential mask is its
+# compensating control: ACP v1 cannot force a permission prompt for a passive
+# read, so the mask is the only thing between a third-party binary and the
+# credential homes the standard tier deliberately leaves open. Two sandbox
+# outcomes hand the child back UNWRAPPED and drop that mask -- the ``off`` tier,
+# and a backend-less host with unsandboxed exec opted in -- and
+# ``agent_sdk.tool_gate.enforce_sandbox_floor`` refuses the session rather than
+# spawn into either.
+#
+# That refusal is correct and its remedy was not: ``agent.sandbox`` is ONE global
+# value, so "set it to standard or strict" confines every other agent on the host
+# too. An operator who set it to ``off`` so their own coding agents run unconfined
+# then has no way to run an enforced descriptor at all.
+#
+# ``min_sandbox`` is the per-harness answer: the tier THIS harness's child is
+# spawned under, raised above the session's configured tier and never below it. So
+# the enforced descriptor gets its mask while every other backend keeps the tier
+# the operator chose. Tightening-only is what keeps this out of the capability
+# class the module header forbids -- a descriptor still grants its harness nothing,
+# it can only ask to be confined MORE than the host asked for. ``off`` is
+# deliberately absent: admitting it would let ``harnesses.json`` switch off the
+# compensating control, the one thing this field must not be able to do.
+MIN_SANDBOX_STANDARD = "standard"
+MIN_SANDBOX_STRICT = "strict"
+MIN_SANDBOX_TIERS = frozenset({MIN_SANDBOX_STANDARD, MIN_SANDBOX_STRICT})
+
 # ── MCP delivery ──
 # How the harness receives its MCP server list: the delivery MECHANISM the
 # spawn/session path keys on (``DescriptorHarness.session_mcp_servers``),
@@ -174,6 +201,7 @@ DESCRIPTOR_KEYS: frozenset[str] = frozenset(
         "mcp_delivery",
         "routing",
         "permission_config",
+        "min_sandbox",
     }
 )
 
@@ -223,6 +251,11 @@ class HarnessDescriptor:
     routing: str = ""
     #: Required when ``routing`` is ``session_config``, forbidden otherwise.
     permission_config: PermissionConfig | None = None
+    #: The sandbox tier this harness's child is spawned under when it is STRICTER
+    #: than the session's configured ``agent.sandbox``; empty means "whatever the
+    #: session uses". Never loosens it. See :data:`MIN_SANDBOX_TIERS` for why an
+    #: enforced descriptor needs this and why ``off`` is not accepted.
+    min_sandbox: str = ""
 
     @property
     def label(self) -> str:
@@ -429,6 +462,22 @@ def validate_descriptor(
         allowed = ", ".join(sorted(MCP_DELIVERIES))
         reasons.append(f"{prefix}mcp_delivery is not one of: {allowed}")
 
+    # Rejected rather than ignored, and rejected for ``off`` in particular: a
+    # silently-dropped tier would read as honoured and spawn the child at the
+    # session's tier, which for an enforced descriptor is the difference between a
+    # masked and an unmasked credential home. ``off`` is refused by name because it
+    # is the plausible mistake -- an operator reading this as "the tier to use"
+    # rather than "the floor to raise to" -- and it is the one value that would turn
+    # the field into a way to disable the compensating control.
+    if descriptor.min_sandbox and descriptor.min_sandbox not in MIN_SANDBOX_TIERS:
+        allowed = ", ".join(sorted(MIN_SANDBOX_TIERS))
+        reasons.append(
+            f"{prefix}min_sandbox is not one of: {allowed} "
+            f"(omit it to spawn under the session's own configured tier; it can only "
+            f"RAISE that tier for this harness, never lower it, so 'off' is not a "
+            f"value it can take)"
+        )
+
     # Routing: an empty routing is a valid known-but-unselectable descriptor, so
     # it is NOT a reason. A non-empty routing must be recognized, and the
     # permission_config coupling must hold in both directions.
@@ -617,6 +666,10 @@ def descriptor_from_mapping(
         prefix, raw.get("permission_config")
     )
     reasons += pc_reasons
+    min_sandbox, min_sandbox_reasons = _optional_string(
+        prefix, "min_sandbox", raw.get("min_sandbox"), ""
+    )
+    reasons += min_sandbox_reasons
 
     descriptor = HarnessDescriptor(
         id=declared_id,
@@ -630,6 +683,7 @@ def descriptor_from_mapping(
         mcp_delivery=mcp_delivery,
         routing=routing,
         permission_config=permission_config,
+        min_sandbox=min_sandbox,
     )
     reasons += validate_descriptor(descriptor, taken_ids=taken_ids, position=position)
     if reasons:

@@ -153,6 +153,7 @@ from kiro_crew.sandbox import (
     bind_voice_safe_agent_workspace_async,
     cgroup_scope_argv,
     create_subprocess_limited,
+    raise_sandbox_mode,
     release_bound_agent_workspace,
     resolve_bound_session_workspace,
     scrub_agent_subprocess_env,
@@ -2256,6 +2257,39 @@ class AcpRuntime:
         thread hop for the same filesystem work or -- worse -- silently resolve a
         different mask than the one the argv was built for.
         """
+        # Raise this spawn's tier to the HARNESS's own floor before anything reads
+        # it, and do it here rather than in the harness. Two consumers take the tier
+        # from ``self._sandbox_mode``: the refuse-then-mask preflight the harness
+        # runs inside ``resolve_spawn`` (through ``ctx.sandbox_mode``), and the
+        # ``wrap_argv_async`` call below that actually applies the mask the plan came
+        # back with. Raising it in ONE place is what keeps those two from
+        # disagreeing -- a tier raised for the preflight alone would resolve a
+        # credential mask and then hand back an unwrapped child, which is exactly
+        # the state ``enforce_sandbox_floor`` exists to refuse, arrived at by a
+        # different route and with nothing left to catch it.
+        #
+        # One-way: ``raise_sandbox_mode`` delegates the ranking to the governed
+        # ordinal scale, so a host floor can tighten ``agent.sandbox`` and can never
+        # loosen it, and the ``sandbox.min_level`` ceiling inside ``wrap_argv`` still
+        # runs on the result. Empty for every bundled harness, so their spawn
+        # arguments stay byte-identical.
+        floor = self._harness.min_sandbox_tier
+        if floor:
+            raised = raise_sandbox_mode(self._sandbox_mode, floor)
+            if raised != self._sandbox_mode:
+                # INFO, not debug: the operator configured one tier and this spawn
+                # is running at another, which is the kind of divergence they have
+                # to be able to find in a log without reproducing it.
+                logger.info(
+                    "acp: %s declares a minimum sandbox tier of %r; spawning this "
+                    "host at %r instead of the configured %r (other backends keep "
+                    "the configured tier)",
+                    self._acp_backend,
+                    floor,
+                    raised,
+                    self._sandbox_mode,
+                )
+                self._sandbox_mode = raised
         plan = await self._harness.resolve_spawn(
             SpawnContext(
                 agent=self._agent,

@@ -302,6 +302,31 @@ class HarnessAdapter(abc.ABC):
         """The host runs its own sandbox, so Crew delegates isolation to it."""
 
     @property
+    def min_sandbox_tier(self) -> str:
+        """The tier this host's child must not be spawned BELOW; empty for none.
+
+        CONCRETE and defaulted, unlike its neighbours here, and that is the whole
+        design: every bundled host answers "no opinion", because its tier is the
+        session's and a builtin asserting a floor of its own would be stating a
+        policy ``agent.sandbox`` already owns. Making it abstract would force a
+        ``return ""`` into every host for one caller's benefit, and would make a
+        host added later choose a value where none is wanted.
+
+        The one host that answers otherwise is an operator descriptor, and only
+        because it can be tool-gate ENFORCED on a host whose global tier is
+        ``off``: there the credential mask that routing depends on is never
+        applied, ``enforce_sandbox_floor`` refuses the session, and the only
+        remedy the refusal can name confines every OTHER agent on the machine.
+        Answering here raises THIS spawn instead.
+
+        Read by ``AcpRuntime._resolve_spawn_plan`` BEFORE it builds the
+        :class:`SpawnContext`, so the tier a host is judged against and the tier
+        it is actually wrapped at are the same value -- see the note there.
+        Tightening only; the runtime clamps in one direction.
+        """
+        return ""
+
+    @property
     @abc.abstractmethod
     def pod_home_remap(self) -> bool:
         """The child's ``HOME`` is remapped when spawned inside a pod bundle."""
