@@ -683,6 +683,61 @@ class TestCreateHandlerBackendValidation:
         assert backend_pins.pin_for("c-kas") == ACP_BACKEND_KAS
 
     @pytest.mark.asyncio
+    async def test_a_pinned_chat_keeps_its_backend_across_a_restart(self, tmp_path, monkeypatch):
+        """The whole defect, end to end, through the real create handler.
+
+        A pinned chat is created, USED (so the transcript's metadata line is
+        created by the first append, which mints its own timestamp), restarted,
+        and its next turn resolved. The pin must survive.
+
+        It did not, and the reason is a pair of mints microseconds apart rather
+        than one value in two spellings: ``_ChatSlot`` stamps ``created_at`` in
+        UTC and the pin store seals THAT as the record's ``owner``, while the
+        transcript's line is created by the first ``append`` with its own
+        ``metadata_now_iso()`` -- the time of the first row, not of the creation
+        -- and the save path prefers whatever is already on disk
+        (``existing_meta.get("created_at") or slot.created_at``), so that value
+        is kept forever. Every restore adopts the transcript's stamp, the owner
+        check compares two different instants, the record is dropped, and the
+        chat silently inherits the configured default while its transcript still
+        reads ``acp_backend: <pinned>``.
+
+        This asserts the shape production actually produces -- the transcript
+        created by a real append, NOT hand-stamped -- so it cannot pass on a host
+        whose two mints happen to coincide.
+        """
+        import json
+
+        from kiro_crew.dashboard import backend_pins
+        from kiro_crew.dashboard.chat_persistence import restore_open_slots
+        from kiro_crew.dashboard.chat_utils import _history_key_for
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        state = _make_state(tmp_path)
+        status, body = await _create_slot(state, {"name": "c-restart", "backend": ACP_BACKEND_KAS})
+        assert status < 300, body
+        slot = state._slots["c-restart"]
+        log = state.conversation_log
+        assert log is not None
+        # The chat is USED: this append creates the transcript's metadata line.
+        log.append(_history_key_for(slot.key), "user", "hi")
+        on_disk = log.get_metadata(_history_key_for(slot.key)).get("created_at")
+        assert on_disk == slot.created_at, (
+            "the creation identity must be stamped at birth, so the transcript's "
+            "own stamp is the slot's and not a second mint of its own"
+        )
+        (tmp_path / "open_slots.json").write_text(json.dumps({"keys": [slot.key], "ts": 0.0}))
+
+        state2 = _make_state(tmp_path)
+        assert restore_open_slots(state2) == 1
+        restored = state2._slots[slot.key]
+        assert restored.created_at == slot.created_at
+        assert (
+            restored.acp_backend == ACP_BACKEND_KAS
+        ), "a chat pinned at creation must still be pinned after a restart"
+        assert backend_pins.pin_for(slot.key) == ACP_BACKEND_KAS
+
+    @pytest.mark.asyncio
     async def test_a_failed_store_write_retracts_the_newborn_and_answers_500(
         self, tmp_path, monkeypatch
     ):

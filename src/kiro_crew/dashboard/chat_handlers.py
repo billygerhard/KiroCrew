@@ -3286,6 +3286,49 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             slot.executor = "remote"
             slot.instance_id = instance_id
             slot.remote_slot = remote_slot_key
+        if is_new_slot and not remote_slot_key:
+            # The CREATION IDENTITY, stamped into the transcript before anything
+            # can mint a different one. This is not a display timestamp: the
+            # backend-pin store seals it as a record's `owner`
+            # (`slot.created_at`) and re-checks it on every restore
+            # (`backend_pins.apply_restored_pin`), and every restore path adopts
+            # the TRANSCRIPT's `created_at` back into the slot.
+            #
+            # Left unstamped, the transcript's metadata line is created by the
+            # first `append`, which mints its own `metadata_now_iso()` — the time
+            # of the first row, not of the creation, microseconds after the slot's
+            # own stamp. The save path then keeps that value forever
+            # (`chat_persistence`: `existing_meta.get("created_at") or
+            # slot.created_at` prefers what is on disk), so the identity the pin
+            # sealed and the identity the restore reads are two different instants:
+            # the owner check fails, every pin is dropped on every restart, and
+            # each explicitly pinned chat silently falls through to the configured
+            # default while its transcript still reads `acp_backend: <pinned>`.
+            #
+            # Stamped HERE, at birth and before any append can create the line, so
+            # the two agree by construction rather than by luck. Deliberately not
+            # a precedence change in the save path: that path also serves
+            # replacement chats and merged transcripts, where the on-disk value
+            # IS the other creation's identity and must survive. This mirrors the
+            # subagent birth record (`session_control._persist_birth`), which
+            # stamps the same field the same way. Off-loop with every other
+            # transcript write, and best-effort with a loud warning: a chat is
+            # still usable without it, but a pin recorded against an unstamped
+            # identity will not survive a restart.
+            if state.conversation_log is not None:
+                try:
+                    await asyncio.to_thread(
+                        state.conversation_log.update_metadata,
+                        slot_history_key(slot),
+                        {"created_at": slot.created_at},
+                    )
+                except OSError:
+                    logger.error(
+                        "Slot %s: creation identity could not be stamped; a backend pin "
+                        "on this chat will not survive a restart",
+                        slot.key,
+                        exc_info=True,
+                    )
         # Per-chat backend pick. Stamped after construction for the same reason
         # the remote binding is: it is slot-owned metadata, not part of a
         # slot's identity, so keeping it out of get_or_create_slot's signature
