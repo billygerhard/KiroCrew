@@ -25,7 +25,7 @@ from kiro_crew.dashboard.slot_ownership import (
     deny_app_slot_session_access,
     slot_not_found,
 )
-from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.state import DashboardState, _ChatSlot, mint_tags_revision
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -387,10 +387,14 @@ async def api_chat_slot_switch_variant(request: web.Request) -> web.Response:
         )
         _bc, _ = redact_exfiltration_urls(target_dict["content"])
         _bc, _ = redact_credentials(_bc)
+        # A fresh revision per slot, carried on the slot list (``variant_seq``), so a
+        # tab whose socket missed this frame re-serves this slot on reconnect.
+        slot.variant_seq = mint_tags_revision()
         state.broadcast_ws(
             "chat_variant_switch",
-            {"slot": slot.key, "index": idx, "content": _bc},
+            {"slot": slot.key, "index": idx, "content": _bc, "seq": slot.variant_seq},
         )
+        state.push_slot_patch(slot.key, ("variant_seq",))
         return web.json_response({"ok": True, "index": idx})
 
 

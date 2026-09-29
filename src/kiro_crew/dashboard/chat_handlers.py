@@ -229,6 +229,7 @@ from kiro_crew.dashboard.remote_relay import (
     remote_bound_refusal,
 )
 from kiro_crew.dashboard.request_priority import owner_start_priority
+from kiro_crew.dashboard.serving_gen import serving_generation  # noqa: F401
 from kiro_crew.dashboard.slot_buffers import (
     MAX_DEFERRED_NOTE_CHARS,
     MAX_DEFERRED_NOTES,

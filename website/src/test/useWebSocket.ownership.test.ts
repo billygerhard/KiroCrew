@@ -54,6 +54,7 @@ const OWNER_MODULES = [
   'contextTraceRefresh.ts',
   'frames.ts',
   'reconnectCatchUp.ts',
+  'redactionHostsHeal.ts',
   'retiredIds.ts',
   'rowDeliveryWatchdog.ts',
   'serverState.ts',
