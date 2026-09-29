@@ -987,6 +987,39 @@ the answer's own clock (`entitlement_probe_result_at`), not by its call time, so
 its floor never rises above the data it holds and a replayed answer is never
 re-dated out of the spawn-race window it was captured in.
 
+**Direct-spawn revalidation.** `AcpClient` owns one process and one session, so
+it has no runtime probe to borrow. It stamps its own `session/new` capture
+(`_available_models_captured_at`, unconfirmed) and, before an explicit
+`set_model` pick is refused or a startup pin is withheld on kiro,
+`refresh_available_models` asks again: a snapshot a probe confirmed within
+`_ENTITLEMENT_PROBE_TTL_SECS` is returned as is (fresh -- no round-trip); otherwise
+`_probe_advertised_models` asks on a DEDICATED short-lived transport: a throwaway
+`AcpClient` built by `_entitlement_probe_client` from this client's own launch
+inputs (work dir, agent, env, backend, sandbox mode, gateway overlay, session key),
+so `_spawn` starts it exactly as it started this session. On its own process it
+sends `initialize` (the same `_initialize_params` this session's handshake sends)
+and, before `session/new`, re-verifies the derived spec with
+`require_unchanged_derived_spec` -- the same verify→create bracket every other
+spawn path closes between initialize and session creation, so a spec revoked
+during probe init aborts (raising `DerivedSpecStale`, absorbed as an empty answer)
+rather than creating a session that would start that revoked spec's MCP server
+commands. It then sends one minimal `session/new` (the pooled broker stubs, for
+cost only), reads the answer through `advertised_models_from_session`, ends it
+with the harness's teardown verb and shuts the process down, bounded by
+`_INIT_TIMEOUT + _ENTITLEMENT_PROBE_TIMEOUT`. A non-empty answer replaces the
+snapshot, dated by its arrival and marked confirmed; an empty or failed one is no
+evidence and the refusal stands. There is no failure replay: the callers are user
+actions and the picker read, the direct-client form of `force=True`.
+`refresh_available_models` owns single-flight: a caller arriving while a probe is
+in flight awaits that same (shielded) probe, so an overlapping picker read and
+explicit pick start one probe process, never two. Because the probe never touches
+this session's stream, nothing it emits -- session updates, substitution
+advisories, and the MCP OAuth and init frames (keyed by `serverName`, no
+`sessionId`) of whatever servers kiro-cli starts from the spec for it -- can enter
+this session's notification buffer, its `_oauth_emitted_servers` dedupe or its
+event stream; no frame filter, prompt hold or turn guard is needed, and isolation
+does not depend on which servers the probe process happens to start.
+
 Step 5 drains MCP server init notifications (both after `session/load` and
 `session/new` — loading a session triggers MCP re-initialization).
 

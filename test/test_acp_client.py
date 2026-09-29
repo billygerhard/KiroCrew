@@ -11971,6 +11971,15 @@ class TestModelEntitlementPreflight:
         # _is_claude is derived from the backend seam, not settable directly.
         client._acp_backend = ACP_BACKEND_CLAUDE if is_claude else ""
         client._available_models = [{"modelId": m, "name": m} for m in advertised]
+
+        # The refusal and the withhold first re-ask entitlement on a throwaway
+        # probe process. Held to a FAILED probe here (no evidence), so these pin
+        # the snapshot's own verdict and never launch a real kiro-cli -- a host
+        # with one installed would otherwise answer with its own account's list.
+        async def _no_probe_evidence():
+            return [], 0.0
+
+        client._probe_advertised_models = _no_probe_evidence
         return client
 
     def test_unadvertised_model_is_unusable(self):
