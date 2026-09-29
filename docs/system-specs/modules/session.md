@@ -508,6 +508,30 @@ retirement machinery detects and recycles them, in `session_lifecycle.py`
 (`retire_kiro_identity_sessions`) driven by the per-turn gate in
 `chat_runner.py`, against baselines owned by `KiroPrerequisiteService`.
 
+**Identity fingerprint** (`current_identity_fingerprint`): one string over
+every credential source a child may have loaded, each kept as its OWN
+component so a failed read drops a component rather than changing one: the
+kiro-cli store's hashed stable claims, then `+key:<sha256>` for Kiro CLI's own
+`KIRO_API_KEY` (read from the environment, falling back to the data home's
+`.env`, as the `whoami` probe does), then `+crew:<digest>` for the Crew vault.
+The key and vault components appear only when present, so a host with neither
+fingerprints exactly as the store alone. An API-key host keeps no identity row
+in the store, and without the key component it read as signed out on every
+turn — every dashboard send retired idle sessions and cancelled their
+`spawn_run` children (#15126). The key joins only a DEFINITIVE store answer
+(read and audited with every credential row identified, or no store file at
+all): after an unauditable, unreadable or relocated store read, or one that
+found a login no stable claim identifies (a social login), only the key
+component is withheld and the fingerprint is exactly what it was before the key
+was counted, because a harness that strips the key (KAS) authenticates from the
+store, and a key-only baseline would let a store account switch compare equal.
+A child whose per-session env overlay (`extra_env`, e.g. a cron job's `env`
+block) names `KIRO_API_KEY` is never spawn-stamped and never spared by the
+sweep: the fingerprint reads the gateway's credentials, and that child may have
+authenticated as a different account. A spawn stamp proves a wrong account only
+through its store or vault component, never its key component: a harness that
+strips the key (KAS) is unaffected by a key rotation, which the ordinary
+baseline comparison still reports.
 **Boot-seeded baseline** (`seed_sessions_baseline`): the running-children
 baseline is adopted from the store at gateway startup, before anything can
 spawn a kiro-backed child, so every child postdates the read. This removes the
@@ -516,7 +540,8 @@ busy, nothing mid-start) is routinely unsatisfiable on a live gateway —
 retired idle sessions are eagerly respawned by dashboard slots, the next sweep
 reads incomplete, and the baseline never advances, recycling healthy children
 forever. The seed refuses (keeping the fail-safe sweep) under `assume_ready`,
-when a baseline is already recorded, when the store cannot be fingerprinted,
+when a baseline is already recorded, when the identity cannot be fingerprinted
+(an unreadable store with no API key, or any store read that is not definitive),
 and when the read hangs past a 5s bound.
 
 **Interim latch** (`_maybe_latch_interim_identity`): a bare baseline
@@ -545,10 +570,13 @@ child keeps exactly the pre-stamping protections.
 
 **Live-account spare** (`spawned_under`, inside the sweep): a session or
 companion runtime whose spawn stamp EQUALS the live fingerprint — the whole
-fingerprint, both components — provably authenticated as the live account and
+fingerprint, every component — provably authenticated as the live account and
 is skipped by `retire_kiro_identity_sessions`: not retired, not flagged, and
 not counted against completeness (the runtime reapers take the fingerprint as
-`live=` and apply the same test to their post-conditions). Without it the
+`live=` and apply the same test to their post-conditions). For a child that
+never received `KIRO_API_KEY` (KAS and every foreign backend strip it at
+spawn) the key component is left out of that comparison, so a key rotation
+does not retire its idle parent and cancel its running children. Without it the
 sweep retired every kiro-backed idle session and could complete only when
 every kiro-backed holder was idle at once, which a busy gateway never is:
 each turn re-swept, and an idle parent whose `spawn_run` children were still
