@@ -1312,6 +1312,10 @@ made; no gate reads it back. Two consumers:
   arms the parent's one delayed re-read, `_QUEUE_DEPTH_RETRY_SECS` later, up
   to `_QUEUE_DEPTH_RETRIES` in a row; a frame published first disarms it, and
   a fresh request restores the budget.
+  Unlike the per-run frames, which follow a nested run to its root chat's tab,
+  the event keeps its literal parent's slot: it is one parent's depth, which the
+  client stores per slot as a value, so a nested parent's count routed to the
+  root tab would overwrite the root chat's own.
   One label per parent, last writer wins: it is the verdict on the most recent
   row the gate judged for that parent, not a per-row ledger. A parent holding a
   memory-deferred row and then a capacity-queued one shows `concurrency_limit`
@@ -1911,7 +1915,10 @@ ladder decides it in strict priority order and answers it on the wire:
    re-queued, parked or refused, is stopped while the reads run, or the
    dispatch raises -- except while a retained claim owns it, which
    `retry_retained_claims` releases once that claim settles. A contest,
-   once written, is read back by every resolution.
+   once written, is read back by every resolution:
+   an in-memory `_queue` entry keeps its first entry's conversation stamp, so
+   the gate's commit point adopts a contest any retained record of the
+   conversation carries before it registers the run.
 2. If empty and the spawn carried `approval_mode="auto"` → `"auto"`
 3. If empty and YOLO mode active → `"auto"` (a contested root is no
    exception: it withholds chat-level trust, not this rung or any below it).
