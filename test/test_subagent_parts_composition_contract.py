@@ -571,7 +571,7 @@ _BASE_CLASS: dict[str, tuple[str, str]] = {
     "_clear_tool_dispatch": ("staticmethod", "(info: 'SubagentInfo') -> 'None'"),
     "_continue_prelude": (
         "method",
-        "(self, conv_id: 'str', task: 'str', parent_session_key: 'str' = '', agent: 'str' = '', model: 'str | None' = None, max_turns: 'int' = 0, cwd: 'str' = '', _preassigned_id: 'str' = '', _memory_mode: 'str | None' = None, _crew_log_asked: \"'tuple[str, int] | None'\" = None, *, _execution_context=None, _captured_state=Ellipsis, _root_session_key: 'str' = '') -> \"'SubagentInfo | dict[str, Any] | None'\"",
+        "(self, conv_id: 'str', task: 'str', parent_session_key: 'str' = '', agent: 'str' = '', model: 'str | None' = None, max_turns: 'int' = 0, cwd: 'str' = '', _preassigned_id: 'str' = '', _memory_mode: 'str | None' = None, _crew_log_asked: \"'tuple[str, int] | None'\" = None, *, _execution_context=None, _captured_state=Ellipsis, _root_session_key: 'str' = '', _run_pin: \"'tuple[str, str] | None'\" = None) -> \"'SubagentInfo | dict[str, Any] | None'\"",
     ),
     "_conversation_busy": ("method", "(self, conv_key: 'str') -> 'SubagentInfo | None'"),
     "_conversation_records": ("method", "(self, key: 'str') -> 'list[SubagentInfo]'"),

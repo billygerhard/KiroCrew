@@ -699,6 +699,43 @@ class TestNestedFileCardRoutesToRoot:
         del manager._agents["A2"]
         assert _subagent_parent_session_key(state, "subagent:C") == ""
 
+    @pytest.mark.asyncio
+    async def test_a_later_continuation_from_another_chat_does_not_move_a_contested_childs_tab(
+        self,
+    ) -> None:
+        """The tab a run below a contest belongs to is fixed when it is admitted.
+
+        Chat 2 continues A (contesting it) and that turn spawns C; the
+        continuation then finishes while C's record stays. Chat 3 continues A
+        next. Resolved afresh, C's tab would follow the newest live record
+        under ``subagent:A`` -- chat 3's -- so C's file card and frames would
+        land in a chat that never asked for it.
+        """
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.handlers.files import _subagent_parent_session_key
+
+        manager = _manager(_sessions({ROOT}), AsyncMock(return_value=True))
+        founder = _live(manager, "A", ROOT)
+        founder.done = True
+        founder.started = 1.0
+        cont = _continue(manager, "A2", "dashboard:chat-2", "subagent:A")  # contests A
+        cont.started = 2.0
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            child = manager.spawn("child task", parent_session_key="subagent:A")
+            assert child is not None
+            await manager._tasks[child.id]
+        assert child.root_session_key == CONTESTED_A
+        assert manager.root_session_key_for(child) == "dashboard:chat-2"
+
+        cont.done = True
+        later = _continue(manager, "A3", "dashboard:chat-3", "subagent:A")
+        later.started = 3.0
+        state = SimpleNamespace(subagents=manager)
+        assert manager.root_session_key_for(child) == "dashboard:chat-2"
+        assert _subagent_parent_session_key(state, f"subagent:{child.id}") == "dashboard:chat-2"
+        assert manager.trust_root_for(child) == CONTESTED_A
+
 
 class TestRetryKeepsTheFailedRunsRoot:
     """A retried run is governed by the trust its original actually ran under.

@@ -462,8 +462,22 @@ class ContinuationCoordinator(ManagerComponent):
         spawn, so its value has to be awaited -- which is exactly what the async
         entry does.
         """
+        run_pin: tuple[str, str] | None = None
         try:
-            conv_id = self.founder_conversation_id_impl(conv_id)
+            founder_id = self.founder_conversation_id_impl(conv_id)
+            if founder_id != conv_id:
+                # The turn is the REQUESTED run's next one: keep its own pin.
+                own = self._manager._agents.get(conv_id)
+                row = {} if own is not None else (read_state(conv_id) or {})
+                run_pin = (
+                    (own.model or "", own.reasoning_effort)
+                    if own is not None
+                    else (
+                        str(row.get("pinned_model") or ""),
+                        str(row.get("reasoning_effort") or ""),
+                    )
+                )
+                conv_id = founder_id
         except (OSError, ValueError) as exc:
             return SubagentInfo(
                 id=_preassigned_id or self._manager._mint_agent_id(),
@@ -483,6 +497,7 @@ class ContinuationCoordinator(ManagerComponent):
             _preassigned_id,
             _memory_mode,
             _crew_log_asked,
+            _run_pin=run_pin,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -537,7 +552,16 @@ class ContinuationCoordinator(ManagerComponent):
                 parent_session_key=parent_session_key,
                 error=f"memory_unavailable: {exc}",
             )
+        run_pin: tuple[str, str] | None = None
         if founder_id != conv_id:
+            # The turn is the REQUESTED run's next one: keep its own pin.
+            own = self._manager._agents.get(conv_id)
+            row = own_row or {}
+            run_pin = (
+                (own.model or "", own.reasoning_effort)
+                if own is not None
+                else (str(row.get("pinned_model") or ""), str(row.get("reasoning_effort") or ""))
+            )
             conv_id = founder_id
             own_row, own_row_read = None, False  # the founder's record is read below
         conv_key = f"subagent:{conv_id}"
@@ -624,6 +648,7 @@ class ContinuationCoordinator(ManagerComponent):
                 _execution_context=execution,
                 _captured_state=state,
                 _root_session_key=_root_session_key,
+                _run_pin=run_pin,
             )
             if not isinstance(prelude, dict):
                 return prelude
@@ -657,8 +682,12 @@ class ContinuationCoordinator(ManagerComponent):
         _execution_context=None,
         _captured_state=...,
         _root_session_key: str = "",
+        _run_pin: "tuple[str, str] | None" = None,
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
+
+        ``_run_pin`` is the (model, effort) of the run the caller addressed when
+        it named a continuation rather than the founder *conv_id*.
 
         ``_root_session_key`` is the trust root of the run whose OWN next turn
         this is -- set only by the runtime's automatic follow-up
@@ -850,7 +879,9 @@ class ContinuationCoordinator(ManagerComponent):
         # both), so it resolves again, as it does for a run still in memory. After
         # a gateway restart the run is gone from memory and state.json holds what
         # the spawn recorded.
-        if original is not None:
+        if _run_pin is not None:
+            run_model, run_effort = _run_pin
+        elif original is not None:
             run_model, run_effort = original.model or "", original.reasoning_effort
         else:
             recorded = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
@@ -1388,7 +1419,8 @@ class ContinuationCoordinator(ManagerComponent):
     def _release_prefix(self, conv_id: str, founder_id: str) -> Any:
         """The on-loop half of a release, shared by both entry points.
 
-        Returns ``(False, detail)`` when the release is refused, otherwise
+        Returns ``(False, detail)`` when the release is refused, ``(True,
+        detail)`` when only a legacy alias was retired, otherwise
         ``(sid, provider_label, original)`` after the ``SessionMap`` and TTL
         registry have forgotten the conversation. No await happens inside it, so
         the busy check and ``forget_conversation`` commit together, BEFORE the disk
@@ -1403,9 +1435,11 @@ class ContinuationCoordinator(ManagerComponent):
         no run -- continuations now register under the founder -- and the
         release would delete the native session's files under the founder's
         live continuation. The alias is a second pointer to the same
-        conversation, so it is RETIRED here either way (its mapping and TTL
-        entry forgotten, no file touched); the files go only with the founder's
-        own mapping, and only when the founder's conversation is free.
+        conversation, so releasing a mapped alias RETIRES only it (its mapping and
+        TTL entry forgotten, no file touched) and leaves the founder alone: the
+        TTL sweep ages a rebuilt alias out while continuations refresh only
+        the founder's key. The files go only when the founder's own key is
+        released, and only when its conversation is free.
         """
         # Not an ``_impl``, so it keeps this module's globals: import here.
         from ..subagent import PROVIDER_LABEL_DEFAULT
@@ -1416,9 +1450,11 @@ class ContinuationCoordinator(ManagerComponent):
         if busy is None and founder_id != conv_id:
             busy = self._manager._conversation_busy(alias_key)
         alias_sid = None
+        alias_known = False
         if founder_id != conv_id:
             alias_sid = self._manager._sessions.forget_conversation(alias_key)
-            self._manager._conversations.pop(alias_key, None)
+            alias_ttl = self._manager._conversations.pop(alias_key, None)
+            alias_known = alias_sid is not None or alias_ttl is not None
         if busy is not None:
             if busy._state_writer_abandoned:
                 return (
@@ -1426,6 +1462,8 @@ class ContinuationCoordinator(ManagerComponent):
                     f"conversation_busy: run {busy.id} is still settling a state write",
                 )
             return False, f"conversation_busy: run {busy.id} is in flight"
+        if alias_known:
+            return self._release_answer(alias_sid or "", "", True)
         provider_label = (
             self._manager._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         )
@@ -1505,10 +1543,11 @@ class ContinuationCoordinator(ManagerComponent):
         ``(ok, detail)``. Runs its disk I/O on the CALLING thread, so event-loop
         callers use :meth:`release_conversation_async_impl` instead.
         """
-        conv_id = self._release_founder(conv_id)
-        prefix = self._release_prefix(conv_id, conv_id)
-        if prefix[0] is False:
+        founder_id = self._release_founder(conv_id)
+        prefix = self._release_prefix(conv_id, founder_id)
+        if isinstance(prefix[0], bool):
             return prefix
+        conv_id = founder_id
         sid, provider_label, original = prefix
         disposed = self._release_disk_sync(conv_id, sid, provider_label)
         self._release_forget_live_state(conv_id, original)
@@ -1534,7 +1573,7 @@ class ContinuationCoordinator(ManagerComponent):
         # on-loop half is keyed on the founder it answered.
         founder_id = await asyncio.to_thread(self._release_founder, conv_id)
         prefix = self._release_prefix(conv_id, founder_id)
-        if prefix[0] is False:
+        if isinstance(prefix[0], bool):
             return prefix
         conv_id = founder_id
         sid, provider_label, original = prefix

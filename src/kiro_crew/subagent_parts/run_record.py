@@ -268,6 +268,10 @@ class SubagentInfo:
     # ``subagent:<id>`` key, so a chat's continuation contests it rather than
     # founding it. Empty only outside admission.
     conversation_root_session_key: str = ""
+    # The tab a run stamped with a contested ``root_session_key`` belongs to,
+    # captured at admission from the parent conversation's live record. Later
+    # continuations of that conversation from another chat must not move it.
+    tab_root_session_key: str = ""
     memory_mode: str = field(default="persistent", kw_only=True)
     _memory_mode_ready: bool = field(default=True, init=False, repr=False)
     agent: str = ""

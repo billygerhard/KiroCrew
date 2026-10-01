@@ -1091,11 +1091,14 @@ def root_session_key_for(self: SubagentManager, info: SubagentInfo) -> str:
     the tab of the chat that continued it -- so the walk climbs one record
     and asks the same question of it. A parent not retained
     leaves no tab to answer with (``""``: the global feed), which is where a
-    marker resolved anyway.
+    marker resolved anyway. Admission captures that answer in
+    ``tab_root_session_key`` so a later continuation of the parent
+    conversation from another chat cannot move the card; the walk serves
+    only a record built outside admission.
     """
     stamp = info.root_session_key
     if is_contested_root(stamp):
-        return self._tab_root_below_contest(info)
+        return info.tab_root_session_key or self._tab_root_below_contest(info)
     return stamp or self.root_session_key(info.parent_session_key)
 
 

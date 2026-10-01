@@ -251,6 +251,7 @@ def _continue_prelude(
     _execution_context=None,
     _captured_state=...,
     _root_session_key: str = "",
+    _run_pin: "tuple[str, str] | None" = None,
 ) -> "SubagentInfo | dict[str, Any] | None":
     return self._continuation._continue_prelude_impl(
         conv_id,
@@ -266,6 +267,7 @@ def _continue_prelude(
         _execution_context=_execution_context,
         _captured_state=_captured_state,
         _root_session_key=_root_session_key,
+        _run_pin=_run_pin,
     )
 
 

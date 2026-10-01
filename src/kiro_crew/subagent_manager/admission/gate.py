@@ -1540,8 +1540,21 @@ class _GateMixin(ManagerComponent):
                     batch_total=max(0, int(batch_total)),
                 )
                 return _refuse_row(refused)
+            # A contest is one-way, and an in-memory queued continuation keeps
+            # the stamp of its first entry: a rival admitted while it waited may
+            # have contested the conversation since (its run writes the marker
+            # onto the founder's record), so the stamp must not outlive that.
+            if not is_contested_root(conversation_root_session_key):
+                for record in self._manager._conversation_records(conversation_key):
+                    if is_contested_root(record.conversation_root_session_key):
+                        conversation_root_session_key = record.conversation_root_session_key
+                        break
         info.root_session_key = root_session_key
         info.conversation_root_session_key = conversation_root_session_key
+        if is_contested_root(root_session_key):
+            # The marker is no tab: fix the tab now, while the record that
+            # spawned this run is the parent conversation's live one.
+            info.tab_root_session_key = self._manager._tab_root_below_contest(info)
         self._manager._agents[agent_id] = info
         self._manager._forget_pending_start(agent_id)
         self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)

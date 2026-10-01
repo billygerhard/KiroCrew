@@ -1028,6 +1028,44 @@ class TestNestedTrustInheritance:
         assert a2.conversation_root_session_key == ROOT
         assert manager.root_session_key("subagent:A") == ROOT
 
+    @pytest.mark.asyncio
+    async def test_a_queued_continuation_adopts_a_contest_made_while_it_waited(self) -> None:
+        """An in-memory queued continuation re-enters with its first entry's stamp.
+        A rival admitted while it waited may have contested the conversation
+        (its run writes the marker onto the founder's record); the contest is
+        one-way, so the drained continuation must not run on the founding
+        chat's trust."""
+        sessions = _sessions({ROOT})
+        manager = _manager(sessions, AsyncMock(return_value=True))
+        founder = _live(manager, "A", ROOT)
+        founder.done = True
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            prepared = manager.prepare_spawn(
+                "continue A",
+                parent_session_key=ROOT,
+                conversation_key="subagent:A",
+                _memory_mode="persistent",
+                _execution_context=execution_for_store("", template_id="").to_record(),
+            )
+        assert not isinstance(prepared, SubagentInfo), (prepared.error, prepared.queued)
+        params = dict(prepared.params)
+        assert params["_conversation_root_session_key"] == ROOT  # stamped before the contest
+        founder.conversation_root_session_key = CONTESTED_A  # the rival's contest landed
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(manager, "_run", AsyncMock()),
+        ):
+            info = manager.spawn(**params, _from_queue=True)
+            try:
+                assert info is not None and not info.error, info.error if info else None
+                assert info.conversation_root_session_key == CONTESTED_A
+                assert manager.trust_root_for(info) == CONTESTED_A
+                assert sessions.get_approval_policy(manager.trust_root_for(info)) == ""
+            finally:
+                await manager.cancel_all()
+
     def test_cross_root_continuation_marks_the_conversation_contested(self) -> None:
         """A continue from another chat never lends that chat's trust to the conversation.
 
@@ -1499,6 +1537,60 @@ class TestNestedTrustInheritance:
             assert own.conversation_root_session_key == ROOT
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("retained", [True, False])
+    @pytest.mark.parametrize("entry", ["async", "sync"])
+    async def test_continuing_a_continuation_keeps_its_own_model_and_effort(
+        self, entry: str, retained: bool
+    ) -> None:
+        """Continuing A2 with no model override runs on A2's model, not founder A's.
+
+        A was spawned on ``model-x``; the caller continued it with an explicit
+        ``model-y`` (and its effort), which created A2. Continuing A2 resolves
+        the id to A for the conversation's identity, but the turn is A2's next
+        one, so it keeps A2's pin -- from the retained record, or from A2's own
+        ``state.json`` once it is evicted.
+        """
+        manager = _manager(_sessions({ROOT}), AsyncMock(return_value=True))
+        a = _live(manager, "A", ROOT)
+        a.done, a.model, a.reasoning_effort = True, "model-x", "low"
+        a2 = _continue(manager, "A2", ROOT, "subagent:A")
+        a2.done, a2.model, a2.reasoning_effort = True, "model-y", "high"
+        if not retained:
+            manager._agents.pop("A2")
+        records = {
+            "A": {"id": "A", "pinned_model": "model-x", "reasoning_effort": "low"},
+            "A2": {
+                "id": "A2",
+                "conversation_key": "subagent:A",
+                "pinned_model": "model-y",
+                "reasoning_effort": "high",
+            },
+        }
+        captured: dict = {}
+
+        def _capture(**kwargs):  # type: ignore[no-untyped-def]
+            captured.update(kwargs)
+            return SubagentInfo(id="A3", task="t")
+
+        async def _capture_async(**kwargs):  # type: ignore[no-untyped-def]
+            return _capture(**kwargs)
+
+        with (
+            patch("kiro_crew.subagent.read_state", side_effect=records.get),
+            patch("kiro_crew.subagent_persistence.read_state", side_effect=records.get),
+            patch.object(manager, "_promote_conversation", return_value=None),
+            patch.object(manager, "spawn", side_effect=_capture),
+            patch.object(manager, "spawn_async", side_effect=_capture_async),
+        ):
+            if entry == "async":
+                result = await manager.continue_conversation_async("A2", "next turn", ROOT)
+            else:
+                result = manager.continue_conversation("A2", "next turn", ROOT)
+        assert result is not None and not result.error, result and result.error
+        assert captured["model"] == "model-y"
+        assert captured["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
     async def test_a_pre_upgrade_chain_is_followed_to_the_actual_founder(self) -> None:
         """A3 -> A2 -> A on disk resolves to A, not to A2.
 
@@ -1606,16 +1698,59 @@ class TestNestedTrustInheritance:
             assert mapping == {"subagent:A": "sid-native"}
             assert "subagent:A2" not in manager._conversations
             assert manager._conversations["subagent:A"] == 1.0
-            # Once the founder's conversation is free, releasing through the
-            # alias id releases the conversation itself.
+            # Free, the alias is still only a pointer: releasing it retires
+            # the alias alone. The files go with the founder's own key.
             mapping["subagent:A2"] = "sid-native"
             live.done = True
             ok, detail = await manager.release_conversation_async("A2")
+            assert (ok, detail) == (True, "released")
+            cleanup.assert_not_called()
+            assert demoted == []
+            assert mapping == {"subagent:A": "sid-native"}
+            ok, detail = await manager.release_conversation_async("A")
             assert (ok, detail) == (True, "released")
             cleanup.assert_called_once_with("sid-native", "acp")
             assert demoted == ["A"]
             assert mapping == {}
             assert "subagent:A" not in manager._conversations
+
+    @pytest.mark.asyncio
+    async def test_an_expired_legacy_alias_never_releases_its_recently_continued_founder(
+        self,
+    ) -> None:
+        """The TTL sweep retiring a rebuilt alias leaves the founder alone.
+
+        Every continuation resolves to founder A and refreshes only
+        ``subagent:A``, so a rebuilt ``subagent:A2`` alias ages out first. Its
+        release resolves to A; keyed there it would forget A's mapping and TTL
+        entry and delete A's native session files minutes after A was
+        continued.
+        """
+        from kiro_crew.subagent_parts.run_limits import _CONVERSATION_TTL_SECS
+
+        sessions = _sessions(set())
+        manager = _manager(sessions, AsyncMock(return_value=True))
+        records = {
+            "A": {"id": "A"},
+            "A2": {"id": "A2", "conversation_key": "subagent:A"},
+        }
+        mapping = {"subagent:A": "sid-native", "subagent:A2": "sid-native"}
+        sessions.forget_conversation = MagicMock(side_effect=lambda key: mapping.pop(key, None))
+        sessions.conversation_provider = MagicMock(return_value="acp")
+        now = 10_000.0 + _CONVERSATION_TTL_SECS
+        manager._conversations["subagent:A2"] = 1.0  # aged out
+        manager._conversations["subagent:A"] = now - 60  # continued a minute ago
+        with (
+            patch("kiro_crew.subagent.read_state", side_effect=records.get),
+            patch("kiro_crew.subagent_persistence.read_state", side_effect=records.get),
+            patch("kiro_crew.subagent.update_state") as demote,
+            patch("kiro_crew.subagent._cleanup_session_files_sync") as cleanup,
+        ):
+            await manager._sweep_conversations_async(now)
+        cleanup.assert_not_called()
+        demote.assert_not_called()
+        assert mapping == {"subagent:A": "sid-native"}
+        assert manager._conversations == {"subagent:A": now - 60}
 
 
 class TestNestedTrustPreservation:
