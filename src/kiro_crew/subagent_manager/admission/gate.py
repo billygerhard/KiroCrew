@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         cached_admission_check,
         check_memory_available,
         contested_root,
+        is_contested_root,
         logger,
         parent_spawn_policy,
         platform_compat,
@@ -1375,6 +1376,15 @@ class _GateMixin(ManagerComponent):
                     batch_total=max(0, int(batch_total)),
                 )
                 return _refuse_row(refused)
+            # A contest is one-way, and an in-memory queued continuation keeps
+            # the stamp of its first entry: a rival admitted while it waited may
+            # have contested the conversation since (its run writes the marker
+            # onto the founder's record), so the stamp must not outlive that.
+            if not is_contested_root(conversation_root_session_key):
+                for record in self._manager._conversation_records(conversation_key):
+                    if is_contested_root(record.conversation_root_session_key):
+                        conversation_root_session_key = record.conversation_root_session_key
+                        break
         info.root_session_key = root_session_key
         info.conversation_root_session_key = conversation_root_session_key
         self._manager._agents[agent_id] = info
