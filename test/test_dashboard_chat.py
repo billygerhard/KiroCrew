@@ -13824,6 +13824,50 @@ class TestBulkApproveBroadcast:
         }
         assert {"req-1", "req-2"} <= resolved_ids
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["yolo", "trust"])
+    async def test_bulk_sweep_leaves_a_pending_contested_prompt_for_a_human(
+        self, tmp_path, monkeypatch, mode
+    ):
+        """A contested background prompt is one no standing grant answers.
+
+        The gateway refuses YOLO and every trust shortcut for a prompt keyed by a
+        contested conversation when it is RAISED; a grant armed while that prompt
+        waits is the same grant arriving later, so the bulk sweep that approves
+        every pending background future on ``yolo`` / all-slots ``trust`` must
+        skip the contested ones. Its uncontested neighbour is still swept.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat.sel", lambda: MagicMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.broadcast_ws = MagicMock()
+        loop = asyncio.get_running_loop()
+        contested: asyncio.Future[bool] = loop.create_future()
+        plain: asyncio.Future[bool] = loop.create_future()
+        state._approval_futures["bg-contested"] = contested
+        state._approval_futures["bg-plain"] = plain
+        state._pending_approvals["bg-contested"] = {
+            "id": "bg-contested",
+            "source": "subagent",
+            "tool": "shell",
+            "slot": "",
+            "contested": True,
+        }
+        state._pending_approvals["bg-plain"] = {
+            "id": "bg-plain",
+            "source": "subagent",
+            "tool": "shell",
+            "slot": "",
+        }
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": mode})
+            assert (await resp.json())["ok"] is True
+
+        assert plain.done() and plain.result() is True
+        assert not contested.done()  # still waiting on a human
+
 
 # ── Coverage: multi-pending approval 400 and trust auto-approve ──
 

@@ -9811,17 +9811,33 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         if not scoped:
             for aid in list(state._approval_futures):
                 fut = state._approval_futures[aid]
-                if not fut.done():
-                    state.resolve_approval(aid, True)
+                if fut.done():
+                    continue
+                if (state._pending_approvals.get(aid) or {}).get("contested"):
+                    # A contested prompt is one no standing grant answers: the
+                    # gateway refused YOLO and every trust shortcut for it when
+                    # it was raised, and a grant armed WHILE it waits is the same
+                    # grant arriving later. It stays pending for a human.
                     try:
                         sel().log_api_access(
                             caller=audit_caller("dashboard:background"),
                             operation=f"tool_approval:bulk_{mode}",
-                            outcome="approved",
+                            outcome="skipped_contested",
                             resources=aid,
                         )
                     except Exception:
-                        logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
+                        logger.warning("SEL audit failed for bulk skip %s", aid, exc_info=True)
+                    continue
+                state.resolve_approval(aid, True)
+                try:
+                    sel().log_api_access(
+                        caller=audit_caller("dashboard:background"),
+                        operation=f"tool_approval:bulk_{mode}",
+                        outcome="approved",
+                        resources=aid,
+                    )
+                except Exception:
+                    logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
             # Auto-approve pending channel approvals
             mgr = getattr(state, "channel_manager", None)
             if mgr:

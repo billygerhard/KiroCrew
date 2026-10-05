@@ -351,6 +351,66 @@ class ContinuationCoordinator(ManagerComponent):
                 return str(reason)
         return None
 
+    def founder_conversation_id_impl(self, conv_id: str, state: dict | None = None) -> str:
+        """The id of the run that FOUNDED the conversation *conv_id* belongs to.
+
+        A continuation is a run of its own (``subagent:<id>``, its own
+        ``state.json``) resumed on the FOUNDER's native session, and its record
+        -- in memory, or on disk -- names that conversation
+        (``conversation_key``); the founder's own record names none. A caller
+        that continues a continuation (``POST /api/spawn/<A2>/continue``) must
+        be resolved to the founder BEFORE anything is keyed on the id: the
+        busy check, the founding-root comparison and the durable contest write
+        all address the conversation, and keyed on ``subagent:<A2>`` they would
+        address a second, parallel conversation over the same native session --
+        a contest written onto A2's record alone leaves A's founding root
+        unchanged, so after a restart the founding chat reads it back and its
+        trust approves a session another chat has already written into.
+
+        *state* is the id's ``state.json`` when the caller has already read it
+        (off the event loop); without it, and with no retained record, the file
+        is read here -- a blocking read, for sync callers; an async caller runs
+        the whole resolution in a thread.
+
+        The record is FOLLOWED, not read once: a continuation admitted before
+        this resolution existed was keyed on the id it continued, so a
+        pre-upgrade chain reads A3 -> A2 -> A on disk, and stopping at A2 would
+        hand A3's continuation A2's own stamp as the founding root -- a chat
+        that continued A2 with trust would then approve a session A's untrusted
+        founder still owns, with no contest written. Each hop reads a retained
+        record or a cold ``state.json``; a record that names no conversation, or
+        its own (a kept founder's record does), is the founder, and one that
+        cannot be read ends the walk at that id, which downstream reads as an
+        unknown founder and contests. A cycle through another id is a corrupt
+        ancestry and raises ``ValueError``, which
+        both entries answer as a ``memory_unavailable`` refusal: there is no
+        founder to key the conversation on.
+        """
+        seen = {conv_id}
+        current, row = conv_id, state
+        while True:
+            record = self._manager._agents.get(current)
+            key = ""
+            if record is not None:
+                key = record.conversation_key or ""
+            else:
+                if row is None:
+                    row = read_state(current) or {}
+                if isinstance(row, dict):
+                    key = str(row.get("conversation_key") or "")
+            parent = self._persistence.subagent_id_from_conversation_key(key) if key else None
+            if parent is None or parent == current:
+                # No conversation named, or its own: a kept founder's record
+                # names ``subagent:<its own id>`` (``_publish_identity``).
+                return current
+            if parent in seen:
+                raise ValueError(
+                    f"cyclic conversation ancestry on subagent:{conv_id}; "
+                    "refusing to continue a conversation with no founder"
+                )
+            seen.add(parent)
+            current, row = parent, None
+
     def continue_conversation_impl(
         self,
         conv_id: str,
@@ -383,6 +443,16 @@ class ContinuationCoordinator(ManagerComponent):
         spawn, so its value has to be awaited -- which is exactly what the async
         entry does.
         """
+        try:
+            conv_id = self.founder_conversation_id_impl(conv_id)
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or self._manager._mint_agent_id(),
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=f"memory_unavailable: {exc}",
+            )
         prelude = self._manager._continue_prelude(
             conv_id,
             task,
@@ -411,6 +481,7 @@ class ContinuationCoordinator(ManagerComponent):
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
         _crew_log_asked: "tuple[str, int] | None" = None,
+        _root_session_key: str = "",
     ) -> SubagentInfo | None:
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
@@ -419,6 +490,37 @@ class ContinuationCoordinator(ManagerComponent):
         # immutable record is read by the worker, then the prelude rechecks busy.
         from kiro_crew.execution_context import stricter_memory_mode
 
+        # Resolve a continuation's id to its founder FIRST: every step below is
+        # keyed on the conversation (busy check, prelude, the gate's root
+        # comparison, the run's durable contest write). A retained record
+        # answers in memory; otherwise the id's own ``state.json`` is read off
+        # the loop -- ONE read, reused as the execution snapshot below when the
+        # id turns out to be the founder's, so a cold continuation still costs a
+        # single read and the busy recheck still follows it. The walk to the
+        # founder may read cold ancestors (a pre-upgrade chain), so it runs in
+        # the same thread.
+        own_row: dict | None = None
+        own_row_read = False
+
+        def resolve_founder() -> tuple[dict | None, bool, str]:
+            if self._manager._agents.get(conv_id) is None:
+                row = self._persistence.read_state(conv_id)
+                return row, True, self.founder_conversation_id_impl(conv_id, state=row or {})
+            return None, False, self.founder_conversation_id_impl(conv_id)
+
+        try:
+            own_row, own_row_read, founder_id = await asyncio.to_thread(resolve_founder)
+        except (OSError, ValueError) as exc:
+            return SubagentInfo(
+                id=_preassigned_id or self._manager._mint_agent_id(),
+                task=_redact(task),
+                done=True,
+                parent_session_key=parent_session_key,
+                error=f"memory_unavailable: {exc}",
+            )
+        if founder_id != conv_id:
+            conv_id = founder_id
+            own_row, own_row_read = None, False  # the founder's record is read below
         conv_key = f"subagent:{conv_id}"
         if self._manager._conversation_busy(conv_key) is not None:
             busy_result = self._manager._continue_prelude(
@@ -446,7 +548,7 @@ class ContinuationCoordinator(ManagerComponent):
             if execution is None or not self._manager._sessions.resumable_sid(conv_key):
 
                 def read_snapshot():
-                    row = self._persistence.read_state(conv_id)
+                    row = own_row if own_row_read else self._persistence.read_state(conv_id)
                     captured = (
                         self._persistence.read_run_execution(conv_id, state=row)
                         if row is not None
@@ -484,6 +586,7 @@ class ContinuationCoordinator(ManagerComponent):
             _crew_log_asked,
             _execution_context=execution,
             _captured_state=state,
+            _root_session_key=_root_session_key,
         )
         if not isinstance(prelude, dict):
             return prelude
@@ -504,8 +607,22 @@ class ContinuationCoordinator(ManagerComponent):
         *,
         _execution_context=None,
         _captured_state=...,
+        _root_session_key: str = "",
     ) -> "SubagentInfo | dict[str, Any] | None":
         """Dispatch a follow-up *task* into conversation *conv_id*.
+
+        ``_root_session_key`` is the trust root of the run whose OWN next turn
+        this is -- set only by the runtime's automatic follow-up
+        (``spawn_steer`` ``mode="follow_up"``), which holds that run's record
+        and its admission stamp. Admission then keeps the stamp instead of
+        re-walking ``parent_session_key``: by the time a follow-up dispatches,
+        the run's parent may have finished and been evicted, and a walk from a
+        key with no record answers the key itself -- no chat's trust, and a
+        founding root the conversation's durable record contradicts -- which
+        would mark the run's own conversation contested and persist that
+        false contest onto its founder. A caller that is not the run itself
+        (a chat continuing it, another run) passes nothing and is resolved
+        as before.
 
         ``_preassigned_id`` mirrors ``spawn``: a caller that must persist the
         dispatch identity BEFORE the side effect (so a crash in between is
@@ -714,6 +831,7 @@ class ContinuationCoordinator(ManagerComponent):
             memory_store=memory_store,
             _memory_mode=_memory_mode,
             app=app,
+            **({"_root_session_key": _root_session_key} if _root_session_key else {}),
             **(
                 {"_execution_context": _execution_context.to_record()}
                 if _execution_context is not None
@@ -1049,6 +1167,13 @@ class ContinuationCoordinator(ManagerComponent):
                 # merged dispatch this is the turn that asked LAST; each individual
                 # ask is recorded at its own turn as `subagent/steered`.
                 _crew_log_asked=getattr(info, "_crew_log_followup_asked", None),
+                # This is the run's OWN next turn: its trust root is the stamp
+                # it was admitted with, not a re-walk of a parent key whose
+                # record may be gone by now (see ``_continue_prelude_impl``).
+                # A parentless run (a cron's or the CLI's) has no chat root and
+                # founded its conversation in its own name, so that founding
+                # stamp is what its follow-up must present to inherit it.
+                _root_session_key=info.root_session_key or info.conversation_root_session_key,
             )
             err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
             if not err.startswith("conversation_busy"):
