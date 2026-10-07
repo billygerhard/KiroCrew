@@ -1577,6 +1577,19 @@ async def _traced_dashboard(
     import test_dashboard_server_startup_coverage as harness
 
     monkeypatch.setattr(server, "_start_secondary_loopback_site", AsyncMock(return_value=None))
+    # The crewmate prune is kicked onto a worker thread a few steps before the boot
+    # merges channel transcripts, and the merge kicks a deferred removal when the
+    # prune has not settled yet. Which branch runs depends on the worker thread's
+    # speed, so hold the merge until the prune has settled: the recorded order is
+    # then the settled one on every runner, however slow.
+    converge = server._converge_channel_transcripts
+
+    @functools.wraps(converge)
+    async def _converge_once_settled(state: Any) -> None:
+        await asyncio.wait_for(state.crewmate_prune_settled.wait(), timeout=30)
+        await converge(state)
+
+    monkeypatch.setattr(server, "_converge_channel_transcripts", _converge_once_settled)
     holder: dict[str, list[str]] = {}
     real = server.start_dashboard
 
