@@ -325,6 +325,7 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                                 "task": {"type": "string"},
                                 "model": {"type": "string"},
                                 "reasoning_effort": {"type": "string"},
+                                "backend": {"type": "string"},
                             },
                             "required": ["task"],
                             "additionalProperties": False,
@@ -332,9 +333,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                         "description": (
                             "Multiple tasks to run in parallel as one wave. Each entry is a "
                             "prompt string, or an object {task, model?, "
-                            "reasoning_effort?} whose fields override the call's batch-wide "
-                            "value for that task only, e.g. the same review prompt on two "
-                            "models, delivered together."
+                            "reasoning_effort?, backend?} whose fields override the call's "
+                            "batch-wide value for that task only, e.g. the same review prompt "
+                            "on two models or two backends, delivered together."
                         ),
                     },
                     "agent": {
@@ -400,6 +401,19 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "`kiro-cli chat --list-models --format json`; another backend "
                             "(e.g. codex) accepts only ids from its own model list and "
                             "refuses ids from kiro's catalog."
+                        ),
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": (
+                            "Optional backend (agent harness) for the subagent(s), e.g. "
+                            "'kiro', 'claude', 'codex': the run starts on that harness "
+                            "instead of the gateway default, so one orchestrator can hand "
+                            "each task to the harness that suits it. An unavailable backend "
+                            "is REFUSED with the list of available ones, never replaced by "
+                            "the default. Pass 'model' as an id from THAT backend's list. "
+                            "Batch-wide; a tasks[] object can override it per task. A "
+                            "spawn_continue follow-up stays on the run's backend."
                         ),
                     },
                     "reasoning_effort": {
@@ -763,6 +777,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     cwd = args.get("cwd") or ""
     model = args.get("model") or ""
     reasoning_effort = args.get("reasoning_effort") or ""
+    backend = args.get("backend") or ""
     keep = bool(args.get("keep"))
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
     # same context a normal session would.
@@ -838,6 +853,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         a = agents_list[i] if agents_list else agent
         t_model = over.get("model") or model
         t_effort = over.get("reasoning_effort") or reasoning_effort
+        t_backend = over.get("backend") or backend
         if a in refused_agents:
             # Short line on purpose: the full roster is already on the first
             # refusal above, and repeating it once per remaining member would
@@ -861,6 +877,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["model"] = t_model
         if t_effort:
             body["reasoning_effort"] = t_effort
+        if t_backend:
+            body["backend"] = t_backend
         if keep:
             body["keep"] = True
         if not inc_memory:
