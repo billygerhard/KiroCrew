@@ -2285,6 +2285,73 @@ def model_registry_namespace(backend: str) -> str:
     return _MODEL_REGISTRY_NAMESPACE_BY_BACKEND.get(backend, "acp")
 
 
+def uses_advertised_model_selection(backend: str) -> bool:
+    """Whether *backend* takes its model vocabulary from what it advertises.
+
+    Membership of :data:`ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`, OR a REGISTERED
+    operator descriptor declaring ``model_source: "acp_advertised"`` -- the same
+    question ``/api/models`` asks via
+    :func:`~kiro_crew.acp.harness.operator_registry.operator_backend_models` to decide
+    a registered backend's picker rows.
+
+    Why the second clause: that set is built from module-level constants, so it is
+    complete at import -- before any config-authored descriptor is registered -- and a
+    backend named only in ``harnesses.json`` can never appear in it. Membership alone
+    therefore excluded every config-registered backend from the advertised vocabulary,
+    and the failure is silent in both directions. The harness still names its models on
+    ``session/new``, but the fold that turns a ``model`` select into a ``models``
+    envelope (harness-parity H6) refuses to run, so :meth:`AcpClient._capture_available_models`
+    returns before recording anything -- neither on the session nor in the
+    cross-session cache ``/api/models`` reads. The visible result is a picker offering
+    nothing but ``auto`` for a harness that had just answered with a real list.
+
+    One predicate, read by all three gates, so the envelope fold, the cache write and
+    the endpoint cannot disagree about which backends are in scope. The cold-cache case
+    stays harmless: :func:`~kiro_crew.model_registry.resolve_wire_model_id` returns its
+    input unchanged when the provider advertised nothing, so the folds onto an exact
+    advertised spelling are no-ops until this cache fills.
+    """
+    if backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+        return True
+    # Imported lazily: acp.harness imports this module at module level, so a
+    # top-level import here would be a cycle.
+    from kiro_crew.acp.harness.descriptor import MODEL_SOURCE_ACP_ADVERTISED
+    from kiro_crew.acp.harness.operator_registry import operator_backend_models
+
+    info = operator_backend_models(backend)
+    return info is not None and info[0] == MODEL_SOURCE_ACP_ADVERTISED
+
+
+def switches_model_via_config_option(backend: str, config_options: Any) -> bool:
+    """Whether a model switch on *backend* travels down ``session/set_config_option``.
+
+    Membership of :data:`ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`, OR a REGISTERED
+    operator descriptor whose session actually advertised a ``model`` select in
+    *config_options* (the ``configOptions`` its ``session/new`` / ``session/load``
+    returned).
+
+    Why the second clause: the set is a frozen literal, so a backend named only in
+    ``harnesses.json`` is never in it and fell through to ``session/set_model``. A
+    descriptor wrapping claude-agent-acp (0.66.0 implements no ``session/set_model``)
+    then had every model pick refused by the adapter while Crew recorded it as
+    applied. The clause claims nothing from config: it reads the adapter's own
+    advertisement on this session, the same evidence the switch would be validated
+    against, and builtins stay governed by the reviewed set alone.
+    """
+    if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+        return True
+    # Imported lazily: acp.harness imports this module at module level, so a
+    # top-level import here would be a cycle.
+    from kiro_crew.acp.harness.operator_registry import operator_backend_models
+
+    if operator_backend_models(backend) is None:
+        return False
+    return any(
+        isinstance(opt, dict) and opt.get("id") == "model" and opt.get("type") == "select"
+        for opt in config_options or ()
+    )
+
+
 # Backends implementing ``_kiro.dev/commands/execute`` — the kiro extension that
 # runs a slash command as an RPC. Non-members have no equivalent verb, so their
 # slash commands go through ``session/prompt`` and are interpreted by the adapter

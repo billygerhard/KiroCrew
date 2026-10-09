@@ -3307,7 +3307,9 @@ async def test_handle_set_model():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle._wait_for_response = AsyncMock(return_value={})  # type: ignore[method-assign]
     await handle.set_model("claude-sonnet-4")
+    handle._wait_for_response.assert_awaited_once()
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["method"] == "session/set_model"
     assert sent["params"]["modelId"] == "claude-sonnet-4"
@@ -6125,9 +6127,10 @@ class TestAcpRuntimeLoadSession:
             return {}
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
-        # set_model goes through the routed (fire-and-forget) send.
+        # set_model goes through the routed send, then awaits its reply.
         routed = AsyncMock(return_value=1)
         monkeypatch.setattr(rt, "send_request", routed)
+        monkeypatch.setattr(AcpSessionHandle, "_wait_for_response", AsyncMock(return_value={}))
 
         handle = await rt.load_session("/f.json", "sid-resume", agent="kirocrew")
 
@@ -7817,6 +7820,7 @@ async def test_set_model_syncs_resolved_model_id():
     rt.send_request = AsyncMock()
     h = AcpSessionHandle("sA", asyncio.Queue(), rt)
     h._turn_done.set()
+    h._wait_for_response = AsyncMock(return_value={})  # type: ignore[method-assign]
     await h.set_model("new-model")
     assert h._model == "new-model"
     assert h._resolved_model_id == "new-model"
@@ -7837,6 +7841,7 @@ async def test_set_model_rebases_context_stats(monkeypatch):
     rt.send_request = AsyncMock()
     h = AcpSessionHandle("sA", asyncio.Queue(), rt)
     h._turn_done.set()
+    h._wait_for_response = AsyncMock(return_value={})  # type: ignore[method-assign]
     h.last_prompt_stats.context_used_tokens = 100_000
     h.last_prompt_stats.context_window_tokens = 1_000_000
     h.last_prompt_stats.context_pct = 10.0

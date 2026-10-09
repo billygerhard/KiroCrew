@@ -107,6 +107,7 @@ from kiro_crew.agent_sdk.backends import (  # noqa: F401 - re-exported for exist
     routing_for,
     selectable_backend_values,
     selectable_backends,
+    uses_advertised_model_selection,
 )
 
 # Declared per harness rather than listed as a capability set: whether a
@@ -195,4 +196,5 @@ __all__ = [
     "routing_for",
     "selectable_backend_values",
     "selectable_backends",
+    "uses_advertised_model_selection",
 ]

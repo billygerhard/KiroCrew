@@ -107,7 +107,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
@@ -200,6 +199,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_PROCESS_NAMES,
     NODE_ADAPTER_ENTRY_SEGMENTS,
     launch_for,
+    uses_advertised_model_selection,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
@@ -5881,8 +5881,14 @@ class AcpClient:
     @property
     def _uses_advertised_model_selection(self) -> bool:
         """True when this backend sources its wire model id / seed from the
-        provider's advertised list (see ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``)."""
-        return self.backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+        provider's advertised list.
+
+        Delegates to :func:`~kiro_crew.agent_sdk.backends.uses_advertised_model_selection`
+        so the cache write gated here, the ``configOptions`` fold in
+        :func:`~kiro_crew.acp.session_handle.models_from_config_options`, and the
+        ``/api/models`` dispatch cannot disagree about which backends are in scope.
+        """
+        return uses_advertised_model_selection(self.backend)
 
     @property
     def _seeds_local_settings(self) -> bool:

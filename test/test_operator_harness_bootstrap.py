@@ -199,7 +199,7 @@ def test_a_registered_backend_is_a_member_of_no_session_path_capability_set(clea
         assert isinstance(frozen, frozenset)
 
     body = inspect.getsource(client_mod)
-    assert "self.backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION" in body
+    assert "uses_advertised_model_selection(self.backend)" in body
     assert "self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY" in body
     assert "self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS" in body
     assert "self.backend in ACP_BACKENDS_LOAD_WITHOUT_MODES" in body

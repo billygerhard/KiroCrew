@@ -30,6 +30,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_KIRO,
     model_registry_namespace,
     selectable_backend_values,
+    uses_advertised_model_selection,
 )
 from kiro_crew.agent import (
     AGENT_FILENAME,
@@ -1909,15 +1910,20 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
     claude session would otherwise answer the codex picker with claude ids --
     every one of which codex refuses.
 
-    Newest matching session first, like :func:`_entitled_kiro_models`: forward
-    order is creation order, so the most recently started session carries the most
-    recent snapshot of what the account is served.
+    The FULLEST matching snapshot wins, not the newest. A session/new that races
+    the adapter's entitlement lookup answers a degraded default list
+    (``default, sonnet[1m], haiku``) while sibling sessions on the same account
+    hold the full one, and nothing on this read path re-probes it. Taking the
+    newest let any freshly started background session collapse every chat's
+    picker to that degraded list. Over-offering fails open: ``set_model`` awaits
+    the adapter's reply, so a model the account truly lacks is refused visibly.
     """
     try:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
         return []
+    best: list[dict] = []
     for provider in reversed(providers):
         # Read each field straight off ``capabilities_of(provider)``: binding it to a
         # local would be a second spelling of the question, which the one-spelling
@@ -1933,17 +1939,18 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
             advertised = getter()
         except Exception:
             continue
-        if advertised:
-            return [
-                {
-                    "model_name": m.get("modelId", ""),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
-                    "description": m.get("description", ""),
-                }
-                for m in advertised
-                if m.get("modelId")
-            ]
-    return []
+        rows = [
+            {
+                "model_name": m.get("modelId", ""),
+                "display_name": m.get("name", "") or m.get("modelId", ""),
+                "description": m.get("description", ""),
+            }
+            for m in advertised or []
+            if m.get("modelId")
+        ]
+        if len(rows) > len(best):
+            best = rows
+    return best
 
 
 async def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
@@ -2203,33 +2210,44 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     return merged
 
 
-def _codex_models(request: web.Request, configured_default: str = "") -> list[dict]:
-    """Assemble the codex model dropdown from what codex-acp itself advertises.
+def _advertised_backend_models(
+    request: web.Request, backend: str, configured_default: str = ""
+) -> list[dict]:
+    """Assemble the model dropdown from what *backend*'s own harness advertises.
 
-    codex-acp has no static catalog on our side: the registry carries no codex
-    namespace, and kiro-cli's ``--list-models`` names models codex refuses with a
-    bare ``-32602`` at startup. The ONLY ids ``session/set_config_option("model")``
-    accepts are the ones the adapter advertised as its ``model`` select on
-    ``session/new``, so those are the only rows offered.
+    Every ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` member has no static catalog
+    on our side, and kiro-cli's ``--list-models`` names models these adapters
+    refuse -- codex with a bare ``-32602`` at startup, opencode with the same on
+    ``session/set_config_option("model")``. The ONLY ids a member accepts are the
+    ones its adapter advertised as its ``model`` select on ``session/new``, so
+    those are the only rows offered.
 
-    Source order: a live CODEX session's advertised list first (the
+    Dispatch is by MEMBERSHIP rather than by naming backends one at a time. The
+    name-by-name form is what let opencode/pi/goose/deepseek fall past every
+    branch onto the kiro spawn, so a harness added to the set was mis-served the
+    day it was added, and nothing failed until a picker offered an id the harness
+    refused. The set is the contract: a new member is covered by construction.
+
+    Source order: a live session of THIS backend's advertised list first (the
     namespace-selected read :func:`_advertised_cc_models` does, so a retained
-    claude session cannot answer with ids codex refuses), then the cross-session
-    cache that :meth:`AcpClient._capture_available_models` fed on the last codex
-    ``session/new`` -- so a cold dashboard after a restart still offers the real
-    list instead of nothing. Both empty means no codex session has ever
-    started on this install; the picker then offers ``auto`` alone, and the
-    frontend refetches on the next session spawn.
+    claude or kiro session cannot answer with ids this backend refuses -- the
+    capability alone does not separate them, only ``model_id_namespace`` says
+    whose ids these are), then the cross-session cache that
+    :meth:`AcpClient._capture_available_models` fed on the last ``session/new``
+    -- so a cold dashboard after a restart still offers the real list instead of
+    nothing. Both empty means no session of this backend has ever started on this
+    install; the picker then offers ``auto`` alone, and the frontend refetches on
+    the next session spawn.
 
-    ``auto`` always leads: it means "inherit codex's own default" and is never an
-    entitlement question. The configured default is resurrected only when nothing
-    is known -- force-including a pin the adapter did not advertise would put back
-    the exact row that kills the session.
+    ``auto`` always leads: it means "inherit the harness's own default" and is
+    never an entitlement question. The configured default is resurrected only
+    when nothing is known -- force-including a pin the adapter did not advertise
+    would put back the exact row that kills the session.
     """
-    codex_namespace = model_registry_namespace(ACP_BACKEND_CODEX)
-    advertised = _advertised_cc_models(request, codex_namespace)
+    namespace = model_registry_namespace(backend)
+    advertised = _advertised_cc_models(request, namespace)
     if not advertised:
-        cached = model_registry.advertised_models(codex_namespace)
+        cached = model_registry.advertised_models(namespace)
         advertised = [{"model_name": m, "display_name": m, "description": ""} for m in cached]
 
     rows: list[dict] = [
@@ -2264,6 +2282,18 @@ def _codex_models(request: web.Request, configured_default: str = "") -> list[di
             or model_registry.REFERENCE_WINDOW_TOKENS
         )
     return rows
+
+
+def _codex_models(request: web.Request, configured_default: str = "") -> list[dict]:
+    """:func:`_advertised_backend_models` for codex, kept as the named spelling.
+
+    codex's own tests drive this name, and it is the readable spelling at a
+    codex-shaped call site. It delegates rather than carrying a second copy of
+    the row assembly, so the two cannot drift.
+    """
+    return _advertised_backend_models(
+        request, ACP_BACKEND_CODEX, configured_default=configured_default
+    )
 
 
 def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
@@ -2341,9 +2371,15 @@ async def api_models(request: web.Request) -> web.Response:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))
         )
-    if backend == ACP_BACKEND_CODEX:
+    if uses_advertised_model_selection(backend):
+        # Membership, not a name. claude is handled above and never reaches here:
+        # it has a ``claude_code`` registry to merge, so a cold cache is not
+        # "nothing is known" for it. Every other member is served from its own
+        # adapter's advertised list, so none of them can reach the kiro spawn.
         return web.json_response(
-            _codex_models(request, configured_default=_scoped_default(cfg, backend))
+            _advertised_backend_models(
+                request, backend, configured_default=_scoped_default(cfg, backend)
+            )
         )
     # A config-authored operator backend serves ITS OWN model namespace, never
     # kiro-cli's --list-models catalog: a static descriptor answers with its

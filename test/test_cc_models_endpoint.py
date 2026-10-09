@@ -89,6 +89,30 @@ class TestAdvertisedCcModels:
         out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
         assert out[0]["model_name"] == "global.anthropic.claude-opus-4-8[1m]"
 
+    def test_newer_degraded_snapshot_does_not_collapse_the_picker(self):
+        """A session/new that raced the entitlement lookup answers the default
+        tier; a newer such session must not hide what an older one proved."""
+        full = _FakeProvider(
+            [
+                {"modelId": "default", "name": "Default", "description": ""},
+                {"modelId": "opus", "name": "Opus", "description": ""},
+                {"modelId": "fable", "name": "Fable", "description": ""},
+                {"modelId": "sonnet", "name": "Sonnet", "description": ""},
+                {"modelId": "haiku", "name": "Haiku", "description": ""},
+            ]
+        )
+        degraded = _FakeProvider(
+            [
+                {"modelId": "default", "name": "Default", "description": ""},
+                {"modelId": "sonnet[1m]", "name": "Sonnet (1M)", "description": ""},
+                {"modelId": "haiku", "name": "Haiku", "description": ""},
+            ]
+        )
+        out = _advertised_cc_models(
+            _request_with_providers({"old": full, "new": degraded}), "claude_code"
+        )
+        assert [r["model_name"] for r in out] == ["default", "opus", "fable", "sonnet", "haiku"]
+
     def test_empty_when_no_active_sessions(self):
         assert _advertised_cc_models(_request_with_providers({}), "claude_code") == []
 

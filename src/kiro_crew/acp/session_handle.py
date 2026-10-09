@@ -101,11 +101,9 @@ from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_st
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
-    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     EVENT_AGENT_SWITCHED,
@@ -159,6 +157,10 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     StructuredStatus,
     effort_config_option_id,
+)
+from kiro_crew.agent_sdk.backends import (
+    switches_model_via_config_option,
+    uses_advertised_model_selection,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating  # noqa: F401 - raised here
@@ -610,16 +612,19 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     Some hosts advertise no ``models`` object at all and put their model list in
     ``configOptions`` instead, as a ``select`` whose ``options`` carry the ids
     ``session/set_config_option`` accepts -- so a caller that reads only ``models``
-    records nothing and the picker it feeds is empty. Gated on membership in
-    ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` (harness-parity H6): the fold is
-    only meaningful where the advertised list IS the vocabulary, and a host outside
-    that set keeps whatever the static registry gave it.
+    records nothing and the picker it feeds is empty. Gated on
+    :func:`~kiro_crew.agent_sdk.backends.uses_advertised_model_selection`
+    (harness-parity H6): the fold is only meaningful where the advertised list IS the
+    vocabulary, and a host outside that set keeps whatever the static registry gave it.
+    That predicate is set membership OR a registered ``acp_advertised`` operator
+    descriptor -- a backend that exists only in ``harnesses.json`` is structurally
+    absent from the set, and gating on membership alone left the picker empty for it.
 
     Authored once because both drivers need the same answer -- ``AcpClient`` on the
     per-session path and ``AcpSessionHandle`` on the shared-runtime one -- and a
     second copy is free to disagree about the select's shape.
     """
-    if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+    if not uses_advertised_model_selection(backend):
         return None
     for opt in resp.get("configOptions") or []:
         if not isinstance(opt, dict) or opt.get("id") != "model" or opt.get("type") != "select":
@@ -2175,7 +2180,7 @@ class AcpSessionHandle:
             # _bg session the current model IS session/new's served default.
             return
         backend = self._runtime.acp_backend
-        if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+        if switches_model_via_config_option(backend, self._config_options):
             # A harness whose adapter judges the model VALUE rather than only the
             # option: the spelling Crew stored may not be the spelling this build
             # serves, so the candidate ladder decides. Non-strict, because this
@@ -2200,10 +2205,14 @@ class AcpSessionHandle:
             # a refusal into a silent stay-on-default where today it raises.
             await self.set_config_option(MODEL_CONFIG_ID, resolved)
         else:
-            await self._runtime.send_request(
+            # Await the reply: send_request only writes the frame. Unawaited, an
+            # adapter's refusal was dropped by the pre-turn drain and the model
+            # below was recorded as switched while the old one kept serving.
+            req_id = await self._runtime.send_request(
                 METHOD_SET_MODEL,
                 set_model_params(self._session_id, resolved),
             )
+            await self._wait_for_response(req_id, timeout=10.0)
         self._model = resolved
         # Parity with AcpClient.set_model: keep _resolved_model_id in sync so
         # _backfill_context_window looks up the NEW model's window after a switch
