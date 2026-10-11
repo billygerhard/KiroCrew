@@ -9544,7 +9544,9 @@ class GatewayOrchestrator:
                         # failure this recovery drains, so the sub-agent is what
                         # caused the turn.
                         _turn_actor="subagent",
-                    )
+                    ),
+                    state=self.dashboard_state,
+                    slot=slot,
                 ),
             )
             slot.task = _task
@@ -10412,7 +10414,9 @@ class GatewayOrchestrator:
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
                                     **_run_kwargs,
-                                )
+                                ),
+                                state=self.dashboard_state,
+                                slot=_injection_slot,
                             )
                         )
                         _injection_slot.task = _task
