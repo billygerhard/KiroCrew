@@ -93,8 +93,8 @@ with no row here.
    * - ``ACP_BACKENDS_STEER``
      - pre-session registry query (whether ``_session/steer`` exists)
    * - ``ACP_BACKENDS_STEERING_REQUEST``
-     - pre-session registry query (whether a user steer travels on codex-acp's
-       ``_session/steering`` request instead)
+     - pre-session registry query (whether a user steer travels on the
+       ``_session/steering`` request of codex-acp and claude-agent-acp instead)
    * - ``ACP_BACKENDS_COMPACT``
      - pre-session registry query (whether manual ``/compact`` is offered at all)
    * - ``ACP_BACKENDS_INLINE_COMPACTION``
@@ -1375,7 +1375,8 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
 # claude-agent-acp does not implement it, so a steer sent there is answered with
-# method-not-found rather than reaching the turn.
+# method-not-found rather than reaching the turn. It takes a user's steer over
+# ``_session/steering`` instead (see ``ACP_BACKENDS_STEERING_REQUEST``).
 # codex-acp (1.11.0) has a steering channel, but not this one and not usable for
 # what membership buys. Measured against a real adapter: it is a different method
 # (``_session/steering``, ``{sessionId, prompt: [ContentBlock]}``, answered with
@@ -1422,9 +1423,9 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # ``startedNewTurn`` is cancelled first so the text cannot run twice. The result
 # is at-least-once: codex orders the answer against the turn's terminal in no
 # way, so a steer injected just as its turn ends can be queued as well and run a
-# second time, visibly, as its own turn. Only the
-# shared-runtime path speaks it -- ``AcpSessionHandle`` -- because only there can
-# a request be awaited without competing with the turn for the adapter's stdout.
+# second time, visibly, as its own turn. For codex
+# the shared-runtime path speaks it -- ``AcpSessionHandle`` -- whose reader routes
+# the answer without competing with the turn for the adapter's stdout.
 #
 # Deliberately NOT ``ACP_BACKENDS_STEER``: the deny-notice path needs a steer
 # that survives the refusal, and codex discards an injected steer with a turn
@@ -1437,7 +1438,27 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # such an entry, so membership here also means ``steer_needs_loss_recovery``: the
 # provider wrapper that the messaging channels, Side Chat and ``spawn_steer``
 # steer refuses, so those queue instead.
-ACP_BACKENDS_STEERING_REQUEST = frozenset({ACP_BACKEND_CODEX})
+#
+# claude-agent-acp takes the same request, on its own evidence: read from the
+# adapter's ``dist/acp-agent.js`` and driven live on 0.65.0 and 0.89.1 (the real
+# adapter, Agent SDK and native ``claude`` binary, with the model API served
+# locally). ``initialize`` advertises ``_meta.steering.supported: true``.
+# ``steer()`` finds the session's unsettled turn and pushes the text onto the
+# streaming input the Agent SDK query reads, answering ``injected``; the turn is
+# held open until a result answers the steer, so the model's next request carries
+# the steered text and the ``session/prompt`` terminal comes after its reply. A
+# steer sent with ``_meta.steering.idleBehavior: "promptRequired"`` to a session
+# with no running turn is answered ``promptRequired`` and starts nothing. 0.64.x
+# answers ``injected`` and then ends the turn without running the text, which is
+# why ``AcpClient`` speaks the request only from 0.65.0. A permission
+# awaiting the user is not cancelled by a steer (it is delivered at the SDK's
+# ``later`` priority), and Crew's reject is the adapter's ``reject`` option, a
+# ``deny`` without ``interrupt`` that does not end the turn. So unlike codex a
+# denial drops nothing, and the steer is reported consumed when the turn ends
+# with ``end_turn``; a cancelled or failed turn queues it. claude runs one adapter per
+# session, so ``AcpClient`` speaks the request for it, and only when the handshake
+# advertised it.
+ACP_BACKENDS_STEERING_REQUEST = frozenset({ACP_BACKEND_CODEX, ACP_BACKEND_CLAUDE})
 
 # Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
 # Every member acts on the ``/compact`` prompt that ``AcpProvider.compact()``
