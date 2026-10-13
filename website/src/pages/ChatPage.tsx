@@ -851,6 +851,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
      before producing any output is a real case (it happens on the very first
      turn), so the card wins and the welcome content stands down. */
   const isWelcomeState = messages.length === 0 && !slotRunning && !slotLoading && !sendingRef.current && !knowledgeFetch.results.length && !knowledgeFetch.loading && !knowledgeFetch.pendingKnowledge && !pendingQuestion
+  // A REF mirror of `isWelcomeState`, for the switch callbacks to read. Which
+  // surface reports a refused backend switch depends on it: the welcome hero
+  // renders `backendSwitchError` inline under its picker, and the composer chip
+  // — the only other place a backend can be picked — has no such surface, so it
+  // uses the shared notice toast its sibling model/agent switches use. A ref
+  // rather than the value itself so `switchBackend` stays referentially stable:
+  // `isWelcomeState` is recomputed every render, and naming it in that callback's
+  // deps would rebuild the callback (and every picker holding it) on every
+  // render for no behavioral gain. Same pattern as `sendingRef` above, which
+  // `isWelcomeState` itself reads for exactly this reason.
+  const isWelcomeStateRef = useRef(isWelcomeState)
+  isWelcomeStateRef.current = isWelcomeState
   const showHistorySuggestions = isWelcomeState && historySuggestions.length > 0 && !historyDismissed
   useEffect(() => {
     if (!showHistorySuggestions) return
@@ -3146,14 +3158,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // live on the drill-in page and keep the menu open on their own.
     // setPendingModel is a stable useState setter.
   }, [activeSlot, dispatch, setPendingModel])
-  // A backend pick from the welcome-screen picker. The welcome surface renders
-  // on an ALREADY-CREATED empty slot (the new-chat click made it), so parking
-  // the pick in `pendingBackend` alone would apply it to the NEXT slot created
-  // and leave THIS chat on the global default — the pick looked accepted (the
-  // trigger showed it) while the first message spawned kiro-cli. Mirror
-  // `switchModel`: without an active slot park it; with one, write it to the
-  // slot through the mutation endpoint. The endpoint resets the session (a
-  // backend is a distinct harness PROCESS), which is free on an empty slot.
+  // A backend pick. TWO surfaces call this: the welcome-screen picker and the
+  // composer's backend chip, which is the control on a chat that already has
+  // turns. The welcome surface renders on an ALREADY-CREATED empty slot (the
+  // new-chat click made it), so parking the pick in `pendingBackend` alone would
+  // apply it to the NEXT slot created and leave THIS chat on the global default —
+  // the pick looked accepted (the trigger showed it) while the first message
+  // spawned kiro-cli. Mirror `switchModel`: without an active slot park it; with
+  // one, write it to the slot through the mutation endpoint.
+  //
+  // The endpoint resets the session — a backend is a distinct harness PROCESS and
+  // there is no `session/set_model`-style call that moves a running session
+  // across harnesses. That reset was free on an empty slot, which is why this
+  // control used to live only there; it is NOT free on a chat with turns, where
+  // it costs the live session's continuity and a cold start on the next message.
+  // The chat's TRANSCRIPT is durable and survives, so nothing is lost that the
+  // user can read. That makes the pick a cost to disclose (`backendTitle` on the
+  // chip) rather than a wall to hide behind: the endpoint already accepts any
+  // slot, and its only refusals are a turn in flight and a parent with children.
+  //
   // `pendingBackend` is still written so the trigger reflects the pick
   // immediately and a follow-on creation from this surface inherits it.
   const switchBackend = useCallback(async (backendId: string) => {
@@ -3169,10 +3192,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         },
         (value) => dispatch(updateSlot({ key: activeSlot, acp_backend: value })))
     } catch (e) {
-      // An error surface, so it takes the shared one: WelcomeView renders this
-      // through ErrorNotice under the picker (structured recovery context and
-      // the agent hand-off), not the hand-written switch toast. The server's
-      // own message is preferred, as for the sibling switches.
+      // TWO surfaces, one per placement, because the two pickers live in
+      // different trees. The welcome hero renders `backendSwitchError` under its
+      // picker through ErrorNotice (structured recovery context and the agent
+      // hand-off) — the richer surface, and the one its own comment chose over
+      // the toast. The composer chip, which is the only backend control on a
+      // chat that has turns, has no such slot, so its refusals go to the shared
+      // notice toast that `switchModel` and `switchAgent` already use; a 409 for
+      // a turn in flight or a parent with children has to be visible SOMEWHERE,
+      // and the chip keeps showing what is still serving either way.
+      if (!isWelcomeStateRef.current) dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
       setBackendSwitchError(agentSwitchFailureMessage(e))
       // eslint-disable-next-line no-console -- surface switchBackend failures for debugging
       console.error('switchBackend failed', e)
@@ -7827,10 +7856,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // Not on the welcome surface: the picker directly above the
               // composer IS the backend control there, and a chip beside it
               // saying the backend "can't be changed" would contradict it.
-              // The chip appears once the first message has pinned the binding.
+              // Everywhere else the chip is the picker (see `onSelectBackend`).
               backendLabel={backendChoiceExists && !isWelcomeState ? backendChipLabel : undefined}
               backendTitle={backendChipTitle}
               backendIsInheritedDefault={activeSlotBackend === null}
+              // The chip is the real picker on a live chat, not a read-only label.
+              // `switchBackend` is the same callback the welcome surface's picker
+              // uses — it writes the pin through the per-slot mutation endpoint and
+              // mirrors the stored value into the slot row — so the two surfaces
+              // cannot diverge in what they do, only in where they sit.
+              //
+              // Disabled while the slot is running: the endpoint answers 409 for a
+              // turn in flight (the reset would tear down the streaming turn), and
+              // offering a pick that is guaranteed to be refused is worse than not
+              // offering it. The trigger stays focusable and keeps its label, so
+              // the serving backend is still readable mid-turn.
+              onSelectBackend={switchBackend}
+              backendValue={activeSlotBackend}
+              backendDisabled={slotRunning}
               modelName={shownModel}
               // The served default is shown exactly when the pin alone would
               // have read `auto`; that is the inherited case the marker names.

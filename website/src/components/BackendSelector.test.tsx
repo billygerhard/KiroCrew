@@ -79,23 +79,32 @@ describe('BackendSelector', () => {
     expect(onSelect).toHaveBeenCalledWith('claude')
   })
 
-  it('the list is bounded by its pane and centered under the trigger, never a fixed 300px', async () => {
-    // A 320px viewport or a narrow split pane: an absolute list anchored to a
-    // centered content-width trigger extends from the trigger's LEFT edge, so a
-    // fixed 300px list ran off-screen. The wrapper spans the pane and the list
-    // is `w-full max-w-[300px]`, centered with a translate, so it is never
-    // wider than the pane and never wider than 300px.
+  it('on a phone the list escapes the composer, fits the screen, and opens upward from a bottom chip', async () => {
+    // The composer chip sits at the bottom of a phone screen: an `absolute
+    // top-full` list hung below it, off-screen, and was clipped by the scrolling
+    // container. The list is portaled to <body>, `fixed`, clamped to the
+    // viewport, and opens on the side with room.
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(320)
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(640)
     vi.spyOn(api, 'backends').mockResolvedValue(PAYLOAD)
-    mount(<BackendSelector value="" onSelect={vi.fn()} />)
+    const onSelect = vi.fn()
+    mount(<BackendSelector value="" onSelect={onSelect} variant="chip" />)
+    const trigger = await screen.findByRole('button')
+    vi.spyOn(trigger, 'getBoundingClientRect').mockReturnValue(
+      { left: 250, right: 310, width: 60, top: 590, bottom: 618, height: 28, x: 250, y: 590, toJSON: () => ({}) } as DOMRect,
+    )
     const list = await openList()
-    const cls = list.className.split(/\s+/)
-    expect(cls).toContain('w-full')
-    expect(cls).toContain('max-w-[300px]')
-    expect(cls).toContain('left-1/2')
-    expect(cls).toContain('-translate-x-1/2')
-    expect(cls).not.toContain('w-[300px]')
-    const wrapper = list.parentElement as HTMLElement
-    expect(wrapper.className.split(/\s+/)).toEqual(expect.arrayContaining(['relative', 'w-full', 'min-w-0']))
+    expect(list.parentElement).toBe(document.body)
+    expect(list.className.split(/\s+/)).toContain('fixed')
+    expect(list.style.width).toBe('300px')
+    expect(list.style.left).toBe('12px')
+    expect(list.style.top).toBe('')
+    expect(list.style.bottom).toBe('54px')
+    // A tap on a portaled option must not be eaten by the outside-click closer.
+    const option = within(list).getByRole('option', { name: /Claude Code/ })
+    fireEvent.mouseDown(option)
+    fireEvent.click(option)
+    expect(onSelect).toHaveBeenCalledWith('claude')
   })
 
   it('selecting kiro-cli fires onSelect with the empty-string id', async () => {

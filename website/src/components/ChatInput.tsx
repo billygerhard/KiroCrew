@@ -119,6 +119,7 @@ const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
 const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
+import BackendSelector from './BackendSelector'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -531,13 +532,35 @@ interface ChatInputProps {
   agentIsInheritedDefault?: boolean
   agentSource?: string
   /** Bound-backend display name for the shelf chip. Empty/absent hides the
-   *  chip. The chip opens no picker: the backend picker lives on the welcome
-   *  screen, where an EMPTY chat's backend can still be changed (the welcome
-   *  picker calls `switchBackend`); once the chat has a first turn the chip is
-   *  read-only, and a click only explains that. */
+   *  chip. HOW the chip behaves is decided by `onSelectBackend`, not by this
+   *  prop: with a callback the chip is the real backend picker (the same
+   *  `BackendSelector` the welcome surface uses, in its `chip` variant); with
+   *  none it stays the read-only chip whose click only explains the binding. */
   backendLabel?: string
   /** Tooltip/aria text for the backend chip (pinned vs resolved-default variant). */
   backendTitle?: string
+  /**
+   * Makes the backend chip a real picker. `null`/`undefined` (the default) keeps
+   * today's read-only chip, so a surface that does not pass this renders exactly
+   * what it rendered before.
+   *
+   * This is the reason the chip is not merely hidden on a live chat. A backend is
+   * a distinct harness PROCESS with no `session/set_model`-style in-place
+   * switch, so picking one mid-chat costs a session reset — the live process is
+   * torn down and the next message cold-starts on the new harness. The chat's
+   * transcript is durable and survives; the live session's continuity does not.
+   * That is a cost worth a control, not a prohibition, so the pick is offered and
+   * `backendTitle` names the cost. Disable the trigger instead while a pick or a
+   * turn is in flight (`backendDisabled`), which is also what the server answers
+   * 409 for.
+   */
+  onSelectBackend?: (id: string) => void
+  /** The slot's STORED backend for the picker, `null` = inherit the default. The
+   *  picker matches its check mark on this, not on `backendLabel`. */
+  backendValue?: string | null
+  /** Blocks picking (a turn in flight, or a pick already applying). The trigger
+   *  stays focusable and keeps its label so the current choice stays readable. */
+  backendDisabled?: boolean
   /**
    * True when `backendLabel` is the backend an INHERITING slot resolves to (the
    * configured default), not a per-chat pin. The click-to-explain caption then
@@ -981,6 +1004,9 @@ function ChatInput({
   backendLabel,
   backendTitle,
   backendIsInheritedDefault,
+  onSelectBackend,
+  backendValue,
+  backendDisabled,
   modelName,
   onAgentClick,
   onModelClick,
@@ -5111,15 +5137,44 @@ function ChatInput({
           </div>
           )}
           </div>
-          {!!backendLabel && (
-            /* Backend chip: names the AI backend serving this chat. The chat's
-               backend is picked on the welcome screen (where an empty chat can
-               still switch it) and is read-only once the chat has a first turn,
-               so this does not open a picker -- it must not look like the chips
-               that do, and it must still answer a click: a click toggles the
-               explanation (role=status, so AT hears it) instead of leaving it
-               tooltip-only. Visually: lock glyph + dotted underline + help cursor,
-               no hover fill.
+          {!!backendLabel && onSelectBackend && (
+            /* Backend PICKER — the live-chat path. The chat already has turns, and
+               the backend is still changeable, so this is the real control: the
+               SAME `BackendSelector` the welcome surface renders, in its `chip`
+               variant, so there is exactly one implementation of "which backends
+               can this chat run on" and one verdict per refusal. A pick calls the
+               per-slot mutation endpoint, which resets the session (a backend is a
+               distinct harness process — there is no in-place switch across
+               harnesses), so the chat keeps its transcript and loses only the live
+               session's continuity.
+
+               Deliberately NOT `backendTitle`: that string is the read-only chip's
+               aria-label and says the backend was "fixed when the chat was
+               created", which is exactly the claim this picker makes false. The
+               trigger's own "Backend: <name>" label is accurate in both surfaces,
+               so the picker uses it and no new copy is needed to stop the lie.
+
+               It keeps the read-only chip's separated region — the leading
+               divider, and the same `max-two-buttons-per-row` exemption the chip
+               documented — so adding a real control here does not push the shelf's
+               horizontal group past that cap. */
+            <div className="relative flex items-center shrink-0 pl-2 border-l border-border">
+              <BackendSelector
+                variant="chip"
+                value={backendValue ?? null}
+                onSelect={onSelectBackend}
+                disabled={backendDisabled}
+                triggerTestId="chat-input-backend-chip"
+              />
+            </div>
+          )}
+          {!!backendLabel && !onSelectBackend && (
+            /* Backend chip: names the AI backend serving this chat, read-only.
+               This is the path for a surface that passes no `onSelectBackend`, and
+               the click only explains the binding (role=status, so AT hears it)
+               instead of leaving it tooltip-only. Visually: lock glyph + dotted
+               underline + help cursor, no hover fill — it must not look like the
+               chips that open something. The pickable path is the block above.
 
                It lives in its OWN separated region, exactly as the app
                session-controls group does and for the same rule:

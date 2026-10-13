@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { createPortal } from 'react-dom'
 import { AlertTriangle, Check, ChevronDown, Cpu } from 'lucide-react'
 
 import { backendRow, useBackends } from '../hooks/useBackends'
@@ -19,6 +20,22 @@ interface BackendSelectorProps {
    *  stays focusable and keeps its label so the current choice is still
    *  readable. */
   disabled?: boolean
+  /**
+   * Placement. `'welcome'` (the default) spans its pane and centres the trigger,
+   * which is right for the full-width welcome surface. `'chip'` drops the span
+   * and the centring so the trigger sits inline in the composer's horizontal
+   * chip row, at the shelf's own sizing.
+   *
+   * This is PRESENTATION ONLY: the list, its rows, the selectability verdicts,
+   * the keyboard contract and the i18n are identical in both. It exists because
+   * the composer chip must be the SAME control the welcome surface uses — a
+   * second implementation of this list is how the two surfaces drift apart on
+   * what is selectable and what a refusal says.
+   */
+  variant?: 'welcome' | 'chip'
+  /** `data-testid` on the trigger, so a surface embedding this chip can address
+   *  it by its own stable name. */
+  triggerTestId?: string
 }
 
 /**
@@ -44,7 +61,7 @@ interface BackendSelectorProps {
  * pick the gateway now refuses. The picker says it does not know instead of
  * guessing.
  */
-export default function BackendSelector({ value, onSelect, disabled }: BackendSelectorProps) {
+export default function BackendSelector({ value, onSelect, disabled, variant = 'welcome', triggerTestId }: BackendSelectorProps) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
@@ -57,7 +74,10 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
   useEffect(() => {
     if (!open) return
     const handler = (e: MouseEvent) => {
-      if (wrapRef.current?.contains(e.target as Node)) return
+      const target = e.target as Node
+      // The list is portaled out of wrapRef, so it needs its own check or a tap
+      // on an option closes the menu before the option's click lands.
+      if (wrapRef.current?.contains(target) || listRef.current?.contains(target)) return
       setOpen(false)
     }
     document.addEventListener('mousedown', handler)
@@ -93,14 +113,16 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
   const triggerText = i18nT('components.backendSelector.backend_name', { name: triggerLabel })
 
   return (
-    // The wrapper spans its pane (`w-full`) so the dropdown below has the pane's
-    // width to position in: an `absolute` list anchored to a centered,
-    // content-width trigger extends from the trigger's LEFT edge, and at 320px
-    // or in a narrow split pane a fixed 300px list ran off-screen. The trigger
-    // stays content-width and centered; the list is `w-full max-w-[300px]`
-    // centered under it (`left-1/2 -translate-x-1/2`), so it is never wider than
-    // the pane and never wider than 300px.
-    <div ref={wrapRef} className="relative flex flex-col items-center gap-1 w-full min-w-0">
+    // `welcome` spans its pane and centres the trigger; `chip` sits inline in the
+    // composer's chip row. The list itself is placed by `listStyle` either way.
+    <div
+      ref={wrapRef}
+      className={
+        variant === 'chip'
+          ? 'relative flex items-center shrink-0 min-w-0'
+          : 'relative flex flex-col items-center gap-1 w-full min-w-0'
+      }
+    >
       <button
         ref={btnRef}
         type="button"
@@ -109,6 +131,7 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={triggerText}
+        data-testid={triggerTestId}
         className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[12px] border border-border bg-transparent hover:bg-bg-hover transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 text-muted hover:text-text max-w-full"
       >
         <Cpu size={13} className="shrink-0 opacity-70" />
@@ -122,7 +145,7 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
         </span>
         <ChevronDown size={12} className="shrink-0 opacity-70" aria-hidden />
       </button>
-      {open && (
+      {open && createPortal(
         <div
           ref={listRef}
           role="listbox"
@@ -132,7 +155,12 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
           tabIndex={-1}
           aria-label={i18nT('components.backendSelector.backend_list')}
           onKeyDown={onListKeyDown}
-          className="absolute top-full left-1/2 -translate-x-1/2 mt-1 z-[9999] w-full max-w-[300px] max-h-[320px] overflow-y-auto bg-bg-elevated border border-border rounded-xl shadow-xl p-1 flex flex-col gap-0.5"
+          // Portaled + `fixed` from the trigger's live rect. An `absolute top-full`
+          // list hung BELOW the composer chip, i.e. off the bottom of a phone
+          // screen, and was clipped by the scrolling welcome hero. It opens on
+          // whichever side has more room and is clamped inside the viewport.
+          className="fixed z-[9999] overflow-y-auto bg-bg-elevated border border-border rounded-xl shadow-xl p-1 flex flex-col gap-0.5"
+          style={listStyle(btnRef.current)}
         >
           {state.isError && (
             <div className="px-2 py-2">
@@ -228,8 +256,28 @@ export default function BackendSelector({ value, onSelect, disabled }: BackendSe
               ))}
             </div>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   )
+}
+
+const LIST_MAX_W = 300
+const LIST_MAX_H = 320
+const EDGE = 8
+
+function listStyle(trigger: HTMLElement | null): CSSProperties {
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const width = Math.min(LIST_MAX_W, vw - EDGE * 2)
+  if (!trigger) return { width, left: (vw - width) / 2, top: EDGE, maxHeight: LIST_MAX_H }
+  const r = trigger.getBoundingClientRect()
+  const left = Math.min(Math.max(r.left + r.width / 2 - width / 2, EDGE), vw - width - EDGE)
+  const below = vh - r.bottom - EDGE - 4
+  const above = r.top - EDGE - 4
+  if (below >= Math.min(LIST_MAX_H, above)) {
+    return { width, left, top: r.bottom + 4, maxHeight: Math.min(LIST_MAX_H, below) }
+  }
+  return { width, left, bottom: vh - r.top + 4, maxHeight: Math.min(LIST_MAX_H, above) }
 }
