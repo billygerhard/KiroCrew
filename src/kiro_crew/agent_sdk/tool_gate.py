@@ -493,7 +493,14 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
         return
     # Local import for the same reason as the mask builder: this is a leaf that
     # ``acp/client.py`` imports at import time.
-    from kiro_crew.sandbox import credential_mask_applies
+    from kiro_crew.sandbox import credential_mask_applies, effective_sandbox_mode
+
+    # The operator turned the sandbox off on purpose. Judged on the EFFECTIVE tier,
+    # so a governed ``sandbox.min_level`` floor that raised "off" still refuses
+    # below. The no-backend + ``sandbox_allow_unsandboxed_exec`` case also still
+    # refuses: that one is not a declared "off".
+    if not platform_compat.IS_WINDOWS and effective_sandbox_mode(mode) == "off":
+        return
 
     # Ask whether the mask WILL BE APPLIED, never whether one particular tier is
     # selected. An earlier revision tested ``effective_sandbox_mode(mode) != "off"``

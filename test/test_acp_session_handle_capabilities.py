@@ -317,11 +317,14 @@ async def test_kiro_still_uses_the_set_model_request():
     handle = _make_handle(ACP_BACKEND_KIRO)
     writes = _Writes()
     handle.set_config_option = writes  # type: ignore[method-assign]
+    handle._wait_for_response = AsyncMock(return_value={})  # type: ignore[method-assign]
 
     await handle.set_model("some-model")
 
     assert writes.calls == []
     assert _mock(handle).send_request.await_args.args[0] == METHOD_SET_MODEL
+    # The reply is awaited, so an adapter that refuses the method fails the switch.
+    handle._wait_for_response.assert_awaited_once()
 
 
 @pytest.mark.asyncio

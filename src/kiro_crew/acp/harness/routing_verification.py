@@ -122,12 +122,18 @@ PROBE_TOOL_CLASSES: frozenset[str] = frozenset({PROBE_CLASS_EDIT, PROBE_CLASS_SH
 #: host must ask about), one through each tool class, both into the current
 #: working directory (so the sandbox mask, if any, is not what stops them),
 #: phrased so an agent has no reason to refuse. The turn is attested only when
-#: the host asked before BOTH and nothing was written.
+#: the host asked before BOTH and nothing was written. The prompt says outright
+#: that a refusal of the first step is expected and must not stop the second: an
+#: agent that stops after the first denial never attempts the shell tool, and the
+#: probe then cannot tell "shell is gated" from "shell was never tried".
 PROBE_PROMPT = (
-    "Do exactly these two things, in order, and nothing else. First, using your "
-    f"file-editing tool, create a file named {PROBE_FILE_NAME} in the current "
-    "working directory containing the single word: probe. Second, using your shell "
-    f"tool, run this command in the current working directory: {PROBE_SHELL_COMMAND}"
+    "This is a permission-system test. Do exactly these two things, in order, and "
+    "nothing else. First, using your file-editing tool, create a file named "
+    f"{PROBE_FILE_NAME} in the current working directory containing the single "
+    "word: probe. Second, using your shell tool, run this command in the current "
+    f"working directory: {PROBE_SHELL_COMMAND}. Permission to either step may be "
+    "denied; that is expected and fine. If the first step is denied, still attempt "
+    "the second, and do not retry or work around a denial."
 )
 
 #: Bound on the whole probe: spawn, handshake, one turn, shutdown.
@@ -463,7 +469,7 @@ def _probe_digest_for(
             return None
     except (OSError, ValueError):
         return None
-    if agent is not None and (agent or "") != probe_agent:
+    if agent is not None and probe_agent and (agent or "") != probe_agent:
         return None
     return digest
 
@@ -505,15 +511,29 @@ def agent_attestation_problem(
 ) -> str | None:
     """Why *descriptor* must not be spawned for *agent* right now, or ``None``.
 
-    The attestation says the harness's tool calls reached the permission gate
-    UNDER THE AGENT the probe selected. Another agent is another permission
-    posture -- an ``agent_spec`` descriptor's decision travels as exactly that
-    selection, and any descriptor may hand the name to its binary -- so a spawn
-    for an agent the record does not name is refused rather than admitted on the
-    strength of a different agent's probe. The probe's own spawn -- identified
-    by *work_dir*, the probe's scratch (:data:`_PROBING`) -- is the one
-    exception: it is what produces the record. Another spawn of the same id
-    during the probe is held to the record like any other.
+    The attestation says the harness's tool calls reached the permission gate.
+    Whether that fact is specific to ONE agent depends on whether the agent name
+    is part of the spawn at all -- and that is exactly :attr:`HarnessDescriptor.
+    agent_args`:
+
+    * ``agent_args`` NON-EMPTY (``agent_spec``, e.g. Strands' ``--agent={agent}``)
+      -- the binary receives the selection and may behave differently under it, so
+      another agent is genuinely another permission posture. A spawn for an agent
+      the record does not name is refused rather than admitted on the strength of
+      a different agent's probe.
+    * ``agent_args`` EMPTY (``session_config``, e.g. AGY) -- the agent name never
+      reaches the process. The spawned argv is byte-identical for every agent, so
+      a per-agent record is ceremony that can only ever be wrong: it forces the
+      owner to re-verify once per agent to obtain a grant that was never in doubt,
+      and -- because the Verify action is only offered for rows that are not yet
+      selectable -- leaves no way to obtain it at all. The probe's evidence
+      (fingerprint, executable digest, permission classes) is agent-independent
+      here and is enforced unchanged by :func:`_attestation_problem_for`.
+
+    The probe's own spawn -- identified by *work_dir*, the probe's scratch
+    (:data:`_PROBING`) -- is exempt from the record entirely: it is what produces
+    the record. Another spawn of the same id during the probe is held to the
+    record like any other.
 
     This is a refusal of THIS spawn, not a withdrawal of the backend: the record
     still stands for the agents it names. Reads the store, so callers on the
@@ -524,6 +544,11 @@ def agent_attestation_problem(
     record = load_attestations().get(descriptor.id)
     if not record:
         return "no routing attestation is recorded for this backend"
+    if not list(descriptor.agent_args or ()):
+        # The agent is not an input to this spawn, so the record cannot be
+        # about a different posture. Everything that IS bound to the bytes is
+        # checked by the caller.
+        return None
     if (agent or "") in attested_agents(record):
         return None
     return (

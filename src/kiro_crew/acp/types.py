@@ -665,6 +665,23 @@ def _normalize_to_kebab(name: str) -> str:
     return s.lower()
 
 
+#: Parameter keys that carry a shell command string, in precedence order.
+#: ``command`` is the Bash-style spelling that Claude-shaped ACP tool calls use;
+#: the rest are casing variants of the SAME field that other hosts put on the
+#: wire. AGY (Antigravity's ACP server) sends its shell arguments as
+#: ``{"CommandLine": ..., "Cwd": ..., "WaitMsBeforeExecution": ...}`` --
+#: PascalCase, because the host marshals its own struct field names straight onto
+#: the JSON. A missing spelling here is not a cosmetic gap: it makes the command
+#: INVISIBLE to every downstream check. ``AcpEvent.shell_command`` then returns
+#: None, ``HookManager.on_tool_call``'s deny-by-default backstop refuses the call
+#: as unverifiable ("shell command could not be verified"), and the routing
+#: attestation's shell class can never be satisfied -- even though the harness
+#: asked correctly and honoured the answer. This is the same defect the casing
+#: note below already fixed for AWS operation names, one field over: normalize
+#: the SPELLING, never relax the checks that run on the result.
+_SHELL_COMMAND_KEYS: tuple[str, ...] = ("command", "CommandLine", "commandLine")
+
+
 def _command_from_tool_params(params: dict) -> str | None:
     """Recover the verifiable command string from a shell tool's params dict.
 
@@ -696,9 +713,10 @@ def _command_from_tool_params(params: dict) -> str | None:
       payloads in a form the shell-text matchers were not authored for. This is
       acceptable for a single-user tool but is not a complete smuggling defense.
     """
-    cmd = params.get("command")
-    if isinstance(cmd, str) and cmd:
-        return cmd
+    for _key in _SHELL_COMMAND_KEYS:
+        cmd = params.get(_key)
+        if isinstance(cmd, str) and cmd:
+            return cmd
     service = params.get("service_name")
     operation = params.get("operation_name")
     if isinstance(service, str) and service and isinstance(operation, str) and operation:

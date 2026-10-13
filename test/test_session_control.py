@@ -1505,6 +1505,59 @@ def test_birth_metadata_carries_the_slots_own_identity_and_origin(tmp_path, monk
         "origin must reach the birth metadata -- without it the session comes back "
         "unattributed and leaves slots:user"
     )
+    assert written.get("created_at") == created.created_at, (
+        "created_at must be the SLOT's own value, not a fresh stamp. It is the "
+        "creation identity the backend-pin store records as a record's owner and "
+        "re-checks on every restore (backend_pins.apply_restored_pin), and the "
+        "restore paths adopt it straight back into slot.created_at. A second stamp "
+        "is a different string for the same chat -- metadata_now_iso() mints local "
+        "time where _ChatSlot.__init__ mints UTC, so they differ by microseconds -- "
+        "and the owner check then fails for EVERY pinned chat on EVERY restart: the "
+        "pin is silently dropped and the chat inherits the configured default "
+        "backend. One creation, one value."
+    )
+
+
+def test_a_pin_set_on_a_created_session_survives_a_real_restart(tmp_path, monkeypatch):
+    """The whole loop, through the real birth write and the real restore.
+
+    Every other test in this area hands both sides of the owner check the same
+    string (``owner="t0"``, ``created_at="t0"``), which is exactly why the dual-mint
+    went unnoticed: the comparison was never asked to survive two producers. Here
+    the slot is created for real, its ``created_at`` is read back off the metadata
+    line the birth path actually wrote, a pin is recorded against the slot's own
+    value, and a SECOND state is built from the same crew home and restored.
+
+    Mutation guard: reintroducing a fresh local stamp in the birth dict fails here
+    even though every other pin test still passes.
+    """
+    import json
+
+    from kiro_crew.dashboard import backend_pins
+    from kiro_crew.dashboard.chat_persistence import restore_open_slots
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-caller")
+    monkeypatch.setattr(sc, "_workspace_name_for_dir", lambda cfg, ws_dir: caller.workspace)
+
+    result = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+    created = state.get_slot(result["target"])
+    written = state.conversation_log.get_metadata(sc.slot_history_key(created))
+    assert written["created_at"] == created.created_at
+
+    backend_pins.set_pin(created.key, "agy", owner=created.created_at)
+    (tmp_path / "open_slots.json").write_text(json.dumps({"keys": [created.key], "ts": 0.0}))
+
+    state2 = _make_state(tmp_path)
+    assert restore_open_slots(state2) == 1
+    restored = state2._slots[created.key]
+    assert restored.created_at == created.created_at
+    assert restored.acp_backend == "agy", (
+        "a pin recorded against the slot's own created_at must be restored; if this "
+        "is None the owner check rejected a record it should have matched, and the "
+        "chat has silently inherited the configured default backend"
+    )
 
 
 def test_nothing_suspends_between_the_stop_gate_and_the_stop(tmp_path, monkeypatch):

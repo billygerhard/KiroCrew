@@ -84,7 +84,7 @@ from kiro_crew.execution_context import (
     refresh_vouched_session_execution,
     resolve_member_execution,
 )
-from kiro_crew.history import metadata_now_iso, transcript_stem
+from kiro_crew.history import transcript_stem
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
 from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
@@ -2214,7 +2214,19 @@ async def create_session(
                     # that it does not already write.
                     "tab_id": slot._tab_id,
                     "origin": slot._origin,
-                    "created_at": metadata_now_iso(),
+                    # The slot's OWN `created_at`, never a fresh stamp. This field
+                    # is not only a display timestamp: it is the creation identity
+                    # the backend-pin store records as a record's `owner` and
+                    # re-checks on every restore (`backend_pins.apply_restored_pin`),
+                    # and the restore paths adopt it back into `slot.created_at`.
+                    # `metadata_now_iso()` minted it in LOCAL time while
+                    # `_ChatSlot.__init__` mints UTC, so the two were different
+                    # strings for the same creation by microseconds -- the owner
+                    # check then failed for EVERY pinned chat on EVERY restart, the
+                    # pin was silently dropped, and the chat inherited the
+                    # configured default backend. One creation, one value: the
+                    # slot's.
+                    "created_at": slot.created_at,
                     "workspace": slot.workspace,
                     "agent": slot.agent or "",
                     "project": slot.project or "",

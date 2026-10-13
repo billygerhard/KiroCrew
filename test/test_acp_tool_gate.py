@@ -679,20 +679,19 @@ def test_mask_still_exposes_the_adapters_own_token() -> None:
             )
 
 
-def test_sandbox_off_refuses_an_enforced_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With the sandbox off the mask is never applied, so the session must refuse.
+def test_sandbox_off_is_an_operator_choice_an_enforced_adapter_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``agent.sandbox: off`` starts an enforced adapter.
 
-    ``wrap_argv`` returns from its ``mode == "off"`` branch before it applies
-    ``extra_hidden_dirs``. Because ACP v1 cannot force a prompt for a passive read,
-    an enforced adapter started that way has NO compensating control and is strictly
-    weaker than the gate-routed harnesses beside it. Revert-verified: without the
-    guard this raises nothing.
+    The mask is not applied in that configuration, so the adapter's passive reads are
+    unfenced. The operator chose that for their own host (2026-10-08); only a
+    governed floor that raises ``off`` still refuses, tested below.
     """
     from kiro_crew import sandbox
 
     monkeypatch.setattr(sandbox, "_governance_sandbox_floor", lambda: None)
-    with pytest.raises(gate.ToolGateUnroutable):
-        gate.enforce_sandbox_floor(ACP_BACKEND_CODEX, "off")
+    gate.enforce_sandbox_floor(ACP_BACKEND_CODEX, "off")
 
 
 def test_sandbox_off_is_allowed_for_an_unenforced_harness(
@@ -963,7 +962,7 @@ def test_windows_still_passes_when_the_mask_applies(
     gate.enforce_sandbox_floor(ACP_BACKEND_OPENCODE, "off")
 
 
-@pytest.mark.parametrize("mode,detect", [("off", "namespace"), ("standard", "none")])
+@pytest.mark.parametrize("mode,detect", [("standard", "none")])
 def test_non_windows_keeps_the_generic_sandbox_refusal(
     monkeypatch: pytest.MonkeyPatch, mode: str, detect: str
 ) -> None:

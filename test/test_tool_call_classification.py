@@ -399,6 +399,124 @@ class TestPermissionPathCodex:
         assert "could not be verified" in (result.reason or "")
 
 
+def _agy_shell_update(call_id: str = "a1") -> dict[str, Any]:
+    """AGY's shell frame, verbatim from a live ``session/update``.
+
+    The ``kind`` is the ordinary ``"execute"`` every ACP adapter sends, so
+    classification was never in question. Only the ARG SPELLING differs: the
+    host marshals its own struct field names onto the wire, giving PascalCase
+    ``CommandLine``/``Cwd`` where a Claude-shaped adapter sends
+    ``command``/``cwd``.
+    """
+    return {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "kind": "execute",
+        "title": "echo probe >> KIROCREW_ROUTING_PROBE.txt",
+        "status": "pending",
+        "rawInput": {
+            "CommandLine": "echo probe >> KIROCREW_ROUTING_PROBE.txt",
+            "Cwd": "/tmp/agy-routing-probe",
+            "WaitMsBeforeExecution": 0,
+        },
+    }
+
+
+def _agy_shell_approval(request_id: int, call_id: str) -> JsonRpcMessage:
+    """The correlated ``session/request_permission`` for an AGY shell call. No
+    ``is_mcp_tool_approval`` marker: nothing here is MCP-served."""
+    return JsonRpcMessage(
+        id=request_id,
+        method="session/request_permission",
+        params={
+            "sessionId": "s-1",
+            "toolCall": {
+                "toolCallId": call_id,
+                "kind": "execute",
+                "status": "pending",
+                "title": "echo probe >> KIROCREW_ROUTING_PROBE.txt",
+            },
+            "options": [
+                {"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
+                {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "cancel", "name": "Deny", "kind": "reject_once"},
+            ],
+        },
+    )
+
+
+def _agy_permission_after_tool_call(update: dict[str, Any], request_id: int = 21) -> AcpEvent:
+    caches: dict[str, Any] = {
+        "tool_input_cache": {},
+        "shell_cache": {},
+        "raw_params_cache": {},
+        "mcp_server_name_cache": {},
+        "tool_name_cache": {},
+    }
+    parse_session_update(update, **caches)
+    event, _ = build_permission_event(
+        _agy_shell_approval(request_id, update["toolCallId"]), **caches
+    )
+    return event
+
+
+class TestPermissionPathAgy:
+    """AGY's PascalCase ``CommandLine`` reaches the same deny checks as every
+    other spelling.
+
+    Before this, the command was recovered as None, the deny-by-default backstop
+    refused the call as unverifiable, and the routing attestation could never
+    record its shell class -- even though AGY asked correctly and honoured the
+    answer every time.
+    """
+
+    def test_commandline_shape_is_recovered(self) -> None:
+        event = _agy_permission_after_tool_call(_agy_shell_update("a1"))
+        # The kind was always recognised; only the arg spelling was not.
+        assert event.is_shell is True
+        assert event.shell_classified is True
+        assert event.shell_command == "echo probe >> KIROCREW_ROUTING_PROBE.txt"
+
+    def test_commandline_shape_is_no_longer_refused_as_unverifiable(self) -> None:
+        """End to end through the dashboard gate. Asserted on the SPECIFIC
+        backstop rather than ``action != TOOL_DENY`` so an unrelated deny rule
+        cannot mask a regression here."""
+        event = _agy_permission_after_tool_call(_agy_shell_update("a2"))
+        result = HookManager().on_tool_call(
+            event.title or "run_command",
+            tool_kind=event.tool_kind,
+            raw_params=event.raw_tool_params,
+            command=event.shell_command,
+            is_shell=event.is_shell,
+        )
+        assert "could not be verified" not in (result.reason or "")
+
+    def test_agy_frame_naming_no_command_is_still_denied(self) -> None:
+        """The control the fix must not weaken: a genuine ``kind="execute"``
+        frame whose params name no command under ANY spelling keeps the
+        deny-by-default refusal. ``Cwd`` is a directory, never a command."""
+        update = _agy_shell_update("a3")
+        update["rawInput"] = {"Cwd": "/tmp/agy-routing-probe"}
+        event = _agy_permission_after_tool_call(update)
+        assert event.is_shell is True
+        assert event.shell_command is None
+        result = HookManager().on_tool_call(
+            "Run a command",
+            command=event.shell_command,
+            is_shell=event.is_shell,
+        )
+        assert result.action == TOOL_DENY
+        assert "could not be verified" in (result.reason or "")
+
+    def test_bash_style_command_still_wins_over_the_variants(self) -> None:
+        """Precedence guard: when a host sends both, the ordinary Bash-style
+        ``command`` is the one that executes, so it is the one that is gated."""
+        update = _agy_shell_update("a4")
+        update["rawInput"]["command"] = "echo authoritative"
+        event = _agy_permission_after_tool_call(update)
+        assert event.shell_command == "echo authoritative"
+
+
 class TestCliChatUnverifiableShell:
     def test_classified_mcp_call_with_execute_kind_on_payload_is_not_refused(self) -> None:
         """codex-acp labels the MCP approval itself ``kind="execute"``. The CLI
