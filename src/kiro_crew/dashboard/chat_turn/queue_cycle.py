@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         effective_session_key,
         generate_session_summary,
         logger,
+        refresh_config_stale,
         spawn_guarded_turn,
         synthesis_fire_verdict,
         title_then_refresh,
@@ -685,6 +686,21 @@ def _note_failed_before_the_try(slot: _ChatSlot, turn_exit: _TurnExit) -> None:
         "msg msg-err",
         meta={TURN_FAILED_META: True},
     )
+
+
+def _schedule_config_stale_refresh(state: DashboardState, slot: _ChatSlot) -> None:
+    """Recompute *slot*'s stale-config badge in the background, off the turn's path.
+
+    Badge bookkeeping never breaks a turn: any failure here is logged and dropped.
+    """
+    try:
+        task = asyncio.get_running_loop().create_task(
+            refresh_config_stale(state, slot, turn_ended=True)
+        )
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+    except Exception:  # noqa: BLE001 - a change detector never fails a turn
+        logger.debug("Stale-config refresh not scheduled for slot %s", slot.key, exc_info=True)
 
 
 async def _turn_record_outcome(turn: _ChatTurn) -> None:
