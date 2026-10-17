@@ -99,6 +99,69 @@ class TestUsageLimitIsTerminalAndTruthful:
         assert "Retrying will not help" in _format_acp_error(err)
 
 
+class TestClaudeSeatLimitIsUsageLimitNotBedrock:
+    """A full Claude subscription seat (claude-agent-acp) is a spent allowance.
+
+    It must not be worded as a Bedrock throttle or retried as a transient one.
+    """
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            "You've hit your session limit · resets 5:50pm (America/New_York)",
+            "You’ve hit your weekly limit · resets Oct 20, 9am",
+            "You've reached your Opus limit · resets 3pm",
+            "You're out of usage credits",
+            "You're out of extra usage",
+            "Your org is out of usage · add funds to continue",
+            "Your seat type doesn't include usage credits",
+            "Your usage allocation has been disabled by your admin",
+            "Your group's usage limit is set to $0",
+            "Fable 5 requires usage credits",
+        ],
+    )
+    def test_claude_limit_wording_is_terminal(self, data):
+        err = _err(data)
+        assert _is_transient_raw_error(err) is False
+        out = _format_acp_error(err, backend="claude-seat2")
+        assert "Retrying will not help" in out
+        assert "Bedrock" not in out
+
+    def test_limit_with_rate_limit_wording_is_still_terminal(self):
+        err = _err("rate_limit: You've hit your session limit · resets 5:50pm")
+        assert _is_transient_raw_error(err) is False
+        out = _format_acp_error(err, backend="claude-seat2")
+        assert "You've hit your session limit" in out
+        assert "Bedrock" not in out
+
+    def test_limit_sentence_in_message_field_is_quoted(self):
+        out = _format_acp_error(
+            {"code": -32603, "message": "You've hit your session limit · resets 5pm"},
+            backend="claude",
+        )
+        assert out.startswith("You've hit your session limit · resets 5pm.")
+
+    def test_unrelated_you_have_hit_text_is_not_a_limit(self):
+        assert _is_transient_raw_error(_err("You've hit your stride today")) is False
+        out = _format_acp_error(_err("You've hit your stride today"))
+        assert "Retrying will not help" not in out
+
+
+class TestThrottleNamesBedrockOnlyForKiro:
+    def test_kiro_backend_keeps_bedrock_wording(self):
+        out = _format_acp_error(_err("ThrottlingException: Rate exceeded"))
+        assert out.startswith("Bedrock is throttling requests.")
+
+    def test_other_backend_does_not_say_bedrock(self):
+        err = _err("429 rate_limit_error: Number of requests has exceeded your rate limit")
+        out = _format_acp_error(err, backend="claude-seat2")
+        assert "Bedrock" not in out
+        assert "'claude-seat2'" in out
+        # Still a short throttle: retried, and the string-fallback marker holds.
+        assert _is_transient_raw_error(err) is True
+        assert "throttl" in out
+
+
 class TestEnvelopeIsNotATransientSignal:
     def test_envelope_alone_is_not_transient(self):
         """The regression: the wrapper by itself must decide nothing."""

@@ -3789,7 +3789,17 @@ def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRa
 _RE_USAGE_LIMIT = re.compile(
     r"\b(?:monthly|daily|weekly)\s+(?:usage\s+)?limit\b"
     r"|\busage\s+limit\s+has\s+been\s+reached\b"
-    r"|\b(?:MonthlyLimitError|FreeTierLimitExceeded)\b",
+    r"|\b(?:MonthlyLimitError|FreeTierLimitExceeded)\b"
+    # claude-agent-acp: the Claude Agent SDK's USAGE_LIMIT_ERROR_PREFIXES, e.g.
+    # "You've hit your session limit · resets 5:50pm". A full subscription seat
+    # otherwise falls through to the throttle branch below and is retried.
+    r"|\bYou[’']ve (?:hit|reached) your\b[^.\n]{0,60}\blimit\b"
+    r"|\bYou[’']re out of (?:extra )?usage\b"
+    r"|\bYour org is out of usage\b"
+    r"|\bYour seat type doesn[’']t include (?:extra )?usage\b"
+    r"|\bYour usage allocation has been disabled\b"
+    r"|\bYour group[’']s usage limit is set to \$0"
+    r"|\brequires usage credits\b",
     re.IGNORECASE,
 )
 # kiro-cli's generic wrapper for a backend generation failure that died BEFORE
@@ -4568,7 +4578,7 @@ def _format_acp_error(
             # than paraphrasing it: it is the authoritative statement of WHICH
             # limit was hit, and the CLI shows exactly this, so the dashboard
             # matching it means the two surfaces cannot tell different stories.
-            _limit_detail = _provider_detail(data)
+            _limit_detail = _provider_detail(data) or _provider_detail(message)
             # The provider sentence has no trailing period, so add one before
             # appending guidance or the two run together as one sentence.
             if _limit_detail and _limit_detail[-1] not in ".!?":
@@ -4603,13 +4613,23 @@ def _format_acp_error(
                 f"{req_id_suffix}"
             )
         elif _RE_THROTTLE_NAMED.search(haystack) or _RE_THROTTLE_GENERIC.search(haystack):
-            # Bedrock throttle / rate limit. Cover both AWS service exception
-            # names and the generic phrasing the ACP backend sometimes uses.
-            formatted = (
-                "Bedrock is throttling requests. Try: (1) wait a few seconds and "
-                "retry, or (2) switch to a different model in the picker (e.g. sonnet)."
-                f"{req_id_suffix}"
-            )
+            # Throttle / rate limit. Cover both AWS service exception names and
+            # the generic phrasing the ACP backend sometimes uses. Only the kiro
+            # backend runs on Bedrock; naming it for a Claude or other harness
+            # sends the reader after an AWS throttle that does not exist.
+            if backend == ACP_BACKEND_KIRO:
+                formatted = (
+                    "Bedrock is throttling requests. Try: (1) wait a few seconds and "
+                    "retry, or (2) switch to a different model in the picker (e.g. sonnet)."
+                    f"{req_id_suffix}"
+                )
+            else:
+                formatted = (
+                    f"The model provider for backend '{backend}' is throttling "
+                    "requests (rate limit). Try: (1) wait a few seconds and retry, "
+                    "or (2) switch to a different backend or account."
+                    f"{req_id_suffix}"
+                )
         elif is_credential_propagation_delay(haystack):
             # Not-yet-propagated credential (see is_credential_propagation_delay).
             # Ahead of the Bedrock-auth and session-expiry branches, which match
