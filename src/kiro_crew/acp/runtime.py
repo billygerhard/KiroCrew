@@ -51,9 +51,11 @@ from kiro_crew.acp.client import (
     _get_child_pids,
     _KiroExecutableTrustError,
     apply_pod_bundle_spawn,
+    claude_adapter_reported,
     finish_suspended_spawn,
     is_auth_failure_output,
     is_sandbox_init_failure_output,
+    steering_advertised,
 )
 from kiro_crew.acp.harness import (
     HarnessAdapter,
@@ -1806,6 +1808,12 @@ class AcpRuntime:
         # binary THIS process is executing, which can differ from the one on
         # disk after an in-place upgrade. Empty until the handshake completes.
         self._agent_version = ""
+        # Fork-only: whether ``initialize`` advertised ``_meta.steering.supported``
+        # and named claude-agent-acp. The Claude seats are operator harnesses
+        # served here under their own backend id, so these are what let their
+        # sessions take ``_session/steering`` (see ``AcpSessionHandle``).
+        self._steering_advertised = False
+        self._claude_adapter = False
         # Entitlement probe state (probe_advertised_models): single-flight lock
         # plus a short-TTL cache of the last non-empty answer.
         self._entitlement_probe_lock = asyncio.Lock()
@@ -2056,6 +2064,16 @@ class AcpRuntime:
         spawned before it.
         """
         return self._agent_version
+
+    @property
+    def steering_advertised(self) -> bool:
+        """Whether ``initialize`` advertised ``_meta.steering.supported``."""
+        return self._steering_advertised
+
+    @property
+    def claude_adapter(self) -> bool:
+        """Whether ``initialize`` named claude-agent-acp, whatever the backend id."""
+        return self._claude_adapter
 
     def is_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
@@ -3020,6 +3038,8 @@ class AcpRuntime:
             _prompt_caps = init_resp.get("agentCapabilities", {}).get("promptCapabilities", {})
             self._prompt_capabilities = _prompt_caps if isinstance(_prompt_caps, dict) else {}
             self._agent_version = agent_version_from_init(init_resp)
+            self._steering_advertised = steering_advertised(init_resp)
+            self._claude_adapter = claude_adapter_reported(init_resp)
 
             # The subprocess has now read its agent spec, which closes the window the
             # pre-spawn snapshot opened: a write landing before this point is caught
@@ -4983,23 +5003,10 @@ class AcpRuntime:
         if on_registered is not None:
             on_registered(future)
         try:
-            # Through the transport's write lock like every other stdin writer:
-            # a response write measuring the buffer level for its no-progress bound
-            # must be the only writer in flight (see await_under_no_progress_bound).
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
-        except AcpRuntimeDead:
-            # From _refuse_write_if_dead: _mark_dead already failed or dropped the
-            # future; retrieve or cancel it so asyncio logs nothing unhandled.
-            self._pending_requests.pop(req_id, None)
-            if future.done():
-                if not future.cancelled():
-                    future.exception()
-            else:
-                future.cancel()
-            raise
+            # Fork: written directly, like send_request/send_notification here.
+            # Upstream takes a transport write lock this fork's runtime predates.
+            self._process.stdin.write(data.encode())
+            await self._process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._pending_requests.pop(req_id, None)
             self._mark_dead(f"pipe broken: {exc}")

@@ -51,6 +51,7 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _COMPACTION_FAILED_TURN_BUDGET,
+    CLAUDE_ACP_STEERING_MIN_VERSION,
     DEFAULT_MODEL,
     AcpClient,
     AcpError,
@@ -58,6 +59,7 @@ from kiro_crew.acp.client import (
     AcpProcessDied,
     AcpTimeoutError,
     AcpToolGateUnroutable,
+    _adapter_version_at_least,
     _effective_prompt_timeout_async,
     _is_config_value_rejection,
     _is_safe_oauth_url,
@@ -2423,7 +2425,7 @@ class AcpSessionHandle:
         text = (message or "").strip()
         if not text or not self._session_id:
             return False
-        if self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST:
+        if self._takes_steering_request:
             return await self._steer_via_steering_request(text)
         wrapped = f"<user_message>\n{text}\n</user_message>"
         await self._runtime.send_request(
@@ -2531,10 +2533,15 @@ class AcpSessionHandle:
                         break
             self._steering_settled.pop(entry[0][0], None)
 
+        params: dict[str, Any] = {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+        if self._claude_steering:
+            # claude-agent-acp: refuse a steer that arrives after the turn ended
+            # instead of starting a turn of its own (see AcpClient's steer).
+            params["_meta"] = {"steering": {"idleBehavior": "promptRequired"}}
         try:
             answer = await self._runtime.send_request_for_answer(
                 METHOD_SESSION_STEERING,
-                {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+                params,
                 on_registered=_register,
             )
         except BaseException as exc:
@@ -2795,7 +2802,7 @@ class AcpSessionHandle:
         queued by the caller. A no-op on every other backend, whose reject does
         not discard injected text.
         """
-        if self._runtime.acp_backend not in ACP_BACKENDS_STEERING_REQUEST:
+        if not self._takes_steering_request:
             return
         self._turn_steering_denied = True
 
@@ -2830,8 +2837,29 @@ class AcpSessionHandle:
         would advertise the steer affordance and then meet the user's mid-turn
         correction with ``-32601``.
         """
-        backend = self._runtime.acp_backend
-        return backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+        return self._runtime.acp_backend in ACP_BACKENDS_STEER or self._takes_steering_request
+
+    @property
+    def _claude_steering(self) -> bool:
+        """Fork-only: this session's host is claude-agent-acp at or above
+        ``CLAUDE_ACP_STEERING_MIN_VERSION`` and advertised ``_session/steering``.
+        Read from the handshake, so it covers the Claude seats, operator harnesses
+        served here under their own backend id (``claude-seat1``...)."""
+        runtime = self._runtime
+        return (
+            getattr(runtime, "claude_adapter", False) is True
+            and getattr(runtime, "steering_advertised", False) is True
+            and _adapter_version_at_least(
+                getattr(runtime, "agent_version", "") or "", CLAUDE_ACP_STEERING_MIN_VERSION
+            )
+        )
+
+    @property
+    def _takes_steering_request(self) -> bool:
+        """Whether a user steer travels on ``_session/steering`` for this session:
+        a member of ``ACP_BACKENDS_STEERING_REQUEST`` by backend id, or a host that
+        identified itself as a steerable claude-agent-acp (the seats)."""
+        return self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST or self._claude_steering
 
     @property
     def supports_refusal_steer(self) -> bool:
@@ -2856,7 +2884,7 @@ class AcpSessionHandle:
         provider-wrapper surfaces (messaging channels, Side Chat, ``spawn_steer``)
         read this and queue instead.
         """
-        return self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST
+        return self._takes_steering_request
 
     # ── Commands & Config ──
 

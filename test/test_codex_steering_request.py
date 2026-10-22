@@ -1215,3 +1215,63 @@ async def test_a_written_steer_whose_runtime_then_stalls_is_ambiguous():
     with pytest.raises(AcpRuntimeDead) as ei:
         await handle.steer("hello")
     assert ei.value.ambiguous_delivery is True
+
+
+# ── Fork-only: the Claude seats on the shared runtime ──
+#
+# The seats are ``harnesses.json`` operator harnesses (``claude-seat1``...) served
+# on AcpRuntime, so their backend id is in no membership set. The handshake is
+# what identifies them: claude-agent-acp, steering advertised, 0.65.0 or newer.
+
+
+def _seat_runtime(*, version: str = "0.94.0", claude: bool = True, advertised: bool = True):
+    rt = _Runtime("claude-seat1")
+    rt.claude_adapter = claude
+    rt.steering_advertised = advertised
+    rt.agent_version = version
+    return rt
+
+
+@pytest.mark.asyncio
+async def test_a_seat_on_the_shared_runtime_is_steered_over_the_request():
+    rt = _seat_runtime()
+    rt.answer.set_result({"outcome": "injected"})
+    handle = _handle(rt)
+    assert handle.supports_steer is True
+
+    delivered, echoes = await _steer_and_settle(handle, "use the other file")
+    assert delivered is True
+    assert rt.requests == [
+        (
+            "_session/steering",
+            {
+                "sessionId": "sess-1",
+                "prompt": [{"type": "text", "text": "use the other file"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        )
+    ]
+    rt.send_request.assert_not_awaited()
+    assert len(echoes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"claude": False}, {"advertised": False}, {"version": "0.64.9"}, {"version": ""}],
+)
+async def test_a_seat_without_a_steerable_claude_adapter_takes_no_steer(kwargs):
+    rt = _seat_runtime(**kwargs)
+    handle = _handle(rt)
+    assert handle.supports_steer is False
+    assert handle.steer_needs_loss_recovery is False
+
+
+@pytest.mark.asyncio
+async def test_codex_steering_carries_no_claude_meta():
+    rt = _Runtime()
+    rt.answer.set_result({"outcome": "injected"})
+    handle = _handle(rt)
+    await _steer_and_settle(handle, "hi")
+    ((_, params),) = rt.requests
+    assert "_meta" not in params
