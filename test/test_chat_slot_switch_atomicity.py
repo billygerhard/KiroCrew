@@ -738,26 +738,22 @@ class TestSlotModelSwitchAtomicity:
             assert slot.model == _MODEL_A
 
     @pytest.mark.asyncio
-    async def test_attached_subagents_refuse_the_reset_and_roll_back(self):
-        # The reset tears down the runtime attached children run on, so an
-        # idle parent with children (running, queued, or mid-delivery) answers
-        # the reload handler's 409 instead of discarding their work — and the
-        # already-committed model rolls back with its pick generation.
+    async def test_attached_subagents_switch_and_keep_their_runtime(self):
+        # A parent with children (running, queued, or mid-delivery) is never
+        # blocked from switching: the reset runs with keep_children, which hands
+        # the runtime the children run on off to drain instead of killing it.
         slot = _ChatSlot("test")
         slot.model = _MODEL_A
-        gen_before = slot._model_pick_gen
         state = _mock_state(slot, provider=None)
         state.subagents = MagicMock()
         state.subagents.running_agents_for.return_value = ["child-1"]
         state.subagents._queued_depth.return_value = 0
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/test/model", json={"model": _MODEL_B})
-            data = await resp.json()
-            assert resp.status == 409
-            assert data["code"] == "slot_subagents_running"
-            assert slot.model == _MODEL_A
-            assert slot._model_pick_gen == gen_before
-            state.sessions.reset.assert_not_awaited()
+            assert resp.status == 200
+            assert slot.model == _MODEL_B
+            state.sessions.reset.assert_awaited()
+            assert state.sessions.reset.await_args.kwargs["keep_children"] is True
 
     @pytest.mark.asyncio
     async def test_switch_waits_for_slot_lock(self):

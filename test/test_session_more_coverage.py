@@ -754,6 +754,54 @@ class TestResetTeardown:
         assert "dashboard:a" not in mgr._sessions
         mgr.release_subagent_runtime.assert_awaited_once_with("dashboard:a")
 
+    @pytest.mark.asyncio
+    async def test_keep_children_hands_the_runtime_off_instead_of_killing_it(
+        self, mgr, no_child_scan, monkeypatch
+    ) -> None:
+        # A parent switching seats while its sub-agents run: the session moves,
+        # but the process the children are multiplexed onto is parked to drain,
+        # never force-killed, and the companion runtime is parked too.
+        killed: list[int] = []
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            platform_compat, "kill_process_tree_async", AsyncMock(side_effect=killed.append)
+        )
+        runtime = SimpleNamespace(kill=AsyncMock())
+        provider = _provider(
+            _client=SimpleNamespace(_pid=4242, _child_pids={}),
+            hand_off_runtime=lambda: runtime,
+        )
+        _register(mgr, "dashboard:a", provider=provider)
+        companion = SimpleNamespace(kill=AsyncMock())
+        mgr._subagent_runtimes["dashboard:a"] = companion
+
+        assert await mgr.reset("dashboard:a", keep_children=True) is True
+
+        assert "dashboard:a" not in mgr._sessions
+        provider.shutdown.assert_awaited_once()
+        assert killed == []
+        runtime.kill.assert_not_awaited()
+        companion.kill.assert_not_awaited()
+        assert runtime in mgr._draining_subagent_runtimes
+        assert companion in mgr._draining_subagent_runtimes
+        assert "dashboard:a" not in mgr._subagent_runtimes
+
+    @pytest.mark.asyncio
+    async def test_keep_children_with_no_shared_runtime_resets_as_usual(
+        self, mgr, no_child_scan, monkeypatch
+    ) -> None:
+        # A provider that owns no shared runtime (CC, legacy AcpClient) has
+        # nothing to hand off, so its process is torn down the usual way.
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
+        kill = AsyncMock()
+        monkeypatch.setattr(platform_compat, "kill_process_tree_async", kill)
+        provider = _provider(_client=SimpleNamespace(_pid=4242, _child_pids={}))
+        _register(mgr, "dashboard:a", provider=provider)
+
+        assert await mgr.reset("dashboard:a", keep_children=True) is True
+        kill.assert_awaited_once()
+        assert mgr._draining_subagent_runtimes == []
+
 
 # ── Drain of unfinished turns ────────────────────────────────────────────────
 

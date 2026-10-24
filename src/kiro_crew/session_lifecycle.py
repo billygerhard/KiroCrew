@@ -186,7 +186,9 @@ class SessionLifecycleOwner(Protocol):
 
     async def _retire_stale_backend_bg_runtime(self) -> None: ...
 
-    async def release_subagent_runtime(self, parent_session_key: str) -> None: ...
+    async def release_subagent_runtime(
+        self, parent_session_key: str, *, park: bool = False
+    ) -> None: ...
 
     async def _retire_kiro_warm_pool(self) -> bool: ...
 
@@ -214,6 +216,7 @@ class SessionLifecycleOwner(Protocol):
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        keep_children: bool = False,
     ) -> bool: ...
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None: ...
@@ -336,6 +339,27 @@ class _ReplayGap:
 
     owner: asyncio.Task[Any] | None
     closed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def _hand_off_runtime(provider: Any) -> Any:
+    """Detach the runtime a parent provider owns, for ``reset(keep_children=True)``.
+
+    Looks through the provider wrapper the same way the sub-agent manager finds a
+    parent's runtime (``client`` / ``_client``). ``None`` when the provider does not
+    own a shared runtime (CC, legacy ``AcpClient``), so the reset proceeds as usual.
+    """
+    for candidate in (
+        provider,
+        getattr(provider, "client", None),
+        getattr(provider, "_client", None),
+    ):
+        hand_off = getattr(candidate, "hand_off_runtime", None)
+        if callable(hand_off):
+            try:
+                return hand_off()
+            except Exception:
+                return None
+    return None
 
 
 def _turn_in_flight(session: Any, *, refuse_only_on_active_turn: bool = False) -> bool:
@@ -743,8 +767,15 @@ class SessionLifecycleService:
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        keep_children: bool = False,
     ) -> bool:
         """Kill a live session while preserving the exact reset semantics.
+
+        ``keep_children=True`` is for a parent that switches seat, backend or model
+        while its sub-agents run: the parent's session moves, but the process its
+        session-sharing children are multiplexed onto is handed off and parked to
+        drain (and its companion runtime parked likewise), so the drained-runtime
+        reaper ends those processes after the last child finishes rather than now.
 
         Defaults to recycling a PROCESS while the conversation survives. The session-map
         entry keeps its resume sid, so the next turn on the key restores the same native
@@ -889,8 +920,11 @@ class SessionLifecycleService:
             # any of them runs, and this clear cannot erase a successor's pointer.
             owner._session_map.clear_sid(key)
         shutdown_error: BaseException | None = None
+        handed_off: _BackgroundRuntime | None = None
         if session:
             await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
+            if keep_children:
+                handed_off = _hand_off_runtime(session.provider)
             # Capture PID and child tree before shutdown clears them.
             client = getattr(session.provider, "_client", None)
             raw_pid = getattr(client, "_pid", None) if client else None
@@ -907,6 +941,10 @@ class SessionLifecycleService:
             child_pids: dict[Any, Any] = (
                 dict(raw_children) if isinstance(raw_children, dict) else {}
             )
+            if handed_off is not None:
+                # The process lives on for the children; the drain reaper ends it.
+                pid = None
+                child_pids = {}
             capture_child_records, get_child_pids, kill_escaped_children = (
                 self._deps.get_child_process_helpers()
             )
@@ -940,6 +978,12 @@ class SessionLifecycleService:
                 # would say the same thing; deferring says it without re-indenting two
                 # hundred lines of kill-and-sweep logic, which is its own risk.
                 shutdown_error = exc
+            if handed_off is not None:
+                # Parked, never dropped: an unreferenced runtime escapes close_all and
+                # the drain reaper alike. Parked even after a shutdown raise, since the
+                # process is still alive either way.
+                owner._draining_subagent_runtimes.append(handed_off)
+                logger.info("Reset %s: handed its runtime to running sub-agents to drain", key)
             platform_compat = self._deps.get_platform_compat()
             if pid:
                 if platform_compat.pid_exists(pid):
@@ -981,7 +1025,10 @@ class SessionLifecycleService:
             await self._cancel_parent_children(key, teardown_children, verb="reset")
         if session is not None and key in owner._subagent_runtimes:
             try:
-                await owner.release_subagent_runtime(key)
+                if keep_children:
+                    await owner.release_subagent_runtime(key, park=True)
+                else:
+                    await owner.release_subagent_runtime(key)
             except Exception:
                 logger.debug("Reset %s: subagent runtime cleanup failed", key, exc_info=True)
         if shutdown_error is not None:

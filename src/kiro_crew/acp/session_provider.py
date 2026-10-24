@@ -247,6 +247,25 @@ class AcpSessionProvider(LLMProvider):
         if hasattr(self._handle, "child_fidelity_aware"):
             self._handle.child_fidelity_aware = value
 
+    def hand_off_runtime(self) -> "AcpRuntime | None":
+        """Stop owning a runtime that sub-agent sessions still run on.
+
+        A parent switching seats, backends or models must not kill the process its
+        session-sharing children are multiplexed onto. After this call
+        :meth:`shutdown` takes the co-tenant arm (cancel, terminate, unregister) and
+        leaves the runtime alive; the caller parks the returned runtime to drain and
+        be reaped once its last child session ends. The parent's transcript is kept,
+        because it is the resume material for the successor session.
+
+        Returns ``None`` when this provider never owned its runtime (it is itself a
+        co-tenant), so there is nothing to hand off.
+        """
+        if not self._owns_runtime:
+            return None
+        self._owns_runtime = False
+        self._handle.keep_transcript = True
+        return self._runtime
+
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
 

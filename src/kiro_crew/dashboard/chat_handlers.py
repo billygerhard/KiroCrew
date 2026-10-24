@@ -4197,6 +4197,7 @@ async def _reset_slot_session(
     session_key: str,
     *,
     skip_if_busy: bool = False,
+    keep_children: bool = False,
 ) -> bool:
     """Reset a slot's agent session, releasing anything blocked on the old one.
 
@@ -4237,7 +4238,13 @@ async def _reset_slot_session(
         # put a second in flight over the same key.
         await _test_interleave("reset:pre_pop")
     try:
-        reloaded = await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+        # Only said when true, so a plain switch resets exactly as it always has.
+        if keep_children:
+            reloaded = await state.sessions.reset(
+                session_key, skip_if_busy=skip_if_busy, keep_children=True
+            )
+        else:
+            reloaded = await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
     except BaseException:
         # Raised or cancelled mid-teardown: the session is in a state this slot
         # cannot vouch for, so neither is its verdict. Unknown fails open.
@@ -4359,6 +4366,7 @@ async def _reset_slot_session_or_warn(
     session_key: str,
     *,
     switch_kind: str,
+    keep_children: bool = False,
 ) -> bool | None:
     """:func:`_reset_slot_session` for the commit-before-reset switch handlers.
 
@@ -4414,7 +4422,9 @@ async def _reset_slot_session_or_warn(
         # one of them ends up without one.
         await _test_interleave("switch:post_commit")
     try:
-        return await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+        return await _reset_slot_session(
+            state, slot, session_key, skip_if_busy=True, keep_children=keep_children
+        )
     except Exception:
         if (
             prior_provider is not None
@@ -8040,13 +8050,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 status=409,
             )
 
-        # Children guard, shared with reload/model: the reset tears down the
-        # runtime attached sub-agents run on, so a parent that is idle but
-        # still has children must refuse rather than discard their work.
-        children_409 = await _subagents_attached_response(state, slot, session_key, "slot_agent")
-        if children_409 is not None:
-            _rollback_switch()
-            return children_409
+        # A parent with children switches anyway: the reset hands the runtime
+        # they run on off to drain (keep_children) instead of killing it.
+        keep_children = await subagents_attached_async(state, slot, session_key, "slot_agent")
         # Last-instant re-probe in a NO-AWAIT window before the teardown (the
         # model template's rule at its own reset site): the pre-commit check
         # above is separated from this point by the resolution warm-up and
@@ -8081,7 +8087,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # reads.
         try:
             reset_verdict = await _reset_slot_session_or_warn(
-                state, slot, session_key, switch_kind="agent"
+                state, slot, session_key, switch_kind="agent", keep_children=keep_children
             )
         except Exception:
             # The identity probe proved the pop never happened: the old
@@ -8123,7 +8129,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 # the first-attempt guard prevents.
                 try:
                     reset_verdict = await _reset_slot_session_or_warn(
-                        state, slot, session_key, switch_kind="agent"
+                        state,
+                        slot,
+                        session_key,
+                        switch_kind="agent",
+                        keep_children=keep_children,
                     )
                 except Exception:
                     _rollback_switch()
@@ -8996,12 +9006,9 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # completion event in flight) must refuse rather than discard
             # their work. Same probe block as api_chat_slot_reload; only the
             # rollback is added here because this handler committed first.
-            children_409 = await _subagents_attached_response(
+            keep_children = await subagents_attached_async(
                 state, slot, session_key, "slot_model"
             )
-            if children_409 is not None:
-                _rollback_pick()
-                return children_409
             # Probed AFTER the children await, so this is the NO-AWAIT window
             # the reset needs; same predicate as the pre-check
             # (_switch_target_busy), so a sibling alias that began
@@ -9041,7 +9048,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # a turn that slipped into the window is declined here instead of
             # torn down mid-stream.
             reset_ok = await _reset_slot_session_or_warn(
-                state, slot, session_key, switch_kind="model"
+                state, slot, session_key, switch_kind="model", keep_children=keep_children
             )
             if reset_ok is None:
                 # Teardown raised after the session pop: the switch is
@@ -9098,7 +9105,11 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                     # second decline means another turn is genuinely racing,
                     # which is the turn-in-flight case again.
                     reset_ok = await _reset_slot_session_or_warn(
-                        state, slot, session_key, switch_kind="model"
+                        state,
+                        slot,
+                        session_key,
+                        switch_kind="model",
+                        keep_children=keep_children,
                     )
                     if reset_ok is None:
                         # Retry teardown raised: same committed-switch answer
@@ -9240,13 +9251,10 @@ async def api_chat_slot_backend(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
-        # Children guard, shared with reload/model: the reset tears down the
-        # runtime attached sub-agents run on, so a parent with children
-        # (running, queued, or a completion event in flight) refuses rather
-        # than discard their work.
-        children_409 = await _subagents_attached_response(state, slot, session_key, "slot_backend")
-        if children_409 is not None:
-            return children_409
+        # A parent with children (running, queued, or a completion event in
+        # flight) moves seats anyway: the reset hands the runtime they run on
+        # off to drain (keep_children) instead of killing it.
+        keep_children = await subagents_attached_async(state, slot, session_key, "slot_backend")
         prior_backend = slot.acp_backend
         logger.info(
             "Slot %s backend switching to %s, resetting session",
@@ -9289,7 +9297,7 @@ async def api_chat_slot_backend(request: web.Request) -> web.Response:
         teardown_incomplete = False
         try:
             reset_ok = await _reset_slot_session_or_warn(
-                state, slot, session_key, switch_kind="backend"
+                state, slot, session_key, switch_kind="backend", keep_children=keep_children
             )
         except Exception:
             # Restore the prior pin in the store so the slot never advertises a
@@ -10070,11 +10078,9 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # Children guard, shared with reload/model: the reset tears down
             # the runtime attached sub-agents run on. Nothing is committed
             # yet, so a refusal here changes nothing.
-            children_409 = await _subagents_attached_response(
+            keep_children = await subagents_attached_async(
                 state, slot, session_key, "slot_reasoning_effort"
             )
-            if children_409 is not None:
-                return children_409
             # Probed AFTER the change_effort and children awaits above, in
             # the NO-AWAIT window before the commit and reset below; the
             # signals and the sibling-alias window are on _switch_target_busy.
@@ -10118,7 +10124,11 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
                 # degraded post-pop teardown; a bool verdict is the reset
                 # outcome the ladder reads.
                 reset_verdict = await _reset_slot_session_or_warn(
-                    state, slot, session_key, switch_kind="reasoning_effort"
+                    state,
+                    slot,
+                    session_key,
+                    switch_kind="reasoning_effort",
+                    keep_children=keep_children,
                 )
             except Exception:
                 # The identity probe proved the pop never happened: the old
@@ -10161,6 +10171,7 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
                             slot,
                             session_key,
                             switch_kind="reasoning_effort",
+                            keep_children=keep_children,
                         )
                     except Exception:
                         if slot.reasoning_effort == effort:

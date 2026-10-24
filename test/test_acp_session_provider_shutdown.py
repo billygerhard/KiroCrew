@@ -161,3 +161,25 @@ async def test_an_idle_session_still_destroys(tmp_path, monkeypatch):
 
     handle.cancel.assert_not_awaited()
     assert [f for f in files if f.exists()] == []
+
+
+@pytest.mark.asyncio
+async def test_handed_off_parent_leaves_the_runtime_alive_and_keeps_its_transcript(
+    tmp_path, monkeypatch
+):
+    """A parent switching seats with sub-agents on its runtime: after the hand-off,
+    shutdown ends only the parent's session. The process lives on for the children,
+    and the parent's transcript stays as the successor's resume material."""
+    handle, runtime, sessions, files = _handle_with_transcript(tmp_path, sid="sid-parent")
+    handle._turn_done.set()  # an idle parent
+    runtime.kill = AsyncMock()
+    provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
+    monkeypatch.setattr("kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions)
+
+    assert provider.hand_off_runtime() is runtime
+    assert provider.hand_off_runtime() is None  # already handed off
+    await provider.shutdown()
+
+    runtime.kill.assert_not_awaited()
+    runtime.terminate_session.assert_awaited_once_with("sid-parent")
+    assert all(f.exists() for f in files)

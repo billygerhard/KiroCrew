@@ -2130,9 +2130,13 @@ class SessionManager:
             parent_session_key, agent=agent
         )
 
-    async def release_subagent_runtime(self, parent_session_key: str) -> None:
-        """Release the shared companion runtime for a parent."""
-        await self._allocation_boundary().release_subagent_runtime(parent_session_key)
+    async def release_subagent_runtime(
+        self, parent_session_key: str, *, park: bool = False
+    ) -> None:
+        """Release the shared companion runtime for a parent (``park``: drain, don't kill)."""
+        await self._allocation_boundary().release_subagent_runtime(
+            parent_session_key, park=park
+        )
 
     async def _get_or_bootstrap_run_runtime(
         self, parent_session_key: str, *, agent: str | None = None, cwd: str | None = None
@@ -2424,6 +2428,7 @@ class SessionManager:
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        keep_children: bool = False,
     ) -> bool:
         """Reset a live session while preserving its persistence entry."""
         return await self._lifecycle_boundary().reset(
@@ -2434,6 +2439,7 @@ class SessionManager:
             refuse_only_on_active_turn=refuse_only_on_active_turn,
             clear_conversation=clear_conversation,
             ends_conversation=ends_conversation,
+            keep_children=keep_children,
         )
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:

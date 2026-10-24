@@ -597,8 +597,16 @@ class SessionAllocationService:
                         self._starting_pids.discard(starting_pid)
                 return runtime
 
-    async def release_subagent_runtime(self, parent_session_key: str) -> None:
-        """Serialize release with spawn and kill the detached runtime off-map."""
+    async def release_subagent_runtime(
+        self, parent_session_key: str, *, park: bool = False
+    ) -> None:
+        """Serialize release with spawn and kill the detached runtime off-map.
+
+        ``park=True`` detaches the runtime the same way but parks it on the draining
+        list instead of killing it, so children still running on it finish and the
+        drained-runtime reaper ends the process afterwards. A parent switching seats
+        uses it: its next spawn gets a fresh companion on the new seat.
+        """
         lock = self._subagent_runtime_locks.get(parent_session_key)
         if lock is not None:
             async with lock:
@@ -608,6 +616,9 @@ class SessionAllocationService:
                 self._subagent_runtime_locks.pop(parent_session_key, None)
         else:
             runtime = self._subagent_runtimes.pop(parent_session_key, None)
+        if runtime is not None and park:
+            self._draining_subagent_runtimes.append(runtime)
+            return
         if runtime is not None:
             try:
                 await runtime.kill(expected=True, reason="subagent runtime released")

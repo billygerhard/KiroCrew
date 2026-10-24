@@ -886,6 +886,21 @@ class TestBackendMutationEndpoint:
         assert slot.acp_backend == ACP_BACKEND_KAS
 
     @pytest.mark.asyncio
+    async def test_a_parent_with_running_subagents_still_switches_seat(self, tmp_path):
+        # Seat failover moves a chat while its sub-agents work. The switch is
+        # never refused for them: the reset hands their runtime off to drain.
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("c-mut-kids", agent="")
+        state.subagents = MagicMock()
+        state.subagents.running_agents_for = MagicMock(return_value=["child-1"])
+        state.subagents._queued_depth = MagicMock(return_value=0)
+        state.sessions.reset = AsyncMock(return_value=True)
+        status, body = await _post_backend(state, "c-mut-kids", ACP_BACKEND_KAS)
+        assert status == 200, body
+        assert slot.acp_backend == ACP_BACKEND_KAS
+        assert state.sessions.reset.await_args.kwargs["keep_children"] is True
+
+    @pytest.mark.asyncio
     async def test_change_durably_persists_the_pin(self, tmp_path):
         # Regression: the endpoint must WRITE the pin to durable metadata, not
         # only broadcast it to the sidebar — else a gateway restart loses it and
@@ -968,7 +983,7 @@ class TestBackendMutationEndpoint:
             state.sessions.get_provider = lambda key: started if key == session_key else None
             return False
 
-        async def spy_reset(st, sl, key, *, switch_kind):
+        async def spy_reset(st, sl, key, *, switch_kind, keep_children=False):
             torn_down.append(key)
             state.sessions.get_provider = lambda key: None
             return True
