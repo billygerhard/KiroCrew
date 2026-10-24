@@ -131,7 +131,7 @@ from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
-from kiro_crew.agent_sdk.backends import model_registry_namespace
+from kiro_crew.agent_sdk.backends import model_registry_namespace, session_family_for_label
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config import KiroCrewConfig, live
@@ -430,6 +430,12 @@ def detect_provider_switch(session_map: "SessionMap", session_key: str, new_prov
     """
     stored_provider = session_map.get_provider(session_key) or PROVIDER_LABEL_DEFAULT
     if stored_provider == new_provider:
+        return False
+    # Fork: two backends declared in one session family (the Claude seats over a
+    # shared transcript folder) read the same native sessions, so moving a chat
+    # between them is not a switch -- the stored id resumes natively.
+    stored_family = session_family_for_label(stored_provider)
+    if stored_family and stored_family == session_family_for_label(new_provider):
         return False
     # Only counts as a switch if there's actually a stored SID to discard
     stored_sid = session_map.get(session_key)

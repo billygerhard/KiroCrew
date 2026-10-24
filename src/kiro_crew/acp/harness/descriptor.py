@@ -202,6 +202,7 @@ DESCRIPTOR_KEYS: frozenset[str] = frozenset(
         "routing",
         "permission_config",
         "min_sandbox",
+        "session_family",
     }
 )
 
@@ -256,6 +257,12 @@ class HarnessDescriptor:
     #: session uses". Never loosens it. See :data:`MIN_SANDBOX_TIERS` for why an
     #: enforced descriptor needs this and why ``off`` is not accepted.
     min_sandbox: str = ""
+    #: Fork: harnesses that read and write ONE native session store share a
+    #: family (the Claude seats all run claude-agent-acp over one shared
+    #: transcript folder). A chat moved between two backends of the same family
+    #: keeps its session id and resumes natively instead of being treated as a
+    #: provider switch. Empty means the harness is its own family.
+    session_family: str = ""
 
     @property
     def label(self) -> str:
@@ -670,6 +677,12 @@ def descriptor_from_mapping(
         prefix, "min_sandbox", raw.get("min_sandbox"), ""
     )
     reasons += min_sandbox_reasons
+    session_family, family_reasons = _optional_string(
+        prefix, "session_family", raw.get("session_family"), ""
+    )
+    reasons += family_reasons
+    if session_family and not re.fullmatch(r"[a-z0-9-]{1,32}", session_family):
+        reasons.append(f"{prefix}session_family must match [a-z0-9-]{{1,32}}")
 
     descriptor = HarnessDescriptor(
         id=declared_id,
@@ -684,6 +697,7 @@ def descriptor_from_mapping(
         routing=routing,
         permission_config=permission_config,
         min_sandbox=min_sandbox,
+        session_family=session_family,
     )
     reasons += validate_descriptor(descriptor, taken_ids=taken_ids, position=position)
     if reasons:

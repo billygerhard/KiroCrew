@@ -73,6 +73,7 @@ from kiro_crew.agent_sdk.backends import (
     Routing,
     register_governed_backend,
     register_known_backend,
+    register_session_family,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +211,7 @@ def load_and_register_operator_descriptors(*, path=None) -> None:
                 runtime=True,
             )
             register_operator_harness(descriptor)
+            register_session_family(descriptor.label, descriptor.session_family)
         except ValueError as exc:
             # A registration collision (an id a builtin already serves) or a
             # malformed id the descriptor layer did not catch: record it invalid with

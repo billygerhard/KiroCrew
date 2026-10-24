@@ -528,6 +528,23 @@ def provider_label_for(backend: str) -> str:
     return _REGISTERED_PROVIDER_LABELS.get(backend, "")
 
 
+#: Fork: provider label -> session family, for registered backends that declared
+#: one (``session_family`` in harnesses.json). Keyed on the LABEL because the
+#: label is what the session map persists and ``detect_provider_switch`` compares.
+_REGISTERED_SESSION_FAMILY: dict = {}
+
+
+def register_session_family(label: str, family: str) -> None:
+    """Record that the backend persisted under *label* belongs to *family*."""
+    if label and family:
+        _REGISTERED_SESSION_FAMILY[label] = family
+
+
+def session_family_for_label(label: str) -> str:
+    """The session family a provider label belongs to, or ``""`` for none."""
+    return _REGISTERED_SESSION_FAMILY.get(label, "")
+
+
 def _reset_registered_backends() -> None:
     """TEST-ONLY: drop every registration, restoring the frozen builtin state.
 
@@ -546,6 +563,7 @@ def _reset_registered_backends() -> None:
     _registered_runtime.clear()
     _REGISTERED_PROVIDER_LABELS.clear()
     _REGISTERED_MODEL_NAMESPACE.clear()
+    _REGISTERED_SESSION_FAMILY.clear()
 
 
 # ── Capability: where a harness gets its MCP servers ──

@@ -68,6 +68,7 @@ def test_the_schema_key_set_is_exactly_what_is_documented():
             "routing",
             "permission_config",
             "min_sandbox",
+            "session_family",
         }
     )
 
@@ -789,3 +790,20 @@ def test_operator_harnesses_path_sits_beside_config(monkeypatch, tmp_path):
 
     assert str(resolved) == str(config_dir() / OPERATOR_HARNESSES_LEAF)
     assert str(resolved).endswith(OPERATOR_HARNESSES_LEAF)
+
+
+def test_session_family_is_optional_and_parsed():
+    d, reasons = descriptor_from_mapping(_operator_descriptor(), harness_id="my-tool")
+    assert reasons == [] and d is not None and d.session_family == ""
+    d, reasons = descriptor_from_mapping(
+        _operator_descriptor(session_family="claude-code"), harness_id="my-tool"
+    )
+    assert reasons == [] and d is not None and d.session_family == "claude-code"
+
+
+def test_session_family_rejects_a_malformed_value():
+    d, reasons = descriptor_from_mapping(
+        _operator_descriptor(session_family="Claude Code!"), harness_id="my-tool"
+    )
+    assert d is None
+    assert any("session_family" in r for r in reasons), reasons
