@@ -10272,7 +10272,13 @@ class AcpClient:
             # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
             # cli/<sid>.json; a missing transcript falls back to session/new
             # (a genuinely fresh start).
-            if self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+            # Fork: a Claude seat (an operator harness running claude-agent-acp)
+            # owns its sessions like ``claude`` does; see providers/acp.py.
+            harness_owned = (
+                self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+                or getattr(self, "_claude_adapter", False) is True
+            )
+            if harness_owned:
                 # The harness keeps its own session records and resolves them from
                 # the sessionId, so there is no Crew-side file to name. Gating on
                 # the kiro transcript here would make file_ok always False -- such
@@ -10324,7 +10330,7 @@ class AcpClient:
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
-                    elif self.backend not in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+                    elif not harness_owned:
                         # The kiro family reads its transcript path from _meta. A
                         # harness that owns its sessions reads no _meta of ours,
                         # so it gets neither key rather than a kiro session_file

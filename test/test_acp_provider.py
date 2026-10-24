@@ -796,13 +796,16 @@ class TestStartKiroRuntimeResume:
         provider._client._model = model
         return provider
 
-    async def _run_start(self, provider, resume_sid, file_exists, load_raises=False):
+    async def _run_start(
+        self, provider, resume_sid, file_exists, load_raises=False, claude_adapter=False
+    ):
         mock_handle = MagicMock()
         mock_handle.session_id = "kiro-sess-1"
         mock_handle.store_session_config = MagicMock()
         mock_handle.set_model = AsyncMock()
         mock_runtime = MagicMock()
         mock_runtime.pid = 4321
+        mock_runtime.claude_adapter = claude_adapter
         mock_runtime.spawn = AsyncMock()
         mock_runtime.create_session = AsyncMock(return_value=mock_handle)
         if load_raises:
@@ -850,6 +853,31 @@ class TestStartKiroRuntimeResume:
         # A stale sid with no transcript on disk must NOT replay — fresh start.
         runtime.load_session.assert_not_awaited()
         runtime.create_session.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_claude_seat_resumes_without_a_kiro_transcript(self):
+        """Fork: a Claude seat (``claude-seat1``...) runs claude-agent-acp under its
+        own backend id. It writes no kiro transcript, so gating its resume on one
+        started every stop-reset chat EMPTY with no replay (2026-10-24)."""
+        provider = self._kiro_provider()
+        _handle, runtime = await self._run_start(
+            provider, "seat-sid", file_exists=False, claude_adapter=True
+        )
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_not_awaited()
+        assert runtime.load_session.await_args.args[0] == ""
+        assert runtime.load_session.await_args.args[1] == "seat-sid"
+
+    @pytest.mark.asyncio
+    async def test_claude_seat_failed_resume_replays_history(self):
+        """A seat whose session/load fails (e.g. the transcript is on another
+        seat) starts fresh WITH the conversation replayed, never blank."""
+        provider = self._kiro_provider()
+        _handle, runtime = await self._run_start(
+            provider, "seat-sid", file_exists=False, load_raises=True, claude_adapter=True
+        )
+        runtime.create_session.assert_awaited_once()
+        assert provider._history_replay_needed is True
 
     @pytest.mark.asyncio
     async def test_no_resume_when_sid_empty(self):

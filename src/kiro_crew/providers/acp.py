@@ -1167,8 +1167,16 @@ class AcpProvider(LLMProvider):
             handle = None
             resumed = False
             if resume_sid:
-                if self.is_kas_backend or self._client.backend in (
-                    ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+                # Fork: an operator harness running claude-agent-acp (the Claude
+                # seats, ``claude-seat1``...) owns its sessions exactly as
+                # ``claude`` does, under its own backend id. Keyed on the id
+                # alone, a seat stat'd a kiro transcript that never exists, logged
+                # "Session file missing" and started EMPTY with no replay, so every
+                # stop-reset or seat move wiped the chat's context.
+                if (
+                    self.is_kas_backend
+                    or self._client.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+                    or getattr(runtime, "claude_adapter", False) is True
                 ):
                     # Nothing local to stat. KAS locates the transcript itself
                     # from sessionId, and in remote-session mode there are no
