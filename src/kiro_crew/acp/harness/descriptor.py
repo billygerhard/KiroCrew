@@ -27,15 +27,20 @@ them:
   built by token-wise substitution. Nothing here concatenates a command line,
   quotes an argument, or consults a shell, so an operator-supplied executable,
   agent name, or model id can never become shell syntax.
-- **No capability claims.** A descriptor cannot grant its harness a session-path
-  capability. Every ``ACP_BACKENDS_*`` membership set in
+- **No capability claims of its own.** A descriptor cannot grant its harness a
+  session-path capability. Every ``ACP_BACKENDS_*`` membership set in
   ``kiro_crew.agent_sdk.backends`` is a frozen, code-reviewed literal, and a
   registered id is a member of none of them, so a config-authored host carries
   the DEFAULT posture at every gate (no ``session/new`` MCP array, no
   harness-owned resume, no model switch over ``set_config_option``, no
-  advertised-list model resolution). Admitting a harness to a capability is an
-  edit to the named set, not a line in ``harnesses.json`` (harness-parity H6/H7).
-  A ``capabilities`` key is therefore refused as unknown.
+  advertised-list model resolution). A ``capabilities`` key is refused as unknown.
+  The one exception is ``capabilities_from``: a wrapper around a BUILTIN's own
+  adapter (a Claude seat is claude-agent-acp with another ``CLAUDE_CONFIG_DIR``)
+  names that builtin and answers its code-reviewed memberships, minus the launch,
+  sign-in and driver-only sets in
+  :data:`kiro_crew.agent_sdk.capability_inheritance.NOT_INHERITED`. It names a set
+  of facts already reviewed for that adapter, never a new one. Absent, a
+  ``session_family`` of ``claude-code`` implies ``claude``; ``"none"`` opts out.
 - **Selectability is opt-in through routing.** A descriptor is registered as
   *known* whenever it validates, but it is only *selectable* — offered as a
   session backend — when it declares how permission routing is delivered (see
@@ -187,7 +192,9 @@ PERMISSION_CONFIG_KEYS: frozenset[str] = frozenset({"option", "value"})
 #: There is deliberately NO ``adapter`` key. A descriptor arrives from
 #: ``harnesses.json`` and gets argv-template semantics only; the bundled
 #: harnesses are real classes upstream and never pass through this parser, so
-#: configuration can never select a Python entry point.
+#: configuration can never select a Python entry point. ``capabilities_from``
+#: is not that: it borrows a builtin's capability MEMBERSHIPS, while the launch
+#: stays this descriptor's own argv.
 DESCRIPTOR_KEYS: frozenset[str] = frozenset(
     {
         "id",
@@ -203,6 +210,7 @@ DESCRIPTOR_KEYS: frozenset[str] = frozenset(
         "permission_config",
         "min_sandbox",
         "session_family",
+        "capabilities_from",
     }
 )
 
@@ -262,6 +270,10 @@ class HarnessDescriptor:
     #: keeps its session id and resumes natively instead of being treated as a
     #: provider switch. Empty means the harness is its own family.
     session_family: str = ""
+    #: The builtin backend (config spelling, e.g. ``claude``) whose adapter this
+    #: launcher runs, so its capability memberships apply here. Empty means
+    #: inferred from ``session_family``; ``none`` means no inheritance.
+    capabilities_from: str = ""
 
     @property
     def label(self) -> str:
@@ -679,6 +691,12 @@ def descriptor_from_mapping(
     reasons += family_reasons
     if session_family and not re.fullmatch(r"[a-z0-9-]{1,32}", session_family):
         reasons.append(f"{prefix}session_family must match [a-z0-9-]{{1,32}}")
+    capabilities_from, from_reasons = _optional_string(
+        prefix, "capabilities_from", raw.get("capabilities_from"), ""
+    )
+    reasons += from_reasons
+    if capabilities_from and not re.fullmatch(r"[a-z0-9-]{1,32}", capabilities_from):
+        reasons.append(f"{prefix}capabilities_from must match [a-z0-9-]{{1,32}}")
 
     descriptor = HarnessDescriptor(
         id=declared_id,
@@ -694,6 +712,7 @@ def descriptor_from_mapping(
         permission_config=permission_config,
         min_sandbox=min_sandbox,
         session_family=session_family,
+        capabilities_from=capabilities_from,
     )
     reasons += validate_descriptor(descriptor, taken_ids=taken_ids, position=position)
     if reasons:
