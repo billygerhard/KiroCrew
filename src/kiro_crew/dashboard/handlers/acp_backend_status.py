@@ -162,7 +162,10 @@ async def _deny_non_owner(
 
 
 def _operator_label(backend: str) -> str:
-    from kiro_crew.agent_sdk.backends_registered import is_registered_backend, provider_label_for
+    from kiro_crew.agent_sdk.operator_backend_registry import (
+        is_registered_backend,
+        provider_label_for,
+    )
 
     return provider_label_for(backend) if is_registered_backend(backend) else ""
 

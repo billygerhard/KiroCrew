@@ -61,7 +61,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS,
     model_registry_namespace,
 )
-from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
 from kiro_crew.agent_sdk.tool_gate import (
     ADAPTER_EXPOSED_CREDENTIAL_LEAVES,
     adapter_expose_files,

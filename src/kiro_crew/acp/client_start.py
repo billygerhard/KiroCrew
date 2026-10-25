@@ -118,7 +118,7 @@ from kiro_crew.agent_sdk.backends import (
     can_restore_session,
     launch_for,
 )
-from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.constants import KIROCREW_SPAWN_HOME_ENV, KIROCREW_SPAWN_INSTANCE_ENV
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation

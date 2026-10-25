@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Optional
 
 from kiro_crew import model_registry
-from kiro_crew.agent_sdk.backends_registered import registered_model_source
+from kiro_crew.agent_sdk.operator_backend_registry import registered_model_source
 
 #: The model source a descriptor declares when it lists its ids itself.
 MODEL_SOURCE_STATIC = "static"
