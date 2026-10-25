@@ -1320,6 +1320,7 @@ async def switch_slot_backend(
             raise _target_replaced()
         if slot.backend == pick:
             return {"ok": True, "backend": pick, "changed": False}
+        previous = slot.backend
         same = await _runs_on_same_backend(slot, slot.backend, pick)
         # The probe awaited: re-run the caller's gate before anything changes.
         if not still_ours():
@@ -1330,31 +1331,41 @@ async def switch_slot_backend(
             # ``""`` and ``"kiro"`` on a Kiro gateway: same backend, so the
             # model is kept and nothing is announced.
             return {"ok": True, "backend": pick, "changed": False}
-        # A model id belongs to one backend, so a switch clears it, and any
-        # pending pick, to the new backend's default, as a provider switch does
-        # (config_watch).
-        slot.model = ""
-        slot.jev_route = False
-        slot._pending_model_pick = None
-        slot._model_pick_gen += 1
-        # The swap happens between turns: the next turn start tears the live
-        # session down before acquiring one (the reset a model pick queues),
-        # and get_or_create starts on the pick. A turn or sub-agents in flight
-        # are left alone; the reset waits for them. A session that comes up on
-        # the old backend anyway (a hard Stop's respawn) is caught by the same
-        # turn start, which compares the live backend with the pick.
-        arm_model_switch_reset(state, slot)
-        logger.info("Slot %s backend set to %r for its next turn", name, pick or "default")
-        # Appended under the locks, so no turn lands before it. The new backend
-        # gets the conversation replayed on its cold start, as a model switch does.
-        slot.append(
-            "assistant",
-            f"Backend switched to {f'`{pick}`' if pick else 'the gateway default'} "
-            "from the next turn; the model was reset to that backend's default, "
-            "and this conversation is replayed to it."
-            + (f" Requested by session `{requested_by}`." if requested_by else ""),
-            "msg msg-a",
-            meta={"kind": SESSION_RELOAD_KIND},
-        )
+        from kiro_crew.agent_sdk.backends_registered import same_session_family
+
+        family_move = same_session_family(previous, pick)
+        if family_move:
+            # Two harnesses.json backends over one native session store (the
+            # Claude seats): the model id means the same thing on both and the
+            # next turn resumes the same session, so only the process moves.
+            arm_model_switch_reset(state, slot)
+            logger.info("Slot %s moved to %r in the same session family", name, pick)
+        else:
+            # A model id belongs to one backend, so a switch clears it, and any
+            # pending pick, to the new backend's default, as a provider switch does
+            # (config_watch).
+            slot.model = ""
+            slot.jev_route = False
+            slot._pending_model_pick = None
+            slot._model_pick_gen += 1
+            # The swap happens between turns: the next turn start tears the live
+            # session down before acquiring one (the reset a model pick queues),
+            # and get_or_create starts on the pick. A turn or sub-agents in flight
+            # are left alone; the reset waits for them. A session that comes up on
+            # the old backend anyway (a hard Stop's respawn) is caught by the same
+            # turn start, which compares the live backend with the pick.
+            arm_model_switch_reset(state, slot)
+            logger.info("Slot %s backend set to %r for its next turn", name, pick or "default")
+            # Appended under the locks, so no turn lands before it. The new backend
+            # gets the conversation replayed on its cold start, as a model switch does.
+            slot.append(
+                "assistant",
+                f"Backend switched to {f'`{pick}`' if pick else 'the gateway default'} "
+                "from the next turn; the model was reset to that backend's default, "
+                "and this conversation is replayed to it."
+                + (f" Requested by session `{requested_by}`." if requested_by else ""),
+                "msg msg-a",
+                meta={"kind": SESSION_RELOAD_KIND},
+            )
     state.push_slots_update()
     return {"ok": True, "backend": pick}

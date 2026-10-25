@@ -600,7 +600,12 @@ class AcpProvider(LLMProvider):
         teardown verb, and the reason the background path asks its own question
         rather than reading this one.
         """
-        return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
+        # A harnesses.json backend exists only as a DescriptorHarness on the
+        # shared runtime, so it is read through the registry's accessor too.
+        from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+
+        backend = self._client.backend
+        return backend in ACP_BACKENDS_ACP_RUNTIME or is_registered_backend(backend)
 
     @property
     def is_session_sharing_eligible(self) -> bool:
@@ -1132,7 +1137,12 @@ def provider_label(provider: Any) -> str:
     # as that harness, which is more than one mapping key can hold.
     if is_claude_backend_name(backend):
         return PROVIDER_LABEL_CLAUDE
-    return PROVIDER_LABEL_BY_BACKEND.get(backend, PROVIDER_LABEL_DEFAULT)
+    if backend in PROVIDER_LABEL_BY_BACKEND:
+        return PROVIDER_LABEL_BY_BACKEND[backend]
+    # A harnesses.json backend persists under the label it registered with.
+    from kiro_crew.agent_sdk.backends_registered import provider_label_for
+
+    return provider_label_for(backend) or PROVIDER_LABEL_DEFAULT
 
 
 # --------------------------------------------------------------------------- #

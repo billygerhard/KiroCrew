@@ -44,10 +44,8 @@ from kiro_crew.acp.session_handle_runtime_contract import AcpRequestTimeout, Acp
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
-    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     METHOD_SET_CONFIG_OPTION,
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
@@ -167,7 +165,9 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     per-session path and ``AcpSessionHandle`` on the shared-runtime one -- and a
     second copy is free to disagree about the select's shape.
     """
-    if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+    from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+
+    if not uses_advertised_model_selection(backend):
         return None
     return model_select_envelope(resp)
 
@@ -326,7 +326,9 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
         # _bg session the current model IS session/new's served default.
         return
     backend = self._runtime.acp_backend
-    if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+    from kiro_crew.agent_sdk.backends_registered import switches_model_via_config_option
+
+    if switches_model_via_config_option(backend, self._config_options):
         # A harness whose adapter judges the model VALUE rather than only the
         # option: the spelling Crew stored may not be the spelling this build
         # serves, so the candidate ladder decides. Non-strict, because this

@@ -54,7 +54,6 @@ from dataclasses import dataclass
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
@@ -198,11 +197,13 @@ def capabilities_for(backend: str) -> SessionCapabilities:
     ``KiroCrewConfig.load()``, where reaching the platform context would re-enter
     the very load that called it.
     """
+    from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+
     return SessionCapabilities(
         backend=backend,
         provider_seam=(PROVIDER_CLAUDE_CODE if is_claude_backend_name(backend) else PROVIDER_ACP),
         model_id_namespace=model_registry_namespace(backend),
-        resolves_model_from_advertised_list=backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+        resolves_model_from_advertised_list=uses_advertised_model_selection(backend),
         effort_via_config_option=backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
         # The two effort channels are disjoint sets, so a harness is told to use
         # at most one. KAS is in neither the command set nor this answer: it

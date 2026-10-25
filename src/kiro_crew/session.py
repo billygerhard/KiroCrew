@@ -365,6 +365,13 @@ def detect_provider_switch(session_map: "SessionMap", session_key: str, new_prov
     stored_provider = session_map.get_provider(session_key) or PROVIDER_LABEL_DEFAULT
     if stored_provider == new_provider:
         return False
+    # Two harnesses.json backends that read and write one native session store
+    # (the Claude seats) share a family: moving between them is a resume.
+    from kiro_crew.agent_sdk.backends_registered import session_family_for_label
+
+    stored_family = session_family_for_label(stored_provider)
+    if stored_family and stored_family == session_family_for_label(new_provider):
+        return False
     # Only counts as a switch if there's actually a stored SID to discard
     stored_sid = session_map.get(session_key)
     if not stored_sid:

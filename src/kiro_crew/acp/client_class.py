@@ -60,7 +60,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
@@ -833,7 +832,9 @@ class AcpClient:
     def _uses_advertised_model_selection(self) -> bool:
         """True when this backend sources its wire model id / seed from the
         provider's advertised list (see ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``)."""
-        return self.backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+        from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+
+        return uses_advertised_model_selection(self.backend)
 
     @property
     def _seeds_local_settings(self) -> bool:
