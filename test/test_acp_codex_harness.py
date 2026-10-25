@@ -811,7 +811,9 @@ class TestSpawnMasks:
                 harness_mod.acp_tool_gate, "adapter_expose_files", return_value=("/h/.aws/config",)
             ) as expose,
         ):
-            hidden, exposed = await harness_mod.resolve_spawn_masks("standard")
+            hidden, exposed = await harness_mod.resolve_spawn_masks(
+                "standard", backend=harness_mod.ACP_BACKEND_CODEX
+            )
         assert hidden == ("/h/.aws",)
         assert exposed == ("/h/.aws/config",)
         # Projected over the mask just resolved, never a re-derived one -- re-deriving
@@ -828,7 +830,7 @@ class TestSpawnMasks:
 
         with patch.object(client_mod, "_run_preflight_bounded", new=_refuse):
             with pytest.raises(RuntimeError, match="sandbox floor refused"):
-                await harness_mod.resolve_spawn_masks("off")
+                await harness_mod.resolve_spawn_masks("off", backend=harness_mod.ACP_BACKEND_CODEX)
 
     @pytest.mark.asyncio
     async def test_the_spawn_refuses_a_tier_that_would_drop_the_mask(self):
@@ -885,7 +887,7 @@ class TestSpawnMasks:
         import inspect
 
         source = inspect.getsource(CodexHarness.resolve_spawn)
-        assert "resolve_spawn_masks(ctx.sandbox_mode)" in source
+        assert "resolve_spawn_masks(ctx.sandbox_mode, backend=ACP_BACKEND_CODEX)" in source
         assert "extra_hidden_dirs=" in source
         assert not hasattr(harness_mod, "resolve_mask_only")
 

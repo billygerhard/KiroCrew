@@ -34,12 +34,12 @@ from kiro_crew.acp.harness.base import (
 from kiro_crew.acp.harness.claude import ClaudeLaunch
 from kiro_crew.acp.harness.codex import CodexHarness
 from kiro_crew.acp.harness.deepseek import DeepseekLaunch
+from kiro_crew.acp.harness.descriptor import HarnessDescriptor
 from kiro_crew.acp.harness.goose import GooseLaunch
 from kiro_crew.acp.harness.kas import KasHarness
-from kiro_crew.acp.harness.descriptor import HarnessDescriptor
 from kiro_crew.acp.harness.kiro import KiroHarness
-from kiro_crew.acp.harness.operator import DescriptorHarness
 from kiro_crew.acp.harness.opencode import OpencodeLaunch
+from kiro_crew.acp.harness.operator import DescriptorHarness
 from kiro_crew.acp.harness.pi import PiLaunch
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
