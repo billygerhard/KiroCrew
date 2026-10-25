@@ -154,20 +154,25 @@ async def _reclaim_off_backend_pick(state, slot, cfg, claimed, claim):
     The check before the claim cannot see a hard Stop's respawn that registers
     the old backend after it ran, so the claimed session is judged again under
     the lease. A mismatch is reset and claimed again, as a stale hook
-    projection is; with sub-agents attached the reset is queued instead, since
-    it would release the runtime they run on.
+    projection is. With sub-agents attached the parent still moves: the reset
+    hands the runtime they run on off to drain (``keep_children``) rather than
+    killing it, so a parent is never held on a backend (a full seat) by its
+    children.
     """
-    from kiro_crew.dashboard.session_control import arm_model_switch_reset
-
     if cfg is None or not _off_backend_pick(state, slot, cfg, claimed[0]):
         return claimed
     key = effective_session_key(slot)
-    if await subagents_attached_async(state, slot, key, "reclaim_off_backend_pick"):
-        arm_model_switch_reset(state, slot)
-        return claimed
+    keep_children = await subagents_attached_async(state, slot, key, "reclaim_off_backend_pick")
     logger.info("Slot %s claimed a session off its backend pick; reclaiming it", slot.key)
     slot.forget_session_model_state()
-    await state.sessions.reset(key)
+    if keep_children:
+        moved = await state.sessions.reset(key, keep_children=True)
+        if moved and slot._pending_reset_history_key == key:
+            # The queued reset this move satisfies would otherwise recycle the
+            # new session once the children finish.
+            slot._pending_reset_history_key = None
+    else:
+        await state.sessions.reset(key)
     claimed = await claim()
     adopt = getattr(state.sessions, "adopt_turn", None)
     if callable(adopt):

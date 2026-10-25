@@ -1360,20 +1360,25 @@ async def test_a_cleared_pick_reclaims_a_late_respawn_still_on_the_old_pick(monk
 
 
 @pytest.mark.asyncio
-async def test_a_claim_off_the_pick_with_children_attached_queues_the_reset(monkeypatch):
-    # The reset would release the runtime attached sub-agents run on, so it is
-    # queued for a later turn instead, as the pre-claim path does.
+async def test_a_claim_off_the_pick_with_children_attached_moves_and_keeps_them(monkeypatch):
+    # The parent moves anyway: the reset hands the runtime its sub-agents run on
+    # off to drain (keep_children) instead of killing it, so a parent is never
+    # held on a backend by its children, and the queued reset it satisfies is
+    # cleared so the new session is not recycled when they finish.
     monkeypatch.setattr(chat_runner, "subagents_attached_async", AsyncMock(return_value=True))
     slot = _ChatSlot("test")
     slot.backend = "codex"
     live = _live_on("claude")
     state = _mock_state(slot, provider=live)
+    slot._pending_reset_history_key = effective_session_key(slot)
+    state.sessions.reset = AsyncMock(return_value=True)
+    fresh = _live_on("codex")
     got = await chat_runner._reclaim_off_backend_pick(
-        state, slot, _cfg("claude"), (live, False, False), _claim_returning(None)
+        state, slot, _cfg("claude"), (live, False, False), _claim_returning(fresh)
     )
-    assert got == (live, False, False)
-    state.sessions.reset.assert_not_awaited()
-    assert slot._pending_reset_history_key == effective_session_key(slot)
+    assert got[0] is fresh
+    state.sessions.reset.assert_awaited_once_with(effective_session_key(slot), keep_children=True)
+    assert slot._pending_reset_history_key is None
 
 
 def test_a_turn_start_resets_an_unpicked_chat_still_on_an_old_pick():

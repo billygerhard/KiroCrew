@@ -265,7 +265,7 @@ class SessionLifecycleOwner(Protocol):
     async def _retire_stale_backend_bg_runtime(self) -> None: ...
 
     async def release_subagent_runtime(
-        self, parent_session_key: str, *, expected: Any = None
+        self, parent_session_key: str, *, expected: Any = None, park: bool = False
     ) -> bool: ...
 
     async def _retire_kiro_warm_pool(self) -> bool: ...
@@ -294,6 +294,7 @@ class SessionLifecycleOwner(Protocol):
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        keep_children: bool = False,
     ) -> bool: ...
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None: ...

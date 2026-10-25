@@ -142,7 +142,7 @@ async def get_subagent_runtime(
 
 
 async def release_subagent_runtime(
-    self: SessionManager, parent_session_key: str, *, expected: Any = None
+    self: SessionManager, parent_session_key: str, *, expected: Any = None, park: bool = False
 ) -> bool:
     """Release the shared companion runtime for a parent.
 
@@ -150,7 +150,7 @@ async def release_subagent_runtime(
     allocation boundary); returns whether one was released.
     """
     return await self._allocation_boundary().release_subagent_runtime(
-        parent_session_key, expected=expected
+        parent_session_key, expected=expected, park=park
     )
 
 

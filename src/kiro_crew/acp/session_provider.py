@@ -488,6 +488,23 @@ class AcpSessionProvider(LLMProvider):
         self._runtime_lease = None
         await RUNTIME_OWNERSHIP.release(lease)
 
+    async def hand_off_runtime(self) -> "AcpRuntime | None":
+        """Stop owning a runtime that sub-agent sessions still run on.
+
+        For a parent moving to another backend while its children run: after this,
+        :meth:`shutdown` takes the co-tenant arm and ends only this session, the
+        transcript is kept as the successor's resume material, and the caller parks
+        the returned runtime to drain (``session_handoff.park_until_drained``). The
+        lease is released here, so the drain reaper's kill is authorized.
+        ``None`` when this provider never owned its runtime.
+        """
+        if not self._owns_runtime:
+            return None
+        await self.release_runtime_lease()
+        self._owns_runtime = False
+        self._handle.keep_transcript = True
+        return self._runtime
+
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
 

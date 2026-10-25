@@ -28,6 +28,7 @@ from kiro_crew.metrics.sessions import (
     END_REASON_UNCLAIMED,
     record_session_ended,
 )
+from kiro_crew.session_handoff import hand_off_runtime, park_until_drained
 from kiro_crew.session_lifecycle_parts.parked_queue import _park_queue, allocation_identity
 
 if TYPE_CHECKING:
@@ -93,8 +94,14 @@ async def reset(
     clear_conversation: bool = False,
     ends_conversation: bool = False,
     scope: _TeardownScope | None = None,
+    keep_children: bool = False,
 ) -> bool:
     """Kill a live session while preserving the exact reset semantics.
+
+    ``keep_children=True`` is for a parent moving to another backend while its
+    sub-agents run: the parent's session ends, and the runtime its children are
+    multiplexed onto (and its companion sub-agent runtime) is handed off and parked
+    to drain (:mod:`kiro_crew.session_handoff`) instead of being killed now.
 
     Defaults to recycling a PROCESS while the conversation survives. The session-map
     entry keeps its resume sid, so the next turn on the key restores the same native
@@ -267,8 +274,11 @@ async def reset(
         # any of them runs, and this clear cannot erase a successor's pointer.
         owner._session_map.clear_sid(key)
     shutdown_error: BaseException | None = None
+    handed_off: Any = None
     if session:
         await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
+        if keep_children:
+            handed_off = await hand_off_runtime(session.provider)
         # Capture PID and child tree before shutdown clears them.
         client = getattr(session.provider, "_client", None)
         raw_pid = getattr(client, "_pid", None) if client else None
@@ -283,6 +293,10 @@ async def reset(
         pid = raw_pid if isinstance(raw_pid, int) else None
         raw_children = getattr(client, "_child_pids", None) if client else None
         child_pids: dict[Any, Any] = dict(raw_children) if isinstance(raw_children, dict) else {}
+        if handed_off is not None:
+            # The process lives on for the children; the drain reaper ends it.
+            pid = None
+            child_pids = {}
         capture_child_records, get_child_pids, kill_escaped_children = (
             self._deps.get_child_process_helpers()
         )
@@ -316,6 +330,10 @@ async def reset(
             # would say the same thing; deferring says it without re-indenting two
             # hundred lines of kill-and-sweep logic, which is its own risk.
             shutdown_error = exc
+        if handed_off is not None:
+            # Parked even after a shutdown raise: the process is alive either way.
+            park_until_drained(owner, handed_off, reason="handed-off parent runtime drained")
+            logger.info("Reset %s: handed its runtime to running sub-agents to drain", key)
         platform_compat = self._deps.get_platform_compat()
         if pid:
             if platform_compat.pid_exists(pid):
@@ -357,7 +375,10 @@ async def reset(
         await self._cancel_parent_children(key, teardown_children, verb="reset")
     if session is not None and key in owner._subagent_runtimes:
         try:
-            await owner.release_subagent_runtime(key)
+            if keep_children:
+                await owner.release_subagent_runtime(key, park=True)
+            else:
+                await owner.release_subagent_runtime(key)
         except Exception:
             logger.debug("Reset %s: subagent runtime cleanup failed", key, exc_info=True)
     if rescued and session is not None:
