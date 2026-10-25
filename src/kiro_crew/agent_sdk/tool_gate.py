@@ -67,6 +67,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_PI,
+    ACP_BACKENDS_BUILTIN,
     Readback,
     Routing,
     gate_probe_command_for,
@@ -75,6 +76,7 @@ from kiro_crew.agent_sdk.backends import (
     permission_setting_for,
     routing_for,
 )
+from kiro_crew.agent_sdk.capability_inheritance import capability_source
 
 logger = logging.getLogger(__name__)
 
@@ -462,6 +464,28 @@ def _sits_under_any(path: str, roots: tuple) -> bool:
     return False
 
 
+def _inherits_unmasked_start(backend: str) -> bool:
+    """Whether *backend* is a builtin's clone and that builtin starts without the mask.
+
+    The floor exists so an enforced harness is never WEAKER than the harnesses beside
+    it at the same tier. A descriptor that declares ``capabilities_from`` a builtin
+    runs that builtin's own adapter, and when the builtin itself is not enforced (the
+    ``claude`` builtin's ``SEEDED_SETTINGS`` routing) the builtin starts at ``off``
+    with no mask and no refusal. The descriptor still applies its own verified
+    ``session_config`` permission mode, so at ``off`` it is guarded at least as well
+    as the builtin it clones; refusing it would make the backend's behaviour depend
+    on the sandbox setting while the builtin's does not.
+
+    Only an explicit inheritance from a BUILTIN counts: a descriptor naming its own
+    capabilities (Antigravity, Strands) has no builtin whose answer it can take, and
+    a builtin that is itself enforced (codex) passes its refusal on unchanged.
+    """
+    source = capability_source(backend)
+    if source == backend or source not in ACP_BACKENDS_BUILTIN:
+        return False
+    return not is_enforced(source)
+
+
 def enforce_sandbox_floor(backend: str, mode: str) -> None:
     """Refuse an enforced adapter whose credential mask would never be applied.
 
@@ -483,6 +507,11 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
     Returns for a harness this core does not enforce, so the first-class path and
     every unenforced harness reach the spawn unchanged.
 
+    A registered backend that declares ``capabilities_from`` a builtin (a Claude seat
+    is ``claude``'s own adapter under another config dir) takes that builtin's answer
+    here, so its sandbox-off behaviour matches the builtin's: it is refused only where
+    the builtin would be. See :func:`_inherits_unmasked_start`.
+
     Native Windows has no Crew OS sandbox backend that can apply the mask, so the
     refusal there names that limitation and points at Kiro CLI rather than at
     ``agent.sandbox``: changing the configured tier cannot enable a backend this
@@ -503,6 +532,8 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
     # resolves to a non-``off`` tier, passed the guard, and still spawned the adapter
     # with its credential mask dropped.
     if credential_mask_applies(mode):
+        return
+    if _inherits_unmasked_start(backend):
         return
     # Platform copy only: the verdict above already decided the session cannot
     # start. Recommending standard/strict is advice that cannot succeed on native

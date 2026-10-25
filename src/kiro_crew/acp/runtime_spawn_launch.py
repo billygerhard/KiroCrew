@@ -26,7 +26,7 @@ Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``
 ``_mcp_secret_server``.
 
 Instance fields read: ``_acp_backend``, ``_extra_env``, ``_launch_agent``, ``_member_context``,
-``_model``, ``_sandbox_mode``, ``_scratch_dir``, ``_shared_scratch``, ``_tool_search``,
+``_model``, ``_scratch_dir``, ``_shared_scratch``, ``_tool_search``,
 ``_work_dir``.
 """
 

@@ -305,6 +305,15 @@ remedy stays for hosts where a backend can exist (Linux user namespaces, macOS
 Windows Crew delegates to Kiro's own sandbox. The unsandboxed-exec opt-in is
 not a recovery path and is not named.
 
+**A builtin's clone takes the builtin's floor.** A `harnesses.json` backend that
+declares `capabilities_from` a builtin runs that builtin's own adapter, so
+`enforce_sandbox_floor` answers it as it answers the builtin: a Claude seat
+(`capabilities_from: claude`) starts at `agent.sandbox: off` exactly as `claude`
+does, still under its own verified `session_config` permission mode. A clone of
+an enforced builtin (codex) inherits the refusal, and a descriptor that names
+its own `capabilities` has no builtin to inherit from and keeps the refusal
+(`agent_sdk/tool_gate.py`, `_inherits_unmasked_start`).
+
 **A provider must declare:** whether it self-sandboxes and how that is detected,
 its nesting compatibility, its delegation predicate, and any additional paths its
 credentials occupy. An unknown provider defaults to *not* self-sandboxing.
