@@ -26,6 +26,7 @@ from chat_runner_coverage_helpers import (
 )
 from chat_test_helpers import pin_harness_choice
 
+from kiro_crew import members
 from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     STOP_REASON_COMPACTION_FAILED,
@@ -166,13 +167,16 @@ class TestRunChatLocalCommands:
         with (
             patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
             patch.object(
-                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+                members, "select_provider_backend", wraps=members.select_provider_backend
             ) as select_backend,
         ):
             await _drive(state, slot, "/todos")
 
         select_backend.assert_called_once_with(
-            chat_runner.effective_session_key(slot), cfg.agent.member_acp_backend, acp_backend
+            chat_runner.effective_session_key(slot),
+            cfg.agent.member_acp_backend,
+            acp_backend,
+            None,
         )
 
         notices = [
@@ -582,7 +586,7 @@ class TestRunChatLocalCommands:
         with (
             patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
             patch.object(
-                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+                members, "select_provider_backend", wraps=members.select_provider_backend
             ) as select_backend,
         ):
             await _drive(state, slot, "/todos")
@@ -597,7 +601,7 @@ class TestRunChatLocalCommands:
             select_backend.assert_not_called()
         else:
             select_backend.assert_called_once_with(
-                chat_runner.effective_session_key(slot), "claude", ""
+                chat_runner.effective_session_key(slot), "claude", "", None
             )
 
     @pytest.mark.asyncio
