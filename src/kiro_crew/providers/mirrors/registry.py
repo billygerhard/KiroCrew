@@ -39,10 +39,15 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
 )
+from kiro_crew.agent_sdk.backends_registered import (
+    is_registered_backend,
+    registered_session_array,
+)
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
 from kiro_crew.providers.mirrors.codex import CodexMirror
 from kiro_crew.providers.mirrors.deepseek import DeepSeekMirror
+from kiro_crew.providers.mirrors.descriptor_array import DescriptorArrayProjection
 from kiro_crew.providers.mirrors.goose import GooseMirror
 from kiro_crew.providers.mirrors.opencode import OpenCodeMirror
 
@@ -403,8 +408,12 @@ def has_mirror(backend: str) -> bool:
     different problems with different remedies, and so is "a projection that
     lives elsewhere". False rather than raising for an unknown backend, because
     the callers are diagnostics.
+
+    True too for a ``harnesses.json`` backend declaring ``session_array``: its
+    projection is :mod:`~kiro_crew.providers.mirrors.descriptor_array`, keyed by
+    registration because no frozen table can name a config-authored id.
     """
-    return backend in MIRRORS
+    return backend in MIRRORS or registered_session_array(backend)
 
 
 def mirror_for(backend: str) -> AgentConfigMirror | None:
@@ -418,5 +427,9 @@ def mirror_for(backend: str) -> AgentConfigMirror | None:
     cls = MIRRORS.get(backend)
     if cls is not None:
         return cls()
+    if registered_session_array(backend):
+        return DescriptorArrayProjection(backend)  # type: ignore[return-value]
+    if is_registered_backend(backend):
+        return None
     projection_for(backend)
     return None
