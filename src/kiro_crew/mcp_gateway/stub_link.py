@@ -399,7 +399,11 @@ async def handshake(
                 raise StaleGenerationError(
                     "gateway did not report its code fingerprint; using direct execution"
                 )
-            if daemon_generation != expected_generation:
+            offered = resp.get("fingerprints")
+            same_code = daemon_generation == expected_generation or (
+                isinstance(offered, list) and expected_generation in offered
+            )
+            if not same_code:
                 await _safe_close(writer)
                 raise StaleGenerationError(
                     "gateway code fingerprint does not match this stub; using direct execution"

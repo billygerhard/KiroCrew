@@ -17,7 +17,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from kiro_crew.code_fingerprint import code_fingerprint
+from kiro_crew.code_fingerprint import code_fingerprint, code_fingerprints
 from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.mcp_gateway import hazards
 from kiro_crew.mcp_gateway.admission import Admission
@@ -310,6 +310,12 @@ async def _handle_connection(
             # upgrade; a stub reconnecting mid-session has no exec left and
             # refuses that generation terminally rather than retrying it.
             "fingerprint": code_fingerprint(),
+            # The same code under every rule this daemon can state. A stub in an
+            # enforced harness's sandbox cannot run the git rule against a
+            # worktree whose git directory lies outside it, so it states the
+            # mtime rule; it matches against this list rather than miss on the
+            # rule and fall back to an in-sandbox server that cannot attest.
+            "fingerprints": list(code_fingerprints()),
             # Capability advertisement: lets a new stub detect a
             # new gateway and run the ensure_backend pre-flight. Absent on an
             # old gateway, so the new stub skips the pre-flight (no 25s skew
