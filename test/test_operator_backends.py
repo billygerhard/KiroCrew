@@ -246,3 +246,20 @@ def test_both_resume_gates_load_a_harnesses_json_session_natively():
 
     for module in (client_start, acp_runtime_start):
         assert "is_registered_backend(" in inspect.getsource(module), module.__name__
+
+
+def test_a_client_on_a_seat_switches_model_through_its_advertised_select(registered):
+    from types import SimpleNamespace
+
+    from kiro_crew.acp.client_model_selection import _switches_via_config_option
+
+    select = [{"id": "model", "type": "select", "options": []}]
+    assert _switches_via_config_option(
+        SimpleNamespace(backend="seat-a", _acp_config_options=select)
+    )
+    assert not _switches_via_config_option(
+        SimpleNamespace(backend="seat-a", _acp_config_options=[])
+    )
+    assert not _switches_via_config_option(
+        SimpleNamespace(backend="kiro", _acp_config_options=select)
+    )

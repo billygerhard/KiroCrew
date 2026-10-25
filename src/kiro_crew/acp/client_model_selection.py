@@ -38,7 +38,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
-    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     METHOD_INITIALIZE,
     METHOD_SESSION_NEW,
     METHOD_SET_MODEL,
@@ -181,6 +180,18 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
     return model_id
 
 
+def _switches_via_config_option(self: AcpClient) -> bool:
+    """Whether this session's model travels down ``session/set_config_option``.
+
+    The same answer the shared-runtime handle reads: the frozen set, or a
+    harnesses.json seat whose adapter advertised a ``model`` select (a Claude
+    seat runs claude-agent-acp, which implements no ``session/set_model``).
+    """
+    from kiro_crew.agent_sdk.backends_registered import switches_model_via_config_option
+
+    return switches_model_via_config_option(self.backend, self._acp_config_options)
+
+
 async def set_model(self: AcpClient, model_id: str) -> None:
     """Switch model on a running session (used by warm pool post-claim)."""
     if not self._session_id:
@@ -215,7 +226,7 @@ async def set_model(self: AcpClient, model_id: str) -> None:
     # An advisory belongs to the request that emitted it.  A clean explicit
     # switch must not inherit the served-model attribution from startup.
     self._last_substitution_model = None
-    if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+    if _switches_via_config_option(self):
         model_id = await self._push_model_config_option(model_id, strict=True)
     else:
         await self._send_request(
@@ -925,7 +936,7 @@ async def _apply_startup_model(self: AcpClient) -> None:
     # resumed — would otherwise be read below as this dispatch's own
     # served model and misattribute the session.
     self._last_substitution_model = None
-    if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
+    if _switches_via_config_option(self):
         sent = await self._push_model_config_option(self._model, strict=False)
         if not sent:
             # Every spelling refused: record the session as running the
