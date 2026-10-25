@@ -749,6 +749,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         effective_sandbox_mode,
         enterprise_policy_cache_view,
         install_root_targets_for,
+        raise_sandbox_mode,
         warn_readonly_layer_unenforced,
     )
     from kiro_crew.sandbox_unavailable import (  # noqa: F401
