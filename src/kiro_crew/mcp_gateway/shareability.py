@@ -159,9 +159,10 @@ class ShareEvidence:
     #
     # Deliberately NOT "is this one of ours". Kiro Crew's own managed servers
     # differ from each other here: ``kirocrew-core`` advertises the
-    # caller-identity extension and consumes the injected caller, while
-    # ``kirocrew-cron`` does not and still reads process identity. Keying this on
-    # authorship disqualified the first for a property only the second has.
+    # caller-identity extension and consumes the injected caller, while a managed
+    # server outside ``_MANAGED_SERVERS_CALLER_AWARE`` still reads process
+    # identity. Keying this on authorship would disqualify the first for a
+    # property only the second has.
     session_bound_by_construction: bool = False
     # Did the handshake succeed? A server we could not start is UNKNOWN.
     probe_ok: bool = False
@@ -277,9 +278,7 @@ def _all_tools_read_only(annotations: list[dict]) -> bool:
     return all(a.get("readOnlyHint") is True for a in annotations)
 
 
-def assess(
-    evidence: ShareEvidence, identity_keys: Collection[str] = ()
-) -> ShareVerdict:
+def assess(evidence: ShareEvidence, identity_keys: Collection[str] = ()) -> ShareVerdict:
     """Turn evidence into a verdict. Pure; no IO, no config, no clock.
 
     ``identity_keys`` is passed IN rather than read here precisely to keep that
@@ -352,9 +351,7 @@ def assess(
     #    Checked BEFORE the probe gate: it is a config fact, true whether or not
     #    the server ever started.
     if evidence.session_bound_by_construction:
-        return verdict(
-            Strength.DISQUALIFIED, [Reason("session_bound_by_construction")]
-        )
+        return verdict(Strength.DISQUALIFIED, [Reason("session_bound_by_construction")])
 
     # 4. Config-derived notes. Computed BEFORE the probe gate for the same reason.
     #

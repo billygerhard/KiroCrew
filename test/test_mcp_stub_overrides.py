@@ -318,8 +318,8 @@ class TestManagedServersFollowTheControlPlane:
         from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
         from kiro_crew.mcp_discovery import _MANAGED_SERVERS_CALLER_AWARE
 
-        # computer: tenant-nonce gated. cron: outside this layer's measured scope.
-        excluded = {"kirocrew-computer", "kirocrew-cron"}
+        # computer: tenant-nonce gated.
+        excluded = {"kirocrew-computer"}
         assert len(MANAGED_STUB_FOLLOWERS) == len(set(MANAGED_STUB_FOLLOWERS))
         assert set(MANAGED_STUB_FOLLOWERS) == (
             _MANAGED_SERVERS_CALLER_AWARE - {MANAGED_STUB_LEADER} - excluded
@@ -327,8 +327,9 @@ class TestManagedServersFollowTheControlPlane:
         assert POOLING_REQUIRES_TENANT_NONCE <= excluded
         assert set(MANAGED_STUB_FOLLOWERS) <= set(KIROCREW_BIN_MCP_SERVERS)
 
-    def test_the_cron_server_never_follows(self) -> None:
-        assert "kirocrew-cron" not in _resolve_stub_servers({"stub_servers": ["kirocrew-core"]})
+    def test_the_cron_server_follows_core(self) -> None:
+        """An enforced harness masks what an in-sandbox cron needs to attest its session."""
+        assert "kirocrew-cron" in _resolve_stub_servers({"stub_servers": ["kirocrew-core"]})
 
     def test_a_follower_turned_on_survives_core_turned_off_later(self) -> None:
         from kiro_crew.dashboard.handlers.mcp import _record_stub_decisions

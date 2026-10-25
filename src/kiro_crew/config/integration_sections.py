@@ -125,8 +125,8 @@ MANAGED_STUB_LEADER = "kirocrew-core"
 #: Being in the stub set mounts nothing: the rewriter wraps only servers a spec
 #: already declares, so an opt-in server still reaches only the agents granted it.
 #:
-#: This is ``mcp_discovery._MANAGED_SERVERS_CALLER_AWARE`` minus the leader,
-#: ``kirocrew-computer`` and ``kirocrew-cron``. It is spelled out rather than
+#: This is ``mcp_discovery._MANAGED_SERVERS_CALLER_AWARE`` minus the leader and
+#: ``kirocrew-computer``. It is spelled out rather than
 #: derived because this module may import only ``config.fields`` (the config
 #: boundary contract) and ``mcp_discovery`` pulls in aiohttp and the probe
 #: executor. A ratchet test pins the equality, so a new caller-aware server fails
@@ -134,9 +134,12 @@ MANAGED_STUB_LEADER = "kirocrew-core"
 #:
 #: ``kirocrew-computer`` drives the desktop and pools only behind a
 #: per-connection tenant nonce (``mcp_caller.POOLING_REQUIRES_TENANT_NONCE``), so
-#: it stays an explicit choice. ``kirocrew-cron`` is not excluded for a known
-#: hazard: it is simply outside what this layer was measured on, and stays one
-#: operator toggle away like any other server.
+#: it stays an explicit choice. ``kirocrew-cron`` follows: it takes its session
+#: from the injected caller like the others, and was measured served from one
+#: pooled backend to two sessions with each seeing only its own jobs. Without it,
+#: a session whose harness masks the SEL key and internal secret (an enforced
+#: ``session_config`` harness) ran cron in its sandbox, where it cannot attest the
+#: session and refuses every tool.
 MANAGED_STUB_FOLLOWERS: tuple[str, ...] = (
     "kirocrew-guide",
     "kirocrew-mate",
@@ -145,6 +148,7 @@ MANAGED_STUB_FOLLOWERS: tuple[str, ...] = (
     "kirocrew-work",
     "kirocrew-crew-log",
     "kirocrew-debug",
+    "kirocrew-cron",
 )
 
 

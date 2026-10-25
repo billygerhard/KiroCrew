@@ -987,7 +987,9 @@ servers join it (`config.integration_sections.MANAGED_STUB_FOLLOWERS`), so each
 is one shared backend instead of one process per session. They already need no
 launch approval (managed launch), get the per-session token from gatewayd, and
 consume the injected caller block. `kirocrew-computer` stays out (tenant-nonce
-gated), and so does `kirocrew-cron` (outside what this layer was measured on).
+gated). `kirocrew-cron` follows: an enforced harness's sandbox masks what an
+in-sandbox cron needs to attest its session, and a pooled cron keeps each
+session's jobs apart through the injected caller.
 Joining the stub set mounts nothing: only
 servers a spec already declares are wrapped. An operator can turn any one off in
 MCP Management; that choice is stored as an override and survives later
