@@ -179,14 +179,32 @@ def code_fingerprint() -> str:
     return _git_fingerprint(_PACKAGE_ROOT) or _mtime_fingerprint(_PACKAGE_ROOT)
 
 
+@functools.lru_cache(maxsize=1)
+def code_fingerprints() -> tuple[str, ...]:
+    """Every fingerprint THIS process can state for its code, one per rule.
+
+    The git rule when ``git`` answers, and always the mtime rule. A peer that
+    cannot run the git rule -- a stub inside an enforced harness's sandbox, which
+    may not read the worktree's git directory -- falls back to the mtime rule for
+    the very same tree, so a process that answers for its peers offers both and
+    the peer compares like with like. Equality of either still means "same code".
+    """
+    primary = code_fingerprint()
+    if primary.startswith("mtime:"):
+        return (primary,)
+    return (primary, _mtime_fingerprint(_PACKAGE_ROOT))
+
+
 async def warm_code_fingerprint() -> str:
-    """Compute :func:`code_fingerprint` off the event loop and return it.
+    """Compute :func:`code_fingerprint` (and :func:`code_fingerprints`) off the loop.
 
     The first computation runs ``git`` or walks the package tree; an async
     caller awaits this once at startup so the synchronous reads that follow on
-    its loop (a ping reply, an adoption check) hit the cache.
+    its loop (a ping reply, an adoption check, a stub registration) hit the cache.
     """
-    return await asyncio.to_thread(code_fingerprint)
+    fingerprint = await asyncio.to_thread(code_fingerprint)
+    await asyncio.to_thread(code_fingerprints)
+    return fingerprint
 
 
 def fingerprint_of(root: Path) -> str:

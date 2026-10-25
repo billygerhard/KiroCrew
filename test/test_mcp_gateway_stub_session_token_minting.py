@@ -256,8 +256,16 @@ def test_the_caller_aware_opt_in_servers_name_the_stubs_code_generation(
             {"type": "registered", "fingerprint": "older-daemon-generation"},
             "does not match",
         ),
+        (
+            {
+                "type": "registered",
+                "fingerprint": "older-daemon-generation",
+                "fingerprints": ["older-daemon-generation", "mtime:older"],
+            },
+            "does not match",
+        ),
     ],
-    ids=["pre-fingerprint-daemon", "different-generation"],
+    ids=["pre-fingerprint-daemon", "different-generation", "different-under-every-rule"],
 )
 async def test_an_owned_control_plane_falls_back_from_a_stale_daemon(
     monkeypatch: pytest.MonkeyPatch,
@@ -314,6 +322,56 @@ async def test_an_owned_control_plane_accepts_the_matching_daemon_generation(
         },
     )
     assert attached[0] is reader and attached[1] is writer
+
+
+@pytest.mark.asyncio
+async def test_a_sandboxed_stub_on_the_mtime_rule_accepts_the_same_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stub in an enforced harness's sandbox cannot read the worktree's git dir.
+
+    It states the mtime rule for the same tree the daemon fingerprints by git. The
+    daemon offers both, so the stub attaches instead of falling back to an
+    in-sandbox server that cannot attest its session and refuses every tool.
+    """
+    reader = _QueueReader()
+    writer = _RecordingWriter()
+    reader.feed(
+        {
+            "type": "registered",
+            "fingerprint": "deadbeef",
+            "fingerprints": ["deadbeef", "mtime:same-tree"],
+        }
+    )
+
+    async def _connect(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return reader, writer
+
+    monkeypatch.setattr(stub_mod.transport, "connect", _connect)
+    attached = await stub_mod.handshake(
+        "ignored.sock",
+        {
+            "type": "register",
+            "stub_uuid": "generation-probe",
+            "stub_code_fingerprint": "mtime:same-tree",
+        },
+    )
+    assert attached[0] is reader and attached[1] is writer
+
+
+def test_code_fingerprints_always_offer_the_mtime_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kiro_crew import code_fingerprint as fingerprint_mod
+
+    monkeypatch.setattr(fingerprint_mod, "_mtime_fingerprint", lambda _root: "mtime:tree")
+    for git, expected in (("abc123", ("abc123", "mtime:tree")), (None, ("mtime:tree",))):
+        monkeypatch.setattr(fingerprint_mod, "_git_fingerprint", lambda _root, g=git: g)
+        fingerprint_mod.code_fingerprint.cache_clear()
+        fingerprint_mod.code_fingerprints.cache_clear()
+        try:
+            assert fingerprint_mod.code_fingerprints() == expected
+        finally:
+            fingerprint_mod.code_fingerprint.cache_clear()
+            fingerprint_mod.code_fingerprints.cache_clear()
 
 
 @pytest.mark.asyncio
