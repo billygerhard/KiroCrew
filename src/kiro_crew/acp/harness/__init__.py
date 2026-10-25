@@ -36,7 +36,9 @@ from kiro_crew.acp.harness.codex import CodexHarness
 from kiro_crew.acp.harness.deepseek import DeepseekLaunch
 from kiro_crew.acp.harness.goose import GooseLaunch
 from kiro_crew.acp.harness.kas import KasHarness
+from kiro_crew.acp.harness.descriptor import HarnessDescriptor
 from kiro_crew.acp.harness.kiro import KiroHarness
+from kiro_crew.acp.harness.operator import DescriptorHarness
 from kiro_crew.acp.harness.opencode import OpencodeLaunch
 from kiro_crew.acp.harness.pi import PiLaunch
 from kiro_crew.acp.types import (
@@ -70,7 +72,9 @@ __all__ = [
     "SpawnPlan",
     "TeardownPolicy",
     "harness_for",
+    "operator_descriptor",
     "process_adapter_for",
+    "register_operator_harness",
 ]
 
 _HARNESSES: dict[str, type[HarnessAdapter]] = {
@@ -87,22 +91,56 @@ _HARNESSES: dict[str, type[HarnessAdapter]] = {
 }
 
 
+#: Operator-declared (``harnesses.json``) harnesses, id -> descriptor. A separate
+#: structure from ``_HARNESSES`` so the builtin table stays a bare literal; filled
+#: once at gateway boot by :func:`register_operator_harness`.
+_OPERATOR_REGISTER: dict[str, HarnessDescriptor] = {}
+
+
+def register_operator_harness(descriptor: HarnessDescriptor) -> None:
+    """Make *descriptor* resolvable through :func:`harness_for`.
+
+    Refuses an id ``_HARNESSES`` already serves and a duplicate registration: a
+    silent overwrite is how one descriptor's harness clobbers another's.
+    """
+    backend_id = descriptor.id
+    if backend_id in _HARNESSES:
+        raise ValueError(f"cannot register operator harness {backend_id!r}: it is a builtin")
+    if backend_id in _OPERATOR_REGISTER:
+        raise ValueError(f"operator harness {backend_id!r} is already registered")
+    _OPERATOR_REGISTER[backend_id] = descriptor
+
+
+def operator_descriptor(backend: str) -> HarnessDescriptor | None:
+    """The operator-declared descriptor for *backend*, or ``None`` for any other id."""
+    return _OPERATOR_REGISTER.get(backend)
+
+
+def _reset_operator_register() -> None:
+    """TEST-ONLY: drop every operator harness."""
+    _OPERATOR_REGISTER.clear()
+
+
 def harness_for(backend: str) -> HarnessAdapter:
     """The harness for ``backend``.
 
-    Raises ``ValueError`` for a backend with no harness. Failing here is the
-    point: a backend the shared-process runtime has no harness for would
-    otherwise silently inherit kiro-cli's spawn argv, protocol version and
-    teardown verb, and the first sign of it would be a session that starts and
-    then behaves wrongly.
+    The builtin table first, then the operator register. Raises ``ValueError``
+    for a backend with no harness. Failing here is the point: a backend the
+    shared-process runtime has no harness for would otherwise silently inherit
+    kiro-cli's spawn argv, protocol version and teardown verb, and the first sign
+    of it would be a session that starts and then behaves wrongly.
     """
     try:
         return _HARNESSES[backend]()
     except KeyError:
-        raise ValueError(
-            f"no ACP harness for backend {backend!r}; "
-            f"the shared-process runtime serves {sorted(_HARNESSES)}"
-        ) from None
+        pass
+    descriptor = _OPERATOR_REGISTER.get(backend)
+    if descriptor is not None:
+        return DescriptorHarness(descriptor)
+    raise ValueError(
+        f"no ACP harness for backend {backend!r}; the shared-process runtime "
+        f"serves {sorted(set(_HARNESSES) | set(_OPERATOR_REGISTER))}"
+    )
 
 
 #: The hosts ``AcpClient`` launches one process per session for, each by its own

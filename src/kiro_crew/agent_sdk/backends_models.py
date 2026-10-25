@@ -505,5 +505,14 @@ _MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
 
 
 def model_registry_namespace(backend: str) -> str:
-    """The model-registry namespace key for *backend* (default ``acp``)."""
-    return _MODEL_REGISTRY_NAMESPACE_BY_BACKEND.get(backend, "acp")
+    """The model-registry namespace key for *backend* (default ``acp``).
+
+    A backend registered from ``harnesses.json`` answers its own namespace, so its
+    advertised ids never share kiro's ``acp`` bucket.
+    """
+    # Deferred: backends_registered imports the vocabulary this module is part of.
+    from kiro_crew.agent_sdk.backends_registered import registered_model_namespace
+
+    return registered_model_namespace(backend) or _MODEL_REGISTRY_NAMESPACE_BY_BACKEND.get(
+        backend, "acp"
+    )

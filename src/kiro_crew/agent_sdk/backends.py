@@ -253,6 +253,8 @@ seam). Both already existed; neither gained a member here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
+from collections.abc import Set as AbstractSet
 from typing import FrozenSet, Set
 
 logger = logging.getLogger(__name__)
@@ -334,10 +336,10 @@ STORED_BACKEND_KIRO = "kiro"
 # or ``""``) and KAS is selectable.
 DEFAULT_ACP_BACKEND = ACP_BACKEND_KAS
 
-# Membership gate for the ``acp_backend`` kwarg. An unrecognized value would
-# otherwise fall through every ``_is_<backend>`` check and silently spawn
-# kiro-cli, so provider construction rejects it instead.
-ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
+# The ids this build ships a harness for. ``ACP_BACKENDS_KNOWN`` below is these
+# plus the ids an operator's ``harnesses.json`` registered at boot
+# (:mod:`kiro_crew.agent_sdk.backends_registered`).
+ACP_BACKENDS_BUILTIN: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_KIRO,
         ACP_BACKEND_CLAUDE,
@@ -349,6 +351,46 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
         ACP_BACKEND_DEEPSEEK,
     }
 )
+
+#: Ids registered at boot from ``harnesses.json``. Empty at rest, so a fresh
+#: process's known set is exactly :data:`ACP_BACKENDS_BUILTIN`. Written only by
+#: :func:`kiro_crew.agent_sdk.backends_registered.register_known_backend`.
+_registered_known: Set[str] = set()
+
+
+class _KnownBackends(AbstractSet):
+    """A live, read-only set VIEW of ``builtin | registered``.
+
+    Bound once to ``ACP_BACKENDS_KNOWN`` and never rebound, so a ``from ... import
+    ACP_BACKENDS_KNOWN`` binding taken at import time still sees a registration
+    made later at boot. Set algebra (``|``, ``-``, ``&``, ``<=``) comes from the
+    ``collections.abc.Set`` mixin and yields plain frozensets. Unhashable on
+    purpose: its contents change across a registration.
+    """
+
+    __slots__ = ()
+
+    def __contains__(self, item: object) -> bool:
+        return item in ACP_BACKENDS_BUILTIN or item in _registered_known
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(ACP_BACKENDS_BUILTIN | _registered_known)
+
+    def __len__(self) -> int:
+        return len(ACP_BACKENDS_BUILTIN | _registered_known)
+
+    @classmethod
+    def _from_iterable(cls, iterable: Iterable[str]) -> FrozenSet[str]:
+        return frozenset(iterable)
+
+    def __repr__(self) -> str:
+        return f"_KnownBackends({sorted(self)!r})"
+
+
+# Membership gate for the ``acp_backend`` kwarg. An unrecognized value would
+# otherwise fall through every ``_is_<backend>`` check and silently spawn
+# kiro-cli, so provider construction rejects it instead.
+ACP_BACKENDS_KNOWN: AbstractSet[str] = _KnownBackends()
 
 # First-run setup can complete without Kiro CLI only for harnesses explicitly
 # known to launch independently. New adapters opt in after their install and
