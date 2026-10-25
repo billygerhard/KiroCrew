@@ -367,6 +367,13 @@ async def run_gateway(
     # non-standalone profile that cannot compose its companion fails closed.
     boot_platform(cfg)
 
+    # ── Operator backends (harnesses.json) ──
+    # Additive, after the platform booted and before any service binds, so the
+    # first chat already sees a configured default that names an operator id.
+    from kiro_crew.operator_backends import register_operator_backends
+
+    register_operator_backends(cfg)
+
     # ── KAS kiro-cli floor ──
     # A configured KAS on a kiro-cli that cannot select the KAS engine falls back
     # to kiro-cli, with the notice in the log. Scheduled in the background, never
