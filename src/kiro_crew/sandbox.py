@@ -670,6 +670,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         crew_home_visible_spellings,
         effective_sandbox_mode,
         install_root_targets_for,
+        raise_sandbox_mode,
     )
     from kiro_crew.sandbox_unavailable import (  # noqa: F401
         _LAUNCHER_REFUSAL_RE,
