@@ -602,7 +602,7 @@ class AcpProvider(LLMProvider):
         """
         # A harnesses.json backend exists only as a DescriptorHarness on the
         # shared runtime, so it is read through the registry's accessor too.
-        from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+        from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
 
         backend = self._client.backend
         return backend in ACP_BACKENDS_ACP_RUNTIME or is_registered_backend(backend)
@@ -1140,7 +1140,7 @@ def provider_label(provider: Any) -> str:
     if backend in PROVIDER_LABEL_BY_BACKEND:
         return PROVIDER_LABEL_BY_BACKEND[backend]
     # A harnesses.json backend persists under the label it registered with.
-    from kiro_crew.agent_sdk.backends_registered import provider_label_for
+    from kiro_crew.agent_sdk.operator_backend_registry import provider_label_for
 
     return provider_label_for(backend) or PROVIDER_LABEL_DEFAULT
 

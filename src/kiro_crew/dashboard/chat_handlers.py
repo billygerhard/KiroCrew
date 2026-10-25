@@ -1331,7 +1331,7 @@ async def switch_slot_backend(
             # ``""`` and ``"kiro"`` on a Kiro gateway: same backend, so the
             # model is kept and nothing is announced.
             return {"ok": True, "backend": pick, "changed": False}
-        from kiro_crew.agent_sdk.backends_registered import same_session_family
+        from kiro_crew.agent_sdk.operator_backend_registry import same_session_family
 
         family_move = same_session_family(previous, pick)
         if family_move:

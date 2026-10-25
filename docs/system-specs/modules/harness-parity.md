@@ -205,6 +205,15 @@ is one of them, because claude's Side Chat confinement is built by `AcpClient` a
 descriptor runs on `AcpRuntime`. A seat's steer still needs claude's adapter floor
 (`steering_identity.takes_steering_request`).
 
+A descriptor that is not a builtin's clone declares `capabilities` instead: the
+measured names from `DESCRIPTOR_CAPABILITIES` (`crew_tools`, `member_tools`, `steer`,
+`compact`, `effort`, `model_switch`), each admitting it to the one set the runtime
+gate and the card both read. `side_chat_tools` is refused for the same reason
+`ACP_BACKENDS_SIDE_READONLY` is never inherited. Precedence is the explicit list,
+then `capabilities_from`, then inference from `mcp_delivery`: both deliveries pass
+Crew's array on `session/new`, so `crew_tools` holds, and `session_array` (the host
+reads that array) adds `member_tools`.
+
 ### pi: what its own channels can and cannot carry
 
 pi-acp drops the `session/new` MCP array, so pi joins

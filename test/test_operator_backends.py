@@ -17,7 +17,7 @@ from kiro_crew.acp.harness.operator_registry import (
 )
 from kiro_crew.agent_sdk import backend_install
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_KNOWN, selectable_backends
-from kiro_crew.agent_sdk.backends_registered import (
+from kiro_crew.agent_sdk.operator_backend_registry import (
     _reset_registered_backends,
     acp_runtime_backends,
     same_session_family,
@@ -252,7 +252,7 @@ def test_a_client_on_a_seat_switches_model_through_its_advertised_select(registe
     import inspect
 
     from kiro_crew.acp import client_model_selection
-    from kiro_crew.agent_sdk.backends_registered import switches_model_via_config_option
+    from kiro_crew.agent_sdk.operator_backend_registry import switches_model_via_config_option
 
     select = [{"id": "model", "type": "select", "options": []}]
     assert switches_model_via_config_option("seat-a", select)

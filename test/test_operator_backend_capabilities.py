@@ -25,12 +25,12 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_SIDE_READONLY,
     ACP_BACKENDS_STEERING_REQUEST,
 )
-from kiro_crew.agent_sdk.backends_registered import _reset_registered_backends
 from kiro_crew.agent_sdk.capability_inheritance import (
     NOT_INHERITED,
     InheritingSet,
     capability_source,
 )
+from kiro_crew.agent_sdk.operator_backend_registry import _reset_registered_backends
 
 
 def _seat(seat_id: str, executable: str, **over: object) -> dict:
@@ -79,15 +79,13 @@ def seats(load, wrapper):
             "seat-explicit": _seat("seat-explicit", wrapper, capabilities_from="claude"),
             "seat-inferred": _seat("seat-inferred", wrapper),
             "seat-opted-out": _seat("seat-opted-out", wrapper, capabilities_from="none"),
-            "agy": {
-                "id": "agy",
-                "display_name": "Antigravity",
-                "executable": wrapper,
-                "argv": ["{executable}"],
-                "mcp_delivery": "agent_file",
-                "routing": "session_config",
-                "permission_config": {"option": "mode", "value": "default"},
-            },
+            "agy": _agy(
+                "agy", wrapper, capabilities=["crew_tools", "member_tools", "model_switch"]
+            ),
+            "agy-bare": _agy("agy-bare", wrapper),
+            "seat-listed": _seat(
+                "seat-listed", wrapper, capabilities_from="claude", capabilities=["crew_tools"]
+            ),
             "strands": {
                 "id": "strands",
                 "display_name": "Strands",
@@ -101,6 +99,24 @@ def seats(load, wrapper):
             },
         }
     )
+
+
+def _agy(agy_id: str, executable: str, **over: object) -> dict:
+    entry = {
+        "id": agy_id,
+        "display_name": agy_id.title(),
+        "executable": executable,
+        "argv": ["{executable}"],
+        "mcp_delivery": "agent_file",
+        "routing": "session_config",
+        "permission_config": {"option": "mode", "value": "default"},
+    }
+    entry.update(over)
+    return entry
+
+
+def _held(backend: str) -> set[str]:
+    return {line.id for line in card_for(backend).capabilities if line.available}
 
 
 def _lines(backend: str) -> dict[str, bool]:
@@ -157,9 +173,14 @@ def test_side_chat_tools_are_never_inherited(seats):
 def test_the_explicit_field_wins_over_the_family_inference(seats):
     assert capability_source("seat-opted-out") == "seat-opted-out"
     assert "seat-opted-out" not in ACP_BACKENDS_COMPACT
-    lines = _lines("seat-opted-out")
-    assert lines.pop("crew_tools") is True  # its own session_array declaration
-    assert not any(lines.values())
+    # Opted out of claude, it falls to the mcp_delivery inference.
+    assert _held("seat-opted-out") == {"crew_tools", "member_thread_tools"}
+
+
+def test_an_explicit_list_wins_over_capabilities_from(seats):
+    assert capability_source("seat-listed") == "seat-listed"
+    assert _held("seat-listed") == {"crew_tools"}
+    assert "seat-listed" not in ACP_BACKENDS_COMPACT
 
 
 def test_a_capability_source_must_be_a_builtin(load, wrapper):
@@ -168,13 +189,45 @@ def test_a_capability_source_must_be_a_builtin(load, wrapper):
     assert "not a builtin backend" in invalid_operator_harnesses()["bad"][0]
 
 
-def test_other_descriptors_report_only_what_they_declare(seats):
+def test_a_measured_list_admits_exactly_its_runtime_sets(seats):
+    from kiro_crew.agent_sdk.capability_inheritance import declared_capabilities
+
     assert capability_source("agy") == "agy"
-    assert not any(_lines("agy").values())
-    # Strands declared the session array, which the descriptor mirror builds.
-    strands = _lines("strands")
-    assert strands.pop("crew_tools") is True
-    assert not any(strands.values())
+    assert _held("agy") == {"crew_tools", "member_thread_tools", "model_switch"}
+    assert declared_capabilities("agy") == {"crew_tools", "member_tools", "model_switch"}
+    assert "agy" in ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert "agy" in ACP_BACKENDS_MEMBER_DISPATCH
+    assert "agy" in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    assert "agy" not in ACP_BACKENDS_STEERING_REQUEST
+    assert "agy" not in ACP_BACKENDS_COMPACT
+    assert "agy" not in ACP_BACKENDS_SIDE_READONLY
+
+
+def test_a_harness_given_crews_mcp_array_never_reports_zero(seats):
+    # agent_file passes the array through; only session_array declares it is read.
+    assert _held("agy-bare") == {"crew_tools"}
+    assert _held("strands") == {"crew_tools", "member_thread_tools"}
+
+
+@pytest.mark.parametrize(
+    "names, fragment",
+    [
+        (["crew_tools", "telepathy"], "capabilities[1] is not one of"),
+        (["side_chat_tools"], "only the builtin harnesses' own drivers build"),
+        ("crew_tools", "must be an array of strings"),
+    ],
+)
+def test_a_capability_list_is_validated(load, wrapper, names, fragment):
+    ids = load({"bad": _agy("bad", wrapper, capabilities=names)})
+    assert "bad" not in ids
+    # An invalid row is listed by file position, never by its operator-written id.
+    reasons = [r for rows in invalid_operator_harnesses().values() for r in rows]
+    assert any(fragment in reason for reason in reasons), reasons
+
+
+def test_an_empty_list_declares_none(load, wrapper):
+    load({"quiet": _agy("quiet", wrapper, capabilities=[])})
+    assert _held("quiet") == set()
 
 
 def test_enumerating_a_set_still_lists_builtins_only(seats):

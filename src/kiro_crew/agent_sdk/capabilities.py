@@ -197,7 +197,7 @@ def capabilities_for(backend: str) -> SessionCapabilities:
     ``KiroCrewConfig.load()``, where reaching the platform context would re-enter
     the very load that called it.
     """
-    from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+    from kiro_crew.agent_sdk.operator_backend_registry import uses_advertised_model_selection
 
     return SessionCapabilities(
         backend=backend,

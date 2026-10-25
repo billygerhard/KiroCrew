@@ -18,15 +18,52 @@ be rebound after import. Instead each inheritable set is replaced, once, while
 :class:`InheritingSet`: a ``frozenset`` with the same members whose ``in`` also
 answers for an id that inherits from a member. Iteration, equality and set algebra
 are untouched, so every reader that enumerates a set still sees builtins only.
+
+A descriptor that is NOT a builtin's clone (Antigravity, a Strands harness) names
+the capabilities it was measured to support instead, in ``capabilities``: each name
+in :data:`DESCRIPTOR_CAPABILITIES` admits the id to the runtime set that gates that
+behaviour, and the card reads the same set. Side Chat read-only tools are not a name
+a descriptor may claim: the lock-down that makes them safe is built only by the
+builtins' own drivers.
 """
 
 from __future__ import annotations
 
 import sys
-from typing import Dict, Iterable
+from typing import Dict, FrozenSet, Iterable, Set, Tuple
 
 #: Registered id -> the builtin backend id whose capability memberships it takes.
 _capabilities_from: Dict[str, str] = {}
+
+#: A capability name a descriptor may declare -> the runtime sets it joins. Each set
+#: is the one the runtime gate AND the Settings card read for that behaviour.
+DESCRIPTOR_CAPABILITIES: Dict[str, Tuple[str, ...]] = {
+    # Crew's MCP servers on session/new (the card's "Kiro Crew tools" line).
+    "crew_tools": ("ACP_BACKENDS_SESSION_MCP_ARRAY",),
+    # The member session-control server appended to a mate thread's array.
+    "member_tools": ("ACP_BACKENDS_MEMBER_DISPATCH",),
+    # A mid-turn message on ``_session/steering``.
+    "steer": ("ACP_BACKENDS_STEERING_REQUEST",),
+    # ``/compact`` sent as a prompt the harness compacts on.
+    "compact": ("ACP_BACKENDS_COMPACT",),
+    # Effort pushed as an ``effort`` select on ``session/set_config_option``.
+    "effort": ("ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION",),
+    # Model switched as a ``model`` select on ``session/set_config_option``.
+    "model_switch": ("ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION",),
+}
+
+#: Names a descriptor may not claim, with the reason a validation error states.
+REFUSED_DESCRIPTOR_CAPABILITIES: Dict[str, str] = {
+    "side_chat_tools": (
+        "Side Chat read-only tools need a read-only lock-down that only the builtin "
+        "harnesses' own drivers build; a harnesses.json launch path has none"
+    ),
+}
+
+#: ``id(InheritingSet)`` -> registered ids that declared that set's capability.
+_declared_members: Dict[int, Set[str]] = {}
+#: Set name -> its InheritingSet, filled by :func:`make_inheritable`.
+_sets_by_name: Dict[str, "InheritingSet"] = {}
 
 #: Sets that are NOT inherited, each for a reason that is about the builtin's own
 #: launch, sign-in or driver rather than the protocol its adapter speaks.
@@ -57,6 +94,9 @@ class InheritingSet(frozenset):  # type: ignore[type-arg]
     def __contains__(self, item: object) -> bool:
         if frozenset.__contains__(self, item):
             return True
+        declared = _declared_members.get(id(self))
+        if declared and item in declared:
+            return True
         source = _capabilities_from.get(item) if isinstance(item, str) else None
         return source is not None and frozenset.__contains__(self, source)
 
@@ -64,6 +104,28 @@ class InheritingSet(frozenset):  # type: ignore[type-arg]
 def record_capabilities_from(backend_id: str, source: str) -> None:
     """Make *backend_id* answer every inheritable set as *source* does."""
     _capabilities_from[backend_id] = source
+
+
+def record_declared_capabilities(backend_id: str, names: Iterable[str]) -> None:
+    """Admit *backend_id* to the runtime set behind each declared capability name.
+
+    Raises ``KeyError`` for a name outside :data:`DESCRIPTOR_CAPABILITIES`;
+    the descriptor parser has already refused one, so this is a programming error.
+    """
+    targets = [
+        _sets_by_name[set_name] for name in names for set_name in DESCRIPTOR_CAPABILITIES[name]
+    ]
+    for target in targets:
+        _declared_members.setdefault(id(target), set()).add(backend_id)
+
+
+def declared_capabilities(backend: str) -> FrozenSet[str]:
+    """The capability names *backend* holds by declaration (not by inheritance)."""
+    return frozenset(
+        name
+        for name, set_names in DESCRIPTOR_CAPABILITIES.items()
+        if all(backend in _declared_members.get(id(_sets_by_name[n]), ()) for n in set_names)
+    )
 
 
 def capability_source(backend: str) -> str:
@@ -77,8 +139,10 @@ def inherits_capabilities(backend: str) -> bool:
 
 
 def forget_capabilities_from(backend_id: str) -> None:
-    """Drop *backend_id*'s link (registration rollback and tests)."""
+    """Drop *backend_id*'s link and declarations (registration rollback and tests)."""
     _capabilities_from.pop(backend_id, None)
+    for members in _declared_members.values():
+        members.discard(backend_id)
 
 
 def make_inheritable(module_names: Iterable[str]) -> None:
@@ -99,15 +163,21 @@ def make_inheritable(module_names: Iterable[str]) -> None:
             ):
                 wrapped = replaced.setdefault(id(value), InheritingSet(value))
                 setattr(module, name, wrapped)
+                _sets_by_name[name] = wrapped
 
 
 def _reset_capabilities_from() -> None:
-    """TEST-ONLY: forget every link."""
+    """TEST-ONLY: forget every link and declaration."""
     _capabilities_from.clear()
+    _declared_members.clear()
 
 
 __all__ = [
+    "DESCRIPTOR_CAPABILITIES",
     "NOT_INHERITED",
+    "REFUSED_DESCRIPTOR_CAPABILITIES",
+    "declared_capabilities",
+    "record_declared_capabilities",
     "InheritingSet",
     "capability_source",
     "forget_capabilities_from",

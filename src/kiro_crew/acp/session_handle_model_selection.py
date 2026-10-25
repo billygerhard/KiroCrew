@@ -165,7 +165,7 @@ def models_from_config_options(resp: dict[str, Any], backend: str) -> dict[str, 
     per-session path and ``AcpSessionHandle`` on the shared-runtime one -- and a
     second copy is free to disagree about the select's shape.
     """
-    from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+    from kiro_crew.agent_sdk.operator_backend_registry import uses_advertised_model_selection
 
     if not uses_advertised_model_selection(backend):
         return None
@@ -326,7 +326,7 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
         # _bg session the current model IS session/new's served default.
         return
     backend = self._runtime.acp_backend
-    from kiro_crew.agent_sdk.backends_registered import switches_model_via_config_option
+    from kiro_crew.agent_sdk.operator_backend_registry import switches_model_via_config_option
 
     if switches_model_via_config_option(backend, self._config_options):
         # A harness whose adapter judges the model VALUE rather than only the

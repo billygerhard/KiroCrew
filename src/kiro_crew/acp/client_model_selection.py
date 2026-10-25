@@ -49,7 +49,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent import require_unchanged_derived_spec
 from kiro_crew.agent_sdk.backends import effort_config_option_levels, model_refusal_phrase
-from kiro_crew.agent_sdk.backends_registered import switches_model_via_config_option
+from kiro_crew.agent_sdk.operator_backend_registry import switches_model_via_config_option
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 

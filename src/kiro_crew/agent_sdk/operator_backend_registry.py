@@ -28,16 +28,14 @@ import re
 from typing import Any, FrozenSet, Optional, Tuple
 
 from kiro_crew.agent_sdk.backends import (
-    ACP_BACKENDS_KNOWN,
-    POLICY_ID_BY_BACKEND,
-    _registered_known,
-)
-from kiro_crew.agent_sdk.backends_routing import (
     ACP_BACKEND_PERMISSION_CONFIG,
     ACP_BACKEND_ROUTING,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_KNOWN,
+    POLICY_ID_BY_BACKEND,
     Routing,
+    _registered_known,
 )
-from kiro_crew.agent_sdk.backends_sessions import ACP_BACKENDS_ACP_RUNTIME
 
 #: Registered ids served by ``AcpRuntime``. Every descriptor is: ``DescriptorHarness``
 #: exists only on the shared-runtime path. Kept apart from ``_registered_known``
@@ -199,7 +197,7 @@ def uses_advertised_model_selection(backend: str) -> bool:
     import, before any descriptor registers, so membership alone left a
     descriptor's picker offering nothing but ``auto``.
     """
-    from kiro_crew.agent_sdk.backends_models import ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
 
     if backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
         return True
@@ -216,7 +214,7 @@ def switches_model_via_config_option(backend: str, config_options: Any) -> bool:
     seat routed down that request had every model pick refused. The clause claims
     nothing from config: it reads the adapter's own advertisement on this session.
     """
-    from kiro_crew.agent_sdk.backends_models import ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
 
     if backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
         return True

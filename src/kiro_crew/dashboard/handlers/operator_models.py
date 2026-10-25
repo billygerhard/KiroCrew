@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from kiro_crew import model_registry
-from kiro_crew.agent_sdk.backends_registered import registered_model_source
+from kiro_crew.agent_sdk.operator_backend_registry import registered_model_source
 
 if TYPE_CHECKING:
     from aiohttp import web

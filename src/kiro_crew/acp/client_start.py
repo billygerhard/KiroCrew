@@ -97,7 +97,7 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH, launch_for
-from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.executors import subprocess_executor

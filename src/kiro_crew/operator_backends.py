@@ -100,7 +100,7 @@ def register_operator_backends(cfg: "KiroCrewConfig") -> None:
     # Every operator id now registered, including one a config load already
     # registered on first need: the narrowing and re-resolve below still apply.
     try:
-        from kiro_crew.agent_sdk.backends_registered import registered_backend_ids
+        from kiro_crew.agent_sdk.operator_backend_registry import registered_backend_ids
 
         registered = sorted(registered_backend_ids())
     except Exception:

@@ -341,7 +341,7 @@ DEFAULT_ACP_BACKEND = ACP_BACKEND_KAS
 
 # The ids this build ships a harness for. ``ACP_BACKENDS_KNOWN`` below is these
 # plus the ids an operator's ``harnesses.json`` registered at boot
-# (:mod:`kiro_crew.agent_sdk.backends_registered`).
+# (:mod:`kiro_crew.agent_sdk.operator_backend_registry`).
 ACP_BACKENDS_BUILTIN: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -357,7 +357,7 @@ ACP_BACKENDS_BUILTIN: FrozenSet[str] = frozenset(
 
 #: Ids registered at boot from ``harnesses.json``. Empty at rest, so a fresh
 #: process's known set is exactly :data:`ACP_BACKENDS_BUILTIN`. Written only by
-#: :func:`kiro_crew.agent_sdk.backends_registered.register_known_backend`.
+#: :func:`kiro_crew.agent_sdk.operator_backend_registry.register_known_backend`.
 _registered_known: Set[str] = set()
 
 

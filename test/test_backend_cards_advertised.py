@@ -58,6 +58,9 @@ SET_GATE_ALLOWLIST: Dict[Tuple[str, str], int] = {
     ("acp/session_provider.py", "ACP_BACKENDS_STEER"): 1,
     ("acp/steering_identity.py", "ACP_BACKENDS_STEERING_REQUEST"): 1,
     ("agent_sdk/capabilities.py", "ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION"): 1,
+    # Moved, not added: switches_model_via_config_option lived in the set home
+    # (agent_sdk/backends_registered.py) before that registry left the owner namespace.
+    ("agent_sdk/operator_backend_registry.py", "ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION"): 1,
     ("agent_sdk/capabilities.py", "ACP_BACKENDS_KIRO_SLASH_COMMANDS"): 1,
     ("dashboard/chat_turn/deny_chokepoints.py", "ACP_BACKENDS_STEER"): 2,
     ("dashboard/chat_turn/slash_commands.py", "ACP_BACKENDS_COMPACT"): 1,

@@ -367,7 +367,7 @@ def detect_provider_switch(session_map: "SessionMap", session_key: str, new_prov
         return False
     # Two harnesses.json backends that read and write one native session store
     # (the Claude seats) share a family: moving between them is a resume.
-    from kiro_crew.agent_sdk.backends_registered import session_family_for_label
+    from kiro_crew.agent_sdk.operator_backend_registry import session_family_for_label
 
     stored_family = session_family_for_label(stored_provider)
     if stored_family and stored_family == session_family_for_label(new_provider):

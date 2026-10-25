@@ -233,9 +233,6 @@ NOTE_CREW_COMMAND_CHANNEL = "crew_command_channel"
 
 #: The auth declaration, rather than a membership set, decides a line.
 _FROM_AUTH_DECLARATION = "auth_declaration"
-#: Pseudo-set: a ``harnesses.json`` descriptor declaring ``mcp_delivery:
-#: "session_array"``, whose array the descriptor mirror builds on ``session/new``.
-_FROM_DESCRIPTOR_SESSION_ARRAY = "descriptor_session_array"
 
 
 @dataclass(frozen=True)
@@ -272,15 +269,7 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     # NOT: codex is served by the shared runtime for TRANSPORT reasons while reading
     # none of Crew's agent spec, so a line keyed on it would hand codex this claim
     # by the wrong route.
-    # A descriptor that declared the session array gets Crew's servers there too.
-    _LineSpec(
-        LINE_CREW_TOOLS,
-        (
-            "ACP_BACKENDS_SESSION_MCP_ARRAY",
-            "ACP_BACKENDS_KIRO_FAMILY",
-            _FROM_DESCRIPTOR_SESSION_ARRAY,
-        ),
-    ),
+    _LineSpec(LINE_CREW_TOOLS, ("ACP_BACKENDS_SESSION_MCP_ARRAY", "ACP_BACKENDS_KIRO_FAMILY")),
     _LineSpec(LINE_MEMBER_THREAD_TOOLS, ("ACP_BACKENDS_MEMBER_DISPATCH",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
     # Three verbs carry a user's mid-turn message: kiro-cli's ``_session/steer``,
@@ -828,12 +817,6 @@ def _holds(backend: str, spec: _LineSpec) -> bool:
             if declaration_for(backend) is UNKNOWN_AGENT_AUTH:
                 continue
             if signs_in_separately(backend):
-                return True
-            continue
-        if name == _FROM_DESCRIPTOR_SESSION_ARRAY:
-            from kiro_crew.agent_sdk.backends_registered import registered_session_array
-
-            if registered_session_array(backend):
                 return True
             continue
         if backend in _membership(name):

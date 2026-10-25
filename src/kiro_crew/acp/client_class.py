@@ -832,7 +832,7 @@ class AcpClient:
     def _uses_advertised_model_selection(self) -> bool:
         """True when this backend sources its wire model id / seed from the
         provider's advertised list (see ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``)."""
-        from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+        from kiro_crew.agent_sdk.operator_backend_registry import uses_advertised_model_selection
 
         return uses_advertised_model_selection(self.backend)
 
