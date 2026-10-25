@@ -4,6 +4,7 @@ import { useGuidePredicate } from '../guide/guidePredicates'
 import { markComposerResize } from '../utils/composerResize'
 import { ArrowUp, Loader2, RotateCw, Sparkles, Target, CheckCircle, Lock, FolderOpen, ClipboardList, PenLine, MoreHorizontal, Terminal, Clock, X } from 'lucide-react'
 import SketchDialog from './SketchDialog'
+import BackendSelector from './BackendSelector'
 import QuoteCard from '../pages/chat/QuoteCard'
 import CopyBranchButton from './CopyBranchButton'
 import ProjectAwsProfileStatus from './ProjectAwsProfile'
@@ -200,6 +201,9 @@ function ChatInput({
   modelIsJevRouted,
   harnessBackend,
   agentSource,
+  onSelectBackend,
+  backendValue,
+  backendDisabled,
   modelName,
   onAgentClick,
   agentBadge,
@@ -1865,6 +1869,7 @@ function ChatInput({
         (onProjectClick ||
           (sessionOnPeer && !!projectProp) ||
           (onModelClick && modelName) ||
+          !!onSelectBackend ||
           // An app-contributed chip is reason enough to draw the shelf. Without
           // this the chip is silently invisible whenever no other pill happens
           // to be present — the control is declared, mounted and unreachable.
@@ -1980,6 +1985,14 @@ function ChatInput({
           {presence}
           {contextPct != null && (
             <ContextUsageControl contextPct={contextPct} contextUnknown={contextUnknown} contextUsedTokens={contextUsedTokens} contextWindowTokens={contextWindowTokens} derivePctFromUsed={derivePctFromUsed} showContextPct={showContextPct} showContextTokens={showContextTokens} shelfCompact={shelfCompact} modelName={modelName} cacheSlot={sessionOnPeer ? null : activeSlot} ctxPopoverOpen={ctxPopoverOpen} setCtxPopoverOpen={setCtxPopoverOpen} autoCompactThreshold={autoCompactThreshold} />
+          )}
+          {onSelectBackend && (
+            /* Its own separated region, so the chip group beside it stays within
+               `max-two-buttons-per-row`. Locked while a turn runs: a backend is
+               picked between turns. */
+            <div className="flex items-center shrink-0 pr-2 mr-1 border-r border-border">
+              <BackendSelector value={backendValue ?? null} onSelect={onSelectBackend} disabled={backendDisabled} triggerTestId="chat-input-backend-chip" />
+            </div>
           )}
           {onModelClick && modelName && (
             <ModelChip modelName={modelName} harnessBackend={harnessBackend} modelIsJevRouted={modelIsJevRouted} modelIsInheritedDefault={modelIsInheritedDefault} modelIsAutoChosen={modelIsAutoChosen} reasoningEffort={reasoningEffort} effortIsDefault={effortIsDefault} hasEffort={hasEffort} isRunning={isRunning} shelfTiny={shelfTiny} composerControl={composerControl} modelChipPressedFromComposerRef={modelChipPressedFromComposerRef} onModelClick={onModelClick} />

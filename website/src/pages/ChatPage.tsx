@@ -210,6 +210,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // same predicate and same `executor` keying `selectContinuable` uses for Resume.
   const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
   const selectionCapabilitiesQ = useSlotSelectionCapabilitiesQuery(activeSlot)
+  // The chat's own backend pick leads: the live session stays on the old
+  // backend until the next turn starts it on the pick.
+  const modelsBackend = slots.find(s => s.key === activeSlot)?.backend || selectionCapabilitiesQ.data?.models_backend
   // The agent and model rosters the pickers offer.
   const {
     installedAgents, sidebarAgents, sidebarChoices, defaultAgent, effectiveAgents,
@@ -218,7 +221,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     effectiveModels, ownModelsQuery, ownModelsFailed,
   } = useSessionRosters({
     activeSlot, activeSlotProject, refreshTrigger, dispatch,
-    modelsBackend: selectionCapabilitiesQ.data?.models_backend,
+    modelsBackend,
   })
   const {
     selectionCapabilities, hiddenModelsQ, modelPickerConfigured, availableModels, codexPairModels, jevRouteOn, modelDropdown, setModelDropdown, modelFilter, setModelFilter,
@@ -1200,7 +1203,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               defaultAgentFailed={defaultAgentFailed} effectiveAgents={effectiveAgents} filteredAgents={filteredAgents} installedAgents={installedAgents} setAgentDropdown={setAgentDropdown}
               setAgentFilter={setAgentFilter} toggleDefaultAgent={toggleDefaultAgent} codexPairModels={codexPairModels} filteredModels={filteredModels} hiddenModelsQ={hiddenModelsQ}
               ownModelsFailed={ownModelsFailed} ownModelsFetching={ownModelsQuery.isFetching} retryOwnModels={() => { void ownModelsQuery.refetch() }}
-              modelsBackend={selectionCapabilitiesQ.data?.models_backend} ultracode={selectionCapabilitiesQ.data?.ultracode}
+              modelsBackend={modelsBackend} ultracode={selectionCapabilitiesQ.data?.ultracode}
               jevRouteOn={jevRouteOn} modelDropdown={modelDropdown} modelDropdownRef={modelDropdownRef} modelFilter={modelFilter} modelInputRef={modelInputRef}
               modelPickerConfigured={modelPickerConfigured} modelPickerReturnsFocusRef={modelPickerReturnsFocusRef} setModelDropdown={setModelDropdown} setModelFilter={setModelFilter}
               onAgentListKeyDown={onAgentListKeyDown} onModelListKeyDown={onModelListKeyDown} anchorModelBtn={anchorModelBtn} modelBtnRect={modelBtnRect} messageQuote={messageQuote}

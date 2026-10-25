@@ -108,6 +108,10 @@ export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fet
      *  applies from the next message; the running reply keeps its model. */
     chatSlotModel: (slot: string, model: string) =>
       post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string; deferred?: boolean }>,
+    /** Pick the backend this chat runs on (`''` = follow the configured default).
+     *  Applied between turns: the next message starts its session on the pick. */
+    chatSlotBackend: (slot: string, backend: string) =>
+      post('/api/chat/slots/' + encodeURIComponent(slot) + '/backend', { backend }).then(j) as Promise<{ ok?: boolean; backend?: string; changed?: boolean; error?: string }>,
     /** This slot's auto-compact threshold override (null = follows a default:
      *  `agent_pct` when the session's agent declares one, else `global_pct`).
      *  `harness_managed` names the backend when the session compacts on its

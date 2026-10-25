@@ -6559,6 +6559,14 @@
       "job_title": "{{name}} — {{time}} {{tz}}",
       "job_title_paused": "{{name}} (paused) — {{time}} {{tz}}",
       "job_name_paused": "{{name}} (paused)"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Default backend",
+      "backend_list": "Backend list",
+      "backend_list_unavailable": "Backend list unavailable",
+      "no_backends_registered": "No backends registered",
+      "default": "Default"
     }
   },
   "hooks": {

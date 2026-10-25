@@ -311,3 +311,23 @@ def test_first_need_reads_harnesses_json_once_per_home(tmp_path):
         assert operator_backends.ensure_operator_backends_registered() == []
     assert load.call_count == 1
     operator_backends._reset_operator_backends_loaded()
+
+
+def test_a_models_request_may_name_a_selectable_seat(registered):
+    """Upstream's ``GET /api/models?backend=`` reader admits a harnesses.json seat."""
+    from types import SimpleNamespace
+
+    from kiro_crew.crewmate_harness import harness_for_query, models_route
+
+    assert harness_for_query("seat-a") == "seat-a"
+    assert harness_for_query("not-a-backend") is None
+    cfg = SimpleNamespace(agent=SimpleNamespace(acp_backend="", kas_bundle=False))
+    assert models_route(cfg, {"backend": "seat-a"}) == ("seat-a", False)
+    assert models_route(cfg, {"backend": "not-a-backend"}) is None
+
+
+def test_an_acp_backends_row_carries_a_seats_display_name(registered):
+    from kiro_crew.dashboard.handlers.acp_backend_status import _operator_label
+
+    assert _operator_label("seat-a") == "Seat A"
+    assert _operator_label("claude") == ""

@@ -43,6 +43,9 @@ export interface CrewmateHarnessReadout {
 export interface AcpBackendProbe {
   id: string
   policy_id: string
+  /** A harnesses.json backend's display name ("Claude Seat 1"); `''` or absent
+   *  for a builtin, whose name is translated from its id. */
+  label?: string
   selectable: boolean
   /** Explicit gateway capability: this harness can complete setup without Kiro CLI. */
   independent_setup: boolean
