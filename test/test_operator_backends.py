@@ -112,3 +112,20 @@ def test_spawn_backend_resolver_admits_a_seat_and_refuses_a_missing_one(register
 def test_a_builtin_id_keeps_its_own_probe(registered):
     assert backend_install._operator_probe("") is None
     assert backend_install._operator_probe("not-a-backend") is None
+
+
+def test_a_session_array_descriptor_gets_the_descriptor_projection(registered):
+    from kiro_crew.providers.mirrors.descriptor_array import DescriptorArrayProjection
+    from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
+
+    assert has_mirror("seat-a")
+    assert isinstance(mirror_for("seat-a"), DescriptorArrayProjection)
+
+
+def test_an_agent_file_descriptor_is_handed_no_array(registered):
+    from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
+
+    if "no-routing" not in registered:
+        pytest.skip("descriptor without routing was not registered")
+    assert not has_mirror("no-routing")
+    assert mirror_for("no-routing") is None
