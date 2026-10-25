@@ -158,7 +158,9 @@ async def _send_harness_command(message: str, state: DashboardState, slot: _Chat
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     cc_provider = is_claude_code(cfg.agent.provider)
     key = effective_session_key(slot)
-    forwarded = await _forwards_harness_command(state, key, first_word, cc_provider=cc_provider)
+    forwarded = await _forwards_harness_command(
+        state, key, first_word, cc_provider=cc_provider, slot=slot
+    )
     return first_word if forwarded else ""
 
 

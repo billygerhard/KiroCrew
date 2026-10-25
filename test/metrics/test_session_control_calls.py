@@ -446,6 +446,7 @@ class TestRouteOps:
             for verb in (
                 "set-color",
                 "set-note",
+                "set-backend",
                 "revive",
                 "history",
                 "queue",

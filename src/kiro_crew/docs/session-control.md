@@ -12,7 +12,7 @@ owner modules. Two halves:
 
 - **Session control** — `session_create`, `session_fork`, `session_send`,
   `session_read_message`, `session_summary`, `session_queue`, `session_run_queued`, `session_stop`, `session_end_wait`, `session_retry`,
-  `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`,
+  `session_continue`, `session_set_model`, `session_set_backend`, `session_reload`, `session_rename`, `session_generate_title`,
   `session_set_color`, `session_set_note`, `session_close`, `session_revive`, `session_history_list`,
   `session_broadcast`,
   `session_status`, `session_adopt`, `session_handoff`, `session_release`,
@@ -757,6 +757,24 @@ checked. The tool never stops anything itself. To force the change, call
 Also refused: `auto` and `Auto (decision model)` (`model_owner_only`), because with the Jev
 preview on a slot on `auto` hands each turn's model to Jev routing, which only the
 owner may arm; and a read-only relay archive (`relay_archive_read_only`).
+
+### `session_set_backend`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | Slot key, or its `dashboard:<slot>` session key |
+| `backend` | yes | Backend id such as `kiro`, `claude` or `codex`; `""` returns to the gateway default |
+
+Picks the backend a chat runs on, through `POST /api/session-control/set-backend`,
+which runs the same target checks and audit as the other verbs here before the
+switch (`chat_handlers.switch_slot_backend`). The pick is saved with the
+chat. A backend is fixed when a session starts, so the swap happens between
+turns: the chat's next turn resets its session onto the new backend before it
+starts, and a turn already running finishes on the old one. The transcript is
+kept and replayed to the new backend. Thread replies and side-panel turns run
+on the pick too. The backend is checked the way `spawn_run(backend=...)`
+checks it: `unknown_backend`, `backend_not_installed` and
+`backend_restart_required` list the backends that can start.
 
 ### `session_reload`
 

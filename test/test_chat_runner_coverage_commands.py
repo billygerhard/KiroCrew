@@ -26,6 +26,7 @@ from chat_runner_coverage_helpers import (
 )
 from chat_test_helpers import pin_harness_choice
 
+from kiro_crew import members
 from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     STOP_REASON_COMPACTION_FAILED,
@@ -179,7 +180,7 @@ class TestRunChatLocalCommands:
         with (
             patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
             patch.object(
-                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+                members, "select_provider_backend", wraps=members.select_provider_backend
             ) as select_backend,
         ):
             await _drive(state, slot, "/todos")
@@ -599,7 +600,7 @@ class TestRunChatLocalCommands:
         with (
             patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
             patch.object(
-                chat_runner, "select_provider_backend", wraps=chat_runner.select_provider_backend
+                members, "select_provider_backend", wraps=members.select_provider_backend
             ) as select_backend,
         ):
             await _drive(state, slot, "/todos")
