@@ -41,7 +41,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_PI,
     ACP_BACKEND_STRANDS,
 )
-from kiro_crew.agent_sdk.backends_registered import (
+from kiro_crew.agent_sdk.operator_backend_registry import (
     is_registered_backend,
     registered_session_array,
 )

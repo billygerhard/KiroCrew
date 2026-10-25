@@ -27,20 +27,26 @@ them:
   built by token-wise substitution. Nothing here concatenates a command line,
   quotes an argument, or consults a shell, so an operator-supplied executable,
   agent name, or model id can never become shell syntax.
-- **No capability claims of its own.** A descriptor cannot grant its harness a
-  session-path capability. Every ``ACP_BACKENDS_*`` membership set in
-  ``kiro_crew.agent_sdk.backends`` is a frozen, code-reviewed literal, and a
-  registered id is a member of none of them, so a config-authored host carries
-  the DEFAULT posture at every gate (no ``session/new`` MCP array, no
-  harness-owned resume, no model switch over ``set_config_option``, no
-  advertised-list model resolution). A ``capabilities`` key is refused as unknown.
-  The one exception is ``capabilities_from``: a wrapper around a BUILTIN's own
-  adapter (a Claude seat is claude-agent-acp with another ``CLAUDE_CONFIG_DIR``)
-  names that builtin and answers its code-reviewed memberships, minus the launch,
-  sign-in and driver-only sets in
-  :data:`kiro_crew.agent_sdk.capability_inheritance.NOT_INHERITED`. It names a set
-  of facts already reviewed for that adapter, never a new one. Absent, a
-  ``session_family`` of ``claude-code`` implies ``claude``; ``"none"`` opts out.
+- **Capability claims are bounded and named.** Every ``ACP_BACKENDS_*``
+  membership set in ``kiro_crew.agent_sdk.backends`` is a code-reviewed literal,
+  and a registered id joins one only through one of three declarations, in this
+  order of precedence:
+
+  1. ``capabilities``: the measured list, each name from
+     :data:`kiro_crew.agent_sdk.capability_inheritance.DESCRIPTOR_CAPABILITIES`
+     (``crew_tools``, ``member_tools``, ``steer``, ``compact``, ``effort``,
+     ``model_switch``). A name admits the id to the ONE set the runtime gate and
+     the card both read. ``side_chat_tools`` is refused: only a builtin's own
+     driver builds the read-only lock-down behind it.
+  2. ``capabilities_from``: a wrapper around a BUILTIN's own adapter (a Claude
+     seat is claude-agent-acp with another ``CLAUDE_CONFIG_DIR``) takes that
+     builtin's memberships, minus the launch, sign-in and driver-only sets in
+     :data:`kiro_crew.agent_sdk.capability_inheritance.NOT_INHERITED`. Absent, a
+     ``session_family`` of ``claude-code`` implies ``claude``; ``"none"`` opts out.
+  3. Inference from ``mcp_delivery``: every descriptor receives Crew's MCP array
+     on ``session/new`` (``agent_file`` passes it through, ``session_array``
+     narrows it), so ``crew_tools`` holds; ``session_array`` also declares the host
+     reads that array, so ``member_tools`` holds too.
 - **Selectability is opt-in through routing.** A descriptor is registered as
   *known* whenever it validates, but it is only *selectable* — offered as a
   session backend — when it declares how permission routing is delivered (see
@@ -211,6 +217,7 @@ DESCRIPTOR_KEYS: frozenset[str] = frozenset(
         "min_sandbox",
         "session_family",
         "capabilities_from",
+        "capabilities",
     }
 )
 
@@ -274,6 +281,9 @@ class HarnessDescriptor:
     #: launcher runs, so its capability memberships apply here. Empty means
     #: inferred from ``session_family``; ``none`` means no inheritance.
     capabilities_from: str = ""
+    #: The measured capability names (see the module docstring). ``None`` means
+    #: not declared; an empty tuple is a declaration of none.
+    capabilities: tuple[str, ...] | None = None
 
     @property
     def label(self) -> str:
@@ -584,6 +594,27 @@ def _permission_config_from_mapping(
     return PermissionConfig(option=option, value=value), []
 
 
+def _capability_reasons(prefix: str, names: tuple[str, ...]) -> list[str]:
+    """Why each declared capability name is not one a descriptor may claim."""
+    from kiro_crew.agent_sdk.capability_inheritance import (
+        DESCRIPTOR_CAPABILITIES,
+        REFUSED_DESCRIPTOR_CAPABILITIES,
+    )
+
+    reasons = []
+    for index, name in enumerate(names):
+        if name in REFUSED_DESCRIPTOR_CAPABILITIES:
+            reasons.append(
+                f"{prefix}capabilities[{index}] {name!r} cannot be declared: "
+                f"{REFUSED_DESCRIPTOR_CAPABILITIES[name]}"
+            )
+        elif name not in DESCRIPTOR_CAPABILITIES:
+            allowed = ", ".join(sorted(DESCRIPTOR_CAPABILITIES))
+            # By position, not content: the value is operator text.
+            reasons.append(f"{prefix}capabilities[{index}] is not one of: {allowed}")
+    return reasons
+
+
 def _string_tuple(prefix: str, key: str, raw: Any) -> tuple[tuple[str, ...], list[str]]:
     """Coerce a JSON array of strings to a tuple, reporting the shape instead
     of guessing.
@@ -697,6 +728,11 @@ def descriptor_from_mapping(
     reasons += from_reasons
     if capabilities_from and not re.fullmatch(r"[a-z0-9-]{1,32}", capabilities_from):
         reasons.append(f"{prefix}capabilities_from must match [a-z0-9-]{{1,32}}")
+    capabilities: tuple[str, ...] | None = None
+    if raw.get("capabilities") is not None:
+        capabilities, cap_reasons = _string_tuple(prefix, "capabilities", raw.get("capabilities"))
+        reasons += cap_reasons
+        reasons += _capability_reasons(prefix, capabilities)
 
     descriptor = HarnessDescriptor(
         id=declared_id,
@@ -713,6 +749,7 @@ def descriptor_from_mapping(
         min_sandbox=min_sandbox,
         session_family=session_family,
         capabilities_from=capabilities_from,
+        capabilities=capabilities,
     )
     reasons += validate_descriptor(descriptor, taken_ids=taken_ids, position=position)
     if reasons:

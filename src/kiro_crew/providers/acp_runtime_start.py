@@ -55,7 +55,7 @@ from kiro_crew.acp.transport_errors import AcpDelegateLaunchFailed
 from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKENDS_HARNESS_OWNED_SESSIONS
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import model_registry_namespace
-from kiro_crew.agent_sdk.backends_registered import is_registered_backend
+from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
 from kiro_crew.agent_sdk.tool_gate import (
     ADAPTER_EXPOSED_CREDENTIAL_LEAVES,
     adapter_expose_files,

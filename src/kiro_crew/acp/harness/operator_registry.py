@@ -30,14 +30,16 @@ from kiro_crew.acp.harness.descriptor import (
     HarnessDescriptor,
     load_operator_descriptors,
 )
-from kiro_crew.agent_sdk.backends import register_selectable_backend
-from kiro_crew.agent_sdk.backends_registered import (
+from kiro_crew.agent_sdk.backends import Routing, register_selectable_backend
+from kiro_crew.agent_sdk.capability_inheritance import (
+    record_capabilities_from,
+    record_declared_capabilities,
+)
+from kiro_crew.agent_sdk.operator_backend_registry import (
     is_registered_backend,
     provider_label_for,
     register_known_backend,
 )
-from kiro_crew.agent_sdk.backends_routing import Routing
-from kiro_crew.agent_sdk.capability_inheritance import record_capabilities_from
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,7 @@ def _label_taken(label: str) -> bool:
     two backends sharing one would file each other's sessions.
     """
     from kiro_crew.acp.types import PROVIDER_LABEL_BY_BACKEND
-    from kiro_crew.agent_sdk.backends_registered import registered_backend_ids
+    from kiro_crew.agent_sdk.operator_backend_registry import registered_backend_ids
 
     if label in PROVIDER_LABEL_BY_BACKEND.values():
         return True
@@ -99,6 +101,29 @@ def capability_source_for(descriptor: HarnessDescriptor) -> tuple[str, str]:
             f"build ships (e.g. claude) or {CAPABILITIES_FROM_NONE!r}"
         )
     return source, ""
+
+
+def inferred_capabilities(descriptor: HarnessDescriptor) -> tuple[str, ...]:
+    """The capability names a descriptor's ``mcp_delivery`` alone establishes.
+
+    Both deliveries hand the host Crew's MCP array on ``session/new``: ``agent_file``
+    passes it through, ``session_array`` narrows it to advertised transports. Only
+    ``session_array`` also declares the host READS that array, which is where the
+    member session-control server is appended.
+    """
+    if descriptor.mcp_delivery == MCP_DELIVERY_SESSION_ARRAY:
+        return ("crew_tools", "member_tools")
+    return ("crew_tools",)
+
+
+def _record_capabilities(descriptor: HarnessDescriptor, capability_source: str) -> None:
+    """Apply the first of: the explicit list, ``capabilities_from``, the delivery inference."""
+    if descriptor.capabilities is not None:
+        record_declared_capabilities(descriptor.id, descriptor.capabilities)
+    elif capability_source:
+        record_capabilities_from(descriptor.id, capability_source)
+    else:
+        record_declared_capabilities(descriptor.id, inferred_capabilities(descriptor))
 
 
 def load_and_register_operator_descriptors(*, path=None) -> list[str]:
@@ -147,8 +172,7 @@ def load_and_register_operator_descriptors(*, path=None) -> list[str]:
                 session_array=descriptor.mcp_delivery == MCP_DELIVERY_SESSION_ARRAY,
             )
             register_operator_harness(descriptor)
-            if capability_source:
-                record_capabilities_from(backend_id, capability_source)
+            _record_capabilities(descriptor, capability_source)
         except ValueError as exc:
             logger.warning("operator harness %r could not be registered: %s", backend_id, exc)
             _INVALID[backend_id] = [f"could not be registered: {exc}"]
@@ -196,6 +220,7 @@ def _reset_operator_diagnostics() -> None:
 __all__ = [
     "CAPABILITIES_FROM_NONE",
     "capability_source_for",
+    "inferred_capabilities",
     "invalid_operator_harnesses",
     "load_and_register_operator_descriptors",
     "registered_operator_descriptor",
