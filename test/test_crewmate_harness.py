@@ -472,7 +472,9 @@ class TestEveryCallerPassesThePin:
                         and isinstance(test.comparators[0], ast.Constant)
                         and test.comparators[0].value is None
                     ), where
-        assert calls >= 9, "the scan found too few callers to be looking at the source"
+        # The dashboard chat callers share ``chat_runner.slot_backend``, which
+        # carries the chat's backend pick, so they count once.
+        assert calls >= 7, "the scan found too few callers to be looking at the source"
         assert missing == []
         # H17: the pin reaches the gate only as the pre-gate check's own result,
         # evaluated in the call's arguments, so an unstartable pin has already
