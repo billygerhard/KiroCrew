@@ -37,6 +37,7 @@ from kiro_crew.agent_sdk.backends_registered import (
     register_known_backend,
 )
 from kiro_crew.agent_sdk.backends_routing import Routing
+from kiro_crew.agent_sdk.capability_inheritance import record_capabilities_from
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,37 @@ def _label_taken(label: str) -> bool:
     return any(provider_label_for(b) == label for b in registered_backend_ids())
 
 
+#: ``capabilities_from`` value that opts a descriptor out of any inheritance.
+CAPABILITIES_FROM_NONE = "none"
+
+#: ``session_family`` -> the builtin whose adapter owns that native session store.
+#: A descriptor sharing claude's store is claude-agent-acp, so it needs no
+#: ``capabilities_from`` written by hand.
+_FAMILY_CAPABILITY_SOURCE = {"claude-code": "claude"}
+
+
+def capability_source_for(descriptor: HarnessDescriptor) -> tuple[str, str]:
+    """``(builtin id, "")`` the descriptor inherits from, ``("", "")`` for none, or ``("", reason)``.
+
+    The explicit ``capabilities_from`` wins over the ``session_family`` inference.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_BUILTIN, backend_from_stored
+
+    declared = descriptor.capabilities_from
+    if declared == CAPABILITIES_FROM_NONE:
+        return "", ""
+    value = declared or _FAMILY_CAPABILITY_SOURCE.get(descriptor.session_family, "")
+    if not value:
+        return "", ""
+    source = backend_from_stored(value)
+    if not isinstance(source, str) or source not in ACP_BACKENDS_BUILTIN:
+        return "", (
+            f"capabilities_from {value!r} is not a builtin backend; name one this "
+            f"build ships (e.g. claude) or {CAPABILITIES_FROM_NONE!r}"
+        )
+    return source, ""
+
+
 def load_and_register_operator_descriptors(*, path=None) -> list[str]:
     """Read ``harnesses.json`` and register every valid descriptor. Returns the ids registered.
 
@@ -89,6 +121,10 @@ def load_and_register_operator_descriptors(*, path=None) -> list[str]:
                 "display_name is already the provider label of another backend; "
                 "sessions are persisted by label, so two backends cannot share one"
             ]
+            continue
+        capability_source, source_reason = capability_source_for(descriptor)
+        if source_reason:
+            _INVALID[backend_id] = [source_reason]
             continue
         routing = _routing_enum_for(descriptor)
         permission_config = None
@@ -111,6 +147,8 @@ def load_and_register_operator_descriptors(*, path=None) -> list[str]:
                 session_array=descriptor.mcp_delivery == MCP_DELIVERY_SESSION_ARRAY,
             )
             register_operator_harness(descriptor)
+            if capability_source:
+                record_capabilities_from(backend_id, capability_source)
         except ValueError as exc:
             logger.warning("operator harness %r could not be registered: %s", backend_id, exc)
             _INVALID[backend_id] = [f"could not be registered: {exc}"]
@@ -156,6 +194,8 @@ def _reset_operator_diagnostics() -> None:
 
 
 __all__ = [
+    "CAPABILITIES_FROM_NONE",
+    "capability_source_for",
     "invalid_operator_harnesses",
     "load_and_register_operator_descriptors",
     "registered_operator_descriptor",

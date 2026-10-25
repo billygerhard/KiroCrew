@@ -192,6 +192,19 @@ Where new work goes:
 - A new owner is also listed in `VOCABULARY_PATHS` and imported at the foot of
   `agent_sdk/backends.py`; `test_harness_parity.py` pins the two lists equal.
 
+A `harnesses.json` backend that launches a builtin's own adapter (a Claude seat is
+claude-agent-acp with its own `CLAUDE_CONFIG_DIR`) declares `capabilities_from` that
+builtin; a `session_family` of `claude-code` implies `claude`, and `"none"` opts out.
+At the foot of `agent_sdk/backends.py`, `agent_sdk/capability_inheritance.py`
+replaces each set with an `InheritingSet`: the same members, with an `in` that also
+admits an id inheriting from a member. This is still H6 opt-in: the operator names a
+builtin whose memberships were reviewed for that adapter, and no set gains a member
+by enumeration. Sets about launch, sign-in, or a confinement only the builtin's own
+driver builds are listed in `NOT_INHERITED` and answer by id. `ACP_BACKENDS_SIDE_READONLY`
+is one of them, because claude's Side Chat confinement is built by `AcpClient` and a
+descriptor runs on `AcpRuntime`. A seat's steer still needs claude's adapter floor
+(`steering_identity.takes_steering_request`).
+
 ### pi: what its own channels can and cannot carry
 
 pi-acp drops the `session/new` MCP array, so pi joins

@@ -167,6 +167,24 @@ def _operator_label(backend: str) -> str:
     return provider_label_for(backend) if is_registered_backend(backend) else ""
 
 
+#: The sign-in note for a harnesses.json launcher of claude-agent-acp: it signs in
+#: like Claude Code, but in the config home its own launcher sets.
+_CLAUDE_LAUNCHER_REMEDY = (
+    "Signs in like Claude Code, in the CLAUDE_CONFIG_DIR its launcher sets "
+    "(run claude /login with that folder), then start a new chat."
+)
+
+
+def _sign_in_remedy(backend: str, declared: str) -> str:
+    """*declared*, or the launcher note for a backend inheriting claude's capabilities."""
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
+    from kiro_crew.agent_sdk.capability_inheritance import capability_source, inherits_capabilities
+
+    if inherits_capabilities(backend) and capability_source(backend) == ACP_BACKEND_CLAUDE:
+        return _CLAUDE_LAUNCHER_REMEDY
+    return declared
+
+
 def _row(state: Any, selectable: set) -> Dict[str, Any]:
     """One backend's wire row, from its install state and the selectable set.
 
@@ -223,7 +241,7 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
         # identifier has no frontend reader and is not sent -- a field can
         # return with its first consumer.
         "auth": {
-            "sign_in_remedy": auth.sign_in_remedy,
+            "sign_in_remedy": _sign_in_remedy(state.backend, auth.sign_in_remedy),
             "signs_in_separately": signs_in_separately(state.backend),
         },
         # The card. Every line is keyed by a machine id whose LABEL is the

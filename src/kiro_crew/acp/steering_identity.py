@@ -17,6 +17,8 @@ from kiro_crew.acp.client_claude_session import (
     _adapter_version_at_least,
 )
 from kiro_crew.acp.types import ACP_BACKENDS_STEERING_REQUEST
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
+from kiro_crew.agent_sdk.capability_inheritance import capability_source, inherits_capabilities
 
 #: ``agentInfo.name`` claude-agent-acp reports at ``initialize`` (its package name).
 CLAUDE_ACP_AGENT_NAME = "@agentclientprotocol/claude-agent-acp"
@@ -40,8 +42,17 @@ def claude_steering_ready(runtime: Any) -> bool:
 
 
 def takes_steering_request(runtime: Any) -> bool:
-    """Whether a user steer on *runtime* travels on ``_session/steering``."""
-    return runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST or claude_steering_ready(runtime)
+    """Whether a user steer on *runtime* travels on ``_session/steering``.
+
+    A seat that inherits claude's memberships (``capabilities_from``) is in the
+    table by inheritance, but claude's own steer is gated on the adapter's version
+    and its advertisement, so the seat is held to the same check here.
+    """
+    backend = runtime.acp_backend
+    if isinstance(backend, str) and inherits_capabilities(backend):
+        if capability_source(backend) == ACP_BACKEND_CLAUDE:
+            return claude_steering_ready(runtime)
+    return backend in ACP_BACKENDS_STEERING_REQUEST or claude_steering_ready(runtime)
 
 
 def steering_request_meta(runtime: Any) -> dict[str, Any] | None:

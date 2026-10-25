@@ -931,7 +931,7 @@ export function AgentBackendTab() {
    *
    * KIRO is always named by the shared helper, before the policy-id fallback.
    */
-  const nameOf = (value: string): string => acpBackendName({ id: value, policy_id: probe(value)?.policy_id })
+  const nameOf = (value: string): string => acpBackendName({ id: value, policy_id: probe(value)?.policy_id, label: probe(value)?.label })
 
   /** The harness's own brand mark, or the generic one for an agent with none here. */
   const iconOf = (value: string): React.ReactNode => <HarnessLogo id={value} size={14} />

@@ -963,3 +963,21 @@ from kiro_crew.agent_sdk.backends_turns import (  # noqa: E402,F401 - re-exporte
     ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR,
     ACP_BACKENDS_UNMARKED_COMPACTION_PAIR,
 )
+
+# A harnesses.json backend may declare ``capabilities_from`` a builtin, so every
+# inheritable set answers ``in`` for it as for that builtin. Done here, after the
+# owners loaded and before any other module imports a set from them.
+from kiro_crew.agent_sdk.capability_inheritance import make_inheritable  # noqa: E402
+
+make_inheritable(
+    (
+        __name__,
+        "kiro_crew.agent_sdk.backends_launch",
+        "kiro_crew.agent_sdk.backends_mcp",
+        "kiro_crew.agent_sdk.backends_members",
+        "kiro_crew.agent_sdk.backends_models",
+        "kiro_crew.agent_sdk.backends_routing",
+        "kiro_crew.agent_sdk.backends_sessions",
+        "kiro_crew.agent_sdk.backends_turns",
+    )
+)

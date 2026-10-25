@@ -167,7 +167,7 @@ own -- the same shape, and for the same reason, as
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Mapping, Tuple
+from typing import AbstractSet, Dict, Mapping, Tuple
 
 from kiro_crew.agent_sdk import backends
 from kiro_crew.agent_sdk.backend_mcp_ability import ability_payload
@@ -233,6 +233,9 @@ NOTE_CREW_COMMAND_CHANNEL = "crew_command_channel"
 
 #: The auth declaration, rather than a membership set, decides a line.
 _FROM_AUTH_DECLARATION = "auth_declaration"
+#: Pseudo-set: a ``harnesses.json`` descriptor declaring ``mcp_delivery:
+#: "session_array"``, whose array the descriptor mirror builds on ``session/new``.
+_FROM_DESCRIPTOR_SESSION_ARRAY = "descriptor_session_array"
 
 
 @dataclass(frozen=True)
@@ -269,7 +272,15 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     # NOT: codex is served by the shared runtime for TRANSPORT reasons while reading
     # none of Crew's agent spec, so a line keyed on it would hand codex this claim
     # by the wrong route.
-    _LineSpec(LINE_CREW_TOOLS, ("ACP_BACKENDS_SESSION_MCP_ARRAY", "ACP_BACKENDS_KIRO_FAMILY")),
+    # A descriptor that declared the session array gets Crew's servers there too.
+    _LineSpec(
+        LINE_CREW_TOOLS,
+        (
+            "ACP_BACKENDS_SESSION_MCP_ARRAY",
+            "ACP_BACKENDS_KIRO_FAMILY",
+            _FROM_DESCRIPTOR_SESSION_ARRAY,
+        ),
+    ),
     _LineSpec(LINE_MEMBER_THREAD_TOOLS, ("ACP_BACKENDS_MEMBER_DISPATCH",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
     # Three verbs carry a user's mid-turn message: kiro-cli's ``_session/steer``,
@@ -360,6 +371,11 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_BUILTIN": (
+        "which ids this build ships a harness class for, as against ids a "
+        "harnesses.json file registered. An identity floor like ACP_BACKENDS_KNOWN, "
+        "not a capability: both kinds of harness get a complete card"
+    ),
     "ACP_BACKENDS_MATE_WORKER_KIT": (
         "whether a crewmate's worker may run here with its kit. A worker always runs "
         "on its crewmate's backend, so the choice it depends on is the member "
@@ -764,14 +780,18 @@ class BackendCard:
     offered_by_build: bool
 
 
-def _membership(name: str) -> FrozenSet[str]:
+def _membership(name: str) -> AbstractSet[str]:
     """The vocabulary module's set called *name*.
 
     Resolved by name, and read through the module on every call, for the two
     reasons the module docstring gives. A name no set answers to raises here
-    rather than quietly reading as "no harness has this".
+    rather than quietly reading as "no harness has this". Returned as the object
+    itself, never a copy: a copy would drop the ``capabilities_from`` answer an
+    :class:`~kiro_crew.agent_sdk.capability_inheritance.InheritingSet` gives, and the
+    card would then disagree with the runtime gate reading the same set.
     """
-    return frozenset(getattr(backends, name))
+    members: AbstractSet[str] = getattr(backends, name)
+    return members
 
 
 def _policy_id(backend: str) -> str:
@@ -808,6 +828,12 @@ def _holds(backend: str, spec: _LineSpec) -> bool:
             if declaration_for(backend) is UNKNOWN_AGENT_AUTH:
                 continue
             if signs_in_separately(backend):
+                return True
+            continue
+        if name == _FROM_DESCRIPTOR_SESSION_ARRAY:
+            from kiro_crew.agent_sdk.backends_registered import registered_session_array
+
+            if registered_session_array(backend):
                 return True
             continue
         if backend in _membership(name):

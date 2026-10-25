@@ -54,8 +54,6 @@ SET_GATE_ALLOWLIST: Dict[Tuple[str, str], int] = {
     ("acp/client_turn_control.py", "ACP_BACKENDS_STEER_CONCURRENT_PROMPT"): 1,
     ("acp/runtime_session_setup.py", "ACP_BACKENDS_SESSION_MCP_ARRAY"): 1,
     ("acp/session_handle_class.py", "ACP_BACKENDS_STEER"): 2,
-    ("acp/session_handle_class.py", "ACP_BACKENDS_STEERING_REQUEST"): 2,
-    ("acp/session_handle_steering.py", "ACP_BACKENDS_STEERING_REQUEST"): 2,
     ("acp/session_provider.py", "ACP_BACKENDS_COMPACT"): 2,
     ("acp/session_provider.py", "ACP_BACKENDS_STEER"): 1,
     ("acp/steering_identity.py", "ACP_BACKENDS_STEERING_REQUEST"): 1,

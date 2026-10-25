@@ -256,7 +256,12 @@ def test_a_client_on_a_seat_switches_model_through_its_advertised_select(registe
 
     select = [{"id": "model", "type": "select", "options": []}]
     assert switches_model_via_config_option("seat-a", select)
-    assert not switches_model_via_config_option("seat-a", [])
+    # A claude-code seat inherits claude's membership, so it switches by config
+    # option before its session has advertised the select; one with no source
+    # still waits for the advertisement.
+    assert switches_model_via_config_option("seat-a", [])
+    assert switches_model_via_config_option("no-routing", select)
+    assert not switches_model_via_config_option("no-routing", [])
     assert not switches_model_via_config_option("kiro", select)
     for fn in (client_model_selection.set_model, client_model_selection._apply_startup_model):
         assert "switches_model_via_config_option(" in inspect.getsource(fn), fn.__name__

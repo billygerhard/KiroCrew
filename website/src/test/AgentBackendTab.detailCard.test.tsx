@@ -1014,3 +1014,28 @@ describe('AgentBackendTab new backend', () => {
     )
   })
 })
+
+/**
+ * A harnesses.json backend sends its own display name as `label`, and the card
+ * names it by that rather than by its id (a Claude seat is "Claude Seat 1", not
+ * `claude-seat1`).
+ */
+describe('AgentBackendTab operator backend name', () => {
+  it('titles the card with the display name the server sends', async () => {
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('kiro', card()),
+        probeRow('claude-seat1', { label: 'Claude Seat 1', ...card() }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['kiro', 'claude-seat1']))
+    wrap()
+
+    await waitFor(() => expect(row('Claude Seat 1')).toBeInTheDocument())
+    highlight('Claude Seat 1')
+    await waitFor(() =>
+      expect(screen.getByText('Claude Seat 1 supports 1 of 2 features')).toBeInTheDocument(),
+    )
+    expect(screen.queryByText(/claude-seat1 supports/)).toBeNull()
+  })
+})
