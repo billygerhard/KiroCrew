@@ -11889,6 +11889,14 @@
       "discarded_many": "Bozza scartata. Restano {{count}} bozze messe da parte.",
       "discarded_one": "Bozza scartata. Resta {{count}} bozza messa da parte.",
       "discarded_other": "Bozza scartata. Restano {{count}} bozze messe da parte."
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Backend predefinito",
+      "backend_list": "Elenco backend",
+      "backend_list_unavailable": "Elenco backend non disponibile",
+      "no_backends_registered": "Nessun backend registrato",
+      "default": "Predefinito"
     }
   },
   "hooks": {

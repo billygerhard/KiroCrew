@@ -11889,6 +11889,14 @@
       "discarded_many": "Brouillon supprimé. {{count}} brouillons restent mis de côté.",
       "discarded_one": "Brouillon supprimé. {{count}} brouillon reste mis de côté.",
       "discarded_other": "Brouillon supprimé. {{count}} brouillons restent mis de côté."
+    },
+    "backendSelector": {
+      "backend_name": "Backend : {{name}}",
+      "default_backend": "Backend par défaut",
+      "backend_list": "Liste des backends",
+      "backend_list_unavailable": "Liste des backends indisponible",
+      "no_backends_registered": "Aucun backend enregistré",
+      "default": "Par défaut"
     }
   },
   "hooks": {

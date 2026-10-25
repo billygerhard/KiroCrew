@@ -11349,6 +11349,14 @@
       "discard_failed": "초안을 삭제하지 못했습니다. 브라우저 저장소를 사용할 수 없습니다. 초안은 그대로 보관되어 있습니다.",
       "undo_failed": "초안을 다시 보관하지 못했습니다. 보관함이 가득 찼거나 브라우저 저장소를 사용할 수 없습니다.",
       "discarded_other": "보관한 초안을 삭제했습니다. {{count}}개가 남아 있습니다."
+    },
+    "backendSelector": {
+      "backend_name": "백엔드: {{name}}",
+      "default_backend": "기본 백엔드",
+      "backend_list": "백엔드 목록",
+      "backend_list_unavailable": "백엔드 목록을 사용할 수 없음",
+      "no_backends_registered": "등록된 백엔드 없음",
+      "default": "기본값"
     }
   },
   "hooks": {

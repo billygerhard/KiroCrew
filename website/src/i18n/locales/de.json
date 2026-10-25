@@ -11619,6 +11619,14 @@
       "undo_failed": "Der Entwurf konnte nicht zurückgelegt werden: Es ist kein Platz mehr oder der Browser-Speicher ist nicht verfügbar.",
       "discarded_one": "Zurückgelegter Entwurf verworfen. {{count}} Entwurf ist noch zurückgelegt.",
       "discarded_other": "Zurückgelegter Entwurf verworfen. {{count}} Entwürfe sind noch zurückgelegt."
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Standard-Backend",
+      "backend_list": "Backend-Liste",
+      "backend_list_unavailable": "Backend-Liste nicht verfügbar",
+      "no_backends_registered": "Keine Backends registriert",
+      "default": "Standard"
     }
   },
   "hooks": {

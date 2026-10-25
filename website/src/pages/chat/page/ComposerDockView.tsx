@@ -78,6 +78,7 @@ import { acpBackendName } from '../../../api/acpBackend'
 import { fmtDateFields, fmtNumber } from '../../../i18n/format'
 import { useSlotRunsHere } from '../../../components/sessionEnvironmentHooks'
 import { stagedProjectTurnKey } from '../../../components/chat-input/stagedProject'
+import { useComposerBackendPick } from './backendPick'
 
 /**
  * The main composer, with its callback props held at stable identities. This
@@ -404,6 +405,7 @@ export default function ComposerDockView({
   // keyboard, a screen reader and a touch reader all reach it, not only a mouse
   // hovering the title. It says, while a reply runs, when the chip works again.
   const crewModeNote = crewModeOffered && crewModeBusy ? i18nT('components.crewMode.chip_hint_busy') : null
+  const backendPick = useComposerBackendPick({ activeSlot, currentSlot, slotRunning, dispatch })
   return (
     <>
             {/* Composer dock. Floats over the bottom of the transcript scroller
@@ -739,6 +741,9 @@ export default function ComposerDockView({
               // session exactly when the picker shows a same-name pair.
               agentMemory={sessionMemoryTag(currentSlot?.agent, currentSlot?.agent_kind, defaultAgent, effectiveAgents)}
               agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
+              backendValue={backendPick.backendValue}
+              onSelectBackend={backendPick.onSelectBackend}
+              backendDisabled={backendPick.backendDisabled}
               modelName={shownModel}
               modelIsInheritedDefault={modelMarker === 'default'}
               modelIsAutoChosen={modelMarker === 'auto'}

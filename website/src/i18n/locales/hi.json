@@ -11619,6 +11619,14 @@
       "undo_failed": "ड्राफ़्ट फिर से अलग नहीं रखा जा सका: जगह नहीं है या ब्राउज़र स्टोरेज उपलब्ध नहीं है।",
       "discarded_one": "अलग रखा ड्राफ़्ट हटा दिया गया। {{count}} ड्राफ़्ट अभी भी अलग रखा है।",
       "discarded_other": "अलग रखा ड्राफ़्ट हटा दिया गया। {{count}} ड्राफ़्ट अभी भी अलग रखे हैं।"
+    },
+    "backendSelector": {
+      "backend_name": "बैकएंड: {{name}}",
+      "default_backend": "डिफ़ॉल्ट बैकएंड",
+      "backend_list": "बैकएंड सूची",
+      "backend_list_unavailable": "बैकएंड सूची अनुपलब्ध",
+      "no_backends_registered": "कोई बैकएंड पंजीकृत नहीं",
+      "default": "डिफ़ॉल्ट"
     }
   },
   "hooks": {

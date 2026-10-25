@@ -12159,6 +12159,14 @@
       "discarded_many": "Отложенный черновик удалён. Ещё отложено: {{count}}.",
       "discarded_one": "Отложенный черновик удалён. Ещё отложено: {{count}}.",
       "discarded_other": "Отложенный черновик удалён. Ещё отложено: {{count}}."
+    },
+    "backendSelector": {
+      "backend_name": "Бэкенд: {{name}}",
+      "default_backend": "Бэкенд по умолчанию",
+      "backend_list": "Список бэкендов",
+      "backend_list_unavailable": "Список бэкендов недоступен",
+      "no_backends_registered": "Нет зарегистрированных бэкендов",
+      "default": "По умолчанию"
     }
   },
   "hooks": {

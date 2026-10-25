@@ -11889,6 +11889,14 @@
       "discarded_many": "Rascunho descartado. Restam {{count}} rascunhos guardados.",
       "discarded_one": "Rascunho descartado. Resta {{count}} rascunho guardado.",
       "discarded_other": "Rascunho descartado. Restam {{count}} rascunhos guardados."
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Backend padrão",
+      "backend_list": "Lista de backends",
+      "backend_list_unavailable": "Lista de backends indisponível",
+      "no_backends_registered": "Nenhum backend registrado",
+      "default": "Padrão"
     }
   },
   "hooks": {

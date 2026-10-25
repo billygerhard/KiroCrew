@@ -6719,6 +6719,14 @@
       "shortcut_hint_mac": "⌃⇧M mutes or unmutes",
       "mute_short": "Mute",
       "unmute_short": "Unmute"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Default backend",
+      "backend_list": "Backend list",
+      "backend_list_unavailable": "Backend list unavailable",
+      "no_backends_registered": "No backends registered",
+      "default": "Default"
     }
   },
   "connectedComputers": {
