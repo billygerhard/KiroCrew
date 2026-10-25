@@ -24,6 +24,7 @@ from typing import Optional
 
 from kiro_crew.acp.harness import operator_descriptor, register_operator_harness
 from kiro_crew.acp.harness.descriptor import (
+    MCP_DELIVERY_SESSION_ARRAY,
     ROUTING_AGENT_SPEC,
     ROUTING_SESSION_CONFIG,
     HarnessDescriptor,
@@ -107,6 +108,7 @@ def load_and_register_operator_descriptors(*, path=None) -> list[str]:
                 models=descriptor.models,
                 session_family=descriptor.session_family,
                 runtime=True,
+                session_array=descriptor.mcp_delivery == MCP_DELIVERY_SESSION_ARRAY,
             )
             register_operator_harness(descriptor)
         except ValueError as exc:
