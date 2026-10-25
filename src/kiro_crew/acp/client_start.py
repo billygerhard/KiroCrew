@@ -97,6 +97,7 @@ from kiro_crew.agent import (
 )
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH, launch_for
+from kiro_crew.agent_sdk.backends_registered import is_registered_backend
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.executors import subprocess_executor
@@ -842,7 +843,13 @@ async def _initialize_session(self: AcpClient) -> None:
         # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
         # cli/<sid>.json; a missing transcript falls back to session/new
         # (a genuinely fresh start).
-        if self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+        # A harnesses.json host (a Claude seat) keeps its own session store
+        # exactly as the built-in harnesses do; the shared-runtime provider
+        # reads the same pair (providers/acp_runtime_start.py).
+        harness_owned = self.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS or (
+            is_registered_backend(self.backend)
+        )
+        if harness_owned:
             # The harness keeps its own session records and resolves them from
             # the sessionId, so there is no Crew-side file to name. Gating on
             # the kiro transcript here would make file_ok always False -- such
@@ -904,7 +911,7 @@ async def _initialize_session(self: AcpClient) -> None:
                     )
                 if self._is_claude:
                     load_params["_meta"] = self._claude_session_meta()
-                elif self.backend not in ACP_BACKENDS_HARNESS_OWNED_SESSIONS:
+                elif not harness_owned:
                     # The kiro family reads its transcript path from _meta. A
                     # harness that owns its sessions reads no _meta of ours,
                     # so it gets neither key rather than a kiro session_file

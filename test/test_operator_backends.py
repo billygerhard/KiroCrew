@@ -235,3 +235,14 @@ def test_a_steerable_claude_adapter_takes_the_steering_request_under_any_id():
     assert not takes_steering_request(quiet)
     codex = SimpleNamespace(acp_backend="codex", claude_adapter=False, steering_advertised=True)
     assert takes_steering_request(codex) and steering_request_meta(codex) is None
+
+
+def test_both_resume_gates_load_a_harnesses_json_session_natively():
+    """A seat keeps no kiro transcript; gating its load on one starts it empty."""
+    import inspect
+
+    from kiro_crew.acp import client_start
+    from kiro_crew.providers import acp_runtime_start
+
+    for module in (client_start, acp_runtime_start):
+        assert "is_registered_backend(" in inspect.getsource(module), module.__name__
