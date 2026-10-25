@@ -57,6 +57,10 @@ _REGISTERED_MODEL_NAMESPACE: dict[str, str] = {}
 #: the session map persists and ``detect_provider_switch`` compares.
 _REGISTERED_SESSION_FAMILY: dict[str, str] = {}
 
+#: Registered ids whose descriptor declares ``mcp_delivery: "session_array"``: the
+#: host learns its MCP servers only from the ``session/new`` array, so Crew builds it.
+_registered_session_array: set[str] = set()
+
 #: Registered id -> declared model source and static list.
 _REGISTERED_MODEL_SOURCE: dict[str, Tuple[str, Tuple[str, ...]]] = {}
 
@@ -77,6 +81,7 @@ def register_known_backend(
     models: Tuple[str, ...] = (),
     session_family: str = "",
     runtime: bool = True,
+    session_array: bool = False,
 ) -> None:
     """Teach this build to SPELL a new (config-authored) backend id.
 
@@ -130,6 +135,8 @@ def register_known_backend(
         _REGISTERED_SESSION_FAMILY[label] = session_family
     if runtime:
         _registered_runtime.add(backend_id)
+    if session_array:
+        _registered_session_array.add(backend_id)
 
 
 def is_registered_backend(backend: str) -> bool:
@@ -161,6 +168,11 @@ def same_session_family(a: str, b: str) -> bool:
     """Whether backend ids *a* and *b* are registered into one session family."""
     family = session_family_for_label(provider_label_for(a))
     return bool(family) and family == session_family_for_label(provider_label_for(b))
+
+
+def registered_session_array(backend: str) -> bool:
+    """Whether a registered *backend* takes its MCP servers from the session array."""
+    return backend in _registered_session_array
 
 
 def registered_model_source(backend: str) -> "Tuple[str, Tuple[str, ...]] | None":
@@ -228,6 +240,7 @@ def _reset_registered_backends() -> None:
         _selectable.discard(backend_id)
     _registered_known.clear()
     _registered_runtime.clear()
+    _registered_session_array.clear()
     _REGISTERED_PROVIDER_LABELS.clear()
     _REGISTERED_MODEL_NAMESPACE.clear()
     _REGISTERED_SESSION_FAMILY.clear()
@@ -243,6 +256,7 @@ __all__ = [
     "registered_backend_ids",
     "registered_model_namespace",
     "registered_model_source",
+    "registered_session_array",
     "same_session_family",
     "session_family_for_label",
     "switches_model_via_config_option",
