@@ -537,6 +537,30 @@ def _cached(backend: str) -> BackendInstallState | None:
     return state
 
 
+def _operator_probe(backend: str) -> "Callable[[], BackendInstallState] | None":
+    """The probe for a ``harnesses.json`` backend, or ``None`` for any other id.
+
+    A descriptor is ready when its executable resolves, so ``spawn_run(backend=...)``
+    and ``session_set_backend`` refuse a seat whose wrapper is gone instead of
+    failing at cold start. No ``install_command``: the operator wrote the wrapper.
+    """
+    if backend in _PROBES or backend not in ACP_BACKENDS_KNOWN:
+        return None
+
+    def _probe() -> BackendInstallState:
+        found = acp_driver.operator_descriptor_executable(backend)
+        if found is None:
+            return BackendInstallState(backend, _policy_id(backend), UNKNOWN)
+        executable, resolves = found
+        if resolves:
+            return BackendInstallState(backend, _policy_id(backend), INSTALLED)
+        return BackendInstallState(
+            backend, _policy_id(backend), MISSING, missing_components=(executable,)
+        )
+
+    return _probe
+
+
 def probe_backend(backend: str) -> BackendInstallState:
     """This machine's readiness for *backend*, cached for ``CACHE_TTL_SECONDS``.
 
@@ -558,7 +582,7 @@ def probe_backend(backend: str) -> BackendInstallState:
     with _cache_lock:
         epoch = _epoch_locked(backend)
 
-    probe = _PROBES.get(backend)
+    probe = _PROBES.get(backend) or _operator_probe(backend)
     if probe is None:
         logger.debug("no install probe for agent backend %r; reporting unknown", backend)
         state = BackendInstallState(backend, _policy_id(backend), UNKNOWN)

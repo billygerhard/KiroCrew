@@ -723,6 +723,22 @@ def self_served_resolves(backend: str) -> bool:
     return bool(binary)
 
 
+def operator_descriptor_executable(backend: str) -> tuple[str, bool] | None:
+    """``(executable, resolves)`` for a ``harnesses.json`` backend, or ``None`` for any other id.
+
+    Resolved through the lookup ``DescriptorHarness`` spawns through, so the
+    verdict and the spawn cannot disagree about where the wrapper is.
+    """
+    from kiro_crew.acp.harness.descriptor_exec import resolve_descriptor_executable
+    from kiro_crew.acp.harness.operator_registry import registered_operator_descriptor
+
+    descriptor = registered_operator_descriptor(backend)
+    if descriptor is None:
+        return None
+    resolved, _searched = resolve_descriptor_executable(descriptor.executable)
+    return descriptor.executable, bool(resolved)
+
+
 def self_served_cached_negative(backend: str) -> bool:
     """Has the RUNNING gateway already resolved *backend*'s binary as absent?
 
