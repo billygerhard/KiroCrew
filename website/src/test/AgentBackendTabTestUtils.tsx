@@ -55,6 +55,7 @@ export function card(
 export function probeRow(
   id: string,
   over: Partial<{
+    label: string
     selectable: boolean
     installed: string
     missing_components: string[]
