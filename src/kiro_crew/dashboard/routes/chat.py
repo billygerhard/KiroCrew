@@ -136,6 +136,9 @@ def register(app: web.Application) -> None:
     # Optimizer
     app.router.add_post("/api/optimizer/optimize", handlers.handle_optimize)
     app.router.add_post("/api/chat/slots/{slot}/model", chat.api_chat_slot_model)
+    from kiro_crew.dashboard.chat_api.slot_backend import api_chat_slot_backend
+
+    app.router.add_post("/api/chat/slots/{slot}/backend", api_chat_slot_backend)
     app.router.add_get("/api/chat/slots/{slot}/autocompact", chat.api_chat_slot_autocompact)
     app.router.add_post("/api/chat/slots/{slot}/autocompact", chat.api_chat_slot_autocompact)
     app.router.add_get("/api/chat/slots/{slot}/turn-timeout", chat.api_chat_slot_turn_timeout)
