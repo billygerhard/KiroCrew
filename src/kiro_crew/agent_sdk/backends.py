@@ -744,6 +744,13 @@ def selectable_stored_backend_values() -> list[str]:
     return sorted(backend_to_stored(b) for b in selectable_backends())
 
 
+def _registers_on_first_need() -> bool:
+    """Read this home's ``harnesses.json`` if this process has not; True when it added any."""
+    from kiro_crew.operator_backends import ensure_operator_backends_registered
+
+    return bool(ensure_operator_backends_registered())
+
+
 def resolve_selected_backend(value: object) -> str:
     """Coerce a persisted ``agent.acp_backend`` to a backend this build can serve.
 
@@ -789,6 +796,12 @@ def resolve_selected_backend(value: object) -> str:
     # config load would bury that notice under copies of a vaguer one.
     if isinstance(value, str) and value in _host_unservable:
         return GOVERNANCE_FLOOR_BACKEND
+    if isinstance(value, str) and _registers_on_first_need():
+        # A harnesses.json backend this process had not read yet (only the gateway
+        # registers at boot); the floor is right only once that file is read.
+        selectable = selectable_backends()
+        if value in selectable:
+            return value
     logger.warning(
         "Ignoring agent.acp_backend %r (not selectable in this build); using "
         "the Kiro CLI floor. Selectable values: %s",

@@ -260,3 +260,49 @@ def test_a_client_on_a_seat_switches_model_through_its_advertised_select(registe
     assert not switches_model_via_config_option("kiro", select)
     for fn in (client_model_selection.set_model, client_model_selection._apply_startup_model):
         assert "switches_model_via_config_option(" in inspect.getsource(fn), fn.__name__
+
+
+def test_a_process_that_never_booted_resolves_a_seat_default(tmp_path, wrapper, caplog):
+    """A CLI or cron process reads config without the gateway's boot step."""
+    import logging
+    from unittest import mock
+
+    from kiro_crew.acp.harness import descriptor
+    from kiro_crew.agent_sdk.backends import resolve_selected_backend
+
+    harnesses = tmp_path / "harnesses.json"
+    harnesses.write_text(
+        json.dumps({"seat-a": _seat("seat-a", wrapper, "Seat A")}), encoding="utf-8"
+    )
+    _reset_registered_backends()
+    _reset_operator_register()
+    backend_install.clear_probe_cache()
+    try:
+        with (
+            mock.patch.object(descriptor, "operator_harnesses_path", return_value=harnesses),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.agent_sdk.backends"),
+        ):
+            assert resolve_selected_backend("seat-a") == "seat-a"
+            assert resolve_selected_backend("seat-a") == "seat-a"
+        assert "not selectable" not in caplog.text
+    finally:
+        _reset_registered_backends()
+        _reset_operator_register()
+        _reset_operator_diagnostics()
+        backend_install.clear_probe_cache()
+
+
+def test_first_need_reads_harnesses_json_once_per_home(tmp_path):
+    from unittest import mock
+
+    from kiro_crew import operator_backends
+
+    operator_backends._reset_operator_backends_loaded()
+    with mock.patch(
+        "kiro_crew.acp.harness.operator_registry.load_and_register_operator_descriptors",
+        return_value=["seat-x"],
+    ) as load:
+        assert operator_backends.ensure_operator_backends_registered() == ["seat-x"]
+        assert operator_backends.ensure_operator_backends_registered() == []
+    assert load.call_count == 1
+    operator_backends._reset_operator_backends_loaded()

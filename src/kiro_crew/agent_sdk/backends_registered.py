@@ -245,6 +245,9 @@ def _reset_registered_backends() -> None:
     _REGISTERED_MODEL_NAMESPACE.clear()
     _REGISTERED_SESSION_FAMILY.clear()
     _REGISTERED_MODEL_SOURCE.clear()
+    from kiro_crew.operator_backends import _reset_operator_backends_loaded
+
+    _reset_operator_backends_loaded()
 
 
 __all__ = [
