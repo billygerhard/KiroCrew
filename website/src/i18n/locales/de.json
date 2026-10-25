@@ -10689,6 +10689,19 @@
       "offer_open": "{{host}} öffnen",
       "copy_failed": "Kopieren fehlgeschlagen. Markiere den Text in der App und kopiere ihn selbst.",
       "more_actions": "Weitere Aktionen"
+    },
+    "unscannedDownload": {
+      "title": "Zu groß zum Prüfen",
+      "body": "{{name}} ist {{size}} groß. Dateien über {{limit}} werden vor dem Download nicht auf Geheimnisse geprüft.",
+      "download_anyway": "Trotzdem herunterladen"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Standard-Backend",
+      "backend_list": "Backend-Liste",
+      "backend_list_unavailable": "Backend-Liste nicht verfügbar",
+      "no_backends_registered": "Keine Backends registriert",
+      "default": "Standard"
     }
   },
   "hooks": {

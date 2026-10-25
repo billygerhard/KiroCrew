@@ -91,6 +91,7 @@ export interface SlotSwitchValueMap {
   project: string
   agent: AgentSwitchValue
   reasoning_effort: string
+  backend: string
 }
 
 export type SlotSwitchField = keyof SlotSwitchValueMap

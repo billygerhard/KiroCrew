@@ -6298,6 +6298,14 @@
       "offer_open": "Open {{host}}",
       "copy_failed": "Couldn't copy. Select the text in the app and copy it yourself.",
       "more_actions": "More actions"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Default backend",
+      "backend_list": "Backend list",
+      "backend_list_unavailable": "Backend list unavailable",
+      "no_backends_registered": "No backends registered",
+      "default": "Default"
     }
   },
   "hooks": {

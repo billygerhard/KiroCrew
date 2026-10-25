@@ -47,14 +47,19 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * another harness than the configured one: that harness's list gets its own key,
  * so it never replaces the configured list the other pickers read.
  */
-type AvailableModelsOptions = { enabled?: boolean; backend?: string }
+type AvailableModelsOptions = {
+  enabled?: boolean
+  /** A stored backend id; `null` or `''` reads the configured backend's list. */
+  backend?: string | null
+}
 
 /** The cache key of the configured list, or of `backend`'s own list. */
 export function modelsQueryKey(providerId: string, backend?: string): readonly unknown[] {
   return backend === undefined ? ['available-models', providerId] : ['available-models', providerId, backend]
 }
 
-export function useAvailableModelsQuery({ enabled, backend }: AvailableModelsOptions = {}) {
+export function useAvailableModelsQuery({ enabled, backend: picked }: AvailableModelsOptions = {}) {
+  const backend = picked || undefined
   const provider = useProvider()
   const isDegraded = useModelsDegraded(modelHealthKey(provider.id, backend))
   const query = useQuery({

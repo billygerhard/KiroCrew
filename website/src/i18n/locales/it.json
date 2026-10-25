@@ -10885,6 +10885,19 @@
       "offer_open": "Apri {{host}}",
       "copy_failed": "Impossibile copiare. Seleziona il testo nell'app e copialo tu.",
       "more_actions": "Altre azioni"
+    },
+    "unscannedDownload": {
+      "title": "Troppo grande per essere analizzato",
+      "body": "{{name}} pesa {{size}}. I file oltre {{limit}} non vengono controllati alla ricerca di segreti prima del download.",
+      "download_anyway": "Scarica comunque"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Backend predefinito",
+      "backend_list": "Elenco backend",
+      "backend_list_unavailable": "Elenco backend non disponibile",
+      "no_backends_registered": "Nessun backend registrato",
+      "default": "Predefinito"
     }
   },
   "hooks": {
