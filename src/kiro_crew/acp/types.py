@@ -843,9 +843,13 @@ def _command_from_tool_params(params: dict) -> str | None:
       payloads in a form the shell-text matchers were not authored for. This is
       acceptable for a single-user tool but is not a complete smuggling defense.
     """
-    cmd = params.get("command")
-    if isinstance(cmd, str) and cmd:
-        return cmd
+    # Spellings of the one command field: Antigravity's ACP server marshals its
+    # struct names, so its shell call carries ``CommandLine``. A spelling missed
+    # here makes the command invisible and the call is denied as unverifiable.
+    for key in ("command", "CommandLine", "commandLine"):
+        cmd = params.get(key)
+        if isinstance(cmd, str) and cmd:
+            return cmd
     service = params.get("service_name")
     operation = params.get("operation_name")
     if isinstance(service, str) and service and isinstance(operation, str) and operation:
