@@ -223,7 +223,11 @@ async def get_subagent_runtime(
 
 
 async def release_subagent_runtime(
-    self: SessionAllocationService, parent_session_key: str, *, expected: Any = None
+    self: SessionAllocationService,
+    parent_session_key: str,
+    *,
+    expected: Any = None,
+    park: bool = False,
 ) -> bool:
     """Serialize release with spawn and kill the detached runtime off-map.
 
@@ -234,6 +238,9 @@ async def release_subagent_runtime(
     replacement under the same key before letting go, and a pop by key
     alone would then kill the replacement the caller never looked at.
     Returns whether a runtime was popped (and so killed).
+
+    ``park=True`` detaches it the same way but parks it to drain instead of
+    killing it, for a parent moving to another backend while its children run.
     """
     lock = self._subagent_runtime_locks.get(parent_session_key)
     if lock is not None:
@@ -253,6 +260,11 @@ async def release_subagent_runtime(
         runtime = self._subagent_runtimes.pop(parent_session_key, None)
     if runtime is None:
         return False
+    if park:
+        from kiro_crew.session_handoff import park_until_drained
+
+        park_until_drained(self._owner, runtime, reason="parked subagent runtime drained")
+        return True
     try:
         await runtime.kill(expected=True, reason="subagent runtime released")
     except Exception:
