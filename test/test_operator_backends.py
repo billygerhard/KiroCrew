@@ -200,3 +200,11 @@ def test_the_picker_takes_the_fullest_live_snapshot():
     with mock.patch.object(agents, "capabilities_of", return_value=caps):
         rows = agents._advertised_cc_models(SimpleNamespace(app=request), "ns")
     assert [r["model_name"] for r in rows] == ["a", "b", "c"]
+
+
+def test_an_antigravity_shell_call_carries_a_verifiable_command():
+    from kiro_crew.acp.types import _command_from_tool_params
+
+    assert _command_from_tool_params({"CommandLine": "ls -la", "Cwd": "/tmp"}) == "ls -la"
+    assert _command_from_tool_params({"commandLine": "pwd"}) == "pwd"
+    assert _command_from_tool_params({"command": "id", "CommandLine": "pwd"}) == "id"
