@@ -36,13 +36,13 @@ from kiro_crew.acp.harness.claude import ClaudeHarness, ClaudeLaunch
 from kiro_crew.acp.harness.codex import CodexHarness
 from kiro_crew.acp.harness.copilot import CopilotLaunch
 from kiro_crew.acp.harness.deepseek import DeepseekHarness, DeepseekLaunch
+from kiro_crew.acp.harness.descriptor import HarnessDescriptor
 from kiro_crew.acp.harness.goose import GooseHarness, GooseLaunch
 from kiro_crew.acp.harness.kas import KasHarness
-from kiro_crew.acp.harness.descriptor import HarnessDescriptor
 from kiro_crew.acp.harness.kiro import KiroHarness
 from kiro_crew.acp.harness.mimocode import MimoCodeLaunch
-from kiro_crew.acp.harness.operator import DescriptorHarness
 from kiro_crew.acp.harness.opencode import OpencodeLaunch
+from kiro_crew.acp.harness.operator import DescriptorHarness
 from kiro_crew.acp.harness.pi import PiLaunch
 from kiro_crew.acp.harness.strands import StrandsLaunch
 from kiro_crew.acp.types import (
