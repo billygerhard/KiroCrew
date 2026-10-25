@@ -154,3 +154,49 @@ def test_only_a_descriptor_declares_a_sandbox_floor(tmp_path, wrapper):
         _reset_registered_backends()
         _reset_operator_register()
         _reset_operator_diagnostics()
+
+
+def test_a_static_descriptor_offers_its_declared_models(tmp_path, wrapper):
+    from kiro_crew.dashboard.handlers.operator_models import static_descriptor_models
+
+    entry = {
+        "id": "static-host",
+        "display_name": "Static Host",
+        "executable": wrapper,
+        "argv": ["{executable}"],
+        "agent_args": ["--agent={agent}"],
+        "model_args": ["--model={model}"],
+        "model_source": "static",
+        "models": ["model-one", "model-two"],
+        "routing": "agent_spec",
+    }
+    harnesses = tmp_path / "static.json"
+    harnesses.write_text(json.dumps({"static-host": entry}), encoding="utf-8")
+    try:
+        assert load_and_register_operator_descriptors(path=harnesses) == ["static-host"]
+        rows = static_descriptor_models("static-host")
+        assert [r["model_name"] for r in rows] == ["auto", "model-one", "model-two"]
+        assert static_descriptor_models("") is None
+    finally:
+        _reset_registered_backends()
+        _reset_operator_register()
+        _reset_operator_diagnostics()
+
+
+def test_the_picker_takes_the_fullest_live_snapshot():
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from kiro_crew.dashboard.handlers import agents
+
+    def provider(ids):
+        return SimpleNamespace(available_models=lambda: [{"modelId": i} for i in ids])
+
+    providers = [provider(["a", "b", "c"]), provider(["a"])]
+    request = {
+        "state": SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: providers))
+    }
+    caps = SimpleNamespace(resolves_model_from_advertised_list=True, model_id_namespace="ns")
+    with mock.patch.object(agents, "capabilities_of", return_value=caps):
+        rows = agents._advertised_cc_models(SimpleNamespace(app=request), "ns")
+    assert [r["model_name"] for r in rows] == ["a", "b", "c"]
