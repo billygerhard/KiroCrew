@@ -314,6 +314,7 @@ from kiro_crew.dashboard.handlers.agent_templates import (  # noqa: F401
     read_only_reason_for_path,
     validate_definition_patch,
 )
+from kiro_crew.dashboard.handlers.operator_models import static_descriptor_models
 from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
     owner_view_for_request,
 )
@@ -568,15 +569,18 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
     otherwise answer the codex picker with claude ids --
     every one of which codex refuses.
 
-    Newest matching session first, like :func:`_entitled_kiro_models`: forward
-    order is creation order, so the most recently started session carries the most
-    recent snapshot of what the account is served.
+    The FULLEST matching live snapshot wins, not the newest: a session/new that
+    races the adapter's entitlement lookup answers a degraded short list while
+    sibling sessions hold the full one, and taking the newest let one such session
+    shrink every chat's picker. Over-offering fails open, since ``set_model`` awaits
+    the adapter's reply and a model the account lacks is refused visibly.
     """
     try:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
         providers = []
+    best: list[dict] = []
     for provider in reversed(providers):
         # Read each field straight off ``capabilities_of(provider)``: binding it to a
         # local would be a second spelling of the question, which the one-spelling
@@ -592,16 +596,19 @@ def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
             advertised = getter()
         except Exception:
             continue
-        if advertised:
-            return [
-                {
-                    "model_name": m.get("modelId", ""),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
-                    "description": m.get("description", ""),
-                }
-                for m in advertised
-                if m.get("modelId")
-            ]
+        rows = [
+            {
+                "model_name": m.get("modelId", ""),
+                "display_name": m.get("name", "") or m.get("modelId", ""),
+                "description": m.get("description", ""),
+            }
+            for m in advertised or []
+            if m.get("modelId")
+        ]
+        if len(rows) > len(best):
+            best = rows
+    if best:
+        return best
     return [
         {"model_name": m, "display_name": m, "description": ""}
         for m in model_registry.advertised_models(namespace)
@@ -1407,6 +1414,9 @@ async def api_models(request: web.Request) -> web.Response:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))
         )
+    static_rows = static_descriptor_models(backend)
+    if static_rows is not None:
+        return web.json_response(static_rows)
     if capabilities_for(backend).resolves_model_from_advertised_list:
         return web.json_response(
             _advertised_backend_models(
