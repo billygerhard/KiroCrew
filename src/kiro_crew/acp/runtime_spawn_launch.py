@@ -305,8 +305,9 @@ async def _resolve_spawn_plan(self: AcpRuntime) -> SpawnPlan:
     """
     # The harness's own tier floor is applied to ``self._sandbox_mode`` before
     # either reader (the preflight through ``ctx.sandbox_mode``, and the wrap
-    # below) sees it, so the two cannot disagree. One-way; empty for builtins.
-    floor = self._harness.min_sandbox_tier
+    # below) sees it, so the two cannot disagree. One-way; empty for builtins
+    # and for a harness class that declares no floor.
+    floor = getattr(self._harness, "min_sandbox_tier", "")
     if floor:
         from kiro_crew.sandbox_tiers import raise_sandbox_mode
 

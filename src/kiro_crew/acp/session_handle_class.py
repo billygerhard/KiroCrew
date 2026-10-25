@@ -819,9 +819,8 @@ class AcpSessionHandle:
         """
         # A harnesses.json claude-agent-acp host (a Claude seat) is identified from
         # its handshake, since no backend-id table can name it.
-        return self._runtime.acp_backend in ACP_BACKENDS_STEER or takes_steering_request(
-            self._runtime
-        )
+        runtime = self._runtime
+        return runtime.acp_backend in ACP_BACKENDS_STEER or takes_steering_request(runtime)
 
     @property
     def supports_refusal_steer(self) -> bool:
