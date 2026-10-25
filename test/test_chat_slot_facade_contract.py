@@ -26,6 +26,8 @@ _TO_DICT_KEYS = (
     # Present on EVERY slot, so an absent key and "pinned by hand" are not the
     # same reading for a stale client.
     "jev_route",
+    # The chat's backend pick; empty follows the gateway default.
+    "backend",
     "model_withheld",
     "served_model",
     "reasoning_effort",

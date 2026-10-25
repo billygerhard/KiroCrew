@@ -429,6 +429,10 @@ class SlotProjection:
             # otherwise be the same reading, and a stale client would show a
             # routed session as pinned.
             "jev_route": bool(getattr(slot, "jev_route", False)),
+            # The chat's own backend pick (``session_set_backend``), as a policy id;
+            # empty means it follows the gateway default. Read by seat failover to
+            # find the chats on a seat that is filling up.
+            "backend": getattr(slot, "backend", "") or "",
             # The backend's own withhold verdict for `model`: true = the account
             # cannot run the pin (this session is on the backend default), false
             # = it can, null = not known yet. Carried so the frontend reads the
