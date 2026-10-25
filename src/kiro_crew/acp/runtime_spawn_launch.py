@@ -16,7 +16,8 @@ Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``
 ``_max_rss_depth``, ``_max_rss_mb``, ``_native_launch_resources``,
 ``_native_launch_sources``, ``_native_launch_view_alias``, ``_native_skill_projection``,
 ``_pid``, ``_process``, ``_process_instance``, ``_process_tree_confirmed_dead``,
-``_prompt_capabilities``, ``_reader_task``, ``_sandbox_cleanup``, ``_scope_unit``,
+``_prompt_capabilities``, ``_reader_task``, ``_sandbox_cleanup``, ``_sandbox_mode``,
+``_scope_unit``,
 ``_skill_projection_generation``, ``_spawn_monotonic``, ``_spawn_skill_projection``,
 ``_spawn_start_token``, ``_start_time``, ``_stderr_task``, ``_tool_search_wire``.
 
@@ -299,6 +300,24 @@ async def _resolve_spawn_plan(self: AcpRuntime) -> SpawnPlan:
     thread hop for the same filesystem work or -- worse -- silently resolve a
     different mask than the one the argv was built for.
     """
+    # The harness's own tier floor is applied to ``self._sandbox_mode`` before
+    # either reader (the preflight through ``ctx.sandbox_mode``, and the wrap
+    # below) sees it, so the two cannot disagree. One-way; empty for builtins.
+    floor = self._harness.min_sandbox_tier
+    if floor:
+        from kiro_crew.sandbox_tiers import raise_sandbox_mode
+
+        raised = raise_sandbox_mode(self._sandbox_mode, floor)
+        if raised != self._sandbox_mode:
+            logger.info(
+                "acp: %s declares a minimum sandbox tier of %r; spawning it at %r "
+                "instead of the configured %r (other backends keep the configured tier)",
+                self._acp_backend,
+                floor,
+                raised,
+                self._sandbox_mode,
+            )
+            self._sandbox_mode = raised
     plan = await self._harness.resolve_spawn(
         SpawnContext(
             agent=self._agent,

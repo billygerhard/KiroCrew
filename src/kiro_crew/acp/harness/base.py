@@ -457,6 +457,19 @@ class HarnessAdapter(LaunchAdapter):
         """The host runs its own sandbox, so Crew delegates isolation to it."""
 
     @property
+    def min_sandbox_tier(self) -> str:
+        """The tier this host's child must not be spawned BELOW; empty for none.
+
+        Concrete and defaulted: every bundled host's tier is the session's, so it
+        answers "no opinion". An operator descriptor answers its own
+        ``min_sandbox``, so a tool-gate enforced host on a gateway whose
+        ``agent.sandbox`` is ``off`` raises only its own spawn instead of being
+        refused. Read by ``_resolve_spawn_plan`` before the ``SpawnContext`` is
+        built, so the tier judged and the tier applied are one value.
+        """
+        return ""
+
+    @property
     @abc.abstractmethod
     def pod_home_remap(self) -> bool:
         """The child's ``HOME`` is remapped when spawned inside a pod bundle."""

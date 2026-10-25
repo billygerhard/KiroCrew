@@ -1189,6 +1189,21 @@ def _floor_mandates_sandbox(floor: str | None) -> bool:
     return floor != _ORDINAL_SCALES["sandbox"][0]
 
 
+def raise_sandbox_mode(mode: str, minimum: str) -> str:
+    """Raise *mode* to a HARNESS's *minimum* tier when that is the stricter one.
+
+    The one-way clamp :func:`_clamp_sandbox_mode_to_floor` applies for
+    ``sandbox.min_level``, for a floor an ACP host declares (a ``harnesses.json``
+    ``min_sandbox``): only that host's spawn is confined further, and the
+    governance ceiling inside ``wrap_argv`` still runs on the result, so a host
+    floor can never lower a ceiling. Empty *minimum* returns *mode* untouched; an
+    unrecognised one raises rather than silently not applying.
+    """
+    if not minimum:
+        return mode
+    return _clamp_sandbox_mode_to_floor(mode, minimum)
+
+
 def _clamp_sandbox_mode_to_floor(mode: str, floor: str | None) -> str:
     """Clamp *mode* UP to an already-read ``sandbox.min_level`` *floor*, if any.
 
