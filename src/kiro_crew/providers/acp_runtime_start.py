@@ -56,6 +56,7 @@ from kiro_crew.acp.session_mcp import agent_spec_snapshot
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.transport_errors import AcpDelegateLaunchFailed, delegate_launch_failed
 from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+from kiro_crew.agent_sdk.backends_registered import is_registered_backend
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS,
@@ -1016,7 +1017,13 @@ async def _start_kiro_runtime_impl(
         handle = None
         resumed = False
         if resume_sid:
-            if self.is_kas_backend or self._client.backend in (ACP_BACKENDS_HARNESS_OWNED_SESSIONS):
+            if (
+                self.is_kas_backend
+                or self._client.backend in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+                # A harnesses.json host keeps its own session store; there is
+                # never a kiro transcript to stat, so resume it natively.
+                or is_registered_backend(self._client.backend)
+            ):
                 # Nothing local to stat. KAS locates the transcript itself
                 # from sessionId, and in remote-session mode there are no
                 # local files at all; a member of

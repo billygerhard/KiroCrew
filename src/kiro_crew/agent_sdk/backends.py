@@ -73,6 +73,9 @@ with no row here.
      - disposition
    * - ``ACP_BACKENDS_KNOWN``
      - pre-session registry query (membership gate on the ``acp_backend`` kwarg)
+   * - ``ACP_BACKENDS_BUILTIN``
+     - pre-session registry query (the ids this build ships a harness for, before
+       any ``harnesses.json`` registration)
    * - ``ACP_BACKENDS_INDEPENDENT_SETUP``
      - pre-session registry query (which first-run harnesses can complete setup
        without Kiro CLI before any session exists)

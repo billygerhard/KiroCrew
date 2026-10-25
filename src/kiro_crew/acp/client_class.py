@@ -63,7 +63,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKEND_STRANDS,
-    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SENT_IMAGE_RECORD,
@@ -972,7 +971,9 @@ class AcpClient:
     def _uses_advertised_model_selection(self) -> bool:
         """True when this backend sources its wire model id / seed from the
         provider's advertised list (see ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``)."""
-        return self.backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+        from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+
+        return uses_advertised_model_selection(self.backend)
 
     #: True on a backend that seeds (and must re-seed) a per-session settings file;
     #: the client class of such a backend sets it (``client_claude``).
