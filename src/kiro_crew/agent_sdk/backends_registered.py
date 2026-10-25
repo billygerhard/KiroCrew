@@ -157,6 +157,12 @@ def session_family_for_label(label: str) -> str:
     return _REGISTERED_SESSION_FAMILY.get(label, "")
 
 
+def same_session_family(a: str, b: str) -> bool:
+    """Whether backend ids *a* and *b* are registered into one session family."""
+    family = session_family_for_label(provider_label_for(a))
+    return bool(family) and family == session_family_for_label(provider_label_for(b))
+
+
 def registered_model_source(backend: str) -> "Tuple[str, Tuple[str, ...]] | None":
     """A registered backend's ``(model_source, static_models)``, or ``None``."""
     return _REGISTERED_MODEL_SOURCE.get(backend)
@@ -237,6 +243,7 @@ __all__ = [
     "registered_backend_ids",
     "registered_model_namespace",
     "registered_model_source",
+    "same_session_family",
     "session_family_for_label",
     "switches_model_via_config_option",
     "uses_advertised_model_selection",
