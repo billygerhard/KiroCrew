@@ -36,6 +36,10 @@ vi.mock('./chat/TaskProgressBar', () => ({ default: () => null }))
 vi.mock('./chat/WorkflowProgressBar', () => ({ default: () => null }))
 vi.mock('./chat/KnowledgePicker', () => ({ KnowledgePicker: (p: Captured) => { seen.knowledge = p; return null } }))
 vi.mock('../app-sdk/ChatScrollChrome', async (orig) => ({ ...(await orig<typeof import('../app-sdk/ChatScrollChrome')>()), JumpToBottomButton: () => null }))
+const { onSelectBackend } = vi.hoisted(() => ({ onSelectBackend: vi.fn() }))
+vi.mock('./chat/page/backendPick', () => ({
+  useComposerBackendPick: () => ({ backendValue: 'claude-seat1', onSelectBackend, backendDisabled: true }),
+}))
 
 import ComposerDockView from './chat/page/ComposerDockView'
 import { dismissFollowupItem } from '../store/chatSlice'
@@ -64,6 +68,14 @@ describe('ComposerDockView', () => {
     render(<ComposerDockView {...dockProps({ setPrefillHint })} />)
     act(() => { (seen.chatInput!.onDismissHint as () => void)() })
     expect(setPrefillHint).toHaveBeenCalledWith(false)
+  })
+
+  it('hands the chat backend pick to the composer chip', () => {
+    render(<ComposerDockView {...dockProps()} />)
+    expect(seen.chatInput!.backendValue).toBe('claude-seat1')
+    act(() => { (seen.chatInput!.onSelectBackend as (id: string) => void)('claude-seat2') })
+    expect(onSelectBackend).toHaveBeenCalledWith('claude-seat2')
+    expect(seen.chatInput!.backendDisabled).toBe(true)
   })
 
   it('injects or skips knowledge results', () => {

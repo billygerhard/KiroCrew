@@ -161,6 +161,12 @@ async def _deny_non_owner(
     )
 
 
+def _operator_label(backend: str) -> str:
+    from kiro_crew.agent_sdk.backends_registered import is_registered_backend, provider_label_for
+
+    return provider_label_for(backend) if is_registered_backend(backend) else ""
+
+
 def _row(state: Any, selectable: set) -> Dict[str, Any]:
     """One backend's wire row, from its install state and the selectable set.
 
@@ -185,6 +191,9 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
         # into ``agent.acp_backend`` (Kiro CLI is ``"kiro"``, never ``""``).
         "id": backend_to_stored(state.backend),
         "policy_id": state.policy_id,
+        # A harnesses.json backend's own display name ("Claude Seat 1"); empty for
+        # a builtin, whose name the panel translates from its id.
+        "label": _operator_label(state.backend),
         "selectable": state.backend in selectable,
         "independent_setup": state.backend in ACP_BACKENDS_INDEPENDENT_SETUP,
         "installed": state.installed,

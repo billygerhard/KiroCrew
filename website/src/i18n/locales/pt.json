@@ -10334,6 +10334,14 @@
       "title": "Grande demais para verificar",
       "body": "{{name}} tem {{size}}. Arquivos acima de {{limit}} não são verificados em busca de segredos antes do download.",
       "download_anyway": "Baixar mesmo assim"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Backend padrão",
+      "backend_list": "Lista de backends",
+      "backend_list_unavailable": "Lista de backends indisponível",
+      "no_backends_registered": "Nenhum backend registrado",
+      "default": "Padrão"
     }
   },
   "hooks": {

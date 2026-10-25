@@ -10334,6 +10334,14 @@
       "title": "Trop volumineux pour être analysé",
       "body": "{{name}} fait {{size}}. Les fichiers de plus de {{limit}} ne sont pas vérifiés à la recherche de secrets avant le téléchargement.",
       "download_anyway": "Télécharger quand même"
+    },
+    "backendSelector": {
+      "backend_name": "Backend : {{name}}",
+      "default_backend": "Backend par défaut",
+      "backend_list": "Liste des backends",
+      "backend_list_unavailable": "Liste des backends indisponible",
+      "no_backends_registered": "Aucun backend enregistré",
+      "default": "Par défaut"
     }
   },
   "hooks": {

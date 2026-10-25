@@ -306,3 +306,23 @@ def test_first_need_reads_harnesses_json_once_per_home(tmp_path):
         assert operator_backends.ensure_operator_backends_registered() == []
     assert load.call_count == 1
     operator_backends._reset_operator_backends_loaded()
+
+
+def test_a_models_request_may_name_a_selectable_seat(registered):
+    from aiohttp.test_utils import make_mocked_request
+
+    from kiro_crew.dashboard.handlers.operator_models import requested_models_backend
+
+    def ask(query: str):
+        return requested_models_backend(make_mocked_request("GET", "/api/models" + query))
+
+    assert ask("?backend=seat-a") == "seat-a"
+    assert ask("?backend=not-a-backend") is None
+    assert ask("") is None
+
+
+def test_an_acp_backends_row_carries_a_seats_display_name(registered):
+    from kiro_crew.dashboard.handlers.acp_backend_status import _operator_label
+
+    assert _operator_label("seat-a") == "Seat A"
+    assert _operator_label("claude") == ""

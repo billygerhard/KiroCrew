@@ -929,6 +929,8 @@ class TestEndpointPayloadShape:
             assert set(row) == {
                 "id",
                 "policy_id",
+                # A harnesses.json backend's display name; empty for a builtin.
+                "label",
                 "selectable",
                 "independent_setup",
                 "installed",
@@ -980,6 +982,7 @@ class TestEndpointPayloadShape:
             # The config-file spelling, which is what the panel PATCHes.
             "id": "kiro",
             "policy_id": "kiro",
+            "label": "",
             "selectable": True,
             "independent_setup": False,
             "installed": "installed",

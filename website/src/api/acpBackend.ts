@@ -78,12 +78,12 @@ export function isKiroHarness(cfg: AcpBackendConfig | undefined): boolean {
 }
 
 /** Shared translated harness labels; unknown harnesses keep the server's policy name. */
-export function acpBackendName(backend: { id: string; policy_id?: string }): string {
+export function acpBackendName(backend: { id: string; policy_id?: string; label?: string }): string {
   switch (backend.id) {
     case ACP_BACKEND_KIRO: return i18nT('pages.developer.agentBackendTab.kiro_cli')
     case 'claude': return i18nT('pages.developer.agentBackendTab.claude_code')
     case ACP_BACKEND_KAS: return i18nT('pages.developer.agentBackendTab.kas_kiro_agent')
-    default: return backend.policy_id || backend.id
+    default: return backend.label || backend.policy_id || backend.id
   }
 }
 

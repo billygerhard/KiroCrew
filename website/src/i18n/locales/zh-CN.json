@@ -10044,6 +10044,14 @@
       "title": "文件太大，无法扫描",
       "body": "{{name}} 大小为 {{size}}。超过 {{limit}} 的文件在下载前不会检查其中是否含有密钥等机密信息。",
       "download_anyway": "仍要下载"
+    },
+    "backendSelector": {
+      "backend_name": "后端：{{name}}",
+      "default_backend": "默认后端",
+      "backend_list": "后端列表",
+      "backend_list_unavailable": "无法获取后端列表",
+      "no_backends_registered": "未注册任何后端",
+      "default": "默认"
     }
   },
   "hooks": {

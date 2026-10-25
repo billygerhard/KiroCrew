@@ -60,6 +60,7 @@ import WorkflowProgressBar from '../WorkflowProgressBar'
 import { tryQuickSend } from '../../../lib/quickSend'
 import { i18nT } from '../../../i18n/t'
 import { fmtDateFields } from '../../../i18n/format'
+import { useComposerBackendPick } from './backendPick'
 
 /**
  * The main composer, with its callback props held at stable identities. This
@@ -275,6 +276,7 @@ export default function ComposerDockView({
   queuePendingIds, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove,
   composerSessionControls,
 }: ComposerDockViewProps) {
+  const backendPick = useComposerBackendPick({ activeSlot, currentSlot, slotRunning, dispatch })
   return (
     <>
             {/* Composer dock. Floats over the bottom of the transcript scroller
@@ -537,6 +539,9 @@ export default function ComposerDockView({
               // session exactly when the picker shows a same-name pair.
               agentMemory={sessionMemoryTag(currentSlot?.agent, currentSlot?.agent_kind, defaultAgent, effectiveAgents)}
               agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
+              backendValue={backendPick.backendValue}
+              onSelectBackend={backendPick.onSelectBackend}
+              backendDisabled={backendPick.backendDisabled}
               modelName={shownModel}
               modelIsInheritedDefault={modelMarker === 'default'}
               modelIsAutoChosen={modelMarker === 'auto'}

@@ -174,6 +174,13 @@ export interface ChatInputProps {
    * marks its label and spoken name with it. Null or unset: no mark. */
   agentMemory?: MemorySource | null
   agentSource?: string
+  /** Makes the composer's backend chip a picker: called with the picked
+   *  backend id. Absent hides the chip. */
+  onSelectBackend?: (id: string) => void
+  /** The chat's stored backend pick for that chip (`null` = the configured default). */
+  backendValue?: string | null
+  /** Locks the backend chip: a turn is running, or a pick is applying. */
+  backendDisabled?: boolean
   modelName?: string
   /**
    * True when `modelName` is the model an INHERITING slot actually runs on (the

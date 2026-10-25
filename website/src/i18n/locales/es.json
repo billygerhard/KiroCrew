@@ -10334,6 +10334,14 @@
       "title": "Demasiado grande para analizar",
       "body": "{{name}} ocupa {{size}}. Los archivos de más de {{limit}} no se revisan en busca de secretos antes de descargarlos.",
       "download_anyway": "Descargar de todos modos"
+    },
+    "backendSelector": {
+      "backend_name": "Backend: {{name}}",
+      "default_backend": "Backend predeterminado",
+      "backend_list": "Lista de backends",
+      "backend_list_unavailable": "Lista de backends no disponible",
+      "no_backends_registered": "No hay backends registrados",
+      "default": "Predeterminado"
     }
   },
   "hooks": {

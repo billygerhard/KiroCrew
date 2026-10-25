@@ -10189,6 +10189,14 @@
       "title": "স্ক্যান করার পক্ষে অনেক বড়",
       "body": "{{name}} এর আকার {{size}}। {{limit}}-এর বেশি ফাইল ডাউনলোডের আগে গোপন তথ্যের জন্য পরীক্ষা করা হয় না।",
       "download_anyway": "তবুও ডাউনলোড করো"
+    },
+    "backendSelector": {
+      "backend_name": "ব্যাকএন্ড: {{name}}",
+      "default_backend": "ডিফল্ট ব্যাকএন্ড",
+      "backend_list": "ব্যাকএন্ড তালিকা",
+      "backend_list_unavailable": "ব্যাকএন্ড তালিকা পাওয়া যাচ্ছে না",
+      "no_backends_registered": "কোনো ব্যাকএন্ড নিবন্ধিত নেই",
+      "default": "ডিফল্ট"
     }
   },
   "hooks": {

@@ -10479,6 +10479,14 @@
       "title": "Слишком большой для проверки",
       "body": "Размер {{name}} — {{size}}. Файлы больше {{limit}} не проверяются на секреты перед загрузкой.",
       "download_anyway": "Всё равно скачать"
+    },
+    "backendSelector": {
+      "backend_name": "Бэкенд: {{name}}",
+      "default_backend": "Бэкенд по умолчанию",
+      "backend_list": "Список бэкендов",
+      "backend_list_unavailable": "Список бэкендов недоступен",
+      "no_backends_registered": "Нет зарегистрированных бэкендов",
+      "default": "По умолчанию"
     }
   },
   "hooks": {

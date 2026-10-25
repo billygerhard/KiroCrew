@@ -402,7 +402,8 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
+    if (backend) return this._fetchBackendModels(backend)
     try {
       const models = await api.models()
       if (!Array.isArray(models) || models.length === 0) {
@@ -441,6 +442,28 @@ export class AcpAdapter implements ProviderAdapter {
       markModelsDegraded(this.id, true)
       markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
       return readCachedModels() ?? this._defaultModels()
+    }
+  }
+
+  /** A chat's own backend pick: its harness serves its own catalog. Read
+   *  outside the configured backend's last-good cache and degraded-list health,
+   *  which describe the configured backend only; a failure offers Auto alone. */
+  private async _fetchBackendModels(backend: string): Promise<ModelInfo[]> {
+    try {
+      const models = await api.models(backend)
+      if (!Array.isArray(models) || models.length === 0) return this._defaultModels()
+      return models.map((m: RawModel) => {
+        const reported = rowWindow(m)
+        learnWindow(m.model_name, reported)
+        return {
+          name: m.model_name,
+          description: m.description || '',
+          contextWindow: reported || MODEL_TOKENS[m.model_name] || DEFAULT_CONTEXT,
+          rateMultiplier: rowMultiplier(m),
+        }
+      })
+    } catch {
+      return this._defaultModels()
     }
   }
 

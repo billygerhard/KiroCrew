@@ -10044,6 +10044,14 @@
       "title": "너무 커서 검사할 수 없음",
       "body": "{{name}}의 크기는 {{size}}입니다. {{limit}}을(를) 넘는 파일은 다운로드 전에 비밀 정보 검사를 하지 않습니다.",
       "download_anyway": "그래도 다운로드"
+    },
+    "backendSelector": {
+      "backend_name": "백엔드: {{name}}",
+      "default_backend": "기본 백엔드",
+      "backend_list": "백엔드 목록",
+      "backend_list_unavailable": "백엔드 목록을 사용할 수 없음",
+      "no_backends_registered": "등록된 백엔드 없음",
+      "default": "기본값"
     }
   },
   "hooks": {

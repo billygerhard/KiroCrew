@@ -14,6 +14,8 @@ interface SessionRostersOptions {
   activeSlotProject: string | undefined
   refreshTrigger: number
   dispatch: AppDispatch
+  /** The active chat's own backend pick (`null` = the configured backend). */
+  activeSlotBackend?: string | null
 }
 
 /**
@@ -21,7 +23,7 @@ interface SessionRostersOptions {
  * session: this machine's catalog. Also the agent picker's filter state and its
  * "set as default" write.
  */
-export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch }: SessionRostersOptions) {
+export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch, activeSlotBackend }: SessionRostersOptions) {
   const { agents: installedAgents, displayAgents, choices: catalogChoices, displayChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
   // The picker's rows, unfolded, as the sidebar last loaded them: the session
   // list marks a same-name pair's sessions from these (#19472).
@@ -51,7 +53,7 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const effectiveModels = useAvailableModels()
+  const effectiveModels = useAvailableModels({ backend: activeSlotBackend })
   return {
     installedAgents, sidebarAgents, sidebarChoices, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,

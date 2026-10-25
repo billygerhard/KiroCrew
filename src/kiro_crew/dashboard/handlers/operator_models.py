@@ -9,10 +9,13 @@ declared in ``harnesses.json`` are the only ones it accepts, so those are the ro
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from kiro_crew import model_registry
 from kiro_crew.agent_sdk.backends_registered import registered_model_source
+
+if TYPE_CHECKING:
+    from aiohttp import web
 
 #: The model source a descriptor declares when it lists its ids itself.
 MODEL_SOURCE_STATIC = "static"
@@ -40,3 +43,21 @@ def static_descriptor_models(backend: str) -> Optional[list[dict]]:
 
 
 __all__ = ["MODEL_SOURCE_STATIC", "static_descriptor_models"]
+
+
+def requested_models_backend(request: web.Request) -> Optional[str]:
+    """The runtime backend ``GET /api/models?backend=<id>`` names, when selectable.
+
+    The id is a stored spelling (``"kiro"``, ``"claude-seat1"``), as a chat's pick
+    and the ``/api/acp-backends`` rows carry it. Anything this build would not
+    start returns ``None``, so the caller keeps the configured backend.
+    """
+    from kiro_crew.acp_backends import backend_from_stored, selectable_backends
+
+    raw = request.query.get("backend")
+    if not raw:
+        return None
+    backend = backend_from_stored(raw)
+    if isinstance(backend, str) and backend in selectable_backends():
+        return backend
+    return None

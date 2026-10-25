@@ -314,7 +314,10 @@ from kiro_crew.dashboard.handlers.agent_templates import (  # noqa: F401
     read_only_reason_for_path,
     validate_definition_patch,
 )
-from kiro_crew.dashboard.handlers.operator_models import static_descriptor_models
+from kiro_crew.dashboard.handlers.operator_models import (
+    requested_models_backend,
+    static_descriptor_models,
+)
 from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
     owner_view_for_request,
 )
@@ -1402,14 +1405,18 @@ def _consume_refresh_exception(task: "asyncio.Task[list[dict]]") -> None:
 
 
 async def api_models(request: web.Request) -> web.Response:
-    """GET /api/models — the model list for the configured backend.
+    """GET /api/models — the model list for the configured backend, or ``?backend=``.
+
+    The query names a chat's own backend pick, so its picker lists what that
+    harness serves; an unselectable or absent value keeps the configured one.
 
     kiro-family backends read kiro-cli's ``--list-models`` catalog (narrowed to a
     live session's entitlement); advertised-selection backends read their own
     adapter's namespace, because they do not accept ids from that catalog.
     """
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    backend = getattr(cfg.agent, "acp_backend", "")
+    picked = requested_models_backend(request)
+    backend: str = picked if picked is not None else getattr(cfg.agent, "acp_backend", "")
     if backend == ACP_BACKEND_CLAUDE:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))
