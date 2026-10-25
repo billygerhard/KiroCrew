@@ -138,9 +138,10 @@ class ShareEvidence:
     #
     # Deliberately NOT "is this one of ours". Kiro Crew's own managed servers
     # differ from each other here: ``kirocrew-core`` advertises the
-    # caller-identity extension and consumes the injected caller, while
-    # ``kirocrew-cron`` does not and still reads process identity. Keying this on
-    # authorship disqualified the first for a property only the second has.
+    # caller-identity extension and consumes the injected caller, while a managed
+    # server outside ``_MANAGED_SERVERS_CALLER_AWARE`` still reads process
+    # identity. Keying this on authorship would disqualify the first for a
+    # property only the second has.
     session_bound_by_construction: bool = False
     # Did the handshake succeed? A server we could not start is UNKNOWN.
     probe_ok: bool = False
