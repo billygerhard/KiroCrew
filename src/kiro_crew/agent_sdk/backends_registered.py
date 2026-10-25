@@ -239,6 +239,9 @@ def _reset_registered_backends() -> None:
         _baseline.discard(backend_id)
         _selectable.discard(backend_id)
     _registered_known.clear()
+    from kiro_crew.agent_sdk.capability_inheritance import _reset_capabilities_from
+
+    _reset_capabilities_from()
     _registered_runtime.clear()
     _registered_session_array.clear()
     _REGISTERED_PROVIDER_LABELS.clear()
