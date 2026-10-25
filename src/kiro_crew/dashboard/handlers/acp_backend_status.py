@@ -188,6 +188,48 @@ def _sign_in_remedy(backend: str, declared: str) -> str:
     return declared
 
 
+#: Card lines that depend on Crew's own MCP servers answering inside the session.
+_CREW_SERVER_LINES = ("crew_tools", "member_thread_tools")
+
+
+def _crew_servers_withheld_from_child(backend: str) -> bool:
+    """Whether a harnesses.json backend's child cannot run Crew's own MCP servers.
+
+    A ``session_config``-routed descriptor is an ENFORCED host: its child runs
+    under a credential mask that withholds the SEL trust root and the internal
+    API secret (``sandbox_leaves._CREW_CHILD_WITHHELD_LEAVES``), so an in-child
+    ``kirocrew mcp-core`` cannot attest the session and refuses every tool. Crew's
+    servers reach such a session only as MCP gateway stubs, which run outside the
+    mask. So the card's Crew-tool lines hold for it only when the gateway is on
+    and ``kirocrew-core`` (which ``kirocrew-dashboard`` follows) is stubbed.
+    """
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.agent_sdk.operator_backend_registry import is_registered_backend
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    if not is_registered_backend(backend):
+        return False
+    try:
+        if not acp_tool_gate.adapter_hidden_credential_dirs(backend):
+            return False
+        gateway = KiroCrewConfig.load().mcp_gateway
+    except Exception:  # noqa: BLE001 - an unreadable answer is not a claim either way
+        logger.debug("crew-server reach check failed for %s", backend, exc_info=True)
+        return False
+    return not (gateway.enabled and "kirocrew-core" in gateway.stub_servers)
+
+
+def _with_crew_server_reach(backend: str, card: Dict[str, Any]) -> Dict[str, Any]:
+    """*card* with its Crew-tool lines withdrawn when Crew's servers cannot reach the child."""
+    if not _crew_servers_withheld_from_child(backend):
+        return card
+    card["capabilities"] = [
+        {**line, "available": False} if line.get("id") in _CREW_SERVER_LINES else line
+        for line in card.get("capabilities", [])
+    ]
+    return card
+
+
 def _row(state: Any, selectable: set) -> Dict[str, Any]:
     """One backend's wire row, from its install state and the selectable set.
 
@@ -252,7 +294,7 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
         # ``sign_in_remedy`` above, and the reason it can be translated at
         # all: a capability label is reused by every harness, so a new
         # harness costs no locale edit while a new LINE costs thirteen.
-        **card_payload(state.backend),
+        **_with_crew_server_reach(state.backend, card_payload(state.backend)),
     }
 
 

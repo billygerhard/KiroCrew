@@ -257,3 +257,35 @@ def test_the_card_payload_counts_six_of_seven_for_a_seat(seats):
     payload = card_payload("seat-explicit")
     available = [line["id"] for line in payload["capabilities"] if line["available"]]
     assert len(payload["capabilities"]) == 7 and len(available) == 6
+
+
+@pytest.mark.parametrize(
+    "enabled, stubs, withheld",
+    [(False, [], True), (True, [], True), (True, ["kirocrew-core"], False)],
+)
+def test_crew_tool_lines_follow_whether_crews_servers_reach_a_masked_child(
+    seats, monkeypatch, enabled, stubs, withheld
+):
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.handlers import acp_backend_status
+
+    cfg = KiroCrewConfig()
+    cfg.mcp_gateway.enabled = enabled
+    cfg.mcp_gateway.stub_servers = stubs
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls, *a, **k: cfg))
+    # agy is session_config-routed (masked); strands is agent_spec-routed (not).
+    monkeypatch.setattr(
+        acp_tool_gate,
+        "adapter_hidden_credential_dirs",
+        lambda backend: ("/masked",) if backend != "strands" else (),
+    )
+    for backend, expect_withheld in (("agy", withheld), ("strands", False), ("claude", False)):
+        card = acp_backend_status._with_crew_server_reach(backend, card_payload(backend))
+        held = {line["id"] for line in card["capabilities"] if line["available"]}
+        if expect_withheld:
+            assert not held & {"crew_tools", "member_thread_tools"}, backend
+        else:
+            assert held == {
+                line["id"] for line in card_payload(backend)["capabilities"] if line["available"]
+            }, backend
