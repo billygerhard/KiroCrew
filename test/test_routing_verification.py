@@ -967,6 +967,22 @@ async def test_the_probe_marker_names_the_agent_the_probe_runs_under(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_the_probe_cwd_is_handed_over_resolved(tmp_path):
+    """A host that checks edit targets against its workspace roots must see the
+    resolved scratch path: on macOS the temp root sits under ``/var`` ->
+    ``/private/var``, and Antigravity refused the probe edit as "outside the
+    workspace" without asking when handed the unresolved one."""
+    seen = {}
+
+    def build(session_key, cwd):
+        seen["cwd"] = cwd
+        return _FakeProvider([LLMEvent(kind=EVENT_COMPLETE)], cwd=cwd)
+
+    await verify_routing(_descriptor(_stub(tmp_path)), build, timeout=5)
+    assert seen["cwd"] == os.path.realpath(seen["cwd"])
+
+
+@pytest.mark.asyncio
 async def test_unrelated_permission_requests_are_denied_but_are_not_evidence(tmp_path):
     """A host that asks about OTHER things and never asks about the probe write
     has proven nothing about that write: inconclusive, nothing recorded -- and

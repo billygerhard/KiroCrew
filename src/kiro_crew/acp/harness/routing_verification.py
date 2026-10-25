@@ -1039,7 +1039,12 @@ async def verify_routing(
             elapsed_secs=time.monotonic() - started,
         )
 
-    scratch = tempfile.mkdtemp(prefix="kirocrew-routing-probe-")
+    # Resolved: on macOS the temp root sits under the ``/var`` -> ``/private/var``
+    # symlink, and a host that checks edit targets against its workspace roots
+    # (Antigravity) compares the resolved target with the unresolved root, calls
+    # the probe file "outside the workspace" and refuses the edit before ever
+    # asking -- so the edit class is never observed and the run is inconclusive.
+    scratch = os.path.realpath(tempfile.mkdtemp(prefix="kirocrew-routing-probe-"))
     probe_path = os.path.join(scratch, PROBE_FILE_NAME)
     permission_requests = 0
     unrelated_requests = 0
