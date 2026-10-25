@@ -129,3 +129,28 @@ def test_an_agent_file_descriptor_is_handed_no_array(registered):
         pytest.skip("descriptor without routing was not registered")
     assert not has_mirror("no-routing")
     assert mirror_for("no-routing") is None
+
+
+def test_a_harness_floor_raises_only_upward():
+    from kiro_crew.sandbox_tiers import raise_sandbox_mode
+
+    assert raise_sandbox_mode("off", "") == "off"
+    assert raise_sandbox_mode("off", "standard") == "standard"
+    assert raise_sandbox_mode("strict", "standard") == "strict"
+
+
+def test_only_a_descriptor_declares_a_sandbox_floor(tmp_path, wrapper):
+    from kiro_crew.acp.harness import harness_for
+
+    entry = _seat("floor-seat", wrapper, "Floor Seat")
+    entry["min_sandbox"] = "standard"
+    harnesses = tmp_path / "floor.json"
+    harnesses.write_text(json.dumps({"floor-seat": entry}), encoding="utf-8")
+    try:
+        assert load_and_register_operator_descriptors(path=harnesses) == ["floor-seat"]
+        assert harness_for("floor-seat").min_sandbox_tier == "standard"
+        assert harness_for("").min_sandbox_tier == ""
+    finally:
+        _reset_registered_backends()
+        _reset_operator_register()
+        _reset_operator_diagnostics()
