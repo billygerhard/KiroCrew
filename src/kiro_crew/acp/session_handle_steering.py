@@ -26,9 +26,13 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp import batch_guard
 from kiro_crew.acp.session_handle_runtime_contract import AcpRuntimeDead
+from kiro_crew.acp.steering_identity import (
+    steering_request_meta,
+    steering_request_ready,
+    takes_steering_request,
+)
 from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER_RETRACT,
-    ACP_BACKENDS_STEERING_REQUEST,
     EVENT_STEER_CONSUMED,
     MAX_STEERING_ANSWERS,
     MAX_STEERING_TEXT_CHARS,
@@ -46,7 +50,6 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     goose_announced_run,
     goose_steer_echo_id,
-    steering_advertised,
     steering_outcome,
     wrap_user_message,
 )
@@ -92,8 +95,8 @@ async def steer(self: AcpSessionHandle, message: str) -> bool:
         if sent:
             trace_steps.steered(trace_steps.STEER_INTERRUPT, source=self)
         return sent
-    if self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST:
-        if not steering_advertised(self.initialize_result):
+    if takes_steering_request(self._runtime):
+        if not steering_request_ready(self._runtime):
             # The process's handshake did not advertise ``_session/steering``
             # (``_meta.steering.supported: true``): nothing is sent, and the
             # caller queues the text as the next turn.
@@ -101,6 +104,9 @@ async def steer(self: AcpSessionHandle, message: str) -> bool:
         # A session whose own harness state carries the per-chat client's steering
         # floor (claude's ``ClaudeSharedSession``) is steered as that client steers.
         claude = callable(getattr(_harness_state(self), "_steering_adapter_floor_met", None))
+        # A harnesses.json Claude seat has no such state; its handshake proved
+        # the adapter and its floor (``steering_identity``).
+        seat = not claude and steering_request_meta(self._runtime) is not None
         if claude and not _claude_steer_ready(self):
             # As the per-chat client: below the adapter release that takes the
             # request, or while a tool call of the turn is open (claude moves a
@@ -109,7 +115,10 @@ async def steer(self: AcpSessionHandle, message: str) -> bool:
             # shortcut: the per-chat client holds such a steer until the tool
             # call ends; hold it here too if queueing proves too late.
             return False
-        sent = await self._steer_via_steering_request(text, idle_prompt_required=claude)
+        if seat and (self._tool_tracker.current is not None or self._tool_dispatched):
+            # The same adapter, so the same open-tool-call hold.
+            return False
+        sent = await self._steer_via_steering_request(text, idle_prompt_required=claude or seat)
         if sent:
             trace_steps.steered(trace_steps.STEER_INTERRUPT, source=self)
         return sent
@@ -574,7 +583,7 @@ def _note_steering_denial(self: AcpSessionHandle) -> None:
     queued by the caller. A no-op on every other backend, whose reject does
     not discard injected text.
     """
-    if self._runtime.acp_backend not in ACP_BACKENDS_STEERING_REQUEST:
+    if not takes_steering_request(self._runtime):
         return
     self._turn_steering_denied = True
 

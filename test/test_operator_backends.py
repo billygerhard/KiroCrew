@@ -208,3 +208,35 @@ def test_an_antigravity_shell_call_carries_a_verifiable_command():
     assert _command_from_tool_params({"CommandLine": "ls -la", "Cwd": "/tmp"}) == "ls -la"
     assert _command_from_tool_params({"commandLine": "pwd"}) == "pwd"
     assert _command_from_tool_params({"command": "id", "CommandLine": "pwd"}) == "id"
+
+
+def test_a_steerable_claude_adapter_takes_the_steering_request_under_any_id():
+    from types import SimpleNamespace
+
+    from kiro_crew.acp.steering_identity import (
+        claude_adapter_reported,
+        steering_request_meta,
+        steering_request_ready,
+        takes_steering_request,
+    )
+
+    steering = {"steering": {"supported": True}}
+    init = {
+        "agentInfo": {"name": "@agentclientprotocol/claude-agent-acp", "version": "0.94.0"},
+        "_meta": steering,
+    }
+    assert claude_adapter_reported(init)
+    seat = SimpleNamespace(
+        acp_backend="claude-seat1", initialize_result=init, agent_version="0.94.0"
+    )
+    assert takes_steering_request(seat) and steering_request_ready(seat)
+    assert steering_request_meta(seat) == {"steering": {"idleBehavior": "promptRequired"}}
+    old = SimpleNamespace(**{**vars(seat), "agent_version": "0.60.0"})
+    assert not takes_steering_request(old)
+    quiet_init = {"agentInfo": init["agentInfo"]}
+    quiet = SimpleNamespace(**{**vars(seat), "initialize_result": quiet_init})
+    assert not takes_steering_request(quiet)
+    codex = SimpleNamespace(acp_backend="codex", initialize_result={"_meta": steering})
+    assert takes_steering_request(codex) and steering_request_meta(codex) is None
+    assert steering_request_ready(codex)
+    assert not steering_request_ready(SimpleNamespace(acp_backend="codex", initialize_result={}))
