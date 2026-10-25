@@ -94,16 +94,16 @@ class DescriptorHarness(MembershipHarness):
         re-checks ``tool_gate.is_enforced`` itself, so an ``agent_spec`` descriptor
         gets an empty mask with no identity test here.
         """
-        from kiro_crew.acp import client as client_mod
+        from kiro_crew.acp.harness import descriptor_exec
         from kiro_crew.acp.harness.codex import resolve_spawn_masks
         from kiro_crew.acp.session_handle import AcpRuntimeError
 
         exe, search_path = await asyncio.to_thread(
-            client_mod.resolve_descriptor_executable, self._descriptor.executable
+            descriptor_exec.resolve_descriptor_executable, self._descriptor.executable
         )
         if not exe:
             raise AcpRuntimeError(
-                client_mod.descriptor_executable_not_found_message(
+                descriptor_exec.descriptor_executable_not_found_message(
                     self._descriptor.id, self._descriptor.executable, search_path
                 )
             )
