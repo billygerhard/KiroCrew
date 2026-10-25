@@ -527,6 +527,11 @@ class AcpRuntime:
         # binary THIS process is executing, which can differ from the one on
         # disk after an in-place upgrade. Empty until the handshake completes.
         self._agent_version = ""
+        # Whether ``initialize`` advertised ``_meta.steering.supported`` and named
+        # claude-agent-acp: what lets a harnesses.json seat take
+        # ``_session/steering`` (``steering_identity``). False until the handshake.
+        self._steering_advertised = False
+        self._claude_adapter = False
         # Entitlement probe state (probe_advertised_models): single-flight lock
         # plus a short-TTL cache of the last non-empty answer.
         self._entitlement_probe_lock = asyncio.Lock()
@@ -844,6 +849,16 @@ class AcpRuntime:
         spawned before it.
         """
         return self._agent_version
+
+    @property
+    def steering_advertised(self) -> bool:
+        """Whether ``initialize`` advertised ``_meta.steering.supported``."""
+        return self._steering_advertised
+
+    @property
+    def claude_adapter(self) -> bool:
+        """Whether ``initialize`` named claude-agent-acp, whatever the backend id."""
+        return self._claude_adapter
 
     @property
     def stdin_stall_death(self) -> bool:

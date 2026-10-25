@@ -10,7 +10,7 @@ binds it by name, so it reads and writes the runtime's own state on the instance
 of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``,
-``_can_load_session``, ``_child_pids``, ``_derived_spec_snapshot``, ``_exit_watch_task``,
+``_can_load_session``, ``_child_pids``, ``_claude_adapter``, ``_derived_spec_snapshot``, ``_exit_watch_task``,
 ``_initialized``, ``_kas_host_auth``, ``_last_activity``, ``_launch_copy_spec``,
 ``_launch_cwd_roots``, ``_launch_process_cwd``, ``_max_age_secs``,
 ``_max_rss_depth``, ``_max_rss_mb``, ``_native_launch_resources``,
@@ -19,7 +19,8 @@ Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``
 ``_prompt_capabilities``, ``_reader_task``, ``_sandbox_cleanup``, ``_sandbox_mode``,
 ``_scope_unit``,
 ``_skill_projection_generation``, ``_spawn_monotonic``, ``_spawn_skill_projection``,
-``_spawn_start_token``, ``_start_time``, ``_stderr_task``, ``_tool_search_wire``.
+``_spawn_start_token``, ``_start_time``, ``_steering_advertised``, ``_stderr_task``,
+``_tool_search_wire``.
 
 ``_with_mcp_sign_in_storage`` (a plain function handed the runtime) also writes
 ``_mcp_secret_server``.
@@ -53,11 +54,13 @@ from kiro_crew.acp.client import (
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
 )
+from kiro_crew.acp.client_turn_control import steering_advertised
 from kiro_crew.acp.harness import SpawnContext, SpawnPlan
 from kiro_crew.acp.launch import LaunchRequest, LaunchTools, launch
 from kiro_crew.acp.runtime_process_tree import ChildRecord, _kill_escaped_children
 from kiro_crew.acp.runtime_tree_kill import _prune_dead_descendants
 from kiro_crew.acp.session_handle import AcpRequestTimeout, AcpRuntimeError, AcpRuntimeOverloaded
+from kiro_crew.acp.steering_identity import claude_adapter_reported
 from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.agent import ensure_agent_materialized
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
@@ -1000,6 +1003,8 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
         _prompt_caps = init_resp.get("agentCapabilities", {}).get("promptCapabilities", {})
         self._prompt_capabilities = _prompt_caps if isinstance(_prompt_caps, dict) else {}
         self._agent_version = agent_version_from_init(init_resp)
+        self._steering_advertised = steering_advertised(init_resp)
+        self._claude_adapter = claude_adapter_reported(init_resp)
 
         # The subprocess has now read its agent spec, which closes the window the
         # pre-spawn snapshot opened: a write landing before this point is caught
