@@ -617,6 +617,7 @@ _SESSION_ANSWERS: dict[str, Any] = {
     "aflush": None,
     # No agentSpawn hook ran, so none is kept.
     "agent_spawn_context": (),
+    "allocation_backend_override": None,
     "allocation_requested_model": "",
     "begin_turn": None,
     # The healthy session cuts its turn cleanly at the ceiling: the native

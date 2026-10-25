@@ -822,8 +822,14 @@ async def _settle_session_model(
         # for the boundary. Backfilling the served (old) model here would
         # overwrite that "" and the boundary would then apply the old model,
         # silently undoing the pick — the same guard the completion backfill
-        # carries (``turn_stats``).
-        if crew_model and not slot._deferred_model_switch_key:
+        # carries (``turn_stats``). A backend switch clears ``slot.model`` and
+        # queues ``_pending_reset_history_key`` the same way, so it is held
+        # off too: the served model belongs to the backend being left.
+        if (
+            crew_model
+            and not slot._deferred_model_switch_key
+            and not slot._pending_reset_history_key
+        ):
             slot.model = _backfill_canonical_model(client, provider_name) or slot.model
     elif is_new or resumed:
         # Record the verdict for BOTH answers, not only the withhold: it is

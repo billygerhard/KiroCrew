@@ -34,8 +34,9 @@ if TYPE_CHECKING:
         refresh_materialized_agents,
         resolve_agent_bindings,
         resolve_session_agent_bindings,
-        select_provider_backend,
         shutdown_event,
+        slot_backend,
+        slot_backend_override,
         subprocess_executor,
     )
     from kiro_crew.dashboard.chat_turn.app_agent_binding import (
@@ -43,10 +44,7 @@ if TYPE_CHECKING:
         app_agent_binding_applies,
     )
     from kiro_crew.dashboard.chat_turn.crew_log_attribution import _slot_predecessor_store
-    from kiro_crew.dashboard.chat_turn.model_fallback import (
-        _app_allocation_kwargs,
-        _slot_backend_allocation_kwargs,
-    )
+    from kiro_crew.dashboard.chat_turn.model_fallback import _app_allocation_kwargs
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
     from kiro_crew.dashboard.chat_turn.turn_context import _require_session_memory_assignment
 
@@ -528,7 +526,7 @@ def schedule_eager_spawn(
     return task
 
 
-def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str]:
+def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str, str]:
     """The slot bindings an eager handshake bakes into the session it registers.
 
     ONE definition, because two exist to be compared: ``_eager_spawn`` snapshots
@@ -546,6 +544,7 @@ def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str]:
         slot.memory_store,
         # The namespace the name is read in: a kind change is a binding change.
         slot.agent_kind,
+        slot.backend,
     )
 
 
@@ -812,18 +811,14 @@ async def _eager_spawn(
             # same fresh-session path it always does. The backend is the
             # factory's own selection for this key, and the prefetch allocates
             # with no channel identity.
-            from kiro_crew.crewmate_harness import crewmate_backend_pin
-            from kiro_crew.members import session_backend_pick
-
-            pick = session_backend_pick(session_key)
             if allow_resume and resume_takes_tool_search_replay(
                 tool_search=cfg.agent.tool_search,
-                backend=select_provider_backend(
-                    session_key,
+                backend=slot_backend(
+                    slot,
                     cfg.agent.member_acp_backend,
                     cfg.agent.acp_backend,
-                    backend_override=pick,
-                    crew_backend=crewmate_backend_pin(cfg, session_key) if pick is None else None,
+                    session_key,
+                    config=cfg,
                 ),
                 channel_id=None,
                 session_key=session_key,
@@ -983,6 +978,12 @@ async def _spawn_admitted_prefetch(
         # allocation resolves the default-model ladder itself, exactly as it
         # will for the first real turn.
         _requested_model = slot.model or agent_model or ""
+        _picked = slot_backend_override(slot)
+        _pick = _picked.get("backend_override")
+        if _pick is not None and slot_backend(slot, "", "", session_key, _picked) != _pick:
+            # As in turn admission: a pick the gate degrades to its fallback
+            # does not send the model chosen for the pick.
+            _requested_model = ""
         try:
             _, is_new, resumed = await sessions.get_or_create(
                 session_key,
@@ -1002,7 +1003,7 @@ async def _spawn_admitted_prefetch(
                 reasoning_effort_override=slot.reasoning_effort or None,
                 start_priority=start_priority,
                 **_app_allocation_kwargs(slot),
-                **_slot_backend_allocation_kwargs(slot),
+                **_picked,
             )
         except (SpeculativeResumeRefused, SessionClosingError, SessionEndingError):
             # A refusal, a gateway shutdown, or a key being ended: no agent

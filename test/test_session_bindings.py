@@ -186,6 +186,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "agent_autocompact_default": ("function", False, "486b646f770f", "turn_context"),
     "agent_spawn_context": ("function", False, "4be47402b13f", "turn_context"),
     "allocation_predecessor": ("function", False, "f1d40e624ae4", "claims"),
+    "allocation_backend_override": ("function", False, "4b576121a346", "claims"),
     "allocation_requested_model": ("function", False, "f1d40e624ae4", "claims"),
     "any_active_turn": ("function", False, "a6632a57e602", "claims"),
     "approval_revocation": ("function", False, "028659ce42ac", "claims"),

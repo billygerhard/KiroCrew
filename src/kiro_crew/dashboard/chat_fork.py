@@ -1277,6 +1277,9 @@ async def fork_slot(
     # ``stamp`` sets, and a child withdrawn inside the block is never announced.
     # The block's only await is the memory bind; the transcript copy and its
     # save stay outside it, so other slots' frames wait at most that long.
+    # The backend pick is read with the model it belongs to (the model is that
+    # backend's id), before the bind below can suspend and let a switch split them.
+    fork_backend = slot.backend
     with state.suspend_slots_push():
         new_slot = state.get_or_create_slot(
             name=None,
@@ -1343,6 +1346,10 @@ async def fork_slot(
                 folder_principal=folder_principal,
                 promote=_promote_from_ephemeral,
             )
+            new_slot.backend = fork_backend
+            from kiro_crew.members import note_session_backend_pick
+
+            note_session_backend_pick(new_slot.key, fork_backend)
             if stamp is not None:
                 stamp(new_slot)
         except Exception:

@@ -529,6 +529,7 @@ def _read_app_agent_owner(r: _Read) -> None:
         r.slot.app_agent_owner = owner
 
 
+
 def _read_project(r: _Read) -> None:
     from kiro_crew.dashboard.transcript_binding import seed_project_from_disk
 
@@ -986,10 +987,10 @@ FIELDS: tuple[Field, ...] = (
         _ALL,
         attr="backend",
         line=_truthy(lambda s: s.backend),
-        # Truthy in the merge too, and not slot-owned (``SLOT_OWNED_META_KEYS``):
-        # the pick is set once, at creation, and never cleared, so a carried-forward
-        # copy is always current and a line without one stays byte-identical to main's.
-        merge=_truthy(lambda s: s.backend),
+        # Always in the merge: the in-chat backend switch can clear the pick back
+        # to the gateway default, and a carried-forward older pick must not
+        # survive that.
+        merge=_always(lambda s: s.backend),
         read=_read_backend,
     ),
     Field(
