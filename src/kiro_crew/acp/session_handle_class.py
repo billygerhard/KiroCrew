@@ -45,14 +45,13 @@ from kiro_crew.acp.session_handle_watchdog import (
     _load_watchdog_settings,
 )
 from kiro_crew.acp.skill_reads import SkillReadTracker
+from kiro_crew.acp.steering_identity import steering_request_ready, takes_steering_request
 from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_RETRACT,
-    ACP_BACKENDS_STEERING_REQUEST,
     AcpEvent,
     AcpPromptStats,
     JsonRpcMessage,
-    steering_advertised,
 )
 from kiro_crew.recovery.ladder import InfraError
 
@@ -885,12 +884,11 @@ class AcpSessionHandle:
         for one would advertise the steer affordance and then meet the user's
         mid-turn correction with ``-32601``.
         """
-        backend = self._runtime.acp_backend
-        if backend in ACP_BACKENDS_STEER:
+        if self._runtime.acp_backend in ACP_BACKENDS_STEER:
             return True
-        return backend in ACP_BACKENDS_STEERING_REQUEST and steering_advertised(
-            self.initialize_result
-        )
+        # A harnesses.json claude-agent-acp host (a Claude seat) is identified from
+        # its handshake, since no backend-id table can name it.
+        return steering_request_ready(self._runtime)
 
     @property
     def supports_steer_retract(self) -> bool:
@@ -928,7 +926,7 @@ class AcpSessionHandle:
         provider-wrapper surfaces (messaging channels, Side Chat, ``spawn_steer``)
         read this and queue instead.
         """
-        return self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST
+        return takes_steering_request(self._runtime)
 
     # ── State tracking ──
 

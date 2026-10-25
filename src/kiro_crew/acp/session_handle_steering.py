@@ -24,9 +24,13 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp.session_handle_runtime_contract import AcpRuntimeDead
+from kiro_crew.acp.steering_identity import (
+    steering_request_meta,
+    steering_request_ready,
+    takes_steering_request,
+)
 from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER_RETRACT,
-    ACP_BACKENDS_STEERING_REQUEST,
     MAX_STEERING_ANSWERS,
     MAX_STEERING_TEXT_CHARS,
     METHOD_CANCEL,
@@ -37,7 +41,6 @@ from kiro_crew.acp.types import (
     STEERING_INJECTED,
     STEERING_STARTED_NEW_TURN,
     STOP_REASON_END_TURN,
-    steering_advertised,
     steering_outcome,
     wrap_user_message,
 )
@@ -75,8 +78,8 @@ async def steer(self: AcpSessionHandle, message: str) -> bool:
     text = (message or "").strip()
     if not text or not self._session_id:
         return False
-    if self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST:
-        if not steering_advertised(self.initialize_result):
+    if takes_steering_request(self._runtime):
+        if not steering_request_ready(self._runtime):
             # The process's handshake did not advertise ``_session/steering``
             # (``_meta.steering.supported: true``): nothing is sent, and the
             # caller queues the text as the next turn.
@@ -231,10 +234,14 @@ async def _steer_via_steering_request(self: AcpSessionHandle, text: str) -> bool
                     break
         self._steering_settled.pop(entry[0][0], None)
 
+    params: dict[str, Any] = {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+    meta = steering_request_meta(self._runtime)
+    if meta is not None:
+        params["_meta"] = meta
     try:
         answer = await self._runtime.send_request_for_answer(
             METHOD_SESSION_STEERING,
-            {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+            params,
             on_registered=_register,
         )
     except BaseException as exc:
@@ -510,6 +517,6 @@ def _note_steering_denial(self: AcpSessionHandle) -> None:
     queued by the caller. A no-op on every other backend, whose reject does
     not discard injected text.
     """
-    if self._runtime.acp_backend not in ACP_BACKENDS_STEERING_REQUEST:
+    if not takes_steering_request(self._runtime):
         return
     self._turn_steering_denied = True
