@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import subprocess
@@ -25,7 +26,7 @@ from typing import Any, Coroutine
 
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform_compat_identity import _windows_process_handle_identity
-from kiro_crew.platform_compat_liveness import pgroup_of, pid_exists
+from kiro_crew.platform_compat_liveness import pgroup_has_live_member, pgroup_of, pid_exists
 from kiro_crew.platform_compat_native import (
     _OWN_PGID,
     _SUBPROCESS_NO_WINDOW,
@@ -64,7 +65,10 @@ def pgroup_exists(pgid: int) -> bool:
     escaped-children reapers, not this.
 
     POSIX: ``os.killpg(pgid, 0)`` -- conservative on EPERM and on an integer
-    outside the native ``pid_t`` range (both read as alive/unknown). Windows:
+    outside the native ``pid_t`` range (both read as alive/unknown), except an
+    EPERM from a group whose listing holds no running member
+    (:func:`_group_eperm_means_gone`): macOS answers a zombie-only group that
+    way, and it reads as empty. Windows:
     process groups in this sense do not exist and ``kill_process_tree`` already
     walks the whole child tree via ``taskkill /T``, so the group id (== the
     launcher pid) is probed as a plain pid via :func:`pid_exists`. A value wider
@@ -85,9 +89,50 @@ def pgroup_exists(pgid: int) -> bool:
         # Persisted owner markers can be syntactically numeric without fitting
         # pid_t. Unknown identity is not proof that cleanup is safe.
         return True
+    except PermissionError:
+        return not _group_eperm_means_gone(pgid)
     except OSError:
         return True  # exists but we can't signal it
     return True
+
+
+def _group_eperm_means_gone(pgid: int) -> bool:
+    """Whether an ``EPERM`` from ``killpg(pgid, …)`` is a group with nothing left running.
+
+    macOS answers ``killpg`` on a group whose leader has exited and whose only
+    members are zombies with ``EPERM``, not ``ESRCH`` (measured: signal 0 and
+    SIGKILL alike, until the zombie is collected, after which it is ``ESRCH``).
+    Read as "a member we may not signal", that turned every teardown racing its
+    own child watcher into a kill failure on a tree that had already ended.
+
+    True only when the group's listing was read and holds no running member
+    (:func:`pgroup_has_live_member` is False). A running member -- another
+    user's process, a sandboxed one -- keeps the ``EPERM`` a real refusal, and
+    an unreadable listing keeps it too: a group is never called gone on missing
+    evidence.
+    """
+    return pgroup_has_live_member(pgid) is False
+
+
+def _killpg_reaping(pgid: int, sig: int) -> None:
+    """``os.killpg``, with an ``EPERM`` from a group with no running member raised as ``ProcessLookupError``.
+
+    The kill shims' callers already read ``ProcessLookupError`` as "the group
+    has emptied, nothing to kill"; a zombie-only group on macOS is exactly
+    that (:func:`_group_eperm_means_gone`). Any other ``EPERM`` propagates as
+    it was raised.
+    """
+    try:
+        os.killpg(pgid, sig)
+    except PermissionError as exc:
+        if not _group_eperm_means_gone(pgid):
+            raise
+        logger.debug(
+            "killpg(%d): EPERM from a group with no running member; reading it as gone", pgid
+        )
+        raise ProcessLookupError(
+            errno.ESRCH, f"process group {pgid} has no running member (EPERM from an exited group)"
+        ) from exc
 
 
 def _raise_taskkill_error(pid: int, rc: int, stderr: bytes) -> None:
@@ -151,8 +196,9 @@ def kill_process_group(pgid: int, sig: int = SIGTERM) -> bool:
     resolve anything from a pid at signal time: ``os.getpgid(pid)`` of a pid the
     kernel has since handed to another process names that process's group.
     ``os.killpg(pgid, sig)`` in-process, **letting exceptions propagate**
-    (``ProcessLookupError`` when the group has emptied, ``PermissionError``
-    when a member is unsignalable).
+    (``ProcessLookupError`` when the group has emptied -- including macOS's
+    ``EPERM`` for a group with no running member left, :func:`_killpg_reaping`
+    -- and ``PermissionError`` when a running member is unsignalable).
 
     Carries the same broadcast guard as :func:`kill_process_tree`, refusing
     with ``ValueError`` instead of degrading: ``killpg(1, sig)`` is ``kill(-1,
@@ -166,7 +212,7 @@ def kill_process_group(pgid: int, sig: int = SIGTERM) -> bool:
         raise OSError("kill_process_group: no POSIX process groups on this platform")
     if type(pgid) is not int or pgid <= 1 or pgid == _OWN_PGID:
         raise ValueError(f"kill_process_group: refusing broadcast/self process group {pgid!r}")
-    os.killpg(pgid, sig)
+    _killpg_reaping(pgid, sig)
     return True
 
 
@@ -204,7 +250,7 @@ def kill_process_tree(pid: int, sig: int = SIGTERM) -> bool:
             )
             os.kill(pid, sig)
             return True
-        os.killpg(pgid, sig)
+        _killpg_reaping(pgid, sig)
         return True
     taskkill_bin = trusted_system_bin("taskkill")
     if taskkill_bin is None:

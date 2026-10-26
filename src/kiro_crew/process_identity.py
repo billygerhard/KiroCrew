@@ -311,7 +311,39 @@ def _tree_survived(handle: ProcessHandle) -> bool:
         # the registry still answers by root pid alone.
         return platform_compat.windows_tree_cleanup_pending(handle.pid, handle.start_id)
     number = handle.pgid if handle.pgid is not None else handle.pid
+    # A group held only by zombies -- the exited leader its parent has not
+    # collected yet -- has nothing left running: ``killpg(pgid, 0)`` still
+    # answers for it (and on macOS answers EPERM), so the listing decides
+    # whenever it can be read.
+    if platform_compat.pgroup_has_live_member(number) is False:
+        return False
     return platform_compat.pgroup_exists(number)
+
+
+def _listed_as_zombie(pid: int) -> bool:
+    """Whether the kernel LISTS *pid* and lists it as a zombie -- positive evidence only.
+
+    ``pid_is_zombie`` reads an unlisted pid as finished on macOS, which is right
+    for "has it stopped running" but is not evidence that THIS pid is an
+    exited, uncollected process; here only the kernel's own record of a zombie
+    counts (``sysctl KERN_PROC_PID`` on macOS, the ``stat`` state on Linux).
+    """
+    if sys.platform == "darwin":
+        facts = platform_compat.darwin_kinfo_proc(pid)
+        return facts is not None and facts.zombie
+    return platform_compat.pid_is_zombie(pid) is True
+
+
+def _leader_running(pid: int) -> bool:
+    """Whether *pid* is present and not a zombie.
+
+    ``pid_exists`` answers True for an exited leader its parent has not
+    collected yet (``kill(pid, 0)`` reaches a zombie), and the gateway's child
+    watcher collects it asynchronously, so a survivor check run right after a
+    clean reset reads the leader as standing. A zombie has finished; a state
+    that cannot be read leaves the liveness answer as it is.
+    """
+    return platform_compat.pid_exists(pid) and not _listed_as_zombie(pid)
 
 
 def _child_start_of(record: Any) -> str | None:
@@ -420,7 +452,10 @@ def process_survived(handle: ProcessHandle) -> bool:
     read through a query handle, which opens for an EXITED process for as long
     as any handle to the process object is still held (the transport's, until
     GC), so identity alone does not say alive there; ``pid_exists`` confirms
-    the exit code. The tree case is POSIX's process group -- a leader that
+    the exit code. A zombie leader -- exited, not yet collected by the
+    gateway's child watcher -- has finished too (:func:`_leader_running`), and
+    so has a group whose listing holds only zombies (:func:`_tree_survived`).
+    The tree case is POSIX's process group -- a leader that
     exited after a late child spawn leaves members under its group id -- and
     Windows's exact-tree cleanup pin, still pending for this root's identity
     when descendants or cleanup debt outlived it; a gone leader is asked for
@@ -443,10 +478,10 @@ def process_survived(handle: ProcessHandle) -> bool:
         return True
     actual_start = platform_compat.get_process_start_id(pid)
     if actual_start is None:
-        return platform_compat.pid_exists(pid) or _tree_survived(handle)
+        return _leader_running(pid) or _tree_survived(handle)
     if handle.start_id is not None and actual_start != handle.start_id:
         return _tree_survived(handle)  # recycled: our leader is gone; its group may not be
-    return platform_compat.pid_exists(pid) or _tree_survived(handle)
+    return _leader_running(pid) or _tree_survived(handle)
 
 
 async def process_survived_async(handle: ProcessHandle) -> bool:
@@ -622,6 +657,8 @@ async def _signal_retained_group(
     try:
         platform_compat.kill_process_group(pgid, platform_compat.SIGKILL)
     except ProcessLookupError:
+        # Also macOS's EPERM for a group with no running member left -- the
+        # exited leader's zombie -- which the shim raises as this.
         logger.debug("%s: process group %d emptied before the signal for %s", who, pgid, key)
         return None
     except ValueError as exc:
@@ -629,6 +666,13 @@ async def _signal_retained_group(
         return failure_name(exc)
     except OSError as group_exc:
         failure = failure_name(group_exc)
+        if isinstance(group_exc, PermissionError):
+            # The shim lets EPERM through only while a running member stands
+            # (or the group could not be listed): a real refusal, named so.
+            failure = (
+                f"{failure} (process group {pgid} still has a running member this "
+                "gateway may not signal, or could not be listed)"
+            )
         if not leader_alive or pid is None:
             logger.error(
                 "%s: SIGKILL of process group %d (exited leader %s) failed for %s: %s",
