@@ -11,7 +11,7 @@ Instance fields written: ``_between_turn_credits``, ``_claude_compaction_pending
 ``_codex_compaction_pending``, ``_compaction_failed_at``, ``_mcp_notifications``,
 ``last_compaction_transient``.
 
-Instance fields read: ``_model``, ``_resolved_model_id``, ``last_prompt_stats``,
+Instance fields read: ``_acp_backend``, ``_model``, ``_resolved_model_id``, ``last_prompt_stats``,
 ``memory_mode``.
 """
 
@@ -30,6 +30,7 @@ from kiro_crew.acp._dispatch import (
     parse_usage_update,
     redact_text,
 )
+from kiro_crew.acp import seat_rate_limits
 from kiro_crew.acp.client_timeouts import _POST_COMPACTION_METADATA_GRACE_SECS, _READ_TIMEOUT
 from kiro_crew.acp.transport_errors import (
     AcpError,
@@ -89,6 +90,8 @@ def _track_usage_update(self: AcpClient, msg: JsonRpcMessage) -> None:
         cost = parse_usage_cost(update)
         if cost is not None:
             self.last_prompt_stats.apply_cost_cumulative(cost)
+        # Plan usage (claude seam): feeds the seat picker without a /usage probe.
+        seat_rate_limits.record(getattr(self, "_acp_backend", None), update)
     elif kind == UPDATE_CONFIG_OPTION:
         self._handle_config_option_update(msg)
     elif self._is_claude and kind and kind not in KNOWN_SESSION_UPDATES:
