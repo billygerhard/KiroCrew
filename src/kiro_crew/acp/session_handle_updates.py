@@ -35,6 +35,7 @@ from kiro_crew.acp._dispatch import (
     release_tool_call_provenance,
     scoped_tool_cache_key,
 )
+from kiro_crew.acp import seat_rate_limits
 from kiro_crew.acp.codex_subagent_wire import SUBAGENT_LIFECYCLE_UPDATES
 from kiro_crew.acp.liveness import (
     INTERACTIVE_NONE,
@@ -367,6 +368,8 @@ def _handle_update(self: AcpSessionHandle, msg: JsonRpcMessage) -> list[AcpEvent
         cost = parse_usage_cost(update)
         if cost is not None:
             self.last_prompt_stats.apply_cost_cumulative(cost)
+        # Plan usage (claude seam): feeds the seat picker without a /usage probe.
+        seat_rate_limits.record(getattr(self._runtime, "acp_backend", None), update)
         return []
 
     # config_option_update: ACP pushes updated configOptions (e.g. after
