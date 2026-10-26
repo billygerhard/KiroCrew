@@ -341,7 +341,9 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
     from kiro_crew.platform_compat_kill import (  # noqa: F401
         REAP_TIMEOUT_SECS,
         _discard_output_until_exit,
+        _group_eperm_means_gone,
         _isolated_group_of_live_child,
+        _killpg_reaping,
         _raise_taskkill_error,
         _run_cleanup_shielded,
         _shares_own_process_group,
@@ -398,6 +400,7 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         PID_UNSIGNALABLE,
         is_thread_group_leader,
         live_thread_group_leaders,
+        pgroup_has_live_member,
         pgroup_of,
         pgroup_of_leader,
         pid_exists,

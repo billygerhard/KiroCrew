@@ -120,7 +120,11 @@ async def _teardown_run_session_impl(
                 self._manager._sessions.release(session_key, cleanup=False)
             except Exception:
                 logger.warning("Subagent %s: release failed", info.id, exc_info=True)
-            if not info._reap_started:
+            if info._ending_claimed and not info.error:
+                # A completed run keeps its result; the undecided kill is
+                # left to reconciliation, as for a failed one below.
+                info._leaked_process = True
+            elif not info._reap_started:
                 info.error = with_kill_failure(
                     info.error or "",
                     f"{failure_name(exc)}: the teardown was cancelled before its kill decided",
@@ -229,7 +233,21 @@ async def _teardown_run_session_impl(
                 # with ``leaked_process``, so the next start ends the
                 # process without announcing the run a second time
                 # (``_end_leaked_processes_impl``).
-                info.error = with_kill_failure(info.error or "", kill_failed)
+                #
+                # A run that claimed its completed ending with no error keeps
+                # it: the work is done and reported as done, and a teardown
+                # problem after the turn is the gateway's, not the run's. The
+                # failure goes to the log and the audit row below, and the
+                # process is still flagged leaked for reconciliation.
+                if info._ending_claimed and not info.error:
+                    logger.warning(
+                        "Subagent %s completed; its teardown kill failed afterwards and is "
+                        "kept off the result (flagged for reconciliation): %s",
+                        info.id,
+                        kill_failed,
+                    )
+                else:
+                    info.error = with_kill_failure(info.error or "", kill_failed)
                 tombstone = read_tombstone(info.id)
                 if tombstone is None:
                     info._leaked_process = True
@@ -270,7 +288,11 @@ async def _teardown_run_session_impl(
             # retained handle before cancelling and its own arm writes the
             # kill's outcome, so a second record here would name the kill
             # twice.
-            if not info._reap_started:
+            if info._ending_claimed and not info.error:
+                # A completed run keeps its result; the undecided kill is
+                # left to reconciliation, as for a failed one below.
+                info._leaked_process = True
+            elif not info._reap_started:
                 info.error = with_kill_failure(
                     info.error or "",
                     f"{failure_name(exc)}: the teardown was cancelled before its kill decided",

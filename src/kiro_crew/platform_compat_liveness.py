@@ -19,7 +19,9 @@ from ctypes import wintypes
 from kiro_crew.platform_compat_native import IS_LINUX, IS_POSIX
 from kiro_crew.platform_compat_proctable import (
     _LINUX_EXITED_STATES,
+    darwin_pgroup_members,
     darwin_pid_is_zombie,
+    linux_pgroup_members,
     read_proc_stat,
     read_proc_status_int,
 )
@@ -268,6 +270,40 @@ def pid_is_zombie(pid: int) -> bool | None:
         return stat.state in _LINUX_EXITED_STATES
     if sys.platform == "darwin":
         return darwin_pid_is_zombie(pid)
+    return None
+
+
+def pgroup_has_live_member(pgid: int) -> bool | None:
+    """Whether process group *pgid* still holds a RUNNING member: True / False, None when unknown.
+
+    ``killpg(pgid, 0)`` cannot answer this. A zombie leader keeps the group
+    answering on Linux, and on macOS a group whose only members are zombies
+    answers ``EPERM`` -- to signal 0 and SIGKILL alike, measured -- rather than
+    ``ESRCH``, which reads as "a member we may not signal". This lists the
+    group instead: ``sysctl KERN_PROC_PGRP`` on macOS
+    (:func:`darwin_pgroup_members`, zombies flagged) and one ``/proc`` pass on
+    Linux (:func:`linux_pgroup_members`, finished processes left out).
+
+    False only on positive evidence: a macOS listing that names the group's
+    members and every one of them is a zombie. An empty listing is None -- the
+    group may have emptied, or the number never named a group, and neither is
+    the "held open by an exited leader" shape this answers. Linux leaves its
+    zombies out of the listing, so it can say True (a running member) but
+    never tell a zombie-only group from an empty one: None. None also when the
+    listing cannot be read or the platform has none, so a caller that turns
+    False into "the group is gone" never does it on missing evidence. Never
+    signals anything.
+    """
+    if pgid <= 1:
+        return None
+    if sys.platform == "darwin":
+        members = darwin_pgroup_members(pgid)
+        if not members:
+            return None
+        return any(not member.zombie for member in members)
+    if sys.platform == "linux":
+        running = linux_pgroup_members(pgid)
+        return True if running else None
     return None
 
 

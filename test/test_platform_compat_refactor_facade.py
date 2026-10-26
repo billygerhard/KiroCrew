@@ -222,6 +222,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
     "kiro_crew.platform_compat_liveness": tuple("""
         PID_DEAD PID_ALIVE PID_UNSIGNALABLE live_thread_group_leaders is_thread_group_leader
         pid_liveness pgroup_of pgroup_of_leader pid_exists pid_is_zombie process_thread_count
+        pgroup_has_live_member
         """.split()),
     "kiro_crew.platform_compat_identity": tuple("""
         process_cwd get_ppid _ANCESTRY_MAX_DEPTH _PYTHON_INTERPRETER_NAME
@@ -287,7 +288,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         kill_process_tree_pinned kill_pid_pinned kill_pid_async kill_process_tree_async
         REAP_TIMEOUT_SECS _shares_own_process_group kill_popen_tree kill_and_reap
         _run_cleanup_shielded _isolated_group_of_live_child _discard_output_until_exit
-        terminate_and_reap terminate_and_reap_sync
+        terminate_and_reap terminate_and_reap_sync _group_eperm_means_gone _killpg_reaping
         """.split()),
     "kiro_crew.platform_compat_metrics": tuple("""
         _MACH_TASK_BASIC_INFO _MachTimeValue _MachTaskBasicInfo _MACH_TASK_BASIC_INFO_COUNT
