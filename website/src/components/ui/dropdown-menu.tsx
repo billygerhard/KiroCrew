@@ -31,6 +31,9 @@ type DropdownMenuProps = React.ComponentProps<typeof DropdownMenuPrimitive.Root>
 
 const DropdownTriggerSink = createTriggerContext()
 
+/** The menu's open state and setter, so a touch trigger can open it on `click` (see `DropdownMenuTrigger`). */
+const DropdownOpenContext = React.createContext<{ open: boolean; setOpen: (next: boolean) => void } | null>(null)
+
 /**
  * Radix `DropdownMenu.Root`, plus two rules.
  *
@@ -70,6 +73,7 @@ function DropdownMenu({ open: openProp, defaultOpen, onOpenChange, modal: modalP
     onOpenChange?.(next)
   }, [isControlled, onOpenChange])
   const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
+  const openContext = React.useMemo(() => ({ open, setOpen: handleOpenChange }), [open, handleOpenChange])
 
   useCloseOnFileDrag(open && modal, close)
   useCloseWhenCrewHidden(open, close)
@@ -96,20 +100,46 @@ function DropdownMenu({ open: openProp, defaultOpen, onOpenChange, modal: modalP
     <MaybeGuideRevealScope id={guideScope} open={open}>
       <DropdownTriggerSink.Provider value={setTrigger}>
         <ProbeHoldContext.Provider value={probeHold.held}>
-          <DropdownMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
+          <DropdownOpenContext.Provider value={openContext}>
+            <DropdownMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
+          </DropdownOpenContext.Provider>
         </ProbeHoldContext.Provider>
       </DropdownTriggerSink.Provider>
     </MaybeGuideRevealScope>
   )
 }
 
-/** Radix `DropdownMenu.Trigger`; it also tells its menu which element it is (for a guide's probe). */
+/**
+ * Radix `DropdownMenu.Trigger`; it also tells its menu which element it is (for a guide's probe).
+ *
+ * A touch opens the menu on the tap's `click`, not on `pointerdown`. Radix
+ * toggles on `pointerdown` for every pointer type, so on a phone a scroll whose
+ * finger landed on a trigger (a ⋮ on a list row) opened that menu before the
+ * browser could tell the touch was a scroll. A scroll never produces a `click`.
+ * Preventing the touch `pointerdown` makes Radix skip its own handler; it does
+ * not cancel the scroll, which only a `touchstart` preventDefault would. Mouse
+ * and pen keep opening on press.
+ */
 const DropdownMenuTrigger = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Trigger>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Trigger>
->(function DropdownMenuTrigger(props, ref) {
+>(function DropdownMenuTrigger({ onPointerDown, onClick, ...props }, ref) {
   const setRef = useTriggerRef(DropdownTriggerSink, ref)
-  return <DropdownMenuPrimitive.Trigger ref={setRef} {...props} />
+  const openState = React.useContext(DropdownOpenContext)
+  const touchPress = React.useRef(false)
+  const disabled = props.disabled
+  const handlePointerDown = React.useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    onPointerDown?.(event)
+    touchPress.current = event.pointerType === 'touch'
+    if (touchPress.current && openState && !disabled) event.preventDefault()
+  }, [onPointerDown, openState, disabled])
+  const handleClick = React.useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    onClick?.(event)
+    const fromTouch = touchPress.current
+    touchPress.current = false
+    if (fromTouch && openState && !disabled && !event.defaultPrevented) openState.setOpen(!openState.open)
+  }, [onClick, openState, disabled])
+  return <DropdownMenuPrimitive.Trigger ref={setRef} onPointerDown={handlePointerDown} onClick={handleClick} {...props} />
 })
 DropdownMenuTrigger.displayName = DropdownMenuPrimitive.Trigger.displayName
 const DropdownMenuGroup = DropdownMenuPrimitive.Group
