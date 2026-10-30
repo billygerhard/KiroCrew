@@ -75,6 +75,7 @@ from kiro_crew.sandbox import (
     CRON_SCRIPT_CHILD_ENV,
     SandboxUnavailableError,
     cgroup_scope_argv,
+    configured_sandbox_mode,
     popen_limited,
     run_limited,
     wrap_argv,
@@ -100,6 +101,15 @@ def _envelope_line(stdout: str, tag: str) -> str:
         if line.startswith(tag):
             return line[len(tag) :]
     raise LookupError("no launcher status line")
+
+
+def _cron_sandbox_mode() -> str:
+    """``cc`` for script and command crons, or ``off`` when the operator set
+    ``agent.sandbox='off'``. Crons run with the same confinement as the agents
+    that write them; a stricter cron sandbox only breaks jobs (e.g. a config.json
+    write) that an unsandboxed agent shell could do anyway. Secret-granted
+    scripts keep ``strict`` at their call site regardless."""
+    return "off" if configured_sandbox_mode() == "off" else "cc"
 
 
 def run_script_sandboxed(
@@ -399,7 +409,7 @@ def run_script_sandboxed(
         # the existing route an operator already approves per job: a vault
         # secret_env grant, which runs ``strict`` and injects the one approved
         # secret instead of exposing a store.
-        sandbox_mode = "strict" if stdin_payload is not None else "cc"
+        sandbox_mode = "strict" if stdin_payload is not None else _cron_sandbox_mode()
         # ``seal_hidden_dirs=hidden``: a granted script has no business WRITING into
         # the crons dir or its own parent -- they are hidden so it cannot read a mutable
         # sibling, and on Linux a hidden dir's stand-in is a writable empty tmpfs, so a
@@ -965,7 +975,7 @@ def run_command_sandboxed(
         cron_scratch = _allocate_cron_scratch(job_id)
         sandboxed_argv, sandbox_cleanup = wrap_argv(
             argv,
-            mode="cc",
+            mode=_cron_sandbox_mode(),
             extra_private_dirs=(str(cron_scratch),) if cron_scratch is not None else (),
         )
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
