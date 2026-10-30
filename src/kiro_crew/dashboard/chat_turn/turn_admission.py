@@ -119,17 +119,26 @@ if TYPE_CHECKING:
 def _off_backend_pick(state, slot, cfg, live) -> bool:
     """Whether *live* runs a backend other than the one *slot* is picked onto.
 
-    Only a picked chat, or one whose session was started on a pick (one
-    cleared while a hard Stop's respawn on it was starting), is judged; other
-    unpicked chats follow the gateway default as before.
+    A picked chat, or one whose session was started on a pick (one cleared
+    while a hard Stop's respawn on it was starting), is judged against its
+    pick. An unpicked chat is judged against the gateway default only when the
+    live backend and the default share a session family (the Claude seats):
+    the seat failover rotates the default off a full seat, and an unpicked
+    chat left on the old seat's process kept hitting that seat's limit while
+    the dashboard showed it on the new one (2026-10-30). Moving within a
+    family resumes the same session, so nothing is replayed. Other unpicked
+    chats follow the gateway default as before.
     """
     key = effective_session_key(slot)
     if live is None:
         return False
-    if not slot_backend_override(slot) and state.sessions.allocation_backend_override(key) is None:
-        return False
     picked = slot_backend(slot, cfg.agent.member_acp_backend, cfg.agent.acp_backend, key)
-    return capabilities_of(live).backend != picked
+    running = capabilities_of(live).backend
+    if not slot_backend_override(slot) and state.sessions.allocation_backend_override(key) is None:
+        from kiro_crew.agent_sdk.operator_backend_registry import same_session_family
+
+        return running != picked and same_session_family(running, picked)
+    return running != picked
 
 
 def _arm_reset_off_backend_pick(state, slot, cfg) -> None:
