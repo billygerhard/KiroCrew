@@ -41,5 +41,6 @@ reviewer:
 4. Moves the file to `submitted/` or `declined/` with the outcome in the front matter,
    then commits and pushes to this branch.
 
-A draft that references a fix on the fork should link the commit so the reviewer can
-cherry-pick it onto a fresh branch from upstream `main`.
+A fix on the fork is a quick unblock, not a design. A draft may link the commit as
+evidence that the problem is real, but the reviewer writes any upstream fix from scratch
+against upstream `main` and leaves the fork commit out of the filed issue body.
