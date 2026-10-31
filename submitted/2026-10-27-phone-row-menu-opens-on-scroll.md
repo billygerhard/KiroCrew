@@ -1,4 +1,6 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/26835
+pr: https://github.com/kirodotdev/KiroCrew/pull/26847 (fix written from scratch; the fork commit was not used)
 title: Phone sidebar: a scroll that starts on a chat row's ⋮ button opens the row menu
 labels: bug
 ---
