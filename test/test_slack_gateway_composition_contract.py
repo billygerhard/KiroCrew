@@ -280,6 +280,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("_schedule_memory_preparation", "method", "(self) -> \"'asyncio.Task[None] | None'\""),
         ("_wait_for_memory_preparation", "async method", "(self) -> 'bool'"),
         ("_repair_member_memory_once", "method", "(self) -> 'None'"),
+        ("_embedding_repair_pressure", "method", "(self) -> 'str | None'"),
         ("_repair_member_memory", "async method", "(self) -> 'None'"),
         ("_start_embeddings", "async method", "(self) -> 'None'"),
         ("_auto_migrate_memory", "async method", "(self) -> 'None'"),

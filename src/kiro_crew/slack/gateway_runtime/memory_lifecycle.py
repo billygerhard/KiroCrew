@@ -298,11 +298,55 @@ def _repair_member_memory_once(self: GatewayOrchestrator) -> None:
     )
 
 
+def _embedding_repair_pressure(self: GatewayOrchestrator) -> str | None:
+    """Why the host is too busy for a repair round right now, or ``None``.
+
+    A round runs the local embedding model inside the gateway process, beside the
+    event loop, and its backlog keeps. On a host short of memory or CPU it only
+    adds load where the loop can least afford it, so it waits. The signals are
+    the ones ``resource_status`` reports and the subagent gate holds on. Fails
+    open: a signal that cannot be read never defers a round.
+    """
+    from kiro_crew import resource_status
+
+    if resource_status.pressure_level_held(resource_status.read_memory_pressure_level()):
+        return "kernel memory pressure"
+    try:
+        status = resource_status.probe()
+    except Exception:
+        return None
+    if status.posture in (resource_status.POSTURE_TIGHT, resource_status.POSTURE_CRITICAL):
+        return f"memory {status.posture}"
+    # Past 4 runnable tasks per core the loop is already waiting for CPU.
+    if status.load_per_cpu is not None and status.load_per_cpu >= 4.0:
+        return f"load {status.load_per_cpu}/core"
+    return None
+
+
 async def _repair_member_memory(self: GatewayOrchestrator) -> None:
-    """Run one paced repair loop across already-open V1 and V2 stores."""
+    """Run one paced repair loop across already-open V1 and V2 stores.
+
+    Every 30 s while the host is clear. While it is busy (see
+    ``_embedding_repair_pressure``) rounds are skipped, waiting 30 s doubling to
+    5 min, with one log line when the pause starts and one when it ends.
+    """
     loop = asyncio.get_running_loop()
+    paused_for: str | None = None
+    backoff = 30.0
     while not self._memory_repair_stop.is_set():
         try:
+            busy = await loop.run_in_executor(embed_executor(), self._embedding_repair_pressure)
+            if busy:
+                if paused_for is None:
+                    logger.info("Memory embedding repair paused while the host is busy (%s)", busy)
+                paused_for = busy
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300.0)
+                continue
+            if paused_for is not None:
+                logger.info("Memory embedding repair resumed (was paused for %s)", paused_for)
+                paused_for = None
+                backoff = 30.0
             await loop.run_in_executor(embed_executor(), self._repair_member_memory_once)
         except asyncio.CancelledError:
             self._memory_repair_stop.set()

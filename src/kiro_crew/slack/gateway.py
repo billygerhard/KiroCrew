@@ -1004,6 +1004,7 @@ class GatewayOrchestrator:
     _schedule_memory_preparation = _memory_lifecycle._schedule_memory_preparation
     _wait_for_memory_preparation = _memory_lifecycle._wait_for_memory_preparation
     _repair_member_memory_once = _memory_lifecycle._repair_member_memory_once
+    _embedding_repair_pressure = _memory_lifecycle._embedding_repair_pressure
     _repair_member_memory = _memory_lifecycle._repair_member_memory
     _start_embeddings = _memory_lifecycle._start_embeddings
     _auto_migrate_memory = _memory_lifecycle._auto_migrate_memory
