@@ -30,6 +30,7 @@ import sys
 import sys as _sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -91,6 +92,30 @@ def _cron_sandbox_mode() -> str:
     return "off" if configured_sandbox_mode() == "off" else "cc"
 
 
+#: Waits before re-checking a script path whose sensitive-path check stalled.
+_STALL_RETRY_DELAYS_SECS = (2.0, 5.0, 10.0)
+
+
+def _resolve_script_path_retrying(script_path: str) -> tuple[str, str]:
+    """``resolve_script_path`` that retries a resolver STALL (never a policy match).
+
+    The stall refusal is fail-closed but explicitly "not a match, retry after a short
+    wait"; on a loaded host the 2s budget misses now and then, and failing the whole
+    run turned a transient stall into a failed job and an inbox alert. Runs on the
+    scheduler's worker thread (this function already blocks on the child process).
+    """
+    from kiro_crew.security import is_unverifiable_path_refusal
+
+    for delay in (*_STALL_RETRY_DELAYS_SECS, None):
+        try:
+            return resolve_script_path(script_path, allow_bundle_roots=True)
+        except PermissionError as e:
+            if delay is None or not is_unverifiable_path_refusal(str(e)):
+                raise
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def run_script_sandboxed(
     script_path: str,
     job_id: str,
@@ -132,7 +157,7 @@ def run_script_sandboxed(
 
     # A PERSISTED spec (see resolve_script_path): an app cron's stored path
     # points into its bundle, which no authoring path may name.
-    file_path_str, func_name = resolve_script_path(script_path, allow_bundle_roots=True)
+    file_path_str, func_name = _resolve_script_path_retrying(script_path)
 
     import_dir_str = os.path.dirname(file_path_str)
     resolved_secret_env: dict[str, str] = {}
