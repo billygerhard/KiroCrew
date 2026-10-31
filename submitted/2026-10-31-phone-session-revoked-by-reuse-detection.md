@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/26824
 title: Tailnet-verified phone sessions get revoked by refresh-token reuse detection while in active use
 labels: bug
 ---

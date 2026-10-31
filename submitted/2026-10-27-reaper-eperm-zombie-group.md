@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/26822
 title: macOS: completed sub-agent marked failed with "kill failed: PermissionError" (EPERM from a zombie-only process group)
 labels: bug
 ---

@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/26823
 title: Gateway freezes for hours when its thread pool stalls, but the loop-stall watchdog never fires
 labels: bug
 ---

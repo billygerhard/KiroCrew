@@ -1,4 +1,5 @@
 ---
+declined: folded into https://github.com/kirodotdev/KiroCrew/issues/26823 as its consequence section (same root cause, one issue)
 title: Idle sweep expires a session whose user message never got a reply, without telling the user
 labels: bug
 ---

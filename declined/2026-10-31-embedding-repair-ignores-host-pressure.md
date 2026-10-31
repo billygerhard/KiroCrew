@@ -1,4 +1,5 @@
 ---
+declined: posted as a comment on the related open issue instead of a duplicate: https://github.com/kirodotdev/KiroCrew/issues/7368#issuecomment-6548474326
 title: Background embedding repair keeps running local inference while the host is under memory pressure
 labels: bug
 ---
