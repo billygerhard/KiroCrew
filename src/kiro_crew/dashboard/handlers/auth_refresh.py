@@ -602,41 +602,51 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
                 _expire_foreign_port_cookies(resp, request)
                 _audit(user_id, "refresh_token_use", "grace_replay")
                 return resp
-        # Genuine reuse → revoke the chain.
-        # We use the now+MAX_REFRESH_TTL_SECS as the eviction floor so the
-        # revocation outlives any token in this chain.
-        # Wrap in to_thread: revoke_chain does sync file I/O (mode=0o600
-        # atomic-rename writes to refresh_chains.json) — must not block
-        # the event loop.
-        revoked_durably = await asyncio.to_thread(
-            state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS
-        )
-        if not revoked_durably:
-            # The revocation is in memory and not on disk. Reporting the chain revoked here
-            # would be the one claim this endpoint must not make on a lost write: reuse
-            # detection is what turns a stolen refresh token into a dead chain, and a restart
-            # loads a store that never saw this record while the chain's current token is
-            # still valid. The presented token is refused either way -- the degraded mark makes
-            # every validation fail closed for the life of this process -- so the difference is
-            # only in what the caller is told, and an operator reading the audit trail must not
-            # see a revocation that did not happen.
-            _audit(user_id, "refresh_token_use", "reuse_revocation_not_persisted", chain_id)
-            resp = web.json_response(
-                {
-                    "error": "Refresh-token reuse was detected for this chain, but the "
-                    "revocation could not be stored, so it is not guaranteed to outlive a "
-                    "gateway restart. Repair the gateway's storage and restart, then treat "
-                    "every session on this chain as compromised.",
-                    "code": "refresh_state_unavailable",
-                },
-                status=503,
+        # LOCAL PATCH (billy/next-setup): an identity-bound chain only reaches
+        # this line after the peer check above proved the request comes from the
+        # same daemon-verified tailnet device that opened the chain. A stale jti
+        # from that device is iOS freezing the home-screen app mid-rotation, not
+        # theft -- a thief would also need to BE that tailnet device. Rotate
+        # forward (fall through to the mint) instead of revoking the 30-day
+        # session. Unbound chains keep the strict revoke-on-reuse posture.
+        if require_peer:
+            _audit(user_id, "refresh_token_use", "reuse_tolerated_verified_peer", chain_id)
+        else:
+            # Genuine reuse → revoke the chain.
+            # We use the now+MAX_REFRESH_TTL_SECS as the eviction floor so the
+            # revocation outlives any token in this chain.
+            # Wrap in to_thread: revoke_chain does sync file I/O (mode=0o600
+            # atomic-rename writes to refresh_chains.json) — must not block
+            # the event loop.
+            revoked_durably = await asyncio.to_thread(
+                state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS
             )
+            if not revoked_durably:
+                # The revocation is in memory and not on disk. Reporting the chain revoked here
+                # would be the one claim this endpoint must not make on a lost write: reuse
+                # detection is what turns a stolen refresh token into a dead chain, and a restart
+                # loads a store that never saw this record while the chain's current token is
+                # still valid. The presented token is refused either way -- the degraded mark makes
+                # every validation fail closed for the life of this process -- so the difference is
+                # only in what the caller is told, and an operator reading the audit trail must not
+                # see a revocation that did not happen.
+                _audit(user_id, "refresh_token_use", "reuse_revocation_not_persisted", chain_id)
+                resp = web.json_response(
+                    {
+                        "error": "Refresh-token reuse was detected for this chain, but the "
+                        "revocation could not be stored, so it is not guaranteed to outlive a "
+                        "gateway restart. Repair the gateway's storage and restart, then treat "
+                        "every session on this chain as compromised.",
+                        "code": "refresh_state_unavailable",
+                    },
+                    status=503,
+                )
+                _clear_refresh_cookie(resp, request)
+                return resp
+            _audit(user_id, "refresh_token_use", "reuse_detected", chain_id)
+            resp = web.json_response({"error": "refresh_chain_revoked"}, status=401)
             _clear_refresh_cookie(resp, request)
             return resp
-        _audit(user_id, "refresh_token_use", "reuse_detected", chain_id)
-        resp = web.json_response({"error": "refresh_chain_revoked"}, status=401)
-        _clear_refresh_cookie(resp, request)
-        return resp
 
     # Happy path: mint a fresh access + refresh pair.
     # register_nonce=False: this is a cookie-only session token (validated on the
