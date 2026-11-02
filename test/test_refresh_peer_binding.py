@@ -267,6 +267,33 @@ async def test_the_original_node_still_rotates_its_own_chain(
     assert state.chain_peer(chain_id) == LAPTOP_KEY
 
 
+@pytest.mark.asyncio
+async def test_the_owning_device_replaying_a_stale_jti_rotates_instead_of_revoking(
+    state: RefreshStateManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LOCAL PATCH: iOS freezing the home-screen app mid-rotation replays an old
+    refresh cookie from the SAME verified device; that must not end the session."""
+    trust = _trust()
+    minted = await _exchange(trust, monkeypatch, node="laptop.tail.ts.net")
+    stale = _refresh_cookie_of(minted)
+    monkeypatch.setattr(
+        h, "resolve_forwarded_peer", AsyncMock(return_value=_peer("laptop.tail.ts.net"))
+    )
+    first = await h.api_auth_refresh(_refresh_request(stale, trust=trust))
+    assert first.status == 200
+    # Past the multi-tab grace window, so only the patch can save it.
+    monkeypatch.setattr(rt, "REFRESH_GRACE_SECS", -1)
+
+    replay = await h.api_auth_refresh(_refresh_request(stale, trust=trust))
+
+    assert replay.status == 200
+    _v, _u, _r, chain_id, _j, _e = rt.validate_refresh_token(_refresh_cookie_of(replay))
+    assert not state.is_chain_revoked(chain_id)
+    # The cookie the first rotation handed out is still live too.
+    again = await h.api_auth_refresh(_refresh_request(_refresh_cookie_of(first), trust=trust))
+    assert again.status == 200
+
+
 # --- the mint side -----------------------------------------------------------
 
 
