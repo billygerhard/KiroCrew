@@ -104,14 +104,14 @@ _BASE_MODULE_NAMES = frozenset("""
     _resolve_secret_env _safe_tail_redaction_window _scrub_grant_values _secret_env_precheck
     _shell_is_posix_strict _spawn_cancelled _split_script_spec _trusted_script_bundle_roots
     _unregister_proc _write_grant_epochs agent_scratch base64 bump_grant_epoch
-    cgroup_scope_argv child_persistence_preflight commit_grant_epoch compute_secret_env_pin
+    canonical_path_refusal cgroup_scope_argv child_persistence_preflight commit_grant_epoch compute_secret_env_pin
     config_dir contextmanager data_home dataclass delivery_fingerprint field grant_epoch_ids
     hashlib hmac is_unverifiable_path_refusal json kill_running_process kiro_agents_dir
     logger logging loopback_urlopen lru_cache os parse_json_object_line peek_grant_epoch
     platform_compat popen_limited prevalidated_gh_env re read_local_secret redact
     refuse_unaudited_on_dead_fs replace_with_retry resolve_script_path resolve_serving_port
     run_command_sandboxed run_limited run_script_sandboxed safe_read_file_bytes_nolink
-    sanitize_spec_env sel sensitive_path_refusal shutil signal subprocess sys tempfile
+    sanitize_spec_env sel shutil signal subprocess sys tempfile
     threading time tmp_env urllib validate_secret_env_grant wrap_argv
     """.split())
 

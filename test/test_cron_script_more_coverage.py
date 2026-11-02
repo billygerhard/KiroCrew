@@ -949,7 +949,7 @@ class TestPathAndSecretResolution:
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: "Blocked: x")
+        monkeypatch.setattr(cron_script, "canonical_path_refusal", lambda p: "Blocked: x")
 
         with pytest.raises(PermissionError, match="blocked by security policy"):
             resolve_script_path(f"{script}:run")
@@ -960,7 +960,25 @@ class TestPathAndSecretResolution:
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: None)
+        monkeypatch.setattr(cron_script, "canonical_path_refusal", lambda p: None)
+
+        resolved, func = resolve_script_path(f"{script}:run")
+
+        assert os.path.realpath(resolved) == os.path.realpath(str(script))
+        assert func == "run"
+
+    def test_a_stalled_resolver_pool_does_not_refuse_a_healthy_script(self, tmp_path, monkeypatch):
+        # Off the event loop the resolved path is checked inline, never on the bounded
+        # pool, so a pool stall (which is_sensitive_path reports as True) cannot fail it.
+        from kiro_crew.security import paths
+
+        crons = tmp_path / "crons"
+        crons.mkdir()
+        script = crons / "job.py"
+        script.write_text("def run(ctx): pass\n", newline="\n")
+        monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(paths, "is_sensitive_path", lambda *a, **k: True)
+        monkeypatch.setattr(paths, "sensitive_path_refusal", lambda *a, **k: "Blocked: stall")
 
         resolved, func = resolve_script_path(f"{script}:run")
 
