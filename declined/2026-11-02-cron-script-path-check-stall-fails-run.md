@@ -1,4 +1,5 @@
 ---
+declined: already reported as https://github.com/kirodotdev/KiroCrew/issues/25008 (fix PR #28245); evidence added as a comment https://github.com/kirodotdev/KiroCrew/issues/25008#issuecomment-6583800553
 title: Script crons fail when the sensitive-path resolver stalls, though the script path is already resolved
 labels: bug
 ---

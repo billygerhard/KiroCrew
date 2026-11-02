@@ -1,4 +1,5 @@
 ---
+declined: already reported as https://github.com/kirodotdev/KiroCrew/issues/28363
 title: Creating a chat in a folder fails with "project_dir refers to a sensitive path" when the path resolver stalls
 labels: bug
 ---

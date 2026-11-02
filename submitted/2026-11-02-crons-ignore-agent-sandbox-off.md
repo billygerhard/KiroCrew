@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/28385
 title: Script and command crons ignore agent.sandbox='off' and always run in the cc sandbox
 labels: bug
 ---
