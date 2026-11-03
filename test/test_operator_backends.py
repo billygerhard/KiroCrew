@@ -103,9 +103,9 @@ def test_probe_follows_the_descriptor_executable(registered):
 def test_spawn_backend_resolver_admits_a_seat_and_refuses_a_missing_one(registered):
     from kiro_crew.dashboard.messaging_api.spawn import _requested_backend
 
-    backend, refused = asyncio.run(_requested_backend("seat-a"))
+    backend, _replaced, refused = asyncio.run(_requested_backend("seat-a"))
     assert backend == "seat-a" and refused is None
-    backend, refused = asyncio.run(_requested_backend("seat-gone"))
+    backend, _replaced, refused = asyncio.run(_requested_backend("seat-gone"))
     assert backend is None and refused is not None
 
 
