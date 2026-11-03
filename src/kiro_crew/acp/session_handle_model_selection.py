@@ -770,7 +770,9 @@ def _feed_advertised_model_cache(self: AcpSessionHandle) -> None:
     when this reports a change.
     """
     backend = self._runtime.acp_backend
-    if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+    from kiro_crew.agent_sdk.backends_registered import uses_advertised_model_selection
+
+    if not uses_advertised_model_selection(backend):
         return
     ids = advertised_model_ids(self._available_models)
     if not ids:
