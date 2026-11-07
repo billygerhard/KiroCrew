@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/32640
 title: WebFetch of a public URL is refused because the sensitive-path resolver treats the URL as a file path and stalls
 labels: bug
 ---
