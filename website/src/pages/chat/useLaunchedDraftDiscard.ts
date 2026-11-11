@@ -37,7 +37,7 @@ const SERVER_STATE = new Set<string>([
 ])
 
 /** Every field a session switch registers, typed so a new field must be added. */
-const SWITCH_FIELDS: Record<SlotSwitchField, true> = { model: true, project: true, agent: true, reasoning_effort: true }
+const SWITCH_FIELDS: Record<SlotSwitchField, true> = { model: true, project: true, agent: true, reasoning_effort: true, backend: true }
 
 /** Whether a settings switch for the session is staged or still on the wire: its
  *  pick reaches the session's row only once the request succeeds. */
