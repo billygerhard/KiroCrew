@@ -149,12 +149,17 @@ def _off_backend_pick(state, slot, cfg, live) -> bool:
     key = effective_session_key(slot)
     if live is None:
         return False
-    picked = slot_backend(slot, cfg.agent.member_acp_backend, cfg.agent.acp_backend, key)
     running = capabilities_of(live).backend
     if not slot_backend_override(slot) and state.sessions.allocation_backend_override(key) is None:
         from kiro_crew.agent_sdk.operator_backend_registry import same_session_family
 
+        # Only a live session in a family can be off the default it follows,
+        # so any other one is settled without resolving the default.
+        if not same_session_family(running, running):
+            return False
+        picked = slot_backend(slot, cfg.agent.member_acp_backend, cfg.agent.acp_backend, key)
         return running != picked and same_session_family(running, picked)
+    picked = slot_backend(slot, cfg.agent.member_acp_backend, cfg.agent.acp_backend, key)
     return running != picked
 
 
