@@ -537,6 +537,28 @@ MAX_BATCH_TOKENS = 8192
 #: two streamed chunks is still read whole.
 _CHUNK_TAIL_CHARS = 64
 
+#: Event-loop time every window's token scans may take together per
+#: :data:`_SCAN_WINDOW_SECS`. The scans run on the loop for each streamed chunk
+#: and result, and a turn streaming a lot of text on a busy host held the loop
+#: past the loop-stall exit (2026-11-11). Past the budget the rest of that window
+#: is not read and the seen set is marked incomplete, as past
+#: :data:`MAX_SCANNED_TEXT_CHARS`.
+_SCAN_BUDGET_SECS = 0.2
+_SCAN_WINDOW_SECS = 1.0
+_scan_spent = [0.0, 0.0]  # [window start, seconds spent in it]
+
+
+def _scan_budget_left() -> bool:
+    now = time.monotonic()
+    if now - _scan_spent[0] >= _SCAN_WINDOW_SECS:
+        _scan_spent[0], _scan_spent[1] = now, 0.0
+    return _scan_spent[1] < _SCAN_BUDGET_SECS
+
+
+def _charge_scan(seconds: float) -> None:
+    _scan_spent[1] += seconds
+
+
 _keys = token_keys
 
 
@@ -710,7 +732,16 @@ class BatchWindow:
         incomplete, like :meth:`_bounded`."""
         if isinstance(text, str) and len(text) > MAX_SCANNED_TEXT_CHARS:
             self.seen.complete = False
-        return _all_tokens(text)
+        if not _scan_budget_left():
+            # Unread like text past the cap: the set is incomplete, so a skipped
+            # scan can only make the guard refuse less.
+            self.seen.complete = False
+            return frozenset()
+        started = time.perf_counter()
+        try:
+            return _all_tokens(text)
+        finally:
+            _charge_scan(time.perf_counter() - started)
 
     def _feeds(self) -> bool:
         """Whether tokens are collected now. A gated window collects only after
