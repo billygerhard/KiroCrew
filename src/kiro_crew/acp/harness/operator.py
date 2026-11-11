@@ -179,8 +179,14 @@ class DescriptorHarness(MembershipHarness):
         member_dispatch: bool = False,
         crew_panel: bool = False,
         session_key: str = "",
+        **_host_inputs: Any,
     ) -> SessionExtras:
-        """Empty. A descriptor host registers no agents over the wire."""
+        """Empty. A descriptor host registers no agents over the wire.
+
+        Takes the base's other per-session inputs (``engine_features``,
+        ``session_cwd``, ...) and ignores them, so a new one upstream cannot
+        refuse every session on a harnesses.json backend.
+        """
         return SessionExtras()
 
     def session_mcp_servers(
