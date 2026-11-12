@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/35703
 title: Batch write guard's token scan runs on the event loop and can stall the gateway into the loop-stall exit
 labels: bug
 ---
