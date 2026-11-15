@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING
 
 from kiro_crew.acp._dispatch import (
@@ -109,6 +109,37 @@ QUEUE_POLL_SECS = 5.0
 #: The frame follows within milliseconds; the bound keeps a missing one from
 #: delaying the Stop acknowledgement.
 _CANCELLED_TURN_METERING_GRACE_SECS = 0.25
+
+
+def _close_unacked_session(self: AcpSessionHandle) -> None:
+    """Close a session whose turn ignored its cancel, keeping its record.
+
+    The synthesized terminal event only unblocks the caller: the engine's turn
+    keeps running, and every tool it calls still lands (a Stop that "worked"
+    while the turn went on to spawn a worker, 2026-11-15). ``session/close``
+    ends that one session's turn without touching co-tenants, and keeps its
+    stored record, so the provider reloads the same conversation before the
+    next turn (``apply_pending_mcp_reinjection``). Only on an engine that
+    advertises ``sessionCapabilities.close``; anything else keeps the old
+    behaviour.
+    """
+    runtime = self._runtime
+    caps = (getattr(runtime, "_agent_capabilities", None) or {}).get("sessionCapabilities")
+    if not (isinstance(caps, Mapping) and isinstance(caps.get("close"), Mapping)):
+        return
+    sid = self._session_id
+
+    async def _close() -> None:
+        try:
+            await runtime.evict_session(sid)
+            logger.warning(
+                "Closed session %s after its unacked cancel; it reloads before its next turn",
+                sid,
+            )
+        except Exception:
+            logger.warning("Closing session %s after its unacked cancel failed", sid, exc_info=True)
+
+    self.closed_after_unacked_cancel = asyncio.get_running_loop().create_task(_close())
 
 
 async def _dispatch_events(
@@ -248,6 +279,7 @@ async def _dispatch_events(
                     self._cancel_grace_secs,
                     self._session_id,
                 )
+                _close_unacked_session(self)
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=STOP_REASON_CANCEL_UNACKED,
