@@ -1,4 +1,5 @@
 ---
+issue: https://github.com/kirodotdev/KiroCrew/issues/37650
 title: Stop on a shared-runtime session whose cancel goes unacked marks the turn stopped, but the engine's turn keeps running and its tool calls still land
 labels: bug
 ---
