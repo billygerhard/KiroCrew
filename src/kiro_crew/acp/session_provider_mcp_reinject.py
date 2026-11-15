@@ -33,6 +33,7 @@ Instance fields read: ``_channel_id``, ``_handle``, ``_runtime``, ``_session_key
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -121,9 +122,15 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
     record -- the conversation this apply exists to keep. Inside the scope that
     teardown is the record-keeping eviction instead.
     """
-    if not getattr(self, "_mcp_reinject_pending", False):
+    # A session closed because its turn ignored a cancel
+    # (``session_handle_dispatch._close_unacked_session``) is reloaded on the
+    # same path, so its conversation carries on. Its close already went out.
+    closed = getattr(self._handle, "closed_after_unacked_cancel", None)
+    if not isinstance(closed, asyncio.Future):
+        closed = None
+    if not getattr(self, "_mcp_reinject_pending", False) and closed is None:
         return
-    if _mcp_independent(self):
+    if closed is None and _mcp_independent(self):
         # Nothing to re-send (see ``_mcp_independent``); a mark that reached it
         # some other way is dropped rather than turned into a reload.
         self._mcp_reinject_pending = False
@@ -136,7 +143,17 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
         self._mcp_reinject_pending = False
         return
     # Consumed here, before any await: see the docstring.
+    was_pending = bool(getattr(self, "_mcp_reinject_pending", False))
     self._mcp_reinject_pending = False
+    if closed is not None:
+        # The close must land before the load, or the engine still holds the id.
+        await asyncio.wait({closed}, timeout=30.0)
+        logger.info("session %s: reloading after the close that ended its unacked turn", sid)
+    else:
+        logger.info(
+            "session %s: MCP config changed; re-sending its projection before this turn",
+            sid,
+        )
     # The same rule as the provider layer's ``_member_session_key``: a member DM
     # on a dispatch-capable backend re-mounts its dispatch server on load, and
     # this load must carry what the first one carried or the thread loses its
@@ -149,13 +166,10 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
         if is_member_session_key(self._session_key):
             member_session_key = self._session_key
     agent = old.active_agent or runtime._agent or None
-    logger.info(
-        "session %s: MCP config changed; re-sending its projection before this turn",
-        sid,
-    )
     try:
         with runtime.keep_record_on_teardown(sid):
-            await runtime.evict_session(sid)
+            if closed is None:
+                await runtime.evict_session(sid)
             new_handle = await runtime.load_session(
                 "",
                 sid,
@@ -170,8 +184,10 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
             )
     except BaseException as exc:
         # Restored on EVERY exit that is not a loaded session, a cancel included,
-        # so the change is applied at the next boundary rather than lost.
-        self._mcp_reinject_pending = True
+        # so the change is applied at the next boundary rather than lost. A
+        # closed session's mark is its handle's, which stays until the swap.
+        if was_pending:
+            self._mcp_reinject_pending = True
         if not isinstance(exc, Exception):
             raise
         logger.warning(
@@ -179,6 +195,11 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
             sid,
             exc_info=True,
         )
+        if closed is not None:
+            raise AcpError(
+                "This chat's session was closed by Stop and could not be reloaded yet; "
+                "send again, or restart the session."
+            ) from exc
         raise AcpError(
             "The MCP change could not be applied to this chat yet; "
             "send again, or restart the session to apply it."

@@ -572,6 +572,9 @@ class AcpSessionHandle:
         # unblock the caller if kiro-cli never acks the cancel.
         self._cancel_ts = 0.0
         self._cancel_grace_secs = _CANCEL_GRACE_SECS
+        # The ``session/close`` sent when a cancel went unacked, or None. The
+        # provider reloads the session before its next turn when this is set.
+        self.closed_after_unacked_cancel: asyncio.Task[None] | None = None
         self._turn_done = asyncio.Event()
         self._turn_done.set()
         # Count of prompts this handle has started. A codex steering answer reads
