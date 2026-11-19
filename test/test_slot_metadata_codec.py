@@ -55,7 +55,6 @@ _POPULATED: dict = {
     "agent": "agent-a",
     "model": "model-m",
     "reasoning_effort": "high",
-    "backend": "codex",
     "autocompact_pct": 44.0,
     "turn_timeout_secs": 28800,
     "_dismissed_source_links": {K1, K2},

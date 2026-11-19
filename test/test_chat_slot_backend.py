@@ -308,7 +308,6 @@ async def test_a_turn_allocates_its_session_with_the_pick(pick, expected):
 async def test_a_cold_picked_chat_reports_its_own_backend_for_capabilities(_floor_monkeypatch):
     from kiro_crew import members
     from kiro_crew.dashboard import chat_handlers
-
     from kiro_crew.members_parts import member_sessions
 
     seen: list = []
@@ -733,7 +732,9 @@ async def test_the_all_chats_pick_skips_a_pinned_chat_it_does_not_suit(monkeypat
     monkeypatch.setattr(
         members,
         "select_provider_backend",
-        lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_CODEX if backend_override else ACP_BACKEND_CLAUDE,
+        lambda k, m, d, *, backend_override=None, **_k: (
+            ACP_BACKEND_CODEX if backend_override else ACP_BACKEND_CLAUDE
+        ),
     )
     a = _ChatSlot("a")
     b = _ChatSlot("b")
@@ -771,7 +772,9 @@ async def test_the_all_chats_pick_rechecks_a_chat_unpinned_while_it_runs(monkeyp
     monkeypatch.setattr(
         members,
         "select_provider_backend",
-        lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_CLAUDE if backend_override else ACP_BACKEND_CODEX,
+        lambda k, m, d, *, backend_override=None, **_k: (
+            ACP_BACKEND_CLAUDE if backend_override else ACP_BACKEND_CODEX
+        ),
     )
     a = _ChatSlot("a")
     b = _ChatSlot("b")
@@ -836,7 +839,9 @@ async def test_the_app_agent_host_check_follows_the_pick(monkeypatch, pick, allo
     monkeypatch.setattr(
         members,
         "select_provider_backend",
-        lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_KIRO if backend_override is not None else ACP_BACKEND_CLAUDE,
+        lambda k, m, d, *, backend_override=None, **_k: (
+            ACP_BACKEND_KIRO if backend_override is not None else ACP_BACKEND_CLAUDE
+        ),
     )
     slot = _ChatSlot("test")
     slot.backend = pick
@@ -860,7 +865,9 @@ async def test_the_app_agent_host_check_after_a_switch_judges_the_next_turns_bac
     from kiro_crew.dashboard.chat_turn import app_agent_binding
 
     monkeypatch.setattr(
-        members, "select_provider_backend", lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_KIRO
+        members,
+        "select_provider_backend",
+        lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_KIRO,
     )
     monkeypatch.setattr(chat_runner, "_provider_backend", lambda p: "kas")
     slot = _ChatSlot("test")
@@ -889,7 +896,9 @@ async def test_a_switch_deferred_by_sub_agents_leaves_the_live_backend_answering
     from kiro_crew.dashboard.chat_turn import app_agent_binding
 
     monkeypatch.setattr(
-        members, "select_provider_backend", lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_KIRO
+        members,
+        "select_provider_backend",
+        lambda k, m, d, *, backend_override=None, **_k: ACP_BACKEND_KIRO,
     )
     monkeypatch.setattr(chat_runner, "_provider_backend", lambda p: "kas")
     monkeypatch.setattr(chat_runner, "capabilities_of", lambda p: SimpleNamespace(backend="kas"))
@@ -999,7 +1008,6 @@ async def test_the_pre_turn_backfill_leaves_a_switched_chats_cleared_model(tmp_p
         resumed=False,
         _is_refusal_retry_turn=False,
         _synthetic_recovery_turn=False,
-        crew_model="crew-pinned-model",
     )
     assert slot.model == "", slot.model
 

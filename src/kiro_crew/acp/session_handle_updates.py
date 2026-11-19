@@ -25,7 +25,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp import batch_guard
+from kiro_crew.acp import batch_guard, seat_rate_limits
 from kiro_crew.acp._dispatch import (
     MAX_ACTIVE_TOOL_CALLS,
     liveness_key,
@@ -35,7 +35,6 @@ from kiro_crew.acp._dispatch import (
     release_tool_call_provenance,
     scoped_tool_cache_key,
 )
-from kiro_crew.acp import seat_rate_limits
 from kiro_crew.acp.codex_subagent_wire import SUBAGENT_LIFECYCLE_UPDATES
 from kiro_crew.acp.liveness import (
     INTERACTIVE_NONE,

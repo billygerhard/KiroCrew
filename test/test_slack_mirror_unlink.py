@@ -125,7 +125,9 @@ class TestMirrorSuppressionAfterUnlink:
 
         # ── Linked turn: mirror MUST fire ──
         await _run_chat(state, slot, "first message")
-        assert state.slack_client.post_message.await_count >= 1, "linked turn should mirror user msg"
+        assert (
+            state.slack_client.post_message.await_count >= 1
+        ), "linked turn should mirror user msg"
         # A tool-free turn opens no task stream (it opens on the first tool call);
         # its "Thinking…" placeholder is posted, then deleted before the answer.
         _posted = [c.args[1] for c in state.slack_client.post_message.await_args_list]

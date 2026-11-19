@@ -25,7 +25,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp import compaction_summary
+from kiro_crew.acp import compaction_summary, seat_rate_limits
 from kiro_crew.acp._dispatch import (
     NATIVE_COMPACTION_CANCELLED,
     parse_codex_compaction_update,
@@ -36,7 +36,6 @@ from kiro_crew.acp._dispatch import (
     parse_usage_update,
     redact_text,
 )
-from kiro_crew.acp import seat_rate_limits
 from kiro_crew.acp.client_timeouts import _POST_COMPACTION_METADATA_GRACE_SECS, _READ_TIMEOUT
 from kiro_crew.acp.stale_compaction import consume_stale_compaction_status
 from kiro_crew.acp.transport_errors import (

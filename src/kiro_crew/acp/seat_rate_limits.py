@@ -50,7 +50,11 @@ def _windows(info: dict[str, Any]) -> dict[str, dict[str, float]]:
         if isinstance(util, bool) or not isinstance(util, (int, float)) or not math.isfinite(util):
             continue
         entry: dict[str, float] = {"utilization": max(0.0, float(util))}
-        if isinstance(resets, (int, float)) and not isinstance(resets, bool) and math.isfinite(resets):
+        if (
+            isinstance(resets, (int, float))
+            and not isinstance(resets, bool)
+            and math.isfinite(resets)
+        ):
             entry["resetsAt"] = float(resets)
         out[name] = entry
     return out
@@ -83,7 +87,9 @@ def record(backend: str | None, update: Any) -> None:
             changed = False
             for name, w in windows.items():
                 old = known.get(name) or {}
-                if old.get("utilization") != w["utilization"] or old.get("resetsAt") != w.get("resetsAt"):
+                if old.get("utilization") != w["utilization"] or old.get("resetsAt") != w.get(
+                    "resetsAt"
+                ):
                     changed = True
                 known[name] = {**w, "at": now}
             seat["at"] = now

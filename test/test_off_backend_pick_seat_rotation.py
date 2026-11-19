@@ -11,19 +11,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew.dashboard import chat_runner as cr
 from kiro_crew.agent_sdk import operator_backend_registry as registry
+from kiro_crew.dashboard import chat_runner as cr
 
 
 def _judge(monkeypatch, *, running, default, pick="", allocation=None, family=True):
     monkeypatch.setattr(cr, "effective_session_key", lambda slot: "dashboard:k")
     monkeypatch.setattr(cr, "slot_backend_override", lambda slot: pick)
-    monkeypatch.setattr(
-        cr, "slot_backend", lambda slot, member, dflt, key=None: pick or dflt
-    )
-    monkeypatch.setattr(
-        cr, "capabilities_of", lambda live: SimpleNamespace(backend=running)
-    )
+    monkeypatch.setattr(cr, "slot_backend", lambda slot, member, dflt, key=None: pick or dflt)
+    monkeypatch.setattr(cr, "capabilities_of", lambda live: SimpleNamespace(backend=running))
     monkeypatch.setattr(
         registry,
         "same_session_family",

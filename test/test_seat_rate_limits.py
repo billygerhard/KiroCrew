@@ -39,20 +39,30 @@ def _read(home):
 def test_records_windows_per_seat_and_keeps_unreported_ones(home):
     seat_rate_limits.record(
         "claude-seat1",
-        _update({
-            "five_hour": {"utilization": 0.04, "resetsAt": 1793056800},
-            "seven_day_fable": {"utilization": 0.3, "resetsAt": 1793400000},
-        }),
+        _update(
+            {
+                "five_hour": {"utilization": 0.04, "resetsAt": 1793056800},
+                "seven_day_fable": {"utilization": 0.3, "resetsAt": 1793400000},
+            }
+        ),
     )
-    seat_rate_limits.record("claude-seat1", _update({"five_hour": {"utilization": 0.06, "resetsAt": 1793056800}}))
-    seat_rate_limits.record("claude-seat2", _update({"five_hour": {"utilization": 1.0, "resetsAt": 1793050000}}))
+    seat_rate_limits.record(
+        "claude-seat1", _update({"five_hour": {"utilization": 0.06, "resetsAt": 1793056800}})
+    )
+    seat_rate_limits.record(
+        "claude-seat2", _update({"five_hour": {"utilization": 1.0, "resetsAt": 1793050000}})
+    )
 
     data = _read(home)
     w1 = data["claude-seat1"]["windows"]
     assert w1["five_hour"]["utilization"] == 0.06
-    assert w1["seven_day_fable"]["utilization"] == 0.3  # a five_hour-only reply keeps the weekly reading
+    assert (
+        w1["seven_day_fable"]["utilization"] == 0.3
+    )  # a five_hour-only reply keeps the weekly reading
     assert data["claude-seat2"]["windows"]["five_hour"] == {
-        "utilization": 1.0, "resetsAt": 1793050000, "at": data["claude-seat2"]["windows"]["five_hour"]["at"],
+        "utilization": 1.0,
+        "resetsAt": 1793050000,
+        "at": data["claude-seat2"]["windows"]["five_hour"]["at"],
     }
 
 

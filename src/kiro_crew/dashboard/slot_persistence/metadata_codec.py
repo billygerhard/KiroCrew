@@ -542,7 +542,6 @@ def _read_app_agent_owner(r: _Read) -> None:
         r.slot.app_agent_owner = owner
 
 
-
 def _read_project(r: _Read) -> None:
     from kiro_crew.dashboard.transcript_binding import seed_project_line
 

@@ -159,7 +159,9 @@ def test_a_claude_launcher_passes_the_runtime_gates(seats, seat):
     # Inheriting the table does not skip claude's own floor.
     assert not takes_steering_request(SimpleNamespace(**{**vars(ready), "agent_version": "0.60.0"}))
     other = {**init, "agentInfo": {"name": "some-other-adapter"}}
-    assert not takes_steering_request(SimpleNamespace(**{**vars(ready), "initialize_result": other}))
+    assert not takes_steering_request(
+        SimpleNamespace(**{**vars(ready), "initialize_result": other})
+    )
 
 
 def test_a_claude_launcher_gets_crews_mcp_array_on_the_runtime(seats):

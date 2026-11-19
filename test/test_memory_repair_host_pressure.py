@@ -46,7 +46,9 @@ def test_kernel_memory_pressure_defers(host):
     assert _gateway()._embedding_repair_pressure() == "kernel memory pressure"
 
 
-@pytest.mark.parametrize("posture", [resource_status.POSTURE_TIGHT, resource_status.POSTURE_CRITICAL])
+@pytest.mark.parametrize(
+    "posture", [resource_status.POSTURE_TIGHT, resource_status.POSTURE_CRITICAL]
+)
 def test_tight_or_critical_memory_defers(host, posture):
     host["status"] = _status(posture=posture)
     assert _gateway()._embedding_repair_pressure() == f"memory {posture}"
