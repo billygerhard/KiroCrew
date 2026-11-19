@@ -83,6 +83,12 @@ NOT_INHERITED: Dict[str, str] = {
         "security: claude's Side Chat confinement (read built-ins only, deny rules, "
         "no hooks) is built by AcpClient, which a descriptor never runs on"
     ),
+    "ACP_BACKENDS_CHAT_RUNTIME_SHARING": (
+        "launch: a descriptor runs on its own process, never in the shared pool"
+    ),
+    "ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS": (
+        "routing: a descriptor is on AcpRuntime for every session, not just shared chats"
+    ),
 }
 
 

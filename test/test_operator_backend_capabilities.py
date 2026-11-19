@@ -18,10 +18,12 @@ from kiro_crew.agent_sdk import backend_install
 from kiro_crew.agent_sdk.backend_cards import USER_FACING_LINES, card_for, card_payload
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKENDS_CHAT_RUNTIME_SHARING,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
+    ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS,
     ACP_BACKENDS_SIDE_READONLY,
     ACP_BACKENDS_STEERING_REQUEST,
 )
@@ -149,6 +151,8 @@ def test_a_claude_launcher_passes_the_runtime_gates(seats, seat):
     assert seat in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION  # model switch in the chat
     assert capabilities_for(seat).effort_via_config_option
     assert seat in ACP_BACKENDS_STEERING_REQUEST
+    assert seat not in ACP_BACKENDS_CHAT_RUNTIME_SHARING
+    assert seat not in ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS
 
     init = {
         "agentInfo": {"name": "@agentclientprotocol/claude-agent-acp"},
