@@ -1,6 +1,7 @@
 ---
 title: Lessons and steering are lost after compaction or resume in long dashboard chats
 labels: bug
+issue: https://github.com/kirodotdev/KiroCrew/issues/39408
 ---
 
 ## What happens
