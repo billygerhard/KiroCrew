@@ -78,6 +78,29 @@ from kiro_crew.sel_trust_root import (
 logger = logging.getLogger(__name__)
 
 
+def _trust_root_hidden(base: Path, exc: OSError) -> bool:
+    """Whether *exc* came from a trust dir that exists but this process cannot see.
+
+    The signature of a sandbox that denies the data home's ``trust`` dir: making
+    it answers "exists" (or "not permitted") while ``lstat`` on it is refused.
+    Anything this process CAN see at that name -- a planted file or link, a real
+    unreadable key -- is not this case and keeps raising.
+    """
+    if not isinstance(exc, (FileExistsError, PermissionError)):
+        return False
+    try:
+        os.lstat(base / _TRUST_SUBDIR)
+    except PermissionError:
+        return True
+    except FileNotFoundError:
+        # ``mkdir`` said it exists, ``lstat`` says it does not: only a filter
+        # between this process and the filesystem answers both.
+        return isinstance(exc, FileExistsError)
+    except OSError:
+        return False
+    return False
+
+
 def _default_dir() -> Path:
     """Resolve the SEL default dir lazily.
 
@@ -324,7 +347,32 @@ class SecurityEventLog:
         # MODULE-level _CHAIN_HOLDS registry, keyed by lock path, so sibling
         # instances in this process share it -- see _ChainHold.)
         self._lock = threading.Lock()
-        self._hmac_key = self._load_or_create_hmac_key()
+        # ``None`` while the log can sign; otherwise why it cannot (see below).
+        self._unavailable: str | None = None
+        try:
+            self._hmac_key = self._load_or_create_hmac_key()
+        except OSError as exc:
+            if not _trust_root_hidden(self._dir, exc):
+                raise
+            # An enforced harness's sandbox (agy, for one) hides the data home's
+            # trust dir from the processes it runs: ``mkdir`` answers EEXIST
+            # while ``stat`` is denied, so the key can be neither read nor made.
+            # Such a process cannot sign an event, and it could not append to the
+            # log it hides either. Crashing here took down every caller that
+            # audits on its way to an answer -- an in-sandbox MCP server's
+            # ``tools/list`` among them, which the harness treats as fatal.
+            # Run unsigned instead: best-effort events are dropped and counted,
+            # and a CRITICAL event still raises, so audit-or-deny callers keep
+            # failing closed.
+            self._unavailable = f"trust root hidden from this process ({exc.__class__.__name__})"
+            self._hmac_key = b""
+            self._hmac_key_file = self._dir / _TRUST_SUBDIR / _HMAC_KEY_FILE
+            logger.warning(
+                "SEL: %s at %s; best-effort security events from this process are "
+                "dropped and critical ones are refused",
+                self._unavailable,
+                self._dir / _TRUST_SUBDIR,
+            )
         # A log that is present but unreadable right now (held open without
         # sharing, EACCES) leaves the tip unknown, not genesis: construction
         # still succeeds, and the first append reads the tip again.
@@ -757,6 +805,11 @@ class SecurityEventLog:
         from the running thread rather than from a flag here, so the rule cannot be
         lost at a call site. The background writer rotates on its next batch.
         """
+        if self._unavailable is not None:
+            if critical:
+                raise PermissionError(f"SEL cannot record a critical event: {self._unavailable}")
+            self.dropped_events += 1
+            return
         if self._sync:
             self._flush_batch([event], raise_on_error=critical)
             return

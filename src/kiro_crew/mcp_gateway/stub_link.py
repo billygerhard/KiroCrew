@@ -334,6 +334,17 @@ class StaleGenerationError(FallbackRequestedError):
     """
 
 
+def _own_code_fingerprints() -> tuple[str, ...]:
+    """Every fingerprint this stub can state for its own code, one per rule."""
+    try:
+        from kiro_crew.code_fingerprint import code_fingerprints
+
+        return code_fingerprints()
+    except (ImportError, OSError):
+        logger.debug("could not compute this stub's alternate code fingerprints", exc_info=True)
+        return ()
+
+
 async def handshake(
     socket_path: str, payload: dict
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str, dict]:
@@ -372,6 +383,15 @@ async def handshake(
                 same_code = daemon_generation == expected_generation or (
                     isinstance(offered, list) and expected_generation in offered
                 )
+                if not same_code and isinstance(offered, list):
+                    # The git rule names the tree at HEAD plus a digest of the
+                    # uncommitted diff, so COMMITTING the code a daemon already
+                    # runs changes this stub's value while the code stays
+                    # byte-identical. The mtime rule does not move on a commit.
+                    # Compare every rule this stub can state against every rule
+                    # the daemon offered; computed only on a miss, so the
+                    # common cold start pays no extra tree walk.
+                    same_code = any(fp in offered for fp in _own_code_fingerprints())
                 if not same_code:
                     raise StaleGenerationError(
                         "gateway code fingerprint does not match this stub; using direct execution"

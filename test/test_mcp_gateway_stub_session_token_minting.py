@@ -51,6 +51,7 @@ from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.mcp_gateway import claim as claim_mod
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import stub as stub_mod
+from kiro_crew.mcp_gateway import stub_link as stub_link_mod
 from kiro_crew.mcp_gateway.daemon import connection as connection_mod
 from kiro_crew.mcp_gateway.pool import PoolKey
 from kiro_crew.mcp_gateway.session_servers import (
@@ -351,6 +352,68 @@ async def test_a_sandboxed_stub_on_the_mtime_rule_accepts_the_same_code(
         },
     )
     assert attached[0] is reader and attached[1] is writer
+
+
+@pytest.mark.asyncio
+async def test_committing_the_running_code_still_matches_the_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The daemon started on an uncommitted tree; that tree was then committed.
+
+    The git rule moves (``tree+diff`` becomes the new HEAD tree) while the code
+    is byte-identical and the mtime rule does not move. The stub must attach
+    rather than fall back to direct execution inside its harness's sandbox.
+    """
+    reader = _QueueReader()
+    writer = _RecordingWriter()
+    reader.feed(
+        {
+            "type": "registered",
+            "fingerprint": "oldtree+diffdigest",
+            "fingerprints": ["oldtree+diffdigest", "mtime:same-tree"],
+        }
+    )
+
+    async def _connect(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return reader, writer
+
+    monkeypatch.setattr(stub_mod.transport, "connect", _connect)
+    monkeypatch.setattr(
+        stub_link_mod, "_own_code_fingerprints", lambda: ("committedtree", "mtime:same-tree")
+    )
+    attached = await stub_mod.handshake(
+        "ignored.sock",
+        {
+            "type": "register",
+            "stub_uuid": "generation-probe",
+            "stub_code_fingerprint": "committedtree",
+        },
+    )
+    assert attached[0] is reader and attached[1] is writer
+
+
+@pytest.mark.asyncio
+async def test_a_real_code_change_still_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    reader = _QueueReader()
+    writer = _RecordingWriter()
+    reader.feed(
+        {
+            "type": "registered",
+            "fingerprint": "oldtree",
+            "fingerprints": ["oldtree", "mtime:old-tree"],
+        }
+    )
+
+    async def _connect(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return reader, writer
+
+    monkeypatch.setattr(stub_mod.transport, "connect", _connect)
+    monkeypatch.setattr(stub_link_mod, "_own_code_fingerprints", lambda: ("newtree", "mtime:new-tree"))
+    with pytest.raises(stub_mod.StaleGenerationError, match="does not match"):
+        await stub_mod.handshake(
+            "ignored.sock",
+            {"type": "register", "stub_uuid": "generation-probe", "stub_code_fingerprint": "newtree"},
+        )
 
 
 def test_code_fingerprints_always_offer_the_mtime_rule(monkeypatch: pytest.MonkeyPatch) -> None:
