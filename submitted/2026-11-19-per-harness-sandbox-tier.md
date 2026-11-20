@@ -1,6 +1,7 @@
 ---
 title: Let one enforced harness run sandboxed while agent.sandbox stays off
 labels: enhancement
+issue: https://github.com/kirodotdev/KiroCrew/issues/39721
 ---
 
 ## What happens
